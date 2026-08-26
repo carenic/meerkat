@@ -41,7 +41,7 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_MANIFEST_DIR": "./meerkat-machine-schema",
     },
     proc_macro_deps = [
@@ -73,7 +73,7 @@ rust_library(
         "//meerkat:__pkg__",
     ],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_MANIFEST_DIR": "./meerkat-machine-schema",
     },
     proc_macro_deps = [
@@ -109,7 +109,7 @@ rust_test(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_MANIFEST_DIR": "./meerkat-machine-schema",
     },
     tags = [
@@ -121,7 +121,7 @@ rust_test(
         ":package_runfiles",
     ],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = [
         "//meerkat-machine-dsl:meerkat_machine_dsl",
@@ -160,7 +160,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "auth_machine_oauth_flow",
         "CARGO_MANIFEST_DIR": "./meerkat-machine-schema",
     },
@@ -170,7 +170,7 @@ rust_test(
     size = "small",
     data = [],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = [
         "//meerkat-machine-dsl:meerkat_machine_dsl",
@@ -210,7 +210,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "auth_machine_release",
         "CARGO_MANIFEST_DIR": "./meerkat-machine-schema",
     },
@@ -220,7 +220,7 @@ rust_test(
     size = "small",
     data = [],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = [
         "//meerkat-machine-dsl:meerkat_machine_dsl",
@@ -260,7 +260,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "catalog_typed_round_trip",
         "CARGO_MANIFEST_DIR": "./meerkat-machine-schema",
     },
@@ -270,7 +270,7 @@ rust_test(
     size = "small",
     data = [],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = [
         "//meerkat-machine-dsl:meerkat_machine_dsl",
@@ -310,7 +310,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "defer_input_totality",
         "CARGO_MANIFEST_DIR": "./meerkat-machine-schema",
     },
@@ -320,7 +320,7 @@ rust_test(
     size = "small",
     data = [],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = [
         "//meerkat-machine-dsl:meerkat_machine_dsl",
@@ -360,7 +360,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "docs_machine_authority_alignment",
         "CARGO_MANIFEST_DIR": "./meerkat-machine-schema",
     },
@@ -375,7 +375,7 @@ rust_test(
         "//:workspace_runfiles",
     ],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
         "WORKSPACE_ROOT": ".",
     },
     proc_macro_deps = [
@@ -416,7 +416,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "draining_registration_fence",
         "CARGO_MANIFEST_DIR": "./meerkat-machine-schema",
     },
@@ -426,7 +426,56 @@ rust_test(
     size = "small",
     data = [],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
+    },
+    proc_macro_deps = [
+        "//meerkat-machine-dsl:meerkat_machine_dsl",
+    ] + all_crate_deps(
+        package_name = "meerkat-machine-schema",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-core:meerkat_core",
+        "//meerkat-machine-schema:meerkat_machine_schema",
+    ] + all_crate_deps(
+        package_name = "meerkat-machine-schema",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "gpt_live_authority_contract_test",
+    aliases = aliases(
+        package_name = "meerkat-machine-schema",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "gpt_live_authority_contract",
+    crate_root = "tests/gpt_live_authority_contract.rs",
+    crate_features = [],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/gpt_live_authority_contract.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.8.30",
+        "CARGO_BIN_NAME": "gpt_live_authority_contract",
+        "CARGO_MANIFEST_DIR": "./meerkat-machine-schema",
+    },
+    tags = [
+        "live",
+    ],
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = [
         "//meerkat-machine-dsl:meerkat_machine_dsl",
@@ -466,7 +515,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "identity_roundtrip",
         "CARGO_MANIFEST_DIR": "./meerkat-machine-schema",
     },
@@ -476,7 +525,7 @@ rust_test(
     size = "small",
     data = [],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = [
         "//meerkat-machine-dsl:meerkat_machine_dsl",
@@ -516,7 +565,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "named_type_binding_covers_catalog",
         "CARGO_MANIFEST_DIR": "./meerkat-machine-schema",
     },
@@ -526,7 +575,7 @@ rust_test(
     size = "small",
     data = [],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = [
         "//meerkat-machine-dsl:meerkat_machine_dsl",
@@ -566,7 +615,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "peer_endpoint_structural_equivalence",
         "CARGO_MANIFEST_DIR": "./meerkat-machine-schema",
     },
@@ -576,7 +625,7 @@ rust_test(
     size = "small",
     data = [],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = [
         "//meerkat-machine-dsl:meerkat_machine_dsl",
@@ -616,7 +665,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "placed_lifecycle_origin_fence",
         "CARGO_MANIFEST_DIR": "./meerkat-machine-schema",
     },
@@ -626,7 +675,7 @@ rust_test(
     size = "small",
     data = [],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = [
         "//meerkat-machine-dsl:meerkat_machine_dsl",
@@ -666,7 +715,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "runtime_authority_reconciliation_totality",
         "CARGO_MANIFEST_DIR": "./meerkat-machine-schema",
     },
@@ -676,7 +725,7 @@ rust_test(
     size = "small",
     data = [],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = [
         "//meerkat-machine-dsl:meerkat_machine_dsl",
@@ -716,7 +765,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "schema_construction_cache",
         "CARGO_MANIFEST_DIR": "./meerkat-machine-schema",
     },
@@ -726,7 +775,7 @@ rust_test(
     size = "small",
     data = [],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = [
         "//meerkat-machine-dsl:meerkat_machine_dsl",
@@ -766,7 +815,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "schema_contracts",
         "CARGO_MANIFEST_DIR": "./meerkat-machine-schema",
     },
@@ -780,7 +829,7 @@ rust_test(
         "//meerkat-runtime:package_runfiles",
     ],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = [
         "//meerkat-machine-dsl:meerkat_machine_dsl",
@@ -820,7 +869,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "stopped_phase_revival_lattice",
         "CARGO_MANIFEST_DIR": "./meerkat-machine-schema",
     },
@@ -830,7 +879,7 @@ rust_test(
     size = "small",
     data = [],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = [
         "//meerkat-machine-dsl:meerkat_machine_dsl",

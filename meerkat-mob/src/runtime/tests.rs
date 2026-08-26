@@ -14,9 +14,10 @@ use crate::storage::MobStorage;
 use crate::store::{
     ExternalBindingOverlayRecord, ExternalBindingOverlayStatus, InMemoryMobEventStore,
     InMemoryMobIdentityStatusStore, InMemoryMobIdentityStore, InMemoryMobRunStore,
-    InMemoryMobRuntimeMetadataStore, InMemoryMobSpecStore, MobEventStore, MobIdentityStatusStore,
-    MobIdentityStore, MobMemberEventCursorRecord, MobRunStore, MobRuntimeMetadataStore,
-    MobStoreError, RealmProfileStore, SupervisorAuthorityRecord, private, terminal_event_identity,
+    InMemoryMobRuntimeMetadataStore, InMemoryMobSpecStore, MobDeliveryIdentity, MobEventStore,
+    MobIdentityStatusStore, MobIdentityStore, MobMemberEventCursorRecord, MobRunStore,
+    MobRuntimeMetadataStore, MobStoreError, RealmProfileStore, SupervisorAuthorityRecord, private,
+    terminal_event_identity,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::store::{SqliteMobEventStore, SqliteMobStores};
@@ -3846,6 +3847,17 @@ impl SessionServiceControlExt for MockSessionService {
 
 #[async_trait]
 impl MobSessionService for MockSessionService {
+    #[cfg(feature = "experimental-gpt-live")]
+    async fn validate_live_bridge_member_eligibility(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<(), SessionError> {
+        Err(SessionError::Unsupported(
+            "mock durable source carries process-local callback tools and is ineligible for direct same-member live bridge execution"
+                .to_string(),
+        ))
+    }
+
     async fn materialize_session_resume_verdict(
         &self,
         session_id: &SessionId,
@@ -3975,6 +3987,22 @@ impl MobSessionService for MockSessionService {
             },
             session_ref: None,
         })
+    }
+
+    #[cfg(feature = "experimental-gpt-live")]
+    async fn start_live_bridge_member_operation(
+        &self,
+        request: super::LiveBridgeOperationRequest,
+        cancellation: super::LiveBridgeOperationCancellationSignal,
+    ) -> Result<super::LiveBridgeOperationTerminalFuture, super::LiveBridgeOperationStartError>
+    {
+        if request.admission().operation().operation_id() != cancellation.operation_id() {
+            return Err(super::LiveBridgeOperationStartError::Rejected);
+        }
+        Ok(Box::pin(async move {
+            cancellation.cancelled().await;
+            super::LiveBridgeOperationTerminal::cancelled()
+        }))
     }
 
     async fn create_session_under_runtime_turn_boundary(
@@ -8217,6 +8245,213 @@ async fn create_test_mob(definition: MobDefinition) -> (MobHandle, Arc<MockSessi
         .expect("create mob");
 
     (handle, service)
+}
+
+async fn create_persistent_runtime_test_mob(
+    definition: MobDefinition,
+) -> (MobHandle, Arc<MockSessionService>) {
+    let service = Arc::new(MockSessionService::new());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let adapter = Arc::new(meerkat_runtime::MeerkatMachine::persistent_without_blobs(
+        runtime_store,
+    ));
+    service.set_runtime_adapter(adapter);
+    let storage = MobStorage::in_memory();
+    let handle = MobBuilder::new(definition, storage.clone())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create persistent-runtime test mob");
+    (handle, service)
+}
+
+#[cfg(feature = "experimental-gpt-live")]
+#[tokio::test]
+async fn callback_bearing_member_is_available_as_durable_fork_source_but_not_direct_bridge() {
+    let definition = with_unique_mob_id(sample_definition(), "live-durable-source-topology");
+    let (handle, _service) = create_test_mob(definition).await;
+    let identity = AgentIdentity::from("callback-bearing-personal-source");
+    let mut spec = SpawnMemberSpec::new(ProfileName::from("worker"), identity.clone());
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("spawn callback-bearing durable source");
+    let member = handle
+        .member(&identity)
+        .await
+        .expect("current durable source member");
+
+    member
+        .validate_live_durable_source_availability()
+        .await
+        .expect("separate durable-fork executor may use the exact current source transcript");
+    assert_eq!(
+        member.validate_live_bridge_eligibility().await,
+        Err(super::LiveBridgeOperationStartError::Rejected),
+        "callback-bearing source must remain ineligible for direct same-member execution"
+    );
+
+    handle.shutdown().await.expect("shutdown test mob");
+}
+
+#[cfg(feature = "experimental-gpt-live")]
+#[tokio::test]
+async fn live_bridge_cancellation_keeps_exact_member_incarnation_and_allows_ordinary_turn() {
+    struct AdmitDispatch;
+
+    #[async_trait]
+    impl meerkat_core::ToolDispatchAdmission for AdmitDispatch {
+        async fn await_dispatch_admission(
+            &self,
+            _call: ToolCallView<'_>,
+            _context: Option<&meerkat_core::ToolDispatchContext>,
+            _effect_kind: meerkat_core::LiveBridgeEffectKind,
+        ) -> Result<(), ToolError> {
+            Ok(())
+        }
+    }
+
+    let definition = with_unique_mob_id(sample_definition(), "live-bridge-cancel-member");
+    let (handle, service) = create_test_mob(definition).await;
+    let identity = AgentIdentity::from("live-bridge-member");
+    let mut spec = SpawnMemberSpec::new(ProfileName::from("worker"), identity.clone());
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("spawn durable bridge member");
+    let member = handle
+        .member(&identity)
+        .await
+        .expect("durable member handle");
+    let before = member.status().await.expect("member status before bridge");
+    let (runtime_id, fence_token) = before
+        .runtime_identity_fields()
+        .expect("current member incarnation");
+    let runtime_id = runtime_id.clone();
+    let session_id = before
+        .current_bridge_session_id()
+        .cloned()
+        .expect("current member session");
+    let session = service
+        .live_session_clone(&session_id)
+        .await
+        .expect("live member session");
+    let snapshot = super::LiveBridgeExecutionSnapshot::from_generation_bound_session(
+        session,
+        identity.as_str(),
+    )
+    .expect("exact generation-bound session snapshot");
+
+    let channel_id = meerkat_core::LiveChannelId::new("channel:actor-cancel-test");
+    let binding = meerkat_runtime::live_execution::LiveDelegationRuntimeBinding::__test_new(
+        session_id.clone(),
+        channel_id.clone(),
+        meerkat_runtime::identifiers::LogicalRuntimeId::new(runtime_id.to_string()),
+        fence_token.get(),
+        runtime_id.generation.get(),
+    );
+    let provider = meerkat_core::LiveBridgeProviderCorrelation::new(
+        "turn:actor-cancel-test",
+        "delegation:actor-cancel-test",
+        "call:actor-cancel-test",
+    )
+    .expect("provider correlation");
+    let correlation = meerkat_core::LiveBridgeOperationCorrelation::new(
+        channel_id,
+        InteractionId::new(),
+        provider,
+    )
+    .expect("operation correlation");
+    let operation = meerkat_core::exact_operation::ExactOperationIdentity::for_domain(
+        meerkat_core::ops::OperationId::new(),
+        correlation,
+    );
+    let request_text = "answer this noncommitting live request";
+    let admission = Arc::new(
+        meerkat_runtime::live_execution::LiveBridgeOperationAdmission::__test_new(
+            session_id.clone(),
+            binding,
+            operation,
+            identity.as_str(),
+            snapshot.canonical_context_revision().clone(),
+            meerkat_core::LiveBridgeRequestDigest::derive(request_text).expect("request digest"),
+        ),
+    );
+    let model_authority = Arc::new(
+        meerkat_runtime::live_execution::LiveBridgeEffectDispatchAuthority::__test_new(
+            admission.as_ref().clone(),
+            meerkat_core::LiveBridgeEffectKind::ModelComputation,
+        ),
+    );
+    let dispatch_admission = meerkat_core::LiveBridgeToolDispatchAdmission::__test_new(
+        admission.operation().operation_id().to_string(),
+        Arc::new(AdmitDispatch),
+    );
+    let request =
+        super::LiveBridgeOperationRequest::new(Arc::clone(&admission), snapshot, request_text)
+            .expect("live bridge request")
+            .with_execution_authorities(Arc::clone(&model_authority), dispatch_admission)
+            .expect("exact execution authorities");
+    assert!(
+        model_authority.sealed_noncommitting_run_permit().is_err(),
+        "one consumed model-computation authority must seal at most one run permit"
+    );
+    let executor = Arc::new(super::DurableMemberLiveBridgeOperationExecutor::new(
+        member.clone(),
+    ));
+    let bridge = super::LiveBridgeOperationService::new(executor);
+    let accepted = bridge.start(request).await.expect("actor accepted bridge");
+    accepted.cancellation_handle().cancel();
+    assert_eq!(
+        accepted.await_terminal().await.terminal(),
+        meerkat_runtime::live_execution::MeerkatExecutionTerminal::Cancelled
+    );
+
+    let after = member
+        .status()
+        .await
+        .expect("member status after bridge cancel");
+    let (after_runtime_id, after_fence) = after
+        .runtime_identity_fields()
+        .expect("member still has a live incarnation");
+    assert_eq!(after_runtime_id, &runtime_id, "member must not respawn");
+    assert_eq!(after_fence, fence_token, "member fence must not rotate");
+    assert_eq!(
+        after.current_bridge_session_id(),
+        Some(&session_id),
+        "member must keep its canonical session binding"
+    );
+    assert!(
+        !after.is_final,
+        "bridge cancellation must not retire the member"
+    );
+
+    let turn_count = service.start_turn_call_count();
+    let delivery = member
+        .internal_turn("ordinary turn after live bridge cancellation")
+        .await
+        .expect("ordinary member turn remains available");
+    assert_eq!(delivery.agent_runtime_id, runtime_id);
+    assert_eq!(delivery.fence_token, fence_token);
+    wait_for_start_turn_call_count(
+        service.as_ref(),
+        turn_count + 1,
+        "ordinary member work must run after bridge cancellation",
+    )
+    .await;
+    assert!(
+        service
+            .recorded_start_turn_prompts()
+            .await
+            .iter()
+            .any(|(recorded_session, prompt)| recorded_session == &session_id
+                && prompt == "ordinary turn after live bridge cancellation"),
+        "ordinary work must execute on the unchanged canonical member session"
+    );
+    handle.shutdown().await.expect("shutdown test mob");
 }
 
 #[tokio::test]
@@ -20253,6 +20488,351 @@ async fn test_visible_mob_operator_tools_emit_identity_native_member_payloads() 
     assert!(member.get("bridge_session_id").is_none());
     assert!(member.get("current_session_id").is_none());
     assert!(member.get("current_bridge_session_id").is_none());
+}
+
+#[tokio::test]
+async fn delegation_execution_service_returns_exact_result_and_retires_member() {
+    let definition = MobDefinition::implicit("delegation-service-success", "claude-sonnet-4-5");
+    let (handle, service) = create_test_mob(definition).await;
+    service.set_return_exact_run_result(true);
+    let helper_id = AgentIdentity::from("delegation-service-helper");
+    let request = DelegationExecutionRequest::new(
+        helper_id.clone(),
+        "return this exact delegation result",
+        BoundedResultSpec::new("delegation-service-result", 256)
+            .expect("valid delegation result spec"),
+    );
+
+    let result = DelegationExecutionService::new(handle.clone())
+        .execute(request)
+        .await
+        .expect("delegation service succeeds");
+
+    assert!(!result.wired(), "a parentless delegation is not wired");
+    assert_eq!(
+        result.turn().result().result().text(),
+        "return this exact delegation result"
+    );
+    assert!(result.retirement_error().is_none());
+    assert!(
+        handle.get_member(&helper_id).await.unwrap().is_none(),
+        "delegation service must retire the helper after exact result capture"
+    );
+}
+
+#[tokio::test]
+async fn delegation_execution_service_runs_on_a_real_durable_fork_and_retires_only_the_child() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    service.set_return_exact_run_result(true);
+    let source_identity = AgentIdentity::from("delegation-durable-source");
+    let source = handle
+        .spawn(ProfileName::from("worker"), source_identity.clone(), None)
+        .await
+        .expect("spawn durable delegation source");
+    let source_session_id = source
+        .bridge_session_id()
+        .expect("source bridge session")
+        .clone();
+    let mut evolved_source = service
+        .persisted_session_clone(&source_session_id)
+        .await
+        .expect("persisted source session");
+    evolved_source.push(Message::User(meerkat_core::UserMessage::text(
+        "committed source context",
+    )));
+    let committed_boundary = evolved_source.messages().len();
+    evolved_source.push(Message::User(meerkat_core::UserMessage::text(
+        "later context outside the sealed live boundary",
+    )));
+    service.replace_live_session(evolved_source).await;
+    let child_identity = AgentIdentity::from("delegation-durable-child");
+    let interaction_id = InteractionId::new();
+    let delivery_identity = MobDeliveryIdentity::new(
+        "bridge-operation:durable-delegation-test",
+        interaction_id.to_string(),
+    )
+    .expect("valid stable delegation delivery identity");
+    let expected_work_ref = WorkRef::for_delivery(
+        &handle.definition().id,
+        &child_identity,
+        &delivery_identity.idempotency_key,
+    );
+    let request = DelegationExecutionRequest::new(
+        child_identity.clone(),
+        "ordinary bounded child task",
+        BoundedResultSpec::new("delegation-durable-result", 256)
+            .expect("valid durable delegation result spec"),
+    )
+    .with_durable_fork(source_identity.clone(), Some(committed_boundary))
+    .with_delivery_identity(delivery_identity, interaction_id);
+
+    let delegation_service = DelegationExecutionService::new(handle.clone());
+    let execution = delegation_service
+        .start(request)
+        .await
+        .expect("durable-fork delegation starts");
+    assert_eq!(execution.work_receipt().work_ref, expected_work_ref);
+    let child_session_id = handle
+        .get_member(&child_identity)
+        .await
+        .expect("child roster lookup")
+        .and_then(|member| member.member_ref.bridge_session_id().cloned())
+        .expect("forked child bridge session");
+    let child_session = service
+        .persisted_session_clone(&child_session_id)
+        .await
+        .expect("persisted forked child");
+    let child_transcript =
+        serde_json::to_string(child_session.messages()).expect("serialize forked child transcript");
+    assert!(child_transcript.contains("committed source context"));
+    assert!(!child_transcript.contains("later context outside the sealed live boundary"));
+
+    let terminalized = execution.await_terminal().await;
+    let result_text = match terminalized.terminal() {
+        DelegationTurnTerminal::Completed(turn) => turn.result().result().text(),
+        terminal => panic!("durable child must complete: {terminal:?}"),
+    };
+
+    assert_eq!(result_text, "ordinary bounded child task");
+    delegation_service
+        .retire_terminalized(&terminalized)
+        .await
+        .expect("retire durable child");
+    assert!(
+        handle
+            .get_member(&child_identity)
+            .await
+            .expect("child roster lookup")
+            .is_none(),
+        "ordinary delegation retirement removes only the forked child"
+    );
+    assert_eq!(
+        handle
+            .get_member(&source_identity)
+            .await
+            .expect("source roster lookup")
+            .and_then(|member| member.member_ref.bridge_session_id().cloned()),
+        Some(source_session_id),
+        "durable delegation must not perturb the canonical source binding"
+    );
+}
+
+#[tokio::test]
+async fn durable_bounded_work_recovery_preserves_exact_terminal_after_child_retirement() {
+    let definition = with_unique_mob_id(sample_definition(), "durable-bounded-recovery-terminal");
+    let (handle, service) = create_persistent_runtime_test_mob(definition).await;
+    service.set_return_exact_run_result(true);
+    let source_identity = AgentIdentity::from("durable-recovery-source");
+    handle
+        .spawn(
+            ProfileName::from("worker"),
+            source_identity.clone(),
+            Some(ContentInput::Text("durable recovery context".to_string())),
+        )
+        .await
+        .expect("spawn durable recovery source");
+    let child_identity = AgentIdentity::from("durable-recovery-child");
+    let interaction_id = InteractionId::new();
+    let delivery_identity = MobDeliveryIdentity::new(
+        "bridge-operation:durable-recovery",
+        interaction_id.to_string(),
+    )
+    .expect("valid durable recovery identity");
+    let result_spec = BoundedResultSpec::new("durable-recovery", 256)
+        .expect("valid durable recovery result bound");
+    let request = DelegationExecutionRequest::new(
+        child_identity.clone(),
+        "recover this exact ordinary child result",
+        result_spec.clone(),
+    )
+    .with_durable_fork(source_identity, None)
+    .with_delivery_identity(delivery_identity.clone(), interaction_id);
+    let delegation_service = DelegationExecutionService::new(handle.clone());
+    let execution = delegation_service
+        .start(request)
+        .await
+        .expect("start durable recovery child");
+    let terminalized = execution.await_terminal().await;
+
+    let active = handle
+        .recover_bounded_work_for_identity_with_delivery_identity(
+            &child_identity,
+            &delivery_identity,
+            &result_spec,
+        )
+        .await
+        .expect("observe active child work after terminal waiter resolution");
+    assert!(matches!(
+        active.member(),
+        DurableBoundedMemberState::Active { .. }
+    ));
+    assert!(
+        matches!(
+            active.work(),
+            DurableBoundedWorkState::InFlight { .. } | DurableBoundedWorkState::Terminal { .. }
+        ),
+        "active child observation is read-only and may precede terminal receipt finalization"
+    );
+
+    delegation_service
+        .retire_terminalized(&terminalized)
+        .await
+        .expect("retire durable recovery child");
+    let retired = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let recovery = handle
+                .recover_bounded_work_for_identity_with_delivery_identity(
+                    &child_identity,
+                    &delivery_identity,
+                    &result_spec,
+                )
+                .await
+                .expect("recover retired child terminal");
+            if matches!(recovery.work(), DurableBoundedWorkState::Terminal { .. }) {
+                break recovery;
+            }
+            assert!(
+                matches!(recovery.work(), DurableBoundedWorkState::InFlight { .. }),
+                "retired child terminal recovery must converge through InFlight only"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retired child terminal recovery converges within the bound");
+    assert!(matches!(
+        retired.member(),
+        DurableBoundedMemberState::Retired { .. }
+    ));
+    let DurableBoundedWorkState::Terminal { result, .. } = retired.work() else {
+        panic!("retired child must retain its exact terminal completion");
+    };
+    assert_eq!(
+        result
+            .as_ref()
+            .expect("retired exact bounded result")
+            .result()
+            .text(),
+        "recover this exact ordinary child result"
+    );
+}
+
+#[tokio::test]
+async fn durable_bounded_work_recovery_marks_retired_child_without_input_broken() {
+    let definition = with_unique_mob_id(sample_definition(), "durable-bounded-recovery-broken");
+    let (handle, _service) = create_test_mob(definition).await;
+    let child_identity = AgentIdentity::from("retired-without-work");
+    handle
+        .spawn_with_options(
+            ProfileName::from("worker"),
+            child_identity.clone(),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn child without work");
+    handle
+        .retire(child_identity.clone())
+        .await
+        .expect("retire child without work");
+    let interaction_id = InteractionId::new();
+    let delivery_identity = MobDeliveryIdentity::new(
+        "bridge-operation:never-admitted",
+        interaction_id.to_string(),
+    )
+    .expect("valid absent delivery identity");
+    let result_spec =
+        BoundedResultSpec::new("never-admitted", 256).expect("valid absent result bound");
+
+    let recovery = handle
+        .recover_bounded_work_for_identity_with_delivery_identity(
+            &child_identity,
+            &delivery_identity,
+            &result_spec,
+        )
+        .await
+        .expect("observe retired child without work");
+    assert!(matches!(
+        recovery.member(),
+        DurableBoundedMemberState::Retired { .. }
+    ));
+    assert!(matches!(
+        recovery.work(),
+        DurableBoundedWorkState::Broken { input_id: None, .. }
+    ));
+}
+
+#[tokio::test]
+async fn delegation_execution_service_retires_member_after_exact_turn_failure() {
+    let definition = MobDefinition::implicit("delegation-service-failure", "claude-sonnet-4-5");
+    let (handle, service) = create_test_mob(definition).await;
+    service.set_fail_start_turn(true);
+    let helper_id = AgentIdentity::from("delegation-service-failing-helper");
+    let request = DelegationExecutionRequest::new(
+        helper_id.clone(),
+        "fail this delegated turn",
+        BoundedResultSpec::new("delegation-service-failure", 256)
+            .expect("valid delegation result spec"),
+    );
+
+    let error = DelegationExecutionService::new(handle.clone())
+        .execute(request)
+        .await
+        .expect_err("the exact delegated turn must fail");
+
+    assert!(
+        matches!(error, DelegationExecutionError::Turn { .. }),
+        "post-admission turn failure must retain its typed stage: {error}"
+    );
+    assert!(
+        handle.get_member(&helper_id).await.unwrap().is_none(),
+        "delegation service must still attempt retirement after turn failure"
+    );
+}
+
+#[tokio::test]
+async fn delegation_execution_service_rejects_delivery_correlation_mismatch_before_spawn() {
+    let definition = MobDefinition::implicit("delegation-delivery-mismatch", "claude-sonnet-4-5");
+    let (handle, _service) = create_test_mob(definition).await;
+    let helper_id = AgentIdentity::from("delegation-mismatched-delivery-helper");
+    let delivery_interaction = InteractionId::new();
+    let request_interaction = InteractionId::new();
+    let request = DelegationExecutionRequest::new(
+        helper_id.clone(),
+        "must never be admitted",
+        BoundedResultSpec::new("delegation-delivery-mismatch", 256)
+            .expect("valid delegation result spec"),
+    )
+    .with_delivery_identity(
+        MobDeliveryIdentity::new(
+            "bridge-operation:delivery-mismatch-test",
+            delivery_interaction.to_string(),
+        )
+        .expect("valid delivery identity"),
+        request_interaction,
+    );
+
+    let error = match DelegationExecutionService::new(handle.clone())
+        .start(request)
+        .await
+    {
+        Ok(_) => panic!("mismatched typed correlation must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        DelegationExecutionError::WorkAdmission { .. }
+    ));
+    assert!(
+        handle
+            .get_member(&helper_id)
+            .await
+            .expect("helper roster lookup")
+            .is_none(),
+        "correlation mismatch must fail before member admission"
+    );
 }
 
 #[tokio::test]
@@ -45051,29 +45631,33 @@ async fn test_explicit_resume_retains_wedged_attachment_retirement_for_level_tri
     let gate = service.install_non_reentrant_turn_finalization_gate();
     let held_gate = Arc::clone(&gate).lock_owned().await;
     let boundary_baseline = service.turn_finalization_acquire_counts();
+    let assert_retained_retry = |error: &MobError| {
+        match error {
+            MobError::LifecycleOperationPending { intent } => assert!(
+                intent == "explicit_resume"
+                    || intent == &format!("explicit_resume_attachment_retirement:{session_id}")
+            ),
+            MobError::LifecycleOperationProgressStalled { intent, .. } => {
+                assert_eq!(intent, "explicit_resume");
+            }
+            other => panic!("wedged takeover returned {other:?}"),
+        }
+        assert_eq!(
+            error.wire_error_code(),
+            Some(meerkat_contracts::ErrorCode::SessionBusy)
+        );
+        let data = error
+            .structured_data()
+            .expect("retained retry observation must carry stable structured data");
+        assert_eq!(data["retryable"], true);
+        assert_eq!(data["authority_retained"], true);
+    };
 
     let first = tokio::time::timeout(Duration::from_secs(3), resumed.resume())
         .await
         .expect("first explicit resume must remain caller-bounded")
         .expect_err("wedged exact takeover must report retained authority");
-    assert!(
-        matches!(
-            &first,
-            MobError::LifecycleOperationPending { intent }
-                if intent == "explicit_resume"
-                    || intent == &format!("explicit_resume_attachment_retirement:{session_id}")
-        ),
-        "wedged takeover returned {first:?}"
-    );
-    assert_eq!(
-        first.wire_error_code(),
-        Some(meerkat_contracts::ErrorCode::SessionBusy)
-    );
-    let retained_data = first
-        .structured_data()
-        .expect("retained lifecycle pending must carry stable structured data");
-    assert_eq!(retained_data["retryable"], true);
-    assert_eq!(retained_data["authority_retained"], true);
+    assert_retained_retry(&first);
     assert_eq!(
         service.turn_finalization_acquire_counts(),
         (boundary_baseline.0 + 1, boundary_baseline.1),
@@ -45084,7 +45668,7 @@ async fn test_explicit_resume_retains_wedged_attachment_retirement_for_level_tri
         .await
         .expect("level-trigger retry must remain caller-bounded")
         .expect_err("retry must join the retained takeover");
-    assert!(matches!(second, MobError::LifecycleOperationPending { .. }));
+    assert_retained_retry(&second);
     assert_eq!(
         service.turn_finalization_acquire_counts(),
         (boundary_baseline.0 + 1, boundary_baseline.1),
@@ -45096,7 +45680,10 @@ async fn test_explicit_resume_retains_wedged_attachment_retirement_for_level_tri
         loop {
             match resumed.resume().await {
                 Ok(()) => break,
-                Err(MobError::LifecycleOperationPending { .. }) => {
+                Err(
+                    MobError::LifecycleOperationPending { .. }
+                    | MobError::LifecycleOperationProgressStalled { .. },
+                ) => {
                     tokio::task::yield_now().await;
                 }
                 Err(error) => {
@@ -45251,6 +45838,118 @@ async fn test_explicit_resume_terminal_survives_observer_drop_and_is_shared() {
         1,
         "observer drop and concurrent observers must not replay Resume"
     );
+    responder.await.expect("Resume responder task");
+}
+
+#[tokio::test]
+async fn test_explicit_resume_host_materialization_uses_typed_host_terminality() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let (command_tx, mut command_rx) =
+        tokio::sync::mpsc::channel::<super::scope_gate::RoutedMobCommand>(4);
+    let shared_handle = MobHandle {
+        command_tx,
+        explicit_resume_operations: Arc::new(super::handle::ResumeOperationRegistry::default()),
+        ..handle
+    };
+    let responder = tokio::spawn(async move {
+        let routed = command_rx.recv().await.expect("one Resume command");
+        let super::state::MobCommand::ResumeLifecycle {
+            admission,
+            progress,
+            reply_tx,
+            ..
+        } = routed.cmd
+        else {
+            panic!("expected ResumeLifecycle command");
+        };
+        admission.admit();
+        for (member_id, delay) in [
+            (AgentIdentity::from("slow-a"), Duration::from_millis(2_200)),
+            (AgentIdentity::from("slow-b"), Duration::from_millis(100)),
+        ] {
+            progress.awaiting_member(
+                &member_id,
+                super::state::LifecycleProgressStage::MemberLiveMaterialization,
+            );
+            tokio::time::sleep(delay).await;
+            progress.member_progress(
+                &member_id,
+                super::state::LifecycleProgressStage::MemberLiveMaterialization,
+            );
+        }
+        let _ = reply_tx.send(Ok(()));
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(4),
+        shared_handle.resume_until_for_test(Instant::now() + Duration::from_millis(100)),
+    )
+    .await
+    .expect("host-owned materialization still completes within the test harness bound")
+    .expect("one typed host materialization may exceed Meerkat's platform-stage patience");
+    responder.await.expect("Resume responder task");
+}
+
+#[tokio::test]
+async fn test_explicit_resume_progress_stall_names_member_and_remains_joinable() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let (command_tx, mut command_rx) =
+        tokio::sync::mpsc::channel::<super::scope_gate::RoutedMobCommand>(4);
+    let shared_handle = MobHandle {
+        command_tx,
+        explicit_resume_operations: Arc::new(super::handle::ResumeOperationRegistry::default()),
+        ..handle
+    };
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let responder = tokio::spawn(async move {
+        let routed = command_rx.recv().await.expect("one Resume command");
+        let super::state::MobCommand::ResumeLifecycle {
+            admission,
+            progress,
+            reply_tx,
+            ..
+        } = routed.cmd
+        else {
+            panic!("expected ResumeLifecycle command");
+        };
+        admission.admit();
+        progress.awaiting_member(
+            &AgentIdentity::from("wedged-host-build"),
+            super::state::LifecycleProgressStage::MemberCommsReadiness,
+        );
+        let _ = release_rx.await;
+        let _ = reply_tx.send(Ok(()));
+    });
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(3),
+        shared_handle.resume_until_for_test(Instant::now() + Duration::from_millis(100)),
+    )
+    .await
+    .expect("stalled Resume returns after one progress-patience window")
+    .expect_err("a host build with no progress must fail closed");
+    assert!(matches!(
+        &error,
+        MobError::LifecycleOperationProgressStalled {
+            intent,
+            member_id: Some(member_id),
+            stage,
+        } if intent == "explicit_resume"
+            && member_id.as_str() == "wedged-host-build"
+            && *stage == "member_comms_readiness"
+    ));
+    let structured = error
+        .structured_data()
+        .expect("progress stall has stable structured diagnostics");
+    assert_eq!(structured["member_id"], "wedged-host-build");
+    assert_eq!(structured["stage"], "member_comms_readiness");
+    assert_eq!(structured["authority_retained"], true);
+
+    let _ = release_tx.send(());
+    shared_handle
+        .resume_until_for_test(Instant::now() + Duration::from_secs(3))
+        .await
+        .expect("retry joins the retained exact Resume operation");
     responder.await.expect("Resume responder task");
 }
 
@@ -46424,6 +47123,7 @@ fn test_session_llm_capabilities() -> meerkat_runtime::SessionLlmCapabilitySurfa
         supports_web_search: false,
         image_generation: false,
         realtime: false,
+        supports_mid_conversation_system_messages: false,
         call_timeout_secs: None,
     }
 }
@@ -46519,6 +47219,7 @@ impl meerkat_runtime::SessionLlmReconfigureHost for RecordingSessionLlmReconfigu
         &self,
         _session_id: &SessionId,
         identity: &meerkat_core::SessionLlmIdentity,
+        _capability_surface: Option<&meerkat_runtime::SessionLlmCapabilitySurface>,
     ) -> Result<(), meerkat_runtime::RuntimeDriverError> {
         if self.fail_live_apply.load(Ordering::SeqCst) {
             return Err(meerkat_runtime::RuntimeDriverError::ValidationFailed {
@@ -64451,6 +65152,9 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
             "autonomous_stop_interrupts_pending".to_string()
         }
         MobError::LifecycleOperationPending { .. } => "lifecycle_operation_pending".to_string(),
+        MobError::LifecycleOperationProgressStalled { .. } => {
+            "lifecycle_operation_progress_stalled".to_string()
+        }
         MobError::LifecycleOperationAdmissionPending { .. } => {
             "lifecycle_operation_admission_pending".to_string()
         }

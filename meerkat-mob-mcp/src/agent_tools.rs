@@ -1,6 +1,6 @@
 //! Agent-facing mob tool surface for delegation and orchestration.
 //!
-//! `AgentMobToolSurface` provides the 8 agent-internal mob tools (delegate,
+//! `AgentMobToolSurface` provides the agent-internal mob tools (delegate,
 //! mob_create, mob_destroy, mob_spawn_member, mob_retire_member,
 //! mob_check_member, mob_list_members, mob_list) composed into the tool
 //! gateway by `build_agent()`.
@@ -18,12 +18,13 @@ use meerkat_core::types::{
 use meerkat_core::{AgentToolDispatcher, ToolUnavailableReason};
 use meerkat_mob::machines::mob_machine::HostId;
 use meerkat_mob::{
-    AgentIdentity, BoundedResultSpec, MobBackendKind, MobDefinition, MobError, MobHandle, MobId,
-    MobRuntimeMode, ProfileName, SpawnMemberSpec, SpawnResult, WorkOrigin, WorkSpec,
-    runtime::MobSessionService,
+    AgentIdentity, BoundedResultSpec, DelegationExecutionError, DelegationExecutionRequest,
+    DelegationExecutionService, DelegationMemberOptions, DelegationParentContext, MobBackendKind,
+    MobDefinition, MobError, MobHandle, MobId, MobRuntimeMode, ProfileName, SpawnMemberSpec,
+    SpawnResult, runtime::MobSessionService,
 };
 use schemars::{JsonSchema, schema_for};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{future::Future, pin::Pin, sync::Arc};
 
@@ -51,6 +52,7 @@ const TOOL_CONCLUDE_OBJECTIVE: &str = "conclude_objective";
 const TOOL_MOB_CREATE: &str = "mob_create";
 const TOOL_MOB_DESTROY: &str = "mob_destroy";
 const TOOL_MOB_SPAWN_MEMBER: &str = "mob_spawn_member";
+const TOOL_FORK_OFF: &str = "fork_off";
 const TOOL_MOB_RETIRE_MEMBER: &str = "mob_retire_member";
 const TOOL_MOB_CHECK_MEMBER: &str = "mob_check_member";
 const TOOL_MOB_LIST_MEMBERS: &str = "mob_list_members";
@@ -230,86 +232,6 @@ impl AgentMobToolSurface {
         )
     }
 
-    fn trusted_descriptor_from_runtime(
-        name: &str,
-        peer_id: PeerId,
-        address: String,
-        runtime: &dyn meerkat_core::agent::CommsRuntime,
-    ) -> Result<TrustedPeerDescriptor, String> {
-        let pubkey = runtime.public_key_bytes().ok_or_else(|| {
-            format!("comms runtime for '{name}' does not expose public key bytes")
-        })?;
-        let address = runtime.advertised_address().unwrap_or(address);
-        TrustedPeerDescriptor::unsigned_with_pubkey(
-            name.to_string(),
-            peer_id.to_string(),
-            pubkey,
-            address,
-        )
-    }
-
-    fn synthetic_parent_peer_added_fields(parent_name: &str) -> (String, String, String) {
-        // Parse the parent's comms name through the single fail-closed authority.
-        // A well-formed member name yields its typed role; anything else is a
-        // typed `PeerRole::External` rather than the magic "external" string.
-        match parent_name.parse::<meerkat_core::MemberCommsName>() {
-            Ok(comms_name) => {
-                let role = meerkat_core::PeerRole::Member(comms_name.role().to_string());
-                (
-                    comms_name.member().to_string(),
-                    role.as_label().to_string(),
-                    format!("peer {}", role.as_label()),
-                )
-            }
-            Err(_) => {
-                let role = meerkat_core::PeerRole::External;
-                (
-                    parent_name.to_string(),
-                    role.as_label().to_string(),
-                    "external peer".to_string(),
-                )
-            }
-        }
-    }
-
-    async fn notify_peer_added(
-        sender: &Arc<dyn meerkat_core::agent::CommsRuntime>,
-        recipient_comms_name: &str,
-        peer: &str,
-        role: &str,
-        description: &str,
-    ) -> bool {
-        let Ok(to) = PeerName::new(recipient_comms_name) else {
-            return false;
-        };
-        let Some(route) = sender
-            .peers()
-            .await
-            .into_iter()
-            .find(|entry| entry.name == to)
-            .map(|entry| PeerRoute::with_display_name(entry.peer_id, entry.name))
-        else {
-            return false;
-        };
-        sender
-            .send(CommsCommand::PeerRequest {
-                objective_id: None,
-                to: route,
-                intent: "mob.peer_added".to_string(),
-                params: serde_json::json!({
-                    "peer": peer,
-                    "role": role,
-                    "description": description,
-                }),
-                blocks: None,
-                content_taint: None,
-                handling_mode: meerkat_core::types::HandlingMode::Queue,
-                stream: meerkat_core::comms::InputStreamMode::None,
-            })
-            .await
-            .is_ok()
-    }
-
     /// Create a new agent mob tool surface.
     ///
     /// # Arguments
@@ -431,6 +353,7 @@ impl AgentMobToolSurface {
          - mob_create: Create an explicit mob with full control over profiles, wiring, and flows\n\
          - mob_destroy: Destroy an explicit mob (cannot destroy implicit delegation mob)\n\
          - mob_spawn_member: Spawn a member into any mob\n\
+         - fork_off: Fork a durable member and run one exact child turn while retaining it\n\
          - mob_retire_member: Archive a member and its session\n\
          - mob_check_member: Check a member's execution status and output\n\
          - mob_list_members: List all members of a mob\n\
@@ -495,6 +418,21 @@ impl AgentMobToolSurface {
                 )
             }
             crate::MobMcpDestroyError::Mob(error) => Self::map_mob_error(call, error),
+        }
+    }
+
+    fn map_bounded_member_run_error(
+        call: ToolCallView<'_>,
+        error: meerkat_mob::BoundedMemberRunError,
+    ) -> ToolError {
+        match error {
+            meerkat_mob::BoundedMemberRunError::Admission(error) => {
+                Self::map_mob_error(call, error)
+            }
+            other => ToolError::execution_failed(format!(
+                "tool '{}' exact bounded child turn failed: {other}",
+                call.name
+            )),
         }
     }
 
@@ -910,141 +848,6 @@ impl AgentMobToolSurface {
         Ok((mob_id, first_delegate))
     }
 
-    async fn wire_delegate_helper_to_creator(
-        &self,
-        mob_id: &MobId,
-        identity: &AgentIdentity,
-    ) -> bool {
-        let Some(name) = self.comms_name.as_ref() else {
-            return false;
-        };
-        let Some(peer_id) = self.comms_peer_id.as_ref() else {
-            return false;
-        };
-        let Some(comms_rt) = self.comms_runtime.as_ref() else {
-            return false;
-        };
-
-        let Ok(handle) = self.bound_handle(mob_id).await else {
-            return false;
-        };
-        let roster = handle.roster().await;
-        let Some(entry) = roster.get_by_identity(identity) else {
-            return false;
-        };
-        let Some(helper_peer_id) = entry.peer_id() else {
-            return false;
-        };
-        let Ok(helper_comms_name) = meerkat_core::MemberCommsName::new(
-            mob_id.as_str(),
-            entry.role.as_str(),
-            identity.as_str(),
-        ) else {
-            return false;
-        };
-        let helper_comms_name = helper_comms_name.to_string();
-        if helper_comms_name == *name {
-            return false;
-        }
-        let peer_description = handle
-            .definition()
-            .resolve_inline_profile(&entry.role)
-            .map(|profile| profile.peer_description.as_str())
-            .unwrap_or("delegate helper");
-        let Some(helper_bridge_session_id) = handle.resolve_bridge_session_id(identity).await
-        else {
-            return false;
-        };
-        let helper_runtime = meerkat_core::service::SessionServiceCommsExt::comms_runtime(
-            self.state.session_service().as_ref(),
-            &helper_bridge_session_id,
-        )
-        .await;
-        let Some(helper_runtime) = helper_runtime else {
-            return false;
-        };
-
-        let Ok(parent_spec) = Self::trusted_descriptor_from_runtime(
-            name.as_str(),
-            *peer_id,
-            format!("inproc://{name}"),
-            comms_rt.as_ref(),
-        ) else {
-            return false;
-        };
-
-        let helper_trusts_parent = self
-            .state
-            .mob_wire(
-                mob_id,
-                identity.clone(),
-                meerkat_mob::PeerTarget::External(parent_spec),
-            )
-            .await;
-        if helper_trusts_parent.is_err() {
-            return false;
-        }
-
-        let Ok(helper_spec) = Self::trusted_descriptor_from_runtime(
-            &helper_comms_name,
-            helper_peer_id,
-            format!("inproc://{helper_comms_name}"),
-            helper_runtime.as_ref(),
-        ) else {
-            return false;
-        };
-        if handle
-            .apply_external_peer_reciprocal_trust(
-                identity,
-                name.as_str(),
-                Arc::clone(comms_rt),
-                helper_spec,
-            )
-            .await
-            .is_err()
-        {
-            return false;
-        }
-
-        // Wired truth is the committed comms-edge/trust authority: by the time we
-        // reach here, both `mob_wire` (helper -> parent) and
-        // `apply_external_peer_reciprocal_trust` (parent -> helper) have committed
-        // (each fails closed with an early `false` above). The `peer_added`
-        // notices below are best-effort delivery courtesy, NOT the source of
-        // wired truth — a dropped notification must not flip a committed edge to
-        // not-wired (row #229).
-        let notify_parent = Self::notify_peer_added(
-            &helper_runtime,
-            name,
-            identity.as_str(),
-            entry.role.as_str(),
-            peer_description,
-        )
-        .await;
-        let (parent_peer, parent_role, parent_description) =
-            Self::synthetic_parent_peer_added_fields(name);
-        let notify_helper = Self::notify_peer_added(
-            comms_rt,
-            &helper_comms_name,
-            &parent_peer,
-            &parent_role,
-            &parent_description,
-        )
-        .await;
-        if !(notify_parent && notify_helper) {
-            tracing::warn!(
-                mob_id = %mob_id,
-                helper = %helper_comms_name,
-                notify_parent,
-                notify_helper,
-                "delegate helper trust edges committed but peer_added notification(s) failed; \
-                 reporting wired=true from committed edge authority"
-            );
-        }
-
-        true
-    }
-
     async fn dispatch_delegate(
         &self,
         call: ToolCallView<'_>,
@@ -1108,27 +911,6 @@ impl AgentMobToolSurface {
             );
         }
 
-        // Build spawn spec.
-        // #115 twin: the tool surface must not mint mob-member identity. A
-        // missing `member_id` fails closed with typed invalid-arguments rather
-        // than fabricating a synthetic `helper-{uuid}` on the runtime identity
-        // path — identity allocation is the mob substrate's responsibility.
-        // Implicit mob always uses the "delegate" profile.
-        let mut spec = SpawnMemberSpec::new(ProfileName::from("delegate"), identity.clone());
-        // Provision first, then admit the task through the exact bounded-turn
-        // carrier. An autonomous initial message has no per-admission result
-        // handle and therefore cannot implement delegate's result contract.
-        spec.initial_message = None;
-        spec.objective_id = objective_id;
-        spec.runtime_mode = Some(MobRuntimeMode::TurnDriven);
-        // Don't use auto_wire_parent — it requires an orchestrator member in the roster.
-        // We wire explicitly below using PeerTarget::External.
-        spec.auto_wire_parent = false;
-        if let Some(instructions) = args.additional_instructions {
-            spec.additional_instructions = Some(vec![instructions]);
-        }
-        spec.placement = lower_wire_placement(args.placement);
-
         // Resolve spawn tooling: default to InheritParent for delegates
         let tooling = args
             .tooling
@@ -1137,76 +919,80 @@ impl AgentMobToolSurface {
                 deny_overlay: None,
             });
         let resolved = self.resolve_spawn_tooling(&tooling).await?;
-        spec.inherited_tool_filter = resolved.inherited_tool_filter;
-        spec.override_profile = resolved.override_profile;
 
         // Transitive containment: the delegate surface carries no explicit
         // policy, so the helper inherits the parent's resolved policy from
         // the factory authority or the legacy metadata seam.
-        spec.tool_access_policy = self
-            .resolve_child_tool_access_policy_boxed(call.name, spec.tool_access_policy.take())
+        let tool_access_policy = self
+            .resolve_child_tool_access_policy_boxed(call.name, None)
             .await?;
-
-        // Spawn via MobMcpState
-        let spawn_result = self
-            .state
-            .mob_spawn_spec(&mob_id, spec)
-            .await
-            .map_err(|e| Self::map_mob_error(call, e))?;
-
-        // Bidirectional comms wiring:
-        // 1. Wire helper → parent: helper trusts parent as external peer
-        // 2. Wire parent → helper: parent trusts helper so it can receive messages
-        let wired = self
-            .wire_delegate_helper_to_creator(&mob_id, &identity)
-            .await;
 
         let handle = self
             .bound_handle(&mob_id)
             .await
             .map_err(|error| Self::map_mob_error(call, error))?;
-        let mut work = WorkSpec::new(args.task, WorkOrigin::Internal);
-        if let Some(objective_id) = objective_id {
-            work = work.with_objective_id(objective_id);
-        }
-        let turn_handle = match handle
-            .start_work_for_identity_bounded(
-                identity.clone(),
-                work,
-                meerkat_core::types::HandlingMode::Queue,
-                result_spec.clone(),
-            )
+        let parent = match (
+            self.comms_name.as_ref(),
+            self.comms_peer_id,
+            self.comms_runtime.as_ref(),
+        ) {
+            (Some(name), Some(peer_id), Some(runtime)) => Some(DelegationParentContext::new(
+                name.clone(),
+                peer_id,
+                Arc::clone(runtime),
+            )),
+            _ => None,
+        };
+        let mut request = DelegationExecutionRequest::new(identity.clone(), args.task, result_spec);
+        let mut member = DelegationMemberOptions::default();
+        member.placement = lower_wire_placement(args.placement);
+        member.additional_instructions = args.additional_instructions.map(|value| vec![value]);
+        member.inherited_tool_filter = resolved.inherited_tool_filter;
+        member.override_profile = resolved.override_profile;
+        member.tool_access_policy = tool_access_policy;
+        member.objective_id = objective_id.clone();
+        request.member = member;
+        request.parent = parent;
+
+        let execution = match DelegationExecutionService::new(handle.clone())
+            .execute(request)
             .await
         {
-            Ok(turn) => turn,
-            Err(error) => {
-                let retirement_error = handle.retire(identity.clone()).await.err();
+            Ok(execution) => execution,
+            Err(DelegationExecutionError::Spawn(error)) => {
+                return Err(Self::map_mob_error(call, error));
+            }
+            Err(DelegationExecutionError::WorkAdmission {
+                error,
+                retirement_error,
+            }) => {
                 return Err(ToolError::execution_failed(format!(
                     "tool '{}' failed to admit delegated helper turn: {error}; retirement_error={retirement_error:?}",
                     call.name
                 )));
             }
-        };
-        let turn = match turn_handle.wait_bounded(result_spec).await {
-            Ok(turn) => turn,
-            Err(error) => {
-                let retirement_error = handle.retire(identity.clone()).await.err();
+            Err(DelegationExecutionError::Turn {
+                error,
+                retirement_error,
+            }) => {
                 return Err(ToolError::execution_failed(format!(
                     "tool '{}' delegated turn failed: {error}; retirement_error={retirement_error:?}",
                     call.name
                 )));
             }
+            Err(error) => {
+                return Err(ToolError::execution_failed(format!(
+                    "tool '{}' delegated helper failed: {error}",
+                    call.name
+                )));
+            }
         };
-        let retirement_error = handle
-            .retire(identity.clone())
-            .await
-            .err()
-            .map(|error| error.to_string());
+        let turn = execution.turn();
 
-        let mut result = Self::spawn_result_payload(&mob_id, &spawn_result);
+        let mut result = Self::spawn_result_payload(&mob_id, execution.spawn());
         result["mob_id"] = json!(mob_id);
         result["agent_identity"] = json!(identity);
-        result["wired"] = json!(wired);
+        result["wired"] = json!(execution.wired());
         result["output"] = json!(turn.result().result().text());
         result["tokens_used"] = json!(turn.result().usage().total_tokens());
         result["bounded_result"] = json!(turn.result().result());
@@ -1214,7 +1000,7 @@ impl AgentMobToolSurface {
         result["usage"] = json!(turn.result().usage());
         result["turns"] = json!(turn.result().turns());
         result["tool_calls"] = json!(turn.result().tool_calls());
-        result["retirement_error"] = json!(retirement_error);
+        result["retirement_error"] = json!(execution.retirement_error());
 
         if first_delegate {
             let notice = "Implicit delegation mob created. The exact helper result was captured \
@@ -1377,6 +1163,103 @@ impl AgentMobToolSurface {
         self.record_successful_operator_action_boxed(&audit_handle, call.name)
             .await;
         Self::encode_result(call, Self::spawn_result_payload(&mob_id, &spawn_result))
+    }
+
+    async fn dispatch_fork_off(
+        &self,
+        call: ToolCallView<'_>,
+        objective_id: Option<meerkat_core::interaction::ObjectiveId>,
+    ) -> Result<meerkat_core::ToolDispatchOutcome, ToolError> {
+        let args: ForkOffArgs = call
+            .parse_args()
+            .map_err(|error| ToolError::invalid_arguments(call.name, error.to_string()))?;
+        let (mob_id, source_identity) = self
+            .state
+            .member_for_bridge_session(&self.owner_bridge_session_id)
+            .await
+            .map_err(|error| Self::map_mob_error(call, error))?
+            .ok_or_else(|| {
+                ToolError::execution_failed(
+                    "fork_off requires the current session to be a durable mob member",
+                )
+            })?;
+        let audit_handle = self
+            .bound_handle(&mob_id)
+            .await
+            .map_err(|error| Self::map_mob_error(call, error))?;
+        let source_entry = audit_handle
+            .roster()
+            .await
+            .get_by_identity(&source_identity)
+            .cloned()
+            .ok_or_else(|| {
+                ToolError::execution_failed(
+                    "fork_off resolved the current session binding but its durable roster member is absent",
+                )
+            })?;
+        let authority = self.authority_context_snapshot();
+        let observations = meerkat_mob::SpawnMemberAdmissionObservations {
+            manage_scope_present: authority.can_manage_mob(mob_id.as_str()),
+            profile_scope_contains: authority
+                .spawn_profile_scope_contains(mob_id.as_str(), source_entry.role.as_str()),
+            ..meerkat_mob::SpawnMemberAdmissionObservations::default()
+        };
+        let admission = audit_handle
+            .resolve_spawn_member_admission(observations)
+            .await
+            .map_err(|error| Self::map_mob_error(call, error))?;
+        if matches!(admission, meerkat_mob::SpawnMemberAdmission::Denied) {
+            return Err(ToolError::access_denied(call.name));
+        }
+
+        let child_input = fork_off_child_input(&args.task, args.expected_output.as_deref());
+        let mut member = SpawnMemberSpec::new(source_entry.role, args.member_id);
+        member.initial_message = Some(ContentInput::Text(child_input));
+        member.override_profile = source_entry.effective_profile_override;
+        member.model_override = source_entry.effective_model_override;
+        member.objective_id = objective_id;
+        member.tool_access_policy = self
+            .resolve_child_tool_access_policy_boxed(call.name, member.tool_access_policy.take())
+            .await?;
+        let handle = audit_handle.clone();
+        let operation_source = source_identity.clone();
+        let outcome = meerkat_runtime::stack_relief::relieve_caller_stack(move || async move {
+            handle
+                .fork_member_then_run_bounded(
+                    &operation_source,
+                    member,
+                    args.message_count,
+                    args.result_label,
+                    args.max_text_bytes,
+                )
+                .await
+        })
+        .await
+        .map_err(|error| Self::map_bounded_member_run_error(call, error))?;
+        self.record_successful_operator_action_boxed(&audit_handle, call.name)
+            .await;
+        let identity = outcome.fork.agent_identity.to_string();
+        let bounded_result = outcome.turn.result().result().to_wire();
+        let result = ForkOffResult {
+            mob_id: mob_id.to_string(),
+            source_member_id: source_identity.to_string(),
+            agent_identity: identity.clone(),
+            member_ref: meerkat_contracts::WireMemberRef::encode(mob_id.as_str(), &identity),
+            fork_session_id: outcome.fork.session_id.to_string(),
+            turn_session_id: outcome.turn.result().session_id().to_string(),
+            cache_inheritance: outcome.fork.cache_inheritance,
+            bounded_result,
+            usage: outcome.turn.result().usage().clone(),
+            turns: outcome.turn.result().turns(),
+            tool_calls: outcome.turn.result().tool_calls(),
+        };
+        let value = serde_json::to_value(result).map_err(|error| {
+            ToolError::execution_failed(format!(
+                "tool '{}' failed to encode durable fork result: {error}",
+                call.name
+            ))
+        })?;
+        Self::encode_result(call, value)
     }
 
     #[inline(never)]
@@ -1804,6 +1687,11 @@ impl AgentMobToolSurface {
         dispatch_mob_spawn_member,
         objective_id: Option<meerkat_core::interaction::ObjectiveId>
     );
+    boxed_agent_dispatch!(
+        dispatch_fork_off_boxed,
+        dispatch_fork_off,
+        objective_id: Option<meerkat_core::interaction::ObjectiveId>
+    );
     boxed_agent_dispatch!(dispatch_mob_retire_member_boxed, dispatch_mob_retire_member);
     boxed_agent_dispatch!(dispatch_mob_check_member_boxed, dispatch_mob_check_member);
     boxed_agent_dispatch!(dispatch_mob_list_members_boxed, dispatch_mob_list_members);
@@ -1858,6 +1746,7 @@ impl AgentMobToolSurface {
                 self.dispatch_mob_spawn_member_boxed(call, objective_id)
                     .await
             }
+            TOOL_FORK_OFF => self.dispatch_fork_off_boxed(call, objective_id).await,
             TOOL_MOB_RETIRE_MEMBER => self.dispatch_mob_retire_member_boxed(call).await,
             TOOL_MOB_CHECK_MEMBER => self.dispatch_mob_check_member_boxed(call).await,
             TOOL_MOB_LIST_MEMBERS => self.dispatch_mob_list_members_boxed(call).await,
@@ -2189,6 +2078,13 @@ fn build_tool_defs_with_profile_support(
             typed_schema::<SpawnMemberArgs>(),
         ),
         tool_def(
+            TOOL_FORK_OFF,
+            "Delegate one task through a real durable transcript fork.\n\n\
+             Unlike delegate, the child starts from an exact committed prefix of an existing mob member's transcript. Unlike prompt-context fork_helper, this persists a real child session and provisions it through the ordinary resume path. The tool visibly commits the task and expected-output guidance as the child input, captures ordinary final assistant text under the caller's byte bound, and retains the child in the normal mob roster.\n\n\
+             The parent remains responsible for replying to the user. The child does not autonomously deliver across sessions. The returned bounded result is ordinary final text with explicit status and truncation, not a validated summary or report.",
+            typed_schema::<ForkOffArgs>(),
+        ),
+        tool_def(
             TOOL_MOB_RETIRE_MEMBER,
             "Retire a mob member and archive its session.\n\n\
              Retirement is graceful: the member's session is archived (preserving its history) \
@@ -2401,6 +2297,62 @@ struct DelegateArgs {
     #[serde(default)]
     #[schemars(with = "serde_json::Value")]
     tooling: Option<meerkat_mob::SpawnTooling>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ForkOffArgs {
+    /// Stable identity for the child fork. The surface never allocates one.
+    member_id: String,
+    /// Caller-authored work to perform on the durable fork.
+    task: String,
+    /// Optional visible guidance for how the child should present its final
+    /// answer. This is prompt text, not a validated output schema.
+    #[serde(default)]
+    expected_output: Option<String>,
+    /// Optional committed transcript prefix length. Omit to fork the source's
+    /// exact current committed end.
+    #[serde(default)]
+    message_count: Option<usize>,
+    /// Label attached to the exact bounded final assistant text.
+    #[serde(default = "fork_off_default_result_label")]
+    result_label: String,
+    /// Maximum UTF-8 bytes returned, including any truncation marker.
+    #[serde(default = "fork_off_default_max_text_bytes")]
+    max_text_bytes: usize,
+}
+
+#[derive(Serialize)]
+struct ForkOffResult {
+    /// Authoritative mob resolved from the current durable session binding.
+    mob_id: String,
+    /// Authoritative source member resolved from the current session binding.
+    source_member_id: String,
+    agent_identity: String,
+    member_ref: meerkat_contracts::WireMemberRef,
+    fork_session_id: String,
+    turn_session_id: String,
+    cache_inheritance: meerkat_core::ForkCacheInheritance,
+    bounded_result: meerkat_contracts::MobBoundedHelperResult,
+    usage: meerkat_core::Usage,
+    turns: u32,
+    tool_calls: u32,
+}
+
+fn fork_off_default_result_label() -> String {
+    "fork_off_result".to_string()
+}
+
+const fn fork_off_default_max_text_bytes() -> usize {
+    16 * 1024
+}
+
+fn fork_off_child_input(task: &str, expected_output: Option<&str>) -> String {
+    let expected_output = expected_output.unwrap_or(
+        "Report the work performed and the final result clearly in your final assistant text.",
+    );
+    format!(
+        "DELEGATED DURABLE FORK\n\nTask:\n{task}\n\nExpected output guidance:\n{expected_output}\n\nInstructions:\n- This is a delegated durable transcript fork.\n- Perform the task, then report the work performed and the final result in your final assistant text.\n- The parent remains responsible for replying to the user.\n- Do not attempt autonomous cross-session delivery."
+    )
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -2720,6 +2672,7 @@ mod tests {
                 "mob_create",
                 "mob_destroy",
                 "mob_spawn_member",
+                "fork_off",
                 "mob_retire_member",
                 "mob_check_member",
                 "mob_list_members",
@@ -2745,6 +2698,7 @@ mod tests {
                 "mob_create",
                 "mob_destroy",
                 "mob_spawn_member",
+                "fork_off",
                 "mob_retire_member",
                 "mob_check_member",
                 "mob_list_members",
@@ -2778,6 +2732,58 @@ mod tests {
                 "{forbidden} must never appear in the agent-facing roster"
             );
         }
+    }
+
+    #[test]
+    fn fork_off_commits_caller_task_and_guidance_visibly() {
+        let input = fork_off_child_input("Inspect the ledger", Some("Return a concise finding"));
+
+        assert!(input.contains("DELEGATED DURABLE FORK"));
+        assert!(input.contains("Task:\nInspect the ledger"));
+        assert!(input.contains("Expected output guidance:\nReturn a concise finding"));
+        assert!(input.contains("parent remains responsible for replying to the user"));
+        assert!(input.contains("Do not attempt autonomous cross-session delivery"));
+    }
+
+    #[test]
+    fn fork_off_schema_keeps_source_authority_out_of_llm_arguments() {
+        let definitions = build_tool_defs();
+        let definition = definitions
+            .iter()
+            .find(|definition| definition.name == "fork_off")
+            .expect("fork_off tool definition");
+        let required = definition.input_schema["required"]
+            .as_array()
+            .expect("fork_off required fields");
+        for field in ["member_id", "task"] {
+            assert!(
+                required.iter().any(|entry| entry == field),
+                "fork_off schema must require {field}"
+            );
+        }
+        let properties = definition.input_schema["properties"]
+            .as_object()
+            .expect("fork_off properties");
+        for forbidden in ["mob_id", "source_member_id", "profile"] {
+            assert!(
+                !properties.contains_key(forbidden),
+                "fork_off must infer {forbidden} from the current durable session binding"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_off_common_case_uses_bounded_result_defaults() {
+        let args: ForkOffArgs = serde_json::from_value(serde_json::json!({
+            "member_id": "analysis-fork",
+            "task": "Inspect the ledger"
+        }))
+        .expect("minimal fork_off args");
+
+        assert_eq!(args.result_label, "fork_off_result");
+        assert_eq!(args.max_text_bytes, 16 * 1024);
+        assert_eq!(args.message_count, None);
+        assert_eq!(args.expected_output, None);
     }
 
     #[test]
@@ -4023,9 +4029,10 @@ mod tests {
     #[test]
     fn test_all_tool_definitions_present() {
         let defs = build_tool_defs();
-        assert_eq!(defs.len(), 11);
+        assert_eq!(defs.len(), 12);
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"delegate"));
+        assert!(names.contains(&"fork_off"));
         assert!(names.contains(&"conclude_objective"));
         assert!(names.contains(&"mob_create"));
         assert!(names.contains(&"mob_destroy"));
@@ -4693,9 +4700,15 @@ mod tests {
             None,
         );
 
-        let delegate_args =
-            serde_json::value::RawValue::from_string(json!({ "task": "say hi" }).to_string())
-                .unwrap();
+        let delegate_args = serde_json::value::RawValue::from_string(
+            json!({
+                "task": "say hi",
+                "result_label": "delegate_result",
+                "max_text_bytes": 4096
+            })
+            .to_string(),
+        )
+        .unwrap();
         let delegate_error = surface
             .dispatch(ToolCallView {
                 id: "delegate-missing-member",
@@ -4704,10 +4717,11 @@ mod tests {
             })
             .await
             .expect_err("delegate without member_id must fail before mob creation");
-        assert!(
-            matches!(delegate_error, ToolError::InvalidArguments { .. }),
-            "unexpected delegate error: {delegate_error:?}"
-        );
+        assert!(matches!(
+            delegate_error,
+            ToolError::InvalidArguments { reason, .. }
+                if reason == "delegate requires member_id; the tool surface does not allocate member identity"
+        ));
 
         assert!(
             state
@@ -4715,6 +4729,51 @@ mod tests {
                 .await
                 .is_none(),
             "invalid delegate args must not create an implicit mob"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delegate_invalid_result_bound_does_not_create_implicit_mob() {
+        let state = MobMcpState::new_in_memory();
+        let session_id = SessionId::new();
+        let session_key = session_id.to_string();
+        let surface = AgentMobToolSurface::new(
+            Arc::clone(&state),
+            None,
+            create_only_authority(),
+            "claude-sonnet-4-5".to_string(),
+            session_id,
+            None,
+            None,
+            None,
+        );
+        let delegate_args = serde_json::value::RawValue::from_string(
+            json!({
+                "member_id": "must-not-spawn",
+                "task": "say hi",
+                "result_label": "",
+                "max_text_bytes": 4096
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let error = surface
+            .dispatch(ToolCallView {
+                id: "delegate-invalid-bound",
+                name: "delegate",
+                args: &delegate_args,
+            })
+            .await
+            .expect_err("invalid result bounds must fail before mob creation");
+
+        assert!(matches!(error, ToolError::InvalidArguments { .. }));
+        assert!(
+            state
+                .find_implicit_mob_for_bridge_session(&session_key)
+                .await
+                .is_none(),
+            "invalid result bounds must have zero implicit-mob effects"
         );
     }
 
@@ -5189,39 +5248,45 @@ mod tests {
             "regression fixture must derive peer id from typed public-key bytes"
         );
         let session_id = SessionId::new();
-        let surface = AgentMobToolSurface::new(
+        let probe_surface = AgentMobToolSurface::new(
             Arc::clone(&state),
             None,
             create_only_authority(),
             "claude-sonnet-4-5".to_string(),
-            session_id.clone(),
-            Some(parent_name.clone()),
-            Some(parent_peer_id),
-            Some(parent_comms.clone() as Arc<dyn CoreCommsRuntime>),
+            session_id,
+            None,
+            None,
+            None,
         );
-
-        let (mob_id, _created) = surface
+        let (mob_id, _created) = probe_surface
             .ensure_implicit_mob()
             .await
             .expect("create implicit mob");
         let helper_id = AgentIdentity::from("helper-1");
-        let mut spec = SpawnMemberSpec::new(ProfileName::from("delegate"), helper_id.clone());
-        spec.runtime_mode = Some(MobRuntimeMode::TurnDriven);
-        let spawn_result = state
-            .mob_spawn_spec(&mob_id, spec)
+        let handle = state.handle_for(&mob_id).await.expect("mob handle");
+        let result_spec =
+            BoundedResultSpec::new("delegate_result", 4096).expect("valid delegate result spec");
+        let mut request =
+            DelegationExecutionRequest::new(helper_id.clone(), "report back", result_spec);
+        request.parent = Some(DelegationParentContext::new(
+            parent_name.clone(),
+            parent_peer_id,
+            parent_comms.clone() as Arc<dyn CoreCommsRuntime>,
+        ));
+        let delegation_service = DelegationExecutionService::new(handle.clone());
+        let execution = delegation_service
+            .start(request)
             .await
-            .expect("spawn helper for delegate wiring test");
-        let wired = surface
-            .wire_delegate_helper_to_creator(&mob_id, &helper_id)
+            .expect("start delegated helper for wiring test")
+            .await_terminal()
             .await;
         assert!(
-            wired,
+            execution.wired(),
             "delegate wiring should succeed when creator comms are present"
         );
 
-        let handle = state.handle_for(&mob_id).await.expect("mob handle");
         let helper_bridge_session_id = handle
-            .resolve_bridge_session_id(&spawn_result.agent_identity)
+            .resolve_bridge_session_id(&execution.spawn().agent_identity)
             .await
             .expect("helper bridge session id");
         let helper_comms = service
@@ -5299,6 +5364,13 @@ mod tests {
                 )
             }),
             "delegate wiring must emit mob.peer_added to the helper"
+        );
+        assert!(
+            delegation_service
+                .retire_terminalized(&execution)
+                .await
+                .is_err(),
+            "this fixture retains explicit cleanup debt after the wiring evidence is inspected"
         );
     }
 

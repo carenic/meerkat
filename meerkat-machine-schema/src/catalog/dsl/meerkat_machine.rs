@@ -25,6 +25,13 @@ pub struct SessionId(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct AgentRuntimeId(pub String);
 
+/// Stable durable Mob member identity bound to one live bridge operation.
+///
+/// This is a DSL bridging type. The owning Mob service supplies its canonical
+/// `AgentIdentity`; provider and surface payloads never construct it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct AgentIdentity(pub String);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct FenceToken(pub u64);
 
@@ -1345,6 +1352,7 @@ pub enum LiveOpenAdmissionRejection {
     AlreadyBound,
     ChannelAlreadyBound,
     LifecycleClosed,
+    RevokedChannelId,
 }
 
 /// Typed public result class for `live/refresh` after the adapter command
@@ -1374,6 +1382,7 @@ pub enum LiveCommandPublicKind {
     CommitInput,
     Interrupt,
     TruncateAssistantOutput,
+    CompleteAssistantPlayback,
 }
 
 /// Closed classifier for live command rejection observations. The live host
@@ -1556,6 +1565,222 @@ pub enum RealtimeTranscriptLaneKind {
     #[default]
     Display,
     Spoken,
+}
+
+/// Provider-neutral reconciliation between the early handoff text used to
+/// start delegated work and the authoritative finalized user transcript.
+/// Only `Confirmed` may unlock consequential effects or result release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveDelegationReconciliation {
+    #[default]
+    Provisional,
+    Confirmed,
+    MaterialConflict,
+    Missing,
+}
+
+/// Mechanical outcome of one ordered context append. Ambiguous delivery is
+/// terminal for that append identity: the machine records a no-retry fence
+/// instead of allowing the provider adapter to guess whether it landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveContextAppendObservation {
+    #[default]
+    Delivered,
+    Rejected,
+    Ambiguous,
+}
+
+/// Generated projection of SessionDocument's total committed-row
+/// classification. Mirror rows require a provider send; the other two kinds
+/// advance canonical coverage without echoing content into the live model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveContextRowDisposition {
+    #[default]
+    MirrorParentText,
+    AlreadyPresentInLiveChannel,
+    ExcludedFromLiveContext,
+}
+
+/// Where an admitted delegation result may be delivered. The live model is
+/// the sole foreground author; a result that misses its provider turn can
+/// only become deferred context for a future turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveDelegationResultDisposition {
+    #[default]
+    OpenTurn,
+    DeferredContext,
+}
+
+/// Provider observation for one exact delegation-result context delivery.
+/// This lifecycle is intentionally separate from canonical session context:
+/// no SessionDocument row or canonical cursor is created for a worker result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveDelegationResultDeliveryObservation {
+    #[default]
+    Delivered,
+    Rejected,
+    Ambiguous,
+}
+
+/// Whether a delivered executor result may open an assistant response slot.
+/// Provider delivery and durable executor completion remain true even when a
+/// newer user turn suppresses speech for the older interaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveDelegationResultSpeechDisposition {
+    #[default]
+    Eligible,
+    SuppressedByNewerUserTurn,
+    NotDelivered,
+}
+
+/// Generated lifecycle of the exact Mob worker bound to one live operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveDelegationWorkerPhase {
+    #[default]
+    StartAuthorized,
+    Running,
+    CancelAuthorized,
+    Terminal,
+    RetirementAuthorized,
+    Retired,
+    Failed,
+}
+
+/// Machine-derived reason for cancelling one exact live delegation worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveDelegationCancellationReason {
+    #[default]
+    Abandoned,
+    Superseded,
+    TranscriptConflict,
+    TranscriptMissing,
+}
+
+/// Mechanical observation returned by the Mob cancellation realization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveDelegationCancellationOutcome {
+    #[default]
+    Cancelled,
+    AlreadyTerminal,
+    Failed,
+}
+
+/// Exact worker terminal observed from Mob bounded-turn authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveDelegationWorkerTerminalKind {
+    #[default]
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+/// Generated phase of one channel's provider-affecting authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveExecutionChannelPhase {
+    #[default]
+    Pending,
+    Active,
+    Revoked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveExecutionMode {
+    #[default]
+    FunctionBridge,
+    ClientContext,
+}
+
+/// Generated lifecycle of one Responses bridge operation on the already-bound
+/// durable member. No variant represents a helper worker lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveBridgeOperationPhase {
+    #[default]
+    PreFinalInference,
+    FinalInputAuthorized,
+    ExecutionRunning,
+    CancellationAuthorized,
+    ExecutionTerminal,
+}
+
+/// Closed effect classes governed by the live bridge authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveBridgeEffectKind {
+    #[default]
+    ModelComputation,
+    ReadOnlyMemorySnapshot,
+    ToolDispatch,
+    DurableMemoryMutation,
+    Comms,
+    HelperSpawn,
+    ExternalIo,
+}
+
+/// Terminal physical outcome of one consumed bridge effect authority.
+/// Unknown is terminal because dispatch started but commit cannot be proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveBridgeEffectOutcome {
+    #[default]
+    Committed,
+    Failed,
+    Unknown,
+}
+
+/// Independent Meerkat execution terminal for one durable-member bridge
+/// operation. Provider output settlement never rewrites this fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum MeerkatExecutionTerminal {
+    #[default]
+    Completed,
+    Rejected,
+    Failed,
+    TimedOut,
+    Unrecoverable,
+    Cancelled,
+    Superseded,
+}
+
+/// Why generated authority cancelled one exact bridge operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveBridgeCancellationReason {
+    #[default]
+    BargeIn,
+    ChannelClose,
+    Restart,
+    ProtocolDrift,
+}
+
+/// Projection class sent to the server-owned Responses call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveBridgeOutputKind {
+    #[default]
+    Success,
+    FailureProjection,
+}
+
+/// Generated provider settlement state. `SubmissionAttemptClaimed` consumes
+/// the one-use send authority before transport IO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveBridgeSubmissionState {
+    #[default]
+    SubmissionAuthorized,
+    SubmissionAttemptClaimed,
+    LocalWriteCompletedAwaitingProof,
+    ProviderProcessed,
+    ProviderRejected,
+    SubmissionAmbiguous,
+    CallExpired,
+    CallAbandonedByClose,
+}
+
+/// Correlated provider observation resolving an exact output submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum LiveBridgeSubmissionObservation {
+    #[default]
+    ProviderProcessed,
+    ProviderRejected,
+    SubmissionAmbiguous,
+    CallExpired,
+    CallAbandonedByClose,
 }
 
 /// Typed mirror of the public runtime lifecycle projection. The shell passes
@@ -3097,6 +3322,140 @@ macro_rules! meerkat_catalog_machine_dsl {
             live_active_channel_by_session: Map<String, String>,
             live_channel_session_by_channel: Map<String, String>,
             live_channel_identity_by_channel: Map<String, SessionLlmIdentity>,
+            // Channel-scoped execution authority. These facts bind semantic
+            // callbacks to the exact runtime incarnation that admitted the
+            // live channel. Provider transport ids never enter this state.
+            live_execution_runtime_id_by_channel: Map<String, AgentRuntimeId>,
+            live_execution_fence_by_channel: Map<String, FenceToken>,
+            live_execution_generation_by_channel: Map<String, Generation>,
+            live_execution_phase_by_channel: Map<String, Enum<LiveExecutionChannelPhase>>,
+            live_revoked_execution_channels: Set<String>,
+            live_execution_profile_by_channel: Map<String, String>,
+            live_execution_mode_by_channel: Map<String, Enum<LiveExecutionMode>>,
+            live_function_bridge_capable_channels: Set<String>,
+            live_client_context_capable_channels: Set<String>,
+            live_playback_owner_by_channel: Map<String, String>,
+            live_playback_readiness_by_channel: Map<String, String>,
+            live_activation_receipt_by_channel: Map<String, String>,
+            live_active_control_operation_by_authority: Map<String, String>,
+            live_consumed_active_control_authorities: Set<String>,
+            live_experimental_staged_runtime_by_channel: Map<String, AgentRuntimeId>,
+            live_experimental_staged_fence_by_channel: Map<String, FenceToken>,
+            live_experimental_staged_generation_by_channel: Map<String, Generation>,
+            live_experimental_staged_seed_cursor_by_channel: Map<String, u64>,
+            live_experimental_pending_receipt_by_channel: Map<String, String>,
+            live_experimental_execution_channels: Set<String>,
+            live_interaction_channel_by_id: Map<String, String>,
+            live_active_interaction_by_channel: Map<String, String>,
+            live_provider_turn_by_channel: Map<String, String>,
+            live_provider_interaction_by_turn: Map<String, String>,
+            live_provider_turn_channel_by_ref: Map<String, String>,
+            live_awaiting_assistant_interaction_by_channel: Map<String, String>,
+            live_assistant_interaction_by_turn: Map<String, String>,
+            live_assistant_turn_channel_by_ref: Map<String, String>,
+            live_abandoned_interactions: Set<String>,
+
+            // Exactly one serialized delegation may be pending per channel.
+            // Provider turn correlation is deliberately opaque and is used
+            // only for exact equality joins.
+            live_delegation_interaction_by_channel: Map<String, String>,
+            live_delegation_operation_by_channel: Map<String, OperationId>,
+            live_delegation_provider_turn_by_channel: Map<String, String>,
+            live_delegation_interaction_by_operation: Map<OperationId, String>,
+            live_delegation_provider_turn_by_operation: Map<OperationId, String>,
+            live_delegation_reconciliation_by_operation: Map<OperationId, Enum<LiveDelegationReconciliation>>,
+            live_delegation_worker_identity_by_operation: Map<OperationId, String>,
+            live_delegation_worker_phase_by_operation: Map<OperationId, Enum<LiveDelegationWorkerPhase>>,
+            live_delegation_cancellation_reason_by_operation: Map<OperationId, Enum<LiveDelegationCancellationReason>>,
+            live_delegation_worker_terminal_by_operation: Map<OperationId, Enum<LiveDelegationWorkerTerminalKind>>,
+            live_delegation_result_eligible_operations: Set<OperationId>,
+            live_delegation_late_terminal_operations: Set<OperationId>,
+            live_consequential_effect_operation_by_authority: Map<String, OperationId>,
+            live_result_released_operations: Set<OperationId>,
+            live_result_release_disposition_by_operation: Map<OperationId, Enum<LiveDelegationResultDisposition>>,
+            live_result_delivery_channel_by_operation: Map<OperationId, String>,
+            live_result_delivery_operation_by_channel: Map<String, OperationId>,
+            live_result_delivery_digest_by_operation: Map<OperationId, String>,
+            live_result_delivery_observation_by_operation: Map<OperationId, Enum<LiveDelegationResultDeliveryObservation>>,
+            live_result_speech_suppressed_operations: Set<OperationId>,
+            live_result_recovery_replacement_by_channel: Map<String, String>,
+            live_result_recovery_source_by_replacement: Map<String, String>,
+            live_result_recovery_session_by_channel: Map<String, String>,
+            live_result_recovery_operation_by_channel: Map<String, OperationId>,
+            live_result_recovery_digest_by_channel: Map<String, String>,
+            live_result_recovery_seed_cursor_by_channel: Map<String, u64>,
+            live_result_recovery_identity_by_channel: Map<String, SessionLlmIdentity>,
+            live_result_recovery_runtime_id_by_channel: Map<String, AgentRuntimeId>,
+            live_result_recovery_fence_by_channel: Map<String, FenceToken>,
+            live_result_recovery_generation_by_channel: Map<String, Generation>,
+
+            // Responses bridge authority. Provider correlation is retained as
+            // opaque adapter keys. Durable member identity and canonical
+            // context revision are direct operation facts; no helper worker is
+            // substituted as the target.
+            live_bridge_operation_by_channel: Map<String, OperationId>,
+            live_bridge_channel_by_operation: Map<OperationId, String>,
+            live_bridge_interaction_by_operation: Map<OperationId, String>,
+            live_bridge_provider_turn_by_operation: Map<OperationId, String>,
+            live_bridge_provider_delegation_by_operation: Map<OperationId, String>,
+            live_bridge_provider_call_by_operation: Map<OperationId, String>,
+            live_bridge_agent_identity_by_operation: Map<OperationId, AgentIdentity>,
+            live_bridge_context_revision_by_operation: Map<OperationId, String>,
+            live_bridge_request_digest_by_operation: Map<OperationId, String>,
+            live_bridge_phase_by_operation: Map<OperationId, Enum<LiveBridgeOperationPhase>>,
+            live_bridge_effect_operation_by_authority: Map<String, OperationId>,
+            live_bridge_effect_kind_by_authority: Map<String, Enum<LiveBridgeEffectKind>>,
+            live_bridge_consumed_effect_authorities: Set<String>,
+            live_bridge_in_flight_effect_authorities: Set<String>,
+            live_bridge_effect_outcome_by_authority: Map<String, Enum<LiveBridgeEffectOutcome>>,
+            live_bridge_model_computation_authorized_operations: Set<OperationId>,
+            live_bridge_read_snapshot_authorized_operations: Set<OperationId>,
+            // Monotonic operation-scoped proof that durable executor work
+            // crossed the generated start boundary. The source outcome
+            // receipt is required before any started operation can retire.
+            live_bridge_execution_started_operations: Set<OperationId>,
+            live_bridge_outcome_receipt_required_operations: Set<OperationId>,
+            live_bridge_outcome_receipt_operations: Set<OperationId>,
+            live_bridge_execution_terminal_by_operation: Map<OperationId, Enum<MeerkatExecutionTerminal>>,
+            live_bridge_execution_result_digest_by_operation: Map<OperationId, String>,
+            live_bridge_cancellation_reason_by_operation: Map<OperationId, Enum<LiveBridgeCancellationReason>>,
+            live_bridge_submission_output_kind_by_operation: Map<OperationId, Enum<LiveBridgeOutputKind>>,
+            live_bridge_submission_digest_by_operation: Map<OperationId, String>,
+            live_bridge_submission_state_by_operation: Map<OperationId, Enum<LiveBridgeSubmissionState>>,
+
+            // Ordered context mirror progress. An append with ambiguous
+            // delivery is fenced forever by its locally minted append id and
+            // is never retried blindly.
+            live_context_cursor_by_channel: Map<String, u64>,
+            // Canonical committed rows enter this generated outbox even when
+            // a provider turn is active. They are session-scoped rather than
+            // channel-scoped so an ambiguity recovery can continue draining
+            // the same durable obligations on the fresh channel.
+            live_context_queued_session_by_append: Map<String, String>,
+            live_context_queued_cursor_by_append: Map<String, u64>,
+            live_context_queued_digest_by_append: Map<String, String>,
+            live_context_queued_commit_token_by_append: Map<String, String>,
+            live_context_queued_disposition_by_append: Map<String, Enum<LiveContextRowDisposition>>,
+            live_context_queued_append_by_cursor: Map<u64, String>,
+            live_context_pending_append_by_channel: Map<String, String>,
+            live_context_pending_channel_by_append: Map<String, String>,
+            live_context_pending_previous_cursor_by_append: Map<String, u64>,
+            live_context_pending_next_cursor_by_append: Map<String, u64>,
+            live_context_delivered_append_ids: Set<String>,
+            live_context_ambiguous_no_retry: Set<String>,
+            // Ambiguous delivery creates an exact recovery obligation. The
+            // old transport must close, the replacement must pass ordinary
+            // live-open admission, and only the dedicated recovery bind may
+            // initialize it at the canonical seed cursor.
+            live_context_recovery_replacement_by_channel: Map<String, String>,
+            live_context_recovery_source_by_replacement: Map<String, String>,
+            live_context_recovery_session_by_channel: Map<String, String>,
+            live_context_recovery_append_by_channel: Map<String, String>,
+            live_context_recovery_seed_cursor_by_channel: Map<String, u64>,
+            live_context_recovery_identity_by_channel: Map<String, SessionLlmIdentity>,
+            live_context_recovery_runtime_id_by_channel: Map<String, AgentRuntimeId>,
+            live_context_recovery_fence_by_channel: Map<String, FenceToken>,
+            live_context_recovery_generation_by_channel: Map<String, Generation>,
 
             // `live/refresh` observes adapter command-queue acceptance in the
             // shell, then submits that observation here. The generated effect
@@ -3541,6 +3900,113 @@ macro_rules! meerkat_catalog_machine_dsl {
             live_active_channel_by_session = EmptyMap,
             live_channel_session_by_channel = EmptyMap,
             live_channel_identity_by_channel = EmptyMap,
+            live_execution_runtime_id_by_channel = EmptyMap,
+            live_execution_fence_by_channel = EmptyMap,
+            live_execution_generation_by_channel = EmptyMap,
+            live_execution_phase_by_channel = EmptyMap,
+            live_revoked_execution_channels = EmptySet,
+            live_execution_profile_by_channel = EmptyMap,
+            live_execution_mode_by_channel = EmptyMap,
+            live_function_bridge_capable_channels = EmptySet,
+            live_client_context_capable_channels = EmptySet,
+            live_playback_owner_by_channel = EmptyMap,
+            live_playback_readiness_by_channel = EmptyMap,
+            live_activation_receipt_by_channel = EmptyMap,
+            live_active_control_operation_by_authority = EmptyMap,
+            live_consumed_active_control_authorities = EmptySet,
+            live_experimental_staged_runtime_by_channel = EmptyMap,
+            live_experimental_staged_fence_by_channel = EmptyMap,
+            live_experimental_staged_generation_by_channel = EmptyMap,
+            live_experimental_staged_seed_cursor_by_channel = EmptyMap,
+            live_experimental_pending_receipt_by_channel = EmptyMap,
+            live_experimental_execution_channels = EmptySet,
+            live_interaction_channel_by_id = EmptyMap,
+            live_active_interaction_by_channel = EmptyMap,
+            live_provider_turn_by_channel = EmptyMap,
+            live_provider_interaction_by_turn = EmptyMap,
+            live_provider_turn_channel_by_ref = EmptyMap,
+            live_awaiting_assistant_interaction_by_channel = EmptyMap,
+            live_assistant_interaction_by_turn = EmptyMap,
+            live_assistant_turn_channel_by_ref = EmptyMap,
+            live_abandoned_interactions = EmptySet,
+            live_delegation_interaction_by_channel = EmptyMap,
+            live_delegation_operation_by_channel = EmptyMap,
+            live_delegation_provider_turn_by_channel = EmptyMap,
+            live_delegation_interaction_by_operation = EmptyMap,
+            live_delegation_provider_turn_by_operation = EmptyMap,
+            live_delegation_reconciliation_by_operation = EmptyMap,
+            live_delegation_worker_identity_by_operation = EmptyMap,
+            live_delegation_worker_phase_by_operation = EmptyMap,
+            live_delegation_cancellation_reason_by_operation = EmptyMap,
+            live_delegation_worker_terminal_by_operation = EmptyMap,
+            live_delegation_result_eligible_operations = EmptySet,
+            live_delegation_late_terminal_operations = EmptySet,
+            live_consequential_effect_operation_by_authority = EmptyMap,
+            live_result_released_operations = EmptySet,
+            live_result_release_disposition_by_operation = EmptyMap,
+            live_result_delivery_channel_by_operation = EmptyMap,
+            live_result_delivery_operation_by_channel = EmptyMap,
+            live_result_delivery_digest_by_operation = EmptyMap,
+            live_result_delivery_observation_by_operation = EmptyMap,
+            live_result_speech_suppressed_operations = EmptySet,
+            live_result_recovery_replacement_by_channel = EmptyMap,
+            live_result_recovery_source_by_replacement = EmptyMap,
+            live_result_recovery_session_by_channel = EmptyMap,
+            live_result_recovery_operation_by_channel = EmptyMap,
+            live_result_recovery_digest_by_channel = EmptyMap,
+            live_result_recovery_seed_cursor_by_channel = EmptyMap,
+            live_result_recovery_identity_by_channel = EmptyMap,
+            live_result_recovery_runtime_id_by_channel = EmptyMap,
+            live_result_recovery_fence_by_channel = EmptyMap,
+            live_result_recovery_generation_by_channel = EmptyMap,
+            live_bridge_operation_by_channel = EmptyMap,
+            live_bridge_channel_by_operation = EmptyMap,
+            live_bridge_interaction_by_operation = EmptyMap,
+            live_bridge_provider_turn_by_operation = EmptyMap,
+            live_bridge_provider_delegation_by_operation = EmptyMap,
+            live_bridge_provider_call_by_operation = EmptyMap,
+            live_bridge_agent_identity_by_operation = EmptyMap,
+            live_bridge_context_revision_by_operation = EmptyMap,
+            live_bridge_request_digest_by_operation = EmptyMap,
+            live_bridge_phase_by_operation = EmptyMap,
+            live_bridge_effect_operation_by_authority = EmptyMap,
+            live_bridge_effect_kind_by_authority = EmptyMap,
+            live_bridge_consumed_effect_authorities = EmptySet,
+            live_bridge_in_flight_effect_authorities = EmptySet,
+            live_bridge_effect_outcome_by_authority = EmptyMap,
+            live_bridge_model_computation_authorized_operations = EmptySet,
+            live_bridge_read_snapshot_authorized_operations = EmptySet,
+            live_bridge_execution_started_operations = EmptySet,
+            live_bridge_outcome_receipt_required_operations = EmptySet,
+            live_bridge_outcome_receipt_operations = EmptySet,
+            live_bridge_execution_terminal_by_operation = EmptyMap,
+            live_bridge_execution_result_digest_by_operation = EmptyMap,
+            live_bridge_cancellation_reason_by_operation = EmptyMap,
+            live_bridge_submission_output_kind_by_operation = EmptyMap,
+            live_bridge_submission_digest_by_operation = EmptyMap,
+            live_bridge_submission_state_by_operation = EmptyMap,
+            live_context_cursor_by_channel = EmptyMap,
+            live_context_queued_session_by_append = EmptyMap,
+            live_context_queued_cursor_by_append = EmptyMap,
+            live_context_queued_digest_by_append = EmptyMap,
+            live_context_queued_commit_token_by_append = EmptyMap,
+            live_context_queued_disposition_by_append = EmptyMap,
+            live_context_queued_append_by_cursor = EmptyMap,
+            live_context_pending_append_by_channel = EmptyMap,
+            live_context_pending_channel_by_append = EmptyMap,
+            live_context_pending_previous_cursor_by_append = EmptyMap,
+            live_context_pending_next_cursor_by_append = EmptyMap,
+            live_context_delivered_append_ids = EmptySet,
+            live_context_ambiguous_no_retry = EmptySet,
+            live_context_recovery_replacement_by_channel = EmptyMap,
+            live_context_recovery_source_by_replacement = EmptyMap,
+            live_context_recovery_session_by_channel = EmptyMap,
+            live_context_recovery_append_by_channel = EmptyMap,
+            live_context_recovery_seed_cursor_by_channel = EmptyMap,
+            live_context_recovery_identity_by_channel = EmptyMap,
+            live_context_recovery_runtime_id_by_channel = EmptyMap,
+            live_context_recovery_fence_by_channel = EmptyMap,
+            live_context_recovery_generation_by_channel = EmptyMap,
             live_refresh_queue_acceptance_sequence_by_channel = EmptyMap,
             live_refresh_status_by_channel = EmptyMap,
             live_close_result_sequence = 0,
@@ -4505,6 +4971,473 @@ macro_rules! meerkat_catalog_machine_dsl {
                 channel_id: String,
                 llm_identity: SessionLlmIdentity,
             },
+            BindLiveExecutionChannel {
+                session_id: String,
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                canonical_seed_cursor: u64,
+            },
+            StageExperimentalLiveExecution {
+                session_id: String,
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                canonical_seed_cursor: u64,
+                pending_receipt: String,
+            },
+            ResolveLiveExecutionModeAdmission {
+                session_id: String,
+                channel_id: String,
+                profile_id: String,
+                requested_mode: Enum<LiveExecutionMode>,
+                function_bridge_available: bool,
+                client_context_available: bool,
+            },
+            RegisterLivePlaybackOwner {
+                session_id: String,
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                owner_id: String,
+                readiness_id: String,
+                pending_receipt: String,
+            },
+            AuthorizeLiveActiveChannelControl {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                activation_receipt: String,
+                control_authority_id: String,
+                operation: String,
+            },
+            ConsumeLiveActiveChannelControl {
+                channel_id: String,
+                activation_receipt: String,
+                control_authority_id: String,
+                operation: String,
+            },
+            RevokeLivePlaybackOwner {
+                session_id: String,
+                channel_id: String,
+                owner_id: String,
+                readiness_id: String,
+            },
+            RevokeLiveChannelCloseCustody {
+                session_id: String,
+                channel_id: String,
+                pending_receipt: Option<String>,
+                activation_receipt: Option<String>,
+            },
+            ObserveLiveProviderTurnStarted {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                provider_turn_ref: String,
+            },
+            ObserveLiveAssistantTurnStarted {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                assistant_turn_ref: String,
+            },
+            AdmitLiveInteraction {
+                session_id: String,
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+            },
+            AdmitLiveDelegation {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                provider_turn_correlation: String,
+                delegation_identity_present: bool,
+                actionable_input_present: bool,
+                exact_join: bool,
+            },
+            AdmitLiveInteractionDelegation {
+                session_id: String,
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                provider_turn_correlation: String,
+                delegation_identity_present: bool,
+                actionable_input_present: bool,
+                exact_join: bool,
+            },
+            ReconcileLiveDelegationTranscript {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                provider_turn_correlation: String,
+                final_transcript_committed: bool,
+                normalized_digest_matches: bool,
+            },
+            AuthorizeLiveDelegationWorkerStart {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                provider_turn_correlation: String,
+                worker_identity: String,
+            },
+            ResolveLiveDelegationWorkerStart {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                worker_identity: String,
+                started: bool,
+            },
+            AuthorizeLiveDelegationTranscriptTerminalCancellation {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                worker_identity: String,
+            },
+            SupersedeLiveInteraction {
+                session_id: String,
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                superseding_interaction_id: String,
+                operation_id: OperationId,
+                worker_identity: String,
+            },
+            ResolveLiveDelegationCancellation {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                worker_identity: String,
+                outcome: Enum<LiveDelegationCancellationOutcome>,
+            },
+            RecordLiveDelegationWorkerTerminal {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                worker_identity: String,
+                terminal: Enum<LiveDelegationWorkerTerminalKind>,
+            },
+            // Restart-only observation after the exact durable child has
+            // reached terminal and physical retirement. No provider
+            // correlation or live binding atom can be supplied here.
+            ReconcileRevokedLiveDelegationWorkerAfterRestart {
+                session_id: String,
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                worker_identity: String,
+                terminal: Enum<LiveDelegationWorkerTerminalKind>,
+            },
+            AuthorizeLiveDelegationWorkerRetirement {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                worker_identity: String,
+            },
+            ResolveLiveDelegationWorkerRetirement {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                worker_identity: String,
+                retired: bool,
+            },
+            AbandonLiveInteraction {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+            },
+            CompleteLiveInteraction {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                provider_turn_ref: String,
+            },
+            AuthorizeLiveConsequentialEffect {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                authority_id: String,
+            },
+            AuthorizeLiveDelegationResultRelease {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                provider_turn_correlation: String,
+            },
+            AuthorizeLiveDelegationResultDelivery {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                provider_turn_correlation: String,
+                result_digest: String,
+                disposition: Enum<LiveDelegationResultDisposition>,
+            },
+            ResolveLiveDelegationResultDelivery {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                operation_id: OperationId,
+                result_digest: String,
+                replacement_channel_id: String,
+                observation: Enum<LiveDelegationResultDeliveryObservation>,
+            },
+            BindLiveDelegationResultRecoveryChannel {
+                session_id: String,
+                closing_channel_id: String,
+                replacement_channel_id: String,
+                answer_observation_sequence: u64,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                operation_id: OperationId,
+                result_digest: String,
+                canonical_seed_cursor: u64,
+            },
+            AdmitLiveBridgeOperation {
+                session_id: String,
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                provider_turn_ref: String,
+                provider_delegation_ref: String,
+                provider_call_ref: String,
+                agent_identity: AgentIdentity,
+                canonical_context_revision: String,
+                request_digest: String,
+                structural_lineage_proven: bool,
+            },
+            ConfirmLiveBridgeFinalInput {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                provider_turn_ref: String,
+            },
+            AuthorizeLiveBridgeExecutionStart {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                request_digest: String,
+            },
+            AuthorizeLiveBridgeEffect {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                authority_id: String,
+                kind: Enum<LiveBridgeEffectKind>,
+            },
+            ConsumeLiveBridgeEffectAuthority {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                operation_id: OperationId,
+                authority_id: String,
+                kind: Enum<LiveBridgeEffectKind>,
+            },
+            RecordLiveBridgeEffectOutcome {
+                channel_id: String,
+                operation_id: OperationId,
+                authority_id: String,
+                kind: Enum<LiveBridgeEffectKind>,
+                outcome: Enum<LiveBridgeEffectOutcome>,
+            },
+            // Trusted runtime observation that the operation-derived,
+            // append-only source receipt was durably Applied or already
+            // present. The constrained append API exposes no sealed store
+            // receipt, so arbitrary caller text never enters this input.
+            RecordLiveBridgeOutcomeReceipt { operation_id: OperationId },
+            RetireSettledLiveBridgeOperation { operation_id: OperationId },
+            CancelLiveBridgeOperation {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                reason: Enum<LiveBridgeCancellationReason>,
+            },
+            RecordLiveBridgeExecutionTerminal {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                terminal: Enum<MeerkatExecutionTerminal>,
+                result_digest: Option<String>,
+            },
+            ReconcileRevokedLiveBridgeExecutionTerminal {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                request_digest: String,
+                terminal: Enum<MeerkatExecutionTerminal>,
+                result_digest: Option<String>,
+            },
+            FenceRestoredLiveBridgeOperationForRestart {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                request_digest: String,
+            },
+            AuthorizeLiveBridgeSubmission {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                interaction_id: String,
+                operation_id: OperationId,
+                provider_call_ref: String,
+                output_kind: Enum<LiveBridgeOutputKind>,
+                output_digest: String,
+            },
+            ClaimLiveBridgeSubmissionAttempt {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                operation_id: OperationId,
+                provider_call_ref: String,
+                output_digest: String,
+            },
+            RecordLiveBridgeSubmissionLocalWrite {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                operation_id: OperationId,
+                provider_call_ref: String,
+                output_digest: String,
+            },
+            ResolveLiveBridgeSubmission {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                operation_id: OperationId,
+                provider_call_ref: String,
+                output_digest: String,
+                observation: Enum<LiveBridgeSubmissionObservation>,
+            },
+            RecoverLiveBridgeSubmission { operation_id: OperationId },
+            AuthorizeLiveContextAppend {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                append_id: String,
+                previous_cursor: u64,
+                next_cursor: u64,
+            },
+            EnqueueLiveContextRow {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                append_id: String,
+                canonical_cursor: u64,
+                content_digest: String,
+                commit_authority_token: String,
+                disposition: Enum<LiveContextRowDisposition>,
+            },
+            AdvanceLiveContextCanonicalCoverage {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                append_id: String,
+                previous_cursor: u64,
+                next_cursor: u64,
+                disposition: Enum<LiveContextRowDisposition>,
+            },
+            ResolveLiveContextAppend {
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                append_id: String,
+                previous_cursor: u64,
+                next_cursor: u64,
+                replacement_channel_id: String,
+                observation: Enum<LiveContextAppendObservation>,
+            },
+            BindLiveContextRecoveryChannel {
+                session_id: String,
+                closing_channel_id: String,
+                replacement_channel_id: String,
+                answer_observation_sequence: u64,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                append_id: String,
+                canonical_seed_cursor: u64,
+            },
             AbandonLiveOpenAdmission { session_id: String, channel_id: String },
             RecordLiveRefreshQueued { channel_id: String, queue_acceptance_sequence: u64 },
             RecordLiveCloseClosed { session_id: String, channel_id: String, close_observation_sequence: u64 },
@@ -4540,6 +5473,16 @@ macro_rules! meerkat_catalog_machine_dsl {
                 session_id: String,
                 channel_id: String,
                 answer_observation_sequence: u64,
+            },
+            RecordLiveWebrtcAnswerAcceptedAndBindExecution {
+                session_id: String,
+                channel_id: String,
+                answer_observation_sequence: u64,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                canonical_seed_cursor: u64,
+                activation_receipt: String,
             },
             RecordLiveWebsocketTokenIssued {
                 session_id: String,
@@ -5373,6 +6316,19 @@ macro_rules! meerkat_catalog_machine_dsl {
                 sequence: u64,
                 answer_observation_sequence: u64,
             },
+            LiveWebrtcAnswerAcceptedAndExecutionBound {
+                session_id: String,
+                channel_id: String,
+                status: Enum<LiveWebrtcAnswerPublicStatus>,
+                answered: bool,
+                sequence: u64,
+                answer_observation_sequence: u64,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                canonical_seed_cursor: u64,
+                activation_receipt: String,
+            },
             LiveWebsocketTokenIssued {
                 session_id: String,
                 channel_id: String,
@@ -5401,6 +6357,408 @@ macro_rules! meerkat_catalog_machine_dsl {
                 session_id: String,
                 channel_id: String,
                 sequence: u64,
+            },
+            LiveExecutionChannelBound {
+                session_id: String,
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                canonical_seed_cursor: u64,
+            },
+            ExperimentalLiveExecutionStaged {
+                session_id: String,
+                channel_id: String,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+                canonical_seed_cursor: u64,
+                pending_receipt: String,
+            },
+            LiveExecutionModeAdmissionResolved {
+                session_id: String,
+                channel_id: String,
+                profile_id: String,
+                resolved_mode: Enum<LiveExecutionMode>,
+                function_bridge_available: bool,
+                client_context_available: bool,
+            },
+            LivePlaybackOwnerReady {
+                session_id: String,
+                channel_id: String,
+                owner_id: String,
+                readiness_id: String,
+                phase: Enum<LiveExecutionChannelPhase>,
+            },
+            LiveActiveChannelControlAuthorityIssued {
+                channel_id: String,
+                activation_receipt: String,
+                control_authority_id: String,
+                operation: String,
+            },
+            LiveActiveChannelControlDispatchAuthorized {
+                channel_id: String,
+                control_authority_id: String,
+                operation: String,
+            },
+            LivePlaybackOwnerRevoked {
+                session_id: String,
+                channel_id: String,
+                owner_id: String,
+                phase: Enum<LiveExecutionChannelPhase>,
+            },
+            LiveChannelCloseCustodyRevoked {
+                session_id: String,
+                channel_id: String,
+                phase: Enum<LiveExecutionChannelPhase>,
+                already_closed: bool,
+            },
+            LiveInteractionAdmitted {
+                session_id: String,
+                channel_id: String,
+                interaction_id: String,
+            },
+            LiveDelegationAdmitted {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                provider_turn_correlation: String,
+            },
+            LiveInteractionDelegationAdmitted {
+                session_id: String,
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                provider_turn_correlation: String,
+            },
+            LiveDelegationTranscriptReconciled {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                reconciliation: Enum<LiveDelegationReconciliation>,
+                cancellation_required: bool,
+            },
+            LiveDelegationWorkerStartAuthorized {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                worker_identity: String,
+            },
+            LiveDelegationWorkerStartResolved {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                worker_identity: String,
+                started: bool,
+            },
+            LiveDelegationCancellationAuthorized {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                worker_identity: String,
+                reason: Enum<LiveDelegationCancellationReason>,
+                superseding_interaction_id: Option<String>,
+            },
+            LiveDelegationCancellationResolved {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                worker_identity: String,
+                outcome: Enum<LiveDelegationCancellationOutcome>,
+            },
+            LiveDelegationWorkerTerminalRecorded {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                worker_identity: String,
+                terminal: Enum<LiveDelegationWorkerTerminalKind>,
+                late: bool,
+                result_eligible: bool,
+            },
+            LiveDelegationWorkerRestartReconciled {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                worker_identity: String,
+                terminal: Enum<LiveDelegationWorkerTerminalKind>,
+                replay: bool,
+            },
+            LiveDelegationWorkerRetirementAuthorized {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                worker_identity: String,
+            },
+            LiveDelegationWorkerRetirementResolved {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                worker_identity: String,
+                retired: bool,
+            },
+            LiveInteractionAbandoned {
+                channel_id: String,
+                interaction_id: String,
+            },
+            LiveInteractionSupersededWithoutCancellation {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                superseding_interaction_id: String,
+            },
+            LiveInteractionCompleted {
+                channel_id: String,
+                interaction_id: String,
+            },
+            LiveProviderTurnStarted {
+                channel_id: String,
+                interaction_id: String,
+                provider_turn_ref: String,
+            },
+            LiveAssistantTurnStarted {
+                channel_id: String,
+                interaction_id: String,
+                assistant_turn_ref: String,
+            },
+            LiveProviderTurnFinished {
+                channel_id: String,
+                interaction_id: String,
+                provider_turn_ref: String,
+            },
+            LiveConsequentialEffectAuthorized {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                authority_id: String,
+            },
+            LiveDelegationResultReleaseAuthorized {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                provider_turn_correlation: String,
+                disposition: Enum<LiveDelegationResultDisposition>,
+            },
+            LiveDelegationResultDeliveryAuthorized {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                provider_turn_correlation: String,
+                result_digest: String,
+                disposition: Enum<LiveDelegationResultDisposition>,
+            },
+            LiveDelegationResultDeliveryResolved {
+                channel_id: String,
+                operation_id: OperationId,
+                result_digest: String,
+                disposition: Enum<LiveDelegationResultDisposition>,
+                observation: Enum<LiveDelegationResultDeliveryObservation>,
+                speech_disposition: Enum<LiveDelegationResultSpeechDisposition>,
+                retry_allowed: bool,
+                recovery_required: bool,
+            },
+            LiveDelegationResultAmbiguityRecoveryAuthorized {
+                session_id: String,
+                closing_channel_id: String,
+                replacement_channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                provider_turn_correlation: String,
+                result_digest: String,
+                disposition: Enum<LiveDelegationResultDisposition>,
+                canonical_seed_cursor: u64,
+                llm_identity: SessionLlmIdentity,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+            },
+            LiveDelegationResultRecoveryChannelBound {
+                session_id: String,
+                closing_channel_id: String,
+                replacement_channel_id: String,
+                operation_id: OperationId,
+                result_digest: String,
+                canonical_seed_cursor: u64,
+                status: Enum<LiveWebrtcAnswerPublicStatus>,
+                answered: bool,
+                sequence: u64,
+                answer_observation_sequence: u64,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+            },
+            LiveBridgeOperationAdmitted {
+                session_id: String,
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                provider_turn_ref: String,
+                provider_delegation_ref: String,
+                provider_call_ref: String,
+                agent_identity: AgentIdentity,
+                canonical_context_revision: String,
+                request_digest: String,
+                phase: Enum<LiveBridgeOperationPhase>,
+            },
+            LiveBridgeOperationReplayObserved {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                provider_delegation_ref: String,
+                provider_call_ref: String,
+            },
+            LiveBridgeProtocolDriftCloseAuthorized {
+                channel_id: String,
+                operation_id: OperationId,
+                provider_delegation_ref: String,
+                provider_call_ref: String,
+            },
+            LiveBridgeFinalInputAuthorized {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                phase: Enum<LiveBridgeOperationPhase>,
+            },
+            LiveBridgeExecutionStartAuthorized {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                request_digest: String,
+                phase: Enum<LiveBridgeOperationPhase>,
+            },
+            LiveBridgeEffectAuthorityIssued {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                authority_id: String,
+                kind: Enum<LiveBridgeEffectKind>,
+            },
+            LiveBridgeEffectDispatchAuthorized {
+                channel_id: String,
+                operation_id: OperationId,
+                authority_id: String,
+                kind: Enum<LiveBridgeEffectKind>,
+            },
+            LiveBridgeEffectOutcomeRecorded {
+                channel_id: String,
+                operation_id: OperationId,
+                authority_id: String,
+                kind: Enum<LiveBridgeEffectKind>,
+                outcome: Enum<LiveBridgeEffectOutcome>,
+                replay: bool,
+            },
+            LiveBridgeOutcomeReceiptRecorded {
+                operation_id: OperationId,
+                replay: bool,
+            },
+            LiveBridgeOperationRetirementResolved {
+                operation_id: OperationId,
+                retired_now: bool,
+            },
+            LiveBridgeOperationCancellationAuthorized {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                agent_identity: AgentIdentity,
+                reason: Enum<LiveBridgeCancellationReason>,
+            },
+            LiveBridgeExecutionTerminalRecorded {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                terminal: Enum<MeerkatExecutionTerminal>,
+                result_digest: Option<String>,
+                replay: bool,
+            },
+            LiveBridgeSubmissionAuthorized {
+                channel_id: String,
+                interaction_id: String,
+                operation_id: OperationId,
+                provider_call_ref: String,
+                output_kind: Enum<LiveBridgeOutputKind>,
+                output_digest: String,
+                state: Enum<LiveBridgeSubmissionState>,
+            },
+            LiveBridgeSubmissionAttemptClaimed {
+                channel_id: String,
+                operation_id: OperationId,
+                provider_call_ref: String,
+                output_digest: String,
+                state: Enum<LiveBridgeSubmissionState>,
+            },
+            LiveBridgeSubmissionLocalWriteRecorded {
+                channel_id: String,
+                operation_id: OperationId,
+                provider_call_ref: String,
+                output_digest: String,
+                state: Enum<LiveBridgeSubmissionState>,
+            },
+            LiveBridgeSubmissionResolved {
+                channel_id: String,
+                operation_id: OperationId,
+                provider_call_ref: String,
+                output_digest: String,
+                state: Enum<LiveBridgeSubmissionState>,
+                retry_allowed: bool,
+            },
+            LiveBridgeSubmissionRecoveredAmbiguous {
+                channel_id: String,
+                operation_id: OperationId,
+                provider_call_ref: String,
+                output_digest: String,
+                state: Enum<LiveBridgeSubmissionState>,
+                retry_allowed: bool,
+            },
+            LiveContextAppendAuthorized {
+                channel_id: String,
+                append_id: String,
+                previous_cursor: u64,
+                next_cursor: u64,
+            },
+            LiveContextRowQueued {
+                session_id: String,
+                channel_id: String,
+                append_id: String,
+                canonical_cursor: u64,
+                disposition: Enum<LiveContextRowDisposition>,
+            },
+            LiveContextCanonicalCoverageAdvanced {
+                channel_id: String,
+                append_id: String,
+                previous_cursor: u64,
+                next_cursor: u64,
+                disposition: Enum<LiveContextRowDisposition>,
+            },
+            LiveContextAppendResolved {
+                channel_id: String,
+                append_id: String,
+                cursor: u64,
+                observation: Enum<LiveContextAppendObservation>,
+                retry_allowed: bool,
+            },
+            LiveContextAmbiguityRecoveryAuthorized {
+                session_id: String,
+                closing_channel_id: String,
+                replacement_channel_id: String,
+                append_id: String,
+                canonical_seed_cursor: u64,
+                llm_identity: SessionLlmIdentity,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
+            },
+            LiveContextRecoveryChannelBound {
+                session_id: String,
+                closing_channel_id: String,
+                replacement_channel_id: String,
+                append_id: String,
+                canonical_seed_cursor: u64,
+                status: Enum<LiveWebrtcAnswerPublicStatus>,
+                answered: bool,
+                sequence: u64,
+                answer_observation_sequence: u64,
+                runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Generation,
             },
             SessionEventStreamOpenResolved {
                 stream_id: String,
@@ -5788,10 +7146,66 @@ macro_rules! meerkat_catalog_machine_dsl {
         disposition LiveWebrtcTokenIssued => local seam SurfaceResultAlignment,
         disposition LiveWebrtcAnswerAdmissionResolved => local seam SurfaceResultAlignment,
         disposition LiveWebrtcAnswerResultResolved => local seam SurfaceResultAlignment,
+        disposition LiveWebrtcAnswerAcceptedAndExecutionBound => local seam SurfaceResultAlignment,
         disposition LiveWebsocketTokenIssued => local seam SurfaceResultAlignment,
         disposition LiveWebsocketTokenAdmissionResolved => local seam SurfaceResultAlignment,
         disposition LiveOpenAdmissionResolved => local seam SurfaceResultAlignment,
         disposition LiveOpenAdmissionAbandoned => local seam SurfaceResultAlignment,
+        disposition LiveExecutionChannelBound => local seam OwnerRealizationOnly,
+        disposition ExperimentalLiveExecutionStaged => local seam OwnerRealizationOnly,
+        disposition LiveExecutionModeAdmissionResolved => local seam OwnerRealizationOnly,
+        disposition LivePlaybackOwnerReady => local seam OwnerRealizationOnly,
+        disposition LiveActiveChannelControlAuthorityIssued => local seam OwnerRealizationOnly,
+        disposition LiveActiveChannelControlDispatchAuthorized => external seam OwnerRealizationOnly,
+        disposition LivePlaybackOwnerRevoked => external seam OwnerRealizationOnly,
+        disposition LiveChannelCloseCustodyRevoked => external seam OwnerRealizationOnly,
+        disposition LiveProviderTurnStarted => local seam OwnerRealizationOnly,
+        disposition LiveAssistantTurnStarted => local seam OwnerRealizationOnly,
+        disposition LiveProviderTurnFinished => local seam OwnerRealizationOnly,
+        disposition LiveInteractionAdmitted => local seam OwnerRealizationOnly,
+        disposition LiveDelegationAdmitted => external seam OwnerRealizationOnly,
+        disposition LiveInteractionDelegationAdmitted => external seam OwnerRealizationOnly,
+        disposition LiveDelegationTranscriptReconciled => local seam OwnerRealizationOnly,
+        disposition LiveDelegationWorkerStartAuthorized => external seam OwnerRealizationOnly,
+        disposition LiveDelegationWorkerStartResolved => local seam OwnerRealizationOnly,
+        disposition LiveDelegationCancellationAuthorized => external seam OwnerRealizationOnly,
+        disposition LiveDelegationCancellationResolved => local seam OwnerRealizationOnly,
+        disposition LiveDelegationWorkerTerminalRecorded => local seam OwnerRealizationOnly,
+        disposition LiveDelegationWorkerRestartReconciled => local seam OwnerRealizationOnly,
+        disposition LiveDelegationWorkerRetirementAuthorized => external seam OwnerRealizationOnly,
+        disposition LiveDelegationWorkerRetirementResolved => local seam OwnerRealizationOnly,
+        disposition LiveInteractionSupersededWithoutCancellation => local seam OwnerRealizationOnly,
+        disposition LiveInteractionAbandoned => external seam OwnerRealizationOnly,
+        disposition LiveInteractionCompleted => local seam OwnerRealizationOnly,
+        disposition LiveConsequentialEffectAuthorized => external seam OwnerRealizationOnly,
+        disposition LiveDelegationResultReleaseAuthorized => external seam OwnerRealizationOnly,
+        disposition LiveDelegationResultDeliveryAuthorized => external seam OwnerRealizationOnly,
+        disposition LiveDelegationResultDeliveryResolved => external seam OwnerRealizationOnly,
+        disposition LiveDelegationResultAmbiguityRecoveryAuthorized => external seam OwnerRealizationOnly,
+        disposition LiveDelegationResultRecoveryChannelBound => local seam OwnerRealizationOnly,
+        disposition LiveBridgeOperationAdmitted => external seam OwnerRealizationOnly,
+        disposition LiveBridgeOperationReplayObserved => local seam OwnerRealizationOnly,
+        disposition LiveBridgeProtocolDriftCloseAuthorized => external seam OwnerRealizationOnly,
+        disposition LiveBridgeFinalInputAuthorized => local seam OwnerRealizationOnly,
+        disposition LiveBridgeExecutionStartAuthorized => external seam OwnerRealizationOnly,
+        disposition LiveBridgeEffectAuthorityIssued => local seam OwnerRealizationOnly,
+        disposition LiveBridgeEffectDispatchAuthorized => external seam OwnerRealizationOnly,
+        disposition LiveBridgeEffectOutcomeRecorded => local seam OwnerRealizationOnly,
+        disposition LiveBridgeOutcomeReceiptRecorded => local seam OwnerRealizationOnly,
+        disposition LiveBridgeOperationRetirementResolved => local seam OwnerRealizationOnly,
+        disposition LiveBridgeOperationCancellationAuthorized => external seam OwnerRealizationOnly,
+        disposition LiveBridgeExecutionTerminalRecorded => local seam OwnerRealizationOnly,
+        disposition LiveBridgeSubmissionAuthorized => local seam OwnerRealizationOnly,
+        disposition LiveBridgeSubmissionAttemptClaimed => external seam OwnerRealizationOnly,
+        disposition LiveBridgeSubmissionLocalWriteRecorded => local seam OwnerRealizationOnly,
+        disposition LiveBridgeSubmissionResolved => local seam OwnerRealizationOnly,
+        disposition LiveBridgeSubmissionRecoveredAmbiguous => external seam OwnerRealizationOnly,
+        disposition LiveContextAppendAuthorized => external seam OwnerRealizationOnly,
+        disposition LiveContextRowQueued => local seam OwnerRealizationOnly,
+        disposition LiveContextCanonicalCoverageAdvanced => local seam OwnerRealizationOnly,
+        disposition LiveContextAppendResolved => external seam OwnerRealizationOnly,
+        disposition LiveContextAmbiguityRecoveryAuthorized => external seam OwnerRealizationOnly,
+        disposition LiveContextRecoveryChannelBound => local seam OwnerRealizationOnly,
         disposition SessionEventStreamOpenResolved => local seam SurfaceResultAlignment,
         disposition SessionEventStreamTerminalResolved => local seam SurfaceResultAlignment,
         disposition SessionEventStreamCloseResolved => local seam SurfaceResultAlignment,
@@ -6359,6 +7773,393 @@ macro_rules! meerkat_catalog_machine_dsl {
 
         invariant runtime_generation_requires_bound_runtime {
             self.active_runtime_generation == None || self.active_runtime_id != None
+        }
+
+        invariant live_execution_binding_is_complete_and_channel_scoped {
+            self.live_execution_runtime_id_by_channel.keys()
+                == self.live_execution_fence_by_channel.keys()
+            && self.live_execution_runtime_id_by_channel.keys()
+                == self.live_execution_generation_by_channel.keys()
+            && for_all(channel_id in self.live_execution_runtime_id_by_channel.keys(),
+                self.live_channel_session_by_channel.contains_key(channel_id))
+        }
+
+        invariant live_execution_phase_is_explicit_and_revocation_is_terminal {
+            for_all(channel_id in self.live_experimental_staged_runtime_by_channel.keys(),
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Pending))
+            && for_all(channel_id in self.live_experimental_execution_channels,
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Active))
+            && for_all(channel_id in self.live_revoked_execution_channels,
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Revoked))
+        }
+
+        invariant live_bridge_operation_identity_is_complete_and_direct {
+            self.live_bridge_channel_by_operation.keys()
+                == self.live_bridge_interaction_by_operation.keys()
+            && self.live_bridge_channel_by_operation.keys()
+                == self.live_bridge_provider_turn_by_operation.keys()
+            && self.live_bridge_channel_by_operation.keys()
+                == self.live_bridge_provider_delegation_by_operation.keys()
+            && self.live_bridge_channel_by_operation.keys()
+                == self.live_bridge_provider_call_by_operation.keys()
+            && self.live_bridge_channel_by_operation.keys()
+                == self.live_bridge_agent_identity_by_operation.keys()
+            && self.live_bridge_channel_by_operation.keys()
+                == self.live_bridge_context_revision_by_operation.keys()
+            && self.live_bridge_channel_by_operation.keys()
+                == self.live_bridge_request_digest_by_operation.keys()
+            && self.live_bridge_channel_by_operation.keys()
+                == self.live_bridge_phase_by_operation.keys()
+            && for_all(channel_id in self.live_bridge_operation_by_channel.keys(),
+                self.live_bridge_channel_by_operation.get_cloned(
+                    self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                    == Some(channel_id))
+        }
+
+        invariant live_bridge_effect_authority_is_one_use_and_exact {
+            self.live_bridge_effect_operation_by_authority.keys()
+                == self.live_bridge_effect_kind_by_authority.keys()
+            && for_all(authority_id in self.live_bridge_effect_operation_by_authority.keys(),
+                self.live_bridge_channel_by_operation.contains_key(
+                    self.live_bridge_effect_operation_by_authority.get_cloned(authority_id).get("value")))
+            && for_all(authority_id in self.live_bridge_consumed_effect_authorities,
+                self.live_bridge_effect_operation_by_authority.contains_key(authority_id)
+                && ((self.live_bridge_in_flight_effect_authorities.contains(authority_id)
+                        && !self.live_bridge_effect_outcome_by_authority.contains_key(authority_id))
+                    || (!self.live_bridge_in_flight_effect_authorities.contains(authority_id)
+                        && self.live_bridge_effect_outcome_by_authority.contains_key(authority_id))))
+            && for_all(authority_id in self.live_bridge_effect_outcome_by_authority.keys(),
+                self.live_bridge_consumed_effect_authorities.contains(authority_id))
+        }
+
+        invariant live_bridge_execution_and_provider_settlement_are_independent {
+            for_all(operation_id in self.live_bridge_execution_terminal_by_operation.keys(),
+                self.live_bridge_phase_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeOperationPhase::ExecutionTerminal))
+            && self.live_bridge_submission_output_kind_by_operation.keys()
+                == self.live_bridge_submission_digest_by_operation.keys()
+            && self.live_bridge_submission_output_kind_by_operation.keys()
+                == self.live_bridge_submission_state_by_operation.keys()
+            && for_all(operation_id in self.live_bridge_submission_state_by_operation.keys(),
+                self.live_bridge_execution_terminal_by_operation.contains_key(operation_id))
+        }
+
+        invariant live_bridge_started_execution_and_outcome_receipt_are_operation_scoped {
+            for_all(operation_id in self.live_bridge_execution_started_operations,
+                self.live_bridge_channel_by_operation.contains_key(operation_id)
+                && self.live_bridge_outcome_receipt_required_operations.contains(operation_id)
+                && (self.live_bridge_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveBridgeOperationPhase::ExecutionRunning)
+                    || self.live_bridge_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveBridgeOperationPhase::ExecutionTerminal)))
+            && for_all(operation_id in self.live_bridge_channel_by_operation.keys(),
+                (self.live_bridge_phase_by_operation.get_copied(operation_id)
+                        != Some(LiveBridgeOperationPhase::ExecutionRunning)
+                    || self.live_bridge_execution_started_operations.contains(operation_id))
+                && ((self.live_bridge_execution_terminal_by_operation.get_copied(operation_id)
+                            != Some(MeerkatExecutionTerminal::Completed)
+                        && self.live_bridge_execution_terminal_by_operation.get_copied(operation_id)
+                            != Some(MeerkatExecutionTerminal::Failed))
+                    || self.live_bridge_execution_started_operations.contains(operation_id)))
+            && for_all(operation_id in self.live_bridge_outcome_receipt_required_operations,
+                self.live_bridge_channel_by_operation.contains_key(operation_id))
+            && for_all(operation_id in self.live_bridge_outcome_receipt_operations,
+                self.live_bridge_outcome_receipt_required_operations.contains(operation_id)
+                && self.live_bridge_channel_by_operation.contains_key(operation_id))
+        }
+
+        invariant live_bridge_cancellation_provenance_is_operation_scoped {
+            for_all(operation_id in self.live_bridge_cancellation_reason_by_operation.keys(),
+                self.live_bridge_channel_by_operation.contains_key(operation_id)
+                && (self.live_bridge_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveBridgeOperationPhase::CancellationAuthorized)
+                    || self.live_bridge_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveBridgeOperationPhase::ExecutionRunning)
+                    || self.live_bridge_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveBridgeOperationPhase::ExecutionTerminal)))
+        }
+
+        invariant live_bridge_completed_terminal_has_exact_result_digest {
+            for_all(operation_id in self.live_bridge_execution_terminal_by_operation.keys(),
+                (self.live_bridge_execution_terminal_by_operation.get_copied(operation_id)
+                        == Some(MeerkatExecutionTerminal::Completed)
+                    && self.live_bridge_execution_result_digest_by_operation.contains_key(operation_id))
+                || (self.live_bridge_execution_terminal_by_operation.get_copied(operation_id)
+                        != Some(MeerkatExecutionTerminal::Completed)
+                    && !self.live_bridge_execution_result_digest_by_operation.contains_key(operation_id)))
+        }
+
+        invariant live_experimental_execution_custody_is_exact {
+            self.live_experimental_staged_runtime_by_channel.keys()
+                == self.live_experimental_staged_fence_by_channel.keys()
+            && self.live_experimental_staged_runtime_by_channel.keys()
+                == self.live_experimental_staged_generation_by_channel.keys()
+            && self.live_experimental_staged_runtime_by_channel.keys()
+                == self.live_experimental_staged_seed_cursor_by_channel.keys()
+            && for_all(channel_id in self.live_experimental_staged_runtime_by_channel.keys(),
+                self.live_channel_session_by_channel.contains_key(channel_id)
+                && !self.live_execution_runtime_id_by_channel.contains_key(channel_id))
+            && for_all(channel_id in self.live_experimental_execution_channels,
+                self.live_execution_runtime_id_by_channel.contains_key(channel_id)
+                && self.live_context_cursor_by_channel.contains_key(channel_id))
+        }
+
+        invariant live_active_interaction_is_exactly_channel_bound {
+            for_all(channel_id in self.live_active_interaction_by_channel.keys(),
+                self.live_interaction_channel_by_id.get_cloned(
+                    self.live_active_interaction_by_channel.get_cloned(channel_id).get("value"))
+                    == Some(channel_id)
+                && !self.live_abandoned_interactions.contains(
+                    self.live_active_interaction_by_channel.get_cloned(channel_id).get("value")))
+        }
+
+        invariant live_provider_turn_occupancy_has_exact_interaction {
+            self.live_provider_interaction_by_turn.keys()
+                == self.live_provider_turn_channel_by_ref.keys()
+            && for_all(channel_id in self.live_provider_turn_by_channel.keys(),
+                self.live_provider_turn_channel_by_ref.get_cloned(
+                    self.live_provider_turn_by_channel.get_cloned(channel_id).get("value"))
+                    == Some(channel_id)
+                && ((self.live_abandoned_interactions.contains(
+                        self.live_provider_interaction_by_turn.get_cloned(
+                            self.live_provider_turn_by_channel.get_cloned(channel_id).get("value")).get("value"))
+                        && !self.live_active_interaction_by_channel.contains_key(channel_id))
+                    || (!self.live_abandoned_interactions.contains(
+                            self.live_provider_interaction_by_turn.get_cloned(
+                                self.live_provider_turn_by_channel.get_cloned(channel_id).get("value")).get("value"))
+                        && self.live_provider_interaction_by_turn.get_cloned(
+                            self.live_provider_turn_by_channel.get_cloned(channel_id).get("value"))
+                            == self.live_active_interaction_by_channel.get_cloned(channel_id))))
+            && for_all(provider_turn_ref in self.live_provider_interaction_by_turn.keys(),
+                self.live_interaction_channel_by_id.get_cloned(
+                    self.live_provider_interaction_by_turn.get_cloned(provider_turn_ref).get("value"))
+                    == self.live_provider_turn_channel_by_ref.get_cloned(provider_turn_ref))
+        }
+
+        invariant live_assistant_turn_is_frozen_to_exact_foreground_interaction {
+            self.live_assistant_interaction_by_turn.keys()
+                == self.live_assistant_turn_channel_by_ref.keys()
+            && for_all(channel_id in self.live_awaiting_assistant_interaction_by_channel.keys(),
+                self.live_interaction_channel_by_id.get_cloned(
+                    self.live_awaiting_assistant_interaction_by_channel.get_cloned(channel_id).get("value"))
+                    == Some(channel_id))
+            && for_all(assistant_turn_ref in self.live_assistant_interaction_by_turn.keys(),
+                self.live_interaction_channel_by_id.get_cloned(
+                    self.live_assistant_interaction_by_turn.get_cloned(assistant_turn_ref).get("value"))
+                    == self.live_assistant_turn_channel_by_ref.get_cloned(assistant_turn_ref))
+        }
+
+        invariant live_pending_delegation_is_serialized_and_complete {
+            self.live_delegation_interaction_by_channel.keys()
+                == self.live_delegation_operation_by_channel.keys()
+            && self.live_delegation_interaction_by_channel.keys()
+                == self.live_delegation_provider_turn_by_channel.keys()
+            && for_all(channel_id in self.live_delegation_operation_by_channel.keys(),
+                self.live_interaction_channel_by_id.get_cloned(
+                    self.live_delegation_interaction_by_channel.get_cloned(channel_id).get("value"))
+                    == Some(channel_id)
+                && (!self.live_abandoned_interactions.contains(
+                    self.live_delegation_interaction_by_channel.get_cloned(channel_id).get("value"))
+                    || self.live_delegation_reconciliation_by_operation.get_copied(
+                        self.live_delegation_operation_by_channel.get_cloned(channel_id).get("value"))
+                        == Some(LiveDelegationReconciliation::MaterialConflict)
+                    || self.live_delegation_reconciliation_by_operation.get_copied(
+                        self.live_delegation_operation_by_channel.get_cloned(channel_id).get("value"))
+                        == Some(LiveDelegationReconciliation::Missing)
+                    || self.live_delegation_worker_terminal_by_operation.contains_key(
+                        self.live_delegation_operation_by_channel.get_cloned(channel_id).get("value"))
+                    || self.live_delegation_cancellation_reason_by_operation.contains_key(
+                        self.live_delegation_operation_by_channel.get_cloned(channel_id).get("value")))
+                && self.live_delegation_reconciliation_by_operation.contains_key(
+                    self.live_delegation_operation_by_channel.get_cloned(channel_id).get("value")))
+        }
+
+        invariant live_delegation_operation_has_exact_join_identity {
+            self.live_delegation_reconciliation_by_operation.keys()
+                == self.live_delegation_interaction_by_operation.keys()
+            && self.live_delegation_reconciliation_by_operation.keys()
+                == self.live_delegation_provider_turn_by_operation.keys()
+        }
+
+        invariant live_delegation_worker_binding_is_exact {
+            self.live_delegation_worker_identity_by_operation.keys()
+                == self.live_delegation_worker_phase_by_operation.keys()
+            && for_all(operation_id in self.live_delegation_worker_identity_by_operation.keys(),
+                self.live_delegation_interaction_by_operation.contains_key(operation_id)
+                && self.live_delegation_reconciliation_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationReconciliation::Confirmed))
+        }
+
+        invariant live_delegation_terminal_is_worker_bound {
+            for_all(operation_id in self.live_delegation_worker_terminal_by_operation.keys(),
+                self.live_delegation_worker_identity_by_operation.contains_key(operation_id)
+                && self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                    != Some(LiveDelegationWorkerPhase::Running)
+                && self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                    != Some(LiveDelegationWorkerPhase::StartAuthorized))
+        }
+
+        invariant live_delegation_result_eligibility_is_terminal_and_confirmed {
+            for_all(operation_id in self.live_delegation_result_eligible_operations,
+                self.live_delegation_worker_terminal_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationWorkerTerminalKind::Completed)
+                && self.live_delegation_reconciliation_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationReconciliation::Confirmed)
+                && !self.live_delegation_late_terminal_operations.contains(operation_id))
+        }
+
+        invariant live_delegation_late_terminal_never_eligible {
+            for_all(operation_id in self.live_delegation_late_terminal_operations,
+                !self.live_delegation_result_eligible_operations.contains(operation_id))
+        }
+
+        invariant live_released_result_requires_confirmed_transcript {
+            for_all(operation_id in self.live_result_released_operations,
+                self.live_delegation_reconciliation_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationReconciliation::Confirmed)
+                && self.live_delegation_result_eligible_operations.contains(operation_id)
+                && self.live_result_release_disposition_by_operation.contains_key(operation_id))
+            && for_all(operation_id in self.live_result_release_disposition_by_operation.keys(),
+                self.live_result_released_operations.contains(operation_id))
+        }
+
+        invariant live_result_delivery_is_exact_and_terminal_once {
+            self.live_result_delivery_channel_by_operation.keys()
+                == self.live_result_delivery_digest_by_operation.keys()
+            && for_all(operation_id in self.live_result_delivery_channel_by_operation.keys(),
+                self.live_result_released_operations.contains(operation_id)
+                && !self.live_result_delivery_observation_by_operation.contains_key(operation_id)
+                && self.live_result_delivery_operation_by_channel.get_cloned(
+                    self.live_result_delivery_channel_by_operation.get_cloned(operation_id).get("value"))
+                    == Some(operation_id)
+                && self.live_execution_runtime_id_by_channel.contains_key(
+                    self.live_result_delivery_channel_by_operation.get_cloned(operation_id).get("value")))
+            && for_all(channel_id in self.live_result_delivery_operation_by_channel.keys(),
+                self.live_result_released_operations.contains(
+                    self.live_result_delivery_operation_by_channel.get_cloned(channel_id).get("value"))
+                && !self.live_result_delivery_observation_by_operation.contains_key(
+                    self.live_result_delivery_operation_by_channel.get_cloned(channel_id).get("value"))
+                && (!self.live_result_delivery_channel_by_operation.contains_key(
+                        self.live_result_delivery_operation_by_channel.get_cloned(channel_id).get("value"))
+                    || self.live_result_delivery_channel_by_operation.get_cloned(
+                        self.live_result_delivery_operation_by_channel.get_cloned(channel_id).get("value"))
+                        == Some(channel_id)))
+            && for_all(operation_id in self.live_result_delivery_observation_by_operation.keys(),
+                self.live_result_released_operations.contains(operation_id)
+                && !self.live_result_delivery_channel_by_operation.contains_key(operation_id)
+                && !self.live_result_delivery_digest_by_operation.contains_key(operation_id))
+        }
+
+        invariant live_result_speech_suppression_is_exact_and_non_cancelling {
+            for_all(operation_id in self.live_result_speech_suppressed_operations,
+                self.live_delegation_reconciliation_by_operation.contains_key(operation_id)
+                && self.live_interaction_channel_by_id.contains_key(
+                    self.live_delegation_interaction_by_operation
+                        .get_cloned(operation_id).get("value")))
+        }
+
+        invariant live_result_recovery_is_exact_and_channel_scoped {
+            self.live_result_recovery_replacement_by_channel.keys()
+                == self.live_result_recovery_session_by_channel.keys()
+            && self.live_result_recovery_replacement_by_channel.keys()
+                == self.live_result_recovery_operation_by_channel.keys()
+            && self.live_result_recovery_replacement_by_channel.keys()
+                == self.live_result_recovery_digest_by_channel.keys()
+            && self.live_result_recovery_replacement_by_channel.keys()
+                == self.live_result_recovery_seed_cursor_by_channel.keys()
+            && self.live_result_recovery_replacement_by_channel.keys()
+                == self.live_result_recovery_identity_by_channel.keys()
+            && self.live_result_recovery_replacement_by_channel.keys()
+                == self.live_result_recovery_runtime_id_by_channel.keys()
+            && self.live_result_recovery_replacement_by_channel.keys()
+                == self.live_result_recovery_fence_by_channel.keys()
+            && self.live_result_recovery_replacement_by_channel.keys()
+                == self.live_result_recovery_generation_by_channel.keys()
+            && for_all(closing_channel_id in self.live_result_recovery_replacement_by_channel.keys(),
+                self.live_result_recovery_source_by_replacement.get_cloned(
+                    self.live_result_recovery_replacement_by_channel.get_cloned(closing_channel_id).get("value"))
+                    == Some(closing_channel_id)
+                && self.live_result_delivery_observation_by_operation.get_copied(
+                    self.live_result_recovery_operation_by_channel.get_cloned(closing_channel_id).get("value"))
+                    == Some(LiveDelegationResultDeliveryObservation::Ambiguous))
+            && for_all(replacement_channel_id in self.live_result_recovery_source_by_replacement.keys(),
+                self.live_result_recovery_replacement_by_channel.get_cloned(
+                    self.live_result_recovery_source_by_replacement.get_cloned(replacement_channel_id).get("value"))
+                    == Some(replacement_channel_id))
+        }
+
+        invariant live_consequential_authority_requires_confirmed_transcript {
+            for_all(authority_id in self.live_consequential_effect_operation_by_authority.keys(),
+                self.live_delegation_reconciliation_by_operation.get_copied(
+                    self.live_consequential_effect_operation_by_authority.get_cloned(authority_id).get("value"))
+                    == Some(LiveDelegationReconciliation::Confirmed))
+        }
+
+        invariant live_pending_context_append_is_exact_and_channel_scoped {
+            self.live_context_pending_channel_by_append.keys()
+                == self.live_context_pending_previous_cursor_by_append.keys()
+            && self.live_context_pending_channel_by_append.keys()
+                == self.live_context_pending_next_cursor_by_append.keys()
+            && for_all(channel_id in self.live_context_pending_append_by_channel.keys(),
+                self.live_context_pending_channel_by_append.get_cloned(
+                    self.live_context_pending_append_by_channel.get_cloned(channel_id).get("value"))
+                    == Some(channel_id))
+            && for_all(append_id in self.live_context_pending_channel_by_append.keys(),
+                self.live_context_pending_append_by_channel.get_cloned(
+                    self.live_context_pending_channel_by_append.get_cloned(append_id).get("value"))
+                    == Some(append_id))
+        }
+
+        // One MeerkatMachine instance is durable state for one session, so
+        // canonical cursor keys below are session-scoped even though the map
+        // key itself is the row sequence.
+        invariant live_context_outbox_is_exact_and_session_scoped {
+            self.live_context_queued_session_by_append.keys()
+                == self.live_context_queued_cursor_by_append.keys()
+            && self.live_context_queued_session_by_append.keys()
+                == self.live_context_queued_digest_by_append.keys()
+            && self.live_context_queued_session_by_append.keys()
+                == self.live_context_queued_commit_token_by_append.keys()
+            && self.live_context_queued_session_by_append.keys()
+                == self.live_context_queued_disposition_by_append.keys()
+            && for_all(append_id in self.live_context_queued_session_by_append.keys(),
+                self.live_context_queued_append_by_cursor.get_cloned(
+                    self.live_context_queued_cursor_by_append.get_copied(append_id).get("value"))
+                    == Some(append_id))
+            && for_all(canonical_cursor in self.live_context_queued_append_by_cursor.keys(),
+                self.live_context_queued_cursor_by_append.get_copied(
+                    self.live_context_queued_append_by_cursor.get_cloned(canonical_cursor).get("value"))
+                    == Some(canonical_cursor))
+        }
+
+        invariant live_context_recovery_is_exact_and_channel_scoped {
+            self.live_context_recovery_replacement_by_channel.keys()
+                == self.live_context_recovery_session_by_channel.keys()
+            && self.live_context_recovery_replacement_by_channel.keys()
+                == self.live_context_recovery_append_by_channel.keys()
+            && self.live_context_recovery_replacement_by_channel.keys()
+                == self.live_context_recovery_seed_cursor_by_channel.keys()
+            && self.live_context_recovery_replacement_by_channel.keys()
+                == self.live_context_recovery_identity_by_channel.keys()
+            && self.live_context_recovery_replacement_by_channel.keys()
+                == self.live_context_recovery_runtime_id_by_channel.keys()
+            && self.live_context_recovery_replacement_by_channel.keys()
+                == self.live_context_recovery_fence_by_channel.keys()
+            && self.live_context_recovery_replacement_by_channel.keys()
+                == self.live_context_recovery_generation_by_channel.keys()
+            && for_all(closing_channel_id in self.live_context_recovery_replacement_by_channel.keys(),
+                self.live_context_recovery_source_by_replacement.get_cloned(
+                    self.live_context_recovery_replacement_by_channel.get_cloned(closing_channel_id).get("value"))
+                    == Some(closing_channel_id)
+                && self.live_context_ambiguous_no_retry.contains(
+                    self.live_context_recovery_append_by_channel.get_cloned(closing_channel_id).get("value")))
+            && for_all(replacement_channel_id in self.live_context_recovery_source_by_replacement.keys(),
+                self.live_context_recovery_replacement_by_channel.get_cloned(
+                    self.live_context_recovery_source_by_replacement.get_cloned(replacement_channel_id).get("value"))
+                    == Some(replacement_channel_id))
         }
 
         // The entry epoch is a REGISTRATION fact, not a placement fact:
@@ -20472,6 +22273,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "runtime_not_stopping" { self.runtime_stop_deferred == false }
             guard "session_not_active" { !self.live_active_channel_by_session.contains_key(session_id) }
             guard "channel_not_bound" { !self.live_channel_session_by_channel.contains_key(channel_id) }
+            guard "channel_id_not_revoked" { !self.live_revoked_execution_channels.contains(channel_id) }
             update {
                 self.live_open_admission_sequence += 1;
                 self.live_active_channel_by_session.insert(session_id, channel_id);
@@ -20534,6 +22336,32 @@ macro_rules! meerkat_catalog_machine_dsl {
                 bound_llm_identity: None,
                 admitted: false,
                 rejection: Some(LiveOpenAdmissionRejection::ChannelAlreadyBound),
+                sequence: self.live_open_admission_sequence
+            }
+        }
+
+        transition ResolveLiveOpenAdmissionRevokedChannelId {
+            per_phase [Idle, Attached, Running]
+            on input ResolveLiveOpenAdmission { session_id, channel_id, llm_identity }
+            guard "session_id_present" { session_id != "" }
+            guard "channel_id_present" { channel_id != "" }
+            guard "session_registered" { self.session_id != None }
+            guard "session_matches_current" { meerkat_machine_session_id_matches_string(self.session_id, session_id) == true }
+            guard "registration_not_draining" { self.registration_phase != RegistrationPhase::Draining }
+            guard "runtime_not_stopping" { self.runtime_stop_deferred == false }
+            guard "session_not_active" { !self.live_active_channel_by_session.contains_key(session_id) }
+            guard "channel_not_bound" { !self.live_channel_session_by_channel.contains_key(channel_id) }
+            guard "channel_id_revoked" { self.live_revoked_execution_channels.contains(channel_id) }
+            update {
+                self.live_open_admission_sequence += 1;
+            }
+            to Idle
+            emit LiveOpenAdmissionResolved {
+                session_id: session_id,
+                channel_id: channel_id,
+                bound_llm_identity: None,
+                admitted: false,
+                rejection: Some(LiveOpenAdmissionRejection::RevokedChannelId),
                 sequence: self.live_open_admission_sequence
             }
         }
@@ -20637,12 +22465,3826 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.live_active_channel_by_session.remove(session_id);
                 self.live_channel_session_by_channel.remove(channel_id);
                 self.live_channel_identity_by_channel.remove(channel_id);
+                self.live_execution_runtime_id_by_channel.remove(channel_id);
+                self.live_execution_fence_by_channel.remove(channel_id);
+                self.live_execution_generation_by_channel.remove(channel_id);
+                self.live_execution_phase_by_channel.insert(
+                    channel_id,
+                    LiveExecutionChannelPhase::Revoked
+                );
+                self.live_revoked_execution_channels.insert(channel_id);
+                self.live_execution_profile_by_channel.remove(channel_id);
+                self.live_execution_mode_by_channel.remove(channel_id);
+                self.live_function_bridge_capable_channels.remove(channel_id);
+                self.live_client_context_capable_channels.remove(channel_id);
+                self.live_playback_owner_by_channel.remove(channel_id);
+                self.live_playback_readiness_by_channel.remove(channel_id);
+                self.live_activation_receipt_by_channel.remove(channel_id);
+                self.live_execution_profile_by_channel.remove(channel_id);
+                self.live_execution_mode_by_channel.remove(channel_id);
+                self.live_function_bridge_capable_channels.remove(channel_id);
+                self.live_client_context_capable_channels.remove(channel_id);
+                self.live_experimental_staged_runtime_by_channel.remove(channel_id);
+                self.live_experimental_staged_fence_by_channel.remove(channel_id);
+                self.live_experimental_staged_generation_by_channel.remove(channel_id);
+                self.live_experimental_staged_seed_cursor_by_channel.remove(channel_id);
+                self.live_experimental_pending_receipt_by_channel.remove(channel_id);
+                self.live_experimental_execution_channels.remove(channel_id);
+                self.live_active_interaction_by_channel.remove(channel_id);
+                self.live_awaiting_assistant_interaction_by_channel.remove(channel_id);
+                self.live_provider_turn_by_channel.remove(channel_id);
+                self.live_delegation_interaction_by_channel.remove(channel_id);
+                self.live_delegation_operation_by_channel.remove(channel_id);
+                self.live_delegation_provider_turn_by_channel.remove(channel_id);
+                if self.live_bridge_operation_by_channel.contains_key(channel_id) {
+                    if !self.live_bridge_execution_terminal_by_operation.contains_key(
+                        self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value")
+                    ) {
+                        if self.live_bridge_phase_by_operation.get_copied(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                                == Some(LiveBridgeOperationPhase::ExecutionRunning) {
+                            self.live_bridge_cancellation_reason_by_operation.insert(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                                LiveBridgeCancellationReason::ChannelClose
+                            );
+                        } else {
+                            self.live_bridge_execution_terminal_by_operation.insert(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                                MeerkatExecutionTerminal::Cancelled
+                            );
+                            self.live_bridge_phase_by_operation.insert(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                                LiveBridgeOperationPhase::ExecutionTerminal
+                            );
+                        }
+                    }
+                    if self.live_bridge_submission_state_by_operation.get_copied(
+                        self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                            == Some(LiveBridgeSubmissionState::SubmissionAuthorized) {
+                        self.live_bridge_submission_state_by_operation.insert(
+                            self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                            LiveBridgeSubmissionState::CallAbandonedByClose
+                        );
+                    } else {
+                        if self.live_bridge_submission_state_by_operation.get_copied(
+                            self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                                == Some(LiveBridgeSubmissionState::SubmissionAttemptClaimed)
+                            || self.live_bridge_submission_state_by_operation.get_copied(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                                    == Some(LiveBridgeSubmissionState::LocalWriteCompletedAwaitingProof) {
+                            self.live_bridge_submission_state_by_operation.insert(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                                LiveBridgeSubmissionState::SubmissionAmbiguous
+                            );
+                        }
+                    }
+                    self.live_bridge_operation_by_channel.remove(channel_id);
+                }
+                self.live_context_cursor_by_channel.remove(channel_id);
+                if self.live_context_pending_append_by_channel.contains_key(channel_id) {
+                    self.live_context_pending_channel_by_append.remove(
+                        self.live_context_pending_append_by_channel.get_cloned(channel_id).get("value")
+                    );
+                    self.live_context_pending_previous_cursor_by_append.remove(
+                        self.live_context_pending_append_by_channel.get_cloned(channel_id).get("value")
+                    );
+                    self.live_context_pending_next_cursor_by_append.remove(
+                        self.live_context_pending_append_by_channel.get_cloned(channel_id).get("value")
+                    );
+                    self.live_context_pending_append_by_channel.remove(channel_id);
+                }
             }
             to Idle
             emit LiveOpenAdmissionAbandoned {
                 session_id: session_id,
                 channel_id: channel_id,
                 sequence: self.live_open_admission_sequence
+            }
+        }
+
+        transition ResolveLiveExecutionModeAdmission {
+            per_phase [Idle, Attached, Running]
+            on input ResolveLiveExecutionModeAdmission {
+                session_id, channel_id, profile_id, requested_mode,
+                function_bridge_available, client_context_available
+            }
+            guard "profile_present" { profile_id != "" }
+            guard "channel_binding_matches" {
+                self.live_channel_session_by_channel.get_cloned(channel_id) == Some(session_id)
+                && !self.live_revoked_execution_channels.contains(channel_id)
+            }
+            guard "requested_mode_is_genuinely_available" {
+                (requested_mode == LiveExecutionMode::FunctionBridge
+                    && function_bridge_available == true)
+                || (requested_mode == LiveExecutionMode::ClientContext
+                    && client_context_available == true)
+            }
+            guard "mode_resolution_is_fresh" {
+                !self.live_execution_profile_by_channel.contains_key(channel_id)
+                && !self.live_execution_mode_by_channel.contains_key(channel_id)
+            }
+            update {
+                self.live_execution_profile_by_channel.insert(channel_id, profile_id);
+                self.live_execution_mode_by_channel.insert(channel_id, requested_mode);
+                if function_bridge_available == true {
+                    self.live_function_bridge_capable_channels.insert(channel_id);
+                }
+                if client_context_available == true {
+                    self.live_client_context_capable_channels.insert(channel_id);
+                }
+            }
+            to Idle
+            emit LiveExecutionModeAdmissionResolved {
+                session_id: session_id,
+                channel_id: channel_id,
+                profile_id: profile_id,
+                resolved_mode: requested_mode,
+                function_bridge_available: function_bridge_available,
+                client_context_available: client_context_available
+            }
+        }
+
+        // Strict experimental admission stages exact seed and runtime custody
+        // before provider answer materialization. Ordinary public realtime
+        // never enters this transition and therefore cannot create pre-bind
+        // experimental context obligations.
+        transition StageExperimentalLiveExecution {
+            per_phase [Idle, Attached, Running]
+            on input StageExperimentalLiveExecution {
+                session_id, channel_id, runtime_id, fence_token, generation,
+                canonical_seed_cursor, pending_receipt
+            }
+            guard "pending_receipt_present" { pending_receipt != "" }
+            guard "channel_binding_matches" {
+                self.live_active_channel_by_session.get_cloned(session_id) == Some(channel_id)
+                && self.live_channel_session_by_channel.get_cloned(channel_id) == Some(session_id)
+            }
+            guard "execution_mode_is_resolved" {
+                self.live_execution_mode_by_channel.contains_key(channel_id)
+            }
+            guard "runtime_incarnation_matches" { self.active_runtime_id == Some(runtime_id) }
+            guard "fence_incarnation_matches" { self.active_fence_token == Some(fence_token) }
+            guard "generation_incarnation_matches" {
+                self.active_runtime_generation == Some(generation)
+            }
+            guard "execution_not_bound" {
+                !self.live_execution_runtime_id_by_channel.contains_key(channel_id)
+                && !self.live_context_cursor_by_channel.contains_key(channel_id)
+            }
+            guard "experimental_stage_absent" {
+                !self.live_experimental_staged_runtime_by_channel.contains_key(channel_id)
+                && !self.live_experimental_staged_fence_by_channel.contains_key(channel_id)
+                && !self.live_experimental_staged_generation_by_channel.contains_key(channel_id)
+                && !self.live_experimental_staged_seed_cursor_by_channel.contains_key(channel_id)
+                && !self.live_experimental_pending_receipt_by_channel.contains_key(channel_id)
+            }
+            update {
+                self.live_experimental_staged_runtime_by_channel.insert(channel_id, runtime_id);
+                self.live_experimental_staged_fence_by_channel.insert(channel_id, fence_token);
+                self.live_experimental_staged_generation_by_channel.insert(channel_id, generation);
+                self.live_experimental_staged_seed_cursor_by_channel.insert(
+                    channel_id,
+                    canonical_seed_cursor
+                );
+                self.live_experimental_pending_receipt_by_channel.insert(
+                    channel_id,
+                    pending_receipt
+                );
+                self.live_execution_phase_by_channel.insert(
+                    channel_id,
+                    LiveExecutionChannelPhase::Pending
+                );
+            }
+            to Idle
+            emit ExperimentalLiveExecutionStaged {
+                session_id: session_id,
+                channel_id: channel_id,
+                runtime_id: runtime_id,
+                fence_token: fence_token,
+                generation: generation,
+                canonical_seed_cursor: canonical_seed_cursor,
+                pending_receipt: pending_receipt
+            }
+        }
+
+        transition RegisterLivePlaybackOwner {
+            per_phase [Idle, Attached, Running]
+            on input RegisterLivePlaybackOwner {
+                session_id, channel_id, runtime_id, fence_token, generation,
+                owner_id, readiness_id, pending_receipt
+            }
+            guard "identities_present" { owner_id != "" && readiness_id != "" }
+            guard "pending_stage_matches" {
+                self.live_channel_session_by_channel.get_cloned(channel_id) == Some(session_id)
+                && self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Pending)
+                && self.live_experimental_staged_runtime_by_channel.get_cloned(channel_id)
+                    == Some(runtime_id)
+                && self.live_experimental_staged_fence_by_channel.get_copied(channel_id)
+                    == Some(fence_token)
+                && self.live_experimental_staged_generation_by_channel.get_copied(channel_id)
+                    == Some(generation)
+                && self.live_experimental_pending_receipt_by_channel.get_cloned(channel_id)
+                    == Some(pending_receipt)
+            }
+            guard "owner_readiness_is_fresh" {
+                !self.live_playback_owner_by_channel.contains_key(channel_id)
+                && !self.live_playback_readiness_by_channel.contains_key(channel_id)
+            }
+            update {
+                self.live_playback_owner_by_channel.insert(channel_id, owner_id);
+                self.live_playback_readiness_by_channel.insert(channel_id, readiness_id);
+            }
+            to Idle
+            emit LivePlaybackOwnerReady {
+                session_id: session_id,
+                channel_id: channel_id,
+                owner_id: owner_id,
+                readiness_id: readiness_id,
+                phase: LiveExecutionChannelPhase::Pending
+            }
+        }
+
+        transition AuthorizeLiveActiveChannelControl {
+            per_phase [Idle, Attached, Running]
+            on input AuthorizeLiveActiveChannelControl {
+                channel_id, runtime_id, fence_token, generation,
+                activation_receipt, control_authority_id, operation
+            }
+            guard "identities_present" {
+                activation_receipt != "" && control_authority_id != "" && operation != ""
+            }
+            guard "active_receipt_and_binding_match" {
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Active)
+                && self.live_activation_receipt_by_channel.get_cloned(channel_id)
+                    == Some(activation_receipt)
+                && self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+                && self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+                && self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+                && !self.live_revoked_execution_channels.contains(channel_id)
+            }
+            guard "control_authority_is_fresh" {
+                !self.live_active_control_operation_by_authority.contains_key(control_authority_id)
+                && !self.live_consumed_active_control_authorities.contains(control_authority_id)
+            }
+            update {
+                self.live_active_control_operation_by_authority.insert(
+                    control_authority_id,
+                    operation
+                );
+            }
+            to Idle
+            emit LiveActiveChannelControlAuthorityIssued {
+                channel_id: channel_id,
+                activation_receipt: activation_receipt,
+                control_authority_id: control_authority_id,
+                operation: operation
+            }
+        }
+
+        transition ConsumeLiveActiveChannelControl {
+            per_phase [Idle, Attached, Running]
+            on input ConsumeLiveActiveChannelControl {
+                channel_id, activation_receipt, control_authority_id, operation
+            }
+            guard "channel_is_still_active" {
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Active)
+                && self.live_activation_receipt_by_channel.get_cloned(channel_id)
+                    == Some(activation_receipt)
+                && !self.live_revoked_execution_channels.contains(channel_id)
+            }
+            guard "one_use_control_matches" {
+                self.live_active_control_operation_by_authority.get_cloned(control_authority_id)
+                    == Some(operation)
+                && !self.live_consumed_active_control_authorities.contains(control_authority_id)
+            }
+            update {
+                self.live_active_control_operation_by_authority.remove(control_authority_id);
+                self.live_consumed_active_control_authorities.insert(control_authority_id);
+            }
+            to Idle
+            emit LiveActiveChannelControlDispatchAuthorized {
+                channel_id: channel_id,
+                control_authority_id: control_authority_id,
+                operation: operation
+            }
+        }
+
+        transition RevokeLivePlaybackOwner {
+            per_phase [Idle, Attached, Running]
+            on input RevokeLivePlaybackOwner {
+                session_id, channel_id, owner_id, readiness_id
+            }
+            guard "owner_readiness_matches" {
+                self.live_channel_session_by_channel.get_cloned(channel_id) == Some(session_id)
+                && self.live_playback_owner_by_channel.get_cloned(channel_id) == Some(owner_id)
+                && self.live_playback_readiness_by_channel.get_cloned(channel_id) == Some(readiness_id)
+                && (self.live_execution_phase_by_channel.get_copied(channel_id)
+                        == Some(LiveExecutionChannelPhase::Pending)
+                    || self.live_execution_phase_by_channel.get_copied(channel_id)
+                        == Some(LiveExecutionChannelPhase::Active))
+            }
+            update {
+                self.live_execution_phase_by_channel.insert(
+                    channel_id,
+                    LiveExecutionChannelPhase::Revoked
+                );
+                self.live_revoked_execution_channels.insert(channel_id);
+                self.live_experimental_staged_runtime_by_channel.remove(channel_id);
+                self.live_experimental_staged_fence_by_channel.remove(channel_id);
+                self.live_experimental_staged_generation_by_channel.remove(channel_id);
+                self.live_experimental_staged_seed_cursor_by_channel.remove(channel_id);
+                self.live_experimental_execution_channels.remove(channel_id);
+                if self.live_bridge_operation_by_channel.contains_key(channel_id) {
+                    self.live_bridge_cancellation_reason_by_operation.insert(
+                        self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                        LiveBridgeCancellationReason::ChannelClose
+                    );
+                    if !self.live_bridge_execution_terminal_by_operation.contains_key(
+                        self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value")
+                    ) {
+                        if self.live_bridge_phase_by_operation.get_copied(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                                != Some(LiveBridgeOperationPhase::ExecutionRunning) {
+                            self.live_bridge_execution_terminal_by_operation.insert(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                                MeerkatExecutionTerminal::Cancelled
+                            );
+                            self.live_bridge_phase_by_operation.insert(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                                LiveBridgeOperationPhase::ExecutionTerminal
+                            );
+                        }
+                    }
+                    if self.live_bridge_submission_state_by_operation.get_copied(
+                        self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                            == Some(LiveBridgeSubmissionState::SubmissionAuthorized) {
+                        self.live_bridge_submission_state_by_operation.insert(
+                            self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                            LiveBridgeSubmissionState::CallAbandonedByClose
+                        );
+                    } else {
+                        if self.live_bridge_submission_state_by_operation.get_copied(
+                            self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                                == Some(LiveBridgeSubmissionState::SubmissionAttemptClaimed)
+                            || self.live_bridge_submission_state_by_operation.get_copied(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                                    == Some(LiveBridgeSubmissionState::LocalWriteCompletedAwaitingProof) {
+                            self.live_bridge_submission_state_by_operation.insert(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                                LiveBridgeSubmissionState::SubmissionAmbiguous
+                            );
+                        }
+                    }
+                    self.live_bridge_operation_by_channel.remove(channel_id);
+                }
+            }
+            to Idle
+            emit LivePlaybackOwnerRevoked {
+                session_id: session_id,
+                channel_id: channel_id,
+                owner_id: owner_id,
+                phase: LiveExecutionChannelPhase::Revoked
+            }
+        }
+
+        // Explicit close accepts only one exact machine-minted bearer receipt.
+        // Playback-owner and bridge-operation details are derived from state;
+        // callers never echo them or maintain a shadow custody ledger.
+        transition RevokeLiveChannelCloseCustody {
+            per_phase [Idle, Attached, Running]
+            on input RevokeLiveChannelCloseCustody {
+                session_id, channel_id, pending_receipt, activation_receipt
+            }
+            guard "exactly_one_close_receipt_is_present" {
+                (pending_receipt != None && activation_receipt == None)
+                || (pending_receipt == None && activation_receipt != None)
+            }
+            guard "session_and_receipt_match_machine_custody" {
+                self.live_channel_session_by_channel.get_cloned(channel_id) == Some(session_id)
+                && ((pending_receipt != None
+                        && self.live_experimental_pending_receipt_by_channel.get_cloned(channel_id)
+                            == Some(pending_receipt.get("value")))
+                    || (activation_receipt != None
+                        && self.live_activation_receipt_by_channel.get_cloned(channel_id)
+                            == Some(activation_receipt.get("value"))))
+                && (self.live_execution_phase_by_channel.get_copied(channel_id)
+                        == Some(LiveExecutionChannelPhase::Pending)
+                    || self.live_execution_phase_by_channel.get_copied(channel_id)
+                        == Some(LiveExecutionChannelPhase::Active)
+                    || self.live_execution_phase_by_channel.get_copied(channel_id)
+                        == Some(LiveExecutionChannelPhase::Revoked))
+            }
+            update {
+                self.live_execution_phase_by_channel.insert(
+                    channel_id,
+                    LiveExecutionChannelPhase::Revoked
+                );
+                self.live_revoked_execution_channels.insert(channel_id);
+                self.live_playback_owner_by_channel.remove(channel_id);
+                self.live_playback_readiness_by_channel.remove(channel_id);
+                self.live_experimental_staged_runtime_by_channel.remove(channel_id);
+                self.live_experimental_staged_fence_by_channel.remove(channel_id);
+                self.live_experimental_staged_generation_by_channel.remove(channel_id);
+                self.live_experimental_staged_seed_cursor_by_channel.remove(channel_id);
+                self.live_experimental_execution_channels.remove(channel_id);
+                if self.live_bridge_operation_by_channel.contains_key(channel_id) {
+                    self.live_bridge_cancellation_reason_by_operation.insert(
+                        self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                        LiveBridgeCancellationReason::ChannelClose
+                    );
+                    if !self.live_bridge_execution_terminal_by_operation.contains_key(
+                        self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value")
+                    ) {
+                        if self.live_bridge_phase_by_operation.get_copied(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                                != Some(LiveBridgeOperationPhase::ExecutionRunning) {
+                            self.live_bridge_execution_terminal_by_operation.insert(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                                MeerkatExecutionTerminal::Cancelled
+                            );
+                            self.live_bridge_phase_by_operation.insert(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                                LiveBridgeOperationPhase::ExecutionTerminal
+                            );
+                        }
+                    }
+                    if self.live_bridge_submission_state_by_operation.get_copied(
+                        self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                            == Some(LiveBridgeSubmissionState::SubmissionAuthorized) {
+                        self.live_bridge_submission_state_by_operation.insert(
+                            self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                            LiveBridgeSubmissionState::CallAbandonedByClose
+                        );
+                    } else {
+                        if self.live_bridge_submission_state_by_operation.get_copied(
+                            self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                                == Some(LiveBridgeSubmissionState::SubmissionAttemptClaimed)
+                            || self.live_bridge_submission_state_by_operation.get_copied(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                                    == Some(LiveBridgeSubmissionState::LocalWriteCompletedAwaitingProof) {
+                            self.live_bridge_submission_state_by_operation.insert(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                                LiveBridgeSubmissionState::SubmissionAmbiguous
+                            );
+                        }
+                    }
+                    self.live_bridge_operation_by_channel.remove(channel_id);
+                }
+            }
+            to Idle
+            emit LiveChannelCloseCustodyRevoked {
+                session_id: session_id,
+                channel_id: channel_id,
+                phase: LiveExecutionChannelPhase::Revoked,
+                already_closed: false
+            }
+        }
+
+        // A lost close response is replay-safe from the retained opaque
+        // tombstone and generated closed status. No provider effect is minted.
+        transition RevokeLiveChannelCloseCustodyClosedReplay {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RevokeLiveChannelCloseCustody {
+                session_id, channel_id, pending_receipt, activation_receipt
+            }
+            guard "exactly_one_close_receipt_is_present" {
+                (pending_receipt != None && activation_receipt == None)
+                || (pending_receipt == None && activation_receipt != None)
+            }
+            guard "closed_tombstone_matches" {
+                self.live_close_status_by_channel.get_copied(channel_id)
+                    == Some(LiveClosePublicStatus::Closed)
+                && ((pending_receipt != None
+                        && self.live_experimental_pending_receipt_by_channel.get_cloned(channel_id)
+                            == Some(pending_receipt.get("value")))
+                    || (activation_receipt != None
+                        && self.live_activation_receipt_by_channel.get_cloned(channel_id)
+                            == Some(activation_receipt.get("value"))))
+            }
+            to Idle
+            emit LiveChannelCloseCustodyRevoked {
+                session_id: session_id,
+                channel_id: channel_id,
+                phase: LiveExecutionChannelPhase::Revoked,
+                already_closed: true
+            }
+        }
+
+        // Bind the live channel to the exact runtime incarnation after the
+        // ordinary live-open admission. Every semantic callback below repeats
+        // this fence check, so a stale provider transport cannot mutate state.
+        transition BindLiveExecutionChannel {
+            per_phase [Idle, Attached, Running]
+            on input BindLiveExecutionChannel {
+                session_id, channel_id, runtime_id, fence_token, generation,
+                canonical_seed_cursor
+            }
+            guard "channel_binding_matches" {
+                self.live_channel_session_by_channel.get_cloned(channel_id) == Some(session_id)
+            }
+            guard "runtime_binding_matches" { self.active_runtime_id == Some(runtime_id) }
+            guard "fence_binding_matches" { self.active_fence_token == Some(fence_token) }
+            guard "generation_binding_matches" { self.active_runtime_generation == Some(generation) }
+            guard "execution_binding_absent" {
+                !self.live_execution_runtime_id_by_channel.contains_key(channel_id)
+                && !self.live_execution_fence_by_channel.contains_key(channel_id)
+                && !self.live_execution_generation_by_channel.contains_key(channel_id)
+            }
+            guard "channel_is_not_pending_recovery_replacement" {
+                !self.live_context_recovery_source_by_replacement.contains_key(channel_id)
+                && !self.live_result_recovery_source_by_replacement.contains_key(channel_id)
+            }
+            guard "channel_is_not_staged_experimental" {
+                !self.live_experimental_staged_runtime_by_channel.contains_key(channel_id)
+            }
+            update {
+                self.live_execution_runtime_id_by_channel.insert(channel_id, runtime_id);
+                self.live_execution_fence_by_channel.insert(channel_id, fence_token);
+                self.live_execution_generation_by_channel.insert(channel_id, generation);
+                self.live_execution_phase_by_channel.insert(
+                    channel_id,
+                    LiveExecutionChannelPhase::Active
+                );
+                self.live_context_cursor_by_channel.insert(channel_id, canonical_seed_cursor);
+            }
+            to Idle
+            emit LiveExecutionChannelBound {
+                session_id: session_id,
+                channel_id: channel_id,
+                runtime_id: runtime_id,
+                fence_token: fence_token,
+                generation: generation,
+                canonical_seed_cursor: canonical_seed_cursor
+            }
+        }
+
+        // A provider foreground turn is admitted from typed sideband evidence
+        // and receives exactly one Meerkat InteractionId before any
+        // delegation can attach. The provider turn ref is opaque equality
+        // material, not provider-owned semantic identity.
+        transition ObserveLiveProviderTurnStarted {
+            per_phase [Idle, Attached, Running]
+            on input ObserveLiveProviderTurnStarted {
+                channel_id, runtime_id, fence_token, generation,
+                interaction_id, provider_turn_ref
+            }
+            guard "identities_present" { interaction_id != "" && provider_turn_ref != "" }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "interaction_unique" {
+                !self.live_interaction_channel_by_id.contains_key(interaction_id)
+                && !self.live_abandoned_interactions.contains(interaction_id)
+                && !self.live_provider_interaction_by_turn.contains_key(provider_turn_ref)
+                && !self.live_provider_turn_channel_by_ref.contains_key(provider_turn_ref)
+            }
+            guard "channel_has_no_active_provider_turn" {
+                !self.live_provider_turn_by_channel.contains_key(channel_id)
+                && !self.live_active_interaction_by_channel.contains_key(channel_id)
+            }
+            update {
+                if self.live_delegation_operation_by_channel.contains_key(channel_id) {
+                    self.live_result_speech_suppressed_operations.insert(
+                        self.live_delegation_operation_by_channel
+                            .get_cloned(channel_id).get("value")
+                    );
+                }
+                if self.live_result_delivery_operation_by_channel.contains_key(channel_id) {
+                    self.live_result_speech_suppressed_operations.insert(
+                        self.live_result_delivery_operation_by_channel
+                            .get_cloned(channel_id).get("value")
+                    );
+                }
+                self.live_interaction_channel_by_id.insert(interaction_id, channel_id);
+                self.live_active_interaction_by_channel.insert(channel_id, interaction_id);
+                self.live_awaiting_assistant_interaction_by_channel.remove(channel_id);
+                self.live_provider_turn_by_channel.insert(channel_id, provider_turn_ref);
+                self.live_provider_interaction_by_turn.insert(provider_turn_ref, interaction_id);
+                self.live_provider_turn_channel_by_ref.insert(provider_turn_ref, channel_id);
+            }
+            to Idle
+            emit LiveProviderTurnStarted {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                provider_turn_ref: provider_turn_ref
+            }
+        }
+
+        // Freeze an assistant output to the exact foreground InteractionId
+        // placed in the one-response awaiting slot by typed user TurnFinished.
+        // A new user start clears an unconsumed slot, and a later user turn
+        // cannot rewrite an already frozen assistant-turn correlation.
+        transition ObserveLiveAssistantTurnStarted {
+            per_phase [Idle, Attached, Running]
+            on input ObserveLiveAssistantTurnStarted {
+                channel_id, runtime_id, fence_token, generation,
+                assistant_turn_ref
+            }
+            guard "identity_present" { assistant_turn_ref != "" }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "foreground_interaction_exists" {
+                self.live_awaiting_assistant_interaction_by_channel.contains_key(channel_id)
+            }
+            guard "assistant_turn_is_new" {
+                !self.live_assistant_interaction_by_turn.contains_key(assistant_turn_ref)
+                && !self.live_assistant_turn_channel_by_ref.contains_key(assistant_turn_ref)
+            }
+            update {
+                self.live_assistant_interaction_by_turn.insert(
+                    assistant_turn_ref,
+                    self.live_awaiting_assistant_interaction_by_channel
+                        .get_cloned(channel_id).get("value")
+                );
+                self.live_assistant_turn_channel_by_ref.insert(assistant_turn_ref, channel_id);
+                self.live_awaiting_assistant_interaction_by_channel.remove(channel_id);
+            }
+            to Idle
+            emit LiveAssistantTurnStarted {
+                channel_id: channel_id,
+                interaction_id: self.live_assistant_interaction_by_turn
+                    .get_cloned(assistant_turn_ref).get("value"),
+                assistant_turn_ref: assistant_turn_ref
+            }
+        }
+
+        transition AdmitLiveInteraction {
+            per_phase [Idle, Attached, Running]
+            on input AdmitLiveInteraction {
+                session_id, channel_id, runtime_id, fence_token, generation, interaction_id
+            }
+            guard "identity_present" { interaction_id != "" }
+            guard "channel_binding_matches" {
+                self.live_channel_session_by_channel.get_cloned(channel_id) == Some(session_id)
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "interaction_unique" { !self.live_interaction_channel_by_id.contains_key(interaction_id) }
+            guard "channel_has_no_active_interaction" {
+                !self.live_active_interaction_by_channel.contains_key(channel_id)
+                && !self.live_provider_turn_by_channel.contains_key(channel_id)
+            }
+            update {
+                self.live_interaction_channel_by_id.insert(interaction_id, channel_id);
+                self.live_active_interaction_by_channel.insert(channel_id, interaction_id);
+            }
+            to Idle
+            emit LiveInteractionAdmitted {
+                session_id: session_id,
+                channel_id: channel_id,
+                interaction_id: interaction_id
+            }
+        }
+
+        transition AdmitLiveDelegation {
+            per_phase [Idle, Attached, Running]
+            on input AdmitLiveDelegation {
+                channel_id, runtime_id, fence_token, generation, interaction_id,
+                operation_id, provider_turn_correlation, delegation_identity_present,
+                actionable_input_present, exact_join
+            }
+            guard "provider_turn_present" { provider_turn_correlation != "" }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "interaction_is_active" {
+                self.live_active_interaction_by_channel.get_cloned(channel_id) == Some(interaction_id)
+            }
+            guard "interaction_not_abandoned" { !self.live_abandoned_interactions.contains(interaction_id) }
+            guard "one_pending_delegation" {
+                !self.live_delegation_operation_by_channel.contains_key(channel_id)
+            }
+            guard "exact_actionable_join" {
+                delegation_identity_present == true
+                && actionable_input_present == true
+                && exact_join == true
+            }
+            guard "operation_not_known" {
+                !self.live_delegation_reconciliation_by_operation.contains_key(operation_id)
+            }
+            update {
+                self.live_delegation_interaction_by_channel.insert(channel_id, interaction_id);
+                self.live_delegation_operation_by_channel.insert(channel_id, operation_id);
+                self.live_delegation_provider_turn_by_channel.insert(channel_id, provider_turn_correlation);
+                self.live_delegation_interaction_by_operation.insert(operation_id, interaction_id);
+                self.live_delegation_provider_turn_by_operation.insert(operation_id, provider_turn_correlation);
+                self.live_delegation_reconciliation_by_operation.insert(
+                    operation_id,
+                    LiveDelegationReconciliation::Provisional
+                );
+            }
+            to Idle
+            emit LiveDelegationAdmitted {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                provider_turn_correlation: provider_turn_correlation
+            }
+        }
+
+        // Provider turn start and its exact actionable handoff join commit as
+        // one generated transition. Production uses this edge so a rejected
+        // delegation can never leave a separately admitted active interaction.
+        transition AdmitLiveInteractionDelegation {
+            per_phase [Idle, Attached, Running]
+            on input AdmitLiveInteractionDelegation {
+                session_id, channel_id, runtime_id, fence_token, generation,
+                interaction_id, operation_id, provider_turn_correlation,
+                delegation_identity_present, actionable_input_present, exact_join
+            }
+            guard "identities_present" {
+                interaction_id != "" && provider_turn_correlation != ""
+            }
+            guard "channel_binding_matches" {
+                self.live_channel_session_by_channel.get_cloned(channel_id) == Some(session_id)
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "channel_has_no_active_interaction_or_delegation" {
+                !self.live_active_interaction_by_channel.contains_key(channel_id)
+                && !self.live_delegation_operation_by_channel.contains_key(channel_id)
+                && !self.live_provider_turn_by_channel.contains_key(channel_id)
+            }
+            guard "exact_actionable_join" {
+                delegation_identity_present == true
+                && actionable_input_present == true
+                && exact_join == true
+            }
+            guard "identities_are_fresh" {
+                !self.live_interaction_channel_by_id.contains_key(interaction_id)
+                && !self.live_delegation_reconciliation_by_operation.contains_key(operation_id)
+            }
+            update {
+                self.live_interaction_channel_by_id.insert(interaction_id, channel_id);
+                self.live_active_interaction_by_channel.insert(channel_id, interaction_id);
+                self.live_delegation_interaction_by_channel.insert(channel_id, interaction_id);
+                self.live_delegation_operation_by_channel.insert(channel_id, operation_id);
+                self.live_delegation_provider_turn_by_channel.insert(channel_id, provider_turn_correlation);
+                self.live_delegation_interaction_by_operation.insert(operation_id, interaction_id);
+                self.live_delegation_provider_turn_by_operation.insert(operation_id, provider_turn_correlation);
+                self.live_delegation_reconciliation_by_operation.insert(
+                    operation_id,
+                    LiveDelegationReconciliation::Provisional
+                );
+            }
+            to Idle
+            emit LiveInteractionDelegationAdmitted {
+                session_id: session_id,
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                provider_turn_correlation: provider_turn_correlation
+            }
+        }
+
+        transition AuthorizeLiveDelegationWorkerStart {
+            per_phase [Idle, Attached, Running]
+            on input AuthorizeLiveDelegationWorkerStart {
+                channel_id, runtime_id, fence_token, generation, interaction_id,
+                operation_id, provider_turn_correlation, worker_identity
+            }
+            guard "worker_identity_present" { worker_identity != "" }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_operation_join" {
+                self.live_interaction_channel_by_id.get_cloned(interaction_id) == Some(channel_id)
+                && self.live_delegation_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_delegation_provider_turn_by_operation.get_cloned(operation_id) == Some(provider_turn_correlation)
+            }
+            guard "canonical_final_transcript_confirmed" {
+                self.live_delegation_reconciliation_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationReconciliation::Confirmed)
+            }
+            guard "worker_unbound" {
+                !self.live_delegation_worker_identity_by_operation.contains_key(operation_id)
+                && !self.live_delegation_worker_phase_by_operation.contains_key(operation_id)
+            }
+            update {
+                self.live_delegation_worker_identity_by_operation.insert(operation_id, worker_identity);
+                self.live_delegation_worker_phase_by_operation.insert(
+                    operation_id,
+                    LiveDelegationWorkerPhase::StartAuthorized
+                );
+            }
+            to Idle
+            emit LiveDelegationWorkerStartAuthorized {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                worker_identity: worker_identity
+            }
+        }
+
+        transition ResolveLiveDelegationWorkerStart {
+            per_phase [Idle, Attached, Running]
+            on input ResolveLiveDelegationWorkerStart {
+                channel_id, runtime_id, fence_token, generation, interaction_id,
+                operation_id, worker_identity, started
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_worker_start_authority" {
+                self.live_delegation_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_delegation_worker_identity_by_operation.get_cloned(operation_id) == Some(worker_identity)
+                && self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationWorkerPhase::StartAuthorized)
+            }
+            update {
+                self.live_delegation_worker_phase_by_operation.insert(
+                    operation_id,
+                    if started == true {
+                        LiveDelegationWorkerPhase::Running
+                    } else {
+                        LiveDelegationWorkerPhase::Failed
+                    }
+                );
+            }
+            to Idle
+            emit LiveDelegationWorkerStartResolved {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                worker_identity: worker_identity,
+                started: started
+            }
+        }
+
+        transition ReconcileLiveDelegationTranscriptConfirmed {
+            per_phase [Idle, Attached, Running]
+            on input ReconcileLiveDelegationTranscript {
+                channel_id, runtime_id, fence_token, generation, interaction_id,
+                operation_id, provider_turn_correlation, final_transcript_committed,
+                normalized_digest_matches
+            }
+            guard "canonical_commit_matches_provisional" {
+                final_transcript_committed == true
+                && normalized_digest_matches == true
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_operation_join" {
+                self.live_interaction_channel_by_id.get_cloned(interaction_id) == Some(channel_id)
+                && self.live_delegation_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_delegation_provider_turn_by_operation.get_cloned(operation_id) == Some(provider_turn_correlation)
+            }
+            guard "still_provisional" {
+                self.live_delegation_reconciliation_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationReconciliation::Provisional)
+            }
+            update {
+                self.live_delegation_reconciliation_by_operation.insert(
+                    operation_id,
+                    LiveDelegationReconciliation::Confirmed
+                );
+                if self.live_delegation_worker_terminal_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerTerminalKind::Completed)
+                    && !self.live_abandoned_interactions.contains(interaction_id)
+                    && !self.live_delegation_cancellation_reason_by_operation.contains_key(operation_id) {
+                    self.live_delegation_result_eligible_operations.insert(operation_id);
+                }
+            }
+            to Idle
+            emit LiveDelegationTranscriptReconciled {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                reconciliation: LiveDelegationReconciliation::Confirmed,
+                cancellation_required: false
+            }
+        }
+
+        transition ReconcileLiveDelegationTranscriptMaterialConflict {
+            per_phase [Idle, Attached, Running]
+            on input ReconcileLiveDelegationTranscript {
+                channel_id, runtime_id, fence_token, generation, interaction_id,
+                operation_id, provider_turn_correlation, final_transcript_committed,
+                normalized_digest_matches
+            }
+            guard "canonical_commit_conflicts_with_provisional" {
+                final_transcript_committed == true
+                && normalized_digest_matches == false
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_operation_join" {
+                self.live_interaction_channel_by_id.get_cloned(interaction_id) == Some(channel_id)
+                && self.live_delegation_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_delegation_provider_turn_by_operation.get_cloned(operation_id) == Some(provider_turn_correlation)
+            }
+            guard "still_provisional" {
+                self.live_delegation_reconciliation_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationReconciliation::Provisional)
+            }
+            update {
+                self.live_delegation_reconciliation_by_operation.insert(
+                    operation_id,
+                    LiveDelegationReconciliation::MaterialConflict
+                );
+                self.live_abandoned_interactions.insert(interaction_id);
+                self.live_active_interaction_by_channel.remove(channel_id);
+            }
+            to Idle
+            emit LiveDelegationTranscriptReconciled {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                reconciliation: LiveDelegationReconciliation::MaterialConflict,
+                cancellation_required: (self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerPhase::Running)
+                    || self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerPhase::StartAuthorized))
+                    && !self.live_delegation_cancellation_reason_by_operation.contains_key(operation_id)
+            }
+        }
+
+        transition ReconcileLiveDelegationTranscriptMissing {
+            per_phase [Idle, Attached, Running]
+            on input ReconcileLiveDelegationTranscript {
+                channel_id, runtime_id, fence_token, generation, interaction_id,
+                operation_id, provider_turn_correlation, final_transcript_committed,
+                normalized_digest_matches
+            }
+            guard "canonical_transcript_terminally_missing" {
+                final_transcript_committed == false
+                && normalized_digest_matches == false
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_operation_join" {
+                self.live_interaction_channel_by_id.get_cloned(interaction_id) == Some(channel_id)
+                && self.live_delegation_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_delegation_provider_turn_by_operation.get_cloned(operation_id) == Some(provider_turn_correlation)
+            }
+            guard "still_provisional" {
+                self.live_delegation_reconciliation_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationReconciliation::Provisional)
+            }
+            update {
+                self.live_delegation_reconciliation_by_operation.insert(
+                    operation_id,
+                    LiveDelegationReconciliation::Missing
+                );
+                self.live_abandoned_interactions.insert(interaction_id);
+                self.live_active_interaction_by_channel.remove(channel_id);
+            }
+            to Idle
+            emit LiveDelegationTranscriptReconciled {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                reconciliation: LiveDelegationReconciliation::Missing,
+                cancellation_required: (self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerPhase::Running)
+                    || self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerPhase::StartAuthorized))
+                    && !self.live_delegation_cancellation_reason_by_operation.contains_key(operation_id)
+            }
+        }
+
+        transition AuthorizeLiveDelegationTranscriptTerminalCancellation {
+            per_phase [Idle, Attached, Running]
+            on input AuthorizeLiveDelegationTranscriptTerminalCancellation {
+                channel_id, runtime_id, fence_token, generation, interaction_id,
+                operation_id, worker_identity
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_worker_is_cancellable" {
+                self.live_delegation_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_delegation_worker_identity_by_operation.get_cloned(operation_id) == Some(worker_identity)
+                && (self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerPhase::Running)
+                    || self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerPhase::StartAuthorized))
+            }
+            guard "transcript_is_nonconfirmed_terminal" {
+                self.live_delegation_reconciliation_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationReconciliation::MaterialConflict)
+                || self.live_delegation_reconciliation_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationReconciliation::Missing)
+            }
+            update {
+                self.live_delegation_worker_phase_by_operation.insert(
+                    operation_id,
+                    LiveDelegationWorkerPhase::CancelAuthorized
+                );
+                self.live_delegation_cancellation_reason_by_operation.insert(
+                    operation_id,
+                    if self.live_delegation_reconciliation_by_operation.get_copied(operation_id)
+                            == Some(LiveDelegationReconciliation::MaterialConflict) {
+                        LiveDelegationCancellationReason::TranscriptConflict
+                    } else {
+                        LiveDelegationCancellationReason::TranscriptMissing
+                    }
+                );
+            }
+            to Idle
+            emit LiveDelegationCancellationAuthorized {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                worker_identity: worker_identity,
+                reason: if self.live_delegation_reconciliation_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationReconciliation::MaterialConflict) {
+                    LiveDelegationCancellationReason::TranscriptConflict
+                } else {
+                    LiveDelegationCancellationReason::TranscriptMissing
+                },
+                superseding_interaction_id: None
+            }
+        }
+
+        transition AbandonLiveInteractionWithDelegationCancellation {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input AbandonLiveInteraction {
+                channel_id, runtime_id, fence_token, generation, interaction_id
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "interaction_is_active" {
+                self.live_active_interaction_by_channel.get_cloned(channel_id) == Some(interaction_id)
+            }
+            guard "exact_running_worker_exists" {
+                self.live_delegation_interaction_by_channel.get_cloned(channel_id) == Some(interaction_id)
+                && self.live_delegation_worker_identity_by_operation.contains_key(
+                    self.live_delegation_operation_by_channel.get_cloned(channel_id).get("value"))
+                && (self.live_delegation_worker_phase_by_operation.get_copied(
+                        self.live_delegation_operation_by_channel.get_cloned(channel_id).get("value"))
+                        == Some(LiveDelegationWorkerPhase::Running)
+                    || self.live_delegation_worker_phase_by_operation.get_copied(
+                        self.live_delegation_operation_by_channel.get_cloned(channel_id).get("value"))
+                        == Some(LiveDelegationWorkerPhase::StartAuthorized))
+            }
+            update {
+                self.live_abandoned_interactions.insert(interaction_id);
+                self.live_active_interaction_by_channel.remove(channel_id);
+                self.live_delegation_worker_phase_by_operation.insert(
+                    self.live_delegation_operation_by_channel.get_cloned(channel_id).get("value"),
+                    LiveDelegationWorkerPhase::CancelAuthorized
+                );
+                self.live_delegation_cancellation_reason_by_operation.insert(
+                    self.live_delegation_operation_by_channel.get_cloned(channel_id).get("value"),
+                    LiveDelegationCancellationReason::Abandoned
+                );
+            }
+            to Idle
+            emit LiveDelegationCancellationAuthorized {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: self.live_delegation_operation_by_channel.get_cloned(channel_id).get("value"),
+                worker_identity: self.live_delegation_worker_identity_by_operation.get_cloned(
+                    self.live_delegation_operation_by_channel.get_cloned(channel_id).get("value")).get("value"),
+                reason: LiveDelegationCancellationReason::Abandoned,
+                superseding_interaction_id: None
+            }
+        }
+
+        transition SupersedeLiveInteractionWithDelegationCancellation {
+            per_phase [Idle, Attached, Running]
+            on input SupersedeLiveInteraction {
+                session_id, channel_id, runtime_id, fence_token, generation, interaction_id,
+                superseding_interaction_id, operation_id, worker_identity
+            }
+            guard "superseding_identity_present" {
+                superseding_interaction_id != "" && superseding_interaction_id != interaction_id
+            }
+            guard "channel_binding_matches" {
+                self.live_channel_session_by_channel.get_cloned(channel_id) == Some(session_id)
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_active_worker" {
+                self.live_active_interaction_by_channel.get_cloned(channel_id) == Some(interaction_id)
+                && self.live_delegation_operation_by_channel.get_cloned(channel_id) == Some(operation_id)
+                && self.live_delegation_worker_identity_by_operation.get_cloned(operation_id) == Some(worker_identity)
+                && (self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerPhase::Running)
+                    || self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerPhase::StartAuthorized))
+            }
+            guard "superseding_interaction_unique" {
+                !self.live_interaction_channel_by_id.contains_key(superseding_interaction_id)
+            }
+            update {
+                self.live_abandoned_interactions.insert(interaction_id);
+                self.live_active_interaction_by_channel.remove(channel_id);
+                self.live_delegation_worker_phase_by_operation.insert(
+                    operation_id,
+                    LiveDelegationWorkerPhase::CancelAuthorized
+                );
+                self.live_delegation_cancellation_reason_by_operation.insert(
+                    operation_id,
+                    LiveDelegationCancellationReason::Superseded
+                );
+            }
+            to Idle
+            emit LiveDelegationCancellationAuthorized {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                worker_identity: worker_identity,
+                reason: LiveDelegationCancellationReason::Superseded,
+                superseding_interaction_id: Some(superseding_interaction_id)
+            }
+        }
+
+        transition SupersedeCompletedLiveInteractionDelegationWithCancellation {
+            per_phase [Idle, Attached, Running]
+            on input SupersedeLiveInteraction {
+                session_id, channel_id, runtime_id, fence_token, generation, interaction_id,
+                superseding_interaction_id, operation_id, worker_identity
+            }
+            guard "superseding_identity_present" {
+                superseding_interaction_id != "" && superseding_interaction_id != interaction_id
+            }
+            guard "channel_binding_matches" {
+                self.live_channel_session_by_channel.get_cloned(channel_id) == Some(session_id)
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "superseding_interaction_is_active" {
+                self.live_active_interaction_by_channel.get_cloned(channel_id)
+                    == Some(superseding_interaction_id)
+                && !self.live_abandoned_interactions.contains(superseding_interaction_id)
+            }
+            guard "exact_completed_turn_worker_is_pending" {
+                self.live_delegation_interaction_by_channel.get_cloned(channel_id) == Some(interaction_id)
+                && self.live_delegation_operation_by_channel.get_cloned(channel_id) == Some(operation_id)
+                && self.live_delegation_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_delegation_worker_identity_by_operation.get_cloned(operation_id) == Some(worker_identity)
+                && (self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerPhase::Running)
+                    || self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerPhase::StartAuthorized))
+                && self.live_interaction_channel_by_id.get_cloned(interaction_id) == Some(channel_id)
+            }
+            update {
+                self.live_delegation_worker_phase_by_operation.insert(
+                    operation_id,
+                    LiveDelegationWorkerPhase::CancelAuthorized
+                );
+                self.live_delegation_cancellation_reason_by_operation.insert(
+                    operation_id,
+                    LiveDelegationCancellationReason::Superseded
+                );
+            }
+            to Idle
+            emit LiveDelegationCancellationAuthorized {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                worker_identity: worker_identity,
+                reason: LiveDelegationCancellationReason::Superseded,
+                superseding_interaction_id: Some(superseding_interaction_id)
+            }
+        }
+
+        transition SupersedeLiveInteractionWithoutDelegationCancellation {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input SupersedeLiveInteraction {
+                session_id, channel_id, runtime_id, fence_token, generation, interaction_id,
+                superseding_interaction_id, operation_id, worker_identity
+            }
+            guard "superseding_identity_present" {
+                superseding_interaction_id != "" && superseding_interaction_id != interaction_id
+            }
+            guard "channel_binding_matches" {
+                self.live_channel_session_by_channel.get_cloned(channel_id) == Some(session_id)
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_active_terminal_worker" {
+                self.live_active_interaction_by_channel.get_cloned(channel_id) == Some(interaction_id)
+                && self.live_delegation_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_delegation_worker_identity_by_operation.get_cloned(operation_id) == Some(worker_identity)
+                && self.live_delegation_worker_terminal_by_operation.contains_key(operation_id)
+            }
+            guard "superseding_interaction_unique" {
+                !self.live_interaction_channel_by_id.contains_key(superseding_interaction_id)
+            }
+            update {
+                self.live_abandoned_interactions.insert(interaction_id);
+                self.live_active_interaction_by_channel.remove(channel_id);
+            }
+            to Idle
+            emit LiveInteractionSupersededWithoutCancellation {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                superseding_interaction_id: superseding_interaction_id
+            }
+        }
+
+        transition AbandonLiveInteraction {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input AbandonLiveInteraction {
+                channel_id, runtime_id, fence_token, generation, interaction_id
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "interaction_is_active" {
+                self.live_active_interaction_by_channel.get_cloned(channel_id) == Some(interaction_id)
+            }
+            guard "pending_delegation_absent_or_owned" {
+                !self.live_delegation_interaction_by_channel.contains_key(channel_id)
+                || self.live_delegation_interaction_by_channel.get_cloned(channel_id) == Some(interaction_id)
+            }
+            guard "no_cancellable_worker" {
+                !self.live_delegation_operation_by_channel.contains_key(channel_id)
+                || (self.live_delegation_worker_phase_by_operation.get_copied(
+                        self.live_delegation_operation_by_channel.get_cloned(channel_id).get("value"))
+                        != Some(LiveDelegationWorkerPhase::Running)
+                    && self.live_delegation_worker_phase_by_operation.get_copied(
+                        self.live_delegation_operation_by_channel.get_cloned(channel_id).get("value"))
+                        != Some(LiveDelegationWorkerPhase::StartAuthorized))
+            }
+            update {
+                self.live_abandoned_interactions.insert(interaction_id);
+                self.live_active_interaction_by_channel.remove(channel_id);
+                self.live_delegation_interaction_by_channel.remove(channel_id);
+                self.live_delegation_operation_by_channel.remove(channel_id);
+                self.live_delegation_provider_turn_by_channel.remove(channel_id);
+            }
+            to Idle
+            emit LiveInteractionAbandoned {
+                channel_id: channel_id,
+                interaction_id: interaction_id
+            }
+        }
+
+        transition AbandonLiveInteractionPreservingEarlierDelegation {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input AbandonLiveInteraction {
+                channel_id, runtime_id, fence_token, generation, interaction_id
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "interaction_is_active" {
+                self.live_active_interaction_by_channel.get_cloned(channel_id) == Some(interaction_id)
+            }
+            guard "earlier_delegation_is_pending" {
+                self.live_delegation_interaction_by_channel.contains_key(channel_id)
+                && self.live_delegation_interaction_by_channel.get_cloned(channel_id) != Some(interaction_id)
+            }
+            update {
+                self.live_abandoned_interactions.insert(interaction_id);
+                self.live_active_interaction_by_channel.remove(channel_id);
+            }
+            to Idle
+            emit LiveInteractionAbandoned {
+                channel_id: channel_id,
+                interaction_id: interaction_id
+            }
+        }
+
+        transition CompleteLiveInteraction {
+            per_phase [Idle, Attached, Running]
+            on input CompleteLiveInteraction {
+                channel_id, runtime_id, fence_token, generation, provider_turn_ref
+            }
+            guard "provider_turn_present" { provider_turn_ref != "" }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "provider_turn_is_exact" {
+                self.live_provider_turn_by_channel.get_cloned(channel_id) == Some(provider_turn_ref)
+                && self.live_provider_turn_channel_by_ref.get_cloned(provider_turn_ref) == Some(channel_id)
+                && self.live_provider_interaction_by_turn.contains_key(provider_turn_ref)
+            }
+            update {
+                self.live_awaiting_assistant_interaction_by_channel.insert(
+                    channel_id,
+                    self.live_provider_interaction_by_turn
+                        .get_cloned(provider_turn_ref).get("value")
+                );
+                if self.live_active_interaction_by_channel.get_cloned(channel_id)
+                    == self.live_provider_interaction_by_turn.get_cloned(provider_turn_ref) {
+                    self.live_active_interaction_by_channel.remove(channel_id);
+                }
+                self.live_provider_turn_by_channel.remove(channel_id);
+            }
+            to Idle
+            emit LiveProviderTurnFinished {
+                channel_id: channel_id,
+                interaction_id: self.live_provider_interaction_by_turn.get_cloned(provider_turn_ref).get("value"),
+                provider_turn_ref: provider_turn_ref
+            }
+        }
+
+        transition ResolveLiveDelegationCancellation {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ResolveLiveDelegationCancellation {
+                channel_id, runtime_id, fence_token, generation, interaction_id,
+                operation_id, worker_identity, outcome
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_cancel_authority" {
+                self.live_delegation_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_delegation_worker_identity_by_operation.get_cloned(operation_id) == Some(worker_identity)
+                && self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationWorkerPhase::CancelAuthorized)
+                && self.live_delegation_cancellation_reason_by_operation.contains_key(operation_id)
+            }
+            update {
+                if outcome == LiveDelegationCancellationOutcome::Failed {
+                    self.live_delegation_worker_phase_by_operation.insert(
+                        operation_id,
+                        LiveDelegationWorkerPhase::Failed
+                    );
+                }
+            }
+            to Idle
+            emit LiveDelegationCancellationResolved {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                worker_identity: worker_identity,
+                outcome: outcome
+            }
+        }
+
+        transition RecordLiveDelegationWorkerTerminal {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RecordLiveDelegationWorkerTerminal {
+                channel_id, runtime_id, fence_token, generation, interaction_id,
+                operation_id, worker_identity, terminal
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_worker_binding" {
+                self.live_delegation_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_delegation_worker_identity_by_operation.get_cloned(operation_id) == Some(worker_identity)
+            }
+            guard "terminal_not_recorded" {
+                !self.live_delegation_worker_terminal_by_operation.contains_key(operation_id)
+            }
+            guard "worker_started_or_cancelling" {
+                self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationWorkerPhase::Running)
+                || self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationWorkerPhase::CancelAuthorized)
+                || self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationWorkerPhase::Failed)
+            }
+            update {
+                self.live_delegation_worker_terminal_by_operation.insert(operation_id, terminal);
+                self.live_delegation_worker_phase_by_operation.insert(
+                    operation_id,
+                    LiveDelegationWorkerPhase::Terminal
+                );
+                if self.live_abandoned_interactions.contains(interaction_id)
+                    || self.live_delegation_cancellation_reason_by_operation.contains_key(operation_id) {
+                    self.live_delegation_late_terminal_operations.insert(operation_id);
+                }
+                if terminal == LiveDelegationWorkerTerminalKind::Completed
+                    && self.live_delegation_reconciliation_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationReconciliation::Confirmed)
+                    && !self.live_abandoned_interactions.contains(interaction_id)
+                    && !self.live_delegation_cancellation_reason_by_operation.contains_key(operation_id) {
+                    self.live_delegation_result_eligible_operations.insert(operation_id);
+                }
+            }
+            to Idle
+            emit LiveDelegationWorkerTerminalRecorded {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                worker_identity: worker_identity,
+                terminal: terminal,
+                late: self.live_delegation_late_terminal_operations.contains(operation_id),
+                result_eligible: self.live_delegation_result_eligible_operations.contains(operation_id)
+            }
+        }
+
+        // A host restart loses process-local executor and provider custody.
+        // The caller first observes the exact durable Mob terminal and retires
+        // that child. This edge then converges only operation-indexed generated
+        // truth after the original channel is revoked. It cannot authorize a
+        // retry or make the result eligible for provider delivery.
+        transition ReconcileRevokedLiveDelegationWorkerAfterRestartFresh {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ReconcileRevokedLiveDelegationWorkerAfterRestart {
+                session_id, channel_id, interaction_id, operation_id,
+                worker_identity, terminal
+            }
+            guard "original_channel_is_revoked_and_noncurrent" {
+                self.live_revoked_execution_channels.contains(channel_id)
+                && self.live_active_channel_by_session.get_cloned(session_id) != Some(channel_id)
+                && !self.live_channel_session_by_channel.contains_key(channel_id)
+                && !self.live_execution_runtime_id_by_channel.contains_key(channel_id)
+                && !self.live_execution_fence_by_channel.contains_key(channel_id)
+                && !self.live_execution_generation_by_channel.contains_key(channel_id)
+                && !self.live_experimental_execution_channels.contains(channel_id)
+            }
+            guard "exact_persisted_worker_binding" {
+                self.live_interaction_channel_by_id.get_cloned(interaction_id) == Some(channel_id)
+                && self.live_delegation_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_delegation_worker_identity_by_operation.get_cloned(operation_id) == Some(worker_identity)
+                && self.live_delegation_reconciliation_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationReconciliation::Confirmed)
+            }
+            guard "durable_terminal_was_not_yet_recorded" {
+                !self.live_delegation_worker_terminal_by_operation.contains_key(operation_id)
+                && (self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerPhase::StartAuthorized)
+                    || self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerPhase::Running)
+                    || self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerPhase::CancelAuthorized))
+            }
+            update {
+                self.live_delegation_worker_terminal_by_operation.insert(operation_id, terminal);
+                self.live_delegation_worker_phase_by_operation.insert(
+                    operation_id,
+                    LiveDelegationWorkerPhase::Retired
+                );
+                self.live_delegation_late_terminal_operations.insert(operation_id);
+                self.live_delegation_result_eligible_operations.remove(operation_id);
+            }
+            to Idle
+            emit LiveDelegationWorkerRestartReconciled {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                worker_identity: worker_identity,
+                terminal: terminal,
+                replay: false
+            }
+        }
+
+        // Crash after generated terminal recording but before physical child
+        // retirement uses the same restart input. Exact durable terminal
+        // equality is required before old result eligibility is fenced.
+        transition ReconcileRevokedLiveDelegationWorkerAfterRestartTerminalCustody {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ReconcileRevokedLiveDelegationWorkerAfterRestart {
+                session_id, channel_id, interaction_id, operation_id,
+                worker_identity, terminal
+            }
+            guard "original_channel_is_revoked_and_noncurrent" {
+                self.live_revoked_execution_channels.contains(channel_id)
+                && self.live_active_channel_by_session.get_cloned(session_id) != Some(channel_id)
+                && !self.live_channel_session_by_channel.contains_key(channel_id)
+                && !self.live_execution_runtime_id_by_channel.contains_key(channel_id)
+                && !self.live_execution_fence_by_channel.contains_key(channel_id)
+                && !self.live_execution_generation_by_channel.contains_key(channel_id)
+                && !self.live_experimental_execution_channels.contains(channel_id)
+            }
+            guard "exact_persisted_terminal_worker_binding" {
+                self.live_interaction_channel_by_id.get_cloned(interaction_id) == Some(channel_id)
+                && self.live_delegation_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_delegation_worker_identity_by_operation.get_cloned(operation_id) == Some(worker_identity)
+                && self.live_delegation_worker_terminal_by_operation.get_copied(operation_id)
+                    == Some(terminal)
+                && (self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerPhase::Terminal)
+                    || self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerPhase::RetirementAuthorized)
+                    || self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerPhase::Retired))
+            }
+            guard "restart_fence_is_not_already_complete" {
+                self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        != Some(LiveDelegationWorkerPhase::Retired)
+                    || !self.live_delegation_late_terminal_operations.contains(operation_id)
+                    || self.live_delegation_result_eligible_operations.contains(operation_id)
+            }
+            update {
+                self.live_delegation_worker_phase_by_operation.insert(
+                    operation_id,
+                    LiveDelegationWorkerPhase::Retired
+                );
+                self.live_delegation_late_terminal_operations.insert(operation_id);
+                self.live_delegation_result_eligible_operations.remove(operation_id);
+            }
+            to Idle
+            emit LiveDelegationWorkerRestartReconciled {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                worker_identity: worker_identity,
+                terminal: terminal,
+                replay: false
+            }
+        }
+
+        transition ReconcileRevokedLiveDelegationWorkerAfterRestartExactReplay {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ReconcileRevokedLiveDelegationWorkerAfterRestart {
+                session_id, channel_id, interaction_id, operation_id,
+                worker_identity, terminal
+            }
+            guard "exact_restart_reconciliation_is_committed" {
+                self.live_revoked_execution_channels.contains(channel_id)
+                && self.live_active_channel_by_session.get_cloned(session_id) != Some(channel_id)
+                && !self.live_channel_session_by_channel.contains_key(channel_id)
+                && !self.live_execution_runtime_id_by_channel.contains_key(channel_id)
+                && !self.live_execution_fence_by_channel.contains_key(channel_id)
+                && !self.live_execution_generation_by_channel.contains_key(channel_id)
+                && !self.live_experimental_execution_channels.contains(channel_id)
+                && self.live_interaction_channel_by_id.get_cloned(interaction_id) == Some(channel_id)
+                && self.live_delegation_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_delegation_worker_identity_by_operation.get_cloned(operation_id) == Some(worker_identity)
+                && self.live_delegation_worker_terminal_by_operation.get_copied(operation_id)
+                    == Some(terminal)
+                && self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationWorkerPhase::Retired)
+                && self.live_delegation_late_terminal_operations.contains(operation_id)
+                && !self.live_delegation_result_eligible_operations.contains(operation_id)
+            }
+            to Idle
+            emit LiveDelegationWorkerRestartReconciled {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                worker_identity: worker_identity,
+                terminal: terminal,
+                replay: true
+            }
+        }
+
+        transition AuthorizeLiveDelegationWorkerRetirement {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input AuthorizeLiveDelegationWorkerRetirement {
+                channel_id, runtime_id, fence_token, generation, interaction_id,
+                operation_id, worker_identity
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_terminal_worker" {
+                self.live_delegation_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_delegation_worker_identity_by_operation.get_cloned(operation_id) == Some(worker_identity)
+                && (self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerPhase::Terminal)
+                    || self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveDelegationWorkerPhase::Failed))
+            }
+            update {
+                self.live_delegation_worker_phase_by_operation.insert(
+                    operation_id,
+                    LiveDelegationWorkerPhase::RetirementAuthorized
+                );
+            }
+            to Idle
+            emit LiveDelegationWorkerRetirementAuthorized {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                worker_identity: worker_identity
+            }
+        }
+
+        transition ResolveLiveDelegationWorkerRetirement {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ResolveLiveDelegationWorkerRetirement {
+                channel_id, runtime_id, fence_token, generation, interaction_id,
+                operation_id, worker_identity, retired
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_retirement_authority" {
+                self.live_delegation_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_delegation_worker_identity_by_operation.get_cloned(operation_id) == Some(worker_identity)
+                && self.live_delegation_worker_phase_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationWorkerPhase::RetirementAuthorized)
+            }
+            update {
+                self.live_delegation_worker_phase_by_operation.insert(
+                    operation_id,
+                    if retired == true {
+                        LiveDelegationWorkerPhase::Retired
+                    } else {
+                        LiveDelegationWorkerPhase::Failed
+                    }
+                );
+                if retired == true {
+                    if !self.live_delegation_worker_terminal_by_operation.contains_key(operation_id) {
+                        self.live_abandoned_interactions.insert(interaction_id);
+                        if self.live_active_interaction_by_channel.get_cloned(channel_id) == Some(interaction_id) {
+                            self.live_active_interaction_by_channel.remove(channel_id);
+                        }
+                    }
+                    if self.live_delegation_operation_by_channel.get_cloned(channel_id) == Some(operation_id) {
+                        self.live_delegation_interaction_by_channel.remove(channel_id);
+                        self.live_delegation_operation_by_channel.remove(channel_id);
+                        self.live_delegation_provider_turn_by_channel.remove(channel_id);
+                    }
+                }
+            }
+            to Idle
+            emit LiveDelegationWorkerRetirementResolved {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                worker_identity: worker_identity,
+                retired: retired
+            }
+        }
+
+        transition AuthorizeLiveConsequentialEffect {
+            per_phase [Idle, Attached, Running]
+            on input AuthorizeLiveConsequentialEffect {
+                channel_id, runtime_id, fence_token, generation, interaction_id,
+                operation_id, authority_id
+            }
+            guard "authority_present" { authority_id != "" }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "interaction_is_admitted_and_not_abandoned" {
+                self.live_interaction_channel_by_id.get_cloned(interaction_id) == Some(channel_id)
+                && !self.live_abandoned_interactions.contains(interaction_id)
+            }
+            guard "operation_join_is_exact" {
+                self.live_delegation_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+            }
+            guard "transcript_confirmed" {
+                self.live_delegation_reconciliation_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationReconciliation::Confirmed)
+            }
+            guard "authority_unique" {
+                !self.live_consequential_effect_operation_by_authority.contains_key(authority_id)
+            }
+            update {
+                self.live_consequential_effect_operation_by_authority.insert(authority_id, operation_id);
+            }
+            to Idle
+            emit LiveConsequentialEffectAuthorized {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                authority_id: authority_id
+            }
+        }
+
+        transition AuthorizeLiveDelegationResultRelease {
+            per_phase [Idle, Attached, Running]
+            on input AuthorizeLiveDelegationResultRelease {
+                channel_id, runtime_id, fence_token, generation, interaction_id,
+                operation_id, provider_turn_correlation
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "interaction_release_window_matches" {
+                !self.live_abandoned_interactions.contains(interaction_id)
+                && self.live_interaction_channel_by_id.get_cloned(interaction_id) == Some(channel_id)
+            }
+            guard "exact_operation_join" {
+                self.live_delegation_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_delegation_provider_turn_by_operation.get_cloned(operation_id) == Some(provider_turn_correlation)
+            }
+            guard "transcript_confirmed" {
+                self.live_delegation_reconciliation_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationReconciliation::Confirmed)
+            }
+            guard "worker_result_is_eligible" {
+                self.live_delegation_result_eligible_operations.contains(operation_id)
+                && !self.live_delegation_late_terminal_operations.contains(operation_id)
+                && self.live_delegation_worker_terminal_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationWorkerTerminalKind::Completed)
+            }
+            guard "result_not_released" { !self.live_result_released_operations.contains(operation_id) }
+            guard "channel_result_delivery_slot_available" {
+                !self.live_result_delivery_operation_by_channel.contains_key(channel_id)
+            }
+            update {
+                self.live_result_released_operations.insert(operation_id);
+                self.live_result_delivery_operation_by_channel.insert(channel_id, operation_id);
+                self.live_result_release_disposition_by_operation.insert(
+                    operation_id,
+                    if self.live_active_interaction_by_channel.get_cloned(channel_id) == Some(interaction_id) { LiveDelegationResultDisposition::OpenTurn } else { LiveDelegationResultDisposition::DeferredContext }
+                );
+                if self.live_delegation_operation_by_channel.get_cloned(channel_id) == Some(operation_id) {
+                    self.live_delegation_interaction_by_channel.remove(channel_id);
+                    self.live_delegation_operation_by_channel.remove(channel_id);
+                    self.live_delegation_provider_turn_by_channel.remove(channel_id);
+                }
+            }
+            to Idle
+            emit LiveDelegationResultReleaseAuthorized {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                provider_turn_correlation: provider_turn_correlation,
+                disposition: if self.live_active_interaction_by_channel.get_cloned(channel_id) == Some(interaction_id) { LiveDelegationResultDisposition::OpenTurn } else { LiveDelegationResultDisposition::DeferredContext }
+            }
+        }
+
+        // A released worker result receives its own provider-context delivery
+        // authority. It is digest-bound and operation-bound, and deliberately
+        // carries no canonical session cursor or SessionDocument append id.
+        transition AuthorizeLiveDelegationResultDelivery {
+            per_phase [Idle, Attached, Running]
+            on input AuthorizeLiveDelegationResultDelivery {
+                channel_id, runtime_id, fence_token, generation, interaction_id,
+                operation_id, provider_turn_correlation, result_digest,
+                disposition
+            }
+            guard "result_digest_present" { result_digest != "" }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "experimental_execution_is_bound" {
+                self.live_experimental_execution_channels.contains(channel_id)
+            }
+            guard "exact_released_operation_join" {
+                self.live_result_released_operations.contains(operation_id)
+                && self.live_delegation_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_delegation_provider_turn_by_operation.get_cloned(operation_id) == Some(provider_turn_correlation)
+                && self.live_result_release_disposition_by_operation.get_copied(operation_id) == Some(disposition)
+            }
+            guard "transcript_and_terminal_still_authorize_result" {
+                self.live_delegation_reconciliation_by_operation.get_copied(operation_id)
+                    == Some(LiveDelegationReconciliation::Confirmed)
+                && self.live_delegation_result_eligible_operations.contains(operation_id)
+                && !self.live_delegation_late_terminal_operations.contains(operation_id)
+            }
+            guard "delivery_not_started_or_resolved" {
+                !self.live_result_delivery_channel_by_operation.contains_key(operation_id)
+                && self.live_result_delivery_operation_by_channel.get_cloned(channel_id)
+                    == Some(operation_id)
+                && !self.live_result_delivery_digest_by_operation.contains_key(operation_id)
+                && !self.live_result_delivery_observation_by_operation.contains_key(operation_id)
+            }
+            update {
+                self.live_result_delivery_channel_by_operation.insert(operation_id, channel_id);
+                self.live_result_delivery_digest_by_operation.insert(operation_id, result_digest);
+            }
+            to Idle
+            emit LiveDelegationResultDeliveryAuthorized {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                provider_turn_correlation: provider_turn_correlation,
+                result_digest: result_digest,
+                disposition: disposition
+            }
+        }
+
+        // Delivered and rejected provider observations terminalize the exact
+        // result without creating a canonical context row or retry path.
+        transition ResolveLiveDelegationResultDelivery {
+            per_phase [Idle, Attached, Running]
+            on input ResolveLiveDelegationResultDelivery {
+                channel_id, runtime_id, fence_token, generation, operation_id,
+                result_digest, replacement_channel_id, observation
+            }
+            guard "non_ambiguous_observation" {
+                observation != LiveDelegationResultDeliveryObservation::Ambiguous
+                && replacement_channel_id == ""
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "pending_delivery_matches" {
+                self.live_result_delivery_channel_by_operation.get_cloned(operation_id) == Some(channel_id)
+                && self.live_result_delivery_digest_by_operation.get_cloned(operation_id) == Some(result_digest)
+                && !self.live_result_delivery_observation_by_operation.contains_key(operation_id)
+            }
+            update {
+                self.live_result_delivery_channel_by_operation.remove(operation_id);
+                self.live_result_delivery_operation_by_channel.remove(channel_id);
+                self.live_result_delivery_digest_by_operation.remove(operation_id);
+                self.live_result_delivery_observation_by_operation.insert(operation_id, observation);
+                if observation == LiveDelegationResultDeliveryObservation::Delivered
+                    && !self.live_result_speech_suppressed_operations.contains(operation_id) {
+                    self.live_awaiting_assistant_interaction_by_channel.insert(
+                        channel_id,
+                        self.live_delegation_interaction_by_operation
+                            .get_cloned(operation_id).get("value")
+                    );
+                }
+            }
+            to Idle
+            emit LiveDelegationResultDeliveryResolved {
+                channel_id: channel_id,
+                operation_id: operation_id,
+                result_digest: result_digest,
+                disposition: self.live_result_release_disposition_by_operation.get_copied(operation_id).get("value"),
+                observation: observation,
+                speech_disposition: if observation != LiveDelegationResultDeliveryObservation::Delivered {
+                    LiveDelegationResultSpeechDisposition::NotDelivered
+                } else {
+                    if self.live_result_speech_suppressed_operations.contains(operation_id) {
+                        LiveDelegationResultSpeechDisposition::SuppressedByNewerUserTurn
+                    } else {
+                        LiveDelegationResultSpeechDisposition::Eligible
+                    }
+                },
+                retry_allowed: false,
+                recovery_required: false
+            }
+        }
+
+        // Ambiguous result delivery is terminal and non-replayable, but it
+        // additionally mints exact close/fresh-channel recovery authority.
+        transition ResolveLiveDelegationResultDeliveryAmbiguous {
+            per_phase [Idle, Attached, Running]
+            on input ResolveLiveDelegationResultDelivery {
+                channel_id, runtime_id, fence_token, generation, operation_id,
+                result_digest, replacement_channel_id, observation
+            }
+            guard "ambiguous_observation_and_fresh_replacement" {
+                observation == LiveDelegationResultDeliveryObservation::Ambiguous
+                && replacement_channel_id != ""
+                && replacement_channel_id != channel_id
+                && !self.live_channel_session_by_channel.contains_key(replacement_channel_id)
+                && !self.live_result_recovery_source_by_replacement.contains_key(replacement_channel_id)
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "pending_delivery_matches" {
+                self.live_result_delivery_channel_by_operation.get_cloned(operation_id) == Some(channel_id)
+                && self.live_result_delivery_digest_by_operation.get_cloned(operation_id) == Some(result_digest)
+                && !self.live_result_delivery_observation_by_operation.contains_key(operation_id)
+            }
+            guard "recovery_facts_present" {
+                self.live_channel_session_by_channel.contains_key(channel_id)
+                && self.live_channel_identity_by_channel.contains_key(channel_id)
+                && self.live_context_cursor_by_channel.contains_key(channel_id)
+                && !self.live_result_recovery_replacement_by_channel.contains_key(channel_id)
+            }
+            update {
+                self.live_result_delivery_channel_by_operation.remove(operation_id);
+                self.live_result_delivery_operation_by_channel.remove(channel_id);
+                self.live_result_delivery_digest_by_operation.remove(operation_id);
+                self.live_result_delivery_observation_by_operation.insert(operation_id, observation);
+                self.live_result_recovery_replacement_by_channel.insert(channel_id, replacement_channel_id);
+                self.live_result_recovery_source_by_replacement.insert(replacement_channel_id, channel_id);
+                self.live_result_recovery_session_by_channel.insert(
+                    channel_id,
+                    self.live_channel_session_by_channel.get_cloned(channel_id).get("value")
+                );
+                self.live_result_recovery_operation_by_channel.insert(channel_id, operation_id);
+                self.live_result_recovery_digest_by_channel.insert(channel_id, result_digest);
+                self.live_result_recovery_seed_cursor_by_channel.insert(
+                    channel_id,
+                    self.live_context_cursor_by_channel.get_copied(channel_id).get("value")
+                );
+                self.live_result_recovery_identity_by_channel.insert(
+                    channel_id,
+                    self.live_channel_identity_by_channel.get_cloned(channel_id).get("value")
+                );
+                self.live_result_recovery_runtime_id_by_channel.insert(channel_id, runtime_id);
+                self.live_result_recovery_fence_by_channel.insert(channel_id, fence_token);
+                self.live_result_recovery_generation_by_channel.insert(channel_id, generation);
+            }
+            to Idle
+            emit LiveDelegationResultAmbiguityRecoveryAuthorized {
+                session_id: self.live_channel_session_by_channel.get_cloned(channel_id).get("value"),
+                closing_channel_id: channel_id,
+                replacement_channel_id: replacement_channel_id,
+                interaction_id: self.live_delegation_interaction_by_operation.get_cloned(operation_id).get("value"),
+                operation_id: operation_id,
+                provider_turn_correlation: self.live_delegation_provider_turn_by_operation.get_cloned(operation_id).get("value"),
+                result_digest: result_digest,
+                disposition: self.live_result_release_disposition_by_operation.get_copied(operation_id).get("value"),
+                canonical_seed_cursor: self.live_context_cursor_by_channel.get_copied(channel_id).get("value"),
+                llm_identity: self.live_channel_identity_by_channel.get_cloned(channel_id).get("value"),
+                runtime_id: runtime_id,
+                fence_token: fence_token,
+                generation: generation
+            }
+        }
+
+        // Replacement answer truth and execution binding are one atomic
+        // commit after SessionReady and exact canonical seed acknowledgement.
+        transition BindLiveDelegationResultRecoveryChannel {
+            per_phase [Idle, Attached, Running]
+            on input BindLiveDelegationResultRecoveryChannel {
+                session_id, closing_channel_id, replacement_channel_id,
+                answer_observation_sequence, runtime_id, fence_token,
+                generation, operation_id, result_digest, canonical_seed_cursor
+            }
+            guard "answer_observation_sequence_present" { answer_observation_sequence > 0 }
+            guard "recovery_obligation_matches" {
+                self.live_result_recovery_replacement_by_channel.get_cloned(closing_channel_id)
+                    == Some(replacement_channel_id)
+                && self.live_result_recovery_source_by_replacement.get_cloned(replacement_channel_id)
+                    == Some(closing_channel_id)
+                && self.live_result_recovery_session_by_channel.get_cloned(closing_channel_id)
+                    == Some(session_id)
+                && self.live_result_recovery_operation_by_channel.get_cloned(closing_channel_id)
+                    == Some(operation_id)
+                && self.live_result_recovery_digest_by_channel.get_cloned(closing_channel_id)
+                    == Some(result_digest)
+                && self.live_result_recovery_seed_cursor_by_channel.get_copied(closing_channel_id)
+                    == Some(canonical_seed_cursor)
+                && self.live_result_recovery_runtime_id_by_channel.get_cloned(closing_channel_id)
+                    == Some(runtime_id)
+                && self.live_result_recovery_fence_by_channel.get_copied(closing_channel_id)
+                    == Some(fence_token)
+                && self.live_result_recovery_generation_by_channel.get_copied(closing_channel_id)
+                    == Some(generation)
+            }
+            guard "replacement_open_admission_matches" {
+                self.live_active_channel_by_session.get_cloned(session_id) == Some(replacement_channel_id)
+                && self.live_channel_session_by_channel.get_cloned(replacement_channel_id) == Some(session_id)
+                && self.live_channel_identity_by_channel.get_cloned(replacement_channel_id)
+                    == self.live_result_recovery_identity_by_channel.get_cloned(closing_channel_id)
+            }
+            guard "runtime_incarnation_matches" {
+                self.active_runtime_id == Some(runtime_id)
+                && self.active_fence_token == Some(fence_token)
+                && self.active_runtime_generation == Some(generation)
+            }
+            guard "replacement_execution_binding_absent" {
+                !self.live_execution_runtime_id_by_channel.contains_key(replacement_channel_id)
+                && !self.live_context_cursor_by_channel.contains_key(replacement_channel_id)
+            }
+            guard "replacement_experimental_stage_matches" {
+                self.live_experimental_staged_runtime_by_channel.get_cloned(replacement_channel_id)
+                    == Some(runtime_id)
+                && self.live_experimental_staged_fence_by_channel.get_copied(replacement_channel_id)
+                    == Some(fence_token)
+                && self.live_experimental_staged_generation_by_channel.get_copied(replacement_channel_id)
+                    == Some(generation)
+                && self.live_experimental_staged_seed_cursor_by_channel.get_copied(replacement_channel_id)
+                    == Some(canonical_seed_cursor)
+            }
+            guard "answer_observation_sequence_advances" {
+                !self.live_webrtc_answer_observation_sequence_by_channel.contains_key(replacement_channel_id)
+                || answer_observation_sequence > self.live_webrtc_answer_observation_sequence_by_channel.get_copied(replacement_channel_id).get("value")
+            }
+            update {
+                self.live_webrtc_answer_result_sequence += 1;
+                self.live_webrtc_answer_observation_sequence_by_channel.insert(replacement_channel_id, answer_observation_sequence);
+                self.live_webrtc_answer_status_by_channel.insert(replacement_channel_id, LiveWebrtcAnswerPublicStatus::Answered);
+                self.live_execution_runtime_id_by_channel.insert(replacement_channel_id, runtime_id);
+                self.live_execution_fence_by_channel.insert(replacement_channel_id, fence_token);
+                self.live_execution_generation_by_channel.insert(replacement_channel_id, generation);
+                self.live_context_cursor_by_channel.insert(replacement_channel_id, canonical_seed_cursor);
+                self.live_experimental_execution_channels.insert(replacement_channel_id);
+                self.live_execution_phase_by_channel.insert(
+                    replacement_channel_id,
+                    LiveExecutionChannelPhase::Active
+                );
+                self.live_experimental_staged_runtime_by_channel.remove(replacement_channel_id);
+                self.live_experimental_staged_fence_by_channel.remove(replacement_channel_id);
+                self.live_experimental_staged_generation_by_channel.remove(replacement_channel_id);
+                self.live_experimental_staged_seed_cursor_by_channel.remove(replacement_channel_id);
+                self.live_experimental_pending_receipt_by_channel.remove(replacement_channel_id);
+                self.live_result_recovery_replacement_by_channel.remove(closing_channel_id);
+                self.live_result_recovery_source_by_replacement.remove(replacement_channel_id);
+                self.live_result_recovery_session_by_channel.remove(closing_channel_id);
+                self.live_result_recovery_operation_by_channel.remove(closing_channel_id);
+                self.live_result_recovery_digest_by_channel.remove(closing_channel_id);
+                self.live_result_recovery_seed_cursor_by_channel.remove(closing_channel_id);
+                self.live_result_recovery_identity_by_channel.remove(closing_channel_id);
+                self.live_result_recovery_runtime_id_by_channel.remove(closing_channel_id);
+                self.live_result_recovery_fence_by_channel.remove(closing_channel_id);
+                self.live_result_recovery_generation_by_channel.remove(closing_channel_id);
+            }
+            to Idle
+            emit LiveDelegationResultRecoveryChannelBound {
+                session_id: session_id,
+                closing_channel_id: closing_channel_id,
+                replacement_channel_id: replacement_channel_id,
+                operation_id: operation_id,
+                result_digest: result_digest,
+                canonical_seed_cursor: canonical_seed_cursor,
+                status: LiveWebrtcAnswerPublicStatus::Answered,
+                answered: true,
+                sequence: self.live_webrtc_answer_result_sequence,
+                answer_observation_sequence: answer_observation_sequence,
+                runtime_id: runtime_id,
+                fence_token: fence_token,
+                generation: generation
+            }
+        }
+
+        // Admit one structurally correlated Responses bridge call directly on
+        // the already-bound durable member. Request text is represented only
+        // by a digest here; no transcript text-equivalence predicate exists.
+        transition AdmitLiveBridgeOperationFresh {
+            per_phase [Idle, Attached, Running]
+            on input AdmitLiveBridgeOperation {
+                session_id, channel_id, runtime_id, fence_token, generation,
+                interaction_id, operation_id, provider_turn_ref,
+                provider_delegation_ref, provider_call_ref, agent_identity,
+                canonical_context_revision, request_digest,
+                structural_lineage_proven
+            }
+            guard "identities_present" {
+                session_id != "" && interaction_id != ""
+                && provider_turn_ref != "" && provider_delegation_ref != ""
+                && provider_call_ref != ""
+                && canonical_context_revision != "" && request_digest != ""
+            }
+            guard "active_channel_binding_matches" {
+                self.live_channel_session_by_channel.get_cloned(channel_id) == Some(session_id)
+                && self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Active)
+                && self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+                && self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+                && self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+                && !self.live_revoked_execution_channels.contains(channel_id)
+            }
+            guard "structural_lineage_is_exact" {
+                structural_lineage_proven == true
+                && self.live_active_interaction_by_channel.get_cloned(channel_id) == Some(interaction_id)
+                && self.live_provider_turn_by_channel.get_cloned(channel_id) == Some(provider_turn_ref)
+                && self.live_provider_interaction_by_turn.get_cloned(provider_turn_ref) == Some(interaction_id)
+                && self.live_provider_turn_channel_by_ref.get_cloned(provider_turn_ref) == Some(channel_id)
+                && !self.live_abandoned_interactions.contains(interaction_id)
+            }
+            guard "fresh_call_and_operation" {
+                !self.live_bridge_operation_by_channel.contains_key(channel_id)
+                && !self.live_bridge_channel_by_operation.contains_key(operation_id)
+            }
+            guard "durable_recovery_image_has_capacity" {
+                128 > self.live_bridge_channel_by_operation.len()
+            }
+            update {
+                self.live_bridge_operation_by_channel.insert(channel_id, operation_id);
+                self.live_bridge_channel_by_operation.insert(operation_id, channel_id);
+                self.live_bridge_interaction_by_operation.insert(operation_id, interaction_id);
+                self.live_bridge_provider_turn_by_operation.insert(operation_id, provider_turn_ref);
+                self.live_bridge_provider_delegation_by_operation.insert(operation_id, provider_delegation_ref);
+                self.live_bridge_provider_call_by_operation.insert(operation_id, provider_call_ref);
+                self.live_bridge_agent_identity_by_operation.insert(operation_id, agent_identity);
+                self.live_bridge_context_revision_by_operation.insert(operation_id, canonical_context_revision);
+                self.live_bridge_request_digest_by_operation.insert(operation_id, request_digest);
+                self.live_bridge_phase_by_operation.insert(
+                    operation_id,
+                    LiveBridgeOperationPhase::PreFinalInference
+                );
+            }
+            to Idle
+            emit LiveBridgeOperationAdmitted {
+                session_id: session_id,
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                provider_turn_ref: provider_turn_ref,
+                provider_delegation_ref: provider_delegation_ref,
+                provider_call_ref: provider_call_ref,
+                agent_identity: agent_identity,
+                canonical_context_revision: canonical_context_revision,
+                request_digest: request_digest,
+                phase: LiveBridgeOperationPhase::PreFinalInference
+            }
+        }
+
+        transition AdmitLiveBridgeOperationExactReplay {
+            per_phase [Idle, Attached, Running]
+            on input AdmitLiveBridgeOperation {
+                session_id, channel_id, runtime_id, fence_token, generation,
+                interaction_id, operation_id, provider_turn_ref,
+                provider_delegation_ref, provider_call_ref, agent_identity,
+                canonical_context_revision, request_digest,
+                structural_lineage_proven
+            }
+            guard "active_channel_binding_matches" {
+                self.live_channel_session_by_channel.get_cloned(channel_id) == Some(session_id)
+                && self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Active)
+                && self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+                && self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+                && self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_replay_matches_existing_operation" {
+                structural_lineage_proven == true
+                && self.live_bridge_operation_by_channel.contains_key(channel_id)
+                && self.live_bridge_interaction_by_operation.get_cloned(
+                    self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                    == Some(interaction_id)
+                && self.live_bridge_provider_turn_by_operation.get_cloned(
+                    self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                    == Some(provider_turn_ref)
+                && self.live_bridge_provider_delegation_by_operation.get_cloned(
+                    self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                    == Some(provider_delegation_ref)
+                && self.live_bridge_provider_call_by_operation.get_cloned(
+                    self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                    == Some(provider_call_ref)
+                && self.live_bridge_agent_identity_by_operation.get_cloned(
+                    self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                    == Some(agent_identity)
+                && self.live_bridge_context_revision_by_operation.get_cloned(
+                    self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                    == Some(canonical_context_revision)
+                && self.live_bridge_request_digest_by_operation.get_cloned(
+                    self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                    == Some(request_digest)
+            }
+            to Idle
+            emit LiveBridgeOperationReplayObserved {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: self.live_bridge_operation_by_channel
+                    .get_cloned(channel_id).get("value"),
+                provider_delegation_ref: provider_delegation_ref,
+                provider_call_ref: provider_call_ref
+            }
+        }
+
+        transition AdmitLiveBridgeOperationProtocolDrift {
+            per_phase [Idle, Attached, Running]
+            on input AdmitLiveBridgeOperation {
+                session_id, channel_id, runtime_id, fence_token, generation,
+                interaction_id, operation_id, provider_turn_ref,
+                provider_delegation_ref, provider_call_ref, agent_identity,
+                canonical_context_revision, request_digest,
+                structural_lineage_proven
+            }
+            guard "active_channel_binding_matches" {
+                self.live_channel_session_by_channel.get_cloned(channel_id) == Some(session_id)
+                && self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Active)
+                && self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+                && self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+                && self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "different_call_while_delegation_is_occupied" {
+                self.live_bridge_operation_by_channel.contains_key(channel_id)
+                && (self.live_bridge_provider_call_by_operation.get_cloned(
+                        self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                        != Some(provider_call_ref)
+                    || self.live_bridge_provider_delegation_by_operation.get_cloned(
+                        self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                        != Some(provider_delegation_ref)
+                    || self.live_bridge_request_digest_by_operation.get_cloned(
+                        self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                        != Some(request_digest))
+            }
+            update {
+                self.live_execution_phase_by_channel.insert(channel_id, LiveExecutionChannelPhase::Revoked);
+                self.live_revoked_execution_channels.insert(channel_id);
+                self.live_bridge_cancellation_reason_by_operation.insert(
+                    self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                    LiveBridgeCancellationReason::ProtocolDrift
+                );
+                if !self.live_bridge_execution_terminal_by_operation.contains_key(
+                    self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value")) {
+                    self.live_bridge_phase_by_operation.insert(
+                        self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                        LiveBridgeOperationPhase::CancellationAuthorized
+                    );
+                }
+            }
+            to Idle
+            emit LiveBridgeProtocolDriftCloseAuthorized {
+                channel_id: channel_id,
+                operation_id: self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                provider_delegation_ref: provider_delegation_ref,
+                provider_call_ref: provider_call_ref
+            }
+        }
+
+        // Canonical final-input evidence confirms only structural lineage. It
+        // never compares provider request text with transcript text.
+        transition ConfirmLiveBridgeFinalInput {
+            per_phase [Idle, Attached, Running]
+            on input ConfirmLiveBridgeFinalInput {
+                channel_id, runtime_id, fence_token, generation,
+                interaction_id, operation_id, provider_turn_ref
+            }
+            guard "active_channel_binding_matches" {
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Active)
+                && self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+                && self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+                && self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_operation_lineage_matches" {
+                self.live_bridge_channel_by_operation.get_cloned(operation_id) == Some(channel_id)
+                && self.live_bridge_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_bridge_provider_turn_by_operation.get_cloned(operation_id) == Some(provider_turn_ref)
+                && self.live_bridge_phase_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeOperationPhase::PreFinalInference)
+                && !self.live_abandoned_interactions.contains(interaction_id)
+            }
+            update {
+                self.live_bridge_phase_by_operation.insert(
+                    operation_id,
+                    LiveBridgeOperationPhase::FinalInputAuthorized
+                );
+            }
+            to Idle
+            emit LiveBridgeFinalInputAuthorized {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                phase: LiveBridgeOperationPhase::FinalInputAuthorized
+            }
+        }
+
+        // The generated machine marks execution as accepted before the host
+        // crosses the durable Mob start boundary. A crash after this authority
+        // but before stable work admission is deliberately repair-blocked and
+        // must never be interpreted as retry permission.
+        transition AuthorizeLiveBridgeExecutionStart {
+            per_phase [Idle, Attached, Running]
+            on input AuthorizeLiveBridgeExecutionStart {
+                channel_id, runtime_id, fence_token, generation,
+                interaction_id, operation_id, request_digest
+            }
+            guard "active_channel_binding_matches" {
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Active)
+                && self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+                && self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+                && self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_final_input_operation_matches" {
+                self.live_bridge_operation_by_channel.get_cloned(channel_id) == Some(operation_id)
+                && self.live_bridge_channel_by_operation.get_cloned(operation_id) == Some(channel_id)
+                && self.live_bridge_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_bridge_request_digest_by_operation.get_cloned(operation_id) == Some(request_digest)
+                && self.live_bridge_phase_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeOperationPhase::FinalInputAuthorized)
+                && !self.live_bridge_execution_terminal_by_operation.contains_key(operation_id)
+                && !self.live_bridge_cancellation_reason_by_operation.contains_key(operation_id)
+            }
+            update {
+                self.live_bridge_phase_by_operation.insert(
+                    operation_id,
+                    LiveBridgeOperationPhase::ExecutionRunning
+                );
+                self.live_bridge_execution_started_operations.insert(operation_id);
+                self.live_bridge_outcome_receipt_required_operations.insert(operation_id);
+            }
+            to Idle
+            emit LiveBridgeExecutionStartAuthorized {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                request_digest: request_digest,
+                phase: LiveBridgeOperationPhase::ExecutionRunning
+            }
+        }
+
+        transition AuthorizeLiveBridgeEffect {
+            per_phase [Idle, Attached, Running]
+            on input AuthorizeLiveBridgeEffect {
+                channel_id, runtime_id, fence_token, generation, interaction_id,
+                operation_id, authority_id, kind
+            }
+            guard "authority_present" { authority_id != "" }
+            guard "active_channel_binding_matches" {
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Active)
+                && self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+                && self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+                && self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "operation_is_current_and_nonterminal" {
+                self.live_bridge_operation_by_channel.get_cloned(channel_id) == Some(operation_id)
+                && self.live_bridge_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && !self.live_bridge_execution_terminal_by_operation.contains_key(operation_id)
+                && !self.live_bridge_cancellation_reason_by_operation.contains_key(operation_id)
+            }
+            guard "phase_allows_effect" {
+                (self.live_bridge_phase_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeOperationPhase::PreFinalInference)
+                    && (kind == LiveBridgeEffectKind::ModelComputation
+                        || kind == LiveBridgeEffectKind::ReadOnlyMemorySnapshot))
+                || self.live_bridge_phase_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeOperationPhase::FinalInputAuthorized)
+            }
+            guard "one_read_and_one_model_computation" {
+                (kind != LiveBridgeEffectKind::ModelComputation
+                    || !self.live_bridge_model_computation_authorized_operations.contains(operation_id))
+                && (kind != LiveBridgeEffectKind::ReadOnlyMemorySnapshot
+                    || !self.live_bridge_read_snapshot_authorized_operations.contains(operation_id))
+            }
+            guard "authority_is_fresh" {
+                !self.live_bridge_effect_operation_by_authority.contains_key(authority_id)
+                && !self.live_bridge_consumed_effect_authorities.contains(authority_id)
+            }
+            update {
+                self.live_bridge_effect_operation_by_authority.insert(authority_id, operation_id);
+                self.live_bridge_effect_kind_by_authority.insert(authority_id, kind);
+                if kind == LiveBridgeEffectKind::ModelComputation {
+                    self.live_bridge_model_computation_authorized_operations.insert(operation_id);
+                }
+                if kind == LiveBridgeEffectKind::ReadOnlyMemorySnapshot {
+                    self.live_bridge_read_snapshot_authorized_operations.insert(operation_id);
+                }
+            }
+            to Idle
+            emit LiveBridgeEffectAuthorityIssued {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                authority_id: authority_id,
+                kind: kind
+            }
+        }
+
+        transition ConsumeLiveBridgeEffectAuthority {
+            per_phase [Idle, Attached, Running]
+            on input ConsumeLiveBridgeEffectAuthority {
+                channel_id, runtime_id, fence_token, generation,
+                operation_id, authority_id, kind
+            }
+            guard "active_channel_binding_matches" {
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Active)
+                && self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+                && self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+                && self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "one_use_authority_matches" {
+                self.live_bridge_effect_operation_by_authority.get_cloned(authority_id) == Some(operation_id)
+                && self.live_bridge_effect_kind_by_authority.get_copied(authority_id) == Some(kind)
+                && !self.live_bridge_consumed_effect_authorities.contains(authority_id)
+            }
+            guard "operation_still_dispatchable" {
+                self.live_bridge_operation_by_channel.get_cloned(channel_id) == Some(operation_id)
+                && !self.live_bridge_execution_terminal_by_operation.contains_key(operation_id)
+                && !self.live_bridge_cancellation_reason_by_operation.contains_key(operation_id)
+                && ((self.live_bridge_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveBridgeOperationPhase::PreFinalInference)
+                        && (kind == LiveBridgeEffectKind::ModelComputation
+                            || kind == LiveBridgeEffectKind::ReadOnlyMemorySnapshot))
+                    || self.live_bridge_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveBridgeOperationPhase::FinalInputAuthorized))
+            }
+            update {
+                self.live_bridge_consumed_effect_authorities.insert(authority_id);
+                self.live_bridge_in_flight_effect_authorities.insert(authority_id);
+            }
+            to Idle
+            emit LiveBridgeEffectDispatchAuthorized {
+                channel_id: channel_id,
+                operation_id: operation_id,
+                authority_id: authority_id,
+                kind: kind
+            }
+        }
+
+        transition RecordLiveBridgeEffectOutcomeFresh {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RecordLiveBridgeEffectOutcome {
+                channel_id, operation_id, authority_id, kind, outcome
+            }
+            guard "exact_consumed_authority_is_in_flight" {
+                self.live_bridge_channel_by_operation.get_cloned(operation_id) == Some(channel_id)
+                && self.live_bridge_effect_operation_by_authority.get_cloned(authority_id)
+                    == Some(operation_id)
+                && self.live_bridge_effect_kind_by_authority.get_copied(authority_id) == Some(kind)
+                && self.live_bridge_consumed_effect_authorities.contains(authority_id)
+                && self.live_bridge_in_flight_effect_authorities.contains(authority_id)
+                && !self.live_bridge_effect_outcome_by_authority.contains_key(authority_id)
+            }
+            update {
+                self.live_bridge_in_flight_effect_authorities.remove(authority_id);
+                self.live_bridge_effect_outcome_by_authority.insert(authority_id, outcome);
+            }
+            to Idle
+            emit LiveBridgeEffectOutcomeRecorded {
+                channel_id: channel_id,
+                operation_id: operation_id,
+                authority_id: authority_id,
+                kind: kind,
+                outcome: outcome,
+                replay: false
+            }
+        }
+
+        transition RecordLiveBridgeEffectOutcomeExactReplay {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RecordLiveBridgeEffectOutcome {
+                channel_id, operation_id, authority_id, kind, outcome
+            }
+            guard "exact_terminal_outcome_already_recorded" {
+                self.live_bridge_channel_by_operation.get_cloned(operation_id) == Some(channel_id)
+                && self.live_bridge_effect_operation_by_authority.get_cloned(authority_id)
+                    == Some(operation_id)
+                && self.live_bridge_effect_kind_by_authority.get_copied(authority_id) == Some(kind)
+                && self.live_bridge_consumed_effect_authorities.contains(authority_id)
+                && !self.live_bridge_in_flight_effect_authorities.contains(authority_id)
+                && self.live_bridge_effect_outcome_by_authority.get_copied(authority_id)
+                    == Some(outcome)
+            }
+            to Idle
+            emit LiveBridgeEffectOutcomeRecorded {
+                channel_id: channel_id,
+                operation_id: operation_id,
+                authority_id: authority_id,
+                kind: kind,
+                outcome: outcome,
+                replay: true
+            }
+        }
+
+        // The source-session append API returns only Applied/AlreadyPresent,
+        // not a sealed store receipt. This trusted runtime observation records
+        // that mechanical completion under the operation identity already
+        // minted and bound by the generated machine. No receipt prose or
+        // caller-selected semantic digest enters machine state.
+        transition RecordLiveBridgeOutcomeReceiptFresh {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RecordLiveBridgeOutcomeReceipt { operation_id }
+            guard "started_operation_is_still_retained" {
+                self.live_bridge_channel_by_operation.contains_key(operation_id)
+                && self.live_bridge_outcome_receipt_required_operations.contains(operation_id)
+                && !self.live_bridge_outcome_receipt_operations.contains(operation_id)
+            }
+            update {
+                self.live_bridge_outcome_receipt_operations.insert(operation_id);
+            }
+            to Idle
+            emit LiveBridgeOutcomeReceiptRecorded {
+                operation_id: operation_id,
+                replay: false
+            }
+        }
+
+        transition RecordLiveBridgeOutcomeReceiptExactReplay {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RecordLiveBridgeOutcomeReceipt { operation_id }
+            guard "exact_receipt_is_already_recorded" {
+                self.live_bridge_channel_by_operation.contains_key(operation_id)
+                && self.live_bridge_outcome_receipt_required_operations.contains(operation_id)
+                && self.live_bridge_outcome_receipt_operations.contains(operation_id)
+            }
+            to Idle
+            emit LiveBridgeOutcomeReceiptRecorded {
+                operation_id: operation_id,
+                replay: true
+            }
+        }
+
+        // A bridge operation may leave the bounded recovery image only after
+        // every semantic obligation is terminal. The runtime may request this
+        // transition, but it cannot select a weaker settlement rule or remove
+        // any generated field itself.
+        transition RetireSettledLiveBridgeOperation {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RetireSettledLiveBridgeOperation { operation_id }
+            guard "operation_has_exact_execution_terminal" {
+                self.live_bridge_channel_by_operation.contains_key(operation_id)
+                && self.live_bridge_phase_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeOperationPhase::ExecutionTerminal)
+                && self.live_bridge_execution_terminal_by_operation.contains_key(operation_id)
+            }
+            guard "started_execution_has_source_outcome_receipt" {
+                !self.live_bridge_outcome_receipt_required_operations.contains(operation_id)
+                || self.live_bridge_outcome_receipt_operations.contains(operation_id)
+            }
+            guard "provider_submission_is_terminal_or_permanently_suppressed" {
+                self.live_bridge_submission_state_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeSubmissionState::ProviderProcessed)
+                || self.live_bridge_submission_state_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeSubmissionState::ProviderRejected)
+                || self.live_bridge_submission_state_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeSubmissionState::SubmissionAmbiguous)
+                || self.live_bridge_submission_state_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeSubmissionState::CallExpired)
+                || self.live_bridge_submission_state_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeSubmissionState::CallAbandonedByClose)
+                || (self.live_bridge_cancellation_reason_by_operation.contains_key(operation_id)
+                    && !self.live_bridge_submission_state_by_operation.contains_key(operation_id))
+            }
+            guard "all_effect_outcomes_are_recorded" {
+                for_all(authority_id in self.live_bridge_effect_operation_by_authority.keys(),
+                    self.live_bridge_effect_operation_by_authority.get_cloned(authority_id)
+                            != Some(operation_id)
+                        || (self.live_bridge_consumed_effect_authorities.contains(authority_id)
+                            && !self.live_bridge_in_flight_effect_authorities.contains(authority_id)
+                            && self.live_bridge_effect_outcome_by_authority.contains_key(authority_id)))
+            }
+            guard "channel_operation_custody_is_closed" {
+                self.live_bridge_operation_by_channel.get_cloned(
+                    self.live_bridge_channel_by_operation.get_cloned(operation_id).get("value"))
+                    != Some(operation_id)
+            }
+            guard "operation_is_not_shared_with_unsettled_delegation_projection" {
+                !self.live_delegation_reconciliation_by_operation.contains_key(operation_id)
+                && !self.live_result_released_operations.contains(operation_id)
+                && !self.live_result_delivery_channel_by_operation.contains_key(operation_id)
+                && !self.live_result_delivery_observation_by_operation.contains_key(operation_id)
+                && for_all(channel_id in self.live_result_recovery_operation_by_channel.keys(),
+                    self.live_result_recovery_operation_by_channel.get_cloned(channel_id)
+                        != Some(operation_id))
+                && for_all(authority_id in self.live_consequential_effect_operation_by_authority.keys(),
+                    self.live_consequential_effect_operation_by_authority.get_cloned(authority_id)
+                        != Some(operation_id))
+            }
+            update {
+                self.live_bridge_effect_kind_by_authority =
+                    meerkat_machine_live_bridge_authority_rows_without_operation(
+                        self.live_bridge_effect_kind_by_authority,
+                        self.live_bridge_effect_operation_by_authority,
+                        operation_id);
+                self.live_bridge_consumed_effect_authorities =
+                    meerkat_machine_live_bridge_authorities_without_operation(
+                        self.live_bridge_consumed_effect_authorities,
+                        self.live_bridge_effect_operation_by_authority,
+                        operation_id);
+                self.live_bridge_in_flight_effect_authorities =
+                    meerkat_machine_live_bridge_authorities_without_operation(
+                        self.live_bridge_in_flight_effect_authorities,
+                        self.live_bridge_effect_operation_by_authority,
+                        operation_id);
+                self.live_bridge_effect_outcome_by_authority =
+                    meerkat_machine_live_bridge_authority_rows_without_operation(
+                        self.live_bridge_effect_outcome_by_authority,
+                        self.live_bridge_effect_operation_by_authority,
+                        operation_id);
+                self.live_bridge_effect_operation_by_authority =
+                    meerkat_machine_live_bridge_authority_rows_without_operation(
+                        self.live_bridge_effect_operation_by_authority,
+                        self.live_bridge_effect_operation_by_authority,
+                        operation_id);
+                self.live_bridge_channel_by_operation.remove(operation_id);
+                self.live_bridge_interaction_by_operation.remove(operation_id);
+                self.live_bridge_provider_turn_by_operation.remove(operation_id);
+                self.live_bridge_provider_delegation_by_operation.remove(operation_id);
+                self.live_bridge_provider_call_by_operation.remove(operation_id);
+                self.live_bridge_agent_identity_by_operation.remove(operation_id);
+                self.live_bridge_context_revision_by_operation.remove(operation_id);
+                self.live_bridge_request_digest_by_operation.remove(operation_id);
+                self.live_bridge_phase_by_operation.remove(operation_id);
+                self.live_bridge_model_computation_authorized_operations.remove(operation_id);
+                self.live_bridge_read_snapshot_authorized_operations.remove(operation_id);
+                self.live_bridge_execution_started_operations.remove(operation_id);
+                self.live_bridge_outcome_receipt_required_operations.remove(operation_id);
+                self.live_bridge_outcome_receipt_operations.remove(operation_id);
+                self.live_bridge_execution_terminal_by_operation.remove(operation_id);
+                self.live_bridge_execution_result_digest_by_operation.remove(operation_id);
+                self.live_bridge_cancellation_reason_by_operation.remove(operation_id);
+                self.live_bridge_submission_output_kind_by_operation.remove(operation_id);
+                self.live_bridge_submission_digest_by_operation.remove(operation_id);
+                self.live_bridge_submission_state_by_operation.remove(operation_id);
+            }
+            to Idle
+            emit LiveBridgeOperationRetirementResolved {
+                operation_id: operation_id,
+                retired_now: true
+            }
+        }
+
+        // Idempotent convergence after an acknowledgement loss or process
+        // restart. This says only that no retained operation state remains;
+        // it does not fabricate evidence that a prior retirement occurred.
+        transition RetireSettledLiveBridgeOperationAlreadyAbsent {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RetireSettledLiveBridgeOperation { operation_id }
+            guard "operation_state_is_already_absent" {
+                !self.live_bridge_channel_by_operation.contains_key(operation_id)
+                && !self.live_bridge_interaction_by_operation.contains_key(operation_id)
+                && !self.live_bridge_provider_turn_by_operation.contains_key(operation_id)
+                && !self.live_bridge_provider_delegation_by_operation.contains_key(operation_id)
+                && !self.live_bridge_provider_call_by_operation.contains_key(operation_id)
+                && !self.live_bridge_agent_identity_by_operation.contains_key(operation_id)
+                && !self.live_bridge_context_revision_by_operation.contains_key(operation_id)
+                && !self.live_bridge_request_digest_by_operation.contains_key(operation_id)
+                && !self.live_bridge_phase_by_operation.contains_key(operation_id)
+                && !self.live_bridge_execution_started_operations.contains(operation_id)
+                && !self.live_bridge_outcome_receipt_required_operations.contains(operation_id)
+                && !self.live_bridge_outcome_receipt_operations.contains(operation_id)
+                && !self.live_bridge_execution_terminal_by_operation.contains_key(operation_id)
+                && !self.live_bridge_execution_result_digest_by_operation.contains_key(operation_id)
+                && !self.live_bridge_cancellation_reason_by_operation.contains_key(operation_id)
+                && !self.live_bridge_submission_output_kind_by_operation.contains_key(operation_id)
+                && !self.live_bridge_submission_digest_by_operation.contains_key(operation_id)
+                && !self.live_bridge_submission_state_by_operation.contains_key(operation_id)
+                && for_all(authority_id in self.live_bridge_effect_operation_by_authority.keys(),
+                    self.live_bridge_effect_operation_by_authority.get_cloned(authority_id)
+                        != Some(operation_id))
+            }
+            to Idle
+            emit LiveBridgeOperationRetirementResolved {
+                operation_id: operation_id,
+                retired_now: false
+            }
+        }
+
+        // Cancellation addresses only the exact operation. The durable member
+        // identity is emitted for attribution, never for retirement.
+        transition CancelLiveBridgeOperation {
+            per_phase [Idle, Attached, Running]
+            on input CancelLiveBridgeOperation {
+                channel_id, runtime_id, fence_token, generation,
+                interaction_id, operation_id, reason
+            }
+            guard "binding_matches_or_is_currently_revoked" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+                && self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+                && self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+                && (self.live_execution_phase_by_channel.get_copied(channel_id)
+                        == Some(LiveExecutionChannelPhase::Active)
+                    || self.live_execution_phase_by_channel.get_copied(channel_id)
+                        == Some(LiveExecutionChannelPhase::Revoked))
+            }
+            guard "exact_nonterminal_operation" {
+                self.live_bridge_channel_by_operation.get_cloned(operation_id) == Some(channel_id)
+                && self.live_bridge_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && !self.live_bridge_execution_terminal_by_operation.contains_key(operation_id)
+                && !self.live_bridge_cancellation_reason_by_operation.contains_key(operation_id)
+            }
+            update {
+                self.live_bridge_cancellation_reason_by_operation.insert(operation_id, reason);
+                if self.live_bridge_phase_by_operation.get_copied(operation_id)
+                        != Some(LiveBridgeOperationPhase::ExecutionRunning) {
+                    self.live_bridge_phase_by_operation.insert(
+                        operation_id,
+                        LiveBridgeOperationPhase::CancellationAuthorized
+                    );
+                }
+            }
+            to Idle
+            emit LiveBridgeOperationCancellationAuthorized {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                agent_identity: self.live_bridge_agent_identity_by_operation
+                    .get_cloned(operation_id).get("value"),
+                reason: reason
+            }
+        }
+
+        transition RecordLiveBridgeExecutionTerminalFresh {
+            per_phase [Idle, Attached, Running]
+            on input RecordLiveBridgeExecutionTerminal {
+                channel_id, runtime_id, fence_token, generation, interaction_id,
+                operation_id, terminal, result_digest
+            }
+            guard "binding_atoms_match" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+                && self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+                && self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_operation_is_nonterminal" {
+                self.live_bridge_channel_by_operation.get_cloned(operation_id) == Some(channel_id)
+                && self.live_bridge_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && !self.live_bridge_execution_terminal_by_operation.contains_key(operation_id)
+            }
+            guard "execution_start_was_recorded" {
+                self.live_bridge_execution_started_operations.contains(operation_id)
+            }
+            guard "terminal_result_shape_is_exact" {
+                (terminal == MeerkatExecutionTerminal::Completed
+                    && result_digest != None
+                    && result_digest.get("value") != "")
+                || (terminal != MeerkatExecutionTerminal::Completed && result_digest == None)
+            }
+            update {
+                self.live_bridge_execution_terminal_by_operation.insert(operation_id, terminal);
+                if result_digest != None {
+                    self.live_bridge_execution_result_digest_by_operation.insert(
+                        operation_id,
+                        result_digest.get("value")
+                    );
+                }
+                self.live_bridge_phase_by_operation.insert(
+                    operation_id,
+                    LiveBridgeOperationPhase::ExecutionTerminal
+                );
+            }
+            to Idle
+            emit LiveBridgeExecutionTerminalRecorded {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                terminal: terminal,
+                result_digest: result_digest,
+                replay: false
+            }
+        }
+
+        transition RecordLiveBridgeExecutionTerminalExactReplay {
+            per_phase [Idle, Attached, Running]
+            on input RecordLiveBridgeExecutionTerminal {
+                channel_id, runtime_id, fence_token, generation, interaction_id,
+                operation_id, terminal, result_digest
+            }
+            guard "binding_atoms_match" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+                && self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+                && self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_operation_and_terminal_match" {
+                self.live_bridge_channel_by_operation.get_cloned(operation_id) == Some(channel_id)
+                && self.live_bridge_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_bridge_phase_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeOperationPhase::ExecutionTerminal)
+                && self.live_bridge_execution_terminal_by_operation.get_copied(operation_id)
+                    == Some(terminal)
+                && ((terminal == MeerkatExecutionTerminal::Completed
+                        && result_digest != None
+                        && result_digest.get("value") != ""
+                        && self.live_bridge_execution_result_digest_by_operation.get_cloned(operation_id)
+                            == Some(result_digest.get("value")))
+                    || (terminal != MeerkatExecutionTerminal::Completed
+                        && result_digest == None
+                        && !self.live_bridge_execution_result_digest_by_operation.contains_key(operation_id)))
+            }
+            guard "execution_start_was_recorded" {
+                self.live_bridge_execution_started_operations.contains(operation_id)
+            }
+            to Idle
+            emit LiveBridgeExecutionTerminalRecorded {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                terminal: terminal,
+                result_digest: result_digest,
+                replay: true
+            }
+        }
+
+        // A restarted host first revokes the provider channel. If execution
+        // had already crossed the generated start boundary, abandonment keeps
+        // cancellation provenance separate and leaves the physical terminal
+        // open for exact stable-delivery reconciliation here. This transition
+        // can never mint provider submission authority.
+        transition FenceRestoredLiveBridgeOperationForRestartFresh {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input FenceRestoredLiveBridgeOperationForRestart {
+                channel_id, interaction_id, operation_id, request_digest
+            }
+            guard "restored_unrevoked_nonterminal_operation_matches_exactly" {
+                self.live_bridge_operation_by_channel.get_cloned(channel_id) == Some(operation_id)
+                && self.live_bridge_channel_by_operation.get_cloned(operation_id) == Some(channel_id)
+                && self.live_bridge_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_bridge_request_digest_by_operation.get_cloned(operation_id) == Some(request_digest)
+                && (self.live_bridge_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveBridgeOperationPhase::PreFinalInference)
+                    || self.live_bridge_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveBridgeOperationPhase::FinalInputAuthorized)
+                    || self.live_bridge_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveBridgeOperationPhase::ExecutionRunning))
+                && !self.live_bridge_execution_terminal_by_operation.contains_key(operation_id)
+                && !self.live_bridge_cancellation_reason_by_operation.contains_key(operation_id)
+                && !self.live_revoked_execution_channels.contains(channel_id)
+            }
+            guard "restored_channel_has_no_live_binding_atoms" {
+                !self.live_channel_session_by_channel.contains_key(channel_id)
+                && !self.live_execution_runtime_id_by_channel.contains_key(channel_id)
+                && !self.live_execution_fence_by_channel.contains_key(channel_id)
+                && !self.live_execution_generation_by_channel.contains_key(channel_id)
+                && !self.live_execution_phase_by_channel.contains_key(channel_id)
+                && !self.live_experimental_execution_channels.contains(channel_id)
+            }
+            update {
+                self.live_bridge_operation_by_channel.remove(channel_id);
+                self.live_bridge_cancellation_reason_by_operation.insert(
+                    operation_id,
+                    LiveBridgeCancellationReason::Restart
+                );
+                self.live_revoked_execution_channels.insert(channel_id);
+                self.live_execution_phase_by_channel.insert(
+                    channel_id,
+                    LiveExecutionChannelPhase::Revoked
+                );
+            }
+            to Idle
+        }
+
+        transition FenceRestoredLiveBridgeOperationForRestartExactReplay {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input FenceRestoredLiveBridgeOperationForRestart {
+                channel_id, interaction_id, operation_id, request_digest
+            }
+            guard "restart_fence_matches_exactly" {
+                !self.live_bridge_operation_by_channel.contains_key(channel_id)
+                && self.live_bridge_channel_by_operation.get_cloned(operation_id) == Some(channel_id)
+                && self.live_bridge_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_bridge_request_digest_by_operation.get_cloned(operation_id) == Some(request_digest)
+                && (self.live_bridge_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveBridgeOperationPhase::PreFinalInference)
+                    || self.live_bridge_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveBridgeOperationPhase::FinalInputAuthorized)
+                    || self.live_bridge_phase_by_operation.get_copied(operation_id)
+                        == Some(LiveBridgeOperationPhase::ExecutionRunning))
+                && !self.live_bridge_execution_terminal_by_operation.contains_key(operation_id)
+                && self.live_bridge_cancellation_reason_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeCancellationReason::Restart)
+                && self.live_revoked_execution_channels.contains(channel_id)
+                && self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Revoked)
+            }
+            guard "restart_fence_has_no_live_binding_atoms" {
+                !self.live_channel_session_by_channel.contains_key(channel_id)
+                && !self.live_execution_runtime_id_by_channel.contains_key(channel_id)
+                && !self.live_execution_fence_by_channel.contains_key(channel_id)
+                && !self.live_execution_generation_by_channel.contains_key(channel_id)
+                && !self.live_experimental_execution_channels.contains(channel_id)
+            }
+            to Idle
+        }
+
+        transition ReconcileRevokedLiveBridgeExecutionTerminalFresh {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ReconcileRevokedLiveBridgeExecutionTerminal {
+                channel_id, interaction_id, operation_id, request_digest,
+                terminal, result_digest
+            }
+            guard "revoked_exact_operation_with_cancellation_provenance" {
+                self.live_revoked_execution_channels.contains(channel_id)
+                && self.live_bridge_channel_by_operation.get_cloned(operation_id) == Some(channel_id)
+                && self.live_bridge_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_bridge_request_digest_by_operation.get_cloned(operation_id) == Some(request_digest)
+                && self.live_bridge_phase_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeOperationPhase::ExecutionRunning)
+                && self.live_bridge_cancellation_reason_by_operation.contains_key(operation_id)
+                && !self.live_bridge_execution_terminal_by_operation.contains_key(operation_id)
+            }
+            guard "terminal_result_shape_is_exact" {
+                (terminal == MeerkatExecutionTerminal::Completed
+                    && result_digest != None
+                    && result_digest.get("value") != "")
+                || (terminal != MeerkatExecutionTerminal::Completed && result_digest == None)
+            }
+            update {
+                self.live_bridge_execution_terminal_by_operation.insert(operation_id, terminal);
+                if result_digest != None {
+                    self.live_bridge_execution_result_digest_by_operation.insert(
+                        operation_id,
+                        result_digest.get("value")
+                    );
+                }
+                self.live_bridge_phase_by_operation.insert(
+                    operation_id,
+                    LiveBridgeOperationPhase::ExecutionTerminal
+                );
+            }
+            to Idle
+            emit LiveBridgeExecutionTerminalRecorded {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                terminal: terminal,
+                result_digest: result_digest,
+                replay: false
+            }
+        }
+
+        transition ReconcileRevokedLiveBridgeExecutionTerminalExactReplay {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ReconcileRevokedLiveBridgeExecutionTerminal {
+                channel_id, interaction_id, operation_id, request_digest,
+                terminal, result_digest
+            }
+            guard "revoked_exact_operation_and_terminal_match" {
+                self.live_revoked_execution_channels.contains(channel_id)
+                && self.live_bridge_channel_by_operation.get_cloned(operation_id) == Some(channel_id)
+                && self.live_bridge_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_bridge_request_digest_by_operation.get_cloned(operation_id) == Some(request_digest)
+                && self.live_bridge_phase_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeOperationPhase::ExecutionTerminal)
+                && self.live_bridge_cancellation_reason_by_operation.contains_key(operation_id)
+                && self.live_bridge_execution_terminal_by_operation.get_copied(operation_id)
+                    == Some(terminal)
+                && ((terminal == MeerkatExecutionTerminal::Completed
+                        && result_digest != None
+                        && result_digest.get("value") != ""
+                        && self.live_bridge_execution_result_digest_by_operation.get_cloned(operation_id)
+                            == Some(result_digest.get("value")))
+                    || (terminal != MeerkatExecutionTerminal::Completed
+                        && result_digest == None
+                        && !self.live_bridge_execution_result_digest_by_operation.contains_key(operation_id)))
+            }
+            to Idle
+            emit LiveBridgeExecutionTerminalRecorded {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                terminal: terminal,
+                result_digest: result_digest,
+                replay: true
+            }
+        }
+
+        transition AuthorizeLiveBridgeSubmission {
+            per_phase [Idle, Attached, Running]
+            on input AuthorizeLiveBridgeSubmission {
+                channel_id, runtime_id, fence_token, generation, interaction_id,
+                operation_id, provider_call_ref, output_kind, output_digest
+            }
+            guard "output_digest_present" { output_digest != "" }
+            guard "active_binding_matches" {
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Active)
+                && self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+                && self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+                && self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_terminal_call_matches" {
+                self.live_bridge_channel_by_operation.get_cloned(operation_id) == Some(channel_id)
+                && self.live_bridge_interaction_by_operation.get_cloned(operation_id) == Some(interaction_id)
+                && self.live_bridge_provider_call_by_operation.get_cloned(operation_id) == Some(provider_call_ref)
+                && self.live_bridge_phase_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeOperationPhase::ExecutionTerminal)
+                && !self.live_bridge_cancellation_reason_by_operation.contains_key(operation_id)
+            }
+            guard "terminal_authorizes_projection" {
+                (self.live_bridge_execution_terminal_by_operation.get_copied(operation_id)
+                        == Some(MeerkatExecutionTerminal::Completed)
+                    && output_kind == LiveBridgeOutputKind::Success
+                    && self.live_bridge_execution_result_digest_by_operation.get_cloned(operation_id)
+                        == Some(output_digest))
+                || ((self.live_bridge_execution_terminal_by_operation.get_copied(operation_id)
+                            == Some(MeerkatExecutionTerminal::Rejected)
+                        || self.live_bridge_execution_terminal_by_operation.get_copied(operation_id)
+                            == Some(MeerkatExecutionTerminal::Failed)
+                        || self.live_bridge_execution_terminal_by_operation.get_copied(operation_id)
+                            == Some(MeerkatExecutionTerminal::TimedOut)
+                        || self.live_bridge_execution_terminal_by_operation.get_copied(operation_id)
+                            == Some(MeerkatExecutionTerminal::Unrecoverable))
+                    && output_kind == LiveBridgeOutputKind::FailureProjection)
+            }
+            guard "submission_not_previously_authorized" {
+                !self.live_bridge_submission_state_by_operation.contains_key(operation_id)
+            }
+            update {
+                self.live_bridge_submission_output_kind_by_operation.insert(operation_id, output_kind);
+                self.live_bridge_submission_digest_by_operation.insert(operation_id, output_digest);
+                self.live_bridge_submission_state_by_operation.insert(
+                    operation_id,
+                    LiveBridgeSubmissionState::SubmissionAuthorized
+                );
+            }
+            to Idle
+            emit LiveBridgeSubmissionAuthorized {
+                channel_id: channel_id,
+                interaction_id: interaction_id,
+                operation_id: operation_id,
+                provider_call_ref: provider_call_ref,
+                output_kind: output_kind,
+                output_digest: output_digest,
+                state: LiveBridgeSubmissionState::SubmissionAuthorized
+            }
+        }
+
+        // This durable transition consumes the one-use send authority before
+        // the executor is permitted to touch transport IO.
+        transition ClaimLiveBridgeSubmissionAttempt {
+            per_phase [Idle, Attached, Running]
+            on input ClaimLiveBridgeSubmissionAttempt {
+                channel_id, runtime_id, fence_token, generation, operation_id,
+                provider_call_ref, output_digest
+            }
+            guard "active_binding_matches" {
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Active)
+                && self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+                && self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+                && self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "authorized_submission_matches" {
+                self.live_bridge_channel_by_operation.get_cloned(operation_id) == Some(channel_id)
+                && self.live_bridge_provider_call_by_operation.get_cloned(operation_id) == Some(provider_call_ref)
+                && self.live_bridge_submission_digest_by_operation.get_cloned(operation_id) == Some(output_digest)
+                && self.live_bridge_submission_state_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeSubmissionState::SubmissionAuthorized)
+            }
+            update {
+                self.live_bridge_submission_state_by_operation.insert(
+                    operation_id,
+                    LiveBridgeSubmissionState::SubmissionAttemptClaimed
+                );
+            }
+            to Idle
+            emit LiveBridgeSubmissionAttemptClaimed {
+                channel_id: channel_id,
+                operation_id: operation_id,
+                provider_call_ref: provider_call_ref,
+                output_digest: output_digest,
+                state: LiveBridgeSubmissionState::SubmissionAttemptClaimed
+            }
+        }
+
+        transition RecordLiveBridgeSubmissionLocalWrite {
+            per_phase [Idle, Attached, Running]
+            on input RecordLiveBridgeSubmissionLocalWrite {
+                channel_id, runtime_id, fence_token, generation, operation_id,
+                provider_call_ref, output_digest
+            }
+            guard "binding_atoms_match" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+                && self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+                && self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "claimed_submission_matches" {
+                self.live_bridge_channel_by_operation.get_cloned(operation_id) == Some(channel_id)
+                && self.live_bridge_provider_call_by_operation.get_cloned(operation_id) == Some(provider_call_ref)
+                && self.live_bridge_submission_digest_by_operation.get_cloned(operation_id) == Some(output_digest)
+                && self.live_bridge_submission_state_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeSubmissionState::SubmissionAttemptClaimed)
+            }
+            update {
+                self.live_bridge_submission_state_by_operation.insert(
+                    operation_id,
+                    LiveBridgeSubmissionState::LocalWriteCompletedAwaitingProof
+                );
+            }
+            to Idle
+            emit LiveBridgeSubmissionLocalWriteRecorded {
+                channel_id: channel_id,
+                operation_id: operation_id,
+                provider_call_ref: provider_call_ref,
+                output_digest: output_digest,
+                state: LiveBridgeSubmissionState::LocalWriteCompletedAwaitingProof
+            }
+        }
+
+        transition ResolveLiveBridgeSubmission {
+            per_phase [Idle, Attached, Running]
+            on input ResolveLiveBridgeSubmission {
+                channel_id, runtime_id, fence_token, generation, operation_id,
+                provider_call_ref, output_digest, observation
+            }
+            guard "binding_atoms_match" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+                && self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+                && self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "submission_identity_matches" {
+                self.live_bridge_channel_by_operation.get_cloned(operation_id) == Some(channel_id)
+                && self.live_bridge_provider_call_by_operation.get_cloned(operation_id) == Some(provider_call_ref)
+                && self.live_bridge_submission_digest_by_operation.get_cloned(operation_id) == Some(output_digest)
+            }
+            guard "observation_matches_current_send_phase" {
+                ((observation == LiveBridgeSubmissionObservation::ProviderProcessed
+                        || observation == LiveBridgeSubmissionObservation::ProviderRejected)
+                    && self.live_bridge_submission_state_by_operation.get_copied(operation_id)
+                        == Some(LiveBridgeSubmissionState::LocalWriteCompletedAwaitingProof))
+                || (observation == LiveBridgeSubmissionObservation::SubmissionAmbiguous
+                    && (self.live_bridge_submission_state_by_operation.get_copied(operation_id)
+                            == Some(LiveBridgeSubmissionState::SubmissionAttemptClaimed)
+                        || self.live_bridge_submission_state_by_operation.get_copied(operation_id)
+                            == Some(LiveBridgeSubmissionState::LocalWriteCompletedAwaitingProof)))
+                || ((observation == LiveBridgeSubmissionObservation::CallExpired
+                        || observation == LiveBridgeSubmissionObservation::CallAbandonedByClose)
+                    && self.live_bridge_submission_state_by_operation.get_copied(operation_id)
+                        == Some(LiveBridgeSubmissionState::SubmissionAuthorized))
+            }
+            update {
+                self.live_bridge_submission_state_by_operation.insert(
+                    operation_id,
+                    if observation == LiveBridgeSubmissionObservation::ProviderProcessed {
+                        LiveBridgeSubmissionState::ProviderProcessed
+                    } else {
+                        if observation == LiveBridgeSubmissionObservation::ProviderRejected {
+                            LiveBridgeSubmissionState::ProviderRejected
+                        } else {
+                            if observation == LiveBridgeSubmissionObservation::SubmissionAmbiguous {
+                                LiveBridgeSubmissionState::SubmissionAmbiguous
+                            } else {
+                                if observation == LiveBridgeSubmissionObservation::CallExpired {
+                                    LiveBridgeSubmissionState::CallExpired
+                                } else {
+                                    LiveBridgeSubmissionState::CallAbandonedByClose
+                                }
+                            }
+                        }
+                    }
+                );
+                if self.live_bridge_operation_by_channel.get_cloned(channel_id) == Some(operation_id) {
+                    self.live_bridge_operation_by_channel.remove(channel_id);
+                }
+            }
+            to Idle
+            emit LiveBridgeSubmissionResolved {
+                channel_id: channel_id,
+                operation_id: operation_id,
+                provider_call_ref: provider_call_ref,
+                output_digest: output_digest,
+                state: if observation == LiveBridgeSubmissionObservation::ProviderProcessed {
+                    LiveBridgeSubmissionState::ProviderProcessed
+                } else {
+                    if observation == LiveBridgeSubmissionObservation::ProviderRejected {
+                        LiveBridgeSubmissionState::ProviderRejected
+                    } else {
+                        if observation == LiveBridgeSubmissionObservation::SubmissionAmbiguous {
+                            LiveBridgeSubmissionState::SubmissionAmbiguous
+                        } else {
+                            if observation == LiveBridgeSubmissionObservation::CallExpired {
+                                LiveBridgeSubmissionState::CallExpired
+                            } else {
+                                LiveBridgeSubmissionState::CallAbandonedByClose
+                            }
+                        }
+                    }
+                },
+                retry_allowed: false
+            }
+        }
+
+        // Recovered claimed or locally written submissions are always
+        // ambiguous. Recovery never returns to SubmissionAuthorized.
+        transition RecoverLiveBridgeSubmission {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RecoverLiveBridgeSubmission { operation_id }
+            guard "claimed_or_locally_written_submission" {
+                self.live_bridge_submission_state_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeSubmissionState::SubmissionAttemptClaimed)
+                || self.live_bridge_submission_state_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeSubmissionState::LocalWriteCompletedAwaitingProof)
+            }
+            update {
+                self.live_bridge_submission_state_by_operation.insert(
+                    operation_id,
+                    LiveBridgeSubmissionState::SubmissionAmbiguous
+                );
+                if self.live_bridge_operation_by_channel.get_cloned(
+                    self.live_bridge_channel_by_operation.get_cloned(operation_id).get("value"))
+                    == Some(operation_id) {
+                    self.live_bridge_operation_by_channel.remove(
+                        self.live_bridge_channel_by_operation.get_cloned(operation_id).get("value")
+                    );
+                }
+            }
+            to Idle
+            emit LiveBridgeSubmissionRecoveredAmbiguous {
+                channel_id: self.live_bridge_channel_by_operation.get_cloned(operation_id).get("value"),
+                operation_id: operation_id,
+                provider_call_ref: self.live_bridge_provider_call_by_operation
+                    .get_cloned(operation_id).get("value"),
+                output_digest: self.live_bridge_submission_digest_by_operation
+                    .get_cloned(operation_id).get("value"),
+                state: LiveBridgeSubmissionState::SubmissionAmbiguous,
+                retry_allowed: false
+            }
+        }
+
+        transition RecoverLiveBridgeSubmissionExactReplay {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RecoverLiveBridgeSubmission { operation_id }
+            guard "submission_is_already_ambiguously_recovered" {
+                self.live_bridge_submission_state_by_operation.get_copied(operation_id)
+                    == Some(LiveBridgeSubmissionState::SubmissionAmbiguous)
+                && self.live_bridge_channel_by_operation.contains_key(operation_id)
+                && self.live_bridge_provider_call_by_operation.contains_key(operation_id)
+                && self.live_bridge_submission_digest_by_operation.contains_key(operation_id)
+            }
+            to Idle
+            emit LiveBridgeSubmissionRecoveredAmbiguous {
+                channel_id: self.live_bridge_channel_by_operation.get_cloned(operation_id).get("value"),
+                operation_id: operation_id,
+                provider_call_ref: self.live_bridge_provider_call_by_operation
+                    .get_cloned(operation_id).get("value"),
+                output_digest: self.live_bridge_submission_digest_by_operation
+                    .get_cloned(operation_id).get("value"),
+                state: LiveBridgeSubmissionState::SubmissionAmbiguous,
+                retry_allowed: false
+            }
+        }
+
+        // Canonical committed rows enter a generated outbox before any
+        // provider-side send is attempted. The sealed runtime bridge accepts
+        // only SessionDocument/store commit authority, so surfaces cannot
+        // manufacture an append obligation or infer provenance from content.
+        transition EnqueueLiveContextRow {
+            per_phase [Idle, Attached, Running]
+            on input EnqueueLiveContextRow {
+                channel_id, runtime_id, fence_token, generation, append_id,
+                canonical_cursor, content_digest, commit_authority_token,
+                disposition
+            }
+            guard "append_present" { append_id != "" }
+            guard "commit_evidence_present" {
+                content_digest != "" && commit_authority_token != ""
+            }
+            guard "channel_is_active_for_session" {
+                self.live_channel_session_by_channel.contains_key(channel_id)
+                && self.live_active_channel_by_session.get_cloned(
+                    self.live_channel_session_by_channel.get_cloned(channel_id).get("value"))
+                    == Some(channel_id)
+            }
+            guard "experimental_context_custody_matches" {
+                (self.live_experimental_staged_runtime_by_channel.get_cloned(channel_id)
+                    == Some(runtime_id)
+                    && self.live_experimental_staged_fence_by_channel.get_copied(channel_id)
+                        == Some(fence_token)
+                    && self.live_experimental_staged_generation_by_channel.get_copied(channel_id)
+                        == Some(generation))
+                || (self.live_experimental_execution_channels.contains(channel_id)
+                    && self.live_execution_runtime_id_by_channel.get_cloned(channel_id)
+                        == Some(runtime_id)
+                    && self.live_execution_fence_by_channel.get_copied(channel_id)
+                        == Some(fence_token)
+                    && self.live_execution_generation_by_channel.get_copied(channel_id)
+                        == Some(generation))
+            }
+            guard "canonical_cursor_is_future" {
+                (self.live_context_cursor_by_channel.contains_key(channel_id)
+                    && self.live_context_cursor_by_channel.get_copied(channel_id).get("value") < canonical_cursor)
+                || (!self.live_context_cursor_by_channel.contains_key(channel_id)
+                    && self.live_experimental_staged_seed_cursor_by_channel.get_copied(channel_id).get("value")
+                        < canonical_cursor)
+            }
+            guard "canonical_cursor_is_unique" {
+                !self.live_context_queued_append_by_cursor.contains_key(canonical_cursor)
+            }
+            guard "append_identity_is_fresh" {
+                !self.live_context_queued_session_by_append.contains_key(append_id)
+                && !self.live_context_pending_channel_by_append.contains_key(append_id)
+                && !self.live_context_delivered_append_ids.contains(append_id)
+                && !self.live_context_ambiguous_no_retry.contains(append_id)
+            }
+            update {
+                self.live_context_queued_session_by_append.insert(
+                    append_id,
+                    self.live_channel_session_by_channel.get_cloned(channel_id).get("value")
+                );
+                self.live_context_queued_cursor_by_append.insert(append_id, canonical_cursor);
+                self.live_context_queued_digest_by_append.insert(append_id, content_digest);
+                self.live_context_queued_commit_token_by_append.insert(append_id, commit_authority_token);
+                self.live_context_queued_disposition_by_append.insert(append_id, disposition);
+                self.live_context_queued_append_by_cursor.insert(canonical_cursor, append_id);
+            }
+            to Idle
+            emit LiveContextRowQueued {
+                session_id: self.live_channel_session_by_channel.get_cloned(channel_id).get("value"),
+                channel_id: channel_id,
+                append_id: append_id,
+                canonical_cursor: canonical_cursor,
+                disposition: disposition
+            }
+        }
+
+        // Rows already present in the live channel and rows excluded from its
+        // context still advance canonical coverage. This exact generated edge
+        // prevents later mirrorable rows from being blocked by canonical gaps
+        // without echoing user/audio/tool/system material back to the model.
+        transition AdvanceLiveContextCanonicalCoverage {
+            per_phase [Idle, Attached, Running]
+            on input AdvanceLiveContextCanonicalCoverage {
+                channel_id, runtime_id, fence_token, generation, append_id,
+                previous_cursor, next_cursor, disposition
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "exact_canonical_outbox_head" {
+                self.live_context_cursor_by_channel.get_copied(channel_id) == Some(previous_cursor)
+                && next_cursor == previous_cursor + 1
+                && self.live_context_queued_session_by_append.get_cloned(append_id)
+                    == self.live_channel_session_by_channel.get_cloned(channel_id)
+                && self.live_context_queued_cursor_by_append.get_copied(append_id) == Some(next_cursor)
+                && self.live_context_queued_append_by_cursor.get_cloned(next_cursor) == Some(append_id)
+            }
+            guard "row_requires_no_provider_send" {
+                self.live_context_queued_disposition_by_append.get_copied(append_id) == Some(disposition)
+                && (disposition == LiveContextRowDisposition::AlreadyPresentInLiveChannel
+                    || disposition == LiveContextRowDisposition::ExcludedFromLiveContext)
+            }
+            update {
+                self.live_context_cursor_by_channel.insert(channel_id, next_cursor);
+                self.live_context_queued_session_by_append.remove(append_id);
+                self.live_context_queued_cursor_by_append.remove(append_id);
+                self.live_context_queued_digest_by_append.remove(append_id);
+                self.live_context_queued_commit_token_by_append.remove(append_id);
+                self.live_context_queued_disposition_by_append.remove(append_id);
+                self.live_context_queued_append_by_cursor.remove(next_cursor);
+            }
+            to Idle
+            emit LiveContextCanonicalCoverageAdvanced {
+                channel_id: channel_id,
+                append_id: append_id,
+                previous_cursor: previous_cursor,
+                next_cursor: next_cursor,
+                disposition: disposition
+            }
+        }
+
+        // Context is machine-authorized before the provider sideband may send
+        // it. The exact append identity and cursor edge remain pending until
+        // a typed delivery observation resolves them.
+        transition AuthorizeLiveContextAppend {
+            per_phase [Idle, Attached, Running]
+            on input AuthorizeLiveContextAppend {
+                channel_id, runtime_id, fence_token, generation, append_id,
+                previous_cursor, next_cursor
+            }
+            guard "append_present" { append_id != "" }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "cursor_edge_is_next" {
+                self.live_context_cursor_by_channel.get_copied(channel_id) == Some(previous_cursor)
+                && next_cursor == previous_cursor + 1
+            }
+            guard "exact_canonical_outbox_head" {
+                self.live_context_queued_session_by_append.get_cloned(append_id)
+                    == self.live_channel_session_by_channel.get_cloned(channel_id)
+                && self.live_context_queued_cursor_by_append.get_copied(append_id) == Some(next_cursor)
+                && self.live_context_queued_append_by_cursor.get_cloned(next_cursor) == Some(append_id)
+                && self.live_context_queued_digest_by_append.contains_key(append_id)
+                && self.live_context_queued_commit_token_by_append.contains_key(append_id)
+                && self.live_context_queued_disposition_by_append.get_copied(append_id)
+                    == Some(LiveContextRowDisposition::MirrorParentText)
+            }
+            guard "channel_has_no_pending_append" {
+                !self.live_context_pending_append_by_channel.contains_key(channel_id)
+            }
+            guard "safe_provider_turn_boundary" {
+                !self.live_provider_turn_by_channel.contains_key(channel_id)
+            }
+            guard "channel_has_no_recovery_obligation" {
+                !self.live_context_recovery_replacement_by_channel.contains_key(channel_id)
+            }
+            guard "append_identity_is_fresh" {
+                !self.live_context_pending_channel_by_append.contains_key(append_id)
+                && !self.live_context_delivered_append_ids.contains(append_id)
+                && !self.live_context_ambiguous_no_retry.contains(append_id)
+            }
+            update {
+                self.live_context_queued_session_by_append.remove(append_id);
+                self.live_context_queued_cursor_by_append.remove(append_id);
+                self.live_context_queued_digest_by_append.remove(append_id);
+                self.live_context_queued_commit_token_by_append.remove(append_id);
+                self.live_context_queued_disposition_by_append.remove(append_id);
+                self.live_context_queued_append_by_cursor.remove(next_cursor);
+                self.live_context_pending_append_by_channel.insert(channel_id, append_id);
+                self.live_context_pending_channel_by_append.insert(append_id, channel_id);
+                self.live_context_pending_previous_cursor_by_append.insert(append_id, previous_cursor);
+                self.live_context_pending_next_cursor_by_append.insert(append_id, next_cursor);
+            }
+            to Idle
+            emit LiveContextAppendAuthorized {
+                channel_id: channel_id,
+                append_id: append_id,
+                previous_cursor: previous_cursor,
+                next_cursor: next_cursor
+            }
+        }
+
+        transition ResolveLiveContextAppendDelivered {
+            per_phase [Idle, Attached, Running]
+            on input ResolveLiveContextAppend {
+                channel_id, runtime_id, fence_token, generation, append_id,
+                previous_cursor, next_cursor, replacement_channel_id, observation
+            }
+            guard "append_present" { append_id != "" }
+            guard "delivery_observed" { observation == LiveContextAppendObservation::Delivered }
+            guard "replacement_channel_absent" { replacement_channel_id == "" }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "canonical_recovery_source_present" {
+                self.live_channel_session_by_channel.contains_key(channel_id)
+                && self.live_channel_identity_by_channel.contains_key(channel_id)
+            }
+            guard "pending_append_matches" {
+                self.live_context_pending_append_by_channel.get_cloned(channel_id) == Some(append_id)
+                && self.live_context_pending_channel_by_append.get_cloned(append_id) == Some(channel_id)
+                && self.live_context_pending_previous_cursor_by_append.get_copied(append_id) == Some(previous_cursor)
+                && self.live_context_pending_next_cursor_by_append.get_copied(append_id) == Some(next_cursor)
+            }
+            guard "cursor_matches" {
+                self.live_context_cursor_by_channel.get_copied(channel_id) == Some(previous_cursor)
+                && next_cursor == previous_cursor + 1
+            }
+            guard "not_ambiguously_sent" { !self.live_context_ambiguous_no_retry.contains(append_id) }
+            guard "append_not_already_delivered" { !self.live_context_delivered_append_ids.contains(append_id) }
+            update {
+                self.live_context_cursor_by_channel.insert(channel_id, next_cursor);
+                self.live_context_delivered_append_ids.insert(append_id);
+                self.live_context_pending_append_by_channel.remove(channel_id);
+                self.live_context_pending_channel_by_append.remove(append_id);
+                self.live_context_pending_previous_cursor_by_append.remove(append_id);
+                self.live_context_pending_next_cursor_by_append.remove(append_id);
+            }
+            to Idle
+            emit LiveContextAppendResolved {
+                channel_id: channel_id,
+                append_id: append_id,
+                cursor: next_cursor,
+                observation: LiveContextAppendObservation::Delivered,
+                retry_allowed: false
+            }
+        }
+
+        transition ResolveLiveContextAppendAmbiguous {
+            per_phase [Idle, Attached, Running]
+            on input ResolveLiveContextAppend {
+                channel_id, runtime_id, fence_token, generation, append_id,
+                previous_cursor, next_cursor, replacement_channel_id, observation
+            }
+            guard "append_present" { append_id != "" }
+            guard "ambiguity_observed" { observation == LiveContextAppendObservation::Ambiguous }
+            guard "replacement_channel_present" { replacement_channel_id != "" }
+            guard "replacement_channel_is_fresh" {
+                !self.live_channel_session_by_channel.contains_key(replacement_channel_id)
+                && !self.live_context_recovery_source_by_replacement.contains_key(replacement_channel_id)
+            }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "canonical_recovery_source_present" {
+                self.live_channel_session_by_channel.contains_key(channel_id)
+                && self.live_channel_identity_by_channel.contains_key(channel_id)
+            }
+            guard "pending_append_matches" {
+                self.live_context_pending_append_by_channel.get_cloned(channel_id) == Some(append_id)
+                && self.live_context_pending_channel_by_append.get_cloned(append_id) == Some(channel_id)
+                && self.live_context_pending_previous_cursor_by_append.get_copied(append_id) == Some(previous_cursor)
+                && self.live_context_pending_next_cursor_by_append.get_copied(append_id) == Some(next_cursor)
+            }
+            guard "cursor_matches_without_advance" {
+                self.live_context_cursor_by_channel.get_copied(channel_id) == Some(previous_cursor)
+                && next_cursor == previous_cursor + 1
+            }
+            guard "ambiguity_not_recorded" { !self.live_context_ambiguous_no_retry.contains(append_id) }
+            guard "append_not_already_delivered" { !self.live_context_delivered_append_ids.contains(append_id) }
+            update {
+                self.live_context_ambiguous_no_retry.insert(append_id);
+                self.live_context_recovery_replacement_by_channel.insert(channel_id, replacement_channel_id);
+                self.live_context_recovery_source_by_replacement.insert(replacement_channel_id, channel_id);
+                self.live_context_recovery_session_by_channel.insert(
+                    channel_id,
+                    self.live_channel_session_by_channel.get_cloned(channel_id).get("value")
+                );
+                self.live_context_recovery_append_by_channel.insert(channel_id, append_id);
+                self.live_context_recovery_seed_cursor_by_channel.insert(channel_id, next_cursor);
+                self.live_context_recovery_identity_by_channel.insert(
+                    channel_id,
+                    self.live_channel_identity_by_channel.get_cloned(channel_id).get("value")
+                );
+                self.live_context_recovery_runtime_id_by_channel.insert(channel_id, runtime_id);
+                self.live_context_recovery_fence_by_channel.insert(channel_id, fence_token);
+                self.live_context_recovery_generation_by_channel.insert(channel_id, generation);
+                self.live_context_pending_append_by_channel.remove(channel_id);
+                self.live_context_pending_channel_by_append.remove(append_id);
+                self.live_context_pending_previous_cursor_by_append.remove(append_id);
+                self.live_context_pending_next_cursor_by_append.remove(append_id);
+            }
+            to Idle
+            emit LiveContextAmbiguityRecoveryAuthorized {
+                session_id: self.live_channel_session_by_channel.get_cloned(channel_id).get("value"),
+                closing_channel_id: channel_id,
+                replacement_channel_id: replacement_channel_id,
+                append_id: append_id,
+                canonical_seed_cursor: next_cursor,
+                llm_identity: self.live_channel_identity_by_channel.get_cloned(channel_id).get("value"),
+                runtime_id: runtime_id,
+                fence_token: fence_token,
+                generation: generation
+            }
+        }
+
+        // Recovery reaches public Answered truth and execution binding in one
+        // generated commit, after the provider proves SessionReady plus exact
+        // canonical seed acknowledgement. A normal bind remains forbidden for
+        // a pending recovery replacement, so intended seed state cannot become
+        // shadow truth.
+        transition BindLiveContextRecoveryChannel {
+            per_phase [Idle, Attached, Running]
+            on input BindLiveContextRecoveryChannel {
+                session_id, closing_channel_id, replacement_channel_id,
+                answer_observation_sequence, runtime_id, fence_token,
+                generation, append_id,
+                canonical_seed_cursor
+            }
+            guard "answer_observation_sequence_present" { answer_observation_sequence > 0 }
+            guard "recovery_obligation_matches" {
+                self.live_context_recovery_replacement_by_channel.get_cloned(closing_channel_id)
+                    == Some(replacement_channel_id)
+                && self.live_context_recovery_source_by_replacement.get_cloned(replacement_channel_id)
+                    == Some(closing_channel_id)
+                && self.live_context_recovery_session_by_channel.get_cloned(closing_channel_id)
+                    == Some(session_id)
+                && self.live_context_recovery_append_by_channel.get_cloned(closing_channel_id)
+                    == Some(append_id)
+                && self.live_context_recovery_seed_cursor_by_channel.get_copied(closing_channel_id)
+                    == Some(canonical_seed_cursor)
+                && self.live_context_recovery_runtime_id_by_channel.get_cloned(closing_channel_id)
+                    == Some(runtime_id)
+                && self.live_context_recovery_fence_by_channel.get_copied(closing_channel_id)
+                    == Some(fence_token)
+                && self.live_context_recovery_generation_by_channel.get_copied(closing_channel_id)
+                    == Some(generation)
+            }
+            guard "replacement_open_admission_matches" {
+                self.live_active_channel_by_session.get_cloned(session_id) == Some(replacement_channel_id)
+                && self.live_channel_session_by_channel.get_cloned(replacement_channel_id) == Some(session_id)
+                && self.live_channel_identity_by_channel.get_cloned(replacement_channel_id)
+                    == self.live_context_recovery_identity_by_channel.get_cloned(closing_channel_id)
+            }
+            guard "runtime_binding_matches" { self.active_runtime_id == Some(runtime_id) }
+            guard "fence_binding_matches" { self.active_fence_token == Some(fence_token) }
+            guard "generation_binding_matches" { self.active_runtime_generation == Some(generation) }
+            guard "replacement_execution_binding_absent" {
+                !self.live_execution_runtime_id_by_channel.contains_key(replacement_channel_id)
+                && !self.live_execution_fence_by_channel.contains_key(replacement_channel_id)
+                && !self.live_execution_generation_by_channel.contains_key(replacement_channel_id)
+                && !self.live_context_cursor_by_channel.contains_key(replacement_channel_id)
+            }
+            guard "replacement_experimental_stage_matches" {
+                self.live_experimental_staged_runtime_by_channel.get_cloned(replacement_channel_id)
+                    == Some(runtime_id)
+                && self.live_experimental_staged_fence_by_channel.get_copied(replacement_channel_id)
+                    == Some(fence_token)
+                && self.live_experimental_staged_generation_by_channel.get_copied(replacement_channel_id)
+                    == Some(generation)
+                && self.live_experimental_staged_seed_cursor_by_channel.get_copied(replacement_channel_id)
+                    == Some(canonical_seed_cursor)
+            }
+            guard "answer_observation_sequence_advances" {
+                !self.live_webrtc_answer_observation_sequence_by_channel.contains_key(replacement_channel_id)
+                || answer_observation_sequence > self.live_webrtc_answer_observation_sequence_by_channel.get_copied(replacement_channel_id).get("value")
+            }
+            update {
+                self.live_webrtc_answer_result_sequence += 1;
+                self.live_webrtc_answer_observation_sequence_by_channel.insert(
+                    replacement_channel_id,
+                    answer_observation_sequence
+                );
+                self.live_webrtc_answer_status_by_channel.insert(
+                    replacement_channel_id,
+                    LiveWebrtcAnswerPublicStatus::Answered
+                );
+                self.live_execution_runtime_id_by_channel.insert(replacement_channel_id, runtime_id);
+                self.live_execution_fence_by_channel.insert(replacement_channel_id, fence_token);
+                self.live_execution_generation_by_channel.insert(replacement_channel_id, generation);
+                self.live_context_cursor_by_channel.insert(replacement_channel_id, canonical_seed_cursor);
+                self.live_experimental_execution_channels.insert(replacement_channel_id);
+                self.live_execution_phase_by_channel.insert(
+                    replacement_channel_id,
+                    LiveExecutionChannelPhase::Active
+                );
+                self.live_experimental_staged_runtime_by_channel.remove(replacement_channel_id);
+                self.live_experimental_staged_fence_by_channel.remove(replacement_channel_id);
+                self.live_experimental_staged_generation_by_channel.remove(replacement_channel_id);
+                self.live_experimental_staged_seed_cursor_by_channel.remove(replacement_channel_id);
+                self.live_experimental_pending_receipt_by_channel.remove(replacement_channel_id);
+                self.live_context_recovery_replacement_by_channel.remove(closing_channel_id);
+                self.live_context_recovery_source_by_replacement.remove(replacement_channel_id);
+                self.live_context_recovery_session_by_channel.remove(closing_channel_id);
+                self.live_context_recovery_append_by_channel.remove(closing_channel_id);
+                self.live_context_recovery_seed_cursor_by_channel.remove(closing_channel_id);
+                self.live_context_recovery_identity_by_channel.remove(closing_channel_id);
+                self.live_context_recovery_runtime_id_by_channel.remove(closing_channel_id);
+                self.live_context_recovery_fence_by_channel.remove(closing_channel_id);
+                self.live_context_recovery_generation_by_channel.remove(closing_channel_id);
+            }
+            to Idle
+            emit LiveContextRecoveryChannelBound {
+                session_id: session_id,
+                closing_channel_id: closing_channel_id,
+                replacement_channel_id: replacement_channel_id,
+                append_id: append_id,
+                canonical_seed_cursor: canonical_seed_cursor,
+                status: LiveWebrtcAnswerPublicStatus::Answered,
+                answered: true,
+                sequence: self.live_webrtc_answer_result_sequence,
+                answer_observation_sequence: answer_observation_sequence,
+                runtime_id: runtime_id,
+                fence_token: fence_token,
+                generation: generation
+            }
+        }
+
+        transition ResolveLiveContextAppendRejected {
+            per_phase [Idle, Attached, Running]
+            on input ResolveLiveContextAppend {
+                channel_id, runtime_id, fence_token, generation, append_id,
+                previous_cursor, next_cursor, replacement_channel_id, observation
+            }
+            guard "append_present" { append_id != "" }
+            guard "rejection_observed" { observation == LiveContextAppendObservation::Rejected }
+            guard "replacement_channel_absent" { replacement_channel_id == "" }
+            guard "runtime_binding_matches" {
+                self.live_execution_runtime_id_by_channel.get_cloned(channel_id) == Some(runtime_id)
+            }
+            guard "fence_binding_matches" {
+                self.live_execution_fence_by_channel.get_copied(channel_id) == Some(fence_token)
+            }
+            guard "generation_binding_matches" {
+                self.live_execution_generation_by_channel.get_copied(channel_id) == Some(generation)
+            }
+            guard "pending_append_matches" {
+                self.live_context_pending_append_by_channel.get_cloned(channel_id) == Some(append_id)
+                && self.live_context_pending_channel_by_append.get_cloned(append_id) == Some(channel_id)
+                && self.live_context_pending_previous_cursor_by_append.get_copied(append_id) == Some(previous_cursor)
+                && self.live_context_pending_next_cursor_by_append.get_copied(append_id) == Some(next_cursor)
+            }
+            guard "cursor_has_not_advanced" {
+                self.live_context_cursor_by_channel.get_copied(channel_id) == Some(previous_cursor)
+                && next_cursor == previous_cursor + 1
+            }
+            update {
+                self.live_context_pending_append_by_channel.remove(channel_id);
+                self.live_context_pending_channel_by_append.remove(append_id);
+                self.live_context_pending_previous_cursor_by_append.remove(append_id);
+                self.live_context_pending_next_cursor_by_append.remove(append_id);
+            }
+            to Idle
+            emit LiveContextAppendResolved {
+                channel_id: channel_id,
+                append_id: append_id,
+                cursor: previous_cursor,
+                observation: LiveContextAppendObservation::Rejected,
+                retry_allowed: true
             }
         }
 
@@ -20712,9 +26354,86 @@ macro_rules! meerkat_catalog_machine_dsl {
                     channel_id,
                     LiveClosePublicStatus::Closed
                 );
+                self.live_execution_phase_by_channel.insert(
+                    channel_id,
+                    LiveExecutionChannelPhase::Revoked
+                );
+                self.live_revoked_execution_channels.insert(channel_id);
                 self.live_active_channel_by_session.remove(session_id);
                 self.live_channel_session_by_channel.remove(channel_id);
                 self.live_channel_identity_by_channel.remove(channel_id);
+                self.live_execution_runtime_id_by_channel.remove(channel_id);
+                self.live_execution_fence_by_channel.remove(channel_id);
+                self.live_execution_generation_by_channel.remove(channel_id);
+                self.live_experimental_staged_runtime_by_channel.remove(channel_id);
+                self.live_experimental_staged_fence_by_channel.remove(channel_id);
+                self.live_experimental_staged_generation_by_channel.remove(channel_id);
+                self.live_experimental_staged_seed_cursor_by_channel.remove(channel_id);
+                self.live_experimental_execution_channels.remove(channel_id);
+                self.live_playback_owner_by_channel.remove(channel_id);
+                self.live_playback_readiness_by_channel.remove(channel_id);
+                self.live_active_interaction_by_channel.remove(channel_id);
+                self.live_awaiting_assistant_interaction_by_channel.remove(channel_id);
+                self.live_provider_turn_by_channel.remove(channel_id);
+                self.live_delegation_interaction_by_channel.remove(channel_id);
+                self.live_delegation_operation_by_channel.remove(channel_id);
+                self.live_delegation_provider_turn_by_channel.remove(channel_id);
+                self.live_context_cursor_by_channel.remove(channel_id);
+                if self.live_bridge_operation_by_channel.contains_key(channel_id) {
+                    self.live_bridge_cancellation_reason_by_operation.insert(
+                        self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                        LiveBridgeCancellationReason::ChannelClose
+                    );
+                    if !self.live_bridge_execution_terminal_by_operation.contains_key(
+                        self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value")
+                    ) {
+                        if self.live_bridge_phase_by_operation.get_copied(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                                != Some(LiveBridgeOperationPhase::ExecutionRunning) {
+                            self.live_bridge_execution_terminal_by_operation.insert(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                                MeerkatExecutionTerminal::Cancelled
+                            );
+                            self.live_bridge_phase_by_operation.insert(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                                LiveBridgeOperationPhase::ExecutionTerminal
+                            );
+                        }
+                    }
+                    if self.live_bridge_submission_state_by_operation.get_copied(
+                        self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                            == Some(LiveBridgeSubmissionState::SubmissionAuthorized) {
+                        self.live_bridge_submission_state_by_operation.insert(
+                            self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                            LiveBridgeSubmissionState::CallAbandonedByClose
+                        );
+                    } else {
+                        if self.live_bridge_submission_state_by_operation.get_copied(
+                            self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                                == Some(LiveBridgeSubmissionState::SubmissionAttemptClaimed)
+                            || self.live_bridge_submission_state_by_operation.get_copied(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"))
+                                    == Some(LiveBridgeSubmissionState::LocalWriteCompletedAwaitingProof) {
+                            self.live_bridge_submission_state_by_operation.insert(
+                                self.live_bridge_operation_by_channel.get_cloned(channel_id).get("value"),
+                                LiveBridgeSubmissionState::SubmissionAmbiguous
+                            );
+                        }
+                    }
+                    self.live_bridge_operation_by_channel.remove(channel_id);
+                }
+                if self.live_context_pending_append_by_channel.contains_key(channel_id) {
+                    self.live_context_pending_channel_by_append.remove(
+                        self.live_context_pending_append_by_channel.get_cloned(channel_id).get("value")
+                    );
+                    self.live_context_pending_previous_cursor_by_append.remove(
+                        self.live_context_pending_append_by_channel.get_cloned(channel_id).get("value")
+                    );
+                    self.live_context_pending_next_cursor_by_append.remove(
+                        self.live_context_pending_append_by_channel.get_cloned(channel_id).get("value")
+                    );
+                    self.live_context_pending_append_by_channel.remove(channel_id);
+                }
             }
             to Idle
             emit LiveCloseResultResolved {
@@ -21128,6 +26847,101 @@ macro_rules! meerkat_catalog_machine_dsl {
                 answered: true,
                 sequence: self.live_webrtc_answer_result_sequence,
                 answer_observation_sequence: answer_observation_sequence
+            }
+        }
+
+        // Experimental GPT Live answers become public Answered truth and an
+        // execution-bound channel in one generated commit. The shell supplies
+        // K only by consuming the opaque provider BoundReady receipt, minted
+        // after SessionReady and exact initial canonical seed acknowledgement.
+        transition RecordLiveWebrtcAnswerAcceptedAndBindExecution {
+            per_phase [Idle, Attached, Running]
+            on input RecordLiveWebrtcAnswerAcceptedAndBindExecution {
+                session_id, channel_id, answer_observation_sequence, runtime_id,
+                fence_token, generation, canonical_seed_cursor, activation_receipt
+            }
+            guard "identities_present" {
+                session_id != "" && channel_id != "" && activation_receipt != ""
+            }
+            guard "answer_observation_sequence_present" { answer_observation_sequence > 0 }
+            guard "session_binding_matches" {
+                self.live_active_channel_by_session.get_cloned(session_id) == Some(channel_id)
+            }
+            guard "channel_binding_matches" {
+                self.live_channel_session_by_channel.get_cloned(channel_id) == Some(session_id)
+            }
+            guard "runtime_binding_matches" { self.active_runtime_id == Some(runtime_id) }
+            guard "fence_binding_matches" { self.active_fence_token == Some(fence_token) }
+            guard "generation_binding_matches" { self.active_runtime_generation == Some(generation) }
+            guard "answer_observation_sequence_advances" {
+                !self.live_webrtc_answer_observation_sequence_by_channel.contains_key(channel_id)
+                || answer_observation_sequence > self.live_webrtc_answer_observation_sequence_by_channel.get_copied(channel_id).get("value")
+            }
+            guard "execution_binding_absent" {
+                !self.live_execution_runtime_id_by_channel.contains_key(channel_id)
+                && !self.live_execution_fence_by_channel.contains_key(channel_id)
+                && !self.live_execution_generation_by_channel.contains_key(channel_id)
+                && !self.live_context_cursor_by_channel.contains_key(channel_id)
+            }
+            guard "experimental_stage_matches" {
+                self.live_experimental_staged_runtime_by_channel.get_cloned(channel_id)
+                    == Some(runtime_id)
+                && self.live_experimental_staged_fence_by_channel.get_copied(channel_id)
+                    == Some(fence_token)
+                && self.live_experimental_staged_generation_by_channel.get_copied(channel_id)
+                    == Some(generation)
+                && self.live_experimental_staged_seed_cursor_by_channel.get_copied(channel_id)
+                    == Some(canonical_seed_cursor)
+            }
+            guard "playback_owner_is_ready" {
+                self.live_execution_phase_by_channel.get_copied(channel_id)
+                    == Some(LiveExecutionChannelPhase::Pending)
+                && self.live_playback_owner_by_channel.contains_key(channel_id)
+                && self.live_playback_readiness_by_channel.contains_key(channel_id)
+                && !self.live_activation_receipt_by_channel.contains_key(channel_id)
+                && !self.live_revoked_execution_channels.contains(channel_id)
+            }
+            update {
+                self.live_webrtc_answer_result_sequence += 1;
+                self.live_webrtc_answer_observation_sequence_by_channel.insert(
+                    channel_id,
+                    answer_observation_sequence
+                );
+                self.live_webrtc_answer_status_by_channel.insert(
+                    channel_id,
+                    LiveWebrtcAnswerPublicStatus::Answered
+                );
+                self.live_execution_runtime_id_by_channel.insert(channel_id, runtime_id);
+                self.live_execution_fence_by_channel.insert(channel_id, fence_token);
+                self.live_execution_generation_by_channel.insert(channel_id, generation);
+                self.live_context_cursor_by_channel.insert(channel_id, canonical_seed_cursor);
+                self.live_experimental_execution_channels.insert(channel_id);
+                self.live_execution_phase_by_channel.insert(
+                    channel_id,
+                    LiveExecutionChannelPhase::Active
+                );
+                self.live_activation_receipt_by_channel.insert(
+                    channel_id,
+                    activation_receipt
+                );
+                self.live_experimental_staged_runtime_by_channel.remove(channel_id);
+                self.live_experimental_staged_fence_by_channel.remove(channel_id);
+                self.live_experimental_staged_generation_by_channel.remove(channel_id);
+                self.live_experimental_staged_seed_cursor_by_channel.remove(channel_id);
+            }
+            to Idle
+            emit LiveWebrtcAnswerAcceptedAndExecutionBound {
+                session_id: session_id,
+                channel_id: channel_id,
+                status: LiveWebrtcAnswerPublicStatus::Answered,
+                answered: true,
+                sequence: self.live_webrtc_answer_result_sequence,
+                answer_observation_sequence: answer_observation_sequence,
+                runtime_id: runtime_id,
+                fence_token: fence_token,
+                generation: generation,
+                canonical_seed_cursor: canonical_seed_cursor,
+                activation_receipt: activation_receipt
             }
         }
 
@@ -25544,6 +31358,33 @@ macro_rules! meerkat_catalog_machine_dsl {
             endpoints
                 .iter()
                 .all(|endpoint| peer_ids.insert(endpoint.peer_id.0.clone()))
+        }
+
+        fn meerkat_machine_live_bridge_authority_rows_without_operation<V: Clone>(
+            rows: &std::collections::BTreeMap<String, V>,
+            operation_by_authority: &std::collections::BTreeMap<String, OperationId>,
+            operation_id: &OperationId,
+        ) -> std::collections::BTreeMap<String, V> {
+            rows.iter()
+                .filter(|(authority_id, _)| {
+                    operation_by_authority.get(*authority_id) != Some(operation_id)
+                })
+                .map(|(authority_id, value)| (authority_id.clone(), value.clone()))
+                .collect()
+        }
+
+        fn meerkat_machine_live_bridge_authorities_without_operation(
+            authorities: &std::collections::BTreeSet<String>,
+            operation_by_authority: &std::collections::BTreeMap<String, OperationId>,
+            operation_id: &OperationId,
+        ) -> std::collections::BTreeSet<String> {
+            authorities
+                .iter()
+                .filter(|authority_id| {
+                    operation_by_authority.get(*authority_id) != Some(operation_id)
+                })
+                .cloned()
+                .collect()
         }
     }
     };

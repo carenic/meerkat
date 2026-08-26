@@ -9,6 +9,7 @@ from collections.abc import Awaitable
 from typing import Any, Literal, Protocol, overload
 
 from .types import (
+    ActivateInstructionParams,
     ApprovalDecideParams,
     ApprovalGetParams,
     ApprovalListParams,
@@ -57,6 +58,8 @@ from .types import (
     HelpResponse,
     InjectSystemContextParams,
     InjectSystemContextResult,
+    InstructionActivationReadPage,
+    InstructionActivationReceipt,
     InterruptParams,
     InterruptResult,
     JobsArtifactsParams,
@@ -89,6 +92,8 @@ from .types import (
     LiveInterruptResult,
     LiveOpenParams,
     LiveOpenResult,
+    LivePlaybackCompleteParams,
+    LivePlaybackCompleteResult,
     LiveRefreshResult,
     LiveSendInputParams,
     LiveSendInputResult,
@@ -217,6 +222,7 @@ from .types import (
     MonitorsStartParams,
     MonitorsStartResult,
     ProvisionApiKeyParams,
+    ReadInstructionActivationsParams,
     ReadSessionHistoryParams,
     ReadSessionParams,
     ReadSessionTranscriptRevisionParams,
@@ -504,6 +510,22 @@ class RpcRequest(Protocol):
         params: UpdateSystemPromptParams,
         /,
     ) -> Awaitable[SystemPromptUpdateResult]: ...
+
+    @overload
+    def __call__(
+        self,
+        method: Literal["session/activate_instruction"],
+        params: ActivateInstructionParams,
+        /,
+    ) -> Awaitable[InstructionActivationReceipt]: ...
+
+    @overload
+    def __call__(
+        self,
+        method: Literal["session/instruction_activations"],
+        params: ReadInstructionActivationsParams,
+        /,
+    ) -> Awaitable[InstructionActivationReadPage]: ...
 
     @overload
     def __call__(
@@ -1064,6 +1086,14 @@ class RpcRequest(Protocol):
         params: LiveTruncateParams,
         /,
     ) -> Awaitable[LiveTruncateResult]: ...
+
+    @overload
+    def __call__(
+        self,
+        method: Literal["live/playback_complete"],
+        params: LivePlaybackCompleteParams,
+        /,
+    ) -> Awaitable[LivePlaybackCompleteResult]: ...
 
     @overload
     def __call__(

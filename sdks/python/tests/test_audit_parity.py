@@ -51,6 +51,8 @@ RPC_PUBLIC_WRAPPERS: dict[str, tuple[type, str]] = {
     "session/fork_replace": (MeerkatClient, "fork_session_replace"),
     "session/rewrite_transcript": (MeerkatClient, "rewrite_session_transcript"),
     "session/update_system_prompt": (MeerkatClient, "update_system_prompt"),
+    "session/activate_instruction": (MeerkatClient, "activate_instruction"),
+    "session/instruction_activations": (MeerkatClient, "instruction_activations"),
     "session/transcript_revision": (MeerkatClient, "read_session_transcript_revision"),
     "session/transcript_revisions": (
         MeerkatClient,
@@ -117,6 +119,7 @@ RPC_PUBLIC_WRAPPERS: dict[str, tuple[type, str]] = {
     "live/commit_input": (MeerkatClient, "live_commit_input"),
     "live/interrupt": (MeerkatClient, "live_interrupt"),
     "live/truncate": (MeerkatClient, "live_truncate"),
+    "live/playback_complete": (MeerkatClient, "live_playback_complete"),
     "live/refresh": (MeerkatClient, "live_refresh"),
     "live/webrtc/answer": (MeerkatClient, "live_webrtc_answer"),
     "mob/create": (MeerkatClient, "create_mob"),

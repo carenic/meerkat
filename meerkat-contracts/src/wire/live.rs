@@ -13,6 +13,7 @@
 //! the `LiveOpenResult` / `LiveStatusResult` titles so SDK codegen sees a
 //! single source of truth.
 
+use serde::de;
 use serde::{Deserialize, Serialize};
 
 use meerkat_core::Provider;
@@ -104,6 +105,52 @@ impl TryFrom<WireProvider> for Provider {
     }
 }
 
+/// Capability required before a client may select a live execution profile.
+///
+/// The capability is versioned independently from the surrounding live RPC
+/// family so a client can refuse an older gateway before selecting a profile.
+/// The strict `LiveOpenParams` decoder provides the server-side half: an older
+/// contract cannot silently ignore the field.
+pub const LIVE_EXECUTION_IDENTITY_V1_CAPABILITY: &str = "live.execution_identity.v1";
+pub const LIVE_FUNCTION_BRIDGE_V1_CAPABILITY: &str = "live.execution.function_bridge.v1";
+pub const LIVE_CLIENT_CONTEXT_V1_CAPABILITY: &str = "live.execution.client_context.v1";
+
+/// Version discriminator for [`WireLiveExecutionIdentityOverrideV1`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WireLiveExecutionIdentityVersion {
+    V1,
+}
+
+/// Strict, versioned channel-scoped profile selector for live execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct WireLiveExecutionIdentityOverrideV1 {
+    pub version: WireLiveExecutionIdentityVersion,
+    /// Stable host-registered execution profile selected for this channel.
+    ///
+    /// The host-owned profile definition owns the full LLM identity, provider
+    /// mode, auth binding, capability atoms, and approved session instructions.
+    /// Callers select only this catalog identity.
+    #[serde(deserialize_with = "deserialize_non_empty_live_identity_string")]
+    pub profile_id: String,
+}
+
+fn deserialize_non_empty_live_identity_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.trim().is_empty() {
+        return Err(de::Error::custom(
+            "live execution identity string must be non-empty",
+        ));
+    }
+    Ok(value)
+}
+
 /// Request payload for `live/open`.
 ///
 /// R3-1 (P1): `turning_mode` lets callers pick between the provider-managed
@@ -120,12 +167,19 @@ impl TryFrom<WireProvider> for Provider {
 /// field get `ProviderManaged`, matching the legacy behavior.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct LiveOpenParams {
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turning_mode: Option<RealtimeTurningMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<LiveOpenTransport>,
+    /// Channel-scoped execution profile selection. The host owns the full
+    /// execution identity. This never mutates the durable session identity and
+    /// requires negotiated
+    /// [`LIVE_EXECUTION_IDENTITY_V1_CAPABILITY`] support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_identity: Option<WireLiveExecutionIdentityOverrideV1>,
     /// Optional serialized-character budget for the history seed messages
     /// sent to the realtime provider when the channel opens.
     ///
@@ -523,6 +577,21 @@ impl TryFrom<WireLiveContinuityMode> for LiveContinuityMode {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct LiveChannelParams {
     pub channel_id: String,
+}
+
+/// Ephemeral control notification emitted after the server has admitted one
+/// exact assistant playback target.
+///
+/// The opaque `output_id` is the only client control handle. Provider turn,
+/// response, item, delta, and interaction identities remain server-internal.
+/// A surface publishes this payload only after the canonical live host has
+/// applied the corresponding provider observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct LiveAssistantOutputAvailableParams {
+    pub channel_id: String,
+    pub output_id: String,
+    pub content_index: u32,
 }
 
 /// Wire projection of [`meerkat_core::live_adapter::LiveResponseModality`].
@@ -944,9 +1013,48 @@ pub struct LiveSendInputParams {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct LiveTruncateParams {
     pub channel_id: String,
-    pub item_id: String,
-    pub content_index: u32,
+    /// Opaque generated output address for experimental live channels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_id: Option<String>,
+    /// Legacy stock-realtime provider address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_index: Option<u32>,
     pub audio_played_ms: u64,
+    /// Exact transcript prefix observed by the playback path. Omission is
+    /// explicit `Unmeasured` coverage and never implies delivery or hearing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_playback_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct LivePlaybackCompleteParams {
+    pub channel_id: String,
+    pub output_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LivePlaybackCompleteStatus {
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct LivePlaybackCompleteResult {
+    pub status: LivePlaybackCompleteStatus,
+}
+
+impl LivePlaybackCompleteResult {
+    pub fn completed() -> Self {
+        Self {
+            status: LivePlaybackCompleteStatus::Completed,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1681,6 +1789,11 @@ impl TryFrom<RealtimeTranscriptEvent> for WireRealtimeTranscriptEvent {
             RealtimeTranscriptEvent::UserContentFinal { .. } => {
                 Err(WireConversionError::InternalRealtimeUserContent)
             }
+            RealtimeTranscriptEvent::AssistantPlaybackTargetAdmitted { .. }
+            | RealtimeTranscriptEvent::AssistantPlaybackTerminalObserved { .. }
+            | RealtimeTranscriptEvent::AssistantPlaybackTargetResolved { .. } => {
+                Err(WireConversionError::InternalRealtimePlaybackAuthority)
+            }
             RealtimeTranscriptEvent::AssistantTextDelta {
                 response_id,
                 delta_id,
@@ -1849,6 +1962,8 @@ pub enum WireLiveAdapterObservation {
     },
     AssistantTranscriptTruncated {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        interaction_id: Option<meerkat_core::InteractionId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_item_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         previous_item_id: Option<String>,
@@ -1998,6 +2113,14 @@ impl From<LiveAdapterObservation> for WireLiveAdapterObservation {
                     content_index,
                 }
             }
+            LiveAdapterObservation::AssistantOutputStarted {
+                provider_turn_ref: _,
+                response_id: _,
+                provider_item_id: _,
+                content_index: _,
+            } => Self::Unknown {
+                debug: "internal_assistant_output_started_filtered".to_string(),
+            },
             LiveAdapterObservation::AssistantTranscriptFinal {
                 provider_item_id,
                 previous_item_id,
@@ -2016,17 +2139,32 @@ impl From<LiveAdapterObservation> for WireLiveAdapterObservation {
                 usage: usage.into(),
             },
             LiveAdapterObservation::AssistantTranscriptTruncated {
+                interaction_id,
                 provider_item_id,
                 previous_item_id,
                 content_index,
                 response_id,
                 text,
             } => Self::AssistantTranscriptTruncated {
+                interaction_id,
                 provider_item_id,
                 previous_item_id,
                 content_index,
                 response_id,
                 text,
+            },
+            LiveAdapterObservation::AssistantPlaybackCompleted {
+                interaction_id: _,
+                provider_item_id: _,
+                content_index: _,
+                response_id: _,
+                stop_reason: _,
+                usage: _,
+            } => Self::Unknown {
+                debug: "internal_assistant_playback_completed_filtered".to_string(),
+            },
+            LiveAdapterObservation::AssistantPlaybackTerminalObserved { .. } => Self::Unknown {
+                debug: "internal_assistant_playback_terminal_filtered".to_string(),
             },
             LiveAdapterObservation::RealtimeTranscript { event } => {
                 match WireRealtimeTranscriptEvent::try_from(event) {
@@ -2134,6 +2272,7 @@ mod tests {
             session_id: "session-1".into(),
             turning_mode: None,
             transport: None,
+            execution_identity: None,
             seed_max_chars: None,
         };
         let j = serde_json::to_value(&v).expect("round-trip should succeed");
@@ -2158,6 +2297,7 @@ mod tests {
             session_id: "session-1".into(),
             turning_mode: Some(RealtimeTurningMode::ExplicitCommit),
             transport: None,
+            execution_identity: None,
             seed_max_chars: None,
         };
         let j = serde_json::to_value(&v).expect("round-trip should succeed");
@@ -2172,6 +2312,7 @@ mod tests {
             session_id: "session-1".into(),
             turning_mode: Some(RealtimeTurningMode::ProviderManaged),
             transport: None,
+            execution_identity: None,
             seed_max_chars: None,
         };
         let j = serde_json::to_value(&v).expect("round-trip should succeed");
@@ -2186,6 +2327,7 @@ mod tests {
             session_id: "session-1".into(),
             turning_mode: None,
             transport: Some(LiveOpenTransport::Webrtc),
+            execution_identity: None,
             seed_max_chars: None,
         };
         let j = serde_json::to_value(&v).expect("round-trip should succeed");
@@ -2200,6 +2342,7 @@ mod tests {
             session_id: "session-1".into(),
             turning_mode: None,
             transport: None,
+            execution_identity: None,
             seed_max_chars: Some(24_000),
         };
         let j = serde_json::to_value(&v).expect("round-trip should succeed");
@@ -2214,6 +2357,7 @@ mod tests {
             session_id: "session-1".into(),
             turning_mode: None,
             transport: None,
+            execution_identity: None,
             seed_max_chars: Some(0),
         };
         let j = serde_json::to_value(&v).expect("round-trip should succeed");
@@ -2318,9 +2462,11 @@ mod tests {
     fn live_truncate_params_round_trip() {
         let v = LiveTruncateParams {
             channel_id: "live_1".into(),
-            item_id: "item_42".into(),
-            content_index: 0,
+            output_id: None,
+            item_id: Some("item_42".into()),
+            content_index: Some(0),
             audio_played_ms: 1_234,
+            reported_playback_prefix: Some("partial".into()),
         };
         let j = serde_json::to_value(&v).expect("round-trip should succeed");
         let back: LiveTruncateParams =
@@ -2756,6 +2902,7 @@ mod tests {
                 },
             },
             WireLiveAdapterObservation::AssistantTranscriptTruncated {
+                interaction_id: None,
                 provider_item_id: Some("item_trunc".into()),
                 previous_item_id: None,
                 content_index: Some(0),

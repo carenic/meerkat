@@ -48,7 +48,7 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_MANIFEST_DIR": "./meerkat-providers",
     },
     proc_macro_deps = all_crate_deps(
@@ -86,7 +86,7 @@ rust_library(
         "//meerkat:__pkg__",
     ],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_MANIFEST_DIR": "./meerkat-providers",
     },
     proc_macro_deps = all_crate_deps(
@@ -128,7 +128,7 @@ rust_test(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_MANIFEST_DIR": "./meerkat-providers",
     },
     tags = [
@@ -140,7 +140,7 @@ rust_test(
         ":package_runfiles",
     ],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = all_crate_deps(
         package_name = "meerkat-providers",

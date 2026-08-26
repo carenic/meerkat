@@ -54,10 +54,11 @@ use meerkat_core::skills::{SkillError, SourceIdentityRegistry};
 use meerkat_core::types::{Message, RunResult, SessionId};
 use meerkat_core::{
     AgentExecutionSnapshot, Config, ConfigStore, ContentInput, ExternalToolSurfaceSnapshot,
-    PeerIngressRuntimeSnapshot, Session, SessionLlmIdentity, SessionLlmIdentityOverride,
-    SurfaceSessionRecoveryContext, SurfaceSessionRecoveryError, SurfaceSessionRecoveryOverrides,
-    SystemMessage, SystemPromptUpdateRequest, SystemPromptUpdateResult, ToolScopeSnapshot,
-    build_recovered_session,
+    InstructionActivationAdmissionErrorCode, InstructionActivationReceipt,
+    InstructionActivationRequest, PeerIngressRuntimeSnapshot, Session, SessionLlmIdentity,
+    SessionLlmIdentityOverride, SurfaceSessionRecoveryContext, SurfaceSessionRecoveryError,
+    SurfaceSessionRecoveryOverrides, SystemMessage, SystemPromptUpdateRequest,
+    SystemPromptUpdateResult, ToolScopeSnapshot, build_recovered_session,
 };
 use meerkat_core::{EventEnvelope, EventStream, InputId, RunId, StreamError};
 use meerkat_runtime::input_state::InputStatePersistenceRecord;
@@ -1152,6 +1153,36 @@ impl SessionServiceHistoryExt for RpcMobSessionService {
 #[cfg(feature = "mob")]
 #[async_trait::async_trait]
 impl meerkat_mob::MobSessionService for RpcMobSessionService {
+    #[cfg(feature = "experimental-gpt-live")]
+    async fn commit_live_delegation_final_transcript(
+        &self,
+        session_id: &SessionId,
+        provisional: meerkat_core::ProvisionalLiveHandoff,
+        final_event: meerkat_core::RealtimeTranscriptEvent,
+    ) -> Result<meerkat_core::FinalLiveUserTranscriptCommitEvidence, SessionError> {
+        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::commit_live_delegation_final_transcript(
+            &self.service,
+            session_id,
+            provisional,
+            final_event,
+        )
+        .await
+    }
+
+    #[cfg(feature = "experimental-gpt-live")]
+    async fn capture_live_bridge_execution_snapshot(
+        &self,
+        session_id: &SessionId,
+        agent_identity: &str,
+    ) -> Result<meerkat_mob::LiveBridgeExecutionSnapshot, SessionError> {
+        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::capture_live_bridge_execution_snapshot(
+            &self.service,
+            session_id,
+            agent_identity,
+        )
+        .await
+    }
+
     async fn observe_session_resume_authority(
         &self,
         session_id: &SessionId,
@@ -1380,6 +1411,23 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
             return Ok(None);
         }
         Ok(Some(session))
+    }
+
+    async fn fork_persisted_session(
+        &self,
+        source_session_id: &SessionId,
+        message_count: Option<usize>,
+        tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
+        target: meerkat_core::DurableSessionForkTarget,
+    ) -> Result<meerkat_core::SessionForkResult, SessionError> {
+        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::fork_persisted_session(
+            &self.service,
+            source_session_id,
+            message_count,
+            tool_access_policy,
+            target,
+        )
+        .await
     }
 
     async fn load_revivable_retired_session(
@@ -1714,6 +1762,8 @@ fn profile_to_capability_surface(
         image_input: profile.image_input,
         image_tool_results: profile.image_tool_results,
         supports_web_search: profile.supports_web_search,
+        supports_mid_conversation_system_messages: profile
+            .supports_mid_conversation_system_messages,
         image_generation: profile.image_generation,
         realtime: profile.realtime,
         call_timeout_secs: profile.call_timeout_secs,
@@ -2326,6 +2376,16 @@ struct RealmContextSnapshot {
 }
 
 impl SessionRuntime {
+    #[cfg(test)]
+    pub(crate) async fn acquire_instruction_activation_test_boundary(
+        &self,
+        session_id: &SessionId,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.service
+            .acquire_runtime_turn_finalization_guard(session_id)
+            .await
+    }
+
     fn take_runtime_pre_admission_guard(
         pre_admission: &mut RuntimePreAdmissionGuard,
         session_id: &SessionId,
@@ -4300,6 +4360,62 @@ impl SessionRuntime {
             .await
     }
 
+    /// Thin RPC composition over Meerkat's shared strict execution-identity
+    /// open coordinator.
+    #[cfg(feature = "experimental-gpt-live")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_live_channel_with_execution_identity(
+        self: &Arc<Self>,
+        host: &meerkat_live::LiveAdapterHost,
+        transport_ctx: meerkat::session_runtime::live_orchestration::LiveTransportContext<'_>,
+        authority: &dyn meerkat::experimental_gpt_live::ExperimentalLiveOpenAuthorityProvider,
+        session_id: &SessionId,
+        execution_identity: &meerkat_contracts::WireLiveExecutionIdentityOverrideV1,
+        turning_mode: Option<meerkat_contracts::RealtimeTurningMode>,
+        seed_window: Option<meerkat::session_runtime::live_orchestration::LiveSeedWindow>,
+        requested_transport: Option<meerkat_contracts::LiveOpenTransport>,
+    ) -> Result<
+        meerkat::surface::ExperimentalLivePendingChannel,
+        meerkat::session_runtime::live_orchestration::ExperimentalLiveChannelOpenError,
+    > {
+        let snapshot = self.realm_context_snapshot();
+        let cleanup = self.archive_runtime_cleanup();
+        let reconciler = RpcLiveIngressReconciler {
+            runtime: Arc::clone(self),
+        };
+        let mut orchestrator = self.live_orchestrator(&snapshot, cleanup);
+        orchestrator.ingress_reconciler = Some(&reconciler);
+        orchestrator
+            .open_live_channel_with_execution_identity(
+                host,
+                transport_ctx,
+                authority,
+                session_id,
+                execution_identity,
+                turning_mode,
+                seed_window,
+                requested_transport,
+            )
+            .await
+    }
+
+    #[cfg(feature = "experimental-gpt-live")]
+    pub async fn cleanup_experimental_live_channel_after_publication_failure(
+        &self,
+        host: &meerkat_live::LiveAdapterHost,
+        authority: &dyn meerkat::experimental_gpt_live::ExperimentalLiveOpenAuthorityProvider,
+        session_id: &SessionId,
+        channel_id: &meerkat_live::LiveChannelId,
+    ) -> Result<(), meerkat::session_runtime::errors::LiveChannelVerbError> {
+        let snapshot = self.realm_context_snapshot();
+        let cleanup = self.archive_runtime_cleanup();
+        self.live_orchestrator(&snapshot, cleanup)
+            .cleanup_experimental_live_channel_after_publication_failure(
+                host, authority, session_id, channel_id,
+            )
+            .await
+    }
+
     /// Phase 6b: `live/close` via the shared pipeline. RPC verbs are
     /// channel-addressed and pass no session pin (DEC-P6B-L6).
     pub async fn close_live_channel(
@@ -4409,9 +4525,11 @@ impl SessionRuntime {
         host: &meerkat_live::LiveAdapterHost,
         transport_ctx: meerkat::session_runtime::live_orchestration::LiveTransportContext<'_>,
         channel_id: &meerkat_live::LiveChannelId,
-        item_id: String,
-        content_index: u32,
+        output_id: Option<String>,
+        item_id: Option<String>,
+        content_index: Option<u32>,
         audio_played_ms: u64,
+        reported_playback_prefix: Option<String>,
     ) -> Result<
         meerkat_contracts::LiveTruncateResult,
         meerkat::session_runtime::errors::LiveChannelVerbError,
@@ -4425,11 +4543,29 @@ impl SessionRuntime {
                 channel_id,
                 None,
                 meerkat::session_runtime::live_orchestration::LiveTruncateCursor {
+                    output_id,
                     item_id,
                     content_index,
                     audio_played_ms,
+                    reported_playback_prefix,
                 },
             )
+            .await
+    }
+
+    pub async fn complete_live_playback(
+        &self,
+        host: &meerkat_live::LiveAdapterHost,
+        channel_id: &meerkat_live::LiveChannelId,
+        output_id: &str,
+    ) -> Result<
+        meerkat_contracts::LivePlaybackCompleteResult,
+        meerkat::session_runtime::errors::LiveChannelVerbError,
+    > {
+        let snapshot = self.realm_context_snapshot();
+        let cleanup = self.archive_runtime_cleanup();
+        self.live_orchestrator(&snapshot, cleanup)
+            .complete_live_playback(host, channel_id, None, output_id)
             .await
     }
 
@@ -5629,8 +5765,227 @@ impl SessionRuntime {
         event: meerkat_core::RealtimeTranscriptEvent,
     ) -> Result<meerkat_core::RealtimeTranscriptApplyOutcome, SessionError> {
         self.service
-            .append_realtime_transcript_event(session_id, event)
+            .append_realtime_transcript_event_with_machine(
+                self.runtime_adapter.as_ref(),
+                session_id,
+                event,
+            )
             .await
+    }
+
+    /// Admit an assistant playback target only from the generated foreground
+    /// user interaction already sealed by provider TurnStarted authority.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn admit_live_assistant_playback_target(
+        &self,
+        session_id: &SessionId,
+        channel_id: meerkat_core::LiveChannelId,
+        provider_turn_ref: String,
+        response_id: String,
+        item_id: String,
+        content_index: u32,
+    ) -> Result<meerkat_live::LiveAssistantOutputAddress, SessionError> {
+        let handle = self
+            .runtime_adapter
+            .live_assistant_output_handle_for_turn(session_id, &channel_id, &provider_turn_ref)
+            .ok_or_else(|| {
+                SessionError::Agent(meerkat_core::error::AgentError::ConfigError(
+                    "assistant playback target has no generated assistant-start handle".to_string(),
+                ))
+            })?;
+        let target = self
+            .service
+            .admit_live_assistant_playback_target(
+                session_id,
+                channel_id.clone(),
+                handle.interaction_id(),
+                response_id.clone(),
+                item_id.clone(),
+                content_index,
+            )
+            .await?;
+        if target.interaction_id() != handle.interaction_id() {
+            return Err(SessionError::Agent(
+                meerkat_core::error::AgentError::ConfigError(
+                    "assistant output handle did not match persisted target".to_string(),
+                ),
+            ));
+        }
+        handle
+            .__bind_target(&response_id, &item_id, content_index)
+            .map_err(|error| {
+                SessionError::Agent(meerkat_core::error::AgentError::ConfigError(
+                    error.to_string(),
+                ))
+            })?;
+        Ok(meerkat_live::LiveAssistantOutputAddress {
+            channel_id,
+            output_id: handle.output_id().to_string(),
+            content_index,
+        })
+    }
+
+    pub async fn live_assistant_playback_target(
+        &self,
+        session_id: &SessionId,
+        channel_id: meerkat_core::LiveChannelId,
+        item_id: String,
+        content_index: u32,
+    ) -> Result<Option<meerkat_core::LiveAssistantPlaybackTarget>, SessionError> {
+        self.service
+            .live_assistant_playback_target(session_id, channel_id, item_id, content_index)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn observe_live_assistant_playback_final(
+        &self,
+        session_id: &SessionId,
+        channel_id: meerkat_core::LiveChannelId,
+        interaction_id: meerkat_core::InteractionId,
+        response_id: String,
+        item_id: String,
+        content_index: u32,
+    ) -> Result<Option<meerkat_core::LiveAssistantPlaybackTruncationEvidence>, SessionError> {
+        self.service
+            .observe_live_assistant_playback_final(
+                session_id,
+                channel_id,
+                interaction_id,
+                response_id,
+                item_id,
+                content_index,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_live_assistant_playback_truncation(
+        &self,
+        session_id: &SessionId,
+        channel_id: meerkat_core::LiveChannelId,
+        interaction_id: meerkat_core::InteractionId,
+        response_id: String,
+        item_id: String,
+        content_index: u32,
+        evidence: meerkat_core::LiveAssistantPlaybackEvidence,
+    ) -> Result<meerkat_core::LiveAssistantPlaybackTruncationEvidence, SessionError> {
+        self.service
+            .commit_live_assistant_playback_truncation(
+                session_id,
+                channel_id,
+                interaction_id,
+                response_id,
+                item_id,
+                content_index,
+                evidence,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_live_assistant_playback_complete(
+        &self,
+        session_id: &SessionId,
+        channel_id: meerkat_core::LiveChannelId,
+        interaction_id: meerkat_core::InteractionId,
+        response_id: String,
+        item_id: String,
+        content_index: u32,
+        stop_reason: meerkat_core::StopReason,
+        usage: meerkat_core::TurnUsage,
+    ) -> Result<meerkat_core::LiveAssistantPlaybackTruncationEvidence, SessionError> {
+        self.service
+            .commit_live_assistant_playback_complete(
+                session_id,
+                channel_id,
+                interaction_id,
+                response_id,
+                item_id,
+                content_index,
+                stop_reason,
+                usage,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn observe_live_assistant_playback_terminal(
+        &self,
+        session_id: &SessionId,
+        channel_id: meerkat_core::LiveChannelId,
+        interaction_id: meerkat_core::InteractionId,
+        response_id: String,
+        item_id: String,
+        content_index: u32,
+        evidence: meerkat_core::LiveAssistantPlaybackEvidence,
+        stop_reason: meerkat_core::StopReason,
+        usage: meerkat_core::TurnUsage,
+    ) -> Result<bool, SessionError> {
+        self.service
+            .observe_live_assistant_playback_terminal(
+                session_id,
+                channel_id,
+                interaction_id,
+                response_id,
+                item_id,
+                content_index,
+                evidence,
+                stop_reason,
+                usage,
+            )
+            .await
+            .map(|outcome| outcome.is_resolved())
+    }
+
+    pub async fn fail_assistant_output_publication(
+        &self,
+        session_id: &SessionId,
+        address: &meerkat_live::LiveAssistantOutputAddress,
+    ) -> Result<(), SessionError> {
+        let reservation = self
+            .runtime_adapter
+            .reserve_live_assistant_output_handle(
+                session_id,
+                &address.channel_id,
+                &address.output_id,
+            )
+            .await
+            .map_err(|error| {
+                SessionError::Agent(meerkat_core::error::AgentError::ConfigError(
+                    error.to_string(),
+                ))
+            })?;
+        let handle = reservation.handle();
+        let (response_id, item_id, content_index) = handle.__target().ok_or_else(|| {
+            SessionError::Agent(meerkat_core::error::AgentError::ConfigError(
+                "assistant output publication failure has no exact target".to_string(),
+            ))
+        })?;
+        self.service
+            .commit_live_assistant_playback_truncation(
+                session_id,
+                address.channel_id.clone(),
+                handle.interaction_id(),
+                response_id.clone(),
+                item_id,
+                content_index,
+                meerkat_core::LiveAssistantPlaybackEvidence::Unmeasured,
+            )
+            .await?;
+        self.runtime_adapter
+            .commit_live_assistant_output_terminal(reservation)
+            .map_err(|error| {
+                SessionError::Agent(meerkat_core::error::AgentError::ConfigError(
+                    error.to_string(),
+                ))
+            })?;
+        self.append_realtime_transcript_event(
+            session_id,
+            meerkat_core::RealtimeTranscriptEvent::AssistantTurnInterrupted { response_id },
+        )
+        .await?;
+        Ok(())
     }
 
     /// Return distinct in-flight provider `response_id`s for the realtime
@@ -9887,6 +10242,19 @@ impl SessionRuntime {
         }
     }
 
+    /// Read authoritative durable instruction activation records without
+    /// inferring machine publication state from a cache.
+    pub async fn read_instruction_activation_records(
+        &self,
+        session_id: &SessionId,
+        query: meerkat_core::InstructionActivationReadQuery,
+    ) -> Result<meerkat_core::InstructionActivationReadPage, RpcError> {
+        self.inner
+            .read_instruction_activations(session_id, query)
+            .await
+            .map_err(session_error_to_rpc)
+    }
+
     /// Read a retained transcript revision through the authoritative session service.
     pub async fn read_session_transcript_revision_rich(
         &self,
@@ -10065,6 +10433,23 @@ impl SessionRuntime {
             .update_system_prompt(session_id, req)
             .await
             .map_err(session_error_to_rpc)
+    }
+
+    /// Activate one immutable instruction revision at the next stable
+    /// materialized-session boundary.
+    ///
+    /// The ordered transcript remains the chronology and model-context
+    /// authority. This facade contributes only the typed compatibility,
+    /// live-channel, turn-boundary, durable commit, and receipt contract.
+    pub async fn activate_instruction(
+        &self,
+        session_id: &SessionId,
+        request: InstructionActivationRequest,
+    ) -> Result<InstructionActivationReceipt, RpcError> {
+        self.inner
+            .activate_instruction(session_id, request)
+            .await
+            .map_err(instruction_activation_host_error_to_rpc)
     }
 
     /// Restore a retained transcript revision through typed service authority.
@@ -10768,6 +11153,72 @@ impl meerkat::session_runtime::live_orchestration::LiveSessionIngressReconciler
             let _ = session_id;
             Ok(())
         }
+    }
+}
+
+fn instruction_activation_admission_rpc_error(
+    rpc_code: i32,
+    code: InstructionActivationAdmissionErrorCode,
+    message: String,
+) -> RpcError {
+    RpcError {
+        code: rpc_code,
+        message,
+        data: Some(serde_json::json!({
+            "instruction_activation_code": code,
+        })),
+    }
+}
+
+fn instruction_activation_host_error_to_rpc(
+    host_error: meerkat::session_runtime::instruction_activation::InstructionActivationHostError,
+) -> RpcError {
+    use meerkat::session_runtime::instruction_activation::InstructionActivationHostError;
+
+    match host_error {
+        InstructionActivationHostError::Admission { code, message } => {
+            let rpc_code = match code {
+                InstructionActivationAdmissionErrorCode::UnsupportedCurrentLowering => {
+                    error::INVALID_PARAMS
+                }
+                InstructionActivationAdmissionErrorCode::TargetNotMaterialized
+                | InstructionActivationAdmissionErrorCode::LiveChannelOpen
+                | InstructionActivationAdmissionErrorCode::SessionBusy
+                | InstructionActivationAdmissionErrorCode::ExternalWriteFenceConflict
+                | InstructionActivationAdmissionErrorCode::ExternalWriteFenceBackoff => {
+                    error::SESSION_BUSY
+                }
+                InstructionActivationAdmissionErrorCode::DurabilityUnavailable => {
+                    error::INTERNAL_ERROR
+                }
+            };
+            instruction_activation_admission_rpc_error(rpc_code, code, message)
+        }
+        InstructionActivationHostError::ExternalWriteFenceConflict(message) => {
+            instruction_activation_admission_rpc_error(
+                error::SESSION_BUSY,
+                InstructionActivationAdmissionErrorCode::ExternalWriteFenceConflict,
+                message,
+            )
+        }
+        InstructionActivationHostError::ExternalWriteFenceBackoff(message) => {
+            instruction_activation_admission_rpc_error(
+                error::SESSION_BUSY,
+                InstructionActivationAdmissionErrorCode::ExternalWriteFenceBackoff,
+                message,
+            )
+        }
+        InstructionActivationHostError::Session(error) => session_error_to_rpc(error),
+        InstructionActivationHostError::Runtime(error) => RpcError {
+            code: error::INTERNAL_ERROR,
+            message: error.to_string(),
+            data: None,
+        },
+        InstructionActivationHostError::OwnerTask(message) => RpcError {
+            code: error::INTERNAL_ERROR,
+            message: format!("instruction activation owner failed: {message}"),
+            data: None,
+        },
     }
 }
 
@@ -15631,6 +16082,80 @@ mod tests {
             err.to_string().contains("unknown provider")
                 && err.to_string().contains("provider-shaped-cache-key"),
             "error should reject the provider string before model fallback: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconfigure_rejects_a_target_that_cannot_preserve_recorded_activations() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = make_runtime(temp_factory(&temp), 10);
+        let build_config = AgentBuildConfig {
+            llm_client_override: Some(Arc::new(MockLlmClient)),
+            ..AgentBuildConfig::new("claude-opus-5")
+        };
+        let session_id = runtime
+            .create_session(build_config, None, None, Vec::new())
+            .await
+            .unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(100);
+        runtime
+            .start_turn(
+                &session_id,
+                "Hello".into(),
+                event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let body = "Policy";
+        runtime
+            .activate_instruction(
+                &session_id,
+                InstructionActivationRequest {
+                    revision: meerkat_core::InstructionRevisionRef {
+                        namespace: meerkat_core::InstructionNamespace::new("app.example").unwrap(),
+                        key: meerkat_core::InstructionKey::new("primary").unwrap(),
+                        revision_id: meerkat_core::InstructionRevisionId::new("revision-1")
+                            .unwrap(),
+                        content_sha256: meerkat_core::InstructionContentDigest::for_body(body),
+                    },
+                    activation_id: meerkat_core::InstructionActivationId::new("activation-1")
+                        .unwrap(),
+                    expectation: meerkat_core::InstructionActivationExpectation::Absent,
+                    supersedes: None,
+                    body: body.to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let error = runtime
+            .hot_swap_llm_client(
+                &session_id,
+                &crate::handlers::turn::TurnOverrides {
+                    model: Some("claude-sonnet-4-6".to_string()),
+                    provider: Some("anthropic".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("incompatible model hot-swap must fail closed");
+        assert!(
+            error
+                .message
+                .contains("cannot represent the ordered instruction activations"),
+            "unexpected reconfigure error: {error:?}"
+        );
+        assert_eq!(
+            runtime
+                .current_materialized_llm_identity(&session_id)
+                .await
+                .unwrap()
+                .model,
+            "claude-opus-5"
         );
     }
 
@@ -24425,6 +24950,10 @@ mod tests {
         }))
         .expect("serialize live/open params");
 
+        #[cfg(all(feature = "experimental-gpt-live", feature = "live-webrtc"))]
+        let experimental_live_playback_custodies =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
         let ctx = crate::handlers::live::LiveOpenHandlerContext {
             host: &host,
             live_ws: None,
@@ -24434,6 +24963,10 @@ mod tests {
             runtime: &runtime,
             // The whole point of #302: no factory wired.
             session_factory: None,
+            #[cfg(feature = "experimental-gpt-live")]
+            experimental_live_open_authority: None,
+            #[cfg(all(feature = "experimental-gpt-live", feature = "live-webrtc"))]
+            experimental_live_playback_custodies: &experimental_live_playback_custodies,
         };
 
         let response =

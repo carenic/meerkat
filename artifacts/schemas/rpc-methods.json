@@ -167,6 +167,18 @@
       "result_type": "SystemPromptUpdateResult"
     },
     {
+      "description": "Activate one immutable instruction revision at a safe materialized-session boundary",
+      "name": "session/activate_instruction",
+      "params_type": "ActivateInstructionParams",
+      "result_type": "InstructionActivationReceipt"
+    },
+    {
+      "description": "Read authoritative durable instruction activation records",
+      "name": "session/instruction_activations",
+      "params_type": "ReadInstructionActivationsParams",
+      "result_type": "InstructionActivationReadPage"
+    },
+    {
       "description": "Read a retained immutable transcript revision body",
       "name": "session/transcript_revision",
       "params_type": "ReadSessionTranscriptRevisionParams",
@@ -576,6 +588,12 @@
       "name": "live/truncate",
       "params_type": "LiveTruncateParams",
       "result_type": "LiveTruncateResult"
+    },
+    {
+      "description": "Report that client playback completed for one assistant output",
+      "name": "live/playback_complete",
+      "params_type": "LivePlaybackCompleteParams",
+      "result_type": "LivePlaybackCompleteResult"
     },
     {
       "description": "Apply mutable session config (instructions/tools/audio) to an open live channel via a single session.update; does NOT replay history. Identity swaps (model/provider) require close + reopen.",

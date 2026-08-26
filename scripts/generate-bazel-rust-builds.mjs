@@ -1237,7 +1237,7 @@ function writeRootBuild(fastTestLabels, e2eSystemTestLabels, surfaceFeatureMatri
     `    16, 21, 22, 23, 25, 26, 27, 28, 30, 31, 38, 39,`,
     `    43, 44, 47, 48, 49, 50, 51, 52, 53, 54, 71, 72,`,
     `    74, 76, 77, 79, 80, 82, 83, 84, 85, 86, 87, 88,`,
-    `    89, 90, 92, 93, 94,`,
+    `    89, 90, 92, 93, 94, 96,`,
     `]`,
     ``,
     `E2E_SMOKE_TURBO_S_SUITES = [`,
@@ -1585,7 +1585,7 @@ for (const pkg of localPackages.values()) {
       if (needsPackageRunfiles(target) || extraData.includes(currentPackageRunfiles) || usesTrybuild) {
         data.unshift(":package_runfiles");
       }
-      const env = [`        "RUST_MIN_STACK": "16777216",`];
+      const env = [`        "RUST_MIN_STACK": "33554432",`];
       attrs.splice(attrs.length - 1, 0, `    tags = ${listExpr([...new Set(tags)].sort())},`);
       if (key === "meerkat" && target.name === "agent_builder_policy_canary") {
         attrs.splice(attrs.length - 1, 0, `    size = "large",`);
@@ -1816,7 +1816,7 @@ for (const pkg of localPackages.values()) {
         ":package_runfiles",
         ...workspaceDataLabels(target).filter((label) => label !== currentPackageRunfiles),
       ];
-      const unitEnv = [`        "RUST_MIN_STACK": "16777216",`];
+      const unitEnv = [`        "RUST_MIN_STACK": "33554432",`];
       const unitSize = key === "meerkat-mob" ? "large" : key === "xtask" ? "medium" : "small";
       if (key === "xtask") {
         const rustfmt = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin";

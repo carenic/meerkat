@@ -47,6 +47,7 @@ pub mod image_generation;
 pub mod interaction;
 pub mod lifecycle;
 pub mod live_adapter;
+pub mod live_execution;
 pub mod mcp_config;
 pub mod memory;
 pub mod model_defaults;
@@ -108,7 +109,8 @@ pub use agent::{
     AgentRunner, AgentSessionStore, AgentToolDispatcher, BindOutcome, CancelAfterBoundaryCommand,
     CancelAfterBoundarySender, CommsCapabilityError, CommsRuntime, CurrentTurnContent,
     CurrentTurnImageRef, DefaultSystemPromptPolicy, DispatcherCapabilities, ExternalToolUpdate,
-    FilteredToolDispatcher, LlmStreamResult, SnapshotProjectionError,
+    FilteredToolDispatcher, LiveBridgeNoncommittingRunPermit, LiveBridgePreparedOperation,
+    LiveBridgeToolDispatchAdmission, LlmStreamResult, SnapshotProjectionError,
     StickyModelFallbackActivationProof, ToolDispatchContext, dispatch_tool_execution_plan_fenced,
     resolve_tool_execution_plan_fenced, select_tool_catalog_mode,
     should_compose_tool_catalog_control_plane,
@@ -125,9 +127,11 @@ pub use artifact::{
     ArtifactOwner, ArtifactPayload, ArtifactRecord, ArtifactStore, ArtifactType,
 };
 pub use auth::{
-    ActingOnBehalfOf, AuthGrant, GrantAction, GrantScope, PrincipalContractError, PrincipalId,
-    PrincipalKind, PrincipalRef, VisibilityClass, can_observe_visibility,
-    metadata_grants_no_visibility,
+    ActingOnBehalfOf, AuthBindingUseDecision, AuthBindingUseDenial, AuthBindingUseGateError,
+    AuthBindingUseRequest, AuthBindingUseWitness, AuthGrant, GrantAction, GrantScope,
+    PrincipalContractError, PrincipalId, PrincipalKind, PrincipalRef, VisibilityClass,
+    authorize_explicit_auth_binding_use, authorize_then_materialize_auth_binding,
+    can_observe_visibility, metadata_grants_no_visibility,
 };
 pub use blob::{
     BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError, ImageBlobIntegrityError,
@@ -257,6 +261,21 @@ pub use lifecycle::{
     CoreInteractionTerminalPublicationReceipt, CoreRenderable, InputId, RunApplyBoundary,
     RunBoundaryReceipt, RunBoundaryReceiptDraft, RunEvent, RunId, RunPrimitive, StagedRunInput,
 };
+pub use live_execution::{
+    AmbiguousDeliveryNoRetryEvidence, CanonicalContextRevision, CanonicalTranscriptPrefixDigest,
+    FinalLiveUserTranscriptCommitError, FinalLiveUserTranscriptCommitEvidence,
+    FinalLiveUserTranscriptDisposition, LiveAppendDeliveryOutcome, LiveAppendDeliveryReceipt,
+    LiveAssistantPlaybackEvidence, LiveAssistantPlaybackTruncationDisposition,
+    LiveAssistantPlaybackTruncationError, LiveAssistantPlaybackTruncationEvidence,
+    LiveBridgeCancellationReason, LiveBridgeEffectKind, LiveBridgeEffectOutcome,
+    LiveBridgeOperationCorrelation, LiveBridgeOperationPhase, LiveBridgeOutputKind,
+    LiveBridgeProviderCorrelation, LiveBridgeRequestDigest, LiveBridgeSubmissionObservation,
+    LiveBridgeSubmissionState, LiveChannelId, LiveContextCursor, LiveExecutionCapabilities,
+    LiveExecutionChannelPhase, LiveExecutionIdentityError, LiveExecutionMode,
+    LiveHandoffInputProvenance, LiveHandoffReconciliation, LiveResultDisposition,
+    LiveUserTurnCorrelation, MeerkatExecutionTerminal, NormalizedLiveUserInputDigest,
+    OpaqueProviderCorrelation, ProvisionalLiveHandoff,
+};
 pub use mcp_config::{McpConfig, McpConfigError, McpScope, McpServerConfig, McpServerWithScope};
 pub use memory::{
     CompactionCommitCoordinationError, CompactionCommitCoordinator, CompactionHandoffRefusal,
@@ -268,6 +287,7 @@ pub use memory::{
     MemoryStore, MemoryStoreError, MessageRange, SESSION_COMPACTION_PROJECTION_INTENTS_KEY,
 };
 pub use model_defaults::ModelOperationalDefaultsResolver;
+pub use model_profile::catalog::ModelReleaseStage;
 pub use model_profile::{ModelCatalog, ModelProfile};
 pub use model_registry::{
     ModelCapability, ModelProfileWitness, ModelRegistry, ModelRegistryEntry, SelfHostedServerRef,
@@ -313,9 +333,9 @@ pub use provider_evidence::{
     provider_cache_breakpoint_claim,
 };
 pub use realtime_transcript::{
-    PendingRealtimeUserContentBlob, RealtimeTranscriptApplyOutcome, RealtimeTranscriptEvent,
-    RealtimeTranscriptMaterializedMessage, RealtimeTranscriptRole, RealtimeUserContentApplyOutcome,
-    RealtimeUserContentIdentity, RealtimeUserContentTombstone,
+    LiveAssistantPlaybackTarget, PendingRealtimeUserContentBlob, RealtimeTranscriptApplyOutcome,
+    RealtimeTranscriptEvent, RealtimeTranscriptMaterializedMessage, RealtimeTranscriptRole,
+    RealtimeUserContentApplyOutcome, RealtimeUserContentIdentity, RealtimeUserContentTombstone,
     SESSION_REALTIME_TRANSCRIPT_STATE_KEY,
 };
 pub use realtime_transcript_sidecar::{
@@ -358,18 +378,25 @@ pub use service::{
 };
 pub use session::{
     AuthorizedSessionToolVisibilityState, ConsumedDeferredTurnInputs, DeferredFirstTurnPhase,
-    DeferredToolLoadAuthority, ImportedReleased0810Session, InheritedToolVisibilityAuthority,
-    InvalidSessionLineageId, PendingDeferredPrompt, PendingToolResultsMessage,
-    PersistedSessionMetadataView, PreparedTransientTurnContextBoundary, ProviderNativeToolPolicy,
-    Released0810ImportError, Released0810ImportEvidence, Released0810ImportReceipt,
-    SESSION_BUILD_STATE_KEY, SESSION_DEFERRED_TURN_STATE_KEY, SESSION_LIFECYCLE_TERMINAL_KEY,
-    SESSION_METADATA_SCHEMA_VERSION, SESSION_TOOL_VISIBILITY_STATE_KEY,
-    SESSION_TRANSCRIPT_HISTORY_STATE_KEY, SESSION_TRANSCRIPT_REWRITE_PREFIX_AUTHORITY_KEY,
-    SESSION_VERSION, SerializedSessionArtifact, Session, SessionBuildState,
-    SessionDeferredTurnState, SessionGeneration, SessionHeadMetadataCell,
-    SessionHeadMetadataCellIdentity, SessionHeadMetadataDigest, SessionHeadMetadataIdentity,
-    SessionHeadMetadataProjection, SessionHeadMetadataValueDigest, SessionLifecycleTerminal,
-    SessionLineageId, SessionLlmIdentity, SessionLlmIdentityOverride,
+    DeferredToolLoadAuthority, INSTRUCTION_ACTIVATION_RENDER_VERSION_V1,
+    ImportedReleased0810Session, InheritedToolVisibilityAuthority,
+    InstructionActivationAdmissionErrorCode, InstructionActivationDisposition,
+    InstructionActivationError, InstructionActivationErrorCode, InstructionActivationExpectation,
+    InstructionActivationKeyState, InstructionActivationMutation,
+    InstructionActivationProjectionWitness, InstructionActivationReadPage,
+    InstructionActivationReadQuery, InstructionActivationReceipt, InstructionActivationRecord,
+    InstructionActivationRequest, InvalidSessionLineageId,
+    MAX_INSTRUCTION_ACTIVATION_LINEAGE_BYTES, MAX_INSTRUCTION_BODY_BYTES, PendingDeferredPrompt,
+    PendingToolResultsMessage, PersistedSessionMetadataView, PreparedTransientTurnContextBoundary,
+    ProviderNativeToolPolicy, Released0810ImportError, Released0810ImportEvidence,
+    Released0810ImportReceipt, SESSION_BUILD_STATE_KEY, SESSION_DEFERRED_TURN_STATE_KEY,
+    SESSION_LIFECYCLE_TERMINAL_KEY, SESSION_METADATA_SCHEMA_VERSION,
+    SESSION_TOOL_VISIBILITY_STATE_KEY, SESSION_TRANSCRIPT_HISTORY_STATE_KEY,
+    SESSION_TRANSCRIPT_REWRITE_PREFIX_AUTHORITY_KEY, SESSION_VERSION, SerializedSessionArtifact,
+    Session, SessionBuildState, SessionDeferredTurnState, SessionGeneration,
+    SessionHeadMetadataCell, SessionHeadMetadataCellIdentity, SessionHeadMetadataDigest,
+    SessionHeadMetadataIdentity, SessionHeadMetadataProjection, SessionHeadMetadataValueDigest,
+    SessionLifecycleTerminal, SessionLineageId, SessionLlmIdentity, SessionLlmIdentityOverride,
     SessionLlmIdentityOverrideError, SessionLlmRequestPolicy, SessionMeta, SessionMetadata,
     SessionMetadataDocument, SessionToolVisibilityState, SessionTooling, SystemMessageAppendError,
     SystemPromptUpdateError, SystemPromptUpdateRequest, SystemPromptUpdateResult,
@@ -454,8 +481,8 @@ pub use tool_execution::{
     ToolProgressPolicy, ephemeral_tool_catalog_binding_fingerprint,
 };
 pub use tool_execution_policy::{
-    ExecutionPolicyGatedDispatcher, ToolExecutionPolicy, ToolExecutionPolicyError,
-    ToolMutationClass,
+    ExecutionPolicyGatedDispatcher, ToolDispatchAdmission, ToolExecutionPolicy,
+    ToolExecutionPolicyError, ToolMutationClass,
 };
 pub use tool_scope::{
     ComposedToolFilter, EXTERNAL_TOOL_FILTER_METADATA_KEY, ExternalToolSurfaceBaseState,
@@ -478,7 +505,10 @@ pub use turn_execution_authority::{
 pub use turn_terminal::{ClassifiedTurnTerminal, TurnTerminalClassifier, TurnTerminalKind};
 pub use types::{
     ArtifactRef, AssistantBlock, BlockAssistantMessage, CommsNoticeKind, ContentBlock,
-    ContentInput, CumulativeUsage, ExtractionError, HandlingMode, ImageData, MemoryIndexExclusion,
+    ContentInput, CumulativeUsage, ExtractionError, HandlingMode, ImageData,
+    InstructionActivationId, InstructionActivationIdentity, InstructionContentDigest,
+    InstructionKey, InstructionNamespace, InstructionRevisionId, InstructionRevisionRef,
+    InvalidInstructionContentDigest, InvalidInstructionIdentifier, MemoryIndexExclusion,
     MemoryIndexableContent, Message, OutputSchema, ProviderMeta, RunInput, RunResult,
     SUPPORTED_VIDEO_MEDIA_TYPES, SecurityMode, ServerToolKind, SessionId, StopReason,
     SystemMessage, SystemMessageIdentity, SystemNoticeBlock, SystemNoticeDirection,

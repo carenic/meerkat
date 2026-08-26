@@ -60,6 +60,41 @@ use crate::types::{ToolCallView, ToolDef, ToolNameSet};
 use async_trait::async_trait;
 use std::sync::Arc;
 
+/// Process-local authority consulted immediately before an actual tool call.
+///
+/// This seam is intentionally asynchronous: provisional execution may resolve
+/// and advertise the ordinary tool catalog while the final authority needed
+/// to execute a call is still pending. Implementations wait for their owning
+/// generated machine rather than returning a model-visible retry error.
+///
+/// The admission object does not replace [`ToolExecutionPolicy`]. Once it
+/// admits a call, the ordinary access and consequence policies still apply.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait ToolDispatchAdmission: Send + Sync {
+    async fn await_dispatch_admission(
+        &self,
+        call: ToolCallView<'_>,
+        context: Option<&ToolDispatchContext>,
+        effect_kind: crate::LiveBridgeEffectKind,
+    ) -> Result<(), ToolError>;
+
+    /// Settle the physical result of the exact dispatch admitted above.
+    ///
+    /// The default is intentionally inert for ordinary process-local gates.
+    /// Generated live bridge gates override it to move their consumed effect
+    /// authority from in-flight to an exact terminal outcome.
+    async fn record_dispatch_outcome(
+        &self,
+        _call: ToolCallView<'_>,
+        _context: Option<&ToolDispatchContext>,
+        _effect_kind: crate::LiveBridgeEffectKind,
+        _outcome: crate::LiveBridgeEffectOutcome,
+    ) -> Result<(), ToolError> {
+        Ok(())
+    }
+}
+
 /// Error resolving a [`ToolAccessPolicy`] into a [`ToolExecutionPolicy`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ToolExecutionPolicyError {
@@ -267,6 +302,7 @@ pub struct ExecutionPolicyGatedDispatcher<T: AgentToolDispatcher + ?Sized> {
     inner: Arc<T>,
     policy: ToolExecutionPolicy,
     consequence_policy: Option<crate::BoundToolConsequencePolicy>,
+    dispatch_admission: Option<Arc<dyn ToolDispatchAdmission>>,
 }
 
 impl<T: AgentToolDispatcher + ?Sized> ExecutionPolicyGatedDispatcher<T> {
@@ -276,6 +312,7 @@ impl<T: AgentToolDispatcher + ?Sized> ExecutionPolicyGatedDispatcher<T> {
             inner,
             policy,
             consequence_policy: None,
+            dispatch_admission: None,
         }
     }
 
@@ -286,6 +323,17 @@ impl<T: AgentToolDispatcher + ?Sized> ExecutionPolicyGatedDispatcher<T> {
         consequence_policy: crate::BoundToolConsequencePolicy,
     ) -> Self {
         self.consequence_policy = Some(consequence_policy);
+        self
+    }
+
+    /// Attach a process-local pre-dispatch admission authority.
+    ///
+    /// The factory applies this wrapper after every dispatcher composition, so
+    /// the check covers built-ins, dynamic gateways, MCP, Mob, memory, and
+    /// catalog-control tools at the last actual dispatch boundary.
+    #[must_use]
+    pub fn with_dispatch_admission(mut self, admission: Arc<dyn ToolDispatchAdmission>) -> Self {
+        self.dispatch_admission = Some(admission);
         self
     }
 
@@ -336,6 +384,66 @@ impl<T: AgentToolDispatcher + ?Sized> ExecutionPolicyGatedDispatcher<T> {
             .evaluate(call, context.and_then(ToolDispatchContext::run_id).cloned())
             .await
     }
+
+    async fn await_dispatch_admission(
+        &self,
+        call: ToolCallView<'_>,
+        context: Option<&ToolDispatchContext>,
+    ) -> Result<DispatchAdmissionCustody, ToolError> {
+        let effect_kind = self.inner.live_bridge_effect_kind(call.name);
+        let mut admissions = Vec::with_capacity(2);
+        if let Some(admission) = self.dispatch_admission.as_ref() {
+            admission
+                .await_dispatch_admission(call, context, effect_kind)
+                .await?;
+            admissions.push(Arc::clone(admission));
+        }
+        if let Some(admission) = context.and_then(ToolDispatchContext::live_bridge_admission) {
+            if let Err(error) = admission
+                .admission()
+                .await_dispatch_admission(call, context, effect_kind)
+                .await
+            {
+                for admitted in admissions {
+                    admitted
+                        .record_dispatch_outcome(
+                            call,
+                            context,
+                            effect_kind,
+                            crate::LiveBridgeEffectOutcome::Failed,
+                        )
+                        .await?;
+                }
+                return Err(error);
+            }
+            admissions.push(Arc::clone(admission.admission()));
+        }
+        Ok(DispatchAdmissionCustody {
+            admissions,
+            effect_kind,
+        })
+    }
+}
+
+struct DispatchAdmissionCustody {
+    admissions: Vec<Arc<dyn ToolDispatchAdmission>>,
+    effect_kind: crate::LiveBridgeEffectKind,
+}
+
+impl DispatchAdmissionCustody {
+    async fn settle(
+        self,
+        call: ToolCallView<'_>,
+        context: Option<&ToolDispatchContext>,
+        outcome: crate::LiveBridgeEffectOutcome,
+    ) -> Result<(), ToolError> {
+        for admission in self.admissions {
+            admission
+                .record_dispatch_outcome(call, context, self.effect_kind, outcome)
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -357,6 +465,14 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
 
     fn tool_mutation_class(&self, tool_name: &str) -> ToolMutationClass {
         self.inner.tool_mutation_class(tool_name)
+    }
+
+    fn live_bridge_effect_kind(&self, tool_name: &str) -> crate::LiveBridgeEffectKind {
+        self.inner.live_bridge_effect_kind(tool_name)
+    }
+
+    fn execution_binding_epoch(&self, tool_name: &str) -> u64 {
+        self.inner.execution_binding_epoch(tool_name)
     }
 
     fn pending_catalog_sources(&self) -> Arc<[String]> {
@@ -409,15 +525,52 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
             .resolve_execution_plan(call, dispatch_context, resolution_context)
     }
 
+    fn validate_resolved_execution_plan(
+        &self,
+        call: ToolCallView<'_>,
+        resolution_context: &crate::ToolExecutionResolutionContext,
+        plan: &crate::ResolvedToolExecutionPlan,
+    ) -> Result<(), crate::ToolExecutionResolutionError> {
+        if !self.permits_inner_call(call.name) {
+            return Err(match self.denial_error(call.name) {
+                ToolError::NotFound { .. } => crate::ToolExecutionResolutionError::NotFound {
+                    tool_name: call.name.to_string(),
+                },
+                _ => crate::ToolExecutionResolutionError::AccessDenied {
+                    tool_name: call.name.to_string(),
+                },
+            });
+        }
+        self.inner
+            .validate_resolved_execution_plan(call, resolution_context, plan)
+    }
+
     async fn dispatch(
         &self,
         call: ToolCallView<'_>,
     ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
-        if !self.permits_inner_call(call.name) {
-            return Err(self.denial_error(call.name));
+        let custody = self.await_dispatch_admission(call, None).await?;
+        let pre_dispatch = async {
+            if !self.permits_inner_call(call.name) {
+                return Err(self.denial_error(call.name));
+            }
+            self.evaluate_consequence_policy(call, None).await
         }
-        self.evaluate_consequence_policy(call, None).await?;
-        self.inner.dispatch(call).await
+        .await;
+        if let Err(error) = pre_dispatch {
+            custody
+                .settle(call, None, crate::LiveBridgeEffectOutcome::Failed)
+                .await?;
+            return Err(error);
+        }
+        let result = self.inner.dispatch(call).await;
+        let outcome = if result.is_ok() {
+            crate::LiveBridgeEffectOutcome::Committed
+        } else {
+            crate::LiveBridgeEffectOutcome::Unknown
+        };
+        custody.settle(call, None, outcome).await?;
+        result
     }
 
     async fn dispatch_with_context(
@@ -425,12 +578,28 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
         call: ToolCallView<'_>,
         context: &ToolDispatchContext,
     ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
-        if !self.permits_inner_call(call.name) {
-            return Err(self.denial_error(call.name));
+        let custody = self.await_dispatch_admission(call, Some(context)).await?;
+        let pre_dispatch = async {
+            if !self.permits_inner_call(call.name) {
+                return Err(self.denial_error(call.name));
+            }
+            self.evaluate_consequence_policy(call, Some(context)).await
         }
-        self.evaluate_consequence_policy(call, Some(context))
-            .await?;
-        self.inner.dispatch_with_context(call, context).await
+        .await;
+        if let Err(error) = pre_dispatch {
+            custody
+                .settle(call, Some(context), crate::LiveBridgeEffectOutcome::Failed)
+                .await?;
+            return Err(error);
+        }
+        let result = self.inner.dispatch_with_context(call, context).await;
+        let outcome = if result.is_ok() {
+            crate::LiveBridgeEffectOutcome::Committed
+        } else {
+            crate::LiveBridgeEffectOutcome::Unknown
+        };
+        custody.settle(call, Some(context), outcome).await?;
+        result
     }
 
     async fn dispatch_resolved_with_context(
@@ -439,14 +608,31 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
         context: &ToolDispatchContext,
         plan: &crate::ResolvedToolExecutionPlan,
     ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
-        if !self.permits_inner_call(call.name) {
-            return Err(self.denial_error(call.name));
+        let custody = self.await_dispatch_admission(call, Some(context)).await?;
+        let pre_dispatch = async {
+            if !self.permits_inner_call(call.name) {
+                return Err(self.denial_error(call.name));
+            }
+            self.evaluate_consequence_policy(call, Some(context)).await
         }
-        self.evaluate_consequence_policy(call, Some(context))
-            .await?;
-        self.inner
+        .await;
+        if let Err(error) = pre_dispatch {
+            custody
+                .settle(call, Some(context), crate::LiveBridgeEffectOutcome::Failed)
+                .await?;
+            return Err(error);
+        }
+        let result = self
+            .inner
             .dispatch_resolved_with_context(call, context, plan)
-            .await
+            .await;
+        let outcome = if result.is_ok() {
+            crate::LiveBridgeEffectOutcome::Committed
+        } else {
+            crate::LiveBridgeEffectOutcome::Unknown
+        };
+        custody.settle(call, Some(context), outcome).await?;
+        result
     }
 
     async fn poll_external_updates(&self) -> ExternalToolUpdate {
@@ -477,6 +663,7 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
                 inner,
                 policy: owned.policy,
                 consequence_policy: owned.consequence_policy,
+                dispatch_admission: owned.dispatch_admission,
             });
             Ok(if bound {
                 BindOutcome::Bound(gated)
@@ -489,6 +676,7 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
                     inner: owned.inner,
                     policy: owned.policy,
                     consequence_policy: owned.consequence_policy,
+                    dispatch_admission: owned.dispatch_admission,
                 },
             )))
         }
@@ -539,6 +727,60 @@ mod tests {
     };
     use std::collections::BTreeSet;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct BlockingAdmission {
+        released: AtomicBool,
+        notify: tokio::sync::Notify,
+        effect_kinds: Mutex<Vec<crate::LiveBridgeEffectKind>>,
+        outcomes: Mutex<Vec<crate::LiveBridgeEffectOutcome>>,
+    }
+
+    impl BlockingAdmission {
+        fn new() -> Self {
+            Self {
+                released: AtomicBool::new(false),
+                notify: tokio::sync::Notify::new(),
+                effect_kinds: Mutex::new(Vec::new()),
+                outcomes: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn release(&self) {
+            self.released.store(true, Ordering::Release);
+            self.notify.notify_waiters();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolDispatchAdmission for BlockingAdmission {
+        async fn await_dispatch_admission(
+            &self,
+            _call: ToolCallView<'_>,
+            _context: Option<&ToolDispatchContext>,
+            effect_kind: crate::LiveBridgeEffectKind,
+        ) -> Result<(), ToolError> {
+            self.effect_kinds.lock().unwrap().push(effect_kind);
+            loop {
+                let notified = self.notify.notified();
+                if self.released.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                notified.await;
+            }
+        }
+
+        async fn record_dispatch_outcome(
+            &self,
+            _call: ToolCallView<'_>,
+            _context: Option<&ToolDispatchContext>,
+            _effect_kind: crate::LiveBridgeEffectKind,
+            outcome: crate::LiveBridgeEffectOutcome,
+        ) -> Result<(), ToolError> {
+            self.outcomes.lock().unwrap().push(outcome);
+            Ok(())
+        }
+    }
 
     fn tool_def(name: &str) -> Arc<ToolDef> {
         Arc::new(ToolDef::new(
@@ -1512,6 +1754,143 @@ mod tests {
             .expect_err("static policy must remain authoritative");
         assert_eq!(error, ToolError::access_denied("beta"));
         assert!(inner.dispatched().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_admission_is_outermost_and_still_intersects_ordinary_policy() {
+        let inner = Arc::new(SpyDispatcher::new(&["alpha", "beta"]));
+        let admission = Arc::new(BlockingAdmission::new());
+        let gated = Arc::new(
+            ExecutionPolicyGatedDispatcher::new(Arc::clone(&inner), allow_list(&["alpha"]))
+                .with_dispatch_admission(Arc::clone(&admission) as Arc<dyn ToolDispatchAdmission>),
+        );
+
+        let pending = tokio::spawn({
+            let gated = Arc::clone(&gated);
+            async move { dispatch_named_with_context(gated.as_ref(), "alpha").await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            inner.dispatched().is_empty(),
+            "inner dispatcher must not observe a provisional tool call"
+        );
+
+        let denied = tokio::spawn({
+            let gated = Arc::clone(&gated);
+            async move { dispatch_named_with_context(gated.as_ref(), "beta").await }
+        });
+        tokio::task::yield_now().await;
+        assert!(inner.dispatched().is_empty());
+
+        admission.release();
+        pending
+            .await
+            .expect("dispatch task")
+            .expect("released exact operation must dispatch");
+        let denied = denied
+            .await
+            .expect("denied dispatch task")
+            .expect_err("ordinary policy must still narrow released admission");
+        assert_eq!(denied, ToolError::access_denied("beta"));
+        assert_eq!(inner.dispatched(), vec!["alpha"]);
+        let outcomes = admission.outcomes.lock().unwrap().clone();
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.contains(&crate::LiveBridgeEffectOutcome::Committed));
+        assert!(outcomes.contains(&crate::LiveBridgeEffectOutcome::Failed));
+    }
+
+    #[tokio::test]
+    async fn entered_inner_dispatch_error_is_unknown_not_retriable_failure() {
+        struct FailingDispatcher(SpyDispatcher);
+
+        #[async_trait::async_trait]
+        impl AgentToolDispatcher for FailingDispatcher {
+            fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+                self.0.tools()
+            }
+
+            async fn dispatch(
+                &self,
+                _call: ToolCallView<'_>,
+            ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
+                Err(ToolError::ExecutionFailed {
+                    message: "physical outcome unavailable".to_string(),
+                })
+            }
+        }
+
+        let admission = Arc::new(BlockingAdmission::new());
+        admission.release();
+        let gated = ExecutionPolicyGatedDispatcher::new(
+            Arc::new(FailingDispatcher(SpyDispatcher::new(&["external"]))),
+            ToolExecutionPolicy::unrestricted(),
+        )
+        .with_dispatch_admission(Arc::clone(&admission) as Arc<dyn ToolDispatchAdmission>);
+
+        dispatch_named(&gated, "external")
+            .await
+            .expect_err("inner dispatcher reports an error");
+        assert_eq!(
+            *admission.outcomes.lock().unwrap(),
+            vec![crate::LiveBridgeEffectOutcome::Unknown],
+            "an error after entering physical dispatch cannot be relabeled as a retryable failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_context_admission_receives_owner_declared_effect_kind() {
+        struct MemoryEffectDispatcher(SpyDispatcher);
+
+        #[async_trait::async_trait]
+        impl AgentToolDispatcher for MemoryEffectDispatcher {
+            fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+                self.0.tools()
+            }
+
+            fn live_bridge_effect_kind(&self, _tool_name: &str) -> crate::LiveBridgeEffectKind {
+                crate::LiveBridgeEffectKind::ReadOnlyMemorySnapshot
+            }
+
+            async fn dispatch(
+                &self,
+                call: ToolCallView<'_>,
+            ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
+                self.0.dispatch(call).await
+            }
+        }
+
+        let inner = Arc::new(MemoryEffectDispatcher(SpyDispatcher::new(&[
+            "memory_search",
+        ])));
+        let admission = Arc::new(BlockingAdmission::new());
+        admission.release();
+        let gated = ExecutionPolicyGatedDispatcher::new(inner, ToolExecutionPolicy::unrestricted());
+        let context = ToolDispatchContext::default().with_live_bridge_admission(
+            crate::LiveBridgeToolDispatchAdmission::new(
+                "operation-1",
+                Arc::clone(&admission) as Arc<dyn ToolDispatchAdmission>,
+            ),
+        );
+        let args = empty_args();
+        gated
+            .dispatch_with_context(
+                ToolCallView {
+                    id: "call-1",
+                    name: "memory_search",
+                    args: &args,
+                },
+                &context,
+            )
+            .await
+            .expect("owner-classified dispatch");
+        assert_eq!(
+            *admission.effect_kinds.lock().unwrap(),
+            vec![crate::LiveBridgeEffectKind::ReadOnlyMemorySnapshot]
+        );
+        assert_eq!(
+            *admission.outcomes.lock().unwrap(),
+            vec![crate::LiveBridgeEffectOutcome::Committed]
+        );
     }
 
     struct WedgedConsequenceSnapshot;

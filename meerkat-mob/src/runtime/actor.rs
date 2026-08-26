@@ -129,8 +129,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 pub(super) const RETIRE_LOCAL_TRUST_CLEANUP_CONCURRENCY: usize = 32;
 
-const STARTUP_FAILURE_AUTONOMOUS_STOP_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const STARTUP_FAILURE_AUTONOMOUS_STOP_DEADLINE: Duration = Duration::from_secs(10);
+const ROLLBACK_AUTONOMOUS_STOP_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const ROLLBACK_AUTONOMOUS_STOP_DEADLINE: Duration = Duration::from_secs(10);
 /// A status projection is observational and must never hold the single mob
 /// actor behind a slow or wedged session-runtime read. Unknown progress is a
 /// truthful result; delaying lifecycle commands is not.
@@ -398,6 +398,8 @@ fn identity_session_load_error_class(
         | SessionError::Agent(_)
         | SessionError::DurableTailHeldForRecovery { .. }
         | SessionError::DurableTailRecoveryRefused { .. }
+        | SessionError::ExternalWriteFenceConflict { .. }
+        | SessionError::ExternalWriteFenceBackoff { .. }
         | SessionError::FailedWithData { .. } => IdentitySessionLoadErrorClass::Unavailable,
     }
 }
@@ -3623,6 +3625,7 @@ struct DeferredResumeProvision {
     shell_env: Option<std::collections::HashMap<String, String>>,
     inherited_tool_filter: Option<meerkat_core::InheritedToolVisibilityAuthority>,
     tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
+    tool_dispatch_admission: Option<Arc<dyn meerkat_core::ToolDispatchAdmission>>,
     web_search_override: meerkat_core::ToolCategoryOverride,
     application_tool_policy: meerkat_core::ApplicationToolPolicyBinding,
     tool_consequence_policy_registry: Option<Arc<meerkat_core::ToolConsequencePolicyRegistry>>,
@@ -3718,6 +3721,7 @@ impl DeferredResumeProvision {
             shell_env,
             inherited_tool_filter,
             tool_access_policy,
+            tool_dispatch_admission,
             web_search_override,
             application_tool_policy,
             tool_consequence_policy_registry,
@@ -3767,6 +3771,7 @@ impl DeferredResumeProvision {
             resumed_session: stored_session,
         })
         .await?;
+        config.tool_dispatch_admission = tool_dispatch_admission;
         config.keep_alive = keep_alive;
         config.override_web_search = web_search_override;
         config.application_tool_policy = application_tool_policy;
@@ -12185,37 +12190,14 @@ impl MobActor {
             );
             return;
         }
-        let autonomous_stop_deadline = Instant::now() + STARTUP_FAILURE_AUTONOMOUS_STOP_DEADLINE;
-        loop {
-            match self.stop_all_autonomous_members().await {
-                Ok(()) => break,
-                Err(stop_error @ MobError::AutonomousStopInterruptsPending { .. }) => {
-                    let now = Instant::now();
-                    if now >= autonomous_stop_deadline {
-                        tracing::warn!(
-                            mob_id = %self.definition.id,
-                            error = %stop_error,
-                            failure_label,
-                            "startup failure Stop did not prove exact autonomous cleanup before its deadline"
-                        );
-                        return;
-                    }
-                    tokio::time::sleep(
-                        STARTUP_FAILURE_AUTONOMOUS_STOP_POLL_INTERVAL
-                            .min(autonomous_stop_deadline - now),
-                    )
-                    .await;
-                }
-                Err(stop_error) => {
-                    tracing::warn!(
-                        mob_id = %self.definition.id,
-                        error = %stop_error,
-                        failure_label,
-                        "startup failure Stop remains pending on autonomous cleanup"
-                    );
-                    return;
-                }
-            }
+        if let Err(stop_error) = self.stop_all_autonomous_members_for_rollback().await {
+            tracing::warn!(
+                mob_id = %self.definition.id,
+                error = %stop_error,
+                failure_label,
+                "startup failure Stop remains pending on autonomous cleanup"
+            );
+            return;
         }
         if let Err(error) = self.commit_stopped_lifecycle_after_cleanup().await {
             tracing::warn!(
@@ -15159,6 +15141,29 @@ impl MobActor {
         Ok(())
     }
 
+    /// Complete an exact rollback instead of exposing the ordinary
+    /// level-triggered interrupt-pending observation to its caller. Interrupt
+    /// bridge I/O remains actor-owned and bounded; this loop only polls the
+    /// retained result until every exact incarnation is settled or the
+    /// rollback cleanup budget is exhausted.
+    async fn stop_all_autonomous_members_for_rollback(&mut self) -> Result<(), MobError> {
+        let deadline = Instant::now() + ROLLBACK_AUTONOMOUS_STOP_DEADLINE;
+        loop {
+            match self.stop_all_autonomous_members().await {
+                Ok(()) => return Ok(()),
+                Err(error @ MobError::AutonomousStopInterruptsPending { .. }) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(error);
+                    }
+                    tokio::time::sleep(ROLLBACK_AUTONOMOUS_STOP_POLL_INTERVAL.min(deadline - now))
+                        .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Fence every local session at the explicit stopped -> running resume
     /// seam. A same-handle resume keeps the exact active sidecar already
     /// owned by this provisioner. A reconstructed handle retires the foreign
@@ -15405,6 +15410,7 @@ impl MobActor {
     async fn rebuild_explicit_resume_member_sessions(
         &mut self,
         rebuild: Vec<ExplicitResumeMemberRebuild>,
+        progress: &super::state::LifecycleProgressSignal,
     ) -> Result<(), MobError> {
         let mut first_infrastructure_error = None;
         for rebuild in rebuild {
@@ -15480,6 +15486,10 @@ impl MobActor {
                 .labels
                 .clone()
                 .unwrap_or_else(|| entry.labels.clone());
+            progress.awaiting_member(
+                &entry.agent_identity,
+                super::state::LifecycleProgressStage::MemberLiveMaterialization,
+            );
             {
                 let mut retained = self.per_spawn_external_tools.write().await;
                 if let Some(tools) = restore_spec.external_tools {
@@ -15527,6 +15537,10 @@ impl MobActor {
                     }
                 }
             }
+            progress.member_progress(
+                &entry.agent_identity,
+                super::state::LifecycleProgressStage::MemberLiveMaterialization,
+            );
         }
         if let Some(error) = first_infrastructure_error {
             return Err(error);
@@ -15545,6 +15559,7 @@ impl MobActor {
     async fn ensure_autonomous_runtimes_from_roster(
         &mut self,
         allow_stopped_resume_reopen: bool,
+        progress: Option<&super::state::LifecycleProgressSignal>,
     ) -> Result<(), MobError> {
         let lifecycle = self.dsl_authority.state();
         if lifecycle_origin_fenced(lifecycle) {
@@ -15610,6 +15625,12 @@ impl MobActor {
                 .collect::<Vec<_>>()
         };
         for entry in &all_entries {
+            if let Some(progress) = progress {
+                progress.awaiting_member(
+                    &entry.agent_identity,
+                    super::state::LifecycleProgressStage::MemberCommsReadiness,
+                );
+            }
             let ensure_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 self.provisioner
                     .ensure_runtime_session_state(&entry.member_ref)
@@ -15635,6 +15656,12 @@ impl MobActor {
                             )],
                         });
                     }
+                    if let Some(progress) = progress {
+                        progress.member_progress(
+                            &entry.agent_identity,
+                            super::state::LifecycleProgressStage::MemberCommsReadiness,
+                        );
+                    }
                     continue;
                 }
             };
@@ -15648,8 +15675,20 @@ impl MobActor {
                     first_error = Some(error);
                 }
             }
+            if let Some(progress) = progress {
+                progress.member_progress(
+                    &entry.agent_identity,
+                    super::state::LifecycleProgressStage::MemberCommsReadiness,
+                );
+            }
         }
         for entry in &entries {
+            if let Some(progress) = progress {
+                progress.awaiting_member(
+                    &entry.agent_identity,
+                    super::state::LifecycleProgressStage::AutonomousRuntimeReadiness,
+                );
+            }
             let ensure_result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 self.ensure_autonomous_runtime_ready(&entry.agent_identity, &entry.member_ref),
@@ -15673,6 +15712,12 @@ impl MobActor {
                             )],
                         });
                     }
+                    if let Some(progress) = progress {
+                        progress.member_progress(
+                            &entry.agent_identity,
+                            super::state::LifecycleProgressStage::AutonomousRuntimeReadiness,
+                        );
+                    }
                     continue;
                 }
             };
@@ -15684,6 +15729,12 @@ impl MobActor {
                 );
                 if first_error.is_none() {
                     first_error = Some(error);
+                }
+                if let Some(progress) = progress {
+                    progress.member_progress(
+                        &entry.agent_identity,
+                        super::state::LifecycleProgressStage::AutonomousRuntimeReadiness,
+                    );
                 }
                 continue;
             }
@@ -15720,6 +15771,12 @@ impl MobActor {
                         first_error = Some(error);
                     }
                 }
+            }
+            if let Some(progress) = progress {
+                progress.member_progress(
+                    &entry.agent_identity,
+                    super::state::LifecycleProgressStage::AutonomousRuntimeReadiness,
+                );
             }
         }
 
@@ -21142,6 +21199,163 @@ impl MobActor {
                         }
                     }
                 }
+                #[cfg(feature = "experimental-gpt-live")]
+                MobCommand::ValidateLiveBridgeMemberEligibility {
+                    agent_identity,
+                    reply_tx,
+                } => {
+                    let result = async {
+                        let entry = self
+                            .roster
+                            .read()
+                            .await
+                            .get(&agent_identity)
+                            .cloned()
+                            .ok_or(super::LiveBridgeOperationStartError::Unavailable)?;
+                        let session_id = entry
+                            .bridge_session_id()
+                            .cloned()
+                            .ok_or(super::LiveBridgeOperationStartError::Rejected)?;
+                        let dsl_identity = mob_dsl::AgentIdentity::from_domain(&agent_identity);
+                        let dsl_runtime = self
+                            .dsl_authority
+                            .state()
+                            .identity_to_runtime
+                            .get(&dsl_identity);
+                        let dsl_session = self
+                            .dsl_authority
+                            .state()
+                            .member_session_bindings
+                            .get(&dsl_identity);
+                        if dsl_runtime.is_none_or(|runtime| {
+                            runtime.0 != entry.agent_runtime_id.to_string()
+                        }) || dsl_session.is_none_or(|session| {
+                            session.0 != session_id.to_string()
+                        }) || !dsl_runtime.is_some_and(|runtime| {
+                            self.dsl_authority.state().live_runtime_ids.contains(runtime)
+                        }) {
+                            return Err(super::LiveBridgeOperationStartError::Rejected);
+                        }
+                        self.session_service
+                            .validate_live_bridge_member_eligibility(&session_id)
+                            .await
+                            .map_err(|_| super::LiveBridgeOperationStartError::Rejected)
+                    }
+                    .await;
+                    let _ = reply_tx.send(result);
+                }
+                #[cfg(feature = "experimental-gpt-live")]
+                MobCommand::ValidateLiveDurableSourceAvailability {
+                    agent_identity,
+                    reply_tx,
+                } => {
+                    let result = async {
+                        let entry = self
+                            .roster
+                            .read()
+                            .await
+                            .get(&agent_identity)
+                            .cloned()
+                            .ok_or(super::LiveBridgeOperationStartError::Unavailable)?;
+                        let session_id = entry
+                            .bridge_session_id()
+                            .cloned()
+                            .ok_or(super::LiveBridgeOperationStartError::Rejected)?;
+                        let dsl_identity = mob_dsl::AgentIdentity::from_domain(&agent_identity);
+                        let dsl_runtime = self
+                            .dsl_authority
+                            .state()
+                            .identity_to_runtime
+                            .get(&dsl_identity);
+                        let dsl_session = self
+                            .dsl_authority
+                            .state()
+                            .member_session_bindings
+                            .get(&dsl_identity);
+                        if dsl_runtime.is_none_or(|runtime| {
+                            runtime.0 != entry.agent_runtime_id.to_string()
+                        }) || dsl_session.is_none_or(|session| {
+                            session.0 != session_id.to_string()
+                        }) || !dsl_runtime.is_some_and(|runtime| {
+                            self.dsl_authority.state().live_runtime_ids.contains(runtime)
+                        }) {
+                            return Err(super::LiveBridgeOperationStartError::Rejected);
+                        }
+                        let source = self
+                            .session_service
+                            .load_persisted_session(&session_id)
+                            .await
+                            .map_err(|_| super::LiveBridgeOperationStartError::Rejected)?;
+                        if source
+                            .as_ref()
+                            .is_none_or(|session| session.id() != &session_id)
+                        {
+                            return Err(super::LiveBridgeOperationStartError::Rejected);
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    let _ = reply_tx.send(result);
+                }
+                #[cfg(feature = "experimental-gpt-live")]
+                MobCommand::StartLiveBridgeOperation {
+                    agent_identity,
+                    request,
+                    cancellation,
+                    reply_tx,
+                } => {
+                    let result = async {
+                        if !request.has_execution_authorities()
+                            || request.admission().agent_identity() != agent_identity.as_str()
+                            || request.snapshot().agent_identity() != agent_identity.as_str()
+                        {
+                            return Err(
+                                super::LiveBridgeOperationStartError::Rejected,
+                            );
+                        }
+                        let entry = self
+                            .roster
+                            .read()
+                            .await
+                            .get(&agent_identity)
+                            .cloned()
+                            .ok_or(super::LiveBridgeOperationStartError::Unavailable)?;
+                        let binding = request.admission().binding();
+                        let dsl_identity = mob_dsl::AgentIdentity::from_domain(&agent_identity);
+                        let dsl_runtime = self
+                            .dsl_authority
+                            .state()
+                            .identity_to_runtime
+                            .get(&dsl_identity);
+                        let dsl_session = self
+                            .dsl_authority
+                            .state()
+                            .member_session_bindings
+                            .get(&dsl_identity);
+                        if entry.agent_runtime_id.to_string() != binding.runtime_id().0.as_str()
+                            || entry.generation.get() != binding.generation()
+                            || entry.fence_token.get() != binding.fence_token()
+                            || dsl_runtime.is_none_or(|runtime| runtime.0 != binding.runtime_id().0)
+                            || dsl_session.is_none_or(|session| {
+                                session.0 != request.admission().session_id().to_string()
+                            })
+                            || !dsl_runtime.is_some_and(|runtime| {
+                                self.dsl_authority.state().live_runtime_ids.contains(runtime)
+                            })
+                            || request.snapshot().session().id()
+                                != request.admission().session_id()
+                            || request.snapshot().canonical_context_revision()
+                                != request.admission().canonical_context_revision()
+                        {
+                            return Err(super::LiveBridgeOperationStartError::Rejected);
+                        }
+                        self.session_service
+                            .start_live_bridge_member_operation(request, cancellation)
+                            .await
+                    }
+                    .await;
+                    let _ = reply_tx.send(result);
+                }
                 MobCommand::SendPeerMessage {
                     from,
                     to,
@@ -22331,6 +22545,7 @@ impl MobActor {
                 MobCommand::ResumeLifecycle {
                     deadline,
                     admission,
+                    progress,
                     reply_tx,
                 } => {
                     let result = if Instant::now() >= deadline {
@@ -22373,9 +22588,11 @@ impl MobActor {
                             // machine-owned revival seam.
                             if !rebuilt_attachment
                                 && let Err(error) =
-                                    self.ensure_autonomous_runtimes_from_roster(true).await
+                                    self.ensure_autonomous_runtimes_from_roster(true, None).await
                             {
-                                if let Err(stop_error) = self.stop_all_autonomous_members().await {
+                                if let Err(stop_error) =
+                                    self.stop_all_autonomous_members_for_rollback().await
+                                {
                                     tracing::warn!(
                                         mob_id = %self.definition.id,
                                         error = %stop_error,
@@ -22404,7 +22621,7 @@ impl MobActor {
                                     };
                                 if !rebuilt_attachment
                                     && let Err(stop_error) =
-                                        self.stop_all_autonomous_members().await
+                                        self.stop_all_autonomous_members_for_rollback().await
                                 {
                                     self.provisioner.cancel_all_checkpointers().await;
                                     return Err(MobError::Internal(format!(
@@ -22415,10 +22632,13 @@ impl MobActor {
                                 return Err(timeout_error);
                             }
                             admission.admit();
+                            progress.awaiting_stage(
+                                super::state::LifecycleProgressStage::DurableResumeTransition,
+                            );
                             if let Err(error) = self.resume_lifecycle_after_quiesce().await {
                                 if !rebuilt_attachment
                                     && let Err(stop_error) =
-                                        self.stop_all_autonomous_members().await
+                                        self.stop_all_autonomous_members_for_rollback().await
                                 {
                                     tracing::warn!(
                                         mob_id = %self.definition.id,
@@ -22433,10 +22653,17 @@ impl MobActor {
                             let mut post_commit_error = None;
                             if rebuilt_attachment {
                                 let rebuild_result = self
-                                    .rebuild_explicit_resume_member_sessions(rebuild)
+                                    .rebuild_explicit_resume_member_sessions(rebuild, &progress)
                                     .await;
+                                progress.awaiting_stage(
+                                    super::state::LifecycleProgressStage::PostRebuildReadiness,
+                                );
                                 let readiness_result =
-                                    self.ensure_autonomous_runtimes_from_roster(false).await;
+                                    self.ensure_autonomous_runtimes_from_roster(
+                                        false,
+                                        Some(&progress),
+                                    )
+                                    .await;
                                 if let Err(error) = rebuild_result {
                                     post_commit_error = Some(error);
                                 }
@@ -22449,6 +22676,9 @@ impl MobActor {
 
                             #[cfg(feature = "runtime-adapter")]
                             {
+                                progress.awaiting_stage(
+                                    super::state::LifecycleProgressStage::ResumeTopologyReconciliation,
+                                );
                                 // All exact session attachments are settled before
                                 // topology repair. The shared reconciler consumes its
                                 // generated trust handoffs directly; routing the same
@@ -23165,7 +23395,10 @@ impl MobActor {
                 .await;
         }
         if matches!(self.state(), MobState::Running) {
-            if let Err(error) = self.ensure_autonomous_runtimes_from_roster(false).await {
+            if let Err(error) = self
+                .ensure_autonomous_runtimes_from_roster(false, None)
+                .await
+            {
                 tracing::error!(
                     mob_id = %self.definition.id,
                     error = %error,
@@ -24482,6 +24715,7 @@ impl MobActor {
             labels,
             launch_mode,
             tool_access_policy,
+            tool_dispatch_admission,
             tool_category_overrides,
             application_tool_policy,
             budget_limits,
@@ -24750,6 +24984,7 @@ impl MobActor {
                             shell_env,
                             inherited_tool_filter: inherited_tool_filter.clone(),
                             tool_access_policy: tool_access_policy.clone(),
+                            tool_dispatch_admission: tool_dispatch_admission.clone(),
                             web_search_override: tool_category_overrides.web_search,
                             application_tool_policy: application_tool_policy.clone(),
                             tool_consequence_policy_registry: self
@@ -24834,6 +25069,7 @@ impl MobActor {
                         },
                     )
                     .await?;
+                    config.tool_dispatch_admission = tool_dispatch_admission.clone();
                     config.keep_alive =
                         selected_runtime_mode == crate::MobRuntimeMode::AutonomousHost;
                     config.override_web_search = tool_category_overrides.web_search;
@@ -24929,6 +25165,7 @@ impl MobActor {
                 system_prompt_override,
             })
             .await?;
+            config.tool_dispatch_admission = tool_dispatch_admission.clone();
             tracing::debug!(
                 mob_id = %self.definition.id,
                 agent_identity = %agent_identity,
@@ -26224,6 +26461,7 @@ impl MobActor {
             labels,
             launch_mode,
             tool_access_policy,
+            tool_dispatch_admission,
             tool_category_overrides,
             application_tool_policy,
             budget_limits,
@@ -26246,6 +26484,12 @@ impl MobActor {
                 "enqueue_spawn_remote invoked without placement".to_string()
             ));
         };
+        if tool_dispatch_admission.is_some() {
+            fail!(MobError::WiringError(
+                "process-local tool dispatch admission cannot cross member-host placement"
+                    .to_string(),
+            ));
+        }
         if compaction_curator_override.is_some() {
             fail!(MobError::WiringError(
                 "compaction curator overrides are in-process host behavior and cannot be submitted to a remote member host"
@@ -27688,6 +27932,7 @@ impl MobActor {
             labels,
             launch_mode: _,
             tool_access_policy,
+            tool_dispatch_admission: _,
             tool_category_overrides,
             application_tool_policy,
             budget_limits,
@@ -38260,6 +38505,7 @@ impl MobActor {
             labels: replacement_labels,
             launch_mode: _,
             tool_access_policy: replacement_tool_access_policy,
+            tool_dispatch_admission: replacement_tool_dispatch_admission,
             tool_category_overrides: replacement_tool_category_overrides,
             application_tool_policy: replacement_application_tool_policy,
             budget_limits: replacement_budget_limits,
@@ -38482,6 +38728,7 @@ impl MobActor {
             system_prompt_override: replacement_system_prompt_override,
         })
         .await?;
+        config.tool_dispatch_admission = replacement_tool_dispatch_admission;
         config.keep_alive = replacement_runtime_mode == crate::MobRuntimeMode::AutonomousHost;
         config.override_web_search = replacement_tool_category_overrides.web_search;
         config.application_tool_policy = replacement_application_tool_policy;

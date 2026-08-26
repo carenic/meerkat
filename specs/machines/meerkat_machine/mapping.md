@@ -3845,6 +3845,15 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ResolveLiveOpenAdmissionChannelAlreadyBoundRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `ResolveLiveOpenAdmissionRevokedChannelIdIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveOpenAdmissionRevokedChannelIdAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveOpenAdmissionRevokedChannelIdRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `ResolveLiveOpenAdmissionDrainingIdle`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -3879,6 +3888,807 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `AbandonLiveOpenAdmissionStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveExecutionModeAdmissionIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveExecutionModeAdmissionAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveExecutionModeAdmissionRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `StageExperimentalLiveExecutionIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `StageExperimentalLiveExecutionAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `StageExperimentalLiveExecutionRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RegisterLivePlaybackOwnerIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RegisterLivePlaybackOwnerAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RegisterLivePlaybackOwnerRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveActiveChannelControlIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveActiveChannelControlAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveActiveChannelControlRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ConsumeLiveActiveChannelControlIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ConsumeLiveActiveChannelControlAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ConsumeLiveActiveChannelControlRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RevokeLivePlaybackOwnerIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RevokeLivePlaybackOwnerAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RevokeLivePlaybackOwnerRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RevokeLiveChannelCloseCustodyIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RevokeLiveChannelCloseCustodyAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RevokeLiveChannelCloseCustodyRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RevokeLiveChannelCloseCustodyClosedReplayIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RevokeLiveChannelCloseCustodyClosedReplayAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RevokeLiveChannelCloseCustodyClosedReplayRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RevokeLiveChannelCloseCustodyClosedReplayRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RevokeLiveChannelCloseCustodyClosedReplayStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `BindLiveExecutionChannelIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `BindLiveExecutionChannelAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `BindLiveExecutionChannelRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ObserveLiveProviderTurnStartedIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ObserveLiveProviderTurnStartedAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ObserveLiveProviderTurnStartedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ObserveLiveAssistantTurnStartedIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ObserveLiveAssistantTurnStartedAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ObserveLiveAssistantTurnStartedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveInteractionIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveInteractionAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveInteractionRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveDelegationIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveDelegationAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveDelegationRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveInteractionDelegationIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveInteractionDelegationAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveInteractionDelegationRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveDelegationWorkerStartIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveDelegationWorkerStartAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveDelegationWorkerStartRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationWorkerStartIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationWorkerStartAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationWorkerStartRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileLiveDelegationTranscriptConfirmedIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileLiveDelegationTranscriptConfirmedAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileLiveDelegationTranscriptConfirmedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileLiveDelegationTranscriptMaterialConflictIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileLiveDelegationTranscriptMaterialConflictAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileLiveDelegationTranscriptMaterialConflictRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileLiveDelegationTranscriptMissingIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileLiveDelegationTranscriptMissingAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileLiveDelegationTranscriptMissingRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveDelegationTranscriptTerminalCancellationIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveDelegationTranscriptTerminalCancellationAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveDelegationTranscriptTerminalCancellationRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonLiveInteractionWithDelegationCancellationIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonLiveInteractionWithDelegationCancellationAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonLiveInteractionWithDelegationCancellationRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonLiveInteractionWithDelegationCancellationRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonLiveInteractionWithDelegationCancellationStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SupersedeLiveInteractionWithDelegationCancellationIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SupersedeLiveInteractionWithDelegationCancellationAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SupersedeLiveInteractionWithDelegationCancellationRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SupersedeCompletedLiveInteractionDelegationWithCancellationIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SupersedeCompletedLiveInteractionDelegationWithCancellationAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SupersedeCompletedLiveInteractionDelegationWithCancellationRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SupersedeLiveInteractionWithoutDelegationCancellationIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SupersedeLiveInteractionWithoutDelegationCancellationAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SupersedeLiveInteractionWithoutDelegationCancellationRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SupersedeLiveInteractionWithoutDelegationCancellationRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SupersedeLiveInteractionWithoutDelegationCancellationStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonLiveInteractionIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonLiveInteractionAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonLiveInteractionRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonLiveInteractionRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonLiveInteractionStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonLiveInteractionPreservingEarlierDelegationIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonLiveInteractionPreservingEarlierDelegationAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonLiveInteractionPreservingEarlierDelegationRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonLiveInteractionPreservingEarlierDelegationRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonLiveInteractionPreservingEarlierDelegationStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CompleteLiveInteractionIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CompleteLiveInteractionAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CompleteLiveInteractionRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationCancellationIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationCancellationAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationCancellationRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationCancellationRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationCancellationStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveDelegationWorkerTerminalIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveDelegationWorkerTerminalAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveDelegationWorkerTerminalRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveDelegationWorkerTerminalRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveDelegationWorkerTerminalStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveDelegationWorkerAfterRestartFreshIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveDelegationWorkerAfterRestartFreshAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveDelegationWorkerAfterRestartFreshRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveDelegationWorkerAfterRestartFreshRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveDelegationWorkerAfterRestartFreshStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveDelegationWorkerAfterRestartTerminalCustodyIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveDelegationWorkerAfterRestartTerminalCustodyAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveDelegationWorkerAfterRestartTerminalCustodyRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveDelegationWorkerAfterRestartTerminalCustodyRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveDelegationWorkerAfterRestartTerminalCustodyStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveDelegationWorkerAfterRestartExactReplayIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveDelegationWorkerAfterRestartExactReplayAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveDelegationWorkerAfterRestartExactReplayRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveDelegationWorkerAfterRestartExactReplayRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveDelegationWorkerAfterRestartExactReplayStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveDelegationWorkerRetirementIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveDelegationWorkerRetirementAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveDelegationWorkerRetirementRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveDelegationWorkerRetirementRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveDelegationWorkerRetirementStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationWorkerRetirementIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationWorkerRetirementAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationWorkerRetirementRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationWorkerRetirementRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationWorkerRetirementStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveConsequentialEffectIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveConsequentialEffectAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveConsequentialEffectRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveDelegationResultReleaseIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveDelegationResultReleaseAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveDelegationResultReleaseRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveDelegationResultDeliveryIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveDelegationResultDeliveryAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveDelegationResultDeliveryRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationResultDeliveryIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationResultDeliveryAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationResultDeliveryRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationResultDeliveryAmbiguousIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationResultDeliveryAmbiguousAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveDelegationResultDeliveryAmbiguousRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `BindLiveDelegationResultRecoveryChannelIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `BindLiveDelegationResultRecoveryChannelAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `BindLiveDelegationResultRecoveryChannelRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveBridgeOperationFreshIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveBridgeOperationFreshAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveBridgeOperationFreshRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveBridgeOperationExactReplayIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveBridgeOperationExactReplayAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveBridgeOperationExactReplayRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveBridgeOperationProtocolDriftIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveBridgeOperationProtocolDriftAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveBridgeOperationProtocolDriftRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ConfirmLiveBridgeFinalInputIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ConfirmLiveBridgeFinalInputAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ConfirmLiveBridgeFinalInputRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveBridgeExecutionStartIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveBridgeExecutionStartAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveBridgeExecutionStartRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveBridgeEffectIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveBridgeEffectAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveBridgeEffectRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ConsumeLiveBridgeEffectAuthorityIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ConsumeLiveBridgeEffectAuthorityAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ConsumeLiveBridgeEffectAuthorityRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeEffectOutcomeFreshIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeEffectOutcomeFreshAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeEffectOutcomeFreshRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeEffectOutcomeFreshRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeEffectOutcomeFreshStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeEffectOutcomeExactReplayIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeEffectOutcomeExactReplayAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeEffectOutcomeExactReplayRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeEffectOutcomeExactReplayRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeEffectOutcomeExactReplayStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeOutcomeReceiptFreshIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeOutcomeReceiptFreshAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeOutcomeReceiptFreshRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeOutcomeReceiptFreshRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeOutcomeReceiptFreshStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeOutcomeReceiptExactReplayIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeOutcomeReceiptExactReplayAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeOutcomeReceiptExactReplayRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeOutcomeReceiptExactReplayRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeOutcomeReceiptExactReplayStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireSettledLiveBridgeOperationIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireSettledLiveBridgeOperationAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireSettledLiveBridgeOperationRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireSettledLiveBridgeOperationRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireSettledLiveBridgeOperationStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireSettledLiveBridgeOperationAlreadyAbsentIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireSettledLiveBridgeOperationAlreadyAbsentAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireSettledLiveBridgeOperationAlreadyAbsentRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireSettledLiveBridgeOperationAlreadyAbsentRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireSettledLiveBridgeOperationAlreadyAbsentStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CancelLiveBridgeOperationIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CancelLiveBridgeOperationAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CancelLiveBridgeOperationRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeExecutionTerminalFreshIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeExecutionTerminalFreshAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeExecutionTerminalFreshRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeExecutionTerminalExactReplayIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeExecutionTerminalExactReplayAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeExecutionTerminalExactReplayRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `FenceRestoredLiveBridgeOperationForRestartFreshIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `FenceRestoredLiveBridgeOperationForRestartFreshAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `FenceRestoredLiveBridgeOperationForRestartFreshRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `FenceRestoredLiveBridgeOperationForRestartFreshRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `FenceRestoredLiveBridgeOperationForRestartFreshStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `FenceRestoredLiveBridgeOperationForRestartExactReplayIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `FenceRestoredLiveBridgeOperationForRestartExactReplayAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `FenceRestoredLiveBridgeOperationForRestartExactReplayRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `FenceRestoredLiveBridgeOperationForRestartExactReplayRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `FenceRestoredLiveBridgeOperationForRestartExactReplayStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveBridgeExecutionTerminalFreshIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveBridgeExecutionTerminalFreshAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveBridgeExecutionTerminalFreshRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveBridgeExecutionTerminalFreshRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveBridgeExecutionTerminalFreshStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveBridgeExecutionTerminalExactReplayIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveBridgeExecutionTerminalExactReplayAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveBridgeExecutionTerminalExactReplayRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveBridgeExecutionTerminalExactReplayRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileRevokedLiveBridgeExecutionTerminalExactReplayStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveBridgeSubmissionIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveBridgeSubmissionAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveBridgeSubmissionRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClaimLiveBridgeSubmissionAttemptIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClaimLiveBridgeSubmissionAttemptAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClaimLiveBridgeSubmissionAttemptRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeSubmissionLocalWriteIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeSubmissionLocalWriteAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveBridgeSubmissionLocalWriteRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveBridgeSubmissionIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveBridgeSubmissionAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveBridgeSubmissionRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverLiveBridgeSubmissionIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverLiveBridgeSubmissionAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverLiveBridgeSubmissionRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverLiveBridgeSubmissionRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverLiveBridgeSubmissionStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverLiveBridgeSubmissionExactReplayIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverLiveBridgeSubmissionExactReplayAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverLiveBridgeSubmissionExactReplayRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverLiveBridgeSubmissionExactReplayRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverLiveBridgeSubmissionExactReplayStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `EnqueueLiveContextRowIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `EnqueueLiveContextRowAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `EnqueueLiveContextRowRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdvanceLiveContextCanonicalCoverageIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdvanceLiveContextCanonicalCoverageAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdvanceLiveContextCanonicalCoverageRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveContextAppendIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveContextAppendAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeLiveContextAppendRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveContextAppendDeliveredIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveContextAppendDeliveredAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveContextAppendDeliveredRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveContextAppendAmbiguousIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveContextAppendAmbiguousAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveContextAppendAmbiguousRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `BindLiveContextRecoveryChannelIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `BindLiveContextRecoveryChannelAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `BindLiveContextRecoveryChannelRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveContextAppendRejectedIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveContextAppendRejectedAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveContextAppendRejectedRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `RecordLiveRefreshQueuedIdle`
@@ -4074,6 +4884,15 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `RecordLiveWebrtcAnswerAcceptedStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveWebrtcAnswerAcceptedAndBindExecutionIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveWebrtcAnswerAcceptedAndBindExecutionAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordLiveWebrtcAnswerAcceptedAndBindExecutionRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `RecordLiveWebsocketTokenIssuedIdle`
@@ -6466,6 +7285,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `LiveWebrtcAnswerResultResolved`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `LiveWebrtcAnswerAcceptedAndExecutionBound`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `LiveWebsocketTokenIssued`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -6476,6 +7298,171 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `LiveOpenAdmissionAbandoned`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveExecutionChannelBound`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ExperimentalLiveExecutionStaged`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveExecutionModeAdmissionResolved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LivePlaybackOwnerReady`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveActiveChannelControlAuthorityIssued`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveActiveChannelControlDispatchAuthorized`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LivePlaybackOwnerRevoked`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveChannelCloseCustodyRevoked`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveInteractionAdmitted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveDelegationAdmitted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveInteractionDelegationAdmitted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveDelegationTranscriptReconciled`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveDelegationWorkerStartAuthorized`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveDelegationWorkerStartResolved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveDelegationCancellationAuthorized`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveDelegationCancellationResolved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveDelegationWorkerTerminalRecorded`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveDelegationWorkerRestartReconciled`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveDelegationWorkerRetirementAuthorized`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveDelegationWorkerRetirementResolved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveInteractionAbandoned`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveInteractionSupersededWithoutCancellation`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveInteractionCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveProviderTurnStarted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveAssistantTurnStarted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveProviderTurnFinished`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveConsequentialEffectAuthorized`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveDelegationResultReleaseAuthorized`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveDelegationResultDeliveryAuthorized`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveDelegationResultDeliveryResolved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveDelegationResultAmbiguityRecoveryAuthorized`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveDelegationResultRecoveryChannelBound`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveBridgeOperationAdmitted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveBridgeOperationReplayObserved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveBridgeProtocolDriftCloseAuthorized`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveBridgeFinalInputAuthorized`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveBridgeExecutionStartAuthorized`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveBridgeEffectAuthorityIssued`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveBridgeEffectDispatchAuthorized`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveBridgeEffectOutcomeRecorded`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveBridgeOutcomeReceiptRecorded`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveBridgeOperationRetirementResolved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveBridgeOperationCancellationAuthorized`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveBridgeExecutionTerminalRecorded`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveBridgeSubmissionAuthorized`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveBridgeSubmissionAttemptClaimed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveBridgeSubmissionLocalWriteRecorded`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveBridgeSubmissionResolved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveBridgeSubmissionRecoveredAmbiguous`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveContextAppendAuthorized`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveContextRowQueued`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveContextCanonicalCoverageAdvanced`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveContextAppendResolved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveContextAmbiguityRecoveryAuthorized`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveContextRecoveryChannelBound`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `SessionEventStreamOpenResolved`
@@ -6619,6 +7606,84 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `runtime_generation_requires_bound_runtime`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_execution_binding_is_complete_and_channel_scoped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_execution_phase_is_explicit_and_revocation_is_terminal`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_bridge_operation_identity_is_complete_and_direct`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_bridge_effect_authority_is_one_use_and_exact`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_bridge_execution_and_provider_settlement_are_independent`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_bridge_started_execution_and_outcome_receipt_are_operation_scoped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_bridge_cancellation_provenance_is_operation_scoped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_bridge_completed_terminal_has_exact_result_digest`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_experimental_execution_custody_is_exact`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_active_interaction_is_exactly_channel_bound`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_provider_turn_occupancy_has_exact_interaction`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_assistant_turn_is_frozen_to_exact_foreground_interaction`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_pending_delegation_is_serialized_and_complete`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_delegation_operation_has_exact_join_identity`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_delegation_worker_binding_is_exact`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_delegation_terminal_is_worker_bound`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_delegation_result_eligibility_is_terminal_and_confirmed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_delegation_late_terminal_never_eligible`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_released_result_requires_confirmed_transcript`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_result_delivery_is_exact_and_terminal_once`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_result_speech_suppression_is_exact_and_non_cancelling`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_result_recovery_is_exact_and_channel_scoped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_consequential_authority_requires_confirmed_transcript`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_pending_context_append_is_exact_and_channel_scoped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_context_outbox_is_exact_and_session_scoped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_context_recovery_is_exact_and_channel_scoped`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `runtime_epoch_requires_registered_session`

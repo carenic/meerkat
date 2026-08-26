@@ -143,6 +143,8 @@ pub(super) struct PendingResumeOperation {
     deadline: Instant,
     command_authority: crate::control_policy::CommandAuthority,
     state_tx: tokio::sync::watch::Sender<ResumeOperationState>,
+    progress: super::state::LifecycleProgressSignal,
+    progress_rx: tokio::sync::watch::Receiver<super::state::LifecycleProgressObservation>,
 }
 
 #[derive(Default)]
@@ -181,11 +183,14 @@ impl ResumeOperationRegistry {
         }
         let (state_tx, _) =
             tokio::sync::watch::channel(ResumeOperationState::AwaitingLifecycleAdmission);
+        let (progress, progress_rx) = super::state::LifecycleProgressSignal::new();
         let pending = Arc::new(PendingResumeOperation {
             generation: state.generation,
             deadline,
             command_authority: command_authority.clone(),
             state_tx,
+            progress,
+            progress_rx,
         });
         state.current.push(Arc::clone(&pending));
         (pending, true)
@@ -2012,6 +2017,7 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         | MobError::PlacedKickoffCleanupPending { .. }
         | MobError::AutonomousStopInterruptsPending { .. }
         | MobError::LifecycleOperationPending { .. }
+        | MobError::LifecycleOperationProgressStalled { .. }
         | MobError::LifecycleOperationAdmissionPending { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
@@ -3125,6 +3131,93 @@ impl std::fmt::Display for BoundedTurnFailure {
 }
 
 impl std::error::Error for BoundedTurnFailure {}
+
+/// Durable member lifecycle observed while reconciling one caller-identified
+/// bounded work item.
+///
+/// This is an observation only. It carries no spawn, retirement, or work
+/// admission authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DurableBoundedMemberState {
+    Absent,
+    Active {
+        session_id: SessionId,
+    },
+    Retiring {
+        session_id: SessionId,
+    },
+    Retired {
+        session_id: SessionId,
+    },
+    Broken {
+        session_id: Option<SessionId>,
+        reason: String,
+    },
+}
+
+impl DurableBoundedMemberState {
+    #[must_use]
+    pub fn session_id(&self) -> Option<&SessionId> {
+        match self {
+            Self::Absent => None,
+            Self::Active { session_id }
+            | Self::Retiring { session_id }
+            | Self::Retired { session_id } => Some(session_id),
+            Self::Broken { session_id, .. } => session_id.as_ref(),
+        }
+    }
+}
+
+/// Exact durable work fact recovered by stable delivery identity.
+///
+/// `Terminal` is produced only from the runtime's persisted exact completion
+/// receipt and passes through the same bounded validation as the live waiter.
+/// `Absent` never means retryable. The caller decides whether absence is
+/// expected for the independently observed member lifecycle.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DurableBoundedWorkState {
+    Absent,
+    InFlight {
+        input_id: meerkat_core::InputId,
+        phase: meerkat_runtime::InputLifecycleState,
+    },
+    Terminal {
+        input_id: meerkat_core::InputId,
+        result: Result<BoundedTurnResult, BoundedTurnFailure>,
+    },
+    Broken {
+        input_id: Option<meerkat_core::InputId>,
+        reason: String,
+    },
+}
+
+/// Read-only recovery projection for one deterministic child and one stable
+/// bounded work delivery.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct DurableBoundedWorkRecovery {
+    member: DurableBoundedMemberState,
+    work: DurableBoundedWorkState,
+}
+
+impl DurableBoundedWorkRecovery {
+    #[must_use]
+    pub fn member(&self) -> &DurableBoundedMemberState {
+        &self.member
+    }
+
+    #[must_use]
+    pub fn work(&self) -> &DurableBoundedWorkState {
+        &self.work
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (DurableBoundedMemberState, DurableBoundedWorkState) {
+        (self.member, self.work)
+    }
+}
 
 /// A bounded wait failure paired with the admission receipt for the exact
 /// operation that failed.
@@ -4378,6 +4471,10 @@ pub struct SpawnMemberSpec {
     pub launch_mode: crate::launch::MemberLaunchMode,
     /// Tool access policy for this member.
     pub tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
+    /// Process-local final dispatch admission for provisional executions.
+    /// This authority is forwarded to AgentFactory's outermost dispatcher
+    /// gate and is never persisted or serialized for remote placement.
+    pub tool_dispatch_admission: Option<Arc<dyn meerkat_core::ToolDispatchAdmission>>,
     /// Administrative per-category overrides carried by durable identity intent.
     pub tool_category_overrides: meerkat_core::ToolCategoryOverrides,
     /// Stable application consequence-policy identity for this member.
@@ -4453,6 +4550,10 @@ impl std::fmt::Debug for SpawnMemberSpec {
             .field("labels", &self.labels)
             .field("launch_mode", &self.launch_mode)
             .field("tool_access_policy", &self.tool_access_policy)
+            .field(
+                "tool_dispatch_admission",
+                &self.tool_dispatch_admission.is_some(),
+            )
             .field("tool_category_overrides", &self.tool_category_overrides)
             .field("application_tool_policy", &self.application_tool_policy)
             .field("budget_limits", &self.budget_limits)
@@ -4489,6 +4590,7 @@ impl SpawnMemberSpec {
             labels: None,
             launch_mode: crate::launch::MemberLaunchMode::Fresh,
             tool_access_policy: None,
+            tool_dispatch_admission: None,
             tool_category_overrides: meerkat_core::ToolCategoryOverrides::default(),
             application_tool_policy: meerkat_core::ApplicationToolPolicyBinding::Unmanaged,
             budget_limits: None,
@@ -4975,6 +5077,7 @@ impl MobHandle {
                             cmd: MobCommand::ResumeLifecycle {
                                 deadline: operation.deadline,
                                 admission,
+                                progress: operation.progress.clone(),
                                 reply_tx,
                             },
                         });
@@ -5011,6 +5114,15 @@ impl MobHandle {
             MobError::LifecycleOperationPending { intent } => MobError::LifecycleOperationPending {
                 intent: intent.clone(),
             },
+            MobError::LifecycleOperationProgressStalled {
+                intent,
+                member_id,
+                stage,
+            } => MobError::LifecycleOperationProgressStalled {
+                intent: intent.clone(),
+                member_id: member_id.clone(),
+                stage,
+            },
             MobError::LifecycleOperationAdmissionPending { intent, stage } => {
                 MobError::LifecycleOperationAdmissionPending {
                     intent: intent.clone(),
@@ -5027,6 +5139,9 @@ impl MobHandle {
         caller_deadline: Instant,
     ) -> Result<(), MobError> {
         let mut state_rx = operation.state_tx.subscribe();
+        let mut progress_rx = operation.progress_rx.clone();
+        let mut observed_progress_epoch = progress_rx.borrow().epoch;
+        let mut progress_deadline = None;
         loop {
             let state = state_rx.borrow().clone();
             match state {
@@ -5057,27 +5172,79 @@ impl MobHandle {
                 | ResumeOperationState::LifecycleAuthorityAdmitted => {}
             }
 
-            let Some(remaining) = caller_deadline.checked_duration_since(Instant::now()) else {
-                return match state {
-                    ResumeOperationState::AwaitingLifecycleAdmission => {
-                        Err(MobError::LifecycleOperationAdmissionPending {
+            match state {
+                ResumeOperationState::AwaitingLifecycleAdmission => {
+                    let Some(remaining) = caller_deadline.checked_duration_since(Instant::now())
+                    else {
+                        return Err(MobError::LifecycleOperationAdmissionPending {
                             intent: "explicit_resume".to_string(),
                             stage: "lifecycle_authority_admission",
-                        })
+                        });
+                    };
+                    match tokio::time::timeout(remaining, state_rx.changed()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => return Err(MobError::ActorReplyChannelClosed),
+                        Err(_) => {}
                     }
-                    ResumeOperationState::LifecycleAuthorityAdmitted => {
-                        Err(MobError::LifecycleOperationPending {
+                }
+                ResumeOperationState::LifecycleAuthorityAdmitted => {
+                    let progress = progress_rx.borrow().clone();
+                    if progress.stage.uses_host_owned_terminality() {
+                        // An opaque host build may legitimately take longer
+                        // than any platform-owned inactivity budget. Await its
+                        // typed completion or failure instead of converting
+                        // host latency into a run-ending Meerkat stall.
+                        progress_deadline = None;
+                        tokio::select! {
+                            changed = state_rx.changed() => {
+                                if changed.is_err() {
+                                    return Err(MobError::ActorReplyChannelClosed);
+                                }
+                            }
+                            changed = progress_rx.changed() => {
+                                if changed.is_err() {
+                                    return Err(MobError::ActorReplyChannelClosed);
+                                }
+                                observed_progress_epoch = progress_rx.borrow().epoch;
+                            }
+                        }
+                        continue;
+                    }
+                    let deadline = progress_deadline.get_or_insert_with(|| {
+                        Instant::now() + super::provisioner::EXPLICIT_RESUME_PROGRESS_TIMEOUT
+                    });
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        let stalled = progress_rx.borrow().clone();
+                        return Err(MobError::LifecycleOperationProgressStalled {
                             intent: "explicit_resume".to_string(),
-                        })
+                            member_id: stalled.member_id,
+                            stage: stalled.stage.as_str(),
+                        });
+                    };
+                    tokio::select! {
+                        changed = state_rx.changed() => {
+                            if changed.is_err() {
+                                return Err(MobError::ActorReplyChannelClosed);
+                            }
+                        }
+                        changed = progress_rx.changed() => {
+                            if changed.is_err() {
+                                return Err(MobError::ActorReplyChannelClosed);
+                            }
+                            let epoch = progress_rx.borrow().epoch;
+                            if epoch != observed_progress_epoch {
+                                observed_progress_epoch = epoch;
+                                progress_deadline = Some(
+                                    Instant::now()
+                                        + super::provisioner::EXPLICIT_RESUME_PROGRESS_TIMEOUT,
+                                );
+                            }
+                        }
+                        () = tokio::time::sleep(remaining) => {}
                     }
-                    ResumeOperationState::Terminal(_)
-                    | ResumeOperationState::InvalidatedByLifecycleAuthority => unreachable!(),
-                };
-            };
-            match tokio::time::timeout(remaining, state_rx.changed()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => return Err(MobError::ActorReplyChannelClosed),
-                Err(_) => {}
+                }
+                ResumeOperationState::Terminal(_)
+                | ResumeOperationState::InvalidatedByLifecycleAuthority => unreachable!(),
             }
         }
     }
@@ -9630,6 +9797,204 @@ impl MobHandle {
     // Work lane
     // -----------------------------------------------------------------
 
+    async fn durable_bounded_member_state(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<DurableBoundedMemberState, MobError> {
+        let machine_state = self.machine_state_watch_rx.borrow().clone();
+        let lifecycle = Self::member_lifecycle_from_machine_state(identity, &machine_state);
+        let current_session =
+            Self::machine_bridge_session_id_for_identity(identity, &machine_state);
+
+        match lifecycle.status {
+            mob_dsl::MobMemberLifecycleStatus::Active => {
+                return Ok(current_session.map_or_else(
+                    || DurableBoundedMemberState::Broken {
+                        session_id: None,
+                        reason: "active member has no machine-owned bridge session".to_string(),
+                    },
+                    |session_id| DurableBoundedMemberState::Active { session_id },
+                ));
+            }
+            mob_dsl::MobMemberLifecycleStatus::Retiring => {
+                if let Some(session_id) = current_session {
+                    return Ok(DurableBoundedMemberState::Retiring { session_id });
+                }
+            }
+            mob_dsl::MobMemberLifecycleStatus::Broken => {
+                let diagnostic = self.restore_failure_for(identity).await;
+                return Ok(DurableBoundedMemberState::Broken {
+                    session_id: diagnostic
+                        .as_ref()
+                        .and_then(|diagnostic| diagnostic.bridge_session_id.clone()),
+                    reason: lifecycle
+                        .error
+                        .or_else(|| diagnostic.map(|diagnostic| diagnostic.reason))
+                        .unwrap_or_else(|| {
+                            "member restore failed without a diagnostic".to_string()
+                        }),
+                });
+            }
+            mob_dsl::MobMemberLifecycleStatus::Completed
+            | mob_dsl::MobMemberLifecycleStatus::Unknown => {}
+        }
+
+        let mut observed = DurableBoundedMemberState::Absent;
+        for event in self.events().replay_all().await? {
+            match event.kind {
+                crate::event::MobEventKind::MemberSpawned(spawned)
+                    if &spawned.agent_identity == identity =>
+                {
+                    observed = spawned
+                        .bridge_member_ref()
+                        .and_then(crate::event::MemberRef::bridge_session_id)
+                        .cloned()
+                        .map_or_else(
+                            || DurableBoundedMemberState::Broken {
+                                session_id: None,
+                                reason: "durable member spawn has no recoverable bridge session"
+                                    .to_string(),
+                            },
+                            |session_id| DurableBoundedMemberState::Active { session_id },
+                        );
+                }
+                crate::event::MobEventKind::MemberRetirementStarted {
+                    agent_identity,
+                    releasing,
+                    session_id,
+                    ..
+                } if &agent_identity == identity => {
+                    let retained_session = session_id
+                        .or(releasing)
+                        .or_else(|| observed.session_id().cloned());
+                    observed = retained_session.map_or_else(
+                        || DurableBoundedMemberState::Broken {
+                            session_id: None,
+                            reason: "durable member retirement has no recoverable bridge session"
+                                .to_string(),
+                        },
+                        |session_id| DurableBoundedMemberState::Retiring { session_id },
+                    );
+                }
+                crate::event::MobEventKind::MemberRetired { agent_identity, .. }
+                    if &agent_identity == identity =>
+                {
+                    observed = observed.session_id().cloned().map_or_else(
+                        || DurableBoundedMemberState::Broken {
+                            session_id: None,
+                            reason: "retired durable member lost its bridge session correlation"
+                                .to_string(),
+                        },
+                        |session_id| DurableBoundedMemberState::Retired { session_id },
+                    );
+                }
+                _ => {}
+            }
+        }
+        Ok(observed)
+    }
+
+    /// Recover one deterministic member's exact bounded work fact by the
+    /// caller's stable delivery identity.
+    ///
+    /// This method is strictly observational. It never spawns a member,
+    /// submits or retries work, registers a completion waiter, or mutates the
+    /// member lifecycle. `Absent` therefore carries no retry implication.
+    #[cfg(feature = "runtime-adapter")]
+    pub async fn recover_bounded_work_for_identity_with_delivery_identity(
+        &self,
+        identity: &AgentIdentity,
+        delivery_identity: &crate::store::MobDeliveryIdentity,
+        result_spec: &BoundedResultSpec,
+    ) -> Result<DurableBoundedWorkRecovery, MobError> {
+        delivery_identity.validate()?;
+        let member = self.durable_bounded_member_state(identity).await?;
+        let Some(session_id) = member.session_id().cloned() else {
+            let work = match &member {
+                DurableBoundedMemberState::Absent => DurableBoundedWorkState::Absent,
+                DurableBoundedMemberState::Broken { reason, .. } => {
+                    DurableBoundedWorkState::Broken {
+                        input_id: None,
+                        reason: reason.clone(),
+                    }
+                }
+                _ => DurableBoundedWorkState::Broken {
+                    input_id: None,
+                    reason: "durable member lifecycle lost its session correlation".to_string(),
+                },
+            };
+            return Ok(DurableBoundedWorkRecovery { member, work });
+        };
+        let Some(runtime) = self.runtime_adapter.as_ref() else {
+            return Ok(DurableBoundedWorkRecovery {
+                member,
+                work: DurableBoundedWorkState::Broken {
+                    input_id: None,
+                    reason: "runtime adapter is unavailable for durable work recovery".to_string(),
+                },
+            });
+        };
+        use meerkat_runtime::service_ext::SessionServiceRuntimeExt as _;
+        let stored = match runtime
+            .input_state_by_idempotency_key(&session_id, &delivery_identity.idempotency_key)
+            .await
+        {
+            Ok(stored) => stored,
+            Err(error) => {
+                return Ok(DurableBoundedWorkRecovery {
+                    member,
+                    work: DurableBoundedWorkState::Broken {
+                        input_id: None,
+                        reason: format!("durable work identity lookup failed: {error}"),
+                    },
+                });
+            }
+        };
+        let Some(stored) = stored else {
+            let work = if matches!(member, DurableBoundedMemberState::Retired { .. }) {
+                DurableBoundedWorkState::Broken {
+                    input_id: None,
+                    reason: "retired member has no input for the stable delivery identity"
+                        .to_string(),
+                }
+            } else {
+                DurableBoundedWorkState::Absent
+            };
+            return Ok(DurableBoundedWorkRecovery { member, work });
+        };
+        let input_id = stored.state.input_id.clone();
+        let completion = match runtime
+            .input_terminal_completion(&session_id, &input_id)
+            .await
+        {
+            Ok(Some(completion)) => completion,
+            Ok(None) => {
+                return Ok(DurableBoundedWorkRecovery {
+                    member,
+                    work: DurableBoundedWorkState::InFlight {
+                        input_id,
+                        phase: stored.seed.phase,
+                    },
+                });
+            }
+            Err(error) => {
+                return Ok(DurableBoundedWorkRecovery {
+                    member,
+                    work: DurableBoundedWorkState::Broken {
+                        input_id: Some(input_id),
+                        reason: format!("durable terminal completion lookup failed: {error}"),
+                    },
+                });
+            }
+        };
+        let result =
+            bounded_runtime_turn_result(completion, &session_id, session_id.clone(), result_spec);
+        Ok(DurableBoundedWorkRecovery {
+            member,
+            work: DurableBoundedWorkState::Terminal { input_id, result },
+        })
+    }
+
     /// Submit a unit of work to a mob member.
     ///
     /// The fence token is validated against the member's current incarnation at
@@ -9752,6 +10117,39 @@ impl MobHandle {
             WorkRef::new(),
             spec,
             handling_mode,
+            result_spec,
+        )
+        .await
+    }
+
+    /// Resolve the current machine-owned runtime/fence for one identity and
+    /// admit a caller-identified exact bounded work item.
+    ///
+    /// This is the identity-first counterpart to
+    /// [`Self::start_work_with_mode_and_delivery_identity_bounded`]. The
+    /// caller-owned delivery identity supplies stable idempotency while the
+    /// MobMachine still validates the current runtime binding at admission.
+    pub async fn start_work_for_identity_with_delivery_identity_bounded(
+        &self,
+        identity: AgentIdentity,
+        spec: WorkSpec,
+        handling_mode: HandlingMode,
+        delivery_identity: crate::store::MobDeliveryIdentity,
+        result_spec: BoundedResultSpec,
+    ) -> Result<WorkTurnHandle, MobError> {
+        let (runtime_id, fence_token) = self
+            .resolve_submit_work_runtime_binding(
+                &identity,
+                WorkOrigin::Internal,
+                "start_work_for_identity_with_delivery_identity_bounded",
+            )
+            .await?;
+        self.start_work_with_mode_and_delivery_identity_bounded(
+            runtime_id,
+            fence_token,
+            spec,
+            handling_mode,
+            delivery_identity,
             result_spec,
         )
         .await
@@ -12635,6 +13033,81 @@ impl MemberHandle {
     /// Target member identity.
     pub fn identity(&self) -> AgentIdentity {
         AgentIdentity::from(self.agent_identity.as_str())
+    }
+
+    /// Preflight the exact current durable member for experimental live bridge
+    /// eligibility without opening a channel or consuming operation authority.
+    #[cfg(feature = "experimental-gpt-live")]
+    pub async fn validate_live_bridge_eligibility(
+        &self,
+    ) -> Result<(), super::LiveBridgeOperationStartError> {
+        self.mob
+            .send_actor_command(|reply_tx| MobCommand::ValidateLiveBridgeMemberEligibility {
+                agent_identity: self.agent_identity.clone(),
+                reply_tx,
+            })
+            .await
+            .map_err(|error| match error {
+                MobError::ActorCommandChannelClosed | MobError::ActorReplyChannelClosed => {
+                    super::LiveBridgeOperationStartError::Unavailable
+                }
+                _ => super::LiveBridgeOperationStartError::Rejected,
+            })?
+    }
+
+    /// Preflight this exact current durable member as the transcript source
+    /// for a separate experimental live executor.
+    ///
+    /// This deliberately does not admit direct execution on the member and
+    /// therefore does not apply the callback-free direct-bridge policy. The
+    /// actor still atomically validates current roster, runtime, and canonical
+    /// bridge-session ownership. Direct same-member execution must continue to
+    /// use [`Self::validate_live_bridge_eligibility`].
+    #[cfg(feature = "experimental-gpt-live")]
+    pub async fn validate_live_durable_source_availability(
+        &self,
+    ) -> Result<(), super::LiveBridgeOperationStartError> {
+        self.mob
+            .send_actor_command(
+                |reply_tx| MobCommand::ValidateLiveDurableSourceAvailability {
+                    agent_identity: self.agent_identity.clone(),
+                    reply_tx,
+                },
+            )
+            .await
+            .map_err(|error| match error {
+                MobError::ActorCommandChannelClosed | MobError::ActorReplyChannelClosed => {
+                    super::LiveBridgeOperationStartError::Unavailable
+                }
+                _ => super::LiveBridgeOperationStartError::Rejected,
+            })?
+    }
+
+    /// Start one machine-authorized, noncommitting bridge operation as this
+    /// exact durable member. The Mob actor revalidates current incarnation,
+    /// fence, session binding, and canonical revision before transferring
+    /// custody to the session actor.
+    #[cfg(feature = "experimental-gpt-live")]
+    pub async fn start_live_bridge_operation(
+        &self,
+        request: super::LiveBridgeOperationRequest,
+        cancellation: super::LiveBridgeOperationCancellationSignal,
+    ) -> Result<super::LiveBridgeOperationTerminalFuture, super::LiveBridgeOperationStartError>
+    {
+        self.mob
+            .send_actor_command(|reply_tx| MobCommand::StartLiveBridgeOperation {
+                agent_identity: self.agent_identity.clone(),
+                request,
+                cancellation,
+                reply_tx,
+            })
+            .await
+            .map_err(|error| match error {
+                MobError::ActorCommandChannelClosed | MobError::ActorReplyChannelClosed => {
+                    super::LiveBridgeOperationStartError::Unavailable
+                }
+                _ => super::LiveBridgeOperationStartError::Rejected,
+            })?
     }
 
     /// Install (or clear) the host-owned outbound content-taint declaration

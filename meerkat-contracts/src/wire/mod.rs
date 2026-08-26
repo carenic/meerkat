@@ -107,14 +107,18 @@ pub use image_generation::{
 };
 pub use jobs::*;
 pub use live::{
-    LiveChannelParams, LiveCloseResult, LiveCloseStatus, LiveCommitInputParams,
-    LiveCommitInputResult, LiveCommitInputStatus, LiveInputChunkWire, LiveInterruptResult,
-    LiveInterruptStatus, LiveOpenParams, LiveOpenResult, LiveOpenTransport, LiveRefreshResult,
-    LiveRefreshStatus, LiveSendInputErrorData, LiveSendInputParams, LiveSendInputResult,
-    LiveSendInputStatus, LiveStatusResult, LiveTruncateParams, LiveTruncateResult,
-    LiveTruncateStatus, LiveWebrtcAnswerParams, LiveWebrtcAnswerResult, WireLiveAdapterErrorCode,
+    LIVE_CLIENT_CONTEXT_V1_CAPABILITY, LIVE_EXECUTION_IDENTITY_V1_CAPABILITY,
+    LIVE_FUNCTION_BRIDGE_V1_CAPABILITY, LiveAssistantOutputAvailableParams, LiveChannelParams,
+    LiveCloseResult, LiveCloseStatus, LiveCommitInputParams, LiveCommitInputResult,
+    LiveCommitInputStatus, LiveInputChunkWire, LiveInterruptResult, LiveInterruptStatus,
+    LiveOpenParams, LiveOpenResult, LiveOpenTransport, LivePlaybackCompleteParams,
+    LivePlaybackCompleteResult, LivePlaybackCompleteStatus, LiveRefreshResult, LiveRefreshStatus,
+    LiveSendInputErrorData, LiveSendInputParams, LiveSendInputResult, LiveSendInputStatus,
+    LiveStatusResult, LiveTruncateParams, LiveTruncateResult, LiveTruncateStatus,
+    LiveWebrtcAnswerParams, LiveWebrtcAnswerResult, WireLiveAdapterErrorCode,
     WireLiveAdapterObservation, WireLiveAdapterStatus, WireLiveChannelCapabilities,
     WireLiveConfigRejectionReason, WireLiveContinuityMode, WireLiveDegradationReason,
+    WireLiveExecutionIdentityOverrideV1, WireLiveExecutionIdentityVersion,
     WireLiveResponseModality, WireLiveTransportBootstrap, WireProvider,
     WireRealtimeTranscriptEvent,
 };
@@ -193,7 +197,7 @@ pub use mob::{
 };
 pub use models::{
     CatalogModelEntry, ModelsCatalogResponse, ProviderCatalog, WireModelBetaHeader,
-    WireModelProfile, WireModelTier, WireResolvedModelCapabilities,
+    WireModelProfile, WireModelReleaseStage, WireModelTier, WireResolvedModelCapabilities,
 };
 pub use params::{CommsParams, CoreCreateParams, HookParams, SkillsParams, StructuredOutputParams};
 pub use portable_spec::{
@@ -240,14 +244,14 @@ pub use schedule::{
     ScheduleOccurrencesParams, ScheduleOccurrencesResult, UpdateScheduleParams,
 };
 pub use session::{
-    ForkSessionAtParams, ForkSessionReplaceParams, InterruptResult,
-    ListSessionTranscriptRevisionsParams, ReadSessionTranscriptRevisionParams,
-    RestoreSessionTranscriptRevisionParams, RevisionId, RevisionSelector,
-    RewriteSessionTranscriptParams, SessionStreamCloseParams, SessionStreamCloseResult,
-    SessionStreamOpenParams, SessionStreamOpenResult, TranscriptRewriteMessage,
-    UpdateSystemPromptParams, WireAssistantBlock, WireContentBlock, WireContentInput,
-    WireInterruptOutcome, WirePromptInput, WireProviderMeta, WireSessionHistory, WireSessionInfo,
-    WireSessionMessage, WireSessionSummary, WireSessionTranscriptRevision,
+    ActivateInstructionParams, ForkSessionAtParams, ForkSessionReplaceParams, InterruptResult,
+    ListSessionTranscriptRevisionsParams, ReadInstructionActivationsParams,
+    ReadSessionTranscriptRevisionParams, RestoreSessionTranscriptRevisionParams, RevisionId,
+    RevisionSelector, RewriteSessionTranscriptParams, SessionStreamCloseParams,
+    SessionStreamCloseResult, SessionStreamOpenParams, SessionStreamOpenResult,
+    TranscriptRewriteMessage, UpdateSystemPromptParams, WireAssistantBlock, WireContentBlock,
+    WireContentInput, WireInterruptOutcome, WirePromptInput, WireProviderMeta, WireSessionHistory,
+    WireSessionInfo, WireSessionMessage, WireSessionSummary, WireSessionTranscriptRevision,
     WireSessionTranscriptRevisionEntry, WireSessionTranscriptRevisionList, WireStopReason,
     WireSystemMessageIdentity, WireToolResult, WireToolResultContent, WireTranscriptSource,
 };

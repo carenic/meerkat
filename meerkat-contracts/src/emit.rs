@@ -224,6 +224,7 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "LiveSendInputParams": schema_for!(crate::wire::LiveSendInputParams),
         "LiveInputChunkWire": schema_for!(crate::wire::LiveInputChunkWire),
         "LiveTruncateParams": schema_for!(crate::wire::LiveTruncateParams),
+        "LivePlaybackCompleteParams": schema_for!(crate::wire::LivePlaybackCompleteParams),
         // G9 (P2): emit `LiveCommitInputParams` and `WireLiveResponseModality`
         // at the top level so SDK codegen produces typed shapes (param
         // struct + discriminated modality union) for `live/commit_input`
@@ -249,6 +250,8 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "LiveInterruptStatus": schema_for!(crate::wire::LiveInterruptStatus),
         "LiveTruncateResult": schema_for!(crate::wire::LiveTruncateResult),
         "LiveTruncateStatus": schema_for!(crate::wire::LiveTruncateStatus),
+        "LivePlaybackCompleteResult": schema_for!(crate::wire::LivePlaybackCompleteResult),
+        "LivePlaybackCompleteStatus": schema_for!(crate::wire::LivePlaybackCompleteStatus),
         // CC5/CC6: emit the typed wire mirrors at the top level so SDK
         // codegen produces named typed shapes (TypedDict / interface /
         // discriminated union) instead of inlining them as anonymous `Any`
@@ -626,6 +629,21 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "RewriteSessionTranscriptParams": schema_for!(crate::wire::RewriteSessionTranscriptParams),
         "UpdateSystemPromptParams": schema_for!(crate::wire::UpdateSystemPromptParams),
         "SystemPromptUpdateResult": schema_for!(meerkat_core::SystemPromptUpdateResult),
+        "ActivateInstructionParams": schema_for!(crate::wire::ActivateInstructionParams),
+        "InstructionActivationDisposition": schema_for!(meerkat_core::InstructionActivationDisposition),
+        "InstructionActivationExpectation": schema_for!(meerkat_core::InstructionActivationExpectation),
+        "InstructionActivationId": schema_for!(meerkat_core::InstructionActivationId),
+        "InstructionActivationIdentity": schema_for!(meerkat_core::InstructionActivationIdentity),
+        "InstructionActivationRecord": schema_for!(meerkat_core::InstructionActivationRecord),
+        "InstructionActivationRequest": schema_for!(meerkat_core::InstructionActivationRequest),
+        "InstructionActivationReceipt": schema_for!(meerkat_core::InstructionActivationReceipt),
+        "InstructionContentDigest": schema_for!(meerkat_core::InstructionContentDigest),
+        "InstructionKey": schema_for!(meerkat_core::InstructionKey),
+        "InstructionNamespace": schema_for!(meerkat_core::InstructionNamespace),
+        "InstructionRevisionId": schema_for!(meerkat_core::InstructionRevisionId),
+        "InstructionRevisionRef": schema_for!(meerkat_core::InstructionRevisionRef),
+        "ReadInstructionActivationsParams": schema_for!(crate::wire::ReadInstructionActivationsParams),
+        "InstructionActivationReadPage": schema_for!(meerkat_core::InstructionActivationReadPage),
         "ReadSessionTranscriptRevisionParams": schema_for!(crate::wire::ReadSessionTranscriptRevisionParams),
         "ListSessionTranscriptRevisionsParams": schema_for!(crate::wire::ListSessionTranscriptRevisionsParams),
         "RestoreSessionTranscriptRevisionParams": schema_for!(crate::wire::RestoreSessionTranscriptRevisionParams),

@@ -44,7 +44,7 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_MANIFEST_DIR": "./meerkat-skills",
     },
     proc_macro_deps = all_crate_deps(
@@ -78,7 +78,7 @@ rust_library(
         "//meerkat:__pkg__",
     ],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_MANIFEST_DIR": "./meerkat-skills",
     },
     proc_macro_deps = all_crate_deps(
@@ -116,7 +116,7 @@ rust_test(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_MANIFEST_DIR": "./meerkat-skills",
     },
     tags = [
@@ -128,7 +128,7 @@ rust_test(
         ":package_runfiles",
     ],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = all_crate_deps(
         package_name = "meerkat-skills",
@@ -173,7 +173,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "filesystem_source",
         "CARGO_MANIFEST_DIR": "./meerkat-skills",
     },
@@ -184,7 +184,7 @@ rust_test(
         ":package_runfiles",
     ],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = all_crate_deps(
         package_name = "meerkat-skills",
@@ -230,7 +230,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "resolver_precedence",
         "CARGO_MANIFEST_DIR": "./meerkat-skills",
     },
@@ -242,7 +242,7 @@ rust_test(
         ":package_runfiles",
     ],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = all_crate_deps(
         package_name = "meerkat-skills",
@@ -288,7 +288,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "transport_sources",
         "CARGO_MANIFEST_DIR": "./meerkat-skills",
     },
@@ -300,7 +300,7 @@ rust_test(
         ":package_runfiles",
     ],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = all_crate_deps(
         package_name = "meerkat-skills",

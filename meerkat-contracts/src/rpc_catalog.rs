@@ -258,6 +258,18 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
             "SystemPromptUpdateResult",
         ),
         RpcMethodDescriptor::typed(
+            "session/activate_instruction",
+            "Activate one immutable instruction revision at a safe materialized-session boundary",
+            "ActivateInstructionParams",
+            "InstructionActivationReceipt",
+        ),
+        RpcMethodDescriptor::typed(
+            "session/instruction_activations",
+            "Read authoritative durable instruction activation records",
+            "ReadInstructionActivationsParams",
+            "InstructionActivationReadPage",
+        ),
+        RpcMethodDescriptor::typed(
             "session/transcript_revision",
             "Read a retained immutable transcript revision body",
             "ReadSessionTranscriptRevisionParams",
@@ -703,6 +715,12 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
                 "Truncate the assistant output on a live channel at the client-tracked playback cursor",
                 "LiveTruncateParams",
                 "LiveTruncateResult",
+            ),
+            RpcMethodDescriptor::typed(
+                "live/playback_complete",
+                "Report that client playback completed for one assistant output",
+                "LivePlaybackCompleteParams",
+                "LivePlaybackCompleteResult",
             ),
             RpcMethodDescriptor::typed(
                 "live/refresh",

@@ -18,6 +18,33 @@ use std::collections::HashMap;
 #[cfg(feature = "runtime-adapter")]
 use std::sync::{Mutex, OnceLock, Weak};
 
+#[cfg(feature = "experimental-gpt-live")]
+fn start_live_bridge_on_session_actor(
+    accepted: Result<meerkat_session::LiveBridgeSessionOperationTerminalReceiver, SessionError>,
+    max_output_bytes: usize,
+) -> Result<super::LiveBridgeOperationTerminalFuture, super::LiveBridgeOperationStartError> {
+    let terminal = accepted.map_err(|error| match error {
+        SessionError::NotFound { .. } => super::LiveBridgeOperationStartError::Unavailable,
+        SessionError::Busy { .. } => super::LiveBridgeOperationStartError::TemporarilyUnavailable,
+        SessionError::Agent(meerkat_core::AgentError::ConfigError(_)) => {
+            super::LiveBridgeOperationStartError::Rejected
+        }
+        _ => super::LiveBridgeOperationStartError::Failed,
+    })?;
+    Ok(Box::pin(async move {
+        match terminal.await {
+            Ok(Ok(result)) => {
+                super::LiveBridgeOperationTerminal::completed(result.text, max_output_bytes)
+                    .unwrap_or_else(|_| super::LiveBridgeOperationTerminal::failed())
+            }
+            Ok(Err(meerkat_core::AgentError::Cancelled)) => {
+                super::LiveBridgeOperationTerminal::cancelled()
+            }
+            Ok(Err(_)) | Err(_) => super::LiveBridgeOperationTerminal::failed(),
+        }
+    }))
+}
+
 /// Outcome of the explicit resume-seam durable read.
 ///
 /// Exists because `Option<Session>` conflated three materially different
@@ -883,6 +910,66 @@ pub(crate) async fn retire_runtime_session_for_archive(
 pub trait MobSessionService:
     SessionServiceCommsExt + SessionServiceControlExt + SessionServiceHistoryExt
 {
+    /// Commit one provider-final client-delegation transcript through the
+    /// canonical session actor and SessionDocument authority.
+    ///
+    /// The provider observation is not executor authority. Only the sealed
+    /// evidence returned by this method may be reconciled by the live runtime
+    /// before any delegated model or tool work starts.
+    #[cfg(feature = "experimental-gpt-live")]
+    async fn commit_live_delegation_final_transcript(
+        &self,
+        _session_id: &SessionId,
+        _provisional: meerkat_core::ProvisionalLiveHandoff,
+        _final_event: meerkat_core::RealtimeTranscriptEvent,
+    ) -> Result<meerkat_core::FinalLiveUserTranscriptCommitEvidence, SessionError> {
+        Err(SessionError::Unsupported(
+            "session service cannot commit a live delegation final transcript".into(),
+        ))
+    }
+
+    /// Validate the exact current durable member's bridge policy and isolated
+    /// client capability before any live channel/provider open.
+    #[cfg(feature = "experimental-gpt-live")]
+    async fn validate_live_bridge_member_eligibility(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<(), SessionError> {
+        Err(SessionError::Unsupported(
+            "session service cannot preflight live bridge member eligibility".into(),
+        ))
+    }
+
+    /// Capture one exact live actor Session clone before bridge admission.
+    ///
+    /// The returned opaque snapshot owns the revision later sealed by the
+    /// machine. Callers must retain and execute this identical clone; a
+    /// post-admission re-read is forbidden because full-duplex input may have
+    /// advanced the actor in between.
+    #[cfg(feature = "experimental-gpt-live")]
+    async fn capture_live_bridge_execution_snapshot(
+        &self,
+        session_id: &SessionId,
+        agent_identity: &str,
+    ) -> Result<super::LiveBridgeExecutionSnapshot, SessionError> {
+        let _ = (session_id, agent_identity);
+        Err(SessionError::Unsupported(
+            "session service cannot capture an exact live bridge execution snapshot".into(),
+        ))
+    }
+
+    /// Start one accepted noncommitting operation on the already-materialized
+    /// durable member's session actor.
+    #[cfg(feature = "experimental-gpt-live")]
+    async fn start_live_bridge_member_operation(
+        &self,
+        _request: super::LiveBridgeOperationRequest,
+        _cancellation: super::LiveBridgeOperationCancellationSignal,
+    ) -> Result<super::LiveBridgeOperationTerminalFuture, super::LiveBridgeOperationStartError>
+    {
+        Err(super::LiveBridgeOperationStartError::Unavailable)
+    }
+
     /// Create while the caller already owns this session's stable runtime-turn
     /// finalization boundary. Persistent implementations override this to use
     /// their non-reentrant boundary-aware admission seam; simple/mock services
@@ -1431,6 +1518,25 @@ pub trait MobSessionService:
         authority: &meerkat_core::CommittedSessionBoundaryAuthority,
     ) -> Result<(), SessionError>;
 
+    /// Project the exact durable parent-session boundary after this caller's
+    /// runtime input reaches successful machine completion. Implementations
+    /// must derive both the sealed document and store-issued authority from
+    /// canonical session ownership; the Mob shell supplies neither.
+    #[cfg(feature = "experimental-gpt-live")]
+    async fn enqueue_committed_parent_session_boundary_after_runtime_turn(
+        &self,
+        _session_id: &SessionId,
+        _runtime_adapter: &meerkat_runtime::MeerkatMachine,
+    ) -> Result<usize, SessionError> {
+        if self.supports_persistent_sessions() {
+            return Err(SessionError::Unsupported(
+                "persistent MobSessionService wrappers must delegate committed parent-session boundary projection to canonical session ownership"
+                    .to_string(),
+            ));
+        }
+        Ok(0)
+    }
+
     /// Remove the service-side live actor while the owning runtime entry is in
     /// its generated post-stop unregister window.
     async fn discard_live_session_after_runtime_stop_terminalized(
@@ -1587,6 +1693,71 @@ impl<B> MobSessionService for meerkat_session::EphemeralSessionService<B>
 where
     B: meerkat_session::SessionAgentBuilder + 'static,
 {
+    #[cfg(feature = "experimental-gpt-live")]
+    async fn commit_live_delegation_final_transcript(
+        &self,
+        session_id: &SessionId,
+        provisional: meerkat_core::ProvisionalLiveHandoff,
+        final_event: meerkat_core::RealtimeTranscriptEvent,
+    ) -> Result<meerkat_core::FinalLiveUserTranscriptCommitEvidence, SessionError> {
+        self.commit_live_user_transcript_final(session_id, provisional, Some(final_event))
+            .await
+    }
+
+    #[cfg(feature = "experimental-gpt-live")]
+    async fn validate_live_bridge_member_eligibility(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), SessionError> {
+        self.validate_live_bridge_member_eligibility(session_id)
+            .await
+    }
+
+    #[cfg(feature = "experimental-gpt-live")]
+    async fn start_live_bridge_member_operation(
+        &self,
+        request: super::LiveBridgeOperationRequest,
+        cancellation: super::LiveBridgeOperationCancellationSignal,
+    ) -> Result<super::LiveBridgeOperationTerminalFuture, super::LiveBridgeOperationStartError>
+    {
+        start_live_bridge_on_session_actor(
+            self.start_live_bridge_operation(
+                request.admission().session_id(),
+                request.session_operation_request()?,
+                cancellation.receiver(),
+            )
+            .await,
+            request.max_output_bytes(),
+        )
+    }
+
+    #[cfg(feature = "experimental-gpt-live")]
+    async fn capture_live_bridge_execution_snapshot(
+        &self,
+        session_id: &SessionId,
+        agent_identity: &str,
+    ) -> Result<super::LiveBridgeExecutionSnapshot, SessionError> {
+        loop {
+            let authority = self
+                .observe_session_transcript_authority(session_id)
+                .await?;
+            if let Some(session) = self
+                .export_session_if_transcript_authority(session_id, authority)
+                .await?
+            {
+                return super::LiveBridgeExecutionSnapshot::from_generation_bound_session(
+                    session,
+                    agent_identity,
+                )
+                .map_err(|error| {
+                    SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                        error.to_string(),
+                    ))
+                });
+            }
+        }
+    }
+
     async fn materialize_session_resume_verdict(
         &self,
         session_id: &SessionId,
@@ -1979,6 +2150,59 @@ impl<B> MobSessionService for meerkat_session::PersistentSessionService<B>
 where
     B: meerkat_session::SessionAgentBuilder + 'static,
 {
+    #[cfg(feature = "experimental-gpt-live")]
+    async fn commit_live_delegation_final_transcript(
+        &self,
+        session_id: &SessionId,
+        provisional: meerkat_core::ProvisionalLiveHandoff,
+        final_event: meerkat_core::RealtimeTranscriptEvent,
+    ) -> Result<meerkat_core::FinalLiveUserTranscriptCommitEvidence, SessionError> {
+        self.commit_live_user_transcript_final(session_id, provisional, Some(final_event))
+            .await
+    }
+
+    #[cfg(feature = "experimental-gpt-live")]
+    async fn validate_live_bridge_member_eligibility(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), SessionError> {
+        self.validate_live_bridge_member_eligibility(session_id)
+            .await
+    }
+
+    #[cfg(feature = "experimental-gpt-live")]
+    async fn start_live_bridge_member_operation(
+        &self,
+        request: super::LiveBridgeOperationRequest,
+        cancellation: super::LiveBridgeOperationCancellationSignal,
+    ) -> Result<super::LiveBridgeOperationTerminalFuture, super::LiveBridgeOperationStartError>
+    {
+        start_live_bridge_on_session_actor(
+            self.start_live_bridge_operation(
+                request.admission().session_id(),
+                request.session_operation_request()?,
+                cancellation.receiver(),
+            )
+            .await,
+            request.max_output_bytes(),
+        )
+    }
+
+    #[cfg(feature = "experimental-gpt-live")]
+    async fn capture_live_bridge_execution_snapshot(
+        &self,
+        session_id: &SessionId,
+        agent_identity: &str,
+    ) -> Result<super::LiveBridgeExecutionSnapshot, SessionError> {
+        let session = self.export_live_session(session_id).await?;
+        super::LiveBridgeExecutionSnapshot::from_generation_bound_session(session, agent_identity)
+            .map_err(|error| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                    error.to_string(),
+                ))
+            })
+    }
+
     async fn create_session_under_runtime_turn_boundary(
         &self,
         req: meerkat_core::service::CreateSessionRequest,
@@ -2097,6 +2321,31 @@ where
             actor_witness_slot,
         )
         .await
+    }
+
+    #[cfg(feature = "experimental-gpt-live")]
+    async fn enqueue_committed_parent_session_boundary_after_runtime_turn(
+        &self,
+        session_id: &SessionId,
+        runtime_adapter: &meerkat_runtime::MeerkatMachine,
+    ) -> Result<usize, SessionError> {
+        let (committed, store_commit_authority) =
+            meerkat_session::PersistentSessionService::<B>::export_live_context_committed_boundary(
+                self, session_id,
+            )
+            .await?;
+        runtime_adapter
+            .enqueue_committed_parent_session_boundary(
+                session_id,
+                &committed,
+                &store_commit_authority,
+            )
+            .await
+            .map_err(|error| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+                    "failed to enqueue committed Mob parent-session boundary for {session_id}: {error}"
+                )))
+            })
     }
 
     #[cfg(feature = "runtime-adapter")]

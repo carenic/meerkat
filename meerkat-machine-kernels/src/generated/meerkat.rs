@@ -1057,6 +1057,34 @@ impl std::fmt::Display for AdmissionValidationResultKind {
     serde::Serialize,
     serde::Deserialize,
 )]
+pub struct AgentIdentity(pub String);
+impl From<String> for AgentIdentity {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for AgentIdentity {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for AgentIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct AgentRuntimeId(pub String);
 impl From<String> for AgentRuntimeId {
     fn from(value: String) -> Self {
@@ -2749,6 +2777,440 @@ impl std::fmt::Display for InteractionStreamState {
     serde::Serialize,
     serde::Deserialize,
 )]
+pub enum LiveBridgeCancellationReason {
+    #[default]
+    #[serde(rename = "BargeIn")]
+    BargeIn,
+    #[serde(rename = "ChannelClose")]
+    ChannelClose,
+    #[serde(rename = "Restart")]
+    Restart,
+    #[serde(rename = "ProtocolDrift")]
+    ProtocolDrift,
+}
+impl LiveBridgeCancellationReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::BargeIn => "BargeIn",
+            Self::ChannelClose => "ChannelClose",
+            Self::Restart => "Restart",
+            Self::ProtocolDrift => "ProtocolDrift",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveBridgeCancellationReason {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "BargeIn" => Ok(Self::BargeIn),
+            "ChannelClose" => Ok(Self::ChannelClose),
+            "Restart" => Ok(Self::Restart),
+            "ProtocolDrift" => Ok(Self::ProtocolDrift),
+            other => Err(format!(
+                "invalid LiveBridgeCancellationReason value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveBridgeCancellationReason {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveBridgeCancellationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LiveBridgeEffectKind {
+    #[default]
+    #[serde(rename = "ModelComputation")]
+    ModelComputation,
+    #[serde(rename = "ReadOnlyMemorySnapshot")]
+    ReadOnlyMemorySnapshot,
+    #[serde(rename = "ToolDispatch")]
+    ToolDispatch,
+    #[serde(rename = "DurableMemoryMutation")]
+    DurableMemoryMutation,
+    #[serde(rename = "Comms")]
+    Comms,
+    #[serde(rename = "HelperSpawn")]
+    HelperSpawn,
+    #[serde(rename = "ExternalIo")]
+    ExternalIo,
+}
+impl LiveBridgeEffectKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ModelComputation => "ModelComputation",
+            Self::ReadOnlyMemorySnapshot => "ReadOnlyMemorySnapshot",
+            Self::ToolDispatch => "ToolDispatch",
+            Self::DurableMemoryMutation => "DurableMemoryMutation",
+            Self::Comms => "Comms",
+            Self::HelperSpawn => "HelperSpawn",
+            Self::ExternalIo => "ExternalIo",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveBridgeEffectKind {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "ModelComputation" => Ok(Self::ModelComputation),
+            "ReadOnlyMemorySnapshot" => Ok(Self::ReadOnlyMemorySnapshot),
+            "ToolDispatch" => Ok(Self::ToolDispatch),
+            "DurableMemoryMutation" => Ok(Self::DurableMemoryMutation),
+            "Comms" => Ok(Self::Comms),
+            "HelperSpawn" => Ok(Self::HelperSpawn),
+            "ExternalIo" => Ok(Self::ExternalIo),
+            other => Err(format!("invalid LiveBridgeEffectKind value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveBridgeEffectKind {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveBridgeEffectKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LiveBridgeEffectOutcome {
+    #[default]
+    #[serde(rename = "Committed")]
+    Committed,
+    #[serde(rename = "Failed")]
+    Failed,
+    #[serde(rename = "Unknown")]
+    Unknown,
+}
+impl LiveBridgeEffectOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Committed => "Committed",
+            Self::Failed => "Failed",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveBridgeEffectOutcome {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Committed" => Ok(Self::Committed),
+            "Failed" => Ok(Self::Failed),
+            "Unknown" => Ok(Self::Unknown),
+            other => Err(format!("invalid LiveBridgeEffectOutcome value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveBridgeEffectOutcome {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveBridgeEffectOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LiveBridgeOperationPhase {
+    #[default]
+    #[serde(rename = "PreFinalInference")]
+    PreFinalInference,
+    #[serde(rename = "FinalInputAuthorized")]
+    FinalInputAuthorized,
+    #[serde(rename = "ExecutionRunning")]
+    ExecutionRunning,
+    #[serde(rename = "CancellationAuthorized")]
+    CancellationAuthorized,
+    #[serde(rename = "ExecutionTerminal")]
+    ExecutionTerminal,
+}
+impl LiveBridgeOperationPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::PreFinalInference => "PreFinalInference",
+            Self::FinalInputAuthorized => "FinalInputAuthorized",
+            Self::ExecutionRunning => "ExecutionRunning",
+            Self::CancellationAuthorized => "CancellationAuthorized",
+            Self::ExecutionTerminal => "ExecutionTerminal",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveBridgeOperationPhase {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "PreFinalInference" => Ok(Self::PreFinalInference),
+            "FinalInputAuthorized" => Ok(Self::FinalInputAuthorized),
+            "ExecutionRunning" => Ok(Self::ExecutionRunning),
+            "CancellationAuthorized" => Ok(Self::CancellationAuthorized),
+            "ExecutionTerminal" => Ok(Self::ExecutionTerminal),
+            other => Err(format!("invalid LiveBridgeOperationPhase value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveBridgeOperationPhase {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveBridgeOperationPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LiveBridgeOutputKind {
+    #[default]
+    #[serde(rename = "Success")]
+    Success,
+    #[serde(rename = "FailureProjection")]
+    FailureProjection,
+}
+impl LiveBridgeOutputKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Success => "Success",
+            Self::FailureProjection => "FailureProjection",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveBridgeOutputKind {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Success" => Ok(Self::Success),
+            "FailureProjection" => Ok(Self::FailureProjection),
+            other => Err(format!("invalid LiveBridgeOutputKind value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveBridgeOutputKind {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveBridgeOutputKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LiveBridgeSubmissionObservation {
+    #[default]
+    #[serde(rename = "ProviderProcessed")]
+    ProviderProcessed,
+    #[serde(rename = "ProviderRejected")]
+    ProviderRejected,
+    #[serde(rename = "SubmissionAmbiguous")]
+    SubmissionAmbiguous,
+    #[serde(rename = "CallExpired")]
+    CallExpired,
+    #[serde(rename = "CallAbandonedByClose")]
+    CallAbandonedByClose,
+}
+impl LiveBridgeSubmissionObservation {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ProviderProcessed => "ProviderProcessed",
+            Self::ProviderRejected => "ProviderRejected",
+            Self::SubmissionAmbiguous => "SubmissionAmbiguous",
+            Self::CallExpired => "CallExpired",
+            Self::CallAbandonedByClose => "CallAbandonedByClose",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveBridgeSubmissionObservation {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "ProviderProcessed" => Ok(Self::ProviderProcessed),
+            "ProviderRejected" => Ok(Self::ProviderRejected),
+            "SubmissionAmbiguous" => Ok(Self::SubmissionAmbiguous),
+            "CallExpired" => Ok(Self::CallExpired),
+            "CallAbandonedByClose" => Ok(Self::CallAbandonedByClose),
+            other => Err(format!(
+                "invalid LiveBridgeSubmissionObservation value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveBridgeSubmissionObservation {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveBridgeSubmissionObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LiveBridgeSubmissionState {
+    #[default]
+    #[serde(rename = "SubmissionAuthorized")]
+    SubmissionAuthorized,
+    #[serde(rename = "SubmissionAttemptClaimed")]
+    SubmissionAttemptClaimed,
+    #[serde(rename = "LocalWriteCompletedAwaitingProof")]
+    LocalWriteCompletedAwaitingProof,
+    #[serde(rename = "ProviderProcessed")]
+    ProviderProcessed,
+    #[serde(rename = "ProviderRejected")]
+    ProviderRejected,
+    #[serde(rename = "SubmissionAmbiguous")]
+    SubmissionAmbiguous,
+    #[serde(rename = "CallExpired")]
+    CallExpired,
+    #[serde(rename = "CallAbandonedByClose")]
+    CallAbandonedByClose,
+}
+impl LiveBridgeSubmissionState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SubmissionAuthorized => "SubmissionAuthorized",
+            Self::SubmissionAttemptClaimed => "SubmissionAttemptClaimed",
+            Self::LocalWriteCompletedAwaitingProof => "LocalWriteCompletedAwaitingProof",
+            Self::ProviderProcessed => "ProviderProcessed",
+            Self::ProviderRejected => "ProviderRejected",
+            Self::SubmissionAmbiguous => "SubmissionAmbiguous",
+            Self::CallExpired => "CallExpired",
+            Self::CallAbandonedByClose => "CallAbandonedByClose",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveBridgeSubmissionState {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "SubmissionAuthorized" => Ok(Self::SubmissionAuthorized),
+            "SubmissionAttemptClaimed" => Ok(Self::SubmissionAttemptClaimed),
+            "LocalWriteCompletedAwaitingProof" => Ok(Self::LocalWriteCompletedAwaitingProof),
+            "ProviderProcessed" => Ok(Self::ProviderProcessed),
+            "ProviderRejected" => Ok(Self::ProviderRejected),
+            "SubmissionAmbiguous" => Ok(Self::SubmissionAmbiguous),
+            "CallExpired" => Ok(Self::CallExpired),
+            "CallAbandonedByClose" => Ok(Self::CallAbandonedByClose),
+            other => Err(format!("invalid LiveBridgeSubmissionState value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveBridgeSubmissionState {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveBridgeSubmissionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum LiveChannelDegradationReason {
     #[default]
     #[serde(rename = "Unknown")]
@@ -3115,6 +3577,8 @@ pub enum LiveCommandPublicKind {
     Interrupt,
     #[serde(rename = "TruncateAssistantOutput")]
     TruncateAssistantOutput,
+    #[serde(rename = "CompleteAssistantPlayback")]
+    CompleteAssistantPlayback,
 }
 impl LiveCommandPublicKind {
     pub fn as_str(&self) -> &'static str {
@@ -3123,6 +3587,7 @@ impl LiveCommandPublicKind {
             Self::CommitInput => "CommitInput",
             Self::Interrupt => "Interrupt",
             Self::TruncateAssistantOutput => "TruncateAssistantOutput",
+            Self::CompleteAssistantPlayback => "CompleteAssistantPlayback",
         }
     }
 }
@@ -3134,6 +3599,7 @@ impl std::convert::TryFrom<&str> for LiveCommandPublicKind {
             "CommitInput" => Ok(Self::CommitInput),
             "Interrupt" => Ok(Self::Interrupt),
             "TruncateAssistantOutput" => Ok(Self::TruncateAssistantOutput),
+            "CompleteAssistantPlayback" => Ok(Self::CompleteAssistantPlayback),
             other => Err(format!("invalid LiveCommandPublicKind value `{other}`")),
         }
     }
@@ -3283,6 +3749,686 @@ impl std::fmt::Display for LiveCommandRejectionReason {
     serde::Serialize,
     serde::Deserialize,
 )]
+pub enum LiveContextAppendObservation {
+    #[default]
+    #[serde(rename = "Delivered")]
+    Delivered,
+    #[serde(rename = "Rejected")]
+    Rejected,
+    #[serde(rename = "Ambiguous")]
+    Ambiguous,
+}
+impl LiveContextAppendObservation {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Delivered => "Delivered",
+            Self::Rejected => "Rejected",
+            Self::Ambiguous => "Ambiguous",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveContextAppendObservation {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Delivered" => Ok(Self::Delivered),
+            "Rejected" => Ok(Self::Rejected),
+            "Ambiguous" => Ok(Self::Ambiguous),
+            other => Err(format!(
+                "invalid LiveContextAppendObservation value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveContextAppendObservation {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveContextAppendObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LiveContextRowDisposition {
+    #[default]
+    #[serde(rename = "MirrorParentText")]
+    MirrorParentText,
+    #[serde(rename = "AlreadyPresentInLiveChannel")]
+    AlreadyPresentInLiveChannel,
+    #[serde(rename = "ExcludedFromLiveContext")]
+    ExcludedFromLiveContext,
+}
+impl LiveContextRowDisposition {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::MirrorParentText => "MirrorParentText",
+            Self::AlreadyPresentInLiveChannel => "AlreadyPresentInLiveChannel",
+            Self::ExcludedFromLiveContext => "ExcludedFromLiveContext",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveContextRowDisposition {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "MirrorParentText" => Ok(Self::MirrorParentText),
+            "AlreadyPresentInLiveChannel" => Ok(Self::AlreadyPresentInLiveChannel),
+            "ExcludedFromLiveContext" => Ok(Self::ExcludedFromLiveContext),
+            other => Err(format!("invalid LiveContextRowDisposition value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveContextRowDisposition {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveContextRowDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LiveDelegationCancellationOutcome {
+    #[default]
+    #[serde(rename = "Cancelled")]
+    Cancelled,
+    #[serde(rename = "AlreadyTerminal")]
+    AlreadyTerminal,
+    #[serde(rename = "Failed")]
+    Failed,
+}
+impl LiveDelegationCancellationOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cancelled => "Cancelled",
+            Self::AlreadyTerminal => "AlreadyTerminal",
+            Self::Failed => "Failed",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveDelegationCancellationOutcome {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Cancelled" => Ok(Self::Cancelled),
+            "AlreadyTerminal" => Ok(Self::AlreadyTerminal),
+            "Failed" => Ok(Self::Failed),
+            other => Err(format!(
+                "invalid LiveDelegationCancellationOutcome value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveDelegationCancellationOutcome {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveDelegationCancellationOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LiveDelegationCancellationReason {
+    #[default]
+    #[serde(rename = "Abandoned")]
+    Abandoned,
+    #[serde(rename = "Superseded")]
+    Superseded,
+    #[serde(rename = "TranscriptConflict")]
+    TranscriptConflict,
+    #[serde(rename = "TranscriptMissing")]
+    TranscriptMissing,
+}
+impl LiveDelegationCancellationReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Abandoned => "Abandoned",
+            Self::Superseded => "Superseded",
+            Self::TranscriptConflict => "TranscriptConflict",
+            Self::TranscriptMissing => "TranscriptMissing",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveDelegationCancellationReason {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Abandoned" => Ok(Self::Abandoned),
+            "Superseded" => Ok(Self::Superseded),
+            "TranscriptConflict" => Ok(Self::TranscriptConflict),
+            "TranscriptMissing" => Ok(Self::TranscriptMissing),
+            other => Err(format!(
+                "invalid LiveDelegationCancellationReason value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveDelegationCancellationReason {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveDelegationCancellationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LiveDelegationReconciliation {
+    #[default]
+    #[serde(rename = "Provisional")]
+    Provisional,
+    #[serde(rename = "Confirmed")]
+    Confirmed,
+    #[serde(rename = "MaterialConflict")]
+    MaterialConflict,
+    #[serde(rename = "Missing")]
+    Missing,
+}
+impl LiveDelegationReconciliation {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Provisional => "Provisional",
+            Self::Confirmed => "Confirmed",
+            Self::MaterialConflict => "MaterialConflict",
+            Self::Missing => "Missing",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveDelegationReconciliation {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Provisional" => Ok(Self::Provisional),
+            "Confirmed" => Ok(Self::Confirmed),
+            "MaterialConflict" => Ok(Self::MaterialConflict),
+            "Missing" => Ok(Self::Missing),
+            other => Err(format!(
+                "invalid LiveDelegationReconciliation value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveDelegationReconciliation {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveDelegationReconciliation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LiveDelegationResultDeliveryObservation {
+    #[default]
+    #[serde(rename = "Delivered")]
+    Delivered,
+    #[serde(rename = "Rejected")]
+    Rejected,
+    #[serde(rename = "Ambiguous")]
+    Ambiguous,
+}
+impl LiveDelegationResultDeliveryObservation {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Delivered => "Delivered",
+            Self::Rejected => "Rejected",
+            Self::Ambiguous => "Ambiguous",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveDelegationResultDeliveryObservation {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Delivered" => Ok(Self::Delivered),
+            "Rejected" => Ok(Self::Rejected),
+            "Ambiguous" => Ok(Self::Ambiguous),
+            other => Err(format!(
+                "invalid LiveDelegationResultDeliveryObservation value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveDelegationResultDeliveryObservation {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveDelegationResultDeliveryObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LiveDelegationResultDisposition {
+    #[default]
+    #[serde(rename = "OpenTurn")]
+    OpenTurn,
+    #[serde(rename = "DeferredContext")]
+    DeferredContext,
+}
+impl LiveDelegationResultDisposition {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OpenTurn => "OpenTurn",
+            Self::DeferredContext => "DeferredContext",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveDelegationResultDisposition {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "OpenTurn" => Ok(Self::OpenTurn),
+            "DeferredContext" => Ok(Self::DeferredContext),
+            other => Err(format!(
+                "invalid LiveDelegationResultDisposition value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveDelegationResultDisposition {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveDelegationResultDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LiveDelegationResultSpeechDisposition {
+    #[default]
+    #[serde(rename = "Eligible")]
+    Eligible,
+    #[serde(rename = "SuppressedByNewerUserTurn")]
+    SuppressedByNewerUserTurn,
+    #[serde(rename = "NotDelivered")]
+    NotDelivered,
+}
+impl LiveDelegationResultSpeechDisposition {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Eligible => "Eligible",
+            Self::SuppressedByNewerUserTurn => "SuppressedByNewerUserTurn",
+            Self::NotDelivered => "NotDelivered",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveDelegationResultSpeechDisposition {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Eligible" => Ok(Self::Eligible),
+            "SuppressedByNewerUserTurn" => Ok(Self::SuppressedByNewerUserTurn),
+            "NotDelivered" => Ok(Self::NotDelivered),
+            other => Err(format!(
+                "invalid LiveDelegationResultSpeechDisposition value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveDelegationResultSpeechDisposition {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveDelegationResultSpeechDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LiveDelegationWorkerPhase {
+    #[default]
+    #[serde(rename = "StartAuthorized")]
+    StartAuthorized,
+    #[serde(rename = "Running")]
+    Running,
+    #[serde(rename = "CancelAuthorized")]
+    CancelAuthorized,
+    #[serde(rename = "Terminal")]
+    Terminal,
+    #[serde(rename = "RetirementAuthorized")]
+    RetirementAuthorized,
+    #[serde(rename = "Retired")]
+    Retired,
+    #[serde(rename = "Failed")]
+    Failed,
+}
+impl LiveDelegationWorkerPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::StartAuthorized => "StartAuthorized",
+            Self::Running => "Running",
+            Self::CancelAuthorized => "CancelAuthorized",
+            Self::Terminal => "Terminal",
+            Self::RetirementAuthorized => "RetirementAuthorized",
+            Self::Retired => "Retired",
+            Self::Failed => "Failed",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveDelegationWorkerPhase {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "StartAuthorized" => Ok(Self::StartAuthorized),
+            "Running" => Ok(Self::Running),
+            "CancelAuthorized" => Ok(Self::CancelAuthorized),
+            "Terminal" => Ok(Self::Terminal),
+            "RetirementAuthorized" => Ok(Self::RetirementAuthorized),
+            "Retired" => Ok(Self::Retired),
+            "Failed" => Ok(Self::Failed),
+            other => Err(format!("invalid LiveDelegationWorkerPhase value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveDelegationWorkerPhase {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveDelegationWorkerPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LiveDelegationWorkerTerminalKind {
+    #[default]
+    #[serde(rename = "Completed")]
+    Completed,
+    #[serde(rename = "Cancelled")]
+    Cancelled,
+    #[serde(rename = "Failed")]
+    Failed,
+}
+impl LiveDelegationWorkerTerminalKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Completed => "Completed",
+            Self::Cancelled => "Cancelled",
+            Self::Failed => "Failed",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveDelegationWorkerTerminalKind {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Completed" => Ok(Self::Completed),
+            "Cancelled" => Ok(Self::Cancelled),
+            "Failed" => Ok(Self::Failed),
+            other => Err(format!(
+                "invalid LiveDelegationWorkerTerminalKind value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveDelegationWorkerTerminalKind {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveDelegationWorkerTerminalKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LiveExecutionChannelPhase {
+    #[default]
+    #[serde(rename = "Pending")]
+    Pending,
+    #[serde(rename = "Active")]
+    Active,
+    #[serde(rename = "Revoked")]
+    Revoked,
+}
+impl LiveExecutionChannelPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Active => "Active",
+            Self::Revoked => "Revoked",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveExecutionChannelPhase {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Pending" => Ok(Self::Pending),
+            "Active" => Ok(Self::Active),
+            "Revoked" => Ok(Self::Revoked),
+            other => Err(format!("invalid LiveExecutionChannelPhase value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveExecutionChannelPhase {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveExecutionChannelPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LiveExecutionMode {
+    #[default]
+    #[serde(rename = "FunctionBridge")]
+    FunctionBridge,
+    #[serde(rename = "ClientContext")]
+    ClientContext,
+}
+impl LiveExecutionMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FunctionBridge => "FunctionBridge",
+            Self::ClientContext => "ClientContext",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for LiveExecutionMode {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "FunctionBridge" => Ok(Self::FunctionBridge),
+            "ClientContext" => Ok(Self::ClientContext),
+            other => Err(format!("invalid LiveExecutionMode value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for LiveExecutionMode {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for LiveExecutionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum LiveOpenAdmissionRejection {
     #[default]
     #[serde(rename = "AlreadyBound")]
@@ -3291,6 +4437,8 @@ pub enum LiveOpenAdmissionRejection {
     ChannelAlreadyBound,
     #[serde(rename = "LifecycleClosed")]
     LifecycleClosed,
+    #[serde(rename = "RevokedChannelId")]
+    RevokedChannelId,
 }
 impl LiveOpenAdmissionRejection {
     pub fn as_str(&self) -> &'static str {
@@ -3298,6 +4446,7 @@ impl LiveOpenAdmissionRejection {
             Self::AlreadyBound => "AlreadyBound",
             Self::ChannelAlreadyBound => "ChannelAlreadyBound",
             Self::LifecycleClosed => "LifecycleClosed",
+            Self::RevokedChannelId => "RevokedChannelId",
         }
     }
 }
@@ -3308,6 +4457,7 @@ impl std::convert::TryFrom<&str> for LiveOpenAdmissionRejection {
             "AlreadyBound" => Ok(Self::AlreadyBound),
             "ChannelAlreadyBound" => Ok(Self::ChannelAlreadyBound),
             "LifecycleClosed" => Ok(Self::LifecycleClosed),
+            "RevokedChannelId" => Ok(Self::RevokedChannelId),
             other => Err(format!(
                 "invalid LiveOpenAdmissionRejection value `{other}`"
             )),
@@ -3789,6 +4939,76 @@ impl std::convert::TryFrom<String> for McpServerState {
     }
 }
 impl std::fmt::Display for McpServerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum MeerkatExecutionTerminal {
+    #[default]
+    #[serde(rename = "Completed")]
+    Completed,
+    #[serde(rename = "Rejected")]
+    Rejected,
+    #[serde(rename = "Failed")]
+    Failed,
+    #[serde(rename = "TimedOut")]
+    TimedOut,
+    #[serde(rename = "Unrecoverable")]
+    Unrecoverable,
+    #[serde(rename = "Cancelled")]
+    Cancelled,
+    #[serde(rename = "Superseded")]
+    Superseded,
+}
+impl MeerkatExecutionTerminal {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Completed => "Completed",
+            Self::Rejected => "Rejected",
+            Self::Failed => "Failed",
+            Self::TimedOut => "TimedOut",
+            Self::Unrecoverable => "Unrecoverable",
+            Self::Cancelled => "Cancelled",
+            Self::Superseded => "Superseded",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for MeerkatExecutionTerminal {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Completed" => Ok(Self::Completed),
+            "Rejected" => Ok(Self::Rejected),
+            "Failed" => Ok(Self::Failed),
+            "TimedOut" => Ok(Self::TimedOut),
+            "Unrecoverable" => Ok(Self::Unrecoverable),
+            "Cancelled" => Ok(Self::Cancelled),
+            "Superseded" => Ok(Self::Superseded),
+            other => Err(format!("invalid MeerkatExecutionTerminal value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for MeerkatExecutionTerminal {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for MeerkatExecutionTerminal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
@@ -11472,6 +12692,140 @@ pub struct State {
     pub live_active_channel_by_session: std::collections::BTreeMap<String, String>,
     pub live_channel_session_by_channel: std::collections::BTreeMap<String, String>,
     pub live_channel_identity_by_channel: std::collections::BTreeMap<String, SessionLlmIdentity>,
+    pub live_execution_runtime_id_by_channel: std::collections::BTreeMap<String, AgentRuntimeId>,
+    pub live_execution_fence_by_channel: std::collections::BTreeMap<String, FenceToken>,
+    pub live_execution_generation_by_channel: std::collections::BTreeMap<String, Generation>,
+    pub live_execution_phase_by_channel:
+        std::collections::BTreeMap<String, LiveExecutionChannelPhase>,
+    pub live_revoked_execution_channels: std::collections::BTreeSet<String>,
+    pub live_execution_profile_by_channel: std::collections::BTreeMap<String, String>,
+    pub live_execution_mode_by_channel: std::collections::BTreeMap<String, LiveExecutionMode>,
+    pub live_function_bridge_capable_channels: std::collections::BTreeSet<String>,
+    pub live_client_context_capable_channels: std::collections::BTreeSet<String>,
+    pub live_playback_owner_by_channel: std::collections::BTreeMap<String, String>,
+    pub live_playback_readiness_by_channel: std::collections::BTreeMap<String, String>,
+    pub live_activation_receipt_by_channel: std::collections::BTreeMap<String, String>,
+    pub live_active_control_operation_by_authority: std::collections::BTreeMap<String, String>,
+    pub live_consumed_active_control_authorities: std::collections::BTreeSet<String>,
+    pub live_experimental_staged_runtime_by_channel:
+        std::collections::BTreeMap<String, AgentRuntimeId>,
+    pub live_experimental_staged_fence_by_channel: std::collections::BTreeMap<String, FenceToken>,
+    pub live_experimental_staged_generation_by_channel:
+        std::collections::BTreeMap<String, Generation>,
+    pub live_experimental_staged_seed_cursor_by_channel: std::collections::BTreeMap<String, u64>,
+    pub live_experimental_pending_receipt_by_channel: std::collections::BTreeMap<String, String>,
+    pub live_experimental_execution_channels: std::collections::BTreeSet<String>,
+    pub live_interaction_channel_by_id: std::collections::BTreeMap<String, String>,
+    pub live_active_interaction_by_channel: std::collections::BTreeMap<String, String>,
+    pub live_provider_turn_by_channel: std::collections::BTreeMap<String, String>,
+    pub live_provider_interaction_by_turn: std::collections::BTreeMap<String, String>,
+    pub live_provider_turn_channel_by_ref: std::collections::BTreeMap<String, String>,
+    pub live_awaiting_assistant_interaction_by_channel: std::collections::BTreeMap<String, String>,
+    pub live_assistant_interaction_by_turn: std::collections::BTreeMap<String, String>,
+    pub live_assistant_turn_channel_by_ref: std::collections::BTreeMap<String, String>,
+    pub live_abandoned_interactions: std::collections::BTreeSet<String>,
+    pub live_delegation_interaction_by_channel: std::collections::BTreeMap<String, String>,
+    pub live_delegation_operation_by_channel: std::collections::BTreeMap<String, OperationId>,
+    pub live_delegation_provider_turn_by_channel: std::collections::BTreeMap<String, String>,
+    pub live_delegation_interaction_by_operation: std::collections::BTreeMap<OperationId, String>,
+    pub live_delegation_provider_turn_by_operation: std::collections::BTreeMap<OperationId, String>,
+    pub live_delegation_reconciliation_by_operation:
+        std::collections::BTreeMap<OperationId, LiveDelegationReconciliation>,
+    pub live_delegation_worker_identity_by_operation:
+        std::collections::BTreeMap<OperationId, String>,
+    pub live_delegation_worker_phase_by_operation:
+        std::collections::BTreeMap<OperationId, LiveDelegationWorkerPhase>,
+    pub live_delegation_cancellation_reason_by_operation:
+        std::collections::BTreeMap<OperationId, LiveDelegationCancellationReason>,
+    pub live_delegation_worker_terminal_by_operation:
+        std::collections::BTreeMap<OperationId, LiveDelegationWorkerTerminalKind>,
+    pub live_delegation_result_eligible_operations: std::collections::BTreeSet<OperationId>,
+    pub live_delegation_late_terminal_operations: std::collections::BTreeSet<OperationId>,
+    pub live_consequential_effect_operation_by_authority:
+        std::collections::BTreeMap<String, OperationId>,
+    pub live_result_released_operations: std::collections::BTreeSet<OperationId>,
+    pub live_result_release_disposition_by_operation:
+        std::collections::BTreeMap<OperationId, LiveDelegationResultDisposition>,
+    pub live_result_delivery_channel_by_operation: std::collections::BTreeMap<OperationId, String>,
+    pub live_result_delivery_operation_by_channel: std::collections::BTreeMap<String, OperationId>,
+    pub live_result_delivery_digest_by_operation: std::collections::BTreeMap<OperationId, String>,
+    pub live_result_delivery_observation_by_operation:
+        std::collections::BTreeMap<OperationId, LiveDelegationResultDeliveryObservation>,
+    pub live_result_speech_suppressed_operations: std::collections::BTreeSet<OperationId>,
+    pub live_result_recovery_replacement_by_channel: std::collections::BTreeMap<String, String>,
+    pub live_result_recovery_source_by_replacement: std::collections::BTreeMap<String, String>,
+    pub live_result_recovery_session_by_channel: std::collections::BTreeMap<String, String>,
+    pub live_result_recovery_operation_by_channel: std::collections::BTreeMap<String, OperationId>,
+    pub live_result_recovery_digest_by_channel: std::collections::BTreeMap<String, String>,
+    pub live_result_recovery_seed_cursor_by_channel: std::collections::BTreeMap<String, u64>,
+    pub live_result_recovery_identity_by_channel:
+        std::collections::BTreeMap<String, SessionLlmIdentity>,
+    pub live_result_recovery_runtime_id_by_channel:
+        std::collections::BTreeMap<String, AgentRuntimeId>,
+    pub live_result_recovery_fence_by_channel: std::collections::BTreeMap<String, FenceToken>,
+    pub live_result_recovery_generation_by_channel: std::collections::BTreeMap<String, Generation>,
+    pub live_bridge_operation_by_channel: std::collections::BTreeMap<String, OperationId>,
+    pub live_bridge_channel_by_operation: std::collections::BTreeMap<OperationId, String>,
+    pub live_bridge_interaction_by_operation: std::collections::BTreeMap<OperationId, String>,
+    pub live_bridge_provider_turn_by_operation: std::collections::BTreeMap<OperationId, String>,
+    pub live_bridge_provider_delegation_by_operation:
+        std::collections::BTreeMap<OperationId, String>,
+    pub live_bridge_provider_call_by_operation: std::collections::BTreeMap<OperationId, String>,
+    pub live_bridge_agent_identity_by_operation:
+        std::collections::BTreeMap<OperationId, AgentIdentity>,
+    pub live_bridge_context_revision_by_operation: std::collections::BTreeMap<OperationId, String>,
+    pub live_bridge_request_digest_by_operation: std::collections::BTreeMap<OperationId, String>,
+    pub live_bridge_phase_by_operation:
+        std::collections::BTreeMap<OperationId, LiveBridgeOperationPhase>,
+    pub live_bridge_effect_operation_by_authority: std::collections::BTreeMap<String, OperationId>,
+    pub live_bridge_effect_kind_by_authority:
+        std::collections::BTreeMap<String, LiveBridgeEffectKind>,
+    pub live_bridge_consumed_effect_authorities: std::collections::BTreeSet<String>,
+    pub live_bridge_in_flight_effect_authorities: std::collections::BTreeSet<String>,
+    pub live_bridge_effect_outcome_by_authority:
+        std::collections::BTreeMap<String, LiveBridgeEffectOutcome>,
+    pub live_bridge_model_computation_authorized_operations:
+        std::collections::BTreeSet<OperationId>,
+    pub live_bridge_read_snapshot_authorized_operations: std::collections::BTreeSet<OperationId>,
+    pub live_bridge_execution_started_operations: std::collections::BTreeSet<OperationId>,
+    pub live_bridge_outcome_receipt_required_operations: std::collections::BTreeSet<OperationId>,
+    pub live_bridge_outcome_receipt_operations: std::collections::BTreeSet<OperationId>,
+    pub live_bridge_execution_terminal_by_operation:
+        std::collections::BTreeMap<OperationId, MeerkatExecutionTerminal>,
+    pub live_bridge_execution_result_digest_by_operation:
+        std::collections::BTreeMap<OperationId, String>,
+    pub live_bridge_cancellation_reason_by_operation:
+        std::collections::BTreeMap<OperationId, LiveBridgeCancellationReason>,
+    pub live_bridge_submission_output_kind_by_operation:
+        std::collections::BTreeMap<OperationId, LiveBridgeOutputKind>,
+    pub live_bridge_submission_digest_by_operation: std::collections::BTreeMap<OperationId, String>,
+    pub live_bridge_submission_state_by_operation:
+        std::collections::BTreeMap<OperationId, LiveBridgeSubmissionState>,
+    pub live_context_cursor_by_channel: std::collections::BTreeMap<String, u64>,
+    pub live_context_queued_session_by_append: std::collections::BTreeMap<String, String>,
+    pub live_context_queued_cursor_by_append: std::collections::BTreeMap<String, u64>,
+    pub live_context_queued_digest_by_append: std::collections::BTreeMap<String, String>,
+    pub live_context_queued_commit_token_by_append: std::collections::BTreeMap<String, String>,
+    pub live_context_queued_disposition_by_append:
+        std::collections::BTreeMap<String, LiveContextRowDisposition>,
+    pub live_context_queued_append_by_cursor: std::collections::BTreeMap<u64, String>,
+    pub live_context_pending_append_by_channel: std::collections::BTreeMap<String, String>,
+    pub live_context_pending_channel_by_append: std::collections::BTreeMap<String, String>,
+    pub live_context_pending_previous_cursor_by_append: std::collections::BTreeMap<String, u64>,
+    pub live_context_pending_next_cursor_by_append: std::collections::BTreeMap<String, u64>,
+    pub live_context_delivered_append_ids: std::collections::BTreeSet<String>,
+    pub live_context_ambiguous_no_retry: std::collections::BTreeSet<String>,
+    pub live_context_recovery_replacement_by_channel: std::collections::BTreeMap<String, String>,
+    pub live_context_recovery_source_by_replacement: std::collections::BTreeMap<String, String>,
+    pub live_context_recovery_session_by_channel: std::collections::BTreeMap<String, String>,
+    pub live_context_recovery_append_by_channel: std::collections::BTreeMap<String, String>,
+    pub live_context_recovery_seed_cursor_by_channel: std::collections::BTreeMap<String, u64>,
+    pub live_context_recovery_identity_by_channel:
+        std::collections::BTreeMap<String, SessionLlmIdentity>,
+    pub live_context_recovery_runtime_id_by_channel:
+        std::collections::BTreeMap<String, AgentRuntimeId>,
+    pub live_context_recovery_fence_by_channel: std::collections::BTreeMap<String, FenceToken>,
+    pub live_context_recovery_generation_by_channel: std::collections::BTreeMap<String, Generation>,
     pub live_refresh_result_sequence: u64,
     pub live_refresh_queue_acceptance_sequence_by_channel: std::collections::BTreeMap<String, u64>,
     pub live_refresh_status_by_channel: std::collections::BTreeMap<String, LiveRefreshPublicStatus>,
@@ -12830,6 +14184,524 @@ pub mod inputs {
         pub llm_identity: SessionLlmIdentity,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct BindLiveExecutionChannel {
+        pub session_id: String,
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub canonical_seed_cursor: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct StageExperimentalLiveExecution {
+        pub session_id: String,
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub canonical_seed_cursor: u64,
+        pub pending_receipt: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResolveLiveExecutionModeAdmission {
+        pub session_id: String,
+        pub channel_id: String,
+        pub profile_id: String,
+        pub requested_mode: LiveExecutionMode,
+        pub function_bridge_available: bool,
+        pub client_context_available: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RegisterLivePlaybackOwner {
+        pub session_id: String,
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub owner_id: String,
+        pub readiness_id: String,
+        pub pending_receipt: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AuthorizeLiveActiveChannelControl {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub activation_receipt: String,
+        pub control_authority_id: String,
+        pub operation: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ConsumeLiveActiveChannelControl {
+        pub channel_id: String,
+        pub activation_receipt: String,
+        pub control_authority_id: String,
+        pub operation: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RevokeLivePlaybackOwner {
+        pub session_id: String,
+        pub channel_id: String,
+        pub owner_id: String,
+        pub readiness_id: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RevokeLiveChannelCloseCustody {
+        pub session_id: String,
+        pub channel_id: String,
+        pub pending_receipt: Option<String>,
+        pub activation_receipt: Option<String>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ObserveLiveProviderTurnStarted {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub provider_turn_ref: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ObserveLiveAssistantTurnStarted {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub assistant_turn_ref: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AdmitLiveInteraction {
+        pub session_id: String,
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AdmitLiveDelegation {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub provider_turn_correlation: String,
+        pub delegation_identity_present: bool,
+        pub actionable_input_present: bool,
+        pub exact_join: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AdmitLiveInteractionDelegation {
+        pub session_id: String,
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub provider_turn_correlation: String,
+        pub delegation_identity_present: bool,
+        pub actionable_input_present: bool,
+        pub exact_join: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ReconcileLiveDelegationTranscript {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub provider_turn_correlation: String,
+        pub final_transcript_committed: bool,
+        pub normalized_digest_matches: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AuthorizeLiveDelegationWorkerStart {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub provider_turn_correlation: String,
+        pub worker_identity: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResolveLiveDelegationWorkerStart {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub worker_identity: String,
+        pub started: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AuthorizeLiveDelegationTranscriptTerminalCancellation {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub worker_identity: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct SupersedeLiveInteraction {
+        pub session_id: String,
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub superseding_interaction_id: String,
+        pub operation_id: OperationId,
+        pub worker_identity: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResolveLiveDelegationCancellation {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub worker_identity: String,
+        pub outcome: LiveDelegationCancellationOutcome,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecordLiveDelegationWorkerTerminal {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub worker_identity: String,
+        pub terminal: LiveDelegationWorkerTerminalKind,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ReconcileRevokedLiveDelegationWorkerAfterRestart {
+        pub session_id: String,
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub worker_identity: String,
+        pub terminal: LiveDelegationWorkerTerminalKind,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AuthorizeLiveDelegationWorkerRetirement {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub worker_identity: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResolveLiveDelegationWorkerRetirement {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub worker_identity: String,
+        pub retired: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AbandonLiveInteraction {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct CompleteLiveInteraction {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub provider_turn_ref: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AuthorizeLiveConsequentialEffect {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub authority_id: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AuthorizeLiveDelegationResultRelease {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub provider_turn_correlation: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AuthorizeLiveDelegationResultDelivery {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub provider_turn_correlation: String,
+        pub result_digest: String,
+        pub disposition: LiveDelegationResultDisposition,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResolveLiveDelegationResultDelivery {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub operation_id: OperationId,
+        pub result_digest: String,
+        pub replacement_channel_id: String,
+        pub observation: LiveDelegationResultDeliveryObservation,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct BindLiveDelegationResultRecoveryChannel {
+        pub session_id: String,
+        pub closing_channel_id: String,
+        pub replacement_channel_id: String,
+        pub answer_observation_sequence: u64,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub operation_id: OperationId,
+        pub result_digest: String,
+        pub canonical_seed_cursor: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AdmitLiveBridgeOperation {
+        pub session_id: String,
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub provider_turn_ref: String,
+        pub provider_delegation_ref: String,
+        pub provider_call_ref: String,
+        pub agent_identity: AgentIdentity,
+        pub canonical_context_revision: String,
+        pub request_digest: String,
+        pub structural_lineage_proven: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ConfirmLiveBridgeFinalInput {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub provider_turn_ref: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AuthorizeLiveBridgeExecutionStart {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub request_digest: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AuthorizeLiveBridgeEffect {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub authority_id: String,
+        pub kind: LiveBridgeEffectKind,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ConsumeLiveBridgeEffectAuthority {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub operation_id: OperationId,
+        pub authority_id: String,
+        pub kind: LiveBridgeEffectKind,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecordLiveBridgeEffectOutcome {
+        pub channel_id: String,
+        pub operation_id: OperationId,
+        pub authority_id: String,
+        pub kind: LiveBridgeEffectKind,
+        pub outcome: LiveBridgeEffectOutcome,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecordLiveBridgeOutcomeReceipt {
+        pub operation_id: OperationId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RetireSettledLiveBridgeOperation {
+        pub operation_id: OperationId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct CancelLiveBridgeOperation {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub reason: LiveBridgeCancellationReason,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecordLiveBridgeExecutionTerminal {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub terminal: MeerkatExecutionTerminal,
+        pub result_digest: Option<String>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ReconcileRevokedLiveBridgeExecutionTerminal {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub request_digest: String,
+        pub terminal: MeerkatExecutionTerminal,
+        pub result_digest: Option<String>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct FenceRestoredLiveBridgeOperationForRestart {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub request_digest: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AuthorizeLiveBridgeSubmission {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub provider_call_ref: String,
+        pub output_kind: LiveBridgeOutputKind,
+        pub output_digest: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ClaimLiveBridgeSubmissionAttempt {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub operation_id: OperationId,
+        pub provider_call_ref: String,
+        pub output_digest: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecordLiveBridgeSubmissionLocalWrite {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub operation_id: OperationId,
+        pub provider_call_ref: String,
+        pub output_digest: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResolveLiveBridgeSubmission {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub operation_id: OperationId,
+        pub provider_call_ref: String,
+        pub output_digest: String,
+        pub observation: LiveBridgeSubmissionObservation,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecoverLiveBridgeSubmission {
+        pub operation_id: OperationId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AuthorizeLiveContextAppend {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub append_id: String,
+        pub previous_cursor: u64,
+        pub next_cursor: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct EnqueueLiveContextRow {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub append_id: String,
+        pub canonical_cursor: u64,
+        pub content_digest: String,
+        pub commit_authority_token: String,
+        pub disposition: LiveContextRowDisposition,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AdvanceLiveContextCanonicalCoverage {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub append_id: String,
+        pub previous_cursor: u64,
+        pub next_cursor: u64,
+        pub disposition: LiveContextRowDisposition,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResolveLiveContextAppend {
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub append_id: String,
+        pub previous_cursor: u64,
+        pub next_cursor: u64,
+        pub replacement_channel_id: String,
+        pub observation: LiveContextAppendObservation,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct BindLiveContextRecoveryChannel {
+        pub session_id: String,
+        pub closing_channel_id: String,
+        pub replacement_channel_id: String,
+        pub answer_observation_sequence: u64,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub append_id: String,
+        pub canonical_seed_cursor: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct AbandonLiveOpenAdmission {
         pub session_id: String,
         pub channel_id: String,
@@ -12883,6 +14755,17 @@ pub mod inputs {
         pub session_id: String,
         pub channel_id: String,
         pub answer_observation_sequence: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecordLiveWebrtcAnswerAcceptedAndBindExecution {
+        pub session_id: String,
+        pub channel_id: String,
+        pub answer_observation_sequence: u64,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub canonical_seed_cursor: u64,
+        pub activation_receipt: String,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RecordLiveWebsocketTokenIssued {
@@ -13562,6 +15445,64 @@ pub enum Input {
     PublishOrCancelSurfaceRequest(inputs::PublishOrCancelSurfaceRequest),
     FinishSurfaceRequestUnpublished(inputs::FinishSurfaceRequestUnpublished),
     ResolveLiveOpenAdmission(inputs::ResolveLiveOpenAdmission),
+    BindLiveExecutionChannel(inputs::BindLiveExecutionChannel),
+    StageExperimentalLiveExecution(inputs::StageExperimentalLiveExecution),
+    ResolveLiveExecutionModeAdmission(inputs::ResolveLiveExecutionModeAdmission),
+    RegisterLivePlaybackOwner(inputs::RegisterLivePlaybackOwner),
+    AuthorizeLiveActiveChannelControl(inputs::AuthorizeLiveActiveChannelControl),
+    ConsumeLiveActiveChannelControl(inputs::ConsumeLiveActiveChannelControl),
+    RevokeLivePlaybackOwner(inputs::RevokeLivePlaybackOwner),
+    RevokeLiveChannelCloseCustody(inputs::RevokeLiveChannelCloseCustody),
+    ObserveLiveProviderTurnStarted(inputs::ObserveLiveProviderTurnStarted),
+    ObserveLiveAssistantTurnStarted(inputs::ObserveLiveAssistantTurnStarted),
+    AdmitLiveInteraction(inputs::AdmitLiveInteraction),
+    AdmitLiveDelegation(inputs::AdmitLiveDelegation),
+    AdmitLiveInteractionDelegation(inputs::AdmitLiveInteractionDelegation),
+    ReconcileLiveDelegationTranscript(inputs::ReconcileLiveDelegationTranscript),
+    AuthorizeLiveDelegationWorkerStart(inputs::AuthorizeLiveDelegationWorkerStart),
+    ResolveLiveDelegationWorkerStart(inputs::ResolveLiveDelegationWorkerStart),
+    AuthorizeLiveDelegationTranscriptTerminalCancellation(
+        inputs::AuthorizeLiveDelegationTranscriptTerminalCancellation,
+    ),
+    SupersedeLiveInteraction(inputs::SupersedeLiveInteraction),
+    ResolveLiveDelegationCancellation(inputs::ResolveLiveDelegationCancellation),
+    RecordLiveDelegationWorkerTerminal(inputs::RecordLiveDelegationWorkerTerminal),
+    ReconcileRevokedLiveDelegationWorkerAfterRestart(
+        inputs::ReconcileRevokedLiveDelegationWorkerAfterRestart,
+    ),
+    AuthorizeLiveDelegationWorkerRetirement(inputs::AuthorizeLiveDelegationWorkerRetirement),
+    ResolveLiveDelegationWorkerRetirement(inputs::ResolveLiveDelegationWorkerRetirement),
+    AbandonLiveInteraction(inputs::AbandonLiveInteraction),
+    CompleteLiveInteraction(inputs::CompleteLiveInteraction),
+    AuthorizeLiveConsequentialEffect(inputs::AuthorizeLiveConsequentialEffect),
+    AuthorizeLiveDelegationResultRelease(inputs::AuthorizeLiveDelegationResultRelease),
+    AuthorizeLiveDelegationResultDelivery(inputs::AuthorizeLiveDelegationResultDelivery),
+    ResolveLiveDelegationResultDelivery(inputs::ResolveLiveDelegationResultDelivery),
+    BindLiveDelegationResultRecoveryChannel(inputs::BindLiveDelegationResultRecoveryChannel),
+    AdmitLiveBridgeOperation(inputs::AdmitLiveBridgeOperation),
+    ConfirmLiveBridgeFinalInput(inputs::ConfirmLiveBridgeFinalInput),
+    AuthorizeLiveBridgeExecutionStart(inputs::AuthorizeLiveBridgeExecutionStart),
+    AuthorizeLiveBridgeEffect(inputs::AuthorizeLiveBridgeEffect),
+    ConsumeLiveBridgeEffectAuthority(inputs::ConsumeLiveBridgeEffectAuthority),
+    RecordLiveBridgeEffectOutcome(inputs::RecordLiveBridgeEffectOutcome),
+    RecordLiveBridgeOutcomeReceipt(inputs::RecordLiveBridgeOutcomeReceipt),
+    RetireSettledLiveBridgeOperation(inputs::RetireSettledLiveBridgeOperation),
+    CancelLiveBridgeOperation(inputs::CancelLiveBridgeOperation),
+    RecordLiveBridgeExecutionTerminal(inputs::RecordLiveBridgeExecutionTerminal),
+    ReconcileRevokedLiveBridgeExecutionTerminal(
+        inputs::ReconcileRevokedLiveBridgeExecutionTerminal,
+    ),
+    FenceRestoredLiveBridgeOperationForRestart(inputs::FenceRestoredLiveBridgeOperationForRestart),
+    AuthorizeLiveBridgeSubmission(inputs::AuthorizeLiveBridgeSubmission),
+    ClaimLiveBridgeSubmissionAttempt(inputs::ClaimLiveBridgeSubmissionAttempt),
+    RecordLiveBridgeSubmissionLocalWrite(inputs::RecordLiveBridgeSubmissionLocalWrite),
+    ResolveLiveBridgeSubmission(inputs::ResolveLiveBridgeSubmission),
+    RecoverLiveBridgeSubmission(inputs::RecoverLiveBridgeSubmission),
+    AuthorizeLiveContextAppend(inputs::AuthorizeLiveContextAppend),
+    EnqueueLiveContextRow(inputs::EnqueueLiveContextRow),
+    AdvanceLiveContextCanonicalCoverage(inputs::AdvanceLiveContextCanonicalCoverage),
+    ResolveLiveContextAppend(inputs::ResolveLiveContextAppend),
+    BindLiveContextRecoveryChannel(inputs::BindLiveContextRecoveryChannel),
     AbandonLiveOpenAdmission(inputs::AbandonLiveOpenAdmission),
     RecordLiveRefreshQueued(inputs::RecordLiveRefreshQueued),
     RecordLiveCloseClosed(inputs::RecordLiveCloseClosed),
@@ -13571,6 +15512,9 @@ pub enum Input {
     RecordLiveWebrtcTokenIssued(inputs::RecordLiveWebrtcTokenIssued),
     ResolveLiveWebrtcAnswerAdmission(inputs::ResolveLiveWebrtcAnswerAdmission),
     RecordLiveWebrtcAnswerAccepted(inputs::RecordLiveWebrtcAnswerAccepted),
+    RecordLiveWebrtcAnswerAcceptedAndBindExecution(
+        inputs::RecordLiveWebrtcAnswerAcceptedAndBindExecution,
+    ),
     RecordLiveWebsocketTokenIssued(inputs::RecordLiveWebsocketTokenIssued),
     ResolveLiveWebsocketTokenAdmission(inputs::ResolveLiveWebsocketTokenAdmission),
     RecordSessionEventStreamOpened(inputs::RecordSessionEventStreamOpened),
@@ -13932,6 +15876,108 @@ impl Input {
             Self::PublishOrCancelSurfaceRequest(_) => InputKind::PublishOrCancelSurfaceRequest,
             Self::FinishSurfaceRequestUnpublished(_) => InputKind::FinishSurfaceRequestUnpublished,
             Self::ResolveLiveOpenAdmission(_) => InputKind::ResolveLiveOpenAdmission,
+            Self::BindLiveExecutionChannel(_) => InputKind::BindLiveExecutionChannel,
+            Self::StageExperimentalLiveExecution(_) => InputKind::StageExperimentalLiveExecution,
+            Self::ResolveLiveExecutionModeAdmission(_) => {
+                InputKind::ResolveLiveExecutionModeAdmission
+            }
+            Self::RegisterLivePlaybackOwner(_) => InputKind::RegisterLivePlaybackOwner,
+            Self::AuthorizeLiveActiveChannelControl(_) => {
+                InputKind::AuthorizeLiveActiveChannelControl
+            }
+            Self::ConsumeLiveActiveChannelControl(_) => InputKind::ConsumeLiveActiveChannelControl,
+            Self::RevokeLivePlaybackOwner(_) => InputKind::RevokeLivePlaybackOwner,
+            Self::RevokeLiveChannelCloseCustody(_) => InputKind::RevokeLiveChannelCloseCustody,
+            Self::ObserveLiveProviderTurnStarted(_) => InputKind::ObserveLiveProviderTurnStarted,
+            Self::ObserveLiveAssistantTurnStarted(_) => InputKind::ObserveLiveAssistantTurnStarted,
+            Self::AdmitLiveInteraction(_) => InputKind::AdmitLiveInteraction,
+            Self::AdmitLiveDelegation(_) => InputKind::AdmitLiveDelegation,
+            Self::AdmitLiveInteractionDelegation(_) => InputKind::AdmitLiveInteractionDelegation,
+            Self::ReconcileLiveDelegationTranscript(_) => {
+                InputKind::ReconcileLiveDelegationTranscript
+            }
+            Self::AuthorizeLiveDelegationWorkerStart(_) => {
+                InputKind::AuthorizeLiveDelegationWorkerStart
+            }
+            Self::ResolveLiveDelegationWorkerStart(_) => {
+                InputKind::ResolveLiveDelegationWorkerStart
+            }
+            Self::AuthorizeLiveDelegationTranscriptTerminalCancellation(_) => {
+                InputKind::AuthorizeLiveDelegationTranscriptTerminalCancellation
+            }
+            Self::SupersedeLiveInteraction(_) => InputKind::SupersedeLiveInteraction,
+            Self::ResolveLiveDelegationCancellation(_) => {
+                InputKind::ResolveLiveDelegationCancellation
+            }
+            Self::RecordLiveDelegationWorkerTerminal(_) => {
+                InputKind::RecordLiveDelegationWorkerTerminal
+            }
+            Self::ReconcileRevokedLiveDelegationWorkerAfterRestart(_) => {
+                InputKind::ReconcileRevokedLiveDelegationWorkerAfterRestart
+            }
+            Self::AuthorizeLiveDelegationWorkerRetirement(_) => {
+                InputKind::AuthorizeLiveDelegationWorkerRetirement
+            }
+            Self::ResolveLiveDelegationWorkerRetirement(_) => {
+                InputKind::ResolveLiveDelegationWorkerRetirement
+            }
+            Self::AbandonLiveInteraction(_) => InputKind::AbandonLiveInteraction,
+            Self::CompleteLiveInteraction(_) => InputKind::CompleteLiveInteraction,
+            Self::AuthorizeLiveConsequentialEffect(_) => {
+                InputKind::AuthorizeLiveConsequentialEffect
+            }
+            Self::AuthorizeLiveDelegationResultRelease(_) => {
+                InputKind::AuthorizeLiveDelegationResultRelease
+            }
+            Self::AuthorizeLiveDelegationResultDelivery(_) => {
+                InputKind::AuthorizeLiveDelegationResultDelivery
+            }
+            Self::ResolveLiveDelegationResultDelivery(_) => {
+                InputKind::ResolveLiveDelegationResultDelivery
+            }
+            Self::BindLiveDelegationResultRecoveryChannel(_) => {
+                InputKind::BindLiveDelegationResultRecoveryChannel
+            }
+            Self::AdmitLiveBridgeOperation(_) => InputKind::AdmitLiveBridgeOperation,
+            Self::ConfirmLiveBridgeFinalInput(_) => InputKind::ConfirmLiveBridgeFinalInput,
+            Self::AuthorizeLiveBridgeExecutionStart(_) => {
+                InputKind::AuthorizeLiveBridgeExecutionStart
+            }
+            Self::AuthorizeLiveBridgeEffect(_) => InputKind::AuthorizeLiveBridgeEffect,
+            Self::ConsumeLiveBridgeEffectAuthority(_) => {
+                InputKind::ConsumeLiveBridgeEffectAuthority
+            }
+            Self::RecordLiveBridgeEffectOutcome(_) => InputKind::RecordLiveBridgeEffectOutcome,
+            Self::RecordLiveBridgeOutcomeReceipt(_) => InputKind::RecordLiveBridgeOutcomeReceipt,
+            Self::RetireSettledLiveBridgeOperation(_) => {
+                InputKind::RetireSettledLiveBridgeOperation
+            }
+            Self::CancelLiveBridgeOperation(_) => InputKind::CancelLiveBridgeOperation,
+            Self::RecordLiveBridgeExecutionTerminal(_) => {
+                InputKind::RecordLiveBridgeExecutionTerminal
+            }
+            Self::ReconcileRevokedLiveBridgeExecutionTerminal(_) => {
+                InputKind::ReconcileRevokedLiveBridgeExecutionTerminal
+            }
+            Self::FenceRestoredLiveBridgeOperationForRestart(_) => {
+                InputKind::FenceRestoredLiveBridgeOperationForRestart
+            }
+            Self::AuthorizeLiveBridgeSubmission(_) => InputKind::AuthorizeLiveBridgeSubmission,
+            Self::ClaimLiveBridgeSubmissionAttempt(_) => {
+                InputKind::ClaimLiveBridgeSubmissionAttempt
+            }
+            Self::RecordLiveBridgeSubmissionLocalWrite(_) => {
+                InputKind::RecordLiveBridgeSubmissionLocalWrite
+            }
+            Self::ResolveLiveBridgeSubmission(_) => InputKind::ResolveLiveBridgeSubmission,
+            Self::RecoverLiveBridgeSubmission(_) => InputKind::RecoverLiveBridgeSubmission,
+            Self::AuthorizeLiveContextAppend(_) => InputKind::AuthorizeLiveContextAppend,
+            Self::EnqueueLiveContextRow(_) => InputKind::EnqueueLiveContextRow,
+            Self::AdvanceLiveContextCanonicalCoverage(_) => {
+                InputKind::AdvanceLiveContextCanonicalCoverage
+            }
+            Self::ResolveLiveContextAppend(_) => InputKind::ResolveLiveContextAppend,
+            Self::BindLiveContextRecoveryChannel(_) => InputKind::BindLiveContextRecoveryChannel,
             Self::AbandonLiveOpenAdmission(_) => InputKind::AbandonLiveOpenAdmission,
             Self::RecordLiveRefreshQueued(_) => InputKind::RecordLiveRefreshQueued,
             Self::RecordLiveCloseClosed(_) => InputKind::RecordLiveCloseClosed,
@@ -13945,6 +15991,9 @@ impl Input {
                 InputKind::ResolveLiveWebrtcAnswerAdmission
             }
             Self::RecordLiveWebrtcAnswerAccepted(_) => InputKind::RecordLiveWebrtcAnswerAccepted,
+            Self::RecordLiveWebrtcAnswerAcceptedAndBindExecution(_) => {
+                InputKind::RecordLiveWebrtcAnswerAcceptedAndBindExecution
+            }
             Self::RecordLiveWebsocketTokenIssued(_) => InputKind::RecordLiveWebsocketTokenIssued,
             Self::ResolveLiveWebsocketTokenAdmission(_) => {
                 InputKind::ResolveLiveWebsocketTokenAdmission
@@ -14275,6 +16324,58 @@ pub enum InputKind {
     PublishOrCancelSurfaceRequest,
     FinishSurfaceRequestUnpublished,
     ResolveLiveOpenAdmission,
+    BindLiveExecutionChannel,
+    StageExperimentalLiveExecution,
+    ResolveLiveExecutionModeAdmission,
+    RegisterLivePlaybackOwner,
+    AuthorizeLiveActiveChannelControl,
+    ConsumeLiveActiveChannelControl,
+    RevokeLivePlaybackOwner,
+    RevokeLiveChannelCloseCustody,
+    ObserveLiveProviderTurnStarted,
+    ObserveLiveAssistantTurnStarted,
+    AdmitLiveInteraction,
+    AdmitLiveDelegation,
+    AdmitLiveInteractionDelegation,
+    ReconcileLiveDelegationTranscript,
+    AuthorizeLiveDelegationWorkerStart,
+    ResolveLiveDelegationWorkerStart,
+    AuthorizeLiveDelegationTranscriptTerminalCancellation,
+    SupersedeLiveInteraction,
+    ResolveLiveDelegationCancellation,
+    RecordLiveDelegationWorkerTerminal,
+    ReconcileRevokedLiveDelegationWorkerAfterRestart,
+    AuthorizeLiveDelegationWorkerRetirement,
+    ResolveLiveDelegationWorkerRetirement,
+    AbandonLiveInteraction,
+    CompleteLiveInteraction,
+    AuthorizeLiveConsequentialEffect,
+    AuthorizeLiveDelegationResultRelease,
+    AuthorizeLiveDelegationResultDelivery,
+    ResolveLiveDelegationResultDelivery,
+    BindLiveDelegationResultRecoveryChannel,
+    AdmitLiveBridgeOperation,
+    ConfirmLiveBridgeFinalInput,
+    AuthorizeLiveBridgeExecutionStart,
+    AuthorizeLiveBridgeEffect,
+    ConsumeLiveBridgeEffectAuthority,
+    RecordLiveBridgeEffectOutcome,
+    RecordLiveBridgeOutcomeReceipt,
+    RetireSettledLiveBridgeOperation,
+    CancelLiveBridgeOperation,
+    RecordLiveBridgeExecutionTerminal,
+    ReconcileRevokedLiveBridgeExecutionTerminal,
+    FenceRestoredLiveBridgeOperationForRestart,
+    AuthorizeLiveBridgeSubmission,
+    ClaimLiveBridgeSubmissionAttempt,
+    RecordLiveBridgeSubmissionLocalWrite,
+    ResolveLiveBridgeSubmission,
+    RecoverLiveBridgeSubmission,
+    AuthorizeLiveContextAppend,
+    EnqueueLiveContextRow,
+    AdvanceLiveContextCanonicalCoverage,
+    ResolveLiveContextAppend,
+    BindLiveContextRecoveryChannel,
     AbandonLiveOpenAdmission,
     RecordLiveRefreshQueued,
     RecordLiveCloseClosed,
@@ -14284,6 +16385,7 @@ pub enum InputKind {
     RecordLiveWebrtcTokenIssued,
     ResolveLiveWebrtcAnswerAdmission,
     RecordLiveWebrtcAnswerAccepted,
+    RecordLiveWebrtcAnswerAcceptedAndBindExecution,
     RecordLiveWebsocketTokenIssued,
     ResolveLiveWebsocketTokenAdmission,
     RecordSessionEventStreamOpened,
@@ -15046,6 +17148,20 @@ pub mod effects {
         pub answer_observation_sequence: u64,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveWebrtcAnswerAcceptedAndExecutionBound {
+        pub session_id: String,
+        pub channel_id: String,
+        pub status: LiveWebrtcAnswerPublicStatus,
+        pub answered: bool,
+        pub sequence: u64,
+        pub answer_observation_sequence: u64,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub canonical_seed_cursor: u64,
+        pub activation_receipt: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct LiveWebsocketTokenIssued {
         pub session_id: String,
         pub channel_id: String,
@@ -15077,6 +17193,463 @@ pub mod effects {
         pub session_id: String,
         pub channel_id: String,
         pub sequence: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveExecutionChannelBound {
+        pub session_id: String,
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub canonical_seed_cursor: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ExperimentalLiveExecutionStaged {
+        pub session_id: String,
+        pub channel_id: String,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub canonical_seed_cursor: u64,
+        pub pending_receipt: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveExecutionModeAdmissionResolved {
+        pub session_id: String,
+        pub channel_id: String,
+        pub profile_id: String,
+        pub resolved_mode: LiveExecutionMode,
+        pub function_bridge_available: bool,
+        pub client_context_available: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LivePlaybackOwnerReady {
+        pub session_id: String,
+        pub channel_id: String,
+        pub owner_id: String,
+        pub readiness_id: String,
+        pub phase: LiveExecutionChannelPhase,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveActiveChannelControlAuthorityIssued {
+        pub channel_id: String,
+        pub activation_receipt: String,
+        pub control_authority_id: String,
+        pub operation: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveActiveChannelControlDispatchAuthorized {
+        pub channel_id: String,
+        pub control_authority_id: String,
+        pub operation: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LivePlaybackOwnerRevoked {
+        pub session_id: String,
+        pub channel_id: String,
+        pub owner_id: String,
+        pub phase: LiveExecutionChannelPhase,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveChannelCloseCustodyRevoked {
+        pub session_id: String,
+        pub channel_id: String,
+        pub phase: LiveExecutionChannelPhase,
+        pub already_closed: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveInteractionAdmitted {
+        pub session_id: String,
+        pub channel_id: String,
+        pub interaction_id: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveDelegationAdmitted {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub provider_turn_correlation: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveInteractionDelegationAdmitted {
+        pub session_id: String,
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub provider_turn_correlation: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveDelegationTranscriptReconciled {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub reconciliation: LiveDelegationReconciliation,
+        pub cancellation_required: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveDelegationWorkerStartAuthorized {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub worker_identity: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveDelegationWorkerStartResolved {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub worker_identity: String,
+        pub started: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveDelegationCancellationAuthorized {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub worker_identity: String,
+        pub reason: LiveDelegationCancellationReason,
+        pub superseding_interaction_id: Option<String>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveDelegationCancellationResolved {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub worker_identity: String,
+        pub outcome: LiveDelegationCancellationOutcome,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveDelegationWorkerTerminalRecorded {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub worker_identity: String,
+        pub terminal: LiveDelegationWorkerTerminalKind,
+        pub late: bool,
+        pub result_eligible: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveDelegationWorkerRestartReconciled {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub worker_identity: String,
+        pub terminal: LiveDelegationWorkerTerminalKind,
+        pub replay: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveDelegationWorkerRetirementAuthorized {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub worker_identity: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveDelegationWorkerRetirementResolved {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub worker_identity: String,
+        pub retired: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveInteractionAbandoned {
+        pub channel_id: String,
+        pub interaction_id: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveInteractionSupersededWithoutCancellation {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub superseding_interaction_id: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveInteractionCompleted {
+        pub channel_id: String,
+        pub interaction_id: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveProviderTurnStarted {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub provider_turn_ref: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveAssistantTurnStarted {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub assistant_turn_ref: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveProviderTurnFinished {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub provider_turn_ref: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveConsequentialEffectAuthorized {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub authority_id: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveDelegationResultReleaseAuthorized {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub provider_turn_correlation: String,
+        pub disposition: LiveDelegationResultDisposition,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveDelegationResultDeliveryAuthorized {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub provider_turn_correlation: String,
+        pub result_digest: String,
+        pub disposition: LiveDelegationResultDisposition,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveDelegationResultDeliveryResolved {
+        pub channel_id: String,
+        pub operation_id: OperationId,
+        pub result_digest: String,
+        pub disposition: LiveDelegationResultDisposition,
+        pub observation: LiveDelegationResultDeliveryObservation,
+        pub speech_disposition: LiveDelegationResultSpeechDisposition,
+        pub retry_allowed: bool,
+        pub recovery_required: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveDelegationResultAmbiguityRecoveryAuthorized {
+        pub session_id: String,
+        pub closing_channel_id: String,
+        pub replacement_channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub provider_turn_correlation: String,
+        pub result_digest: String,
+        pub disposition: LiveDelegationResultDisposition,
+        pub canonical_seed_cursor: u64,
+        pub llm_identity: SessionLlmIdentity,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveDelegationResultRecoveryChannelBound {
+        pub session_id: String,
+        pub closing_channel_id: String,
+        pub replacement_channel_id: String,
+        pub operation_id: OperationId,
+        pub result_digest: String,
+        pub canonical_seed_cursor: u64,
+        pub status: LiveWebrtcAnswerPublicStatus,
+        pub answered: bool,
+        pub sequence: u64,
+        pub answer_observation_sequence: u64,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveBridgeOperationAdmitted {
+        pub session_id: String,
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub provider_turn_ref: String,
+        pub provider_delegation_ref: String,
+        pub provider_call_ref: String,
+        pub agent_identity: AgentIdentity,
+        pub canonical_context_revision: String,
+        pub request_digest: String,
+        pub phase: LiveBridgeOperationPhase,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveBridgeOperationReplayObserved {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub provider_delegation_ref: String,
+        pub provider_call_ref: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveBridgeProtocolDriftCloseAuthorized {
+        pub channel_id: String,
+        pub operation_id: OperationId,
+        pub provider_delegation_ref: String,
+        pub provider_call_ref: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveBridgeFinalInputAuthorized {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub phase: LiveBridgeOperationPhase,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveBridgeExecutionStartAuthorized {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub request_digest: String,
+        pub phase: LiveBridgeOperationPhase,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveBridgeEffectAuthorityIssued {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub authority_id: String,
+        pub kind: LiveBridgeEffectKind,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveBridgeEffectDispatchAuthorized {
+        pub channel_id: String,
+        pub operation_id: OperationId,
+        pub authority_id: String,
+        pub kind: LiveBridgeEffectKind,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveBridgeEffectOutcomeRecorded {
+        pub channel_id: String,
+        pub operation_id: OperationId,
+        pub authority_id: String,
+        pub kind: LiveBridgeEffectKind,
+        pub outcome: LiveBridgeEffectOutcome,
+        pub replay: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveBridgeOutcomeReceiptRecorded {
+        pub operation_id: OperationId,
+        pub replay: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveBridgeOperationRetirementResolved {
+        pub operation_id: OperationId,
+        pub retired_now: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveBridgeOperationCancellationAuthorized {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub agent_identity: AgentIdentity,
+        pub reason: LiveBridgeCancellationReason,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveBridgeExecutionTerminalRecorded {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub terminal: MeerkatExecutionTerminal,
+        pub result_digest: Option<String>,
+        pub replay: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveBridgeSubmissionAuthorized {
+        pub channel_id: String,
+        pub interaction_id: String,
+        pub operation_id: OperationId,
+        pub provider_call_ref: String,
+        pub output_kind: LiveBridgeOutputKind,
+        pub output_digest: String,
+        pub state: LiveBridgeSubmissionState,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveBridgeSubmissionAttemptClaimed {
+        pub channel_id: String,
+        pub operation_id: OperationId,
+        pub provider_call_ref: String,
+        pub output_digest: String,
+        pub state: LiveBridgeSubmissionState,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveBridgeSubmissionLocalWriteRecorded {
+        pub channel_id: String,
+        pub operation_id: OperationId,
+        pub provider_call_ref: String,
+        pub output_digest: String,
+        pub state: LiveBridgeSubmissionState,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveBridgeSubmissionResolved {
+        pub channel_id: String,
+        pub operation_id: OperationId,
+        pub provider_call_ref: String,
+        pub output_digest: String,
+        pub state: LiveBridgeSubmissionState,
+        pub retry_allowed: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveBridgeSubmissionRecoveredAmbiguous {
+        pub channel_id: String,
+        pub operation_id: OperationId,
+        pub provider_call_ref: String,
+        pub output_digest: String,
+        pub state: LiveBridgeSubmissionState,
+        pub retry_allowed: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveContextAppendAuthorized {
+        pub channel_id: String,
+        pub append_id: String,
+        pub previous_cursor: u64,
+        pub next_cursor: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveContextRowQueued {
+        pub session_id: String,
+        pub channel_id: String,
+        pub append_id: String,
+        pub canonical_cursor: u64,
+        pub disposition: LiveContextRowDisposition,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveContextCanonicalCoverageAdvanced {
+        pub channel_id: String,
+        pub append_id: String,
+        pub previous_cursor: u64,
+        pub next_cursor: u64,
+        pub disposition: LiveContextRowDisposition,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveContextAppendResolved {
+        pub channel_id: String,
+        pub append_id: String,
+        pub cursor: u64,
+        pub observation: LiveContextAppendObservation,
+        pub retry_allowed: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveContextAmbiguityRecoveryAuthorized {
+        pub session_id: String,
+        pub closing_channel_id: String,
+        pub replacement_channel_id: String,
+        pub append_id: String,
+        pub canonical_seed_cursor: u64,
+        pub llm_identity: SessionLlmIdentity,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LiveContextRecoveryChannelBound {
+        pub session_id: String,
+        pub closing_channel_id: String,
+        pub replacement_channel_id: String,
+        pub append_id: String,
+        pub canonical_seed_cursor: u64,
+        pub status: LiveWebrtcAnswerPublicStatus,
+        pub answered: bool,
+        pub sequence: u64,
+        pub answer_observation_sequence: u64,
+        pub runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct SessionEventStreamOpenResolved {
@@ -15490,10 +18063,70 @@ pub enum Effect {
     LiveWebrtcTokenIssued(effects::LiveWebrtcTokenIssued),
     LiveWebrtcAnswerAdmissionResolved(effects::LiveWebrtcAnswerAdmissionResolved),
     LiveWebrtcAnswerResultResolved(effects::LiveWebrtcAnswerResultResolved),
+    LiveWebrtcAnswerAcceptedAndExecutionBound(effects::LiveWebrtcAnswerAcceptedAndExecutionBound),
     LiveWebsocketTokenIssued(effects::LiveWebsocketTokenIssued),
     LiveWebsocketTokenAdmissionResolved(effects::LiveWebsocketTokenAdmissionResolved),
     LiveOpenAdmissionResolved(effects::LiveOpenAdmissionResolved),
     LiveOpenAdmissionAbandoned(effects::LiveOpenAdmissionAbandoned),
+    LiveExecutionChannelBound(effects::LiveExecutionChannelBound),
+    ExperimentalLiveExecutionStaged(effects::ExperimentalLiveExecutionStaged),
+    LiveExecutionModeAdmissionResolved(effects::LiveExecutionModeAdmissionResolved),
+    LivePlaybackOwnerReady(effects::LivePlaybackOwnerReady),
+    LiveActiveChannelControlAuthorityIssued(effects::LiveActiveChannelControlAuthorityIssued),
+    LiveActiveChannelControlDispatchAuthorized(effects::LiveActiveChannelControlDispatchAuthorized),
+    LivePlaybackOwnerRevoked(effects::LivePlaybackOwnerRevoked),
+    LiveChannelCloseCustodyRevoked(effects::LiveChannelCloseCustodyRevoked),
+    LiveInteractionAdmitted(effects::LiveInteractionAdmitted),
+    LiveDelegationAdmitted(effects::LiveDelegationAdmitted),
+    LiveInteractionDelegationAdmitted(effects::LiveInteractionDelegationAdmitted),
+    LiveDelegationTranscriptReconciled(effects::LiveDelegationTranscriptReconciled),
+    LiveDelegationWorkerStartAuthorized(effects::LiveDelegationWorkerStartAuthorized),
+    LiveDelegationWorkerStartResolved(effects::LiveDelegationWorkerStartResolved),
+    LiveDelegationCancellationAuthorized(effects::LiveDelegationCancellationAuthorized),
+    LiveDelegationCancellationResolved(effects::LiveDelegationCancellationResolved),
+    LiveDelegationWorkerTerminalRecorded(effects::LiveDelegationWorkerTerminalRecorded),
+    LiveDelegationWorkerRestartReconciled(effects::LiveDelegationWorkerRestartReconciled),
+    LiveDelegationWorkerRetirementAuthorized(effects::LiveDelegationWorkerRetirementAuthorized),
+    LiveDelegationWorkerRetirementResolved(effects::LiveDelegationWorkerRetirementResolved),
+    LiveInteractionAbandoned(effects::LiveInteractionAbandoned),
+    LiveInteractionSupersededWithoutCancellation(
+        effects::LiveInteractionSupersededWithoutCancellation,
+    ),
+    LiveInteractionCompleted(effects::LiveInteractionCompleted),
+    LiveProviderTurnStarted(effects::LiveProviderTurnStarted),
+    LiveAssistantTurnStarted(effects::LiveAssistantTurnStarted),
+    LiveProviderTurnFinished(effects::LiveProviderTurnFinished),
+    LiveConsequentialEffectAuthorized(effects::LiveConsequentialEffectAuthorized),
+    LiveDelegationResultReleaseAuthorized(effects::LiveDelegationResultReleaseAuthorized),
+    LiveDelegationResultDeliveryAuthorized(effects::LiveDelegationResultDeliveryAuthorized),
+    LiveDelegationResultDeliveryResolved(effects::LiveDelegationResultDeliveryResolved),
+    LiveDelegationResultAmbiguityRecoveryAuthorized(
+        effects::LiveDelegationResultAmbiguityRecoveryAuthorized,
+    ),
+    LiveDelegationResultRecoveryChannelBound(effects::LiveDelegationResultRecoveryChannelBound),
+    LiveBridgeOperationAdmitted(effects::LiveBridgeOperationAdmitted),
+    LiveBridgeOperationReplayObserved(effects::LiveBridgeOperationReplayObserved),
+    LiveBridgeProtocolDriftCloseAuthorized(effects::LiveBridgeProtocolDriftCloseAuthorized),
+    LiveBridgeFinalInputAuthorized(effects::LiveBridgeFinalInputAuthorized),
+    LiveBridgeExecutionStartAuthorized(effects::LiveBridgeExecutionStartAuthorized),
+    LiveBridgeEffectAuthorityIssued(effects::LiveBridgeEffectAuthorityIssued),
+    LiveBridgeEffectDispatchAuthorized(effects::LiveBridgeEffectDispatchAuthorized),
+    LiveBridgeEffectOutcomeRecorded(effects::LiveBridgeEffectOutcomeRecorded),
+    LiveBridgeOutcomeReceiptRecorded(effects::LiveBridgeOutcomeReceiptRecorded),
+    LiveBridgeOperationRetirementResolved(effects::LiveBridgeOperationRetirementResolved),
+    LiveBridgeOperationCancellationAuthorized(effects::LiveBridgeOperationCancellationAuthorized),
+    LiveBridgeExecutionTerminalRecorded(effects::LiveBridgeExecutionTerminalRecorded),
+    LiveBridgeSubmissionAuthorized(effects::LiveBridgeSubmissionAuthorized),
+    LiveBridgeSubmissionAttemptClaimed(effects::LiveBridgeSubmissionAttemptClaimed),
+    LiveBridgeSubmissionLocalWriteRecorded(effects::LiveBridgeSubmissionLocalWriteRecorded),
+    LiveBridgeSubmissionResolved(effects::LiveBridgeSubmissionResolved),
+    LiveBridgeSubmissionRecoveredAmbiguous(effects::LiveBridgeSubmissionRecoveredAmbiguous),
+    LiveContextAppendAuthorized(effects::LiveContextAppendAuthorized),
+    LiveContextRowQueued(effects::LiveContextRowQueued),
+    LiveContextCanonicalCoverageAdvanced(effects::LiveContextCanonicalCoverageAdvanced),
+    LiveContextAppendResolved(effects::LiveContextAppendResolved),
+    LiveContextAmbiguityRecoveryAuthorized(effects::LiveContextAmbiguityRecoveryAuthorized),
+    LiveContextRecoveryChannelBound(effects::LiveContextRecoveryChannelBound),
     SessionEventStreamOpenResolved(effects::SessionEventStreamOpenResolved),
     SessionEventStreamTerminalResolved(effects::SessionEventStreamTerminalResolved),
     SessionEventStreamCloseResolved(effects::SessionEventStreamCloseResolved),
@@ -15667,10 +18300,66 @@ pub enum EffectKind {
     LiveWebrtcTokenIssued,
     LiveWebrtcAnswerAdmissionResolved,
     LiveWebrtcAnswerResultResolved,
+    LiveWebrtcAnswerAcceptedAndExecutionBound,
     LiveWebsocketTokenIssued,
     LiveWebsocketTokenAdmissionResolved,
     LiveOpenAdmissionResolved,
     LiveOpenAdmissionAbandoned,
+    LiveExecutionChannelBound,
+    ExperimentalLiveExecutionStaged,
+    LiveExecutionModeAdmissionResolved,
+    LivePlaybackOwnerReady,
+    LiveActiveChannelControlAuthorityIssued,
+    LiveActiveChannelControlDispatchAuthorized,
+    LivePlaybackOwnerRevoked,
+    LiveChannelCloseCustodyRevoked,
+    LiveInteractionAdmitted,
+    LiveDelegationAdmitted,
+    LiveInteractionDelegationAdmitted,
+    LiveDelegationTranscriptReconciled,
+    LiveDelegationWorkerStartAuthorized,
+    LiveDelegationWorkerStartResolved,
+    LiveDelegationCancellationAuthorized,
+    LiveDelegationCancellationResolved,
+    LiveDelegationWorkerTerminalRecorded,
+    LiveDelegationWorkerRestartReconciled,
+    LiveDelegationWorkerRetirementAuthorized,
+    LiveDelegationWorkerRetirementResolved,
+    LiveInteractionAbandoned,
+    LiveInteractionSupersededWithoutCancellation,
+    LiveInteractionCompleted,
+    LiveProviderTurnStarted,
+    LiveAssistantTurnStarted,
+    LiveProviderTurnFinished,
+    LiveConsequentialEffectAuthorized,
+    LiveDelegationResultReleaseAuthorized,
+    LiveDelegationResultDeliveryAuthorized,
+    LiveDelegationResultDeliveryResolved,
+    LiveDelegationResultAmbiguityRecoveryAuthorized,
+    LiveDelegationResultRecoveryChannelBound,
+    LiveBridgeOperationAdmitted,
+    LiveBridgeOperationReplayObserved,
+    LiveBridgeProtocolDriftCloseAuthorized,
+    LiveBridgeFinalInputAuthorized,
+    LiveBridgeExecutionStartAuthorized,
+    LiveBridgeEffectAuthorityIssued,
+    LiveBridgeEffectDispatchAuthorized,
+    LiveBridgeEffectOutcomeRecorded,
+    LiveBridgeOutcomeReceiptRecorded,
+    LiveBridgeOperationRetirementResolved,
+    LiveBridgeOperationCancellationAuthorized,
+    LiveBridgeExecutionTerminalRecorded,
+    LiveBridgeSubmissionAuthorized,
+    LiveBridgeSubmissionAttemptClaimed,
+    LiveBridgeSubmissionLocalWriteRecorded,
+    LiveBridgeSubmissionResolved,
+    LiveBridgeSubmissionRecoveredAmbiguous,
+    LiveContextAppendAuthorized,
+    LiveContextRowQueued,
+    LiveContextCanonicalCoverageAdvanced,
+    LiveContextAppendResolved,
+    LiveContextAmbiguityRecoveryAuthorized,
+    LiveContextRecoveryChannelBound,
     SessionEventStreamOpenResolved,
     SessionEventStreamTerminalResolved,
     SessionEventStreamCloseResolved,
@@ -17364,6 +20053,9 @@ pub enum TransitionId {
     ResolveLiveOpenAdmissionChannelAlreadyBoundIdle,
     ResolveLiveOpenAdmissionChannelAlreadyBoundAttached,
     ResolveLiveOpenAdmissionChannelAlreadyBoundRunning,
+    ResolveLiveOpenAdmissionRevokedChannelIdIdle,
+    ResolveLiveOpenAdmissionRevokedChannelIdAttached,
+    ResolveLiveOpenAdmissionRevokedChannelIdRunning,
     ResolveLiveOpenAdmissionDrainingIdle,
     ResolveLiveOpenAdmissionDrainingAttached,
     ResolveLiveOpenAdmissionDrainingRunning,
@@ -17376,6 +20068,273 @@ pub enum TransitionId {
     AbandonLiveOpenAdmissionRunning,
     AbandonLiveOpenAdmissionRetired,
     AbandonLiveOpenAdmissionStopped,
+    ResolveLiveExecutionModeAdmissionIdle,
+    ResolveLiveExecutionModeAdmissionAttached,
+    ResolveLiveExecutionModeAdmissionRunning,
+    StageExperimentalLiveExecutionIdle,
+    StageExperimentalLiveExecutionAttached,
+    StageExperimentalLiveExecutionRunning,
+    RegisterLivePlaybackOwnerIdle,
+    RegisterLivePlaybackOwnerAttached,
+    RegisterLivePlaybackOwnerRunning,
+    AuthorizeLiveActiveChannelControlIdle,
+    AuthorizeLiveActiveChannelControlAttached,
+    AuthorizeLiveActiveChannelControlRunning,
+    ConsumeLiveActiveChannelControlIdle,
+    ConsumeLiveActiveChannelControlAttached,
+    ConsumeLiveActiveChannelControlRunning,
+    RevokeLivePlaybackOwnerIdle,
+    RevokeLivePlaybackOwnerAttached,
+    RevokeLivePlaybackOwnerRunning,
+    RevokeLiveChannelCloseCustodyIdle,
+    RevokeLiveChannelCloseCustodyAttached,
+    RevokeLiveChannelCloseCustodyRunning,
+    RevokeLiveChannelCloseCustodyClosedReplayIdle,
+    RevokeLiveChannelCloseCustodyClosedReplayAttached,
+    RevokeLiveChannelCloseCustodyClosedReplayRunning,
+    RevokeLiveChannelCloseCustodyClosedReplayRetired,
+    RevokeLiveChannelCloseCustodyClosedReplayStopped,
+    BindLiveExecutionChannelIdle,
+    BindLiveExecutionChannelAttached,
+    BindLiveExecutionChannelRunning,
+    ObserveLiveProviderTurnStartedIdle,
+    ObserveLiveProviderTurnStartedAttached,
+    ObserveLiveProviderTurnStartedRunning,
+    ObserveLiveAssistantTurnStartedIdle,
+    ObserveLiveAssistantTurnStartedAttached,
+    ObserveLiveAssistantTurnStartedRunning,
+    AdmitLiveInteractionIdle,
+    AdmitLiveInteractionAttached,
+    AdmitLiveInteractionRunning,
+    AdmitLiveDelegationIdle,
+    AdmitLiveDelegationAttached,
+    AdmitLiveDelegationRunning,
+    AdmitLiveInteractionDelegationIdle,
+    AdmitLiveInteractionDelegationAttached,
+    AdmitLiveInteractionDelegationRunning,
+    AuthorizeLiveDelegationWorkerStartIdle,
+    AuthorizeLiveDelegationWorkerStartAttached,
+    AuthorizeLiveDelegationWorkerStartRunning,
+    ResolveLiveDelegationWorkerStartIdle,
+    ResolveLiveDelegationWorkerStartAttached,
+    ResolveLiveDelegationWorkerStartRunning,
+    ReconcileLiveDelegationTranscriptConfirmedIdle,
+    ReconcileLiveDelegationTranscriptConfirmedAttached,
+    ReconcileLiveDelegationTranscriptConfirmedRunning,
+    ReconcileLiveDelegationTranscriptMaterialConflictIdle,
+    ReconcileLiveDelegationTranscriptMaterialConflictAttached,
+    ReconcileLiveDelegationTranscriptMaterialConflictRunning,
+    ReconcileLiveDelegationTranscriptMissingIdle,
+    ReconcileLiveDelegationTranscriptMissingAttached,
+    ReconcileLiveDelegationTranscriptMissingRunning,
+    AuthorizeLiveDelegationTranscriptTerminalCancellationIdle,
+    AuthorizeLiveDelegationTranscriptTerminalCancellationAttached,
+    AuthorizeLiveDelegationTranscriptTerminalCancellationRunning,
+    AbandonLiveInteractionWithDelegationCancellationIdle,
+    AbandonLiveInteractionWithDelegationCancellationAttached,
+    AbandonLiveInteractionWithDelegationCancellationRunning,
+    AbandonLiveInteractionWithDelegationCancellationRetired,
+    AbandonLiveInteractionWithDelegationCancellationStopped,
+    SupersedeLiveInteractionWithDelegationCancellationIdle,
+    SupersedeLiveInteractionWithDelegationCancellationAttached,
+    SupersedeLiveInteractionWithDelegationCancellationRunning,
+    SupersedeCompletedLiveInteractionDelegationWithCancellationIdle,
+    SupersedeCompletedLiveInteractionDelegationWithCancellationAttached,
+    SupersedeCompletedLiveInteractionDelegationWithCancellationRunning,
+    SupersedeLiveInteractionWithoutDelegationCancellationIdle,
+    SupersedeLiveInteractionWithoutDelegationCancellationAttached,
+    SupersedeLiveInteractionWithoutDelegationCancellationRunning,
+    SupersedeLiveInteractionWithoutDelegationCancellationRetired,
+    SupersedeLiveInteractionWithoutDelegationCancellationStopped,
+    AbandonLiveInteractionIdle,
+    AbandonLiveInteractionAttached,
+    AbandonLiveInteractionRunning,
+    AbandonLiveInteractionRetired,
+    AbandonLiveInteractionStopped,
+    AbandonLiveInteractionPreservingEarlierDelegationIdle,
+    AbandonLiveInteractionPreservingEarlierDelegationAttached,
+    AbandonLiveInteractionPreservingEarlierDelegationRunning,
+    AbandonLiveInteractionPreservingEarlierDelegationRetired,
+    AbandonLiveInteractionPreservingEarlierDelegationStopped,
+    CompleteLiveInteractionIdle,
+    CompleteLiveInteractionAttached,
+    CompleteLiveInteractionRunning,
+    ResolveLiveDelegationCancellationIdle,
+    ResolveLiveDelegationCancellationAttached,
+    ResolveLiveDelegationCancellationRunning,
+    ResolveLiveDelegationCancellationRetired,
+    ResolveLiveDelegationCancellationStopped,
+    RecordLiveDelegationWorkerTerminalIdle,
+    RecordLiveDelegationWorkerTerminalAttached,
+    RecordLiveDelegationWorkerTerminalRunning,
+    RecordLiveDelegationWorkerTerminalRetired,
+    RecordLiveDelegationWorkerTerminalStopped,
+    ReconcileRevokedLiveDelegationWorkerAfterRestartFreshIdle,
+    ReconcileRevokedLiveDelegationWorkerAfterRestartFreshAttached,
+    ReconcileRevokedLiveDelegationWorkerAfterRestartFreshRunning,
+    ReconcileRevokedLiveDelegationWorkerAfterRestartFreshRetired,
+    ReconcileRevokedLiveDelegationWorkerAfterRestartFreshStopped,
+    ReconcileRevokedLiveDelegationWorkerAfterRestartTerminalCustodyIdle,
+    ReconcileRevokedLiveDelegationWorkerAfterRestartTerminalCustodyAttached,
+    ReconcileRevokedLiveDelegationWorkerAfterRestartTerminalCustodyRunning,
+    ReconcileRevokedLiveDelegationWorkerAfterRestartTerminalCustodyRetired,
+    ReconcileRevokedLiveDelegationWorkerAfterRestartTerminalCustodyStopped,
+    ReconcileRevokedLiveDelegationWorkerAfterRestartExactReplayIdle,
+    ReconcileRevokedLiveDelegationWorkerAfterRestartExactReplayAttached,
+    ReconcileRevokedLiveDelegationWorkerAfterRestartExactReplayRunning,
+    ReconcileRevokedLiveDelegationWorkerAfterRestartExactReplayRetired,
+    ReconcileRevokedLiveDelegationWorkerAfterRestartExactReplayStopped,
+    AuthorizeLiveDelegationWorkerRetirementIdle,
+    AuthorizeLiveDelegationWorkerRetirementAttached,
+    AuthorizeLiveDelegationWorkerRetirementRunning,
+    AuthorizeLiveDelegationWorkerRetirementRetired,
+    AuthorizeLiveDelegationWorkerRetirementStopped,
+    ResolveLiveDelegationWorkerRetirementIdle,
+    ResolveLiveDelegationWorkerRetirementAttached,
+    ResolveLiveDelegationWorkerRetirementRunning,
+    ResolveLiveDelegationWorkerRetirementRetired,
+    ResolveLiveDelegationWorkerRetirementStopped,
+    AuthorizeLiveConsequentialEffectIdle,
+    AuthorizeLiveConsequentialEffectAttached,
+    AuthorizeLiveConsequentialEffectRunning,
+    AuthorizeLiveDelegationResultReleaseIdle,
+    AuthorizeLiveDelegationResultReleaseAttached,
+    AuthorizeLiveDelegationResultReleaseRunning,
+    AuthorizeLiveDelegationResultDeliveryIdle,
+    AuthorizeLiveDelegationResultDeliveryAttached,
+    AuthorizeLiveDelegationResultDeliveryRunning,
+    ResolveLiveDelegationResultDeliveryIdle,
+    ResolveLiveDelegationResultDeliveryAttached,
+    ResolveLiveDelegationResultDeliveryRunning,
+    ResolveLiveDelegationResultDeliveryAmbiguousIdle,
+    ResolveLiveDelegationResultDeliveryAmbiguousAttached,
+    ResolveLiveDelegationResultDeliveryAmbiguousRunning,
+    BindLiveDelegationResultRecoveryChannelIdle,
+    BindLiveDelegationResultRecoveryChannelAttached,
+    BindLiveDelegationResultRecoveryChannelRunning,
+    AdmitLiveBridgeOperationFreshIdle,
+    AdmitLiveBridgeOperationFreshAttached,
+    AdmitLiveBridgeOperationFreshRunning,
+    AdmitLiveBridgeOperationExactReplayIdle,
+    AdmitLiveBridgeOperationExactReplayAttached,
+    AdmitLiveBridgeOperationExactReplayRunning,
+    AdmitLiveBridgeOperationProtocolDriftIdle,
+    AdmitLiveBridgeOperationProtocolDriftAttached,
+    AdmitLiveBridgeOperationProtocolDriftRunning,
+    ConfirmLiveBridgeFinalInputIdle,
+    ConfirmLiveBridgeFinalInputAttached,
+    ConfirmLiveBridgeFinalInputRunning,
+    AuthorizeLiveBridgeExecutionStartIdle,
+    AuthorizeLiveBridgeExecutionStartAttached,
+    AuthorizeLiveBridgeExecutionStartRunning,
+    AuthorizeLiveBridgeEffectIdle,
+    AuthorizeLiveBridgeEffectAttached,
+    AuthorizeLiveBridgeEffectRunning,
+    ConsumeLiveBridgeEffectAuthorityIdle,
+    ConsumeLiveBridgeEffectAuthorityAttached,
+    ConsumeLiveBridgeEffectAuthorityRunning,
+    RecordLiveBridgeEffectOutcomeFreshIdle,
+    RecordLiveBridgeEffectOutcomeFreshAttached,
+    RecordLiveBridgeEffectOutcomeFreshRunning,
+    RecordLiveBridgeEffectOutcomeFreshRetired,
+    RecordLiveBridgeEffectOutcomeFreshStopped,
+    RecordLiveBridgeEffectOutcomeExactReplayIdle,
+    RecordLiveBridgeEffectOutcomeExactReplayAttached,
+    RecordLiveBridgeEffectOutcomeExactReplayRunning,
+    RecordLiveBridgeEffectOutcomeExactReplayRetired,
+    RecordLiveBridgeEffectOutcomeExactReplayStopped,
+    RecordLiveBridgeOutcomeReceiptFreshIdle,
+    RecordLiveBridgeOutcomeReceiptFreshAttached,
+    RecordLiveBridgeOutcomeReceiptFreshRunning,
+    RecordLiveBridgeOutcomeReceiptFreshRetired,
+    RecordLiveBridgeOutcomeReceiptFreshStopped,
+    RecordLiveBridgeOutcomeReceiptExactReplayIdle,
+    RecordLiveBridgeOutcomeReceiptExactReplayAttached,
+    RecordLiveBridgeOutcomeReceiptExactReplayRunning,
+    RecordLiveBridgeOutcomeReceiptExactReplayRetired,
+    RecordLiveBridgeOutcomeReceiptExactReplayStopped,
+    RetireSettledLiveBridgeOperationIdle,
+    RetireSettledLiveBridgeOperationAttached,
+    RetireSettledLiveBridgeOperationRunning,
+    RetireSettledLiveBridgeOperationRetired,
+    RetireSettledLiveBridgeOperationStopped,
+    RetireSettledLiveBridgeOperationAlreadyAbsentIdle,
+    RetireSettledLiveBridgeOperationAlreadyAbsentAttached,
+    RetireSettledLiveBridgeOperationAlreadyAbsentRunning,
+    RetireSettledLiveBridgeOperationAlreadyAbsentRetired,
+    RetireSettledLiveBridgeOperationAlreadyAbsentStopped,
+    CancelLiveBridgeOperationIdle,
+    CancelLiveBridgeOperationAttached,
+    CancelLiveBridgeOperationRunning,
+    RecordLiveBridgeExecutionTerminalFreshIdle,
+    RecordLiveBridgeExecutionTerminalFreshAttached,
+    RecordLiveBridgeExecutionTerminalFreshRunning,
+    RecordLiveBridgeExecutionTerminalExactReplayIdle,
+    RecordLiveBridgeExecutionTerminalExactReplayAttached,
+    RecordLiveBridgeExecutionTerminalExactReplayRunning,
+    FenceRestoredLiveBridgeOperationForRestartFreshIdle,
+    FenceRestoredLiveBridgeOperationForRestartFreshAttached,
+    FenceRestoredLiveBridgeOperationForRestartFreshRunning,
+    FenceRestoredLiveBridgeOperationForRestartFreshRetired,
+    FenceRestoredLiveBridgeOperationForRestartFreshStopped,
+    FenceRestoredLiveBridgeOperationForRestartExactReplayIdle,
+    FenceRestoredLiveBridgeOperationForRestartExactReplayAttached,
+    FenceRestoredLiveBridgeOperationForRestartExactReplayRunning,
+    FenceRestoredLiveBridgeOperationForRestartExactReplayRetired,
+    FenceRestoredLiveBridgeOperationForRestartExactReplayStopped,
+    ReconcileRevokedLiveBridgeExecutionTerminalFreshIdle,
+    ReconcileRevokedLiveBridgeExecutionTerminalFreshAttached,
+    ReconcileRevokedLiveBridgeExecutionTerminalFreshRunning,
+    ReconcileRevokedLiveBridgeExecutionTerminalFreshRetired,
+    ReconcileRevokedLiveBridgeExecutionTerminalFreshStopped,
+    ReconcileRevokedLiveBridgeExecutionTerminalExactReplayIdle,
+    ReconcileRevokedLiveBridgeExecutionTerminalExactReplayAttached,
+    ReconcileRevokedLiveBridgeExecutionTerminalExactReplayRunning,
+    ReconcileRevokedLiveBridgeExecutionTerminalExactReplayRetired,
+    ReconcileRevokedLiveBridgeExecutionTerminalExactReplayStopped,
+    AuthorizeLiveBridgeSubmissionIdle,
+    AuthorizeLiveBridgeSubmissionAttached,
+    AuthorizeLiveBridgeSubmissionRunning,
+    ClaimLiveBridgeSubmissionAttemptIdle,
+    ClaimLiveBridgeSubmissionAttemptAttached,
+    ClaimLiveBridgeSubmissionAttemptRunning,
+    RecordLiveBridgeSubmissionLocalWriteIdle,
+    RecordLiveBridgeSubmissionLocalWriteAttached,
+    RecordLiveBridgeSubmissionLocalWriteRunning,
+    ResolveLiveBridgeSubmissionIdle,
+    ResolveLiveBridgeSubmissionAttached,
+    ResolveLiveBridgeSubmissionRunning,
+    RecoverLiveBridgeSubmissionIdle,
+    RecoverLiveBridgeSubmissionAttached,
+    RecoverLiveBridgeSubmissionRunning,
+    RecoverLiveBridgeSubmissionRetired,
+    RecoverLiveBridgeSubmissionStopped,
+    RecoverLiveBridgeSubmissionExactReplayIdle,
+    RecoverLiveBridgeSubmissionExactReplayAttached,
+    RecoverLiveBridgeSubmissionExactReplayRunning,
+    RecoverLiveBridgeSubmissionExactReplayRetired,
+    RecoverLiveBridgeSubmissionExactReplayStopped,
+    EnqueueLiveContextRowIdle,
+    EnqueueLiveContextRowAttached,
+    EnqueueLiveContextRowRunning,
+    AdvanceLiveContextCanonicalCoverageIdle,
+    AdvanceLiveContextCanonicalCoverageAttached,
+    AdvanceLiveContextCanonicalCoverageRunning,
+    AuthorizeLiveContextAppendIdle,
+    AuthorizeLiveContextAppendAttached,
+    AuthorizeLiveContextAppendRunning,
+    ResolveLiveContextAppendDeliveredIdle,
+    ResolveLiveContextAppendDeliveredAttached,
+    ResolveLiveContextAppendDeliveredRunning,
+    ResolveLiveContextAppendAmbiguousIdle,
+    ResolveLiveContextAppendAmbiguousAttached,
+    ResolveLiveContextAppendAmbiguousRunning,
+    BindLiveContextRecoveryChannelIdle,
+    BindLiveContextRecoveryChannelAttached,
+    BindLiveContextRecoveryChannelRunning,
+    ResolveLiveContextAppendRejectedIdle,
+    ResolveLiveContextAppendRejectedAttached,
+    ResolveLiveContextAppendRejectedRunning,
     RecordLiveRefreshQueuedIdle,
     RecordLiveRefreshQueuedAttached,
     RecordLiveRefreshQueuedRunning,
@@ -17441,6 +20400,9 @@ pub enum TransitionId {
     RecordLiveWebrtcAnswerAcceptedRunning,
     RecordLiveWebrtcAnswerAcceptedRetired,
     RecordLiveWebrtcAnswerAcceptedStopped,
+    RecordLiveWebrtcAnswerAcceptedAndBindExecutionIdle,
+    RecordLiveWebrtcAnswerAcceptedAndBindExecutionAttached,
+    RecordLiveWebrtcAnswerAcceptedAndBindExecutionRunning,
     RecordLiveWebsocketTokenIssuedIdle,
     RecordLiveWebsocketTokenIssuedAttached,
     RecordLiveWebsocketTokenIssuedRunning,
@@ -18401,6 +21363,113 @@ pub fn initial_state() -> State {
         live_active_channel_by_session: Default::default(),
         live_channel_session_by_channel: Default::default(),
         live_channel_identity_by_channel: Default::default(),
+        live_execution_runtime_id_by_channel: Default::default(),
+        live_execution_fence_by_channel: Default::default(),
+        live_execution_generation_by_channel: Default::default(),
+        live_execution_phase_by_channel: Default::default(),
+        live_revoked_execution_channels: Default::default(),
+        live_execution_profile_by_channel: Default::default(),
+        live_execution_mode_by_channel: Default::default(),
+        live_function_bridge_capable_channels: Default::default(),
+        live_client_context_capable_channels: Default::default(),
+        live_playback_owner_by_channel: Default::default(),
+        live_playback_readiness_by_channel: Default::default(),
+        live_activation_receipt_by_channel: Default::default(),
+        live_active_control_operation_by_authority: Default::default(),
+        live_consumed_active_control_authorities: Default::default(),
+        live_experimental_staged_runtime_by_channel: Default::default(),
+        live_experimental_staged_fence_by_channel: Default::default(),
+        live_experimental_staged_generation_by_channel: Default::default(),
+        live_experimental_staged_seed_cursor_by_channel: Default::default(),
+        live_experimental_pending_receipt_by_channel: Default::default(),
+        live_experimental_execution_channels: Default::default(),
+        live_interaction_channel_by_id: Default::default(),
+        live_active_interaction_by_channel: Default::default(),
+        live_provider_turn_by_channel: Default::default(),
+        live_provider_interaction_by_turn: Default::default(),
+        live_provider_turn_channel_by_ref: Default::default(),
+        live_awaiting_assistant_interaction_by_channel: Default::default(),
+        live_assistant_interaction_by_turn: Default::default(),
+        live_assistant_turn_channel_by_ref: Default::default(),
+        live_abandoned_interactions: Default::default(),
+        live_delegation_interaction_by_channel: Default::default(),
+        live_delegation_operation_by_channel: Default::default(),
+        live_delegation_provider_turn_by_channel: Default::default(),
+        live_delegation_interaction_by_operation: Default::default(),
+        live_delegation_provider_turn_by_operation: Default::default(),
+        live_delegation_reconciliation_by_operation: Default::default(),
+        live_delegation_worker_identity_by_operation: Default::default(),
+        live_delegation_worker_phase_by_operation: Default::default(),
+        live_delegation_cancellation_reason_by_operation: Default::default(),
+        live_delegation_worker_terminal_by_operation: Default::default(),
+        live_delegation_result_eligible_operations: Default::default(),
+        live_delegation_late_terminal_operations: Default::default(),
+        live_consequential_effect_operation_by_authority: Default::default(),
+        live_result_released_operations: Default::default(),
+        live_result_release_disposition_by_operation: Default::default(),
+        live_result_delivery_channel_by_operation: Default::default(),
+        live_result_delivery_operation_by_channel: Default::default(),
+        live_result_delivery_digest_by_operation: Default::default(),
+        live_result_delivery_observation_by_operation: Default::default(),
+        live_result_speech_suppressed_operations: Default::default(),
+        live_result_recovery_replacement_by_channel: Default::default(),
+        live_result_recovery_source_by_replacement: Default::default(),
+        live_result_recovery_session_by_channel: Default::default(),
+        live_result_recovery_operation_by_channel: Default::default(),
+        live_result_recovery_digest_by_channel: Default::default(),
+        live_result_recovery_seed_cursor_by_channel: Default::default(),
+        live_result_recovery_identity_by_channel: Default::default(),
+        live_result_recovery_runtime_id_by_channel: Default::default(),
+        live_result_recovery_fence_by_channel: Default::default(),
+        live_result_recovery_generation_by_channel: Default::default(),
+        live_bridge_operation_by_channel: Default::default(),
+        live_bridge_channel_by_operation: Default::default(),
+        live_bridge_interaction_by_operation: Default::default(),
+        live_bridge_provider_turn_by_operation: Default::default(),
+        live_bridge_provider_delegation_by_operation: Default::default(),
+        live_bridge_provider_call_by_operation: Default::default(),
+        live_bridge_agent_identity_by_operation: Default::default(),
+        live_bridge_context_revision_by_operation: Default::default(),
+        live_bridge_request_digest_by_operation: Default::default(),
+        live_bridge_phase_by_operation: Default::default(),
+        live_bridge_effect_operation_by_authority: Default::default(),
+        live_bridge_effect_kind_by_authority: Default::default(),
+        live_bridge_consumed_effect_authorities: Default::default(),
+        live_bridge_in_flight_effect_authorities: Default::default(),
+        live_bridge_effect_outcome_by_authority: Default::default(),
+        live_bridge_model_computation_authorized_operations: Default::default(),
+        live_bridge_read_snapshot_authorized_operations: Default::default(),
+        live_bridge_execution_started_operations: Default::default(),
+        live_bridge_outcome_receipt_required_operations: Default::default(),
+        live_bridge_outcome_receipt_operations: Default::default(),
+        live_bridge_execution_terminal_by_operation: Default::default(),
+        live_bridge_execution_result_digest_by_operation: Default::default(),
+        live_bridge_cancellation_reason_by_operation: Default::default(),
+        live_bridge_submission_output_kind_by_operation: Default::default(),
+        live_bridge_submission_digest_by_operation: Default::default(),
+        live_bridge_submission_state_by_operation: Default::default(),
+        live_context_cursor_by_channel: Default::default(),
+        live_context_queued_session_by_append: Default::default(),
+        live_context_queued_cursor_by_append: Default::default(),
+        live_context_queued_digest_by_append: Default::default(),
+        live_context_queued_commit_token_by_append: Default::default(),
+        live_context_queued_disposition_by_append: Default::default(),
+        live_context_queued_append_by_cursor: Default::default(),
+        live_context_pending_append_by_channel: Default::default(),
+        live_context_pending_channel_by_append: Default::default(),
+        live_context_pending_previous_cursor_by_append: Default::default(),
+        live_context_pending_next_cursor_by_append: Default::default(),
+        live_context_delivered_append_ids: Default::default(),
+        live_context_ambiguous_no_retry: Default::default(),
+        live_context_recovery_replacement_by_channel: Default::default(),
+        live_context_recovery_source_by_replacement: Default::default(),
+        live_context_recovery_session_by_channel: Default::default(),
+        live_context_recovery_append_by_channel: Default::default(),
+        live_context_recovery_seed_cursor_by_channel: Default::default(),
+        live_context_recovery_identity_by_channel: Default::default(),
+        live_context_recovery_runtime_id_by_channel: Default::default(),
+        live_context_recovery_fence_by_channel: Default::default(),
+        live_context_recovery_generation_by_channel: Default::default(),
         live_refresh_result_sequence: 0,
         live_refresh_queue_acceptance_sequence_by_channel: Default::default(),
         live_refresh_status_by_channel: Default::default(),

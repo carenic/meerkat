@@ -119,6 +119,7 @@ impl SessionGeneration {
 mod digest_accumulator;
 mod head_metadata;
 mod import_0810;
+mod instruction_activation;
 mod system_prompt_update;
 mod transcript_history;
 
@@ -133,6 +134,16 @@ pub use import_0810::{
     ImportedReleased0810Session, Released0810ImportError, Released0810ImportEvidence,
     Released0810ImportReceipt, import_released_0810_session,
     released_0810_transcript_serialized_rows_digest,
+};
+pub use instruction_activation::{
+    INSTRUCTION_ACTIVATION_RENDER_VERSION_V1, InstructionActivationAdmissionErrorCode,
+    InstructionActivationDisposition, InstructionActivationError, InstructionActivationErrorCode,
+    InstructionActivationExpectation, InstructionActivationKeyState, InstructionActivationMutation,
+    InstructionActivationProjectionWitness, InstructionActivationReadPage,
+    InstructionActivationReadQuery, InstructionActivationReceipt, InstructionActivationRecord,
+    InstructionActivationRequest, MAX_INSTRUCTION_ACTIVATION_LINEAGE_BYTES,
+    MAX_INSTRUCTION_BODY_BYTES, inherited_instruction_keys_requiring_activation,
+    materialize_instruction_activation_messages, validate_instruction_activation_messages,
 };
 pub use system_prompt_update::{
     SystemPromptUpdateError, SystemPromptUpdateRequest, SystemPromptUpdateResult,
@@ -1095,6 +1106,8 @@ impl<'de> Deserialize<'de> for Session {
         let serde_repr = SessionSerde::deserialize(deserializer)?;
         crate::types::validate_system_prompt_version_order(&serde_repr.messages)
             .map_err(<D::Error as serde::de::Error>::custom)?;
+        validate_instruction_activation_messages(&serde_repr.messages)
+            .map_err(<D::Error as serde::de::Error>::custom)?;
         let version = session_persistence_version_authority::restore_session_envelope_version(
             serde_repr.version,
         )
@@ -1510,6 +1523,7 @@ impl Session {
             );
         }
         crate::types::validate_system_prompt_version_order(&messages)?;
+        validate_instruction_activation_messages(&messages)?;
         let transcript = TranscriptMessages::from_vec(messages);
         if let Some(prefix) = exact_row_prefix
             && !transcript.install_exact_row_prefix(prefix)
@@ -3318,13 +3332,20 @@ impl std::fmt::Display for SystemMessageAppendError {
 impl std::error::Error for SystemMessageAppendError {}
 
 #[track_caller]
-fn assert_host_append_does_not_mint_system_prompt(message: &Message) {
+fn assert_host_append_does_not_mint_system_semantics(message: &Message) {
     assert!(
         !matches!(
             message,
             Message::System(system) if system.prompt_version.is_some()
         ),
         "ordinary Session append cannot mint a system prompt version; use update_system_prompt",
+    );
+    assert!(
+        !matches!(
+            message,
+            Message::System(system) if system.instruction_activation.is_some()
+        ),
+        "ordinary Session append cannot mint an instruction activation; use activate_instruction",
     );
 }
 
@@ -3793,7 +3814,7 @@ impl Session {
     /// are minted only through [`Session::update_system_prompt`]; ordinary
     /// append APIs cannot import or manufacture them.
     pub fn push(&mut self, message: Message) {
-        assert_host_append_does_not_mint_system_prompt(&message);
+        assert_host_append_does_not_mint_system_semantics(&message);
         // SEAM 2 (append): the accumulator folds only the appended bytes.
         // Retained rewrite history is intentionally untouched: its head is the
         // latest AUDITED endpoint, while this live append is owned by
@@ -3815,7 +3836,7 @@ impl Session {
             return;
         }
         for message in &messages {
-            assert_host_append_does_not_mint_system_prompt(message);
+            assert_host_append_does_not_mint_system_semantics(message);
         }
         // SEAM 3 (append): the accumulator folds only the appended batch.
         // See `push`: ordinary appends never materialize or rewrite the
@@ -4367,6 +4388,166 @@ impl Session {
         )
     }
 
+    /// Observe one exact staged spoken segment for generated playback-prefix
+    /// authorization. The returned text is not canonical transcript and must
+    /// not be surfaced as such.
+    #[must_use]
+    pub fn staged_realtime_assistant_segment_text(
+        &self,
+        response_id: &str,
+        item_id: &str,
+        content_index: u32,
+    ) -> Option<String> {
+        realtime_transcript_revision::realtime_assistant_segment_text(
+            self.realtime_transcript.state(),
+            response_id,
+            item_id,
+            content_index,
+        )
+    }
+
+    #[must_use]
+    pub fn staged_realtime_assistant_segment_is_final(
+        &self,
+        response_id: &str,
+        item_id: &str,
+        content_index: u32,
+    ) -> bool {
+        realtime_transcript_revision::realtime_assistant_segment_is_final(
+            self.realtime_transcript.state(),
+            response_id,
+            item_id,
+            content_index,
+        )
+    }
+
+    /// Admit or replay the exact foreground assistant playback target. The
+    /// interaction must already have been sealed by foreground turn
+    /// causality; neither this session nor terminal callers mint one.
+    pub fn admit_live_assistant_playback_target(
+        &mut self,
+        channel_id: &crate::LiveChannelId,
+        interaction_id: crate::InteractionId,
+        response_id: &str,
+        item_id: &str,
+        content_index: u32,
+    ) -> Result<crate::LiveAssistantPlaybackTarget, crate::error::AgentError> {
+        if let Some(existing) = realtime_transcript_revision::live_assistant_playback_target(
+            self.realtime_transcript.state(),
+            channel_id.as_str(),
+            item_id,
+            content_index,
+        ) {
+            if existing.response_id() == response_id {
+                return Ok(existing);
+            }
+            return Err(crate::error::AgentError::ConfigError(
+                "live assistant playback target response identity mismatch".to_string(),
+            ));
+        }
+        let _ = self.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantPlaybackTargetAdmitted {
+                channel_id: channel_id.to_string(),
+                interaction_id,
+                response_id: response_id.to_string(),
+                item_id: item_id.to_string(),
+                content_index,
+            },
+        );
+        realtime_transcript_revision::live_assistant_playback_target(
+            self.realtime_transcript.state(),
+            channel_id.as_str(),
+            item_id,
+            content_index,
+        )
+        .ok_or_else(|| {
+            crate::error::AgentError::InternalError(
+                "live assistant playback target admission did not persist exact identity"
+                    .to_string(),
+            )
+        })
+    }
+
+    /// Consume the exact one-use assistant playback target after generated
+    /// SessionDocument terminal authority has resolved it.
+    pub fn resolve_live_assistant_playback_target(
+        &mut self,
+        channel_id: &crate::LiveChannelId,
+        interaction_id: crate::InteractionId,
+        response_id: &str,
+        item_id: &str,
+        content_index: u32,
+    ) -> Result<(), crate::error::AgentError> {
+        let _ = self.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantPlaybackTargetResolved {
+                channel_id: channel_id.to_string(),
+                interaction_id,
+                response_id: response_id.to_string(),
+                item_id: item_id.to_string(),
+                content_index,
+            },
+        );
+        Ok(())
+    }
+
+    /// Persist one generated-authorized playback terminal fact while the
+    /// independent provider final is still pending.
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_live_assistant_playback_terminal(
+        &mut self,
+        channel_id: &crate::LiveChannelId,
+        interaction_id: crate::InteractionId,
+        response_id: &str,
+        item_id: &str,
+        content_index: u32,
+        evidence: crate::LiveAssistantPlaybackEvidence,
+        stop_reason: crate::StopReason,
+        usage: crate::TurnUsage,
+    ) -> Result<(), crate::error::AgentError> {
+        let _ = self.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantPlaybackTerminalObserved {
+                channel_id: channel_id.to_string(),
+                interaction_id,
+                response_id: response_id.to_string(),
+                item_id: item_id.to_string(),
+                content_index,
+                evidence,
+                stop_reason,
+                usage,
+            },
+        );
+        Ok(())
+    }
+
+    /// Resolve the exact durable assistant playback target for a surface
+    /// terminal report. No identity is minted by this read.
+    #[must_use]
+    pub fn live_assistant_playback_target(
+        &self,
+        channel_id: &crate::LiveChannelId,
+        item_id: &str,
+        content_index: u32,
+    ) -> Option<crate::LiveAssistantPlaybackTarget> {
+        realtime_transcript_revision::live_assistant_playback_target(
+            self.realtime_transcript.state(),
+            channel_id.as_str(),
+            item_id,
+            content_index,
+        )
+    }
+
+    /// Return the one active assistant playback target for an exact channel.
+    #[must_use]
+    pub fn live_assistant_playback_target_for_channel(
+        &self,
+        channel_id: &crate::LiveChannelId,
+    ) -> Option<crate::LiveAssistantPlaybackTarget> {
+        realtime_transcript_revision::live_assistant_playback_target_for_channel(
+            self.realtime_transcript.state(),
+            channel_id.as_str(),
+        )
+    }
+
     /// Durable session-scoped bindings used to make live non-text input retry
     /// safe across provider reconnects and lost public receipts.
     #[must_use]
@@ -4536,6 +4717,7 @@ impl Session {
             created_at,
             identity,
             prompt_version: None,
+            instruction_activation: None,
         }));
         Ok(crate::service::AppendSystemContextStatus::Applied)
     }
@@ -4547,7 +4729,11 @@ impl Session {
     /// only the latest version is selected. No request-local System message is
     /// synthesized or repositioned at this boundary.
     pub fn messages_for_model_boundary(&self) -> Vec<Message> {
-        crate::types::materialize_latest_system_prompt_versions(self.messages())
+        let prompts = crate::types::materialize_latest_system_prompt_versions(self.messages());
+        match materialize_instruction_activation_messages(self.id(), &prompts) {
+            Ok(messages) => messages,
+            Err(_) => prompts,
+        }
     }
 
     /// Get the last assistant message text content.
@@ -5971,6 +6157,15 @@ impl Session {
         self.transcript_content_digest()
     }
 
+    /// Mint canonical live context authority from this exact Session clone.
+    /// The execution owner retains this same clone for executor custody.
+    pub fn canonical_context_revision(
+        &self,
+    ) -> Result<crate::CanonicalContextRevision, serde_json::Error> {
+        self.transcript_revision()
+            .map(crate::CanonicalContextRevision::from_transcript_revision)
+    }
+
     /// Monotonic durable generation for same-session transcript rewrites.
     /// Ordinary message appends advance the content revision but do not change
     /// this value, allowing live config refresh after normal turns while still
@@ -6126,6 +6321,31 @@ impl Session {
         validate_transcript_tool_result_shape(&rewritten)?;
         crate::types::validate_system_prompt_version_order(&rewritten)
             .map_err(TranscriptEditError::InvalidTranscriptShape)?;
+        validate_instruction_activation_messages(&rewritten)
+            .map_err(TranscriptEditError::InvalidTranscriptShape)?;
+        if expected_revision.is_none() {
+            let activation_rows = |messages: &[Message]| {
+                messages
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, message)| {
+                        let Message::System(system) = message else {
+                            return None;
+                        };
+                        system
+                            .instruction_activation
+                            .as_ref()
+                            .map(|_| (index, system.clone()))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if activation_rows(self.messages()) != activation_rows(&rewritten) {
+                return Err(TranscriptEditError::InvalidTranscriptShape(
+                    "same-session transcript rewrite cannot mint, alter, move, erase, or restore instruction activation boundaries"
+                        .to_string(),
+                ));
+            }
+        }
         // One required hash of the genuinely new content, computed FIRST so
         // the whole-span digests below reuse it instead of re-hashing the
         // same bytes. The reuse conditions are slice-identity arithmetic,
@@ -6507,6 +6727,16 @@ impl Session {
                 }
             }
         };
+
+        if matches!(
+            &replacement_message,
+            Message::System(system) if system.instruction_activation.is_some()
+        ) {
+            return Err(TranscriptEditError::InvalidTranscriptShape(
+                "fork replacement cannot mint an instruction activation; fork-at may only copy exact source-prefix activations"
+                    .to_string(),
+            ));
+        }
 
         let mut forked = self.fork_at(message_index);
         forked.push(replacement_message);
@@ -13708,7 +13938,7 @@ mod tests {
         // item (no prior delta), the staged item's lane MUST be promoted to
         // Spoken so the materializer commits as `AssistantBlock::Transcript`.
         // Without the explicit promotion, the lane stays `Display` (the
-        // default) and the heard audio transcript persists as
+        // default) and the playback-path audio transcript persists as
         // `AssistantBlock::Text`.
         let mut session = Session::new();
 
@@ -13717,7 +13947,7 @@ mod tests {
                 response_id: "resp_a".to_string(),
                 item_id: "item_a".to_string(),
                 content_index: 0,
-                text: "what was actually heard".to_string(),
+                text: "reported playback prefix".to_string(),
             },
         );
 
@@ -13736,7 +13966,7 @@ mod tests {
                 assert_eq!(assistant.blocks.len(), 1);
                 match &assistant.blocks[0] {
                     AssistantBlock::Transcript { text, source, .. } => {
-                        assert_eq!(text, "what was actually heard");
+                        assert_eq!(text, "reported playback prefix");
                         assert_eq!(*source, crate::types::TranscriptSource::Spoken);
                     }
                     other => unreachable!(
@@ -13822,7 +14052,7 @@ mod tests {
                 response_id: "resp_a".to_string(),
                 item_id: "item_a".to_string(),
                 content_index: 0,
-                text: "what was actually heard".to_string(),
+                text: "reported playback prefix".to_string(),
             },
         );
 
@@ -13854,7 +14084,7 @@ mod tests {
                 assert_eq!(assistant.blocks.len(), 1);
                 match &assistant.blocks[0] {
                     AssistantBlock::Transcript { text, source, .. } => {
-                        assert_eq!(text, "what was actually heard");
+                        assert_eq!(text, "reported playback prefix");
                         assert_eq!(*source, crate::types::TranscriptSource::Spoken);
                     }
                     other => unreachable!(

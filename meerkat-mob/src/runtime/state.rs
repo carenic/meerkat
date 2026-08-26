@@ -485,6 +485,111 @@ impl LifecycleAdmissionSignal {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LifecycleProgressStage {
+    LifecycleAuthorityAdmission,
+    MemberLiveMaterialization,
+    MemberCommsReadiness,
+    AutonomousRuntimeReadiness,
+    DurableResumeTransition,
+    PostRebuildReadiness,
+    ResumeTopologyReconciliation,
+}
+
+impl LifecycleProgressStage {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::LifecycleAuthorityAdmission => "lifecycle_authority_admission",
+            Self::MemberLiveMaterialization => "member_live_materialization",
+            Self::MemberCommsReadiness => "member_comms_readiness",
+            Self::AutonomousRuntimeReadiness => "autonomous_runtime_readiness",
+            Self::DurableResumeTransition => "durable_resume_transition",
+            Self::PostRebuildReadiness => "post_rebuild_readiness",
+            Self::ResumeTopologyReconciliation => "resume_topology_reconciliation",
+        }
+    }
+
+    /// Host materialization owns its own completion or typed failure. Meerkat
+    /// cannot classify opaque host latency as a stall without a host progress
+    /// contract; doing so made ordinary cold profile builds fail resume.
+    pub(super) const fn uses_host_owned_terminality(self) -> bool {
+        matches!(self, Self::MemberLiveMaterialization)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LifecycleProgressObservation {
+    pub(super) epoch: u64,
+    pub(super) member_id: Option<AgentIdentity>,
+    pub(super) stage: LifecycleProgressStage,
+    pub(super) observed_at: meerkat_core::time_compat::Instant,
+}
+
+#[derive(Clone)]
+pub(super) struct LifecycleProgressSignal {
+    sender: tokio::sync::watch::Sender<LifecycleProgressObservation>,
+}
+
+impl LifecycleProgressSignal {
+    pub(super) fn new() -> (
+        Self,
+        tokio::sync::watch::Receiver<LifecycleProgressObservation>,
+    ) {
+        let (sender, receiver) = tokio::sync::watch::channel(LifecycleProgressObservation {
+            epoch: 0,
+            member_id: None,
+            stage: LifecycleProgressStage::LifecycleAuthorityAdmission,
+            observed_at: meerkat_core::time_compat::Instant::now(),
+        });
+        (Self { sender }, receiver)
+    }
+
+    pub(super) fn awaiting_member(&self, member_id: &AgentIdentity, stage: LifecycleProgressStage) {
+        let now = meerkat_core::time_compat::Instant::now();
+        self.sender.send_modify(|observation| {
+            observation.member_id = Some(member_id.clone());
+            observation.stage = stage;
+            observation.observed_at = now;
+        });
+        tracing::debug!(
+            agent_identity = %member_id,
+            stage = stage.as_str(),
+            "explicit resume awaiting lifecycle work"
+        );
+    }
+
+    pub(super) fn member_progress(&self, member_id: &AgentIdentity, stage: LifecycleProgressStage) {
+        let now = meerkat_core::time_compat::Instant::now();
+        let mut elapsed = meerkat_core::time_compat::Duration::ZERO;
+        self.sender.send_modify(|observation| {
+            elapsed = now.saturating_duration_since(observation.observed_at);
+            observation.epoch = observation.epoch.wrapping_add(1);
+            observation.member_id = Some(member_id.clone());
+            observation.stage = stage;
+            observation.observed_at = now;
+        });
+        tracing::debug!(
+            agent_identity = %member_id,
+            stage = stage.as_str(),
+            elapsed_ms = elapsed.as_millis(),
+            "explicit resume lifecycle work progressed"
+        );
+    }
+
+    pub(super) fn awaiting_stage(&self, stage: LifecycleProgressStage) {
+        let now = meerkat_core::time_compat::Instant::now();
+        self.sender.send_modify(|observation| {
+            observation.member_id = None;
+            observation.stage = stage;
+            observation.observed_at = now;
+        });
+        tracing::debug!(
+            stage = stage.as_str(),
+            "explicit resume awaiting lifecycle work"
+        );
+    }
+}
+
 pub(super) enum MobCommand {
     Spawn {
         spec: Box<super::handle::SpawnMemberSpec>,
@@ -574,6 +679,29 @@ pub(super) enum MobCommand {
     SubmitWork {
         payload: Box<SubmitWorkPayload>,
         reply_tx: oneshot::Sender<Result<(), MobError>>,
+    },
+    #[cfg(feature = "experimental-gpt-live")]
+    StartLiveBridgeOperation {
+        agent_identity: AgentIdentity,
+        request: super::LiveBridgeOperationRequest,
+        cancellation: super::LiveBridgeOperationCancellationSignal,
+        reply_tx: oneshot::Sender<
+            Result<super::LiveBridgeOperationTerminalFuture, super::LiveBridgeOperationStartError>,
+        >,
+    },
+    #[cfg(feature = "experimental-gpt-live")]
+    ValidateLiveBridgeMemberEligibility {
+        agent_identity: AgentIdentity,
+        reply_tx: oneshot::Sender<Result<(), super::LiveBridgeOperationStartError>>,
+    },
+    /// Side-effect-free preflight for a durable member whose transcript is
+    /// the source of a separate live executor. Unlike direct bridge
+    /// eligibility, this validates only exact current source ownership and
+    /// availability; callback policy belongs to the forked executor.
+    #[cfg(feature = "experimental-gpt-live")]
+    ValidateLiveDurableSourceAvailability {
+        agent_identity: AgentIdentity,
+        reply_tx: oneshot::Sender<Result<(), super::LiveBridgeOperationStartError>>,
     },
     /// Sender-aware peer communication between mob members.
     ///
@@ -1004,6 +1132,7 @@ pub(super) enum MobCommand {
     ResumeLifecycle {
         deadline: meerkat_core::time_compat::Instant,
         admission: LifecycleAdmissionSignal,
+        progress: LifecycleProgressSignal,
         reply_tx: oneshot::Sender<Result<(), MobError>>,
     },
     Complete {
@@ -1171,6 +1300,16 @@ impl MobCommand {
             Self::Respawn { .. } => "Respawn",
             Self::RetireAll { .. } => "RetireAll",
             Self::SubmitWork { .. } => "SubmitWork",
+            #[cfg(feature = "experimental-gpt-live")]
+            Self::StartLiveBridgeOperation { .. } => "StartLiveBridgeOperation",
+            #[cfg(feature = "experimental-gpt-live")]
+            Self::ValidateLiveBridgeMemberEligibility { .. } => {
+                "ValidateLiveBridgeMemberEligibility"
+            }
+            #[cfg(feature = "experimental-gpt-live")]
+            Self::ValidateLiveDurableSourceAvailability { .. } => {
+                "ValidateLiveDurableSourceAvailability"
+            }
             Self::SendPeerMessage { .. } => "SendPeerMessage",
             Self::DriveRouteInstalls { .. } => "DriveRouteInstalls",
             Self::DeclareMemberOutboundTaint { .. } => "DeclareMemberOutboundTaint",

@@ -20,7 +20,7 @@ use crate::Provider;
 use crate::model_profile::capabilities::{BetaHeader, ModelCapabilities, ThinkingSupport};
 use crate::model_profile::catalog::{
     CatalogEntry, ImageGenerationModelProfile, ImageGenerationModelRoute,
-    ImageGenerationProviderDefaults, ProviderDefaults,
+    ImageGenerationProviderDefaults, ModelReleaseStage, ProviderDefaults,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +34,9 @@ use serde::{Deserialize, Serialize};
 pub struct ModelProfile {
     /// Provider that serves this model.
     pub provider: Provider,
+    /// Release maturity and admission class owned by the model catalog.
+    #[serde(default)]
+    pub release_stage: ModelReleaseStage,
     /// Model family identifier (a stable grouping key for related model ids).
     pub model_family: String,
     /// Whether the model accepts a `temperature` parameter.
@@ -56,6 +59,9 @@ pub struct ModelProfile {
     pub realtime: bool,
     /// Whether the model supports provider-native web search tools.
     pub supports_web_search: bool,
+    /// Whether the model accepts ordered System messages after the leading
+    /// system-prefix portion of a transcript.
+    pub supports_mid_conversation_system_messages: bool,
     /// Whether the provider/model can use Meerkat image generation.
     pub image_generation: bool,
     /// JSON Schema describing accepted provider-specific parameters.
@@ -97,11 +103,13 @@ impl From<&BetaHeader> for ModelBetaHeader {
 pub fn project_to_profile(caps: &ModelCapabilities) -> ModelProfile {
     ModelProfile {
         provider: caps.provider,
+        release_stage: caps.release_stage,
         model_family: caps.model_family.to_string(),
         supports_temperature: caps.supports_temperature,
         supports_thinking: caps.thinking != ThinkingSupport::None,
         supports_reasoning: caps.supports_reasoning,
         supports_web_search: caps.supports_web_search,
+        supports_mid_conversation_system_messages: caps.supports_mid_conversation_system_messages,
         inline_video: caps.inline_video,
         vision: caps.vision,
         image_input: caps.vision,
@@ -350,11 +358,13 @@ mod tests {
     /// and a schema regeneration.
     const EXPECTED_MODEL_PROFILE_FIELDS: &[&str] = &[
         "provider",
+        "release_stage",
         "model_family",
         "supports_temperature",
         "supports_thinking",
         "supports_reasoning",
         "supports_web_search",
+        "supports_mid_conversation_system_messages",
         "inline_video",
         "vision",
         "image_input",

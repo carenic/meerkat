@@ -36,6 +36,8 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 base64 = { workspace = true }
 sha2 = { workspace = true, optional = true }
+# Development integration stays on the workspace-owned immutable source pin.
+# A coordinated release replaces this with the published protocol dependency.
 oai-rt-rs = { workspace = true, optional = true }
 # Pinned to the tokio-tungstenite major used by oai-rt-rs so the typed
 # `tungstenite::Error` discriminants can be matched when classifying
@@ -52,12 +54,21 @@ meerkat-runtime = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
 meerkat-auth-core = { workspace = true, features = ["oauth"] }
-axum = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
 
 [features]
 default = ["oauth"]
 oauth = ["meerkat-auth-core/oauth"]
 realtime = ["dep:oai-rt-rs", "dep:sha2", "dep:tokio-tungstenite"]
+experimental-gpt-live = [
+    "dep:oai-rt-rs",
+    "meerkat-llm-core/experimental-gpt-live",
+    "oai-rt-rs/experimental-gpt-live",
+]
+# Structurally separate, non-shipping Gate0 candidate broker. It accepts no
+# qualified experimental admission carrier and advertises no capability.
+experimental-gpt-live-gate0-harness = ["experimental-gpt-live"]
+test-realtime-fixtures = []
 
 [package.metadata.cargo-machete]
 ignored = ["getrandom", "base64", "indexmap", "tempfile"]

@@ -218,6 +218,7 @@ macro_rules! e2e_smoke_lane_entries {
             scenario(e2e_smoke_s93_remote_mob_two_host_constellation_join, 93);
             scenario(e2e_smoke_s94_cli_shorthand_prompt, 94);
             scenario(e2e_smoke_s95_cli_slow_mcp_resume_journey, 95);
+            scenario(e2e_smoke_s96_gpt_live_client_context_vertical, 96);
             suite(e2e_smoke_rpc_dynamic_tool_pickup, "rpc-dynamic-tool-pickup");
             suite(e2e_smoke_rpc_deferred_catalog_session, "rpc-deferred-catalog-session");
             suite(e2e_smoke_cli_background_job_active_turn, "cli-background-job-active-turn");
@@ -1788,10 +1789,10 @@ fn scenario_env(
     // Live/mob-heavy tests recursively drive the runtime through many
     // layered async frames (spawn → wire → retire → destroy) which can
     // exceed the default 2 MiB main-thread stack under debug builds.
-    // Default-raise to 16 MiB for every spec; scenarios can still
+    // Default-raise to 32 MiB for every spec; scenarios can still
     // override by setting their own `RUST_MIN_STACK` in `spec.env`.
     env.entry("RUST_MIN_STACK".to_string())
-        .or_insert_with(|| (16 * 1024 * 1024).to_string());
+        .or_insert_with(|| (32 * 1024 * 1024).to_string());
     for (key, value) in spec.env {
         env.insert((*key).to_string(), expand_template(value, cargo_target_dir));
     }
@@ -2499,6 +2500,9 @@ fn bazel_rust_test_relative(key: &str) -> Result<&'static str, String> {
     match key {
         "meerkat-integration-tests:smoke_shared_realm" => {
             Ok("tests/integration/smoke_shared_realm_test")
+        }
+        "meerkat-integration-tests:gpt_live_client_e2e" => {
+            Ok("tests/integration/gpt_live_client_e2e_test")
         }
         "meerkat-comms:e2e" => Ok("meerkat-comms/e2e_test"),
         "meerkat-mob:smoke_mob_flow_runtime" => Ok("meerkat-mob/smoke_mob_flow_runtime_test"),
@@ -4075,6 +4079,32 @@ fn scenario_spec(id: u16) -> Option<&'static Spec> {
                 test_target: "live_smoke_cli",
                 test_name: "e2e_scenario_95_cli_slow_mcp_resume_journey",
                 features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
+        96 => Some(&Spec {
+            id: Some(96),
+            lane: Lane::Smoke,
+            title: "GPT Live client-context production delegation vertical",
+            timeout_secs: 1200,
+            required_env: &[&["MEERKAT_E2E_AUTH_OPENAI_OAUTH_TOKENS_JSON"]],
+            required_bins: &["cargo", "node", "npm"],
+            cwd: "tests/live_smoke/browser",
+            // This vertical composes the full RPC, Mob, live-machine, and
+            // provider authority graph in one libtest thread. The repository
+            // default 16 MiB test stack is insufficient for that production
+            // composition before the first provider effect.
+            env: &[("RUST_MIN_STACK", "67108864")],
+            cargo_bin_env: &[],
+            pre_commands: &[
+                &["/bin/sh", "-c", "test -d node_modules || npm ci"],
+                &["npx", "playwright", "install", "chromium"],
+            ],
+            command: CommandSpec::CargoTest {
+                package: "meerkat-integration-tests",
+                test_target: "gpt_live_client_e2e",
+                test_name: "e2e_scenario_96_gpt_live_client_context_vertical",
+                features: &["experimental-gpt-live-e2e"],
                 all_features: false,
             },
         }),
@@ -5771,12 +5801,13 @@ fn suite_spec(name: &str) -> Option<&'static Spec> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactManifest, ArtifactRequirement, CommandLockMode, E2eSelection, ExecutionMode, Lane,
-        SMOKE_ENTRIES, SmokeRuntimeClass, SmokeScheduler, bazel_build_event_provenance,
-        build_commands_for_mode, inherited_cargo_build_context, normalize_command_with_env,
-        order_smoke_specs_for_runtime, plan_for_selection, pre_command_lock_mode, repo_cargo,
-        require_built_by_recorded_invocation, sanitize_artifact_key, scenario_env, scenario_spec,
-        smoke_runtime_class, smoke_test_filter_for_selection, source_revision_key, suite_spec,
+        ArtifactManifest, ArtifactRequirement, CommandLockMode, CommandSpec, E2eSelection,
+        ExecutionMode, Lane, SMOKE_ENTRIES, SmokeRuntimeClass, SmokeScheduler,
+        bazel_build_event_provenance, build_commands_for_mode, inherited_cargo_build_context,
+        normalize_command_with_env, order_smoke_specs_for_runtime, plan_for_selection,
+        pre_command_lock_mode, repo_cargo, require_built_by_recorded_invocation,
+        sanitize_artifact_key, scenario_env, scenario_spec, smoke_runtime_class,
+        smoke_test_filter_for_selection, source_revision_key, suite_spec,
     };
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -6182,6 +6213,36 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn gpt_live_client_context_smoke_is_one_strict_oauth_shard() {
+        let spec = scenario_spec(96).expect("GPT Live client-context scenario");
+        assert_eq!(spec.lane, Lane::Smoke);
+        assert_eq!(
+            spec.required_env,
+            &[&["MEERKAT_E2E_AUTH_OPENAI_OAUTH_TOKENS_JSON"]]
+        );
+        assert_eq!(spec.cwd, "tests/live_smoke/browser");
+        match spec.command {
+            CommandSpec::CargoTest {
+                package,
+                test_target,
+                test_name,
+                features,
+                all_features,
+            } => {
+                assert_eq!(package, "meerkat-integration-tests");
+                assert_eq!(test_target, "gpt_live_client_e2e");
+                assert_eq!(
+                    test_name,
+                    "e2e_scenario_96_gpt_live_client_context_vertical"
+                );
+                assert_eq!(features, &["experimental-gpt-live-e2e"]);
+                assert!(!all_features);
+            }
+            _ => panic!("scenario 96 must remain one sequential Cargo test shard"),
         }
     }
 

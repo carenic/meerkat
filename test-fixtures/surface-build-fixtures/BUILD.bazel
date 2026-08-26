@@ -41,7 +41,7 @@ rust_binary(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "embedded_min",
         "CARGO_MANIFEST_DIR": "test-fixtures/surface-build-fixtures",
     },
@@ -70,7 +70,7 @@ rust_binary(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "runtime_backed_min",
         "CARGO_MANIFEST_DIR": "test-fixtures/surface-build-fixtures",
     },
@@ -107,7 +107,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.8.29",
+        "CARGO_PKG_VERSION": "0.8.30",
         "CARGO_BIN_NAME": "live_roundtrip",
         "CARGO_MANIFEST_DIR": "./test-fixtures/surface-build-fixtures",
     },
@@ -117,7 +117,7 @@ rust_test(
     ],
     data = [],
     env = {
-        "RUST_MIN_STACK": "16777216",
+        "RUST_MIN_STACK": "33554432",
     },
     proc_macro_deps = all_crate_deps(
         package_name = "test-fixtures/surface-build-fixtures",

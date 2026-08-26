@@ -206,6 +206,7 @@ pub mod bridge_protocol;
 mod builder;
 pub mod composition;
 pub mod conditions;
+mod delegation;
 mod disposal;
 mod edge_locks;
 mod event_pump;
@@ -217,6 +218,8 @@ mod handle;
 mod identity_local_services;
 #[cfg(any(test, feature = "test-support"))]
 mod identity_recovery_test_support;
+#[cfg(feature = "experimental-gpt-live")]
+mod live_bridge_operation;
 pub(crate) use handle::MemberTurnLlmIdentityAppliedSender;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use identity_recovery_test_support::trigger_identity_recovery_fail_stop;
@@ -303,6 +306,13 @@ pub use builder::MobBuilder;
 pub use builder::{
     ControllingAcceptorConfig, LocalMemberAcceptorMaterialSource, MemberAcceptorRegistration,
 };
+pub use delegation::{
+    BOUNDED_DELEGATION_REPORT_INSTRUCTION_V1, DelegationCancellationHandle,
+    DelegationExecutionError, DelegationExecutionHandle, DelegationExecutionOutcome,
+    DelegationExecutionRequest, DelegationExecutionService, DelegationExecutionSource,
+    DelegationMemberOptions, DelegationParentContext, DelegationTerminalizedExecution,
+    DelegationTurnTerminal, LiveDelegationTerminalEvidence, render_bounded_delegation_task,
+};
 pub use event_router::{MobEventRouterConfig, MobEventRouterHandle};
 pub use flow_frame_engine::{FlowFrameKernel, FlowFrameMutator};
 pub use handle::{
@@ -314,8 +324,9 @@ pub use handle::{
     AdaptiveStopReasonView, BoundedFlowResult, BoundedHelperResult, BoundedHelperResultStatus,
     BoundedHelperRunOutcome, BoundedMemberRunError, BoundedResultSpec, BoundedTurnFailure,
     BoundedTurnResult, BoundedTurnWaitError, CurrentMobAdmission,
-    DEFAULT_BOUNDED_HELPER_RESULT_BYTES, ExternalMemberBindingMode,
-    ExternalMemberForwardingHookRef, ExternalMemberForwardingHooks, ExternalMemberForwardingStatus,
+    DEFAULT_BOUNDED_HELPER_RESULT_BYTES, DurableBoundedMemberState, DurableBoundedWorkRecovery,
+    DurableBoundedWorkState, ExternalMemberBindingMode, ExternalMemberForwardingHookRef,
+    ExternalMemberForwardingHooks, ExternalMemberForwardingStatus,
     ExternalMemberObservationSnapshot, ExternalMemberOwnerRef, ExternalMemberReachability,
     ExternalMemberRebindStatus, ExternalPeerBindingSpec, FlowRunHandle, FlowRunWaitError,
     FlowTargetProvisioner, ForkMemberBoundedRunOutcome, ForkMemberResult,
@@ -340,6 +351,15 @@ pub use host_schedule::HostObservationScheduleMobHost;
 pub use identity_local_services::{
     IdentityLocalExternalToolsError, IdentityLocalExternalToolsProvider,
     IdentityLocalMaterializationKey,
+};
+#[cfg(feature = "experimental-gpt-live")]
+pub use live_bridge_operation::{
+    DEFAULT_LIVE_BRIDGE_OUTPUT_BYTES, DurableMemberLiveBridgeOperationExecutor,
+    LiveBridgeAcceptedExecution, LiveBridgeExecutionSnapshot,
+    LiveBridgeOperationCancellationHandle, LiveBridgeOperationCancellationSignal,
+    LiveBridgeOperationExecutor, LiveBridgeOperationRequest, LiveBridgeOperationService,
+    LiveBridgeOperationStartError, LiveBridgeOperationTerminal, LiveBridgeOperationTerminalError,
+    LiveBridgeOperationTerminalFuture,
 };
 pub use member_history_proxy::MemberHistoryPageDomain;
 pub use member_live_proxy::MemberLiveStatusDomain;

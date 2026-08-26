@@ -24,9 +24,39 @@ mod schedule_host;
 #[cfg(not(target_arch = "wasm32"))]
 mod stdio_json;
 
+#[cfg(all(
+    feature = "session-store",
+    feature = "live",
+    feature = "experimental-gpt-live",
+    not(target_arch = "wasm32")
+))]
+pub use crate::session_runtime::live_orchestration::ExperimentalLivePendingChannel;
 pub use embedded::{
     build_embedded_service, build_embedded_service_from_builder, set_default_schedule_tools,
     set_default_workgraph_namespace_grant, set_default_workgraph_tools,
+};
+#[cfg(all(
+    feature = "session-store",
+    feature = "live-webrtc",
+    not(target_arch = "wasm32")
+))]
+pub use live_host::{
+    CoordinatedLiveWebrtcAnswer, LiveWebrtcAnswerCoordinatorError, LiveWebrtcAnswerDeliveryCustody,
+    LiveWebrtcBoundReadyBindFailure, LiveWebrtcBoundReadyBinder, LiveWebrtcBoundReadyCustody,
+    coordinate_live_webrtc_answer,
+};
+#[cfg(all(
+    feature = "session-store",
+    feature = "live",
+    feature = "live-webrtc",
+    feature = "experimental-gpt-live",
+    not(target_arch = "wasm32")
+))]
+pub use live_host::{
+    ExperimentalGptLiveContextMirrorHost, ExperimentalLiveChannelCloseError,
+    ExperimentalLiveChannelCustodyStatus, ExperimentalLiveChannelPhaseStatus,
+    ExperimentalLiveContextRecoveryError, ExperimentalLivePlaybackOwnerReadiness,
+    ExperimentalLiveReplacementRequired,
 };
 #[cfg(all(
     feature = "session-store",
@@ -909,11 +939,24 @@ pub fn build_models_catalog_response(
                             ))
                         })?;
                     let profile = Some(meerkat_contracts::WireModelProfile {
+                        release_stage: match model_profile.release_stage {
+                            meerkat_core::ModelReleaseStage::Stable => {
+                                meerkat_contracts::WireModelReleaseStage::Stable
+                            }
+                            meerkat_core::ModelReleaseStage::Experimental => {
+                                meerkat_contracts::WireModelReleaseStage::Experimental
+                            }
+                            meerkat_core::ModelReleaseStage::OperatorDefined => {
+                                meerkat_contracts::WireModelReleaseStage::OperatorDefined
+                            }
+                        },
                         model_family: model_profile.model_family.clone(),
                         supports_temperature: model_profile.supports_temperature,
                         supports_thinking: model_profile.supports_thinking,
                         supports_reasoning: model_profile.supports_reasoning,
                         supports_web_search: model_profile.supports_web_search,
+                        supports_mid_conversation_system_messages: model_profile
+                            .supports_mid_conversation_system_messages,
                         vision: model_profile.vision,
                         image_input: model_profile.image_input,
                         image_tool_results: model_profile.image_tool_results,
@@ -940,6 +983,17 @@ pub fn build_models_catalog_response(
                             }
                             meerkat_core::model_profile::catalog::ModelTier::Supported => {
                                 meerkat_contracts::WireModelTier::Supported
+                            }
+                        },
+                        release_stage: match entry.release_stage {
+                            meerkat_core::ModelReleaseStage::Stable => {
+                                meerkat_contracts::WireModelReleaseStage::Stable
+                            }
+                            meerkat_core::ModelReleaseStage::Experimental => {
+                                meerkat_contracts::WireModelReleaseStage::Experimental
+                            }
+                            meerkat_core::ModelReleaseStage::OperatorDefined => {
+                                meerkat_contracts::WireModelReleaseStage::OperatorDefined
                             }
                         },
                         context_window: entry.context_window,

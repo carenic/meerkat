@@ -132,6 +132,16 @@ pub enum SessionError {
     /// The requested operation is not supported by this session service.
     #[error("unsupported: {0}")]
     Unsupported(String),
+
+    /// An external durable write authority was superseded before the physical
+    /// session boundary committed. No target write was invoked.
+    #[error("external session write fence conflict: {reason}")]
+    ExternalWriteFenceConflict { reason: String },
+
+    /// An external durable write authority could not be checked without
+    /// waiting at the physical session boundary. No target write was invoked.
+    #[error("external session write fence backoff: {reason}")]
+    ExternalWriteFenceBackoff { reason: String },
 }
 
 /// Why a durable session refuses to serve a resume while its content stays
@@ -333,6 +343,8 @@ impl SessionError {
             Self::DurableEvidenceQuarantined { .. } => "SESSION_DURABLE_EVIDENCE_QUARANTINED",
             Self::Store(_) => "SESSION_STORE_ERROR",
             Self::Unsupported(_) => "SESSION_UNSUPPORTED",
+            Self::ExternalWriteFenceConflict { .. } => "SESSION_EXTERNAL_WRITE_FENCE_CONFLICT",
+            Self::ExternalWriteFenceBackoff { .. } => "SESSION_EXTERNAL_WRITE_FENCE_BACKOFF",
             Self::Agent(_) => "AGENT_ERROR",
             Self::FailedWithData { .. } => "SESSION_ERROR",
         }
@@ -701,6 +713,11 @@ pub struct SessionBuildOptions {
     /// `Inherit` must be resolved by the spawn chain before build; an
     /// unresolved `Inherit` fails the build closed.
     pub tool_access_policy: Option<crate::ops::ToolAccessPolicy>,
+    /// Process-local authority awaited at the outermost actual tool-dispatch
+    /// boundary. This carrier is intentionally absent from serialized
+    /// contracts and durable metadata; its owner must reconstruct it from
+    /// generated authority after restart.
+    pub tool_dispatch_admission: Option<Arc<dyn crate::ToolDispatchAdmission>>,
     /// Stable application consequence-policy identity for this session.
     pub application_tool_policy: crate::ApplicationToolPolicyBinding,
     /// Host-scoped in-process registry. Executable policy is never serialized.
@@ -1471,6 +1488,7 @@ impl Default for SessionBuildOptions {
             initial_metadata_entries: BTreeMap::new(),
             initial_tool_filter: None,
             tool_access_policy: None,
+            tool_dispatch_admission: None,
             application_tool_policy: crate::ApplicationToolPolicyBinding::Unmanaged,
             tool_consequence_policy_registry: None,
             shell_env: None,
@@ -1546,6 +1564,10 @@ impl std::fmt::Debug for SessionBuildOptions {
             .field("initial_metadata_entries", &self.initial_metadata_entries)
             .field("initial_tool_filter", &self.initial_tool_filter.is_some())
             .field("tool_access_policy", &self.tool_access_policy)
+            .field(
+                "tool_dispatch_admission",
+                &self.tool_dispatch_admission.is_some(),
+            )
             .field("call_timeout_override", &self.call_timeout_override)
             .field("resume_override_mask", &self.resume_override_mask)
             .field("mob_tools", &self.mob_tools.is_some())
@@ -2756,6 +2778,21 @@ pub trait SessionServiceControlExt: SessionService {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait SessionServiceHistoryExt: SessionService {
+    /// Read durable instruction activation records from authoritative session history.
+    ///
+    /// This persistence-only seam does not infer current runtime publication,
+    /// recovery, or provider compatibility.
+    async fn read_instruction_activation_records(
+        &self,
+        id: &SessionId,
+        query: crate::InstructionActivationReadQuery,
+    ) -> Result<crate::InstructionActivationReadPage, SessionError> {
+        let _ = (id, query);
+        Err(SessionError::Unsupported(
+            "read_instruction_activation_records".to_string(),
+        ))
+    }
+
     /// Read the committed transcript for a session.
     ///
     /// Implementations may return `PersistenceDisabled` if they cannot provide

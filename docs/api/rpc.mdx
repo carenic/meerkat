@@ -121,6 +121,8 @@ subset.
 | `session/history` | Session | `ReadSessionHistoryParams` | `WireSessionHistory` | Get committed session transcript messages |
 | `session/export_atif` | Session | `ExportAtifParams` | `Value` | Export currently projected session replay evidence as an ATIF trajectory |
 | `session/update_system_prompt` | Session | `UpdateSystemPromptParams` | `SystemPromptUpdateResult` | Explicitly replace one durable versioned system-prompt key |
+| `session/activate_instruction` | Session | `ActivateInstructionParams` | `InstructionActivationReceipt` | Append one immutable instruction revision at an admitted idle transcript boundary |
+| `session/instruction_activations` | Session | `ReadInstructionActivationsParams` | `InstructionActivationReadPage` | Read authoritative activation records from the durable ordered transcript |
 | `session/rewrite_transcript` | Session | `RewriteSessionTranscriptParams` | `SessionTranscriptRewriteResult` | Commit a same-session transcript rewrite |
 | `session/transcript_revision` | Session | `ReadSessionTranscriptRevisionParams` | `WireSessionTranscriptRevision` | Read a transcript revision by id |
 | `session/transcript_revisions` | Session | `ListSessionTranscriptRevisionsParams` | `WireSessionTranscriptRevisionList` | List retained transcript revision commits with the current head |
@@ -153,6 +155,7 @@ subset.
 | `live/commit_input` | Live | `LiveCommitInputParams` | `LiveCommitInputResult` | Commit pending input on a live channel (turn boundary) |
 | `live/interrupt` | Live | `LiveChannelParams` | `LiveInterruptResult` | Interrupt the assistant turn on a live channel (barge-in) |
 | `live/truncate` | Live | `LiveTruncateParams` | `LiveTruncateResult` | Truncate assistant output at a client-tracked playback cursor |
+| `live/playback_complete` | Live | `LivePlaybackCompleteParams` | `LivePlaybackCompleteResult` | Report completed client playback for one generated assistant output |
 | `live/refresh` | Live | `LiveChannelParams` | `LiveRefreshResult` | Apply mutable session config (instructions/tools/audio) to an open live channel |
 | `session/stream_open` | Session | `SessionStreamOpenParams` | `SessionStreamOpenResult` | Open a standalone session event stream |
 | `session/stream_close` | Session | `SessionStreamCloseParams` | `SessionStreamCloseResult` | Close a standalone session event stream |
@@ -386,9 +389,9 @@ Handshake. Returns server capabilities.
   "result": {
     "server_info": {
       "name": "meerkat-rpc",
-      "version": "0.8.29"
+      "version": "0.8.30"
     },
-    "contract_version": "0.8.29",
+    "contract_version": "0.8.30",
     "methods": [
       "initialize", "initialized",
       "session/create", "session/list", "session/read",
@@ -645,7 +648,7 @@ Trajectory Interchange Format) v1.7 trajectory document.
   "params": {
     "session_id": "01936f8a-7b2c-7000-8000-000000000001",
     "agent_name": "meerkat",
-    "agent_version": "0.8.29",
+    "agent_version": "0.8.30",
     "model_name": "claude-opus-5"
   }
 }
@@ -1652,6 +1655,7 @@ transport details.
 | `live/commit_input` | Commit pending input on a live channel (turn boundary) |
 | `live/interrupt` | Interrupt the assistant turn on a live channel (barge-in) |
 | `live/truncate` | Truncate assistant output at a client-tracked playback cursor |
+| `live/playback_complete` | Report completed client playback for one generated assistant output |
 | `live/refresh` | Apply mutable session config (instructions/tools/audio) to an open channel; config-only, does not replay history; identity swaps and canonical transcript/user-content rewrites return typed reopen-required errors |
 
 WebSocket calls require `--live-ws <addr>`. WebRTC open/answer requires a build
@@ -1813,7 +1817,7 @@ Return the curated model catalog with provider profiles, capability metadata, an
   "jsonrpc": "2.0",
   "id": 17,
   "result": {
-    "contract_version": "0.8.29",
+    "contract_version": "0.8.30",
     "providers": [
       {
         "provider": "anthropic",
@@ -1871,7 +1875,7 @@ Return runtime capabilities with status resolved against config. This lists ever
   "jsonrpc": "2.0",
   "id": 8,
   "result": {
-    "contract_version": {"major": 0, "minor": 8, "patch": 29},
+    "contract_version": {"major": 0, "minor": 8, "patch": 30},
     "capabilities": [
       {
         "id": "sessions",

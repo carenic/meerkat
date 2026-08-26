@@ -62,8 +62,9 @@ use meerkat_core::session_document::{
 use meerkat_core::session_store::{IncrementalSessionStore, SessionHead, session_head_cas_token};
 use meerkat_core::types::{RunResult, SessionId, ToolResult};
 use meerkat_core::{
-    DeferredFirstTurnPhase, SessionDeferredTurnState, SessionLifecycleTerminal,
-    SystemPromptUpdateRequest, SystemPromptUpdateResult,
+    DeferredFirstTurnPhase, InstructionActivationMutation, InstructionActivationRequest,
+    SessionDeferredTurnState, SessionLifecycleTerminal, SystemPromptUpdateRequest,
+    SystemPromptUpdateResult,
 };
 use meerkat_core::{InputId, RunCheckpointAuthority, RunCheckpointReceipt, RunId};
 use meerkat_runtime::identifiers::LogicalRuntimeId;
@@ -79,8 +80,8 @@ use meerkat_runtime::{
     HeadCanonicalStoreAuthority, MachineSessionControlAuthority, MeerkatMachine,
     PreparedArchivedResumeCommitLease, PreparedHeadCanonicalProvisionalTail,
     PreparedSessionMaterialization, PreparedWholeBlobRewriteBoundary, RuntimeSessionAuthority,
-    RuntimeSessionPersistenceProfile, RuntimeState, RuntimeStore,
-    VerifiedCommittedWholeBlobPayload, WholeBlobStoreAuthority,
+    RuntimeSessionPersistenceProfile, RuntimeState, RuntimeStore, RuntimeStoreError,
+    RuntimeStoreWriteFence, VerifiedCommittedWholeBlobPayload, WholeBlobStoreAuthority,
 };
 use meerkat_store::{SessionFilter, SessionStore, SessionStoreError};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -102,6 +103,19 @@ use crate::projector::SessionProjector;
 
 fn runtime_driver_error_to_session_error(err: meerkat_runtime::RuntimeDriverError) -> SessionError {
     SessionError::Agent(AgentError::InternalError(err.to_string()))
+}
+
+fn activation_store_error_to_session_error(error: RuntimeStoreError) -> SessionError {
+    match error {
+        RuntimeStoreError::WriteFenceConflict { reason } => {
+            SessionError::ExternalWriteFenceConflict { reason }
+        }
+        RuntimeStoreError::WriteFenceBackoff { reason } => {
+            SessionError::ExternalWriteFenceBackoff { reason }
+        }
+        RuntimeStoreError::Unsupported(detail) => SessionError::Unsupported(detail),
+        other => SessionError::Agent(AgentError::InternalError(other.to_string())),
+    }
 }
 
 #[cfg(not(test))]
@@ -2950,6 +2964,67 @@ impl<'a> MachineSessionArchiveProtocol<'a> {
 }
 
 impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
+    /// Commit one typed instruction activation while the caller holds this
+    /// session's runtime-turn finalization boundary.
+    ///
+    /// This is the persistent implementation seam used by a runtime-owned
+    /// activation facade. It is deliberately not a `SessionService` control
+    /// extension: surfaces must first perform runtime compatibility and live
+    /// channel admission, then enter here under the stable turn boundary.
+    #[doc(hidden)]
+    pub async fn activate_instruction_under_runtime_turn_boundary(
+        &self,
+        id: &SessionId,
+        request: InstructionActivationRequest,
+        write_fence: Option<Arc<dyn RuntimeStoreWriteFence>>,
+    ) -> Result<InstructionActivationMutation, SessionError> {
+        let _recovery_guard = self.recovery_gate_for_session(id).await.lock_owned().await;
+        if !self.inner.has_live_session(id).await? {
+            return Err(SessionError::NotFound { id: id.clone() });
+        }
+        let mutation = self.inner.activate_instruction_control(id, request).await?;
+        if write_fence.is_none() && matches!(mutation, InstructionActivationMutation::Duplicate(_))
+        {
+            return Ok(mutation);
+        }
+
+        let persist_result = match self.runtime_store.session_persistence_profile() {
+            RuntimeSessionPersistenceProfile::WholeBlobV1 => {
+                async {
+                    let session = self.inner.export_session(id).await?;
+                    self.save_normalized_session_with_write_fence(session, write_fence)
+                        .await
+                        .map(|_| ())
+                }
+                .await
+            }
+            RuntimeSessionPersistenceProfile::HeadCanonicalV1 => {
+                async {
+                    let prepared = self
+                        .prepare_runtime_boundary(id, "instruction activation boundary", None)
+                        .await?;
+                    self.commit_prepared_head_canonical_actor_boundary_with_write_fence(
+                        id,
+                        "instruction activation boundary",
+                        prepared,
+                        write_fence,
+                    )
+                    .await
+                    .map(|_| ())
+                }
+                .await
+            }
+            profile => Err(SessionError::Agent(AgentError::InternalError(format!(
+                "unsupported runtime session persistence profile {profile} while committing instruction activation for session {id}"
+            )))),
+        };
+        if let Err(error) = persist_result {
+            let _ = self.discard_live_session_unfenced(id).await;
+            return Err(error);
+        }
+        Ok(mutation)
+    }
+
     fn archived_not_found(id: &SessionId) -> SessionControlError {
         SessionControlError::Session(SessionError::NotFound { id: id.clone() })
     }
@@ -3086,6 +3161,28 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         id: &SessionId,
     ) -> Option<LiveSessionActorWitness> {
         self.inner.live_session_actor_witness(id).await
+    }
+
+    /// Side-effect-free bridge eligibility preflight for one live member.
+    pub async fn validate_live_bridge_member_eligibility(
+        &self,
+        id: &SessionId,
+    ) -> Result<(), SessionError> {
+        self.inner.validate_live_bridge_member_eligibility(id).await
+    }
+
+    /// Transfer a noncommitting bridge run to the already-materialized inner
+    /// actor. The core agent suppresses checkpointer/store writes for the
+    /// duration, so this does not enter the durable turn-finalization path.
+    pub async fn start_live_bridge_operation(
+        &self,
+        id: &SessionId,
+        request: crate::LiveBridgeSessionOperationRequest,
+        cancellation: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<crate::LiveBridgeSessionOperationTerminalReceiver, SessionError> {
+        self.inner
+            .start_live_bridge_operation(id, request, cancellation)
+            .await
     }
 
     async fn export_session_with_labels(&self, id: &SessionId) -> Result<Session, SessionError> {
@@ -5164,6 +5261,54 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         self.export_realtime_session_authority_snapshot(id).await
     }
 
+    /// Export one exact current canonical boundary for live-context catch-up.
+    ///
+    /// This is used only after a provider has acknowledged seed cursor K and
+    /// generated execution binding has committed. It closes the interval
+    /// between the original open projection and answer-ready without keeping
+    /// a second pending-message ledger: rows after K are re-derived from the
+    /// current store-owned session and its exact authority token.
+    #[cfg(feature = "live")]
+    pub async fn export_live_context_committed_boundary(
+        &self,
+        id: &SessionId,
+    ) -> Result<
+        (
+            meerkat_core::lifecycle::core_executor::BoundSessionCommit,
+            String,
+        ),
+        SessionError,
+    > {
+        let _mutation_guard = self.realtime_transcript_mutation_guard(id).await?;
+        let session = self
+            .load_committed_runtime_session_for_body(id, "live context answer-ready catch-up")
+            .await?
+            .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
+        let authority = self
+            .runtime_store
+            .load_session_boundary_authority(&Self::runtime_id_for_session(id))
+            .await
+            .map_err(|error| {
+                SessionError::Agent(AgentError::InternalError(format!(
+                    "failed to load live context catch-up authority for session {id}: {error}"
+                )))
+            })?
+            .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
+        let _ = PreparedRuntimeBoundaryIdentity::from_runtime_authority(&authority, id)?;
+        let authority_token = match authority {
+            RuntimeSessionAuthority::WholeBlob(authority) => authority.blob_sha256().to_string(),
+            RuntimeSessionAuthority::HeadCanonical(authority) => {
+                authority.committed_head_token().to_string()
+            }
+        };
+        let committed = BoundSessionCommit::sealed(Arc::new(session)).map_err(|error| {
+            SessionError::Agent(AgentError::InternalError(format!(
+                "failed to seal live context catch-up boundary for session {id}: {error}"
+            )))
+        })?;
+        Ok((committed, authority_token))
+    }
+
     async fn export_realtime_session_authority_snapshot(
         &self,
         id: &SessionId,
@@ -5464,6 +5609,109 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         event: meerkat_core::RealtimeTranscriptEvent,
     ) -> Result<meerkat_core::RealtimeTranscriptApplyOutcome, SessionError> {
         let _mutation_guard = self.realtime_transcript_mutation_guard(id).await?;
+        self.append_realtime_transcript_event_guarded(id, event)
+            .await
+    }
+
+    /// Persist the one-use assistant playback correlation before releasing it
+    /// to any terminal surface.
+    pub async fn admit_live_assistant_playback_target(
+        &self,
+        id: &SessionId,
+        channel_id: meerkat_core::LiveChannelId,
+        interaction_id: meerkat_core::InteractionId,
+        response_id: String,
+        item_id: String,
+        content_index: u32,
+    ) -> Result<meerkat_core::LiveAssistantPlaybackTarget, SessionError> {
+        let _mutation_guard = self.realtime_transcript_mutation_guard(id).await?;
+        let target = self
+            .inner
+            .admit_live_assistant_playback_target(
+                id,
+                channel_id,
+                interaction_id,
+                response_id,
+                item_id,
+                content_index,
+            )
+            .await?;
+        if let Err(error) = self.persist_full_session(id).await {
+            let _ = self.discard_live_session_unfenced(id).await;
+            return Err(error);
+        }
+        Ok(target)
+    }
+
+    /// Resolve an exact persisted playback target without minting identity.
+    pub async fn live_assistant_playback_target(
+        &self,
+        id: &SessionId,
+        channel_id: meerkat_core::LiveChannelId,
+        item_id: String,
+        content_index: u32,
+    ) -> Result<Option<meerkat_core::LiveAssistantPlaybackTarget>, SessionError> {
+        self.inner
+            .live_assistant_playback_target(id, channel_id, item_id, content_index)
+            .await
+    }
+
+    /// Persist realtime transcript ingress and classify any newly canonical
+    /// rows with authoritative live provenance before releasing the mutation
+    /// interval. Provider delivery starts only after that interval is dropped.
+    #[cfg(feature = "live")]
+    pub async fn append_realtime_transcript_event_with_machine(
+        &self,
+        machine: &MeerkatMachine,
+        id: &SessionId,
+        event: meerkat_core::RealtimeTranscriptEvent,
+    ) -> Result<meerkat_core::RealtimeTranscriptApplyOutcome, SessionError> {
+        let mutation_guard = self.realtime_transcript_mutation_guard(id).await?;
+        let outcome = self
+            .append_realtime_transcript_event_guarded(id, event)
+            .await?;
+        let committed_projection = if outcome.materialized_messages.is_empty() {
+            None
+        } else {
+            let session = self.inner.export_session(id).await?;
+            let authority = self
+                .observe_persisted_session_authority(id)
+                .await?
+                .ok_or_else(|| {
+                    SessionError::Agent(AgentError::InternalError(format!(
+                        "realtime transcript commit returned no store authority for session {id}"
+                    )))
+                })?;
+            let token = match &authority {
+                RuntimeSessionAuthority::WholeBlob(authority) => {
+                    authority.blob_sha256().to_string()
+                }
+                RuntimeSessionAuthority::HeadCanonical(authority) => {
+                    authority.committed_head_token().to_string()
+                }
+            };
+            let committed = BoundSessionCommit::sealed(Arc::new(session)).map_err(|error| {
+                SessionError::Agent(AgentError::InternalError(format!(
+                    "failed to seal committed realtime transcript projection for session {id}: {error}"
+                )))
+            })?;
+            Some((committed, token))
+        };
+        drop(mutation_guard);
+        if let Some((committed, token)) = committed_projection {
+            machine
+                .enqueue_committed_live_transcript_boundary(id, &committed, &token)
+                .await
+                .map_err(runtime_driver_error_to_session_error)?;
+        }
+        Ok(outcome)
+    }
+
+    async fn append_realtime_transcript_event_guarded(
+        &self,
+        id: &SessionId,
+        event: meerkat_core::RealtimeTranscriptEvent,
+    ) -> Result<meerkat_core::RealtimeTranscriptApplyOutcome, SessionError> {
         let mut current = self.inner.export_session(id).await?;
         if let Some(user_content) = current.preflight_realtime_user_content_event(&event) {
             if matches!(
@@ -5559,6 +5807,179 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         self.ensure_prepared_realtime_user_content_blob(&prepared)
             .await?;
         Ok(outcome)
+    }
+
+    /// Persist canonical provider-final live user input before releasing the
+    /// SessionDocument-sealed commit evidence to runtime authority.
+    pub async fn commit_live_user_transcript_final(
+        &self,
+        id: &SessionId,
+        provisional: meerkat_core::ProvisionalLiveHandoff,
+        final_event: Option<meerkat_core::RealtimeTranscriptEvent>,
+    ) -> Result<meerkat_core::FinalLiveUserTranscriptCommitEvidence, SessionError> {
+        let _mutation_guard = self.realtime_transcript_mutation_guard(id).await?;
+        let evidence = self
+            .inner
+            .commit_live_user_transcript_final(id, provisional, final_event)
+            .await?;
+        if let Err(error) = self.persist_full_session(id).await {
+            let _ = self.discard_live_session_unfenced(id).await;
+            return Err(error);
+        }
+        Ok(evidence)
+    }
+
+    /// Persist close-specific Unmeasured target resolution before channel
+    /// terminality can retire the process-local output address.
+    pub async fn resolve_live_assistant_playback_on_channel_close(
+        &self,
+        id: &SessionId,
+        channel_id: meerkat_core::LiveChannelId,
+    ) -> Result<Option<meerkat_core::LiveAssistantPlaybackTruncationEvidence>, SessionError> {
+        let _mutation_guard = self.realtime_transcript_mutation_guard(id).await?;
+        let receipt = self
+            .inner
+            .resolve_live_assistant_playback_on_channel_close(id, channel_id)
+            .await?;
+        if receipt.is_some()
+            && let Err(error) = self.persist_full_session(id).await
+        {
+            let _ = self.discard_live_session_unfenced(id).await;
+            return Err(error);
+        }
+        Ok(receipt)
+    }
+
+    /// Persist an authorized canonical playback-prefix replacement before
+    /// releasing its SessionDocument-sealed classification receipt.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_live_assistant_playback_truncation(
+        &self,
+        id: &SessionId,
+        channel_id: meerkat_core::LiveChannelId,
+        interaction_id: meerkat_core::InteractionId,
+        response_id: String,
+        item_id: String,
+        content_index: u32,
+        evidence: meerkat_core::LiveAssistantPlaybackEvidence,
+    ) -> Result<meerkat_core::LiveAssistantPlaybackTruncationEvidence, SessionError> {
+        let _mutation_guard = self.realtime_transcript_mutation_guard(id).await?;
+        let receipt = self
+            .inner
+            .commit_live_assistant_playback_truncation(
+                id,
+                channel_id,
+                interaction_id,
+                response_id,
+                item_id,
+                content_index,
+                evidence,
+            )
+            .await?;
+        if let Err(error) = self.persist_full_session(id).await {
+            let _ = self.discard_live_session_unfenced(id).await;
+            return Err(error);
+        }
+        Ok(receipt)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_live_assistant_playback_complete(
+        &self,
+        id: &SessionId,
+        channel_id: meerkat_core::LiveChannelId,
+        interaction_id: meerkat_core::InteractionId,
+        response_id: String,
+        item_id: String,
+        content_index: u32,
+        stop_reason: meerkat_core::StopReason,
+        usage: meerkat_core::TurnUsage,
+    ) -> Result<meerkat_core::LiveAssistantPlaybackTruncationEvidence, SessionError> {
+        let _mutation_guard = self.realtime_transcript_mutation_guard(id).await?;
+        let receipt = self
+            .inner
+            .commit_live_assistant_playback_complete(
+                id,
+                channel_id,
+                interaction_id,
+                response_id,
+                item_id,
+                content_index,
+                stop_reason,
+                usage,
+            )
+            .await?;
+        if let Err(error) = self.persist_full_session(id).await {
+            let _ = self.discard_live_session_unfenced(id).await;
+            return Err(error);
+        }
+        Ok(receipt)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn observe_live_assistant_playback_terminal(
+        &self,
+        id: &SessionId,
+        channel_id: meerkat_core::LiveChannelId,
+        interaction_id: meerkat_core::InteractionId,
+        response_id: String,
+        item_id: String,
+        content_index: u32,
+        evidence: meerkat_core::LiveAssistantPlaybackEvidence,
+        stop_reason: meerkat_core::StopReason,
+        usage: meerkat_core::TurnUsage,
+    ) -> Result<crate::LiveAssistantPlaybackObservationResult, SessionError> {
+        let _mutation_guard = self.realtime_transcript_mutation_guard(id).await?;
+        let outcome = self
+            .inner
+            .observe_live_assistant_playback_terminal(
+                id,
+                channel_id,
+                interaction_id,
+                response_id,
+                item_id,
+                content_index,
+                evidence,
+                stop_reason,
+                usage,
+            )
+            .await?;
+        if let Err(error) = self.persist_full_session(id).await {
+            let _ = self.discard_live_session_unfenced(id).await;
+            return Err(error);
+        }
+        Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn observe_live_assistant_playback_final(
+        &self,
+        id: &SessionId,
+        channel_id: meerkat_core::LiveChannelId,
+        interaction_id: meerkat_core::InteractionId,
+        response_id: String,
+        item_id: String,
+        content_index: u32,
+    ) -> Result<Option<meerkat_core::LiveAssistantPlaybackTruncationEvidence>, SessionError> {
+        let _mutation_guard = self.realtime_transcript_mutation_guard(id).await?;
+        let receipt = self
+            .inner
+            .observe_live_assistant_playback_final(
+                id,
+                channel_id,
+                interaction_id,
+                response_id,
+                item_id,
+                content_index,
+            )
+            .await?;
+        if receipt.is_some()
+            && let Err(error) = self.persist_full_session(id).await
+        {
+            let _ = self.discard_live_session_unfenced(id).await;
+            return Err(error);
+        }
+        Ok(receipt)
     }
 
     async fn prepare_realtime_user_content_blob(
@@ -6520,7 +6941,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             .await
             .map_err(runtime_driver_error_to_session_error)?;
         let recovery_gate = self.recovery_gate_for_session(id).await;
-        let _turn_guard = recovery_gate.lock().await;
+        let turn_guard = recovery_gate.lock().await;
         // This live transcript is the just-finished turn awaiting its first
         // atomic runtime commit. Route on representation BEFORE exporting the
         // actor: WholeBlob retains the compatibility document, while
@@ -6558,6 +6979,12 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 "machine service-turn committed authority differs from the prepared boundary for session {id}"
             ))));
         }
+        let committed_authority_token = match committed_authority {
+            RuntimeSessionAuthority::WholeBlob(authority) => authority.blob_sha256().to_string(),
+            RuntimeSessionAuthority::HeadCanonical(authority) => {
+                authority.committed_head_token().to_string()
+            }
+        };
         if promotes_provisional_tail {
             let (committed_store_revision, committed_authority_token) = match committed_authority {
                 RuntimeSessionAuthority::WholeBlob(authority) => (
@@ -6578,7 +7005,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 .await;
         }
 
-        match staged_boundary.profile {
+        let acknowledgement = match staged_boundary.profile {
             RuntimeSessionPersistenceProfile::WholeBlobV1 => {
                 let authority = committed_authority.whole_blob().ok_or_else(|| {
                     SessionError::Agent(AgentError::InternalError(format!(
@@ -6599,7 +7026,23 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             profile => Err(SessionError::Agent(AgentError::InternalError(format!(
                 "unsupported committed machine service-turn persistence profile {profile} for session {id}"
             )))),
-        }
+        };
+        acknowledgement?;
+
+        // Provider I/O must not hold either the exact commit lease or the
+        // recovery gate. The committed boundary and store-issued authority
+        // token remain sealed inputs after those serialization guards drop.
+        drop(commit_lease);
+        drop(turn_guard);
+        #[cfg(feature = "live")]
+        protocol
+            .runtime_adapter
+            .enqueue_committed_parent_session_boundary(id, &committed, &committed_authority_token)
+            .await
+            .map_err(runtime_driver_error_to_session_error)?;
+        #[cfg(not(feature = "live"))]
+        let _ = (&committed, &committed_authority_token);
+        Ok(())
     }
 
     async fn start_turn_inner_with_admission(
@@ -7027,6 +7470,15 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     }
 
     async fn save_normalized_session(&self, session: Session) -> Result<Session, SessionError> {
+        self.save_normalized_session_with_write_fence(session, None)
+            .await
+    }
+
+    async fn save_normalized_session_with_write_fence(
+        &self,
+        session: Session,
+        write_fence: Option<Arc<dyn RuntimeStoreWriteFence>>,
+    ) -> Result<Session, SessionError> {
         let profile = self.runtime_store.session_persistence_profile();
         if profile != RuntimeSessionPersistenceProfile::WholeBlobV1 {
             return Err(SessionError::Agent(AgentError::InternalError(format!(
@@ -7038,6 +7490,12 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             .transcript_rewrite_commit_chain_for_persistence(&session)
             .await?;
         if !plan.commits.is_empty() {
+            if write_fence.is_some() {
+                return Err(SessionError::Unsupported(
+                    "fenced session-control snapshot cannot route through a transcript rewrite boundary"
+                        .to_string(),
+                ));
+            }
             return self
                 .persist_normalized_transcript_rewrite_chain(session, &plan.commits, false)
                 .await;
@@ -7058,18 +7516,41 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             })?
             .row_sha256_token()
             .to_string();
-        let result = self
-            .runtime_store
-            .commit_prepared_session_boundary(
-                &Self::runtime_id_for_session(&session_id),
-                meerkat_runtime::PreparedRuntimeSessionCommit::snapshot_only(committed),
-            )
-            .await
-            .map_err(|err| {
-                SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
-                    "runtime session control snapshot persistence failed: {err}"
-                )))
-            })?;
+        let request = meerkat_runtime::PreparedRuntimeSessionCommit::snapshot_only(committed);
+        let result = match write_fence {
+            Some(write_fence) => match self
+                .runtime_store
+                .commit_prepared_session_boundary_with_fence(
+                    &Self::runtime_id_for_session(&session_id),
+                    request,
+                    write_fence,
+                )
+                .await
+                .map_err(activation_store_error_to_session_error)?
+            {
+                meerkat_runtime::store::FencedPreparedRuntimeSessionCommitOutcome::Applied(
+                    result,
+                ) => result,
+                meerkat_runtime::store::FencedPreparedRuntimeSessionCommitOutcome::FenceConflict {
+                    reason,
+                } => return Err(SessionError::ExternalWriteFenceConflict { reason }),
+                meerkat_runtime::store::FencedPreparedRuntimeSessionCommitOutcome::FenceBackoff {
+                    reason,
+                } => return Err(SessionError::ExternalWriteFenceBackoff { reason }),
+            },
+            None => self
+                .runtime_store
+                .commit_prepared_session_boundary(
+                    &Self::runtime_id_for_session(&session_id),
+                    request,
+                )
+                .await
+                .map_err(|err| {
+                    SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+                        "runtime session control snapshot persistence failed: {err}"
+                    )))
+                })?,
+        };
         let authority = result
             .authority()
             .and_then(meerkat_runtime::store::RuntimeSessionAuthority::whole_blob)
@@ -8181,23 +8662,60 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         role: &str,
         prepared: PreparedRuntimeBoundary,
     ) -> Result<(usize, String), SessionError> {
+        self.commit_prepared_head_canonical_actor_boundary_with_write_fence(
+            id, role, prepared, None,
+        )
+        .await
+    }
+
+    async fn commit_prepared_head_canonical_actor_boundary_with_write_fence(
+        &self,
+        id: &SessionId,
+        role: &str,
+        prepared: PreparedRuntimeBoundary,
+        write_fence: Option<Arc<dyn RuntimeStoreWriteFence>>,
+    ) -> Result<(usize, String), SessionError> {
         if prepared.identity.profile != RuntimeSessionPersistenceProfile::HeadCanonicalV1 {
             return Err(SessionError::Agent(AgentError::InternalError(format!(
                 "{role} for session {id} produced a non-head-canonical actor boundary"
             ))));
         }
-        let result = self
-            .runtime_store
-            .commit_prepared_session_boundary(
-                &Self::runtime_id_for_session(id),
-                meerkat_runtime::PreparedRuntimeSessionCommit::snapshot_only(prepared.committed),
-            )
-            .await
-            .map_err(|error| {
-                SessionError::Agent(AgentError::InternalError(format!(
-                    "head-canonical {role} failed for session {id}: {error}"
-                )))
-            })?;
+        let request =
+            meerkat_runtime::PreparedRuntimeSessionCommit::snapshot_only(prepared.committed);
+        let result = match write_fence {
+            Some(write_fence) => match self
+                .runtime_store
+                .commit_prepared_session_boundary_with_fence(
+                    &Self::runtime_id_for_session(id),
+                    request,
+                    write_fence,
+                )
+                .await
+                .map_err(activation_store_error_to_session_error)?
+            {
+                meerkat_runtime::store::FencedPreparedRuntimeSessionCommitOutcome::Applied(
+                    result,
+                ) => result,
+                meerkat_runtime::store::FencedPreparedRuntimeSessionCommitOutcome::FenceConflict {
+                    reason,
+                } => return Err(SessionError::ExternalWriteFenceConflict { reason }),
+                meerkat_runtime::store::FencedPreparedRuntimeSessionCommitOutcome::FenceBackoff {
+                    reason,
+                } => return Err(SessionError::ExternalWriteFenceBackoff { reason }),
+            },
+            None => self
+                .runtime_store
+                .commit_prepared_session_boundary(
+                    &Self::runtime_id_for_session(id),
+                    request,
+                )
+                .await
+                .map_err(|error| {
+                    SessionError::Agent(AgentError::InternalError(format!(
+                        "head-canonical {role} failed for session {id}: {error}"
+                    )))
+                })?,
+        };
         let authority = result.authority().ok_or_else(|| {
             SessionError::Agent(AgentError::InternalError(format!(
                 "head-canonical {role} committed no session authority for session {id}"
@@ -10166,6 +10684,24 @@ impl<B: SessionAgentBuilder + 'static> SessionService for PersistentSessionServi
 
 #[async_trait]
 impl<B: SessionAgentBuilder + 'static> SessionServiceHistoryExt for PersistentSessionService<B> {
+    async fn read_instruction_activation_records(
+        &self,
+        id: &SessionId,
+        query: meerkat_core::InstructionActivationReadQuery,
+    ) -> Result<meerkat_core::InstructionActivationReadPage, SessionError> {
+        let session = self
+            .load_authoritative_session_base_for_observation(id)
+            .await?
+            .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
+        session
+            .instruction_activation_records(query)
+            .map_err(|error| {
+                SessionError::Agent(AgentError::ConfigError(format!(
+                    "instruction activation history rejected for session {id}: {error}"
+                )))
+            })
+    }
+
     async fn read_history(
         &self,
         id: &SessionId,
@@ -11473,7 +12009,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
 mod tests {
     use super::*;
     use crate::ephemeral::{
-        EphemeralSessionService, ObservedSessionTailKind, QueuedLosslessEvent, SessionAgent,
+        EphemeralSessionService, HeadCanonicalRuntimeBoundaryAcknowledgeOutcome,
+        HeadCanonicalRuntimeBoundaryPrepareRequest, ObservedSessionTailKind,
+        PreparedHeadCanonicalRuntimeBoundary, QueuedLosslessEvent, SessionAgent,
         SessionAgentBuilder, SessionSnapshot,
     };
     use crate::event_store::{
@@ -11483,8 +12021,8 @@ mod tests {
     use meerkat_core::event::AgentEvent;
     use meerkat_core::service::{
         DeferredPromptPolicy, InitialTurnPolicy, SessionBuildOptions, SessionService,
-        SessionServiceControlExt, StageToolResultsRequest, TranscriptEditRunningBehavior,
-        TranscriptRewriteReason, TranscriptRewriteSelection,
+        SessionServiceControlExt, SessionServiceHistoryExt, StageToolResultsRequest,
+        TranscriptEditRunningBehavior, TranscriptRewriteReason, TranscriptRewriteSelection,
     };
     use meerkat_core::session::SESSION_METADATA_KEY;
     use meerkat_core::session_store::{SessionHeadCas, TranscriptStrandId};
@@ -11492,7 +12030,12 @@ mod tests {
         ContentBlock, ContentInput, ImageData, Message, StopReason, ToolCall, ToolResult,
         UserMessage,
     };
-    use meerkat_core::{RunId, lifecycle::run_primitive::RunApplyBoundary};
+    use meerkat_core::{
+        InstructionActivationExpectation, InstructionActivationReadQuery,
+        InstructionActivationRequest, InstructionContentDigest, InstructionKey,
+        InstructionNamespace, InstructionRevisionId, InstructionRevisionRef, RunId,
+        lifecycle::run_primitive::RunApplyBoundary,
+    };
     use meerkat_runtime::{InMemoryRuntimeStore, RuntimeStore};
     use meerkat_store::{FsBlobStore, MemoryBlobStore, MemoryStore, SessionStoreError};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -11525,10 +12068,353 @@ mod tests {
         Arc::new(MemoryBlobStore::new())
     }
 
+    fn test_instruction_activation_request() -> InstructionActivationRequest {
+        let body = "Always report uncertainty explicitly.";
+        InstructionActivationRequest {
+            revision: InstructionRevisionRef {
+                namespace: InstructionNamespace::new("app.example").unwrap(),
+                key: InstructionKey::new("primary").unwrap(),
+                revision_id: InstructionRevisionId::new("revision-1").unwrap(),
+                content_sha256: InstructionContentDigest::for_body(body),
+            },
+            activation_id: meerkat_core::InstructionActivationId::new("activation-1").unwrap(),
+            expectation: InstructionActivationExpectation::Absent,
+            supersedes: None,
+            body: body.to_string(),
+        }
+    }
+
     fn queued_lossless_event(
         envelope: meerkat_core::event::EventEnvelope<AgentEvent>,
     ) -> QueuedLosslessEvent {
         QueuedLosslessEvent::new(Arc::new(envelope), Arc::new(AtomicUsize::new(0)))
+    }
+
+    #[tokio::test]
+    async fn instruction_activation_records_survive_a_service_restart() {
+        let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+        let runtime_store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+        let blob_store = memory_blob_store();
+        let service = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            Arc::clone(&store),
+            Arc::clone(&runtime_store),
+            Arc::clone(&blob_store),
+        );
+        let created = service
+            .create_session(create_request("seed", InitialTurnPolicy::Defer))
+            .await
+            .expect("create session");
+        let session_id = created.session_id;
+        committed_content_turn(&service, runtime_store.as_ref(), &session_id, "hello").await;
+        let body = "Always report uncertainty explicitly.";
+        let turn_boundary = service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+        let mutation = service
+            .activate_instruction_under_runtime_turn_boundary(
+                &session_id,
+                InstructionActivationRequest {
+                    revision: InstructionRevisionRef {
+                        namespace: InstructionNamespace::new("app.example").unwrap(),
+                        key: InstructionKey::new("primary").unwrap(),
+                        revision_id: InstructionRevisionId::new("revision-1").unwrap(),
+                        content_sha256: InstructionContentDigest::for_body(body),
+                    },
+                    activation_id: meerkat_core::InstructionActivationId::new("activation-1")
+                        .unwrap(),
+                    expectation: InstructionActivationExpectation::Absent,
+                    supersedes: None,
+                    body: body.to_string(),
+                },
+                None,
+            )
+            .await
+            .expect("commit activation");
+        assert!(matches!(
+            mutation,
+            InstructionActivationMutation::Appended(_)
+        ));
+        drop(turn_boundary);
+        drop(service);
+
+        let restarted =
+            PersistentSessionService::new(DummyBuilder, 4, store, runtime_store, blob_store);
+        let page = restarted
+            .read_instruction_activation_records(
+                &session_id,
+                InstructionActivationReadQuery::default(),
+            )
+            .await
+            .expect("read activation after restart");
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(
+            page.records[0].identity.activation_id.as_str(),
+            "activation-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn instruction_activation_persistence_failure_discards_the_mutated_actor() {
+        let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+        let runtime_store = Arc::new(GatedSnapshotRuntimeStore::new());
+        let service = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            Arc::clone(&store),
+            runtime_store.clone(),
+            memory_blob_store(),
+        );
+        let created = service
+            .create_session(create_request("seed", InitialTurnPolicy::Defer))
+            .await
+            .expect("create session");
+        let session_id = created.session_id;
+        committed_content_turn(&service, runtime_store.as_ref(), &session_id, "hello").await;
+        let authority_before = service
+            .load_authoritative_session(&session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let body = "Always report uncertainty explicitly.";
+        let turn_boundary = service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+        runtime_store.set_fail_snapshot_commits(true);
+
+        let error = service
+            .activate_instruction_under_runtime_turn_boundary(
+                &session_id,
+                InstructionActivationRequest {
+                    revision: InstructionRevisionRef {
+                        namespace: InstructionNamespace::new("app.example").unwrap(),
+                        key: InstructionKey::new("primary").unwrap(),
+                        revision_id: InstructionRevisionId::new("revision-1").unwrap(),
+                        content_sha256: InstructionContentDigest::for_body(body),
+                    },
+                    activation_id: meerkat_core::InstructionActivationId::new("activation-1")
+                        .unwrap(),
+                    expectation: InstructionActivationExpectation::Absent,
+                    supersedes: None,
+                    body: body.to_string(),
+                },
+                None,
+            )
+            .await
+            .expect_err("failed durable commit must not publish an activation receipt");
+        drop(turn_boundary);
+
+        assert!(
+            error
+                .to_string()
+                .contains("synthetic runtime snapshot commit failure")
+        );
+        assert!(matches!(
+            service.export_live_session(&session_id).await,
+            Err(SessionError::NotFound { .. })
+        ));
+        let authority_after = service
+            .load_authoritative_session(&session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(authority_after.messages(), authority_before.messages());
+        assert!(
+            authority_after
+                .instruction_activation_records(InstructionActivationReadQuery::default())
+                .unwrap()
+                .records
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn instruction_activation_whole_blob_export_failure_discards_the_mutated_actor() {
+        let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+        let runtime_store: Arc<dyn RuntimeStore> = Arc::new(WholeBlobAuthorityReadProbe {
+            inner: InMemoryRuntimeStore::new(),
+            bounded_authority_reads: AtomicUsize::new(0),
+            full_snapshot_reads: AtomicUsize::new(0),
+        });
+        let service = PersistentSessionService::new(
+            FailingInstructionActivationExportBuilder,
+            4,
+            Arc::clone(&store),
+            runtime_store,
+            memory_blob_store(),
+        );
+        let created = service
+            .create_session(create_request("seed", InitialTurnPolicy::Defer))
+            .await
+            .expect("create session");
+        let session_id = created.session_id;
+        let authority_before = service
+            .load_committed_runtime_session_for_body(
+                &session_id,
+                "head preparation failure test baseline",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let _turn_boundary = service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+
+        let error = service
+            .activate_instruction_under_runtime_turn_boundary(
+                &session_id,
+                test_instruction_activation_request(),
+                None,
+            )
+            .await
+            .expect_err("actor export failure must not publish an activation receipt");
+
+        assert!(
+            error
+                .to_string()
+                .contains("synthetic instruction activation export failure")
+        );
+        assert!(matches!(
+            service.export_live_session(&session_id).await,
+            Err(SessionError::NotFound { .. })
+        ));
+        let authority_after = service
+            .load_committed_runtime_session_for_body(
+                &session_id,
+                "head preparation failure test result",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(authority_after.messages(), authority_before.messages());
+    }
+
+    #[tokio::test]
+    async fn instruction_activation_head_preparation_failure_discards_the_mutated_actor() {
+        let tempdir = tempfile::tempdir().expect("runtime store tempdir");
+        let database_path = tempdir.path().join("runtime.sqlite3");
+        let runtime_store: Arc<dyn RuntimeStore> = Arc::new(
+            meerkat_runtime::SqliteRuntimeStore::new_head_canonical(&database_path)
+                .expect("head-canonical runtime store"),
+        );
+        let store: Arc<dyn SessionStore> = Arc::new(
+            meerkat_store::SqliteSessionStore::open(&database_path)
+                .expect("co-located head-canonical session store"),
+        );
+        assert_eq!(
+            runtime_store.session_persistence_profile(),
+            RuntimeSessionPersistenceProfile::HeadCanonicalV1
+        );
+        let service = PersistentSessionService::new(
+            FailingInstructionActivationExportBuilder,
+            4,
+            Arc::clone(&store),
+            runtime_store,
+            memory_blob_store(),
+        );
+        let created = service
+            .create_session(create_request("seed", InitialTurnPolicy::Defer))
+            .await
+            .expect("create session");
+        let session_id = created.session_id;
+        let authority_before = service
+            .load_committed_runtime_session_for_body(
+                &session_id,
+                "head commit failure test baseline",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let _turn_boundary = service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+
+        let error = service
+            .activate_instruction_under_runtime_turn_boundary(
+                &session_id,
+                test_instruction_activation_request(),
+                None,
+            )
+            .await
+            .expect_err("head preparation failure must not publish an activation receipt");
+
+        assert!(
+            error
+                .to_string()
+                .contains("synthetic instruction activation export failure")
+        );
+        assert!(matches!(
+            service.export_live_session(&session_id).await,
+            Err(SessionError::NotFound { .. })
+        ));
+        let authority_after = service
+            .load_committed_runtime_session_for_body(&session_id, "head commit failure test result")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(authority_after.messages(), authority_before.messages());
+    }
+
+    #[tokio::test]
+    async fn instruction_activation_head_commit_failure_discards_the_mutated_actor() {
+        let tempdir = tempfile::tempdir().expect("runtime store tempdir");
+        let database_path = tempdir.path().join("runtime.sqlite3");
+        let runtime_store = Arc::new(FailingHeadCanonicalCommitRuntimeStore {
+            inner: meerkat_runtime::SqliteRuntimeStore::new_head_canonical(&database_path)
+                .expect("head-canonical runtime store"),
+            fail_commits: AtomicBool::new(false),
+        });
+        let store: Arc<dyn SessionStore> = Arc::new(
+            meerkat_store::SqliteSessionStore::open(&database_path)
+                .expect("co-located head-canonical session store"),
+        );
+        let service = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            Arc::clone(&store),
+            runtime_store.clone(),
+            memory_blob_store(),
+        );
+        let created = service
+            .create_session(create_request("seed", InitialTurnPolicy::Defer))
+            .await
+            .expect("create session");
+        let session_id = created.session_id;
+        let authority_before = service
+            .load_authoritative_session(&session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let _turn_boundary = service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+        runtime_store.fail_commits.store(true, Ordering::Release);
+
+        let error = service
+            .activate_instruction_under_runtime_turn_boundary(
+                &session_id,
+                test_instruction_activation_request(),
+                None,
+            )
+            .await
+            .expect_err("head commit failure must not publish an activation receipt");
+
+        assert!(
+            error
+                .to_string()
+                .contains("synthetic head-canonical boundary commit failure")
+        );
+        assert!(matches!(
+            service.export_live_session(&session_id).await,
+            Err(SessionError::NotFound { .. })
+        ));
+        let authority_after = service
+            .load_authoritative_session(&session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(authority_after.messages(), authority_before.messages());
     }
 
     #[tokio::test]
@@ -13466,6 +14352,166 @@ mod tests {
         }
     }
 
+    struct FailingHeadCanonicalCommitRuntimeStore {
+        inner: meerkat_runtime::SqliteRuntimeStore,
+        fail_commits: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeStore for FailingHeadCanonicalCommitRuntimeStore {
+        fn session_authority_ops(&self) -> &dyn meerkat_runtime::store::RuntimeSessionAuthorityOps {
+            self.inner.session_authority_ops()
+        }
+
+        async fn commit_prepared_session_boundary(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            request: meerkat_runtime::PreparedRuntimeSessionCommit,
+        ) -> Result<
+            meerkat_runtime::store::PreparedRuntimeSessionCommitResult,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            if self.fail_commits.load(Ordering::Acquire) {
+                return Err(meerkat_runtime::store::RuntimeStoreError::WriteFailed(
+                    "synthetic head-canonical boundary commit failure".to_string(),
+                ));
+            }
+            self.inner
+                .commit_prepared_session_boundary(runtime_id, request)
+                .await
+        }
+
+        async fn commit_session_snapshot(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            session_delta: SerializedSessionSnapshot,
+        ) -> Result<(), meerkat_runtime::store::RuntimeStoreError> {
+            self.inner
+                .commit_session_snapshot(runtime_id, session_delta)
+                .await
+        }
+
+        async fn commit_prepared_whole_blob_rewrite_boundary(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            boundary: meerkat_runtime::store::PreparedWholeBlobRewriteStoreParts,
+        ) -> Result<WholeBlobStoreAuthority, meerkat_runtime::store::RuntimeStoreError> {
+            self.inner
+                .commit_prepared_whole_blob_rewrite_boundary(runtime_id, boundary)
+                .await
+        }
+
+        async fn atomic_apply(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            session_delta: Option<SerializedSessionSnapshot>,
+            receipt: meerkat_core::lifecycle::RunBoundaryReceipt,
+            input_updates: Vec<InputStatePersistenceRecord>,
+            session_store_key: Option<SessionId>,
+        ) -> Result<(), meerkat_runtime::store::RuntimeStoreError> {
+            self.inner
+                .atomic_apply(
+                    runtime_id,
+                    session_delta,
+                    receipt,
+                    input_updates,
+                    session_store_key,
+                )
+                .await
+        }
+
+        async fn load_input_states(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<Vec<meerkat_runtime::InputStateRow>, meerkat_runtime::store::RuntimeStoreError>
+        {
+            self.inner.load_input_states(runtime_id).await
+        }
+
+        async fn load_boundary_receipt(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            run_id: &RunId,
+            sequence: u64,
+        ) -> Result<
+            Option<meerkat_core::lifecycle::RunBoundaryReceipt>,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner
+                .load_boundary_receipt(runtime_id, run_id, sequence)
+                .await
+        }
+
+        async fn load_session_snapshot(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<Option<Arc<Vec<u8>>>, meerkat_runtime::store::RuntimeStoreError> {
+            self.inner.load_session_snapshot(runtime_id).await
+        }
+
+        async fn clear_session_snapshot(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<(), meerkat_runtime::store::RuntimeStoreError> {
+            self.inner.clear_session_snapshot(runtime_id).await
+        }
+
+        async fn replace_session_snapshot_if_current(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            expected_current: &[u8],
+            replacement: Vec<u8>,
+        ) -> Result<bool, meerkat_runtime::store::RuntimeStoreError> {
+            self.inner
+                .replace_session_snapshot_if_current(runtime_id, expected_current, replacement)
+                .await
+        }
+
+        async fn clear_session_snapshot_if_current(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            expected_current: &[u8],
+        ) -> Result<bool, meerkat_runtime::store::RuntimeStoreError> {
+            self.inner
+                .clear_session_snapshot_if_current(runtime_id, expected_current)
+                .await
+        }
+
+        async fn persist_input_state(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            state: &InputStatePersistenceRecord,
+        ) -> Result<(), meerkat_runtime::store::RuntimeStoreError> {
+            self.inner.persist_input_state(runtime_id, state).await
+        }
+
+        async fn load_input_state(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            input_id: &InputId,
+        ) -> Result<Option<StoredInputState>, meerkat_runtime::store::RuntimeStoreError> {
+            self.inner.load_input_state(runtime_id, input_id).await
+        }
+
+        async fn load_machine_lifecycle_record(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<Option<Vec<u8>>, meerkat_runtime::store::RuntimeStoreError> {
+            self.inner.load_machine_lifecycle_record(runtime_id).await
+        }
+
+        async fn commit_machine_lifecycle(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            commit: meerkat_runtime::store::MachineLifecycleCommit,
+            input_states: &[InputStatePersistenceRecord],
+        ) -> Result<(), meerkat_runtime::store::RuntimeStoreError> {
+            self.inner
+                .commit_machine_lifecycle(runtime_id, commit, input_states)
+                .await
+        }
+    }
+
     struct GatedSnapshotRuntimeStore {
         inner: InMemoryRuntimeStore,
         hidden_snapshot_loads: AtomicUsize,
@@ -14434,6 +15480,8 @@ mod tests {
         callback_pending_after_run: bool,
         execution_snapshot: Option<meerkat_core::AgentExecutionSnapshot>,
         compaction_abort_failure: Option<String>,
+        export_failure_after_activation: Option<Arc<AtomicBool>>,
+        pending_head_canonical_boundary: Option<PreparedHeadCanonicalRuntimeBoundary>,
     }
 
     #[async_trait::async_trait]
@@ -14652,6 +15700,15 @@ mod tests {
         }
 
         fn session_clone(&self) -> Result<Session, AgentError> {
+            if self
+                .export_failure_after_activation
+                .as_ref()
+                .is_some_and(|failure| failure.load(Ordering::Acquire))
+            {
+                return Err(AgentError::InternalError(
+                    "synthetic instruction activation export failure".to_string(),
+                ));
+            }
             match self.session.lock() {
                 Ok(guard) => Ok(guard.clone()),
                 Err(poisoned) => Ok(poisoned.into_inner().clone()),
@@ -14739,6 +15796,133 @@ mod tests {
                     meerkat_core::types::message_timestamp_now(),
                 )
                 .map_err(|error| AgentError::ConfigError(error.to_string()))
+        }
+
+        fn activate_instruction_control(
+            &mut self,
+            request: meerkat_core::InstructionActivationRequest,
+        ) -> Result<
+            meerkat_core::InstructionActivationMutation,
+            meerkat_core::InstructionActivationError,
+        > {
+            let mut session = self
+                .session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mutation = session.activate_instruction(request)?;
+            if matches!(mutation, InstructionActivationMutation::Appended(_))
+                && let Some(failure) = self.export_failure_after_activation.as_ref()
+            {
+                failure.store(true, Ordering::Release);
+            }
+            Ok(mutation)
+        }
+
+        async fn prepare_head_canonical_runtime_boundary(
+            &mut self,
+            request: HeadCanonicalRuntimeBoundaryPrepareRequest,
+        ) -> Result<PreparedHeadCanonicalRuntimeBoundary, AgentError> {
+            if let Some(prepared) = self.pending_head_canonical_boundary.as_ref() {
+                return Ok(prepared.clone());
+            }
+            let (authority, observed_head, deferred_turn_state, _projection_token, blob_store) =
+                request.into_parts();
+            let mut session = self.session_clone()?;
+            let suffix_start = observed_head.as_ref().map_or(0, |head| {
+                usize::try_from(head.message_count).unwrap_or(usize::MAX)
+            });
+            session
+                .externalize_media(blob_store.as_ref(), suffix_start)
+                .await
+                .map_err(|error| AgentError::InternalError(error.to_string()))?;
+            session
+                .set_deferred_turn_state(deferred_turn_state)
+                .map_err(|error| AgentError::InternalError(error.to_string()))?;
+            {
+                let mut live_session = self
+                    .session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *live_session = session.clone();
+            }
+            let mutation = match authority {
+                HeadCanonicalRuntimeBoundaryAuthority::Root => {
+                    if observed_head.is_some() {
+                        return Err(AgentError::InternalError(
+                            "test head-canonical root observed an existing physical head"
+                                .to_string(),
+                        ));
+                    }
+                    meerkat_core::session_store::PreparedHeadCanonicalMutation::prepare_root(
+                        &session,
+                    )
+                    .map(
+                        meerkat_core::lifecycle::core_executor::PreparedHeadCanonicalPhysicalMutation::from,
+                    )
+                }
+                HeadCanonicalRuntimeBoundaryAuthority::Successor { boundary_head, .. } => {
+                    let observed_head = observed_head.ok_or_else(|| {
+                        AgentError::InternalError(
+                            "test head-canonical successor omitted observed head".to_string(),
+                        )
+                    })?;
+                    let rewrite_required =
+                        meerkat_core::session_store::PreparedHeadCanonicalRewriteMutation::is_required(
+                            &session,
+                            &observed_head,
+                        )
+                        .map_err(|error| AgentError::InternalError(error.to_string()))?;
+                    if rewrite_required {
+                        meerkat_core::session_store::PreparedHeadCanonicalRewriteMutation::prepare_successor(
+                            &session,
+                            &boundary_head,
+                            observed_head,
+                        )
+                        .map(
+                            meerkat_core::lifecycle::core_executor::PreparedHeadCanonicalPhysicalMutation::from,
+                        )
+                    } else {
+                        meerkat_core::session_store::PreparedHeadCanonicalMutation::prepare(
+                            &session,
+                            Some(observed_head),
+                        )
+                        .map(
+                            meerkat_core::lifecycle::core_executor::PreparedHeadCanonicalPhysicalMutation::from,
+                        )
+                    }
+                }
+            }
+            .map_err(|error| AgentError::InternalError(error.to_string()))?;
+            let committed =
+                BoundSessionCommit::head_canonical_physical_from_session(&session, mutation)
+                    .map_err(|error| AgentError::InternalError(error.to_string()))?;
+            let prepared = PreparedHeadCanonicalRuntimeBoundary::new(committed)
+                .map_err(|error| AgentError::InternalError(error.to_string()))?;
+            self.pending_head_canonical_boundary = Some(prepared.clone());
+            Ok(prepared)
+        }
+
+        fn acknowledge_head_canonical_runtime_boundary(
+            &mut self,
+            successor_head_token: &str,
+        ) -> Result<HeadCanonicalRuntimeBoundaryAcknowledgeOutcome, AgentError> {
+            let prepared = self.pending_head_canonical_boundary.take().ok_or_else(|| {
+                AgentError::InternalError(
+                    "test agent has no prepared head-canonical boundary".to_string(),
+                )
+            })?;
+            let boundary = prepared.committed().head_canonical().ok_or_else(|| {
+                AgentError::InternalError("test boundary is not head-canonical".to_string())
+            })?;
+            let mut session = self
+                .session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            boundary
+                .mutation()
+                .acknowledge_session(&mut session, successor_head_token)
+                .map_err(|error| AgentError::InternalError(error.to_string()))?;
+            Ok(HeadCanonicalRuntimeBoundaryAcknowledgeOutcome::Applied)
         }
 
         fn transient_turn_context_state(&self) -> meerkat_core::TransientTurnContextStateHandle {
@@ -15164,6 +16348,8 @@ mod tests {
                     callback_pending_after_run: false,
                     execution_snapshot: None,
                     compaction_abort_failure: None,
+                    export_failure_after_activation: None,
+                    pending_head_canonical_boundary: None,
                 },
                 comms,
                 injector,
@@ -15195,6 +16381,38 @@ mod tests {
                 callback_pending_after_run: false,
                 execution_snapshot: None,
                 compaction_abort_failure: None,
+                export_failure_after_activation: None,
+                pending_head_canonical_boundary: None,
+            })
+        }
+    }
+
+    struct FailingInstructionActivationExportBuilder;
+
+    #[async_trait::async_trait]
+    impl SessionAgentBuilder for FailingInstructionActivationExportBuilder {
+        type Agent = DummyAgent;
+
+        async fn build_agent(
+            &self,
+            req: &CreateSessionRequest,
+            _event_tx: tokio::sync::mpsc::Sender<meerkat_core::event::AgentEvent>,
+        ) -> Result<Self::Agent, SessionError> {
+            let session = req
+                .build
+                .as_ref()
+                .and_then(|build| build.resume_session.clone())
+                .unwrap_or_default();
+            Ok(DummyAgent {
+                session: Arc::new(std::sync::Mutex::new(session)),
+                transient_turn_context_state: test_transient_turn_context_state_handle(),
+                run_failure: None,
+                flow_overlay_failure: None,
+                callback_pending_after_run: false,
+                execution_snapshot: None,
+                compaction_abort_failure: None,
+                export_failure_after_activation: Some(Arc::new(AtomicBool::new(false))),
+                pending_head_canonical_boundary: None,
             })
         }
     }
@@ -15225,6 +16443,8 @@ mod tests {
                 compaction_abort_failure: Some(
                     "synthetic rejected-run compaction abort failure".to_string(),
                 ),
+                export_failure_after_activation: None,
+                pending_head_canonical_boundary: None,
             })
         }
     }
@@ -15256,6 +16476,8 @@ mod tests {
                 callback_pending_after_run: false,
                 execution_snapshot: None,
                 compaction_abort_failure: None,
+                export_failure_after_activation: None,
+                pending_head_canonical_boundary: None,
             })
         }
     }
@@ -15284,6 +16506,8 @@ mod tests {
                 callback_pending_after_run: true,
                 execution_snapshot: None,
                 compaction_abort_failure: None,
+                export_failure_after_activation: None,
+                pending_head_canonical_boundary: None,
             })
         }
     }
@@ -15312,6 +16536,8 @@ mod tests {
                 callback_pending_after_run: false,
                 execution_snapshot: None,
                 compaction_abort_failure: None,
+                export_failure_after_activation: None,
+                pending_head_canonical_boundary: None,
             })
         }
     }
@@ -15406,6 +16632,8 @@ mod tests {
                 callback_pending_after_run: false,
                 execution_snapshot: None,
                 compaction_abort_failure: None,
+                export_failure_after_activation: None,
+                pending_head_canonical_boundary: None,
             })
         }
     }
@@ -15475,6 +16703,8 @@ mod tests {
                     callback_pending_after_run: false,
                     execution_snapshot: None,
                     compaction_abort_failure: None,
+                    export_failure_after_activation: None,
+                    pending_head_canonical_boundary: None,
                 },
                 entered_runs: Arc::clone(&self.entered_runs),
                 entered_notify: Arc::clone(&self.entered_notify),
@@ -15614,6 +16844,8 @@ mod tests {
                     callback_pending_after_run: false,
                     execution_snapshot: None,
                     compaction_abort_failure: None,
+                    export_failure_after_activation: None,
+                    pending_head_canonical_boundary: None,
                 },
                 extra_events: 0,
             })
@@ -15647,6 +16879,8 @@ mod tests {
                     callback_pending_after_run: false,
                     execution_snapshot: None,
                     compaction_abort_failure: None,
+                    export_failure_after_activation: None,
+                    pending_head_canonical_boundary: None,
                 },
                 extra_events: self.extra_events,
             })
@@ -15677,6 +16911,8 @@ mod tests {
                 callback_pending_after_run: false,
                 execution_snapshot: None,
                 compaction_abort_failure: None,
+                export_failure_after_activation: None,
+                pending_head_canonical_boundary: None,
             })
         }
     }
@@ -15735,6 +16971,8 @@ mod tests {
                 callback_pending_after_run: false,
                 execution_snapshot: Some(machine_terminal_tool_failure_snapshot()),
                 compaction_abort_failure: None,
+                export_failure_after_activation: None,
+                pending_head_canonical_boundary: None,
             })
         }
     }
@@ -15762,6 +17000,8 @@ mod tests {
                     callback_pending_after_run: false,
                     execution_snapshot: Some(machine_terminal_tool_failure_snapshot()),
                     compaction_abort_failure: None,
+                    export_failure_after_activation: None,
+                    pending_head_canonical_boundary: None,
                 },
                 extra_events: 0,
             })
@@ -15805,6 +17045,8 @@ mod tests {
                 callback_pending_after_run: false,
                 execution_snapshot: None,
                 compaction_abort_failure: None,
+                export_failure_after_activation: None,
+                pending_head_canonical_boundary: None,
             })
         }
     }

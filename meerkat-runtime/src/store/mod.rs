@@ -29,7 +29,8 @@ use crate::runtime_state::RuntimeState;
 const LEGACY_MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 1;
 const SUPERVISOR_MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 2;
 const UNREGISTER_MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 3;
-pub(crate) const MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 4;
+const RUN_MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 4;
+pub(crate) const MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 5;
 
 /// Maximum number of exact input-state rows admitted by one compare-and-swap
 /// boundary. Directed-terminal outbox batches share the same 256-row bound as
@@ -2292,6 +2293,19 @@ impl PreparedRuntimeSessionCommitResult {
     }
 }
 
+/// Result of a prepared session-boundary commit performed under an external
+/// durable authority fence.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FencedPreparedRuntimeSessionCommitOutcome {
+    /// The backend invoked the target commit while the fence was retained.
+    Applied(PreparedRuntimeSessionCommitResult),
+    /// The external authority was superseded. No target write was invoked.
+    FenceConflict { reason: String },
+    /// The external authority could not be checked without waiting. No target
+    /// write was invoked and the caller should re-observe before retrying.
+    FenceBackoff { reason: String },
+}
+
 /// Errors from RuntimeStore operations.
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
@@ -2314,6 +2328,14 @@ pub enum RuntimeStoreError {
     /// Operation is not supported by this store implementation.
     #[error("Unsupported store operation: {0}")]
     Unsupported(String),
+    /// An external authority fence proved that the prepared target write was
+    /// superseded. The target operation was not invoked.
+    #[error("Runtime store write fence conflict: {reason}")]
+    WriteFenceConflict { reason: String },
+    /// An external authority fence could not be checked without waiting. The
+    /// target operation was not invoked and the caller should re-observe.
+    #[error("Runtime store write fence backoff: {reason}")]
+    WriteFenceBackoff { reason: String },
     /// Direct-member semantic authority is malformed before durable admission.
     #[error("Invalid direct-member incarnation: {reason}")]
     InvalidDirectMemberIncarnation { reason: String },
@@ -4851,6 +4873,62 @@ impl PreparedRuntimeSessionCommit {
     }
 }
 
+/// Backend-only execution carrier for an ordinary or explicitly fenced
+/// prepared session boundary.
+///
+/// The public prepared request never contains an optional fence. RuntimeStore
+/// constructs this carrier only after selecting the ordinary or fenced verb,
+/// so no caller can smuggle external authority through the ordinary commit
+/// path.
+#[doc(hidden)]
+pub struct PreparedRuntimeSessionCommitExecution {
+    request: PreparedRuntimeSessionCommit,
+    write_fence: Option<std::sync::Arc<dyn RuntimeStoreWriteFence>>,
+}
+
+impl std::fmt::Debug for PreparedRuntimeSessionCommitExecution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedRuntimeSessionCommitExecution")
+            .field("kind", &self.request.kind())
+            .field("write_fenced", &self.write_fence.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedRuntimeSessionCommitExecution {
+    fn ordinary(request: PreparedRuntimeSessionCommit) -> Self {
+        Self {
+            request,
+            write_fence: None,
+        }
+    }
+
+    fn fenced(
+        request: PreparedRuntimeSessionCommit,
+        write_fence: std::sync::Arc<dyn RuntimeStoreWriteFence>,
+    ) -> Result<Self, RuntimeStoreError> {
+        if request.kind() != PreparedRuntimeSessionCommitKind::SnapshotOnly {
+            return Err(RuntimeStoreError::Unsupported(format!(
+                "external write fencing is unsupported for prepared {:?} session boundaries",
+                request.kind()
+            )));
+        }
+        Ok(Self {
+            request,
+            write_fence: Some(write_fence),
+        })
+    }
+
+    pub(crate) fn into_payload_and_write_fence(
+        self,
+    ) -> (
+        PreparedRuntimeSessionCommitPayload,
+        Option<std::sync::Arc<dyn RuntimeStoreWriteFence>>,
+    ) {
+        (self.request.into_payload(), self.write_fence)
+    }
+}
+
 /// Store-internal exact pairing produced only from a sealed typed WholeBlob
 /// boundary. Backends consume the typed Session for guards and compaction
 /// intents while writing the already-materialized shared bytes and authority.
@@ -5380,6 +5458,7 @@ pub struct DecodedMachineLifecycleObservation {
     run: MachineLifecycleRunFacts,
     supervisor_authority: SupervisorAuthoritySnapshot,
     unregister_progress: Option<MachineUnregisterProgressSnapshot>,
+    live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage,
 }
 
 impl DecodedMachineLifecycleObservation {
@@ -5411,6 +5490,10 @@ impl DecodedMachineLifecycleObservation {
     #[must_use]
     pub fn unregister_progress(&self) -> Option<&MachineUnregisterProgressSnapshot> {
         self.unregister_progress.as_ref()
+    }
+
+    pub(crate) fn live_bridge_recovery(&self) -> &crate::live_execution::LiveBridgeRecoveryImage {
+        &self.live_bridge_recovery
     }
 }
 
@@ -5522,8 +5605,9 @@ pub enum RuntimeStoreWriteFenceOutcome {
 /// must be evaluated using the authority store's own clock while that guard is
 /// held, never a caller-supplied observation timestamp. Once a successful
 /// operation returns, the fence must return Applied without a new fallible
-/// boundary. Implementations must not re-enter the same RuntimeStore from this
-/// callback.
+/// boundary. The caller defensively treats a successful target operation as
+/// Applied even if a fence implementation then returns a contradictory result.
+/// Implementations must not re-enter the same RuntimeStore from this callback.
 pub trait RuntimeStoreWriteFence: Send + Sync {
     fn execute_if_current(
         &self,
@@ -5543,26 +5627,77 @@ pub(crate) fn execute_runtime_store_write_fence(
         *operation_result.borrow_mut() = Some(result.clone());
         result
     };
-    let outcome = write_fence.execute_if_current(Box::new(checked_operation))?;
-    if let Some(Err(error)) = operation_result.borrow_mut().take() {
-        return Err(error);
+    let fence_result = write_fence.execute_if_current(Box::new(checked_operation));
+    let operation_result = operation_result.borrow_mut().take();
+    if invoked.get() {
+        return match operation_result {
+            Some(Ok(())) => {
+                // The target publication is canonical. A fence implementation
+                // that introduces a later error or contradictory disposition
+                // must not turn an already-committed write into a false
+                // rejection at the caller.
+                Ok(RuntimeStoreWriteFenceOutcome::Applied)
+            }
+            Some(Err(error)) => Err(error),
+            None => Err(RuntimeStoreError::Internal(
+                "runtime write fence invoked the target operation without preserving its result"
+                    .to_string(),
+            )),
+        };
     }
-    let shape_is_valid = matches!(
-        (&outcome, invoked.get()),
-        (RuntimeStoreWriteFenceOutcome::Applied, true)
-            | (
-                RuntimeStoreWriteFenceOutcome::Conflict { .. }
-                    | RuntimeStoreWriteFenceOutcome::Backoff { .. },
-                false,
-            )
-    );
-    if !shape_is_valid {
+    if operation_result.is_some() {
         return Err(RuntimeStoreError::Internal(
-            "runtime write fence returned an outcome inconsistent with operation execution"
+            "runtime write fence preserved an operation result without invoking the operation"
                 .to_string(),
         ));
     }
-    Ok(outcome)
+    match fence_result? {
+        RuntimeStoreWriteFenceOutcome::Conflict { reason } => {
+            Ok(RuntimeStoreWriteFenceOutcome::Conflict { reason })
+        }
+        RuntimeStoreWriteFenceOutcome::Backoff { reason } => {
+            Ok(RuntimeStoreWriteFenceOutcome::Backoff { reason })
+        }
+        RuntimeStoreWriteFenceOutcome::Applied => Err(RuntimeStoreError::Internal(
+            "runtime write fence returned Applied without invoking the target operation"
+                .to_string(),
+        )),
+    }
+}
+
+/// Execute one already-prepared physical target write under an optional
+/// external authority fence.
+///
+/// Backends call this only while holding their own row lock or transaction.
+/// The closure must contain the target publication itself (for SQLite, the
+/// transaction commit), not merely staging work that can later be rolled back
+/// or committed outside the external guard.
+pub(crate) fn execute_optional_runtime_store_target_write<T>(
+    write_fence: Option<&dyn RuntimeStoreWriteFence>,
+    operation: impl FnOnce() -> Result<T, RuntimeStoreError>,
+) -> Result<T, RuntimeStoreError> {
+    let Some(write_fence) = write_fence else {
+        return operation();
+    };
+    let result = std::cell::RefCell::new(None);
+    let outcome = execute_runtime_store_write_fence(write_fence, || {
+        let value = operation()?;
+        *result.borrow_mut() = Some(value);
+        Ok(())
+    })?;
+    match outcome {
+        RuntimeStoreWriteFenceOutcome::Applied => result.into_inner().ok_or_else(|| {
+            RuntimeStoreError::Internal(
+                "runtime write fence applied without returning the target result".to_string(),
+            )
+        }),
+        RuntimeStoreWriteFenceOutcome::Conflict { reason } => {
+            Err(RuntimeStoreError::WriteFenceConflict { reason })
+        }
+        RuntimeStoreWriteFenceOutcome::Backoff { reason } => {
+            Err(RuntimeStoreError::WriteFenceBackoff { reason })
+        }
+    }
 }
 
 /// Result of a target-local lifecycle CAS performed under an external fence.
@@ -5610,6 +5745,7 @@ pub struct MachineLifecycleSnapshot {
     run: MachineLifecycleRunFacts,
     supervisor_authority: SupervisorAuthoritySnapshot,
     unregister_progress: Option<MachineUnregisterProgressSnapshot>,
+    live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage,
 }
 
 /// Durable generated unregister-saga progress needed to resume an interrupted
@@ -5693,12 +5829,31 @@ impl MachineLifecycleSnapshot {
         supervisor_authority: SupervisorAuthoritySnapshot,
         unregister_progress: Option<MachineUnregisterProgressSnapshot>,
     ) -> Self {
+        Self::new_with_run_unregister_progress_and_live_bridge(
+            runtime_state,
+            binding,
+            run,
+            supervisor_authority,
+            unregister_progress,
+            crate::live_execution::LiveBridgeRecoveryImage::default(),
+        )
+    }
+
+    pub(crate) fn new_with_run_unregister_progress_and_live_bridge(
+        runtime_state: RuntimeState,
+        binding: MachineLifecycleBindingFacts,
+        run: MachineLifecycleRunFacts,
+        supervisor_authority: SupervisorAuthoritySnapshot,
+        unregister_progress: Option<MachineUnregisterProgressSnapshot>,
+        live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage,
+    ) -> Self {
         Self {
             runtime_state,
             binding,
             run,
             supervisor_authority,
             unregister_progress,
+            live_bridge_recovery,
         }
     }
 
@@ -5723,6 +5878,10 @@ impl MachineLifecycleSnapshot {
 
     pub fn unregister_progress(&self) -> Option<&MachineUnregisterProgressSnapshot> {
         self.unregister_progress.as_ref()
+    }
+
+    pub(crate) fn live_bridge_recovery(&self) -> &crate::live_execution::LiveBridgeRecoveryImage {
+        &self.live_bridge_recovery
     }
 }
 
@@ -5836,6 +5995,40 @@ struct MachineLifecycleSnapshotStoreWire {
     pre_run_phase: Option<MachineLifecyclePreRunPhase>,
     supervisor_authority: SupervisorAuthoritySnapshotStoreWire,
     unregister_progress: Option<MachineUnregisterProgressSnapshotStoreWire>,
+    live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MachineLifecycleObservationStoreWireV5 {
+    record_version: u16,
+    #[allow(
+        clippy::option_option,
+        reason = "serde distinguishes a missing phase from an explicitly absent observed phase"
+    )]
+    #[serde(default, deserialize_with = "deserialize_present_nullable")]
+    runtime_state: Option<Option<RuntimeState>>,
+    binding: MachineLifecycleBindingFactsStoreWire,
+    #[allow(
+        clippy::option_option,
+        reason = "serde distinguishes a missing run id from an explicitly absent run id"
+    )]
+    #[serde(default, deserialize_with = "deserialize_present_nullable")]
+    current_run_id: Option<Option<RunId>>,
+    #[allow(
+        clippy::option_option,
+        reason = "serde distinguishes a missing pre-run phase from an explicitly absent phase"
+    )]
+    #[serde(default, deserialize_with = "deserialize_present_nullable")]
+    pre_run_phase: Option<Option<MachineLifecyclePreRunPhase>>,
+    supervisor_authority: SupervisorAuthoritySnapshotStoreWire,
+    #[allow(
+        clippy::option_option,
+        reason = "serde distinguishes a missing v5 field from explicit null progress"
+    )]
+    #[serde(default, deserialize_with = "deserialize_present_nullable")]
+    unregister_progress: Option<Option<MachineUnregisterProgressSnapshotStoreWire>>,
+    live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage,
 }
 
 #[derive(serde::Deserialize)]
@@ -6615,6 +6808,7 @@ impl From<&MachineLifecycleSnapshot> for MachineLifecycleSnapshotStoreWire {
             pre_run_phase: snapshot.run().pre_run_phase(),
             supervisor_authority: snapshot.supervisor_authority().into(),
             unregister_progress: snapshot.unregister_progress().map(Into::into),
+            live_bridge_recovery: snapshot.live_bridge_recovery().clone(),
         }
     }
 }
@@ -6667,7 +6861,7 @@ fn decode_machine_lifecycle_observation_v4(
 ) -> Result<DecodedMachineLifecycleObservation, RuntimeStoreError> {
     let record = serde_json::from_slice::<MachineLifecycleObservationStoreWireV4>(bytes)
         .map_err(|err| RuntimeStoreError::ReadFailed(err.to_string()))?;
-    if record.record_version != MACHINE_LIFECYCLE_STORE_RECORD_VERSION {
+    if record.record_version != RUN_MACHINE_LIFECYCLE_STORE_RECORD_VERSION {
         return Err(RuntimeStoreError::ReadFailed(format!(
             "unsupported machine lifecycle store record version {}",
             record.record_version
@@ -6687,6 +6881,40 @@ fn decode_machine_lifecycle_observation_v4(
         run: MachineLifecycleRunFacts::new(current_run_id, pre_run_phase),
         supervisor_authority: record.supervisor_authority.try_into()?,
         unregister_progress,
+        live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage::default(),
+    })
+}
+
+fn decode_machine_lifecycle_observation_v5(
+    bytes: &[u8],
+) -> Result<DecodedMachineLifecycleObservation, RuntimeStoreError> {
+    let record = serde_json::from_slice::<MachineLifecycleObservationStoreWireV5>(bytes)
+        .map_err(|err| RuntimeStoreError::ReadFailed(err.to_string()))?;
+    if record.record_version != MACHINE_LIFECYCLE_STORE_RECORD_VERSION {
+        return Err(RuntimeStoreError::ReadFailed(format!(
+            "unsupported machine lifecycle store record version {}",
+            record.record_version
+        )));
+    }
+    let runtime_state = require_present_nullable(record.runtime_state, "runtime_state")?;
+    let current_run_id = require_present_nullable(record.current_run_id, "current_run_id")?;
+    let pre_run_phase = require_present_nullable(record.pre_run_phase, "pre_run_phase")?;
+    let unregister_progress =
+        require_present_nullable(record.unregister_progress, "unregister_progress")?
+            .map(Into::into);
+    validate_unregister_progress_snapshot(unregister_progress.as_ref())?;
+    record
+        .live_bridge_recovery
+        .validate_bound()
+        .map_err(RuntimeStoreError::ReadFailed)?;
+    Ok(DecodedMachineLifecycleObservation {
+        record_version: record.record_version,
+        runtime_state,
+        binding: record.binding.try_into()?,
+        run: MachineLifecycleRunFacts::new(current_run_id, pre_run_phase),
+        supervisor_authority: record.supervisor_authority.try_into()?,
+        unregister_progress,
+        live_bridge_recovery: record.live_bridge_recovery,
     })
 }
 
@@ -6701,6 +6929,7 @@ fn decoded_machine_lifecycle_from_snapshot(
         run: snapshot.run,
         supervisor_authority: snapshot.supervisor_authority,
         unregister_progress: snapshot.unregister_progress,
+        live_bridge_recovery: snapshot.live_bridge_recovery,
     }
 }
 
@@ -6745,7 +6974,7 @@ fn decode_machine_lifecycle_store_record(
                 .map_err(|err| RuntimeStoreError::ReadFailed(err.to_string()))?;
             MachineLifecycleSnapshot::try_from(record)
         }
-        MACHINE_LIFECYCLE_STORE_RECORD_VERSION => {
+        RUN_MACHINE_LIFECYCLE_STORE_RECORD_VERSION => {
             let record = decode_machine_lifecycle_observation_v4(bytes)?;
             let runtime_state = record.runtime_state.ok_or_else(|| {
                 RuntimeStoreError::ReadFailed(
@@ -6759,6 +6988,24 @@ fn decode_machine_lifecycle_store_record(
                     record.run,
                     record.supervisor_authority,
                     record.unregister_progress,
+                ),
+            )
+        }
+        MACHINE_LIFECYCLE_STORE_RECORD_VERSION => {
+            let record = decode_machine_lifecycle_observation_v5(bytes)?;
+            let runtime_state = record.runtime_state.ok_or_else(|| {
+                RuntimeStoreError::ReadFailed(
+                    "machine lifecycle runtime_state cannot be null for strict recovery".into(),
+                )
+            })?;
+            Ok(
+                MachineLifecycleSnapshot::new_with_run_unregister_progress_and_live_bridge(
+                    runtime_state,
+                    record.binding,
+                    record.run,
+                    record.supervisor_authority,
+                    record.unregister_progress,
+                    record.live_bridge_recovery,
                 ),
             )
         }
@@ -6800,6 +7047,7 @@ fn classify_machine_lifecycle_record(bytes: &[u8]) -> MachineLifecycleObservatio
         u64::from(LEGACY_MACHINE_LIFECYCLE_STORE_RECORD_VERSION),
         u64::from(SUPERVISOR_MACHINE_LIFECYCLE_STORE_RECORD_VERSION),
         u64::from(UNREGISTER_MACHINE_LIFECYCLE_STORE_RECORD_VERSION),
+        u64::from(RUN_MACHINE_LIFECYCLE_STORE_RECORD_VERSION),
         u64::from(MACHINE_LIFECYCLE_STORE_RECORD_VERSION),
     ];
     if !supported.contains(&record_version) {
@@ -6811,6 +7059,8 @@ fn classify_machine_lifecycle_record(bytes: &[u8]) -> MachineLifecycleObservatio
     }
 
     let decoded = if record_version == u64::from(MACHINE_LIFECYCLE_STORE_RECORD_VERSION) {
+        decode_machine_lifecycle_observation_v5(bytes)
+    } else if record_version == u64::from(RUN_MACHINE_LIFECYCLE_STORE_RECORD_VERSION) {
         decode_machine_lifecycle_observation_v4(bytes)
     } else {
         decode_machine_lifecycle_store_record(bytes).map(|snapshot| {
@@ -7198,6 +7448,7 @@ impl MachineLifecycleCommit {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_binding_and_unregister_progress(
         runtime_state: RuntimeState,
         binding: MachineLifecycleBindingFacts,
@@ -7213,6 +7464,24 @@ impl MachineLifecycleCommit {
         )
     }
 
+    pub(crate) fn new_with_binding_unregister_progress_and_live_bridge(
+        runtime_state: RuntimeState,
+        binding: MachineLifecycleBindingFacts,
+        supervisor_authority: SupervisorAuthoritySnapshot,
+        unregister_progress: Option<MachineUnregisterProgressSnapshot>,
+        live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage,
+    ) -> Self {
+        Self::new_with_binding_run_unregister_progress_and_live_bridge(
+            runtime_state,
+            binding,
+            MachineLifecycleRunFacts::default(),
+            supervisor_authority,
+            unregister_progress,
+            live_bridge_recovery,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_with_binding_run_and_unregister_progress(
         runtime_state: RuntimeState,
         binding: MachineLifecycleBindingFacts,
@@ -7220,13 +7489,32 @@ impl MachineLifecycleCommit {
         supervisor_authority: SupervisorAuthoritySnapshot,
         unregister_progress: Option<MachineUnregisterProgressSnapshot>,
     ) -> Self {
+        Self::new_with_binding_run_unregister_progress_and_live_bridge(
+            runtime_state,
+            binding,
+            run,
+            supervisor_authority,
+            unregister_progress,
+            crate::live_execution::LiveBridgeRecoveryImage::default(),
+        )
+    }
+
+    pub(crate) fn new_with_binding_run_unregister_progress_and_live_bridge(
+        runtime_state: RuntimeState,
+        binding: MachineLifecycleBindingFacts,
+        run: MachineLifecycleRunFacts,
+        supervisor_authority: SupervisorAuthoritySnapshot,
+        unregister_progress: Option<MachineUnregisterProgressSnapshot>,
+        live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage,
+    ) -> Self {
         Self {
-            snapshot: MachineLifecycleSnapshot::new_with_run_and_unregister_progress(
+            snapshot: MachineLifecycleSnapshot::new_with_run_unregister_progress_and_live_bridge(
                 runtime_state,
                 binding,
                 run,
                 supervisor_authority,
                 unregister_progress,
+                live_bridge_recovery,
             ),
             expected_version: None,
         }
@@ -7413,10 +7701,10 @@ pub trait RuntimeSessionAuthorityOps: Send + Sync {
         authority: meerkat_core::VerifiedHeadCanonicalAuthority,
     ) -> Result<HeadCanonicalRuntimeAuthorityActivation, RuntimeStoreError>;
 
-    async fn commit_prepared_session_boundary(
+    async fn commit_prepared_session_boundary_execution(
         &self,
         runtime_id: &LogicalRuntimeId,
-        request: PreparedRuntimeSessionCommit,
+        execution: PreparedRuntimeSessionCommitExecution,
     ) -> Result<PreparedRuntimeSessionCommitResult, RuntimeStoreError>;
 
     async fn load_session_boundary_authority(
@@ -7531,7 +7819,7 @@ pub trait RuntimeStore: Send + Sync {
     /// boundary, so its ordinary persistence cost is O(document).
     /// `HeadCanonicalV1` commits the prepared head/suffix mutation and small
     /// runtime authority incrementally. Every profile must implement
-    /// [`RuntimeSessionAuthorityOps::commit_prepared_session_boundary`]
+    /// [`RuntimeSessionAuthorityOps::commit_prepared_session_boundary_execution`]
     /// directly; there is no checkpoint-derived or whole-blob compatibility
     /// bridge.
     fn session_persistence_profile(&self) -> RuntimeSessionPersistenceProfile {
@@ -7571,8 +7859,30 @@ pub trait RuntimeStore: Send + Sync {
         request: PreparedRuntimeSessionCommit,
     ) -> Result<PreparedRuntimeSessionCommitResult, RuntimeStoreError> {
         self.session_authority_ops()
-            .commit_prepared_session_boundary(runtime_id, request)
+            .commit_prepared_session_boundary_execution(
+                runtime_id,
+                PreparedRuntimeSessionCommitExecution::ordinary(request),
+            )
             .await
+    }
+
+    /// Commit one prepared session boundary while an external authority fence
+    /// is retained across the physical target publication.
+    ///
+    /// This has no forwarding default through `session_authority_ops`: a
+    /// RuntimeStore decorator must opt in explicitly so it cannot bypass its
+    /// own write-epoch, projection, or recovery behavior. The verb accepts
+    /// only `SnapshotOnly`; run, terminal, promotion, and recovery boundaries
+    /// have their own machine-owned authority protocols and are refused.
+    async fn commit_prepared_session_boundary_with_fence(
+        &self,
+        _runtime_id: &LogicalRuntimeId,
+        _request: PreparedRuntimeSessionCommit,
+        _write_fence: std::sync::Arc<dyn RuntimeStoreWriteFence>,
+    ) -> Result<FencedPreparedRuntimeSessionCommitOutcome, RuntimeStoreError> {
+        Err(RuntimeStoreError::Unsupported(
+            "commit_prepared_session_boundary_with_fence".to_string(),
+        ))
     }
 
     /// Load the versioned session authority for a runtime.
@@ -8758,6 +9068,252 @@ pub use memory::InMemoryRuntimeStore;
 pub use sqlite::SqliteRuntimeStore;
 
 #[cfg(test)]
+mod runtime_store_write_fence_tests {
+    use super::*;
+
+    struct InvokeThenContradict {
+        error: bool,
+    }
+
+    impl RuntimeStoreWriteFence for InvokeThenContradict {
+        fn execute_if_current(
+            &self,
+            operation: Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + '_>,
+        ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
+            operation()?;
+            if self.error {
+                Err(RuntimeStoreError::Internal(
+                    "synthetic post-commit fence error".to_string(),
+                ))
+            } else {
+                Ok(RuntimeStoreWriteFenceOutcome::Conflict {
+                    reason: "synthetic contradictory conflict".to_string(),
+                })
+            }
+        }
+    }
+
+    struct AppliedWithoutInvocation;
+
+    impl RuntimeStoreWriteFence for AppliedWithoutInvocation {
+        fn execute_if_current(
+            &self,
+            _operation: Box<dyn FnOnce() -> Result<(), RuntimeStoreError> + '_>,
+        ) -> Result<RuntimeStoreWriteFenceOutcome, RuntimeStoreError> {
+            Ok(RuntimeStoreWriteFenceOutcome::Applied)
+        }
+    }
+
+    struct DefaultFenceDecorator {
+        inner: InMemoryRuntimeStore,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeStore for DefaultFenceDecorator {
+        fn session_authority_ops(&self) -> &dyn RuntimeSessionAuthorityOps {
+            &self.inner
+        }
+
+        async fn commit_session_snapshot(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            session_delta: SerializedSessionSnapshot,
+        ) -> Result<(), RuntimeStoreError> {
+            self.inner
+                .commit_session_snapshot(runtime_id, session_delta)
+                .await
+        }
+
+        async fn commit_prepared_whole_blob_rewrite_boundary(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            boundary: PreparedWholeBlobRewriteStoreParts,
+        ) -> Result<WholeBlobStoreAuthority, RuntimeStoreError> {
+            self.inner
+                .commit_prepared_whole_blob_rewrite_boundary(runtime_id, boundary)
+                .await
+        }
+
+        async fn atomic_apply(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            session_delta: Option<SerializedSessionSnapshot>,
+            receipt: RunBoundaryReceipt,
+            input_updates: Vec<InputStatePersistenceRecord>,
+            session_store_key: Option<meerkat_core::types::SessionId>,
+        ) -> Result<(), RuntimeStoreError> {
+            self.inner
+                .atomic_apply(
+                    runtime_id,
+                    session_delta,
+                    receipt,
+                    input_updates,
+                    session_store_key,
+                )
+                .await
+        }
+
+        async fn load_input_states(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<Vec<InputStateRow>, RuntimeStoreError> {
+            self.inner.load_input_states(runtime_id).await
+        }
+
+        async fn load_boundary_receipt(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            run_id: &RunId,
+            sequence: u64,
+        ) -> Result<Option<RunBoundaryReceipt>, RuntimeStoreError> {
+            self.inner
+                .load_boundary_receipt(runtime_id, run_id, sequence)
+                .await
+        }
+
+        async fn load_session_snapshot(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<Option<std::sync::Arc<Vec<u8>>>, RuntimeStoreError> {
+            self.inner.load_session_snapshot(runtime_id).await
+        }
+
+        async fn clear_session_snapshot(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<(), RuntimeStoreError> {
+            self.inner.clear_session_snapshot(runtime_id).await
+        }
+
+        async fn replace_session_snapshot_if_current(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            expected_current: &[u8],
+            replacement: Vec<u8>,
+        ) -> Result<bool, RuntimeStoreError> {
+            self.inner
+                .replace_session_snapshot_if_current(runtime_id, expected_current, replacement)
+                .await
+        }
+
+        async fn clear_session_snapshot_if_current(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            expected_current: &[u8],
+        ) -> Result<bool, RuntimeStoreError> {
+            self.inner
+                .clear_session_snapshot_if_current(runtime_id, expected_current)
+                .await
+        }
+
+        async fn persist_input_state(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            state: &InputStatePersistenceRecord,
+        ) -> Result<(), RuntimeStoreError> {
+            self.inner.persist_input_state(runtime_id, state).await
+        }
+
+        async fn load_input_state(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            input_id: &InputId,
+        ) -> Result<Option<StoredInputState>, RuntimeStoreError> {
+            self.inner.load_input_state(runtime_id, input_id).await
+        }
+
+        async fn load_machine_lifecycle_record(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<Option<Vec<u8>>, RuntimeStoreError> {
+            self.inner.load_machine_lifecycle_record(runtime_id).await
+        }
+
+        async fn commit_machine_lifecycle(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            commit: MachineLifecycleCommit,
+            input_states: &[InputStatePersistenceRecord],
+        ) -> Result<(), RuntimeStoreError> {
+            self.inner
+                .commit_machine_lifecycle(runtime_id, commit, input_states)
+                .await
+        }
+    }
+
+    #[test]
+    fn successful_target_write_remains_applied_after_fence_contradiction() {
+        for error in [false, true] {
+            let invoked = std::sync::atomic::AtomicBool::new(false);
+            let outcome =
+                execute_runtime_store_write_fence(&InvokeThenContradict { error }, || {
+                    invoked.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap();
+            assert!(invoked.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(outcome, RuntimeStoreWriteFenceOutcome::Applied);
+        }
+    }
+
+    #[test]
+    fn applied_without_target_write_is_rejected() {
+        let invoked = std::sync::atomic::AtomicBool::new(false);
+        let error = execute_runtime_store_write_fence(&AppliedWithoutInvocation, || {
+            invoked.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .expect_err("Applied must prove target operation invocation");
+        assert!(!invoked.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(error, RuntimeStoreError::Internal(_)));
+    }
+
+    #[test]
+    fn non_snapshot_boundary_cannot_carry_external_write_fence() {
+        let request = PreparedRuntimeSessionCommit::success(
+            None,
+            RunBoundaryReceipt {
+                run_id: RunId::new(),
+                boundary: meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunStart,
+                contributing_input_ids: Vec::new(),
+                conversation_digest: None,
+                message_count: 0,
+                sequence: 0,
+            },
+            Vec::new(),
+            None,
+        );
+        let error = PreparedRuntimeSessionCommitExecution::fenced(
+            request,
+            std::sync::Arc::new(AppliedWithoutInvocation),
+        )
+        .expect_err("only snapshot boundaries may carry an external write fence");
+        assert!(matches!(error, RuntimeStoreError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn decorator_must_explicitly_opt_in_to_fenced_session_boundary() {
+        let store = DefaultFenceDecorator {
+            inner: InMemoryRuntimeStore::new(),
+        };
+        let session = meerkat_core::Session::new();
+        let runtime_id = LogicalRuntimeId::for_session(session.id());
+        let request = PreparedRuntimeSessionCommit::snapshot_only(
+            BoundSessionCommit::sealed(std::sync::Arc::new(session)).unwrap(),
+        );
+        let error = store
+            .commit_prepared_session_boundary_with_fence(
+                &runtime_id,
+                request,
+                std::sync::Arc::new(AppliedWithoutInvocation),
+            )
+            .await
+            .expect_err("default decorator must not forward fenced commit implicitly");
+        assert!(matches!(error, RuntimeStoreError::Unsupported(_)));
+    }
+}
+
+#[cfg(test)]
 mod store_authority_record_tests {
     use super::*;
     use meerkat_core::session_store::PreparedHeadCanonicalMutation;
@@ -9125,6 +9681,54 @@ mod runtime_session_catalog_entry_tests {
 mod lifecycle_record_compatibility_tests {
     use super::*;
 
+    fn durable_live_bridge_evidence() -> crate::live_execution::LiveBridgeRecoveryImage {
+        serde_json::from_value(serde_json::json!({
+            "operations": [
+                {
+                    "operation_id": "op-in-flight",
+                    "channel_id": "channel-in-flight",
+                    "interaction_id": "interaction-in-flight",
+                    "provider_turn_ref": "turn-in-flight",
+                    "provider_delegation_ref": "delegation-in-flight",
+                    "provider_call_ref": "call-in-flight",
+                    "source_agent_identity": "executor-in-flight",
+                    "canonical_context_revision": "context-in-flight",
+                    "request_digest": "sha256:request-in-flight",
+                    "phase": "execution_running",
+                    "terminal": null,
+                    "result_digest": null,
+                    "cancellation_reason": "restart",
+                    "submission_output_kind": null,
+                    "submission_digest": null,
+                    "submission_state": null,
+                    "current_for_channel": false,
+                    "channel_revoked": true
+                },
+                {
+                    "operation_id": "op-ambiguous",
+                    "channel_id": "channel-ambiguous",
+                    "interaction_id": "interaction-ambiguous",
+                    "provider_turn_ref": "turn-ambiguous",
+                    "provider_delegation_ref": "delegation-ambiguous",
+                    "provider_call_ref": "call-ambiguous",
+                    "source_agent_identity": "executor-ambiguous",
+                    "canonical_context_revision": "context-ambiguous",
+                    "request_digest": "sha256:request-ambiguous",
+                    "phase": "execution_terminal",
+                    "terminal": "completed",
+                    "result_digest": "sha256:result-ambiguous",
+                    "cancellation_reason": "channel_close",
+                    "submission_output_kind": "success",
+                    "submission_digest": "sha256:submission-ambiguous",
+                    "submission_state": "submission_ambiguous",
+                    "current_for_channel": false,
+                    "channel_revoked": true
+                }
+            ]
+        }))
+        .expect("valid durable live bridge test image")
+    }
+
     fn operation_id(
         value: u128,
     ) -> meerkat_contracts::wire::supervisor_bridge::SupervisorRotationOperationId {
@@ -9351,10 +9955,56 @@ mod lifecycle_record_compatibility_tests {
             .as_object_mut()
             .expect("lifecycle record object")
             .remove("pre_run_phase");
+        value
+            .as_object_mut()
+            .expect("lifecycle record object")
+            .remove("live_bridge_recovery");
         let bytes = serde_json::to_vec(&value).expect("serialize v3 row");
         let decoded = decode_machine_lifecycle_store_record(&bytes).expect("decode v3 row");
         assert_eq!(decoded, expected);
         assert_eq!(decoded.run(), &MachineLifecycleRunFacts::default());
+    }
+
+    #[test]
+    fn completed_unregister_v5_round_trip_preserves_durable_live_bridge_evidence() {
+        let live_bridge_recovery = durable_live_bridge_evidence();
+        let snapshot = MachineLifecycleSnapshot::new_with_run_unregister_progress_and_live_bridge(
+            RuntimeState::Retired,
+            MachineLifecycleBindingFacts::default(),
+            MachineLifecycleRunFacts::default(),
+            SupervisorAuthoritySnapshot::UnboundNoReceipt,
+            None,
+            live_bridge_recovery.clone(),
+        );
+
+        let decoded = decode_machine_lifecycle_store_record(&encode_snapshot(&snapshot))
+            .expect("decode completed unregister v5 row");
+
+        assert_eq!(decoded.runtime_state(), RuntimeState::Retired);
+        assert_eq!(decoded.binding(), &MachineLifecycleBindingFacts::default());
+        assert_eq!(decoded.unregister_progress(), None);
+        assert_eq!(decoded.live_bridge_recovery(), &live_bridge_recovery);
+    }
+
+    #[test]
+    fn version_four_completed_unregister_remains_compatible_with_empty_bridge_image() {
+        let expected = snapshot(SupervisorAuthoritySnapshot::UnboundNoReceipt);
+        let mut value = encoded_value(&expected);
+        value["record_version"] = serde_json::json!(RUN_MACHINE_LIFECYCLE_STORE_RECORD_VERSION);
+        value
+            .as_object_mut()
+            .expect("lifecycle record object")
+            .remove("live_bridge_recovery");
+        let bytes = serde_json::to_vec(&value).expect("serialize v4 completed unregister row");
+
+        let decoded = decode_machine_lifecycle_store_record(&bytes)
+            .expect("decode v4 completed unregister row");
+
+        assert_eq!(decoded, expected);
+        assert_eq!(
+            decoded.live_bridge_recovery(),
+            &crate::live_execution::LiveBridgeRecoveryImage::default()
+        );
     }
 
     #[test]

@@ -208,6 +208,57 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `AuthorizeRestoreRealtimeTranscriptState`
   - anchors: `session_document_authority`
   - scenarios: `session_realtime_transcript_materialize_and_restore`
+- `AdmitLiveInteractionTranscript`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `StageLiveProvisionalUserTranscript`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReconcileLiveFinalUserTranscript`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CompleteLiveInteractionTranscript`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitLiveAssistantPlaybackTarget`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverLiveAssistantPlaybackTarget`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveLiveAssistantPlaybackOnChannelClose`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ObserveLiveAssistantPlaybackFinalPendingTerminal`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverLiveAssistantPlaybackFinal`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ObserveLiveAssistantPlaybackTerminalPendingFinal`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverLiveAssistantPlaybackTerminal`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ObserveLiveAssistantPlaybackFinalJoinsComplete`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ObserveLiveAssistantPlaybackFinalJoinsPrefix`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ObserveLiveAssistantPlaybackTerminalJoinsComplete`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ObserveLiveAssistantPlaybackTerminalJoinsPrefix`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ObserveLiveAssistantPlaybackUnmeasured`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyLiveContextCommittedRow`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `AuthorizeSessionMetadataPersist`
   - anchors: `session_document_authority`
   - scenarios: `session_durable_config_authorize_restore`
@@ -351,6 +402,42 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RealtimeTranscriptSnapshotRestoreAuthorized`
   - anchors: `session_document_authority`
   - scenarios: `session_realtime_transcript_materialize_and_restore`
+- `LiveInteractionTranscriptAdmitted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveProvisionalUserTranscriptStaged`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveFinalUserTranscriptReconciled`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveInteractionTranscriptCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveAssistantPlaybackTargetAdmitted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveAssistantPlaybackTargetRecovered`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveAssistantPlaybackFinalObserved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveAssistantPlaybackFinalRecovered`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveAssistantPlaybackTerminalObserved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveAssistantPlaybackTerminalRecovered`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveAssistantPlaybackTerminalResolved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveContextCommittedRowClassified`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `SessionMetadataPersistAuthorized`
   - anchors: `session_document_authority`
   - scenarios: `session_durable_config_authorize_restore`
@@ -404,7 +491,15 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - scenarios: (unclaimed)
 
 ### Invariants
-- `(none)`
+- `live_interaction_transcript_binding_is_complete`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `committed_live_transcript_had_provisional_admission`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_assistant_playback_target_is_complete_and_interaction_bound`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 
 <!-- GENERATED_COVERAGE_END -->
