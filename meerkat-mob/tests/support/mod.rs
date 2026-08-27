@@ -764,6 +764,19 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
             .await
     }
 
+    async fn enqueue_committed_parent_session_boundary_after_runtime_turn(
+        &self,
+        session_id: &meerkat_core::SessionId,
+        runtime_adapter: &meerkat_runtime::MeerkatMachine,
+    ) -> Result<usize, meerkat_core::service::SessionError> {
+        self.inner
+            .enqueue_committed_parent_session_boundary_after_runtime_turn(
+                session_id,
+                runtime_adapter,
+            )
+            .await
+    }
+
     /// Test double: the two-read composition is the exact truth here.
     async fn load_session_for_resume(
         &self,

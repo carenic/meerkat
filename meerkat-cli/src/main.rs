@@ -10308,6 +10308,19 @@ impl meerkat_mob::MobSessionService for RunMobSessionService {
         .await
     }
 
+    async fn enqueue_committed_parent_session_boundary_after_runtime_turn(
+        &self,
+        session_id: &SessionId,
+        runtime_adapter: &meerkat_runtime::MeerkatMachine,
+    ) -> Result<usize, meerkat_core::service::SessionError> {
+        <EphemeralSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::enqueue_committed_parent_session_boundary_after_runtime_turn(
+            &self.inner,
+            session_id,
+            runtime_adapter,
+        )
+        .await
+    }
+
     async fn discard_live_session_after_runtime_stop_terminalized(
         &self,
         session_id: &SessionId,
@@ -13392,6 +13405,19 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
             &self.inner,
             session_id,
             authority,
+        )
+        .await
+    }
+
+    async fn enqueue_committed_parent_session_boundary_after_runtime_turn(
+        &self,
+        session_id: &SessionId,
+        runtime_adapter: &meerkat_runtime::MeerkatMachine,
+    ) -> Result<usize, meerkat_core::service::SessionError> {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::enqueue_committed_parent_session_boundary_after_runtime_turn(
+            &self.inner,
+            session_id,
+            runtime_adapter,
         )
         .await
     }
@@ -20681,6 +20707,14 @@ default_model = "gemma"
             Err(SessionError::Unsupported(
                 "CLI test service has no store-owned boundary authority".to_string(),
             ))
+        }
+
+        async fn enqueue_committed_parent_session_boundary_after_runtime_turn(
+            &self,
+            _session_id: &SessionId,
+            _runtime_adapter: &meerkat_runtime::MeerkatMachine,
+        ) -> Result<usize, SessionError> {
+            Ok(0)
         }
 
         /// Test double: the two-read composition is the exact truth here.

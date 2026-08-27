@@ -3996,6 +3996,14 @@ impl MobSessionService for LocalSessionService {
         ))
     }
 
+    async fn enqueue_committed_parent_session_boundary_after_runtime_turn(
+        &self,
+        _session_id: &SessionId,
+        _runtime_adapter: &meerkat_runtime::MeerkatMachine,
+    ) -> Result<usize, SessionError> {
+        Ok(0)
+    }
+
     /// In-memory service: nothing durable survives archive, so the two-read
     /// composition is the exact truth — `ArchivedNotRevivable` cannot exist.
     async fn load_session_for_resume(
@@ -7134,6 +7142,14 @@ mod tests {
             Err(SessionError::Unsupported(
                 "mock session service has no store-owned boundary authority".to_string(),
             ))
+        }
+
+        async fn enqueue_committed_parent_session_boundary_after_runtime_turn(
+            &self,
+            _session_id: &SessionId,
+            _runtime_adapter: &meerkat_runtime::MeerkatMachine,
+        ) -> Result<usize, SessionError> {
+            Ok(0)
         }
 
         /// Test double: the two-read composition is the exact truth here.

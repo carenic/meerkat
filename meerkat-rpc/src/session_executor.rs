@@ -1509,6 +1509,14 @@ mod tests {
             ))
         }
 
+        async fn enqueue_committed_parent_session_boundary_after_runtime_turn(
+            &self,
+            _session_id: &SessionId,
+            _runtime_adapter: &meerkat_runtime::MeerkatMachine,
+        ) -> Result<usize, SessionError> {
+            Ok(0)
+        }
+
         /// Test double: the two-read composition is the exact truth here.
         async fn load_session_for_resume(
             &self,

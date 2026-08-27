@@ -8276,7 +8276,7 @@ impl MeerkatMachine {
             #[cfg(test)]
             const HANDOFF_REPORT_INTERVAL: std::time::Duration =
                 std::time::Duration::from_millis(50);
-            let handoff_wait_started = std::time::Instant::now();
+            let handoff_wait_started = meerkat_core::time_compat::Instant::now();
             let mut loop_handle = loop_handle;
             let loop_join_result = loop {
                 match crate::tokio::time::timeout(HANDOFF_REPORT_INTERVAL, &mut loop_handle).await {

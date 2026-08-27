@@ -175,6 +175,12 @@ mod live_context_mirror_tests {
             .register_session(session_id.clone())
             .await
             .expect("register session");
+        assert!(
+            !machine
+                .has_live_context_projection_target(&session_id)
+                .await,
+            "a registered session without a live channel has no projection target"
+        );
         let registered = machine
             .session_dsl_state(&session_id)
             .await
@@ -2354,6 +2360,12 @@ mod live_context_mirror_tests {
             .resolve_live_open_admission(&session_id, &channel_id, &identity)
             .await
             .expect("ordinary public live admission");
+        assert!(
+            machine
+                .has_live_context_projection_target(&session_id)
+                .await,
+            "the preflight follows active live-channel ownership"
+        );
 
         let mut session = meerkat_core::Session::with_id(session_id.clone());
         session.push(meerkat_core::Message::User(
@@ -6864,6 +6876,16 @@ impl MeerkatMachine {
                 "generated worker retirement resolution emitted no matching effect".to_string(),
             ))
         }
+    }
+
+    /// Cheap ownership preflight for callers that would otherwise materialize
+    /// an entire committed session boundary only to discover there is no live
+    /// channel to receive it.
+    #[cfg(feature = "live")]
+    pub async fn has_live_context_projection_target(&self, session_id: &SessionId) -> bool {
+        self.live_active_channel_for_session(session_id)
+            .await
+            .is_some()
     }
 
     /// Project the exact store-committed parent-session boundary into the

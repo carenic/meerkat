@@ -105,7 +105,7 @@ def smoke_model() -> str:
 
 def anthropic_mid_system_model() -> str:
     """Select an Anthropic model that can represent ordered mid-thread System rows."""
-    return os.environ.get("SMOKE_MODEL_ANTHROPIC_MID_SYSTEM", "claude-fable-5")
+    return os.environ.get("SMOKE_MODEL_ANTHROPIC_MID_SYSTEM", "claude-opus-4-8")
 
 
 def openai_model() -> str:
