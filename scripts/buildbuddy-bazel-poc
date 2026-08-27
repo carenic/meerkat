@@ -965,6 +965,24 @@ fi
 if [[ "${#gcp_buildbuddy_test_env[@]}" -gt 0 ]]; then
   bb_args+=("${gcp_buildbuddy_test_env[@]}")
 fi
+if [[ -n "${MEERKAT_BUILDBUDDY_SECRET_ENV_OVERRIDES:-}" ]]; then
+  if [[ "${meerkat_bazel_backend}" == "gcp-local" ]]; then
+    echo "error: BuildBuddy secret environment overrides require remote execution" >&2
+    exit 1
+  fi
+  bb_args+=(
+    --remote_exec_header="x-buildbuddy-platform.secret-env-overrides=${MEERKAT_BUILDBUDDY_SECRET_ENV_OVERRIDES}"
+  )
+fi
+if [[ -n "${MEERKAT_BUILDBUDDY_SECRET_ENV_OVERRIDES_BASE64:-}" ]]; then
+  if [[ "${meerkat_bazel_backend}" == "gcp-local" ]]; then
+    echo "error: BuildBuddy base64 secret environment overrides require remote execution" >&2
+    exit 1
+  fi
+  bb_args+=(
+    --remote_exec_header="x-buildbuddy-platform.secret-env-overrides-base64=${MEERKAT_BUILDBUDDY_SECRET_ENV_OVERRIDES_BASE64}"
+  )
+fi
 if [[ "${#extra_args[@]}" -gt 0 ]]; then
   bb_args+=("${extra_args[@]}")
 fi

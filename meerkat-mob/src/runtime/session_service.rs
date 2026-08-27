@@ -1522,20 +1522,11 @@ pub trait MobSessionService:
     /// runtime input reaches successful machine completion. Implementations
     /// must derive both the sealed document and store-issued authority from
     /// canonical session ownership; the Mob shell supplies neither.
-    #[cfg(feature = "experimental-gpt-live")]
     async fn enqueue_committed_parent_session_boundary_after_runtime_turn(
         &self,
-        _session_id: &SessionId,
-        _runtime_adapter: &meerkat_runtime::MeerkatMachine,
-    ) -> Result<usize, SessionError> {
-        if self.supports_persistent_sessions() {
-            return Err(SessionError::Unsupported(
-                "persistent MobSessionService wrappers must delegate committed parent-session boundary projection to canonical session ownership"
-                    .to_string(),
-            ));
-        }
-        Ok(0)
-    }
+        session_id: &SessionId,
+        runtime_adapter: &meerkat_runtime::MeerkatMachine,
+    ) -> Result<usize, SessionError>;
 
     /// Remove the service-side live actor while the owning runtime entry is in
     /// its generated post-stop unregister window.
@@ -2142,6 +2133,14 @@ where
                 .to_string(),
         ))
     }
+
+    async fn enqueue_committed_parent_session_boundary_after_runtime_turn(
+        &self,
+        _session_id: &SessionId,
+        _runtime_adapter: &meerkat_runtime::MeerkatMachine,
+    ) -> Result<usize, SessionError> {
+        Ok(0)
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2323,18 +2322,34 @@ where
         .await
     }
 
-    #[cfg(feature = "experimental-gpt-live")]
     async fn enqueue_committed_parent_session_boundary_after_runtime_turn(
         &self,
         session_id: &SessionId,
         runtime_adapter: &meerkat_runtime::MeerkatMachine,
     ) -> Result<usize, SessionError> {
-        let (committed, store_commit_authority) =
+        #[cfg(not(feature = "experimental-gpt-live"))]
+        {
+            let _ = (session_id, runtime_adapter);
+            return Ok(0);
+        }
+        #[cfg(feature = "experimental-gpt-live")]
+        {
+            // Ordinary Mob turns do not own a live-context projection. Check the
+            // machine's active binding before exporting the committed session
+            // boundary, because that export may otherwise re-read and digest the
+            // whole durable transcript merely to discover the no-op downstream.
+            if !runtime_adapter
+                .has_live_context_projection_target(session_id)
+                .await
+            {
+                return Ok(0);
+            }
+            let (committed, store_commit_authority) =
             meerkat_session::PersistentSessionService::<B>::export_live_context_committed_boundary(
                 self, session_id,
             )
             .await?;
-        runtime_adapter
+            runtime_adapter
             .enqueue_committed_parent_session_boundary(
                 session_id,
                 &committed,
@@ -2346,6 +2361,7 @@ where
                     "failed to enqueue committed Mob parent-session boundary for {session_id}: {error}"
                 )))
             })
+        }
     }
 
     #[cfg(feature = "runtime-adapter")]

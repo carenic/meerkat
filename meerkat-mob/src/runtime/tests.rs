@@ -4482,6 +4482,14 @@ impl MobSessionService for MockSessionService {
         Ok(())
     }
 
+    async fn enqueue_committed_parent_session_boundary_after_runtime_turn(
+        &self,
+        _session_id: &SessionId,
+        _runtime_adapter: &meerkat_runtime::MeerkatMachine,
+    ) -> Result<usize, SessionError> {
+        Ok(0)
+    }
+
     async fn discard_live_session(&self, session_id: &SessionId) -> Result<(), SessionError> {
         {
             let mut sessions = self.sessions.write().await;
@@ -10701,6 +10709,19 @@ impl MobSessionService for PersistedListingSessionService {
             .await
     }
 
+    async fn enqueue_committed_parent_session_boundary_after_runtime_turn(
+        &self,
+        session_id: &SessionId,
+        runtime_adapter: &meerkat_runtime::MeerkatMachine,
+    ) -> Result<usize, SessionError> {
+        self.inner
+            .enqueue_committed_parent_session_boundary_after_runtime_turn(
+                session_id,
+                runtime_adapter,
+            )
+            .await
+    }
+
     /// Test double: nothing durable survives archive here, so the two-read
     /// composition is the exact truth — `ArchivedNotRevivable` cannot exist.
     async fn load_session_for_resume(
@@ -11043,6 +11064,19 @@ impl MobSessionService for InactiveReadSessionService {
         self.inner
             .acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(
                 session_id, authority,
+            )
+            .await
+    }
+
+    async fn enqueue_committed_parent_session_boundary_after_runtime_turn(
+        &self,
+        session_id: &SessionId,
+        runtime_adapter: &meerkat_runtime::MeerkatMachine,
+    ) -> Result<usize, SessionError> {
+        self.inner
+            .enqueue_committed_parent_session_boundary_after_runtime_turn(
+                session_id,
+                runtime_adapter,
             )
             .await
     }
@@ -46722,6 +46756,14 @@ impl MobSessionService for RealCommsSessionService {
         ))
     }
 
+    async fn enqueue_committed_parent_session_boundary_after_runtime_turn(
+        &self,
+        _session_id: &SessionId,
+        _runtime_adapter: &meerkat_runtime::MeerkatMachine,
+    ) -> Result<usize, SessionError> {
+        Ok(0)
+    }
+
     /// Test double: nothing durable survives archive here, so the two-read
     /// composition is the exact truth — `ArchivedNotRevivable` cannot exist.
     async fn load_session_for_resume(
@@ -47985,6 +48027,14 @@ impl MobSessionService for RuntimeBackedRealCommsSessionService {
         } else {
             Ok(())
         }
+    }
+
+    async fn enqueue_committed_parent_session_boundary_after_runtime_turn(
+        &self,
+        _session_id: &SessionId,
+        _runtime_adapter: &meerkat_runtime::MeerkatMachine,
+    ) -> Result<usize, SessionError> {
+        Ok(0)
     }
 
     /// Test double: nothing durable survives archive here, so the two-read

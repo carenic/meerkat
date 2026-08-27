@@ -1183,6 +1183,19 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
         .await
     }
 
+    async fn enqueue_committed_parent_session_boundary_after_runtime_turn(
+        &self,
+        session_id: &SessionId,
+        runtime_adapter: &meerkat_runtime::MeerkatMachine,
+    ) -> Result<usize, SessionError> {
+        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::enqueue_committed_parent_session_boundary_after_runtime_turn(
+            &self.service,
+            session_id,
+            runtime_adapter,
+        )
+        .await
+    }
+
     async fn observe_session_resume_authority(
         &self,
         session_id: &SessionId,

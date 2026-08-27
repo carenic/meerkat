@@ -138,10 +138,38 @@ impl From<RealmBackendArg> for RealmBackend {
     }
 }
 
+/// Worker stack size, overridable for stack-overflow diagnosis.
+///
+/// `RKAT_RPC_WORKER_STACK_BYTES` exists so an overflow can be measured rather
+/// than merely reproduced. Sweeping the value distinguishes a bounded large
+/// future from unbounded recursion or accumulation. This follows the existing
+/// `RKAT_RPC_TRACE_FILE` diagnostic-helper convention.
+const DEFAULT_WORKER_STACK_BYTES: usize = 32 * 1024 * 1024;
+
+fn worker_stack_bytes() -> usize {
+    match std::env::var("RKAT_RPC_WORKER_STACK_BYTES") {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(bytes) if bytes >= 64 * 1024 => bytes,
+            _ => {
+                eprintln!(
+                    "RKAT_RPC_WORKER_STACK_BYTES={raw:?} is not a byte count >= 65536; \
+                     refusing to guess. Unset it to use the {DEFAULT_WORKER_STACK_BYTES} default."
+                );
+                std::process::exit(2);
+            }
+        },
+        Err(_) => DEFAULT_WORKER_STACK_BYTES,
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let stack_bytes = worker_stack_bytes();
+    if stack_bytes != DEFAULT_WORKER_STACK_BYTES {
+        eprintln!("rkat-rpc: worker stack overridden to {stack_bytes} bytes");
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(16 * 1024 * 1024)
+        .thread_stack_size(stack_bytes)
         .build()?
         .block_on(async_main())
 }

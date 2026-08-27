@@ -93,7 +93,7 @@ fn smoke_model() -> String {
 
 fn workgraph_smoke_model() -> String {
     let model =
-        std::env::var("WORKGRAPH_SMOKE_MODEL").unwrap_or_else(|_| "claude-fable-5".to_string());
+        std::env::var("WORKGRAPH_SMOKE_MODEL").unwrap_or_else(|_| "claude-opus-4-8".to_string());
     assert!(
         meerkat_models::capabilities_for(meerkat_core::Provider::Anthropic, &model)
             .is_some_and(|caps| caps.supports_mid_conversation_system_messages),
