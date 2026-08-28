@@ -1395,6 +1395,8 @@ struct RuntimeSessionEntry {
         Arc<std::sync::Mutex<crate::RuntimeActorMaterializationClaimState>>,
     /// Shared consumer cursor state for the epoch.
     cursor_state: Arc<meerkat_core::EpochCursorState>,
+    /// Observe-only hook dispatcher for facts committed by this session.
+    post_commit_hooks: Arc<meerkat_core::PostCommitHookDispatcher>,
     /// Completion waiters (accessed by accept_input_with_completion and RuntimeLoop).
     completions: SharedCompletionRegistry,
     /// Canonical durable visibility owner for this session.
@@ -4773,6 +4775,17 @@ impl RuntimeSessionEntry {
 }
 
 impl MeerkatMachine {
+    pub(crate) async fn post_commit_hooks_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<Arc<meerkat_core::PostCommitHookDispatcher>> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .map(|entry| Arc::clone(&entry.post_commit_hooks))
+    }
+
     /// How many registered sessions currently refuse execution because their
     /// durability gate demands a cold reload.
     ///

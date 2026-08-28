@@ -326,6 +326,7 @@ impl MeerkatMachine {
                     active_runtime_generation,
                     active_runtime_epoch_id,
                     publication_handle,
+                    post_commit_hooks,
                 ) = {
                     let sessions = self.sessions.read().await;
                     let entry = sessions.get(&session_id).ok_or(
@@ -363,8 +364,10 @@ impl MeerkatMachine {
                         generation,
                         epoch,
                         entry.publication_handle(),
+                        Arc::clone(&entry.post_commit_hooks),
                     )
                 };
+                let hook_input = crate::hook_observation::RuntimeInputHookFacts::from_input(&input);
 
                 // Use the canonical admission input id (the id the `Input`
                 // already carries, which admission reports back verbatim as
@@ -394,12 +397,26 @@ impl MeerkatMachine {
                     .preview_session_dsl_input(&session_id, ingest_input.clone(), "Ingest")
                     .await
                 {
-                    return Err(
-                        match self.existing_session_runtime_state(&session_id).await {
-                            Some(state) => RuntimeControlPlaneError::InvalidState { state },
-                            None => RuntimeControlPlaneError::Internal(reason),
-                        },
-                    );
+                    return match self.existing_session_runtime_state(&session_id).await {
+                        Some(state) => {
+                            crate::hook_observation::dispatch_runtime_input_error(
+                                &post_commit_hooks,
+                                &hook_input,
+                                &RuntimeDriverError::NotReady { state },
+                            );
+                            Err(RuntimeControlPlaneError::InvalidState { state })
+                        }
+                        None => {
+                            crate::hook_observation::dispatch_runtime_input_error(
+                                &post_commit_hooks,
+                                &hook_input,
+                                &RuntimeDriverError::ValidationFailed {
+                                    reason: reason.clone(),
+                                },
+                            );
+                            Err(RuntimeControlPlaneError::Internal(reason))
+                        }
+                    };
                 }
                 // Acquire process-owned execution before the first durable
                 // mutation. A committed admission must never be reported as
@@ -587,6 +604,11 @@ impl MeerkatMachine {
                         accepted_input_id,
                     )
                 };
+                crate::hook_observation::dispatch_runtime_input_outcome(
+                    &post_commit_hooks,
+                    &hook_input,
+                    &outcome,
+                );
 
                 let live_boundary_plan = if signal.should_interrupt_yielding()
                     && stages_run_boundary
