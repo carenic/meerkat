@@ -2562,6 +2562,11 @@
             "type": "string"
           },
           {
+            "const": "authorization_route_changed",
+            "description": "A dynamic authorization refresh changed the concrete provider route\nbefore dispatch. The caller must rebuild provider projections before\nretrying.",
+            "type": "string"
+          },
+          {
             "const": "request_too_large",
             "description": "The provider rejected (or preflight proved) a serialized request body\nthat exceeds its request-size cap.",
             "type": "string"
@@ -21524,6 +21529,11 @@
             "type": "string"
           },
           {
+            "const": "authorization_route_changed",
+            "description": "A dynamic authorization refresh changed the concrete provider route\nbefore dispatch. The caller must rebuild provider projections before\nretrying.",
+            "type": "string"
+          },
+          {
             "const": "request_too_large",
             "description": "The provider rejected (or preflight proved) a serialized request body\nthat exceeds its request-size cap.",
             "type": "string"
@@ -32404,6 +32414,11 @@
               "stream_parse_error",
               "incomplete_response"
             ],
+            "type": "string"
+          },
+          {
+            "const": "authorization_route_changed",
+            "description": "A dynamic authorization refresh changed the concrete provider route\nbefore dispatch. The caller must rebuild provider projections before\nretrying.",
             "type": "string"
           },
           {
@@ -46268,6 +46283,11 @@
               "stream_parse_error",
               "incomplete_response"
             ],
+            "type": "string"
+          },
+          {
+            "const": "authorization_route_changed",
+            "description": "A dynamic authorization refresh changed the concrete provider route\nbefore dispatch. The caller must rebuild provider projections before\nretrying.",
             "type": "string"
           },
           {
@@ -62012,6 +62032,11 @@
             "type": "string"
           },
           {
+            "const": "authorization_route_changed",
+            "description": "A dynamic authorization refresh changed the concrete provider route\nbefore dispatch. The caller must rebuild provider projections before\nretrying.",
+            "type": "string"
+          },
+          {
             "const": "request_too_large",
             "description": "The provider rejected (or preflight proved) a serialized request body\nthat exceeds its request-size cap.",
             "type": "string"
@@ -69556,6 +69581,11 @@
               "stream_parse_error",
               "incomplete_response"
             ],
+            "type": "string"
+          },
+          {
+            "const": "authorization_route_changed",
+            "description": "A dynamic authorization refresh changed the concrete provider route\nbefore dispatch. The caller must rebuild provider projections before\nretrying.",
             "type": "string"
           },
           {
@@ -117016,6 +117046,10 @@
   },
   "WireAuthProfilesList": {
     "$defs": {
+      "CredentialAccountId": {
+        "description": "Opaque slug identifying one shared credential account inside a realm.",
+        "type": "string"
+      },
       "WireAuthProfile": {
         "description": "Wire projection of [`meerkat_core::AuthProfile`]. Sensitive credential\nmaterial is NOT wire-projected; callers that inspect profile metadata use\nthe server-side `auth.profile.get` RPC or the\n`GET /auth/bindings/{binding_id}` REST path; both return typed redacted\nshapes. `source_kind` is a\ndiscriminator for the credential-source variant.",
         "properties": {
@@ -117081,6 +117115,16 @@
           },
           "backend_profile": {
             "type": "string"
+          },
+          "credential_account": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/CredentialAccountId"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "default_model": {
             "type": [
@@ -118140,6 +118184,16 @@
           "binding"
         ],
         "type": "object"
+      },
+      "WireOAuthProvider": {
+        "description": "Canonical OAuth issuer identity carried by login request/response contracts.\n\nDeserialization accepts the CLI-compatible aliases owned by\n[`meerkat_core::OAuthProviderIdentity`], while serialization always emits\none canonical wire value.",
+        "enum": [
+          "anthropic",
+          "openai",
+          "google",
+          "copilot"
+        ],
+        "type": "string"
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -118215,7 +118269,7 @@
             "type": "string"
           },
           "provider": {
-            "type": "string"
+            "$ref": "#/$defs/WireOAuthProvider"
           },
           "realm_id": {
             "type": "string"
@@ -118247,6 +118301,18 @@
     "title": "WireDeviceCompleteResult"
   },
   "WireDeviceStart": {
+    "$defs": {
+      "WireOAuthProvider": {
+        "description": "Canonical OAuth issuer identity carried by login request/response contracts.\n\nDeserialization accepts the CLI-compatible aliases owned by\n[`meerkat_core::OAuthProviderIdentity`], while serialization always emits\none canonical wire value.",
+        "enum": [
+          "anthropic",
+          "openai",
+          "google",
+          "copilot"
+        ],
+        "type": "string"
+      }
+    },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "description": "`POST /auth/login/device/start` success body.",
     "properties": {
@@ -118264,7 +118330,7 @@
         "type": "integer"
       },
       "provider": {
-        "type": "string"
+        "$ref": "#/$defs/WireOAuthProvider"
       },
       "user_code": {
         "type": "string"
@@ -120888,6 +120954,11 @@
               "stream_parse_error",
               "incomplete_response"
             ],
+            "type": "string"
+          },
+          {
+            "const": "authorization_route_changed",
+            "description": "A dynamic authorization refresh changed the concrete provider route\nbefore dispatch. The caller must rebuild provider projections before\nretrying.",
             "type": "string"
           },
           {
@@ -130348,6 +130419,16 @@
           "binding"
         ],
         "type": "object"
+      },
+      "WireOAuthProvider": {
+        "description": "Canonical OAuth issuer identity carried by login request/response contracts.\n\nDeserialization accepts the CLI-compatible aliases owned by\n[`meerkat_core::OAuthProviderIdentity`], while serialization always emits\none canonical wire value.",
+        "enum": [
+          "anthropic",
+          "openai",
+          "google",
+          "copilot"
+        ],
+        "type": "string"
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -130372,7 +130453,7 @@
         "type": "string"
       },
       "provider": {
-        "type": "string"
+        "$ref": "#/$defs/WireOAuthProvider"
       },
       "realm_id": {
         "type": "string"
@@ -130403,6 +130484,18 @@
     "type": "object"
   },
   "WireLoginStart": {
+    "$defs": {
+      "WireOAuthProvider": {
+        "description": "Canonical OAuth issuer identity carried by login request/response contracts.\n\nDeserialization accepts the CLI-compatible aliases owned by\n[`meerkat_core::OAuthProviderIdentity`], while serialization always emits\none canonical wire value.",
+        "enum": [
+          "anthropic",
+          "openai",
+          "google",
+          "copilot"
+        ],
+        "type": "string"
+      }
+    },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "description": "`POST /auth/login/start` success body.",
     "properties": {
@@ -130410,7 +130503,7 @@
         "type": "string"
       },
       "provider": {
-        "type": "string"
+        "$ref": "#/$defs/WireOAuthProvider"
       },
       "redirect_uri": {
         "type": "string"
@@ -135267,6 +135360,12 @@
     "title": "WirePromptInput"
   },
   "WireProviderBinding": {
+    "$defs": {
+      "CredentialAccountId": {
+        "description": "Opaque slug identifying one shared credential account inside a realm.",
+        "type": "string"
+      }
+    },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "description": "Wire projection of [`meerkat_core::ProviderBinding`].",
     "properties": {
@@ -135279,6 +135378,16 @@
       },
       "backend_profile": {
         "type": "string"
+      },
+      "credential_account": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/CredentialAccountId"
+          },
+          {
+            "type": "null"
+          }
+        ]
       },
       "default_model": {
         "type": [
@@ -135538,6 +135647,10 @@
   },
   "WireRealmConnectionSet": {
     "$defs": {
+      "CredentialAccountId": {
+        "description": "Opaque slug identifying one shared credential account inside a realm.",
+        "type": "string"
+      },
       "WireAuthProfile": {
         "description": "Wire projection of [`meerkat_core::AuthProfile`]. Sensitive credential\nmaterial is NOT wire-projected; callers that inspect profile metadata use\nthe server-side `auth.profile.get` RPC or the\n`GET /auth/bindings/{binding_id}` REST path; both return typed redacted\nshapes. `source_kind` is a\ndiscriminator for the credential-source variant.",
         "properties": {
@@ -135603,6 +135716,16 @@
           },
           "backend_profile": {
             "type": "string"
+          },
+          "credential_account": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/CredentialAccountId"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "default_model": {
             "type": [

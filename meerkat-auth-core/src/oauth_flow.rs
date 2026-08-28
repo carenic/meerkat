@@ -13,7 +13,10 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use meerkat_core::{AuthBindingRef, AuthProfile, BackendProfile, CredentialSourceSpec, Provider};
+use meerkat_core::{
+    AuthCredentialIdentity, AuthProfile, BackendProfile, CredentialSourceSpec, Provider,
+    ResolvedConnectionTarget,
+};
 use meerkat_llm_core::provider_runtime::binding::NormalizedBackendKind;
 use meerkat_llm_core::provider_runtime::catalog::ProviderRuntimeCatalog;
 use parking_lot::Mutex;
@@ -21,6 +24,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth_oauth::{OAuthEndpoints, OAuthTokenRequestFormat};
 use crate::auth_store::{PersistedAuthMode, credential_source_uses_persisted_store};
+use crate::github_copilot::{
+    GITHUB_COPILOT_AUTHORIZE_URL, GITHUB_COPILOT_DEVICE_CODE_URL, GITHUB_COPILOT_SCOPES,
+    GITHUB_COPILOT_TOKEN_URL,
+};
+pub use crate::github_copilot::{
+    GITHUB_COPILOT_CLIENT_ID, GITHUB_COPILOT_TOKEN_EXCHANGE_URL, GITHUB_COPILOT_USER_AGENT,
+};
 
 // The typed OAuth provider identity vocabulary lives in `meerkat-core` (below
 // `meerkat-contracts` in the dep graph) so wire types can reference it directly.
@@ -68,6 +78,7 @@ const GOOGLE_CLIENT_ID: &str = concat!(
     "09395-oo8ft2oprdrnp9e3aqf6av3hmdib135j",
     ".apps.googleusercontent.com",
 );
+const GOOGLE_CLIENT_SECRET: &str = concat!("GOCSP", "X-4uHgMPm", "-1o7Sk-geV6Cu5clXFsxl");
 const GOOGLE_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_DEVICE_CODE_URL: &str = "https://oauth2.googleapis.com/device/code";
@@ -93,6 +104,9 @@ const TEST_OAUTH_BASE_URL_ENV: &str = "MEERKAT_TEST_OAUTH_BASE_URL";
 pub struct OAuthProviderDeclaration {
     /// OAuth client identifier registered with the provider.
     pub client_id: &'static str,
+    /// OAuth client secret when the provider's installed-application contract
+    /// requires one.
+    pub client_secret: Option<&'static str>,
     /// Authorization endpoint (browser consent flow).
     pub authorize_endpoint: &'static str,
     /// Token-exchange endpoint.
@@ -100,7 +114,7 @@ pub struct OAuthProviderDeclaration {
     /// Scopes requested at authorize time.
     pub scopes: &'static [&'static str],
     /// Typed backend kind these credentials authenticate against.
-    pub backend_kind: NormalizedBackendKind,
+    pub backend_kind: Option<NormalizedBackendKind>,
     /// Provider-specific authorize-query params that are part of the public
     /// login contract (e.g. the OpenAI `originator`). Empty for providers that
     /// require none.
@@ -130,6 +144,7 @@ pub fn oauth_provider_declaration(id: OAuthProviderIdentity) -> OAuthProviderDec
     match id {
         OAuthProviderIdentity::AnthropicClaudeAi => OAuthProviderDeclaration {
             client_id: ANTHROPIC_CLIENT_ID,
+            client_secret: None,
             authorize_endpoint: ANTHROPIC_AUTHORIZE_URL,
             token_endpoint: ANTHROPIC_TOKEN_URL,
             scopes: ANTHROPIC_CLAUDE_AI_SCOPES,
@@ -138,6 +153,7 @@ pub fn oauth_provider_declaration(id: OAuthProviderIdentity) -> OAuthProviderDec
         },
         OAuthProviderIdentity::AnthropicConsoleApiKey => OAuthProviderDeclaration {
             client_id: ANTHROPIC_CLIENT_ID,
+            client_secret: None,
             authorize_endpoint: ANTHROPIC_CONSOLE_AUTHORIZE_URL,
             token_endpoint: ANTHROPIC_TOKEN_URL,
             scopes: ANTHROPIC_CONSOLE_SCOPES,
@@ -146,6 +162,7 @@ pub fn oauth_provider_declaration(id: OAuthProviderIdentity) -> OAuthProviderDec
         },
         OAuthProviderIdentity::OpenAiChatGpt => OAuthProviderDeclaration {
             client_id: OPENAI_CLIENT_ID,
+            client_secret: None,
             authorize_endpoint: OPENAI_AUTHORIZE_URL,
             token_endpoint: OPENAI_TOKEN_URL,
             scopes: OPENAI_SCOPES,
@@ -154,9 +171,19 @@ pub fn oauth_provider_declaration(id: OAuthProviderIdentity) -> OAuthProviderDec
         },
         OAuthProviderIdentity::GoogleCodeAssist => OAuthProviderDeclaration {
             client_id: GOOGLE_CLIENT_ID,
+            client_secret: Some(GOOGLE_CLIENT_SECRET),
             authorize_endpoint: GOOGLE_AUTHORIZE_URL,
             token_endpoint: GOOGLE_TOKEN_URL,
             scopes: GOOGLE_SCOPES,
+            backend_kind,
+            extra_authorize_params: &[],
+        },
+        OAuthProviderIdentity::GitHubCopilot => OAuthProviderDeclaration {
+            client_id: GITHUB_COPILOT_CLIENT_ID,
+            client_secret: None,
+            authorize_endpoint: GITHUB_COPILOT_AUTHORIZE_URL,
+            token_endpoint: GITHUB_COPILOT_TOKEN_URL,
+            scopes: GITHUB_COPILOT_SCOPES,
             backend_kind,
             extra_authorize_params: &[],
         },
@@ -236,6 +263,26 @@ pub fn oauth_provider_endpoints(
             refresh_scopes: Vec::new(),
             extra_headers: Vec::new(),
         },
+        OAuthProviderIdentity::GitHubCopilot => OAuthEndpoints {
+            client_id: declaration.client_id.into(),
+            authorize_url: declaration.authorize_endpoint.into(),
+            token_url: declaration.token_endpoint.into(),
+            device_code_url: Some(GITHUB_COPILOT_DEVICE_CODE_URL.into()),
+            redirect_uri: redirect_uri.into(),
+            scopes: strings(declaration.scopes),
+            extra_authorize_params,
+            token_request_format: OAuthTokenRequestFormat::FormUrlEncoded,
+            include_state_in_token_exchange: false,
+            extra_token_params: Vec::new(),
+            refresh_scopes: Vec::new(),
+            extra_headers: vec![
+                ("Accept".to_string(), "application/json".to_string()),
+                (
+                    "User-Agent".to_string(),
+                    GITHUB_COPILOT_USER_AGENT.to_string(),
+                ),
+            ],
+        },
     };
     apply_test_oauth_endpoint_override(id, endpoints)
 }
@@ -243,14 +290,14 @@ pub fn oauth_provider_endpoints(
 #[derive(Debug, Clone)]
 pub struct OAuthProviderResolution {
     pub identity: OAuthProviderIdentity,
-    pub provider: Provider,
+    pub provider: Option<Provider>,
     pub endpoints: OAuthEndpoints,
     pub auth_mode: PersistedAuthMode,
     pub client_secret: Option<&'static str>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("Unknown provider '{provider}'. Supported: anthropic, openai, google.")]
+#[error("Unknown provider '{provider}'. Supported: anthropic, openai, google, copilot.")]
 pub struct OAuthProviderResolutionError {
     pub provider: String,
 }
@@ -264,13 +311,21 @@ pub fn resolve_oauth_provider(
             provider: provider.to_string(),
         }
     })?;
-    Ok(OAuthProviderResolution {
+    Ok(oauth_provider_resolution(identity, redirect_uri))
+}
+
+pub fn oauth_provider_resolution(
+    identity: OAuthProviderIdentity,
+    redirect_uri: impl Into<String>,
+) -> OAuthProviderResolution {
+    let declaration = oauth_provider_declaration(identity);
+    OAuthProviderResolution {
         identity,
         provider: identity.provider(),
         endpoints: oauth_provider_endpoints(identity, redirect_uri),
         auth_mode: identity.auth_mode(),
-        client_secret: identity.client_secret(),
-    })
+        client_secret: declaration.client_secret,
+    }
 }
 
 /// Apply the local OAuth fixture endpoint override used by release-grade auth
@@ -310,6 +365,8 @@ pub fn apply_test_oauth_endpoint_override(
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum OAuthTargetValidationError {
+    #[error("OAuth issuer '{issuer}' is shared across model providers")]
+    SharedIssuerRequiresAccountTarget { issuer: OAuthProviderIdentity },
     #[error("OAuth target backend provider mismatch: expected {expected:?}, got {actual:?}")]
     BackendProviderMismatch {
         expected: Provider,
@@ -339,13 +396,42 @@ pub enum OAuthTargetValidationError {
         "OAuth target source '{source_kind}' cannot store OAuth credentials; expected source.kind = 'managed_store' or 'platform_default'"
     )]
     SourceMismatch { source_kind: &'static str },
+    #[error("OAuth target binding is invalid: {detail}")]
+    BindingInvalid { detail: String },
+}
+
+pub fn validate_oauth_login_connection_target(
+    target: &ResolvedConnectionTarget,
+    identity: OAuthProviderIdentity,
+) -> Result<(), OAuthTargetValidationError> {
+    if identity != OAuthProviderIdentity::GitHubCopilot {
+        return validate_oauth_login_binding(&target.backend, &target.auth_profile, identity);
+    }
+    ProviderRuntimeCatalog::validate_binding(
+        &target.auth_binding,
+        &target.backend,
+        &target.auth_profile,
+        &target.binding.policy,
+    )
+    .map_err(|error| OAuthTargetValidationError::BindingInvalid {
+        detail: error.to_string(),
+    })?;
+    if target.credential_identity.account().is_none() {
+        return Err(
+            OAuthTargetValidationError::SharedIssuerRequiresAccountTarget { issuer: identity },
+        );
+    }
+    Ok(())
 }
 
 pub fn validate_oauth_login_target(
     auth_profile: &AuthProfile,
     identity: OAuthProviderIdentity,
 ) -> Result<(), OAuthTargetValidationError> {
-    validate_oauth_target_for_auth_mode(auth_profile, identity.provider(), identity.auth_mode())
+    let provider = identity.provider().ok_or(
+        OAuthTargetValidationError::SharedIssuerRequiresAccountTarget { issuer: identity },
+    )?;
+    validate_oauth_target_for_auth_mode(auth_profile, provider, identity.auth_mode())
 }
 
 pub fn validate_oauth_login_binding(
@@ -353,12 +439,19 @@ pub fn validate_oauth_login_binding(
     auth_profile: &AuthProfile,
     identity: OAuthProviderIdentity,
 ) -> Result<(), OAuthTargetValidationError> {
+    let provider = identity.provider().ok_or(
+        OAuthTargetValidationError::SharedIssuerRequiresAccountTarget { issuer: identity },
+    )?;
+    let backend_kind = meerkat_llm_core::provider_runtime::binding::oauth_provider_backend_kind(
+        identity,
+    )
+    .ok_or(OAuthTargetValidationError::SharedIssuerRequiresAccountTarget { issuer: identity })?;
     validate_oauth_target_binding_for_auth_mode(
         backend_profile,
         auth_profile,
-        identity.provider(),
+        provider,
         identity.auth_mode(),
-        meerkat_llm_core::provider_runtime::binding::oauth_provider_backend_kind(identity),
+        backend_kind,
     )
 }
 
@@ -445,7 +538,7 @@ fn source_kind_label(source: &CredentialSourceSpec) -> &'static str {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OAuthFlowRecord {
-    pub target: AuthBindingRef,
+    pub target: AuthCredentialIdentity,
     pub provider: OAuthProviderIdentity,
     pub redirect_uri: String,
     pub pkce_verifier: String,
@@ -454,7 +547,7 @@ pub struct OAuthFlowRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OAuthDeviceFlowRecord {
-    pub target: AuthBindingRef,
+    pub target: AuthCredentialIdentity,
     pub provider: OAuthProviderIdentity,
     pub device_code: String,
     pub created_at: Instant,
@@ -463,8 +556,8 @@ pub struct OAuthDeviceFlowRecord {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OAuthPrunedFlows {
-    pub browser: Vec<(String, AuthBindingRef)>,
-    pub device: Vec<(String, AuthBindingRef)>,
+    pub browser: Vec<(String, AuthCredentialIdentity)>,
+    pub device: Vec<(String, AuthCredentialIdentity)>,
 }
 
 impl OAuthPrunedFlows {
@@ -496,7 +589,7 @@ pub struct OAuthFlowRegistrySnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedOAuthBrowserFlow {
     pub state: String,
-    pub target: AuthBindingRef,
+    pub target: AuthCredentialIdentity,
     pub provider: OAuthProviderIdentity,
     pub redirect_uri: String,
     pub pkce_verifier: String,
@@ -506,7 +599,7 @@ pub struct PersistedOAuthBrowserFlow {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedOAuthDeviceFlow {
-    pub target: AuthBindingRef,
+    pub target: AuthCredentialIdentity,
     pub provider: OAuthProviderIdentity,
     pub device_code: String,
     pub created_at_millis: u64,
@@ -539,8 +632,8 @@ pub enum OAuthFlowError {
     RedirectUriMismatch,
     #[error("oauth state target mismatch: expected {expected:?}, got {actual:?}")]
     TargetMismatch {
-        expected: Box<AuthBindingRef>,
-        actual: Box<AuthBindingRef>,
+        expected: Box<AuthCredentialIdentity>,
+        actual: Box<AuthCredentialIdentity>,
     },
     #[error("failed to generate oauth state token")]
     StateGenerationFailed,
@@ -569,20 +662,20 @@ pub trait OAuthDevicePollLifecycle: Send + Sync {
 
     fn finish_device_poll(
         &self,
-        target: &AuthBindingRef,
+        target: &AuthCredentialIdentity,
         device_code: &str,
     ) -> Result<(), OAuthFlowError>;
 
     fn consume_device_flow(
         &self,
-        target: &AuthBindingRef,
+        target: &AuthCredentialIdentity,
         device_code: &str,
         provider: OAuthProviderIdentity,
     ) -> Result<(), OAuthFlowError>;
 
     fn expire_device_flow(
         &self,
-        target: &AuthBindingRef,
+        target: &AuthCredentialIdentity,
         device_code: &str,
     ) -> Result<(), OAuthFlowError>;
 
@@ -604,7 +697,7 @@ pub trait OAuthDevicePollLifecycle: Send + Sync {
 
 pub struct OAuthDevicePollLease {
     device_flows: Arc<Mutex<HashMap<String, OAuthDeviceFlowState>>>,
-    target: AuthBindingRef,
+    target: AuthCredentialIdentity,
     device_code: String,
     provider: OAuthProviderIdentity,
     lease_id: u64,
@@ -630,7 +723,7 @@ impl std::fmt::Debug for OAuthDevicePollLease {
 impl OAuthDevicePollLease {
     fn new(
         device_flows: Arc<Mutex<HashMap<String, OAuthDeviceFlowState>>>,
-        target: AuthBindingRef,
+        target: AuthCredentialIdentity,
         device_code: String,
         provider: OAuthProviderIdentity,
         lease_id: u64,
@@ -865,7 +958,7 @@ pub trait OAuthFlowAuthority: Send + Sync {
 
     fn start(
         &self,
-        target: AuthBindingRef,
+        target: AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
         redirect_uri: String,
         pkce_verifier: String,
@@ -874,7 +967,7 @@ pub trait OAuthFlowAuthority: Send + Sync {
     fn verify(
         &self,
         state: &str,
-        target: &AuthBindingRef,
+        target: &AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
         redirect_uri: &str,
     ) -> Result<OAuthFlowRecord, OAuthFlowError>;
@@ -882,14 +975,14 @@ pub trait OAuthFlowAuthority: Send + Sync {
     fn consume(
         &self,
         state: &str,
-        target: &AuthBindingRef,
+        target: &AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
         redirect_uri: &str,
     ) -> Result<OAuthFlowRecord, OAuthFlowError>;
 
     fn admit_device_code(
         &self,
-        target: AuthBindingRef,
+        target: AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
         device_code: String,
         expires_in: Duration,
@@ -898,14 +991,14 @@ pub trait OAuthFlowAuthority: Send + Sync {
     fn verify_device_code(
         &self,
         device_code: &str,
-        target: &AuthBindingRef,
+        target: &AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
     ) -> Result<OAuthDeviceFlowRecord, OAuthFlowError>;
 
     fn begin_device_code_poll(
         &self,
         device_code: &str,
-        target: &AuthBindingRef,
+        target: &AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
     ) -> Result<OAuthDevicePollLease, OAuthFlowError>;
 }
@@ -948,7 +1041,7 @@ impl OAuthFlowRegistry {
 
     pub fn start(
         &self,
-        target: AuthBindingRef,
+        target: AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
         redirect_uri: impl Into<String>,
         pkce_verifier: impl Into<String>,
@@ -965,7 +1058,7 @@ impl OAuthFlowRegistry {
     pub fn verify(
         &self,
         state: &str,
-        target: &AuthBindingRef,
+        target: &AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
         redirect_uri: &str,
     ) -> Result<OAuthFlowRecord, OAuthFlowError> {
@@ -975,7 +1068,7 @@ impl OAuthFlowRegistry {
     pub fn consume(
         &self,
         state: &str,
-        target: &AuthBindingRef,
+        target: &AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
         redirect_uri: &str,
     ) -> Result<OAuthFlowRecord, OAuthFlowError> {
@@ -984,7 +1077,7 @@ impl OAuthFlowRegistry {
 
     pub fn admit_device_code(
         &self,
-        target: AuthBindingRef,
+        target: AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
         device_code: impl Into<String>,
         expires_in: Duration,
@@ -1001,7 +1094,7 @@ impl OAuthFlowRegistry {
     pub fn verify_device_code(
         &self,
         device_code: &str,
-        target: &AuthBindingRef,
+        target: &AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
     ) -> Result<OAuthDeviceFlowRecord, OAuthFlowError> {
         <Self as OAuthFlowAuthority>::verify_device_code(self, device_code, target, provider)
@@ -1010,7 +1103,7 @@ impl OAuthFlowRegistry {
     pub fn begin_device_code_poll(
         &self,
         device_code: &str,
-        target: &AuthBindingRef,
+        target: &AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
     ) -> Result<OAuthDevicePollLease, OAuthFlowError> {
         <Self as OAuthFlowAuthority>::begin_device_code_poll(self, device_code, target, provider)
@@ -1019,7 +1112,7 @@ impl OAuthFlowRegistry {
     pub fn expire_device_code(
         &self,
         device_code: &str,
-        target: &AuthBindingRef,
+        target: &AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
     ) -> Result<(), OAuthFlowError> {
         let mut flows = self.device_flows.lock();
@@ -1032,7 +1125,7 @@ impl OAuthFlowRegistry {
         Ok(())
     }
 
-    pub fn prune_expired_browser_flows(&self) -> Vec<(String, AuthBindingRef)> {
+    pub fn prune_expired_browser_flows(&self) -> Vec<(String, AuthCredentialIdentity)> {
         let mut flows = self.flows.lock();
         take_expired_locked(&mut flows, self.ttl)
             .into_iter()
@@ -1040,7 +1133,7 @@ impl OAuthFlowRegistry {
             .collect()
     }
 
-    pub fn prune_expired_device_flows(&self) -> Vec<(String, AuthBindingRef)> {
+    pub fn prune_expired_device_flows(&self) -> Vec<(String, AuthCredentialIdentity)> {
         let mut flows = self.device_flows.lock();
         take_expired_device_locked(&mut flows)
             .into_iter()
@@ -1050,8 +1143,8 @@ impl OAuthFlowRegistry {
 
     pub fn retain_flows_with_lifecycle(
         &self,
-        mut browser_active: impl FnMut(&AuthBindingRef, &str) -> bool,
-        mut device_active: impl FnMut(&AuthBindingRef, &str) -> bool,
+        mut browser_active: impl FnMut(&AuthCredentialIdentity, &str) -> bool,
+        mut device_active: impl FnMut(&AuthCredentialIdentity, &str) -> bool,
     ) -> OAuthPrunedFlows {
         let mut flows = self.flows.lock();
         let mut browser = Vec::new();
@@ -1124,7 +1217,7 @@ impl OAuthFlowRegistry {
     pub fn insert_restored_browser_flow(
         &self,
         state: String,
-        target: AuthBindingRef,
+        target: AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
         redirect_uri: String,
         pkce_verifier: String,
@@ -1146,7 +1239,7 @@ impl OAuthFlowRegistry {
 
     pub fn insert_restored_device_flow(
         &self,
-        target: AuthBindingRef,
+        target: AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
         device_code: String,
         created_at: Instant,
@@ -1175,7 +1268,7 @@ impl OAuthFlowRegistry {
 
     pub fn start_with_pruned(
         &self,
-        target: AuthBindingRef,
+        target: AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
         redirect_uri: String,
         pkce_verifier: String,
@@ -1202,7 +1295,7 @@ impl OAuthFlowRegistry {
     pub fn insert_browser_flow_with_pruned(
         &self,
         state: String,
-        target: AuthBindingRef,
+        target: AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
         redirect_uri: String,
         pkce_verifier: String,
@@ -1227,7 +1320,7 @@ impl OAuthFlowRegistry {
 
     pub fn admit_device_code_with_pruned(
         &self,
-        target: AuthBindingRef,
+        target: AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
         device_code: String,
         expires_in: Duration,
@@ -1273,7 +1366,7 @@ impl Default for OAuthFlowRegistry {
 impl OAuthFlowAuthority for OAuthFlowRegistry {
     fn start(
         &self,
-        target: AuthBindingRef,
+        target: AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
         redirect_uri: String,
         pkce_verifier: String,
@@ -1285,7 +1378,7 @@ impl OAuthFlowAuthority for OAuthFlowRegistry {
     fn verify(
         &self,
         state: &str,
-        target: &AuthBindingRef,
+        target: &AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
         redirect_uri: &str,
     ) -> Result<OAuthFlowRecord, OAuthFlowError> {
@@ -1301,7 +1394,7 @@ impl OAuthFlowAuthority for OAuthFlowRegistry {
     fn consume(
         &self,
         state: &str,
-        target: &AuthBindingRef,
+        target: &AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
         redirect_uri: &str,
     ) -> Result<OAuthFlowRecord, OAuthFlowError> {
@@ -1316,7 +1409,7 @@ impl OAuthFlowAuthority for OAuthFlowRegistry {
 
     fn admit_device_code(
         &self,
-        target: AuthBindingRef,
+        target: AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
         device_code: String,
         expires_in: Duration,
@@ -1328,7 +1421,7 @@ impl OAuthFlowAuthority for OAuthFlowRegistry {
     fn verify_device_code(
         &self,
         device_code: &str,
-        target: &AuthBindingRef,
+        target: &AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
     ) -> Result<OAuthDeviceFlowRecord, OAuthFlowError> {
         let mut flows = self.device_flows.lock();
@@ -1343,7 +1436,7 @@ impl OAuthFlowAuthority for OAuthFlowRegistry {
     fn begin_device_code_poll(
         &self,
         device_code: &str,
-        target: &AuthBindingRef,
+        target: &AuthCredentialIdentity,
         provider: OAuthProviderIdentity,
     ) -> Result<OAuthDevicePollLease, OAuthFlowError> {
         let mut flows = self.device_flows.lock();
@@ -1428,7 +1521,7 @@ fn release_device_poll_lease_locked(
 
 fn verify_browser_record(
     record: &OAuthFlowRecord,
-    target: &AuthBindingRef,
+    target: &AuthCredentialIdentity,
     provider: OAuthProviderIdentity,
     redirect_uri: &str,
 ) -> Result<(), OAuthFlowError> {
@@ -1452,7 +1545,7 @@ fn verify_browser_record(
 
 fn verify_device_record(
     record: &OAuthDeviceFlowRecord,
-    target: &AuthBindingRef,
+    target: &AuthCredentialIdentity,
     provider: OAuthProviderIdentity,
 ) -> Result<(), OAuthFlowError> {
     if &record.target != target {
@@ -1534,22 +1627,22 @@ fn strings(values: &[&str]) -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn target() -> AuthBindingRef {
-        AuthBindingRef {
+    fn target() -> AuthCredentialIdentity {
+        AuthCredentialIdentity::Binding(meerkat_core::AuthBindingRef {
             realm: meerkat_core::RealmId::parse("dev").expect("valid realm"),
             binding: meerkat_core::BindingId::parse("default_openai").expect("valid binding"),
             profile: None,
             origin: meerkat_core::BindingOrigin::Configured,
-        }
+        })
     }
 
-    fn alternate_target() -> AuthBindingRef {
-        AuthBindingRef {
+    fn alternate_target() -> AuthCredentialIdentity {
+        AuthCredentialIdentity::Binding(meerkat_core::AuthBindingRef {
             realm: meerkat_core::RealmId::parse("dev").expect("valid realm"),
             binding: meerkat_core::BindingId::parse("alternate_openai").expect("valid binding"),
             profile: None,
             origin: meerkat_core::BindingOrigin::Configured,
-        }
+        })
     }
 
     #[test]
@@ -2302,7 +2395,7 @@ mod tests {
     impl OAuthDevicePollLifecycle for RejectConsumeLifecycle {
         fn finish_device_poll(
             &self,
-            _target: &AuthBindingRef,
+            _target: &AuthCredentialIdentity,
             _device_code: &str,
         ) -> Result<(), OAuthFlowError> {
             Ok(())
@@ -2310,7 +2403,7 @@ mod tests {
 
         fn consume_device_flow(
             &self,
-            _target: &AuthBindingRef,
+            _target: &AuthCredentialIdentity,
             _device_code: &str,
             _provider: OAuthProviderIdentity,
         ) -> Result<(), OAuthFlowError> {
@@ -2322,7 +2415,7 @@ mod tests {
 
         fn expire_device_flow(
             &self,
-            _target: &AuthBindingRef,
+            _target: &AuthCredentialIdentity,
             _device_code: &str,
         ) -> Result<(), OAuthFlowError> {
             Ok(())
@@ -2424,7 +2517,7 @@ mod tests {
             let resolved =
                 resolve_oauth_provider(alias, "http://127.0.0.1/callback").expect("alias resolves");
             assert_eq!(resolved.identity, identity);
-            assert_eq!(resolved.provider, provider);
+            assert_eq!(resolved.provider, Some(provider));
             assert_eq!(resolved.auth_mode, auth_mode);
             assert_eq!(resolved.endpoints.redirect_uri, "http://127.0.0.1/callback");
         }
@@ -2437,10 +2530,21 @@ mod tests {
 
         assert_eq!(resolved.identity, OAuthProviderIdentity::GoogleCodeAssist);
         assert!(resolved.endpoints.device_code_url.is_some());
+        assert_eq!(resolved.client_secret, Some(GOOGLE_CLIENT_SECRET));
+    }
+
+    #[test]
+    fn copilot_oauth_resolution_is_shared_and_device_capable() {
+        let resolved = resolve_oauth_provider("copilot", "").expect("Copilot resolves");
+        assert_eq!(resolved.identity, OAuthProviderIdentity::GitHubCopilot);
+        assert_eq!(resolved.provider, None);
+        assert_eq!(resolved.auth_mode, PersistedAuthMode::GithubCopilotOauth);
+        assert_eq!(resolved.endpoints.client_id, GITHUB_COPILOT_CLIENT_ID);
         assert_eq!(
-            resolved.client_secret,
-            Some(meerkat_core::oauth_identity::GOOGLE_CLIENT_SECRET)
+            resolved.endpoints.device_code_url.as_deref(),
+            Some(GITHUB_COPILOT_DEVICE_CODE_URL)
         );
+        assert!(!resolved.identity.supports_browser_flow());
     }
 
     #[cfg(feature = "oauth")]
@@ -2522,7 +2626,9 @@ mod tests {
         );
         assert_eq!(
             declaration.backend_kind,
-            NormalizedBackendKind::OpenAi(OpenAiBackendKind::ChatGptBackend)
+            Some(NormalizedBackendKind::OpenAi(
+                OpenAiBackendKind::ChatGptBackend
+            ))
         );
         assert_eq!(
             declaration.extra_authorize_params,

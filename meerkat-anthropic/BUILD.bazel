@@ -34,6 +34,7 @@ rust_library(
     crate_name = "meerkat_anthropic",
     crate_root = "src/lib.rs",
     crate_features = [
+        "copilot",
         "oauth",
     ],
     edition = "2024",
@@ -52,6 +53,7 @@ rust_library(
     ),
     deps = [
         "//meerkat-auth-core:meerkat_auth_core",
+        "//meerkat-copilot:meerkat_copilot",
         "//meerkat-core:meerkat_core",
         "//meerkat-llm-core:meerkat_llm_core",
         "//meerkat-models:meerkat_models",
@@ -67,6 +69,7 @@ rust_library(
     crate_name = "meerkat_anthropic",
     crate_root = "src/lib.rs",
     crate_features = [
+        "copilot",
         "oauth",
     ],
     edition = "2024",
@@ -87,6 +90,7 @@ rust_library(
     ),
     deps = [
         "//meerkat:meerkat_auth_core_agent_factory_build",
+        "//meerkat:meerkat_copilot_agent_factory_build",
         "//meerkat:meerkat_core_agent_factory_build",
         "//meerkat:meerkat_llm_core_agent_factory_build",
         "//meerkat:meerkat_models_agent_factory_build",
@@ -108,6 +112,7 @@ rust_test(
     crate_name = "meerkat_anthropic",
     crate_root = "src/lib.rs",
     crate_features = [
+        "copilot",
         "oauth",
     ],
     edition = "2024",
@@ -138,6 +143,7 @@ rust_test(
     ),
     deps = [
         "//meerkat-auth-core:meerkat_auth_core",
+        "//meerkat-copilot:meerkat_copilot",
         "//meerkat-core:meerkat_core",
         "//meerkat-llm-core:meerkat_llm_core",
         "//meerkat-models:meerkat_models",
@@ -161,6 +167,7 @@ rust_test(
     crate_name = "oauth_resolve",
     crate_root = "tests/oauth_resolve.rs",
     crate_features = [
+        "copilot",
         "oauth",
     ],
     edition = "2024",
@@ -192,6 +199,7 @@ rust_test(
     deps = [
         "//meerkat-anthropic:meerkat_anthropic",
         "//meerkat-auth-core:meerkat_auth_core",
+        "//meerkat-copilot:meerkat_copilot",
         "//meerkat-core:meerkat_core",
         "//meerkat-llm-core:meerkat_llm_core",
         "//meerkat-models:meerkat_models",

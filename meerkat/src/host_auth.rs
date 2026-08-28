@@ -12,14 +12,16 @@ use meerkat_core::{
     AuthBindingRef, AuthStatusPhase, BindingId, Config, OAuthProviderIdentity, ProfileId, Provider,
     RealmId, ResolvedConnectionTarget,
 };
-use meerkat_providers::auth_oauth::{OAuthError, PkcePair, exchange_authorization_code_with_state};
+use meerkat_providers::auth_oauth::{
+    DevicePollOutcome, OAuthError, PkcePair, exchange_authorization_code_with_state,
+    poll_device_code, request_device_code,
+};
 use meerkat_providers::auth_store::{
     CredentialMutationError, PersistedTokens, ProviderAuthPersistence, TokenStoreError,
     credential_source_uses_persisted_store, persisted_auth_mode_is_oauth_login,
 };
 use meerkat_providers::oauth_flow::{
-    OAuthFlowError, OAuthTargetValidationError, oauth_provider_endpoints,
-    validate_oauth_login_binding,
+    OAuthFlowError, OAuthTargetValidationError, oauth_provider_resolution,
 };
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +70,29 @@ pub struct HostAuthLoginComplete {
     pub scopes: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostAuthDeviceStart {
+    pub auth_binding: AuthBindingRef,
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_uri_complete: Option<String>,
+    pub expires_in: u64,
+    pub interval: u64,
+    pub provider: OAuthProviderIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum HostAuthDevicePoll {
+    Pending,
+    SlowDown,
+    AccessDenied,
+    Expired,
+    Ready(HostAuthLoginComplete),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum HostAuthError {
     #[error(transparent)]
@@ -88,12 +113,14 @@ pub enum HostAuthError {
     Factory(#[from] meerkat_client::FactoryError),
     #[error("provider auth persistence is not configured for this runtime")]
     PersistenceUnavailable,
-    #[error("AuthMachine lifecycle update failed: {0}")]
-    Lifecycle(String),
-    #[error("credential status rehydration failed: {0}")]
-    StatusRehydrate(String),
-    #[error("OAuth token expiry is invalid: {0}")]
-    InvalidExpiry(String),
+    #[error("AuthMachine lifecycle update failed")]
+    Lifecycle(#[source] meerkat_core::handles::DslTransitionError),
+    #[error("credential status rehydration failed")]
+    StatusRehydrate(#[source] meerkat_core::auth::AuthStatusRehydrateError),
+    #[error("provider '{0}' requires the device-code login flow")]
+    BrowserFlowUnsupported(OAuthProviderIdentity),
+    #[error("provider '{0}' does not support the device-code login flow")]
+    DeviceFlowUnsupported(OAuthProviderIdentity),
 }
 
 /// Injectable native-host authentication facade.
@@ -140,9 +167,9 @@ impl HostAuthService {
         target: &HostAuthTarget,
     ) -> Result<HostAuthStatus, HostAuthError> {
         let resolved = resolve_target(config, target)?;
-        validate_oauth_login_binding(&resolved.backend, &resolved.auth_profile, target.provider)?;
+        validate_resolved_oauth_target(&resolved, target.provider)?;
         let auth_binding = resolved.auth_binding;
-        let lease_key = LeaseKey::from_auth_binding(&auth_binding);
+        let lease_key = LeaseKey::from_credential_identity(&resolved.credential_identity);
         let now = Utc::now();
         let auth_lease = self.authority.generated_auth_lease_handle();
         auth_lease
@@ -151,7 +178,7 @@ impl HostAuthService {
                 now.timestamp().max(0) as u64,
                 AUTH_LEASE_TTL_REFRESH_WINDOW_SECS,
             )
-            .map_err(|error| HostAuthError::Lifecycle(error.to_string()))?;
+            .map_err(HostAuthError::Lifecycle)?;
         let mut snapshot = auth_lease.snapshot(&lease_key);
         let expected_mode =
             meerkat_providers::NormalizedAuthMethod::from_auth_profile(&resolved.auth_profile)
@@ -167,22 +194,24 @@ impl HostAuthService {
             let phase = AuthStatusPhase::from_lease_snapshot(now, &snapshot);
             if phase.is_no_live_lease() {
                 if let Some(expected_mode) = expected_mode {
-                    stored = meerkat_core::rehydrate_marked_tokens_for_status(
+                    stored = meerkat_core::rehydrate_marked_tokens_for_status_for_identity(
                         store.as_ref(),
                         &auth_lease,
-                        &auth_binding,
+                        &resolved.credential_identity,
                         expected_mode,
                         now,
                     )
                     .await
-                    .map_err(|error| HostAuthError::StatusRehydrate(error.to_string()))?;
+                    .map_err(HostAuthError::StatusRehydrate)?;
                     snapshot = auth_lease.snapshot(&lease_key);
                 }
             } else {
                 stored = store
-                    .load(&meerkat_providers::auth_store::TokenKey::from_auth_binding(
-                        &auth_binding,
-                    ))
+                    .load(
+                        &meerkat_providers::auth_store::TokenKey::from_credential_identity(
+                            &resolved.credential_identity,
+                        ),
+                    )
                     .await?;
             }
         }
@@ -205,7 +234,7 @@ impl HostAuthService {
             meerkat_core::project_published_auth_status(now, stored.as_ref(), projection_snapshot);
         Ok(HostAuthStatus {
             auth_binding,
-            provider: target.provider.provider(),
+            provider: resolved.backend.provider,
             profile_id: resolved.auth_profile.id,
             phase: projection.phase,
             expires_at: projection.expires_at,
@@ -222,17 +251,21 @@ impl HostAuthService {
         redirect_uri: impl Into<String>,
     ) -> Result<HostAuthLoginStart, HostAuthError> {
         let redirect_uri = redirect_uri.into();
+        if !target.provider.supports_browser_flow() {
+            return Err(HostAuthError::BrowserFlowUnsupported(target.provider));
+        }
         let resolved = resolve_writable_oauth_target(config, target)?;
         let pkce = PkcePair::generate_s256();
-        let lease_key = LeaseKey::from_auth_binding(&resolved.auth_binding);
+        let lease_key = LeaseKey::from_credential_identity(&resolved.credential_identity);
         let _guard = meerkat_core::acquire_auth_login_lifecycle_guard(&lease_key).await;
         let state = self.authority.oauth_flow_authority().start(
-            resolved.auth_binding.clone(),
+            resolved.credential_identity.clone(),
             target.provider,
             redirect_uri.clone(),
             pkce.verifier.secret().clone(),
         )?;
-        let authorize_url = oauth_provider_endpoints(target.provider, redirect_uri.clone())
+        let authorize_url = oauth_provider_resolution(target.provider, redirect_uri.clone())
+            .endpoints
             .authorize_url_with_pkce(&pkce.challenge, &state);
         Ok(HostAuthLoginStart {
             auth_binding: resolved.auth_binding,
@@ -253,28 +286,29 @@ impl HostAuthService {
     ) -> Result<HostAuthLoginComplete, HostAuthError> {
         let redirect_uri = redirect_uri.into();
         let state = state.into();
+        if !target.provider.supports_browser_flow() {
+            return Err(HostAuthError::BrowserFlowUnsupported(target.provider));
+        }
         let resolved = resolve_writable_oauth_target(config, target)?;
         let oauth_flow_authority = self.authority.oauth_flow_authority();
         let flow = oauth_flow_authority.verify(
             &state,
-            &resolved.auth_binding,
+            &resolved.credential_identity,
             target.provider,
             &redirect_uri,
         )?;
-        let endpoints = oauth_provider_endpoints(target.provider, redirect_uri.clone());
+        let oauth = oauth_provider_resolution(target.provider, redirect_uri.clone());
         let exchanged = exchange_authorization_code_with_state(
             &self.http,
-            &endpoints,
+            &oauth.endpoints,
             code.as_ref(),
             &flow.pkce_verifier,
-            target.provider.client_secret(),
+            oauth.client_secret,
             Some(&state),
         )
         .await?;
         let now = Utc::now();
-        let expires_at = exchanged
-            .expires_at_from(now)
-            .map_err(|error| HostAuthError::InvalidExpiry(error.to_string()))?;
+        let expires_at = exchanged.expires_at_from(now)?;
         let tokens = PersistedTokens {
             auth_mode: target.provider.auth_mode(),
             primary_secret: Some(exchanged.access_token),
@@ -294,7 +328,7 @@ impl HostAuthService {
             meerkat_providers::browser_login::save_oauth_tokens_and_consume_browser_flow(
                 self.persistence.clone(),
                 self.authority.generated_auth_lease_handle(),
-                resolved.auth_binding.clone(),
+                resolved.credential_identity.clone(),
                 tokens,
                 meerkat_providers::browser_login::BrowserOAuthFlowCommit {
                     authority: oauth_flow_authority,
@@ -306,12 +340,121 @@ impl HostAuthService {
             .await?;
         Ok(HostAuthLoginComplete {
             auth_binding: resolved.auth_binding,
-            provider: target.provider.provider(),
+            provider: resolved.backend.provider,
             profile_id: resolved.auth_profile.id,
             expires_at: committed.expires_at,
             has_refresh_token: committed.refresh_token.is_some(),
             scopes: committed.scopes,
         })
+    }
+
+    pub async fn device_start(
+        &self,
+        config: &Config,
+        target: &HostAuthTarget,
+    ) -> Result<HostAuthDeviceStart, HostAuthError> {
+        let resolved = resolve_writable_oauth_target(config, target)?;
+        let oauth = oauth_provider_resolution(target.provider, "");
+        if oauth.endpoints.device_code_url.is_none() {
+            return Err(HostAuthError::DeviceFlowUnsupported(target.provider));
+        }
+        let device = request_device_code(&self.http, &oauth.endpoints).await?;
+        let lease_key = LeaseKey::from_credential_identity(&resolved.credential_identity);
+        let _guard = meerkat_core::acquire_auth_login_lifecycle_guard(&lease_key).await;
+        self.authority.oauth_flow_authority().admit_device_code(
+            resolved.credential_identity,
+            target.provider,
+            device.device_code.clone(),
+            std::time::Duration::from_secs(device.expires_in),
+        )?;
+        Ok(HostAuthDeviceStart {
+            auth_binding: resolved.auth_binding,
+            device_code: device.device_code,
+            user_code: device.user_code,
+            verification_uri: device.verification_uri,
+            verification_uri_complete: device.verification_uri_complete,
+            expires_in: device.expires_in,
+            interval: device.interval,
+            provider: target.provider,
+        })
+    }
+
+    pub async fn device_poll(
+        &self,
+        config: &Config,
+        target: &HostAuthTarget,
+        device_code: &str,
+    ) -> Result<HostAuthDevicePoll, HostAuthError> {
+        let resolved = resolve_writable_oauth_target(config, target)?;
+        let oauth = oauth_provider_resolution(target.provider, "");
+        if oauth.endpoints.device_code_url.is_none() {
+            return Err(HostAuthError::DeviceFlowUnsupported(target.provider));
+        }
+        let poll_lease = self
+            .authority
+            .oauth_flow_authority()
+            .begin_device_code_poll(device_code, &resolved.credential_identity, target.provider)?;
+        let outcome = poll_device_code(
+            &self.http,
+            &oauth.endpoints,
+            device_code,
+            oauth.client_secret,
+        )
+        .await?;
+        match outcome {
+            DevicePollOutcome::Pending => {
+                poll_lease.finish()?;
+                Ok(HostAuthDevicePoll::Pending)
+            }
+            DevicePollOutcome::SlowDown => {
+                poll_lease.finish()?;
+                Ok(HostAuthDevicePoll::SlowDown)
+            }
+            DevicePollOutcome::AccessDenied => {
+                poll_lease.consume()?;
+                Ok(HostAuthDevicePoll::AccessDenied)
+            }
+            DevicePollOutcome::Expired => {
+                poll_lease.consume()?;
+                Ok(HostAuthDevicePoll::Expired)
+            }
+            DevicePollOutcome::Ready(exchanged) => {
+                let now = Utc::now();
+                let expires_at = exchanged.expires_at_from(now)?;
+                let tokens = PersistedTokens {
+                    auth_mode: target.provider.auth_mode(),
+                    primary_secret: Some(exchanged.access_token),
+                    refresh_token: exchanged.refresh_token,
+                    id_token: exchanged.id_token,
+                    expires_at,
+                    last_refresh: Some(now),
+                    scopes: exchanged
+                        .scope
+                        .as_deref()
+                        .map(|scope| scope.split_whitespace().map(String::from).collect())
+                        .unwrap_or_default(),
+                    account_id: None,
+                    metadata: serde_json::Value::Null,
+                };
+                let committed =
+                    meerkat_providers::browser_login::save_oauth_tokens_and_consume_device_flow(
+                        self.persistence.clone(),
+                        self.authority.generated_auth_lease_handle(),
+                        resolved.credential_identity,
+                        tokens,
+                        poll_lease,
+                    )
+                    .await?;
+                Ok(HostAuthDevicePoll::Ready(HostAuthLoginComplete {
+                    auth_binding: resolved.auth_binding,
+                    provider: resolved.backend.provider,
+                    profile_id: resolved.auth_profile.id,
+                    expires_at: committed.expires_at,
+                    has_refresh_token: committed.refresh_token.is_some(),
+                    scopes: committed.scopes,
+                }))
+            }
+        }
     }
 
     pub async fn logout(
@@ -320,10 +463,10 @@ impl HostAuthService {
         target: &HostAuthTarget,
     ) -> Result<AuthBindingRef, HostAuthError> {
         let resolved = resolve_writable_oauth_target(config, target)?;
-        meerkat_core::clear_tokens_and_publish_lifecycle_released_coordinated(
+        meerkat_core::clear_tokens_and_publish_lifecycle_released_coordinated_for_identity(
             self.persistence.clone(),
             self.authority.generated_auth_lease_handle(),
-            resolved.auth_binding.clone(),
+            resolved.credential_identity,
         )
         .await?;
         Ok(resolved.auth_binding)
@@ -334,14 +477,25 @@ fn resolve_target(
     config: &Config,
     target: &HostAuthTarget,
 ) -> Result<ResolvedConnectionTarget, HostAuthError> {
-    Ok(meerkat_core::resolve_realm_binding_target_for_provider(
+    if let Some(provider) = target.provider.provider() {
+        return Ok(meerkat_core::resolve_realm_binding_target_for_provider(
+            config,
+            provider,
+            Some(&target.realm_id),
+            Some(&target.binding_id),
+            target.profile_id.as_ref(),
+            None,
+            false,
+        )?);
+    }
+    Ok(meerkat_core::resolve_explicit_auth_binding_target(
         config,
-        target.provider.provider(),
-        Some(&target.realm_id),
-        Some(&target.binding_id),
-        target.profile_id.as_ref(),
-        None,
-        false,
+        &AuthBindingRef {
+            realm: target.realm_id.clone(),
+            binding: target.binding_id.clone(),
+            profile: target.profile_id.clone(),
+            origin: meerkat_core::BindingOrigin::Configured,
+        },
     )?)
 }
 
@@ -359,8 +513,16 @@ fn resolve_writable_oauth_target(
     target: &HostAuthTarget,
 ) -> Result<ResolvedConnectionTarget, HostAuthError> {
     let resolved = resolve_writable_target(config, target)?;
-    validate_oauth_login_binding(&resolved.backend, &resolved.auth_profile, target.provider)?;
+    validate_resolved_oauth_target(&resolved, target.provider)?;
     Ok(resolved)
+}
+
+fn validate_resolved_oauth_target(
+    resolved: &ResolvedConnectionTarget,
+    provider: OAuthProviderIdentity,
+) -> Result<(), HostAuthError> {
+    meerkat_providers::oauth_flow::validate_oauth_login_connection_target(resolved, provider)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -400,6 +562,7 @@ mod tests {
             ProviderBindingConfig {
                 backend_profile: "openai".to_string(),
                 auth_profile: "openai".to_string(),
+                credential_account: None,
                 default_model: Some("gpt-5.4".to_string()),
                 policy: Default::default(),
                 provider_default: true,

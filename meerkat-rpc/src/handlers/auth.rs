@@ -22,18 +22,15 @@ use meerkat_core::{
     AuthBindingRef, ConnectionTargetError, CredentialSourceSpec, Provider, RealmConnectionSet,
     ResolvedConnectionTarget,
 };
-use meerkat_providers::auth_oauth::{
-    DevicePollOutcome, OAuthError, PkcePair, exchange_authorization_code_with_state,
-    poll_device_code, request_device_code,
-};
+use meerkat_providers::auth_oauth::{OAuthError, PkcePair, exchange_authorization_code_with_state};
 use meerkat_providers::auth_store::{
     CredentialMutationError, CredentialMutationOutcome, PersistedAuthMode, PersistedTokens,
     RefreshCoordinator, TokenKey, TokenStore, credential_source_uses_persisted_store,
     persisted_auth_mode_is_oauth_login,
 };
 use meerkat_providers::oauth_flow::{
-    OAuthDevicePollLease, OAuthFlowError, OAuthProviderIdentity, resolve_oauth_provider,
-    validate_oauth_login_binding, validate_oauth_target_binding_for_auth_mode,
+    OAuthDevicePollLease, OAuthFlowError, OAuthProviderIdentity, validate_oauth_login_binding,
+    validate_oauth_target_binding_for_auth_mode,
 };
 
 use super::{RpcResponseExt, parse_params};
@@ -55,22 +52,16 @@ fn host_auth_service(
 }
 
 fn host_auth_target(
-    provider: &str,
+    provider: OAuthProviderIdentity,
     realm_id: &str,
     binding_id: &str,
     profile_id: Option<&str>,
-) -> Result<meerkat::HostAuthTarget, String> {
-    let provider = OAuthProviderIdentity::from_alias(provider)
-        .ok_or_else(|| format!("unknown OAuth provider '{provider}'"))?;
+) -> Result<meerkat::HostAuthTarget, meerkat_core::connection::IdentityError> {
     Ok(meerkat::HostAuthTarget {
         provider,
-        realm_id: meerkat_core::RealmId::parse(realm_id).map_err(|error| error.to_string())?,
-        binding_id: meerkat_core::BindingId::parse(binding_id)
-            .map_err(|error| error.to_string())?,
-        profile_id: profile_id
-            .map(meerkat_core::ProfileId::parse)
-            .transpose()
-            .map_err(|error| error.to_string())?,
+        realm_id: meerkat_core::RealmId::parse(realm_id)?,
+        binding_id: meerkat_core::BindingId::parse(binding_id)?,
+        profile_id: profile_id.map(meerkat_core::ProfileId::parse).transpose()?,
     })
 }
 
@@ -78,7 +69,9 @@ fn host_auth_error_response(id: Option<RpcId>, error_value: meerkat::HostAuthErr
     let code = match &error_value {
         meerkat::HostAuthError::Target(_)
         | meerkat::HostAuthError::WriteOwner(_)
-        | meerkat::HostAuthError::OAuthTarget(_) => error::INVALID_PARAMS,
+        | meerkat::HostAuthError::OAuthTarget(_)
+        | meerkat::HostAuthError::BrowserFlowUnsupported(_)
+        | meerkat::HostAuthError::DeviceFlowUnsupported(_) => error::INVALID_PARAMS,
         meerkat::HostAuthError::OAuthFlow(
             OAuthFlowError::Missing
             | OAuthFlowError::ProviderMismatch { .. }
@@ -100,8 +93,7 @@ fn host_auth_error_response(id: Option<RpcId>, error_value: meerkat::HostAuthErr
         | meerkat::HostAuthError::Factory(_)
         | meerkat::HostAuthError::PersistenceUnavailable
         | meerkat::HostAuthError::Lifecycle(_)
-        | meerkat::HostAuthError::StatusRehydrate(_)
-        | meerkat::HostAuthError::InvalidExpiry(_) => error::INTERNAL_ERROR,
+        | meerkat::HostAuthError::StatusRehydrate(_) => error::INTERNAL_ERROR,
     };
     RpcResponse::error(id, code, error_value.to_string())
 }
@@ -273,6 +265,7 @@ async fn resolve_binding_identity(
                 Err(inherited @ meerkat_core::connection::WriteOwnerError::Inherited { .. }) => {
                     inherited.to_string()
                 }
+
                 _ => format!("Unknown auth identity {realm_id}:{binding_id}: {e}"),
             };
             Err(RpcResponse::error(None, error::INVALID_PARAMS, message))
@@ -280,9 +273,55 @@ async fn resolve_binding_identity(
     }
 }
 
+async fn resolve_binding_identity_for_read(
+    runtime: &SessionRuntime,
+    realm_id: &str,
+    binding_id: &str,
+    profile_id: Option<&str>,
+) -> Result<
+    (
+        AuthBindingRef,
+        meerkat_core::ProviderBinding,
+        meerkat_core::AuthProfile,
+    ),
+    RpcResponse,
+> {
+    let config = load_config(runtime).await?;
+    let requested = AuthBindingRef {
+        realm: meerkat_core::RealmId::parse(realm_id).map_err(|error_value| {
+            RpcResponse::error(
+                None,
+                error::INVALID_PARAMS,
+                format!("Invalid realm id {realm_id}: {error_value}"),
+            )
+        })?,
+        binding: meerkat_core::BindingId::parse(binding_id).map_err(|error_value| {
+            RpcResponse::error(
+                None,
+                error::INVALID_PARAMS,
+                format!("Invalid binding id {binding_id}: {error_value}"),
+            )
+        })?,
+        profile: profile_id
+            .map(meerkat_core::ProfileId::parse)
+            .transpose()
+            .map_err(|error_value| {
+                RpcResponse::error(
+                    None,
+                    error::INVALID_PARAMS,
+                    format!("Invalid profile id: {error_value}"),
+                )
+            })?,
+        origin: meerkat_core::BindingOrigin::Configured,
+    };
+    let target = meerkat_core::resolve_explicit_auth_binding_target(&config, &requested)
+        .map_err(target_error_response)?;
+    Ok((target.auth_binding, target.binding, target.auth_profile))
+}
+
 async fn resolve_oauth_target(
     runtime: &SessionRuntime,
-    provider: Provider,
+    provider: Option<Provider>,
     realm_id: Option<&str>,
     binding_id: Option<&str>,
     profile_id: Option<&str>,
@@ -301,14 +340,40 @@ async fn resolve_oauth_target(
         .transpose()
         .map_err(|e| RpcResponse::error(None, error::INVALID_PARAMS, e.to_string()))?;
     let runtime_realm = runtime.realm_id();
-    meerkat_core::resolve_realm_binding_target_for_provider(
+    if let Some(provider) = provider {
+        return meerkat_core::resolve_realm_binding_target_for_provider(
+            &config,
+            provider,
+            explicit_realm.as_ref(),
+            explicit_binding.as_ref(),
+            explicit_profile.as_ref(),
+            runtime_realm.as_ref(),
+            false,
+        )
+        .map_err(target_error_response);
+    }
+    let realm = explicit_realm.ok_or_else(|| {
+        RpcResponse::error(
+            None,
+            error::INVALID_PARAMS,
+            "shared OAuth issuers require an explicit realm_id",
+        )
+    })?;
+    let binding = explicit_binding.ok_or_else(|| {
+        RpcResponse::error(
+            None,
+            error::INVALID_PARAMS,
+            "shared OAuth issuers require an explicit binding_id",
+        )
+    })?;
+    meerkat_core::resolve_explicit_auth_binding_target(
         &config,
-        provider,
-        explicit_realm.as_ref(),
-        explicit_binding.as_ref(),
-        explicit_profile.as_ref(),
-        runtime_realm.as_ref(),
-        false,
+        &AuthBindingRef {
+            realm,
+            binding,
+            profile: explicit_profile,
+            origin: meerkat_core::BindingOrigin::Configured,
+        },
     )
     .map_err(target_error_response)
 }
@@ -469,6 +534,7 @@ fn source_kind_label(source: &CredentialSourceSpec) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn oauth_device_state_error(id: Option<RpcId>, err: OAuthFlowError) -> RpcResponse {
     match err {
         OAuthFlowError::Missing => RpcResponse::error(
@@ -489,6 +555,7 @@ fn oauth_device_state_error(id: Option<RpcId>, err: OAuthFlowError) -> RpcRespon
     }
 }
 
+#[cfg(test)]
 fn oauth_terminal_device_consume_error(id: Option<RpcId>, err: OAuthFlowError) -> RpcResponse {
     match err {
         OAuthFlowError::LifecycleRejected { .. } => RpcResponse::error(
@@ -500,16 +567,48 @@ fn oauth_terminal_device_consume_error(id: Option<RpcId>, err: OAuthFlowError) -
     }
 }
 
+#[cfg(test)]
 fn release_uncredentialed_terminal_oauth_lifecycle(
     auth_lease: &meerkat_core::handles::GeneratedAuthLeaseHandle,
     auth_binding: &AuthBindingRef,
 ) {
-    let lease_key = LeaseKey::from_auth_binding(auth_binding);
+    release_uncredentialed_terminal_oauth_lifecycle_for_identity(
+        auth_lease,
+        &meerkat_core::AuthCredentialIdentity::from_auth_binding(auth_binding),
+    );
+}
+
+#[cfg(test)]
+fn release_uncredentialed_terminal_oauth_lifecycle_for_identity(
+    auth_lease: &meerkat_core::handles::GeneratedAuthLeaseHandle,
+    credential_identity: &meerkat_core::AuthCredentialIdentity,
+) {
+    let lease_key = LeaseKey::from_credential_identity(credential_identity);
     if !auth_lease.snapshot(&lease_key).credential_present {
         let _ = auth_lease.release_credential_lifecycle(&lease_key);
     }
 }
 
+#[cfg(test)]
+fn consume_terminal_device_flow_for_identity(
+    id: Option<RpcId>,
+    auth_lease: &meerkat_core::handles::GeneratedAuthLeaseHandle,
+    credential_identity: &meerkat_core::AuthCredentialIdentity,
+    poll_lease: OAuthDevicePollLease,
+) -> Option<RpcResponse> {
+    match poll_lease.consume() {
+        Ok(_) => None,
+        Err(err) => {
+            release_uncredentialed_terminal_oauth_lifecycle_for_identity(
+                auth_lease,
+                credential_identity,
+            );
+            Some(oauth_terminal_device_consume_error(id, err))
+        }
+    }
+}
+
+#[cfg(test)]
 fn consume_terminal_device_flow(
     id: Option<RpcId>,
     auth_lease: &meerkat_core::handles::GeneratedAuthLeaseHandle,
@@ -525,6 +624,7 @@ fn consume_terminal_device_flow(
     }
 }
 
+#[cfg(test)]
 fn finish_device_flow_poll(
     id: Option<RpcId>,
     poll_lease: OAuthDevicePollLease,
@@ -535,6 +635,7 @@ fn finish_device_flow_poll(
     }
 }
 
+#[cfg(test)]
 fn verify_terminal_device_flow(
     id: Option<RpcId>,
     poll_lease: &OAuthDevicePollLease,
@@ -545,12 +646,14 @@ fn verify_terminal_device_flow(
     }
 }
 
+#[cfg(test)]
 struct PreparedTokenCommitSnapshot {
     key: TokenKey,
     lease_key: LeaseKey,
     previous: Option<PersistedTokens>,
 }
 
+#[cfg(test)]
 struct TokenCommitSnapshot {
     key: TokenKey,
     lease_key: LeaseKey,
@@ -560,6 +663,7 @@ struct TokenCommitSnapshot {
     lifecycle_transition: meerkat_core::handles::AuthLeaseTransition,
 }
 
+#[cfg(test)]
 async fn prepare_token_commit_unlocked(
     id: Option<RpcId>,
     store: &Arc<dyn TokenStore>,
@@ -595,6 +699,7 @@ async fn prepare_token_commit_unlocked(
 /// single durable `TokenStore::save` run. No unmarked token bytes ever reach
 /// the store — on a crash the durable record either carries the
 /// proof-of-acquisition marker or does not exist.
+#[cfg(test)]
 async fn save_tokens_and_publish_lifecycle_commit_unlocked(
     id: Option<RpcId>,
     store: &Arc<dyn TokenStore>,
@@ -651,6 +756,7 @@ async fn save_tokens_and_publish_lifecycle_commit_unlocked(
 /// handoff or the durable save fails, the freshly acquired lease is rolled
 /// back via [`rollback_token_commit`] (release + previous credential/lifecycle
 /// restore) so no half-state survives.
+#[cfg(test)]
 async fn save_marked_token_commit_unlocked(
     id: Option<RpcId>,
     store: &dyn TokenStore,
@@ -693,6 +799,7 @@ async fn save_marked_token_commit_unlocked(
     Ok(())
 }
 
+#[cfg(test)]
 async fn save_tokens_and_publish_lifecycle(
     id: Option<RpcId>,
     runtime: &SessionRuntime,
@@ -747,6 +854,7 @@ async fn save_tokens_and_publish_lifecycle(
     }
 }
 
+#[cfg(test)]
 fn rpc_response_to_credential_mutation_error(response: RpcResponse) -> CredentialMutationError {
     CredentialMutationError::Operation(
         response
@@ -762,6 +870,7 @@ fn rpc_response_to_credential_mutation_error(response: RpcResponse) -> Credentia
 /// here re-assert the previous record and re-stamp its marker from the
 /// restored transition. The lease release always runs first: even if the
 /// durable restore fails, no freshly acquired lease survives a failed commit.
+#[cfg(test)]
 async fn rollback_token_commit(
     store: &dyn TokenStore,
     auth_lease: &meerkat_core::handles::GeneratedAuthLeaseHandle,
@@ -819,6 +928,7 @@ async fn rollback_token_commit(
     Ok(())
 }
 
+#[cfg(test)]
 async fn save_prepared_tokens_after_terminal_consume_unlocked(
     id: Option<RpcId>,
     store: &Arc<dyn TokenStore>,
@@ -860,6 +970,7 @@ async fn save_prepared_tokens_after_terminal_consume_unlocked(
     .await
 }
 
+#[cfg(test)]
 async fn save_tokens_and_consume_device_flow_unlocked(
     id: Option<RpcId>,
     store: &Arc<dyn TokenStore>,
@@ -900,6 +1011,7 @@ async fn save_tokens_and_consume_device_flow_unlocked(
     .err()
 }
 
+#[cfg(test)]
 async fn save_tokens_and_consume_device_flow(
     id: Option<RpcId>,
     runtime: &SessionRuntime,
@@ -967,6 +1079,7 @@ async fn save_tokens_and_consume_device_flow(
     }
 }
 
+#[cfg(test)]
 struct BrowserFlowConsume<'a> {
     authority: &'a dyn meerkat_providers::oauth_flow::OAuthFlowAuthority,
     state: &'a str,
@@ -974,6 +1087,7 @@ struct BrowserFlowConsume<'a> {
     redirect_uri: &'a str,
 }
 
+#[cfg(test)]
 struct OwnedBrowserFlowConsume {
     authority: Arc<dyn meerkat_providers::oauth_flow::OAuthFlowAuthority>,
     state: String,
@@ -981,6 +1095,7 @@ struct OwnedBrowserFlowConsume {
     redirect_uri: String,
 }
 
+#[cfg(test)]
 async fn save_tokens_and_consume_browser_flow_unlocked(
     id: Option<RpcId>,
     store: &Arc<dyn TokenStore>,
@@ -999,7 +1114,12 @@ async fn save_tokens_and_consume_browser_flow_unlocked(
     let prepared =
         prepare_token_commit_unlocked(id.clone(), store, auth_lease, auth_binding).await?;
     flow.authority
-        .consume(flow.state, auth_binding, flow.provider, flow.redirect_uri)
+        .consume(
+            flow.state,
+            &meerkat_core::AuthCredentialIdentity::from_auth_binding(auth_binding),
+            flow.provider,
+            flow.redirect_uri,
+        )
         .map_err(|err| {
             release_uncredentialed_terminal_oauth_lifecycle(auth_lease, auth_binding);
             RpcResponse::error(
@@ -1020,6 +1140,7 @@ async fn save_tokens_and_consume_browser_flow_unlocked(
     Ok(())
 }
 
+#[cfg(test)]
 async fn save_tokens_and_consume_browser_flow(
     id: Option<RpcId>,
     runtime: &SessionRuntime,
@@ -1085,6 +1206,7 @@ async fn save_tokens_and_consume_browser_flow(
     }
 }
 
+#[cfg(test)]
 async fn clear_tokens_and_publish_lifecycle(
     id: Option<RpcId>,
     runtime: &SessionRuntime,
@@ -1222,7 +1344,7 @@ pub async fn handle_auth_profile_create(
         Ok(v) => v,
         Err(r) => return r.with_id(id),
     };
-    let (auth_binding, _binding, auth_profile) = match resolve_binding_identity(
+    let (auth_binding, binding, auth_profile) = match resolve_binding_identity(
         runtime,
         &parsed.realm_id,
         &parsed.binding_id,
@@ -1267,9 +1389,10 @@ pub async fn handle_auth_profile_create(
     if let Some(r) = require_managed_store_source(id.clone(), &parsed.binding_id, &auth_profile) {
         return r;
     }
-    if let Err(response) = require_provider_auth_persistence(runtime, id.clone()) {
-        return response;
-    }
+    let persistence = match require_provider_auth_persistence(runtime, id.clone()) {
+        Ok(persistence) => persistence,
+        Err(response) => return response,
+    };
     let tokens = PersistedTokens {
         auth_mode,
         primary_secret: Some(parsed.secret),
@@ -1281,10 +1404,15 @@ pub async fn handle_auth_profile_create(
         account_id: None,
         metadata: serde_json::Value::Null,
     };
-    if let Err(resp) =
-        save_tokens_and_publish_lifecycle(id.clone(), runtime, &auth_binding, &tokens).await
+    if let Err(error_value) = meerkat_providers::browser_login::save_tokens_and_publish_lifecycle(
+        persistence,
+        runtime.generated_auth_lease_handle(),
+        binding.credential_identity(&auth_binding),
+        tokens,
+    )
+    .await
     {
-        return resp;
+        return RpcResponse::error(id, error::INTERNAL_ERROR, error_value.to_string());
     }
     tracing::info!(
         target: "meerkat::auth::audit",
@@ -1315,7 +1443,7 @@ pub async fn handle_auth_profile_delete(
         Ok(v) => v,
         Err(r) => return r.with_id(id),
     };
-    let (auth_binding, _binding, auth_profile) = match resolve_binding_identity(
+    let (auth_binding, binding, auth_profile) = match resolve_binding_identity(
         runtime,
         &parsed.realm_id,
         &parsed.binding_id,
@@ -1326,12 +1454,23 @@ pub async fn handle_auth_profile_delete(
         Ok(v) => v,
         Err(r) => return r.with_id(id),
     };
-    if let Err(response) = require_provider_auth_persistence(runtime, id.clone()) {
-        return response;
-    }
-    if let Err(resp) = clear_tokens_and_publish_lifecycle(id.clone(), runtime, &auth_binding).await
+    let persistence = match require_provider_auth_persistence(runtime, id.clone()) {
+        Ok(persistence) => persistence,
+        Err(response) => return response,
+    };
+    if let Err(error) =
+        meerkat_core::clear_tokens_and_publish_lifecycle_released_coordinated_for_identity(
+            persistence,
+            runtime.generated_auth_lease_handle(),
+            binding.credential_identity(&auth_binding),
+        )
+        .await
     {
-        return resp;
+        return RpcResponse::error(
+            id,
+            error::INTERNAL_ERROR,
+            format!("credential lifecycle clear failed: {error}"),
+        );
     }
     tracing::info!(
         target: "meerkat::auth::audit",
@@ -1361,14 +1500,14 @@ pub async fn handle_auth_login_start(
         Err(r) => return r.with_id(id),
     };
     let target = match host_auth_target(
-        &parsed.provider,
+        parsed.provider.identity(),
         &parsed.realm_id,
         &parsed.binding_id,
         parsed.profile_id.as_deref(),
     ) {
         Ok(target) => target,
         Err(error_value) => {
-            return RpcResponse::error(id, error::INVALID_PARAMS, error_value);
+            return RpcResponse::error(id, error::INVALID_PARAMS, error_value.to_string());
         }
     };
     let config = match load_config(runtime).await {
@@ -1407,14 +1546,14 @@ pub async fn handle_auth_login_complete(
         Err(r) => return r.with_id(id),
     };
     let target = match host_auth_target(
-        &parsed.provider,
+        parsed.provider.identity(),
         &parsed.realm_id,
         &parsed.binding_id,
         parsed.profile_id.as_deref(),
     ) {
         Ok(target) => target,
         Err(error_value) => {
-            return RpcResponse::error(id, error::INVALID_PARAMS, error_value);
+            return RpcResponse::error(id, error::INVALID_PARAMS, error_value.to_string());
         }
     };
     let config = match load_config(runtime).await {
@@ -1469,85 +1608,39 @@ pub async fn handle_auth_login_device_start(
         Ok(v) => v,
         Err(r) => return r.with_id(id),
     };
-    let resolved = match resolve_oauth_provider(&parsed.provider, "") {
-        Ok(v) => v,
-        Err(e) => return RpcResponse::error(id, error::INVALID_PARAMS, e.to_string()),
-    };
-    if resolved.endpoints.device_code_url.is_none() {
-        return RpcResponse::error(
-            id,
-            error::INVALID_PARAMS,
-            format!(
-                "provider '{}' does not support the device-code flow",
-                parsed.provider,
-            ),
-        );
-    }
-    let target = match resolve_oauth_target(
-        runtime,
-        resolved.provider,
-        Some(parsed.realm_id.as_str()),
-        Some(parsed.binding_id.as_str()),
+    let target = match host_auth_target(
+        parsed.provider.identity(),
+        &parsed.realm_id,
+        &parsed.binding_id,
         parsed.profile_id.as_deref(),
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(r) => return r.with_id(id),
-    };
-    // Strict-owner write guard (decision 5): reject a device-flow login that
-    // targets a realm which only INHERITS this binding, naming the owner.
-    if let Err(r) = guard_strict_owner_write(
-        runtime,
-        &id,
-        parsed.realm_id.as_str(),
-        parsed.binding_id.as_str(),
-    )
-    .await
-    {
-        return r;
-    }
-    if let Err(e) =
-        validate_oauth_login_binding(&target.backend, &target.auth_profile, resolved.identity)
-    {
-        return RpcResponse::error(id, error::INVALID_PARAMS, e.to_string());
-    }
-    let auth_binding = target.auth_binding;
-    let http = reqwest::Client::new();
-    match request_device_code(&http, &resolved.endpoints).await {
-        Ok(resp) => {
-            let lease_key = LeaseKey::from_auth_binding(&auth_binding);
-            let _guard = meerkat_core::acquire_auth_login_lifecycle_guard(&lease_key).await;
-            if let Err(err) = runtime.oauth_flow_authority().admit_device_code(
-                auth_binding,
-                resolved.identity,
-                resp.device_code.clone(),
-                std::time::Duration::from_secs(resp.expires_in),
-            ) {
-                return RpcResponse::error(
-                    id,
-                    error::INTERNAL_ERROR,
-                    format!("oauth device state initialization failed: {err}"),
-                );
-            }
-            RpcResponse::success(
-                id,
-                meerkat_contracts::WireDeviceStart {
-                    device_code: resp.device_code,
-                    user_code: resp.user_code,
-                    verification_uri: resp.verification_uri,
-                    verification_uri_complete: resp.verification_uri_complete,
-                    expires_in: resp.expires_in,
-                    interval: resp.interval,
-                    provider: parsed.provider,
-                },
-            )
+    ) {
+        Ok(target) => target,
+        Err(error_value) => {
+            return RpcResponse::error(id, error::INVALID_PARAMS, error_value.to_string());
         }
-        Err(e) => RpcResponse::error(
+    };
+    let config = match load_config(runtime).await {
+        Ok(config) => config,
+        Err(response) => return response.with_id(id),
+    };
+    let service = match host_auth_service(runtime) {
+        Ok(service) => service,
+        Err(error_value) => return host_auth_error_response(id, error_value),
+    };
+    match service.device_start(&config, &target).await {
+        Ok(device) => RpcResponse::success(
             id,
-            error::INTERNAL_ERROR,
-            format!("device-code request failed: {e}"),
+            meerkat_contracts::WireDeviceStart {
+                device_code: device.device_code,
+                user_code: device.user_code,
+                verification_uri: device.verification_uri,
+                verification_uri_complete: device.verification_uri_complete,
+                expires_in: device.expires_in,
+                interval: device.interval,
+                provider: parsed.provider,
+            },
         ),
+        Err(error_value) => host_auth_error_response(id, error_value),
     }
 }
 
@@ -1568,178 +1661,63 @@ pub async fn handle_auth_login_device_complete(
         Ok(v) => v,
         Err(r) => return r.with_id(id),
     };
-    let resolved = match resolve_oauth_provider(&parsed.provider, "") {
-        Ok(v) => v,
-        Err(e) => return RpcResponse::error(id, error::INVALID_PARAMS, e.to_string()),
-    };
-    let provider = resolved.provider;
-    if resolved.endpoints.device_code_url.is_none() {
-        return RpcResponse::error(
-            id,
-            error::INVALID_PARAMS,
-            format!(
-                "provider '{}' does not support the device-code flow",
-                parsed.provider,
-            ),
-        );
-    }
-    let target = match resolve_oauth_target(
-        runtime,
-        provider,
-        Some(parsed.realm_id.as_str()),
-        Some(parsed.binding_id.as_str()),
+    let target = match host_auth_target(
+        parsed.provider.identity(),
+        &parsed.realm_id,
+        &parsed.binding_id,
         parsed.profile_id.as_deref(),
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(r) => return r.with_id(id),
-    };
-    // Strict-owner write guard (decision 5): reject persisting an OAuth login
-    // against a realm that only INHERITS this binding, naming the owner.
-    if let Err(r) = guard_strict_owner_write(
-        runtime,
-        &id,
-        parsed.realm_id.as_str(),
-        parsed.binding_id.as_str(),
-    )
-    .await
-    {
-        return r;
-    }
-    let auth_binding = target.auth_binding;
-    let binding = target.binding;
-    let backend_profile = target.backend;
-    let auth_profile = target.auth_profile;
-    if provider != auth_profile.provider {
-        return RpcResponse::error(
-            id,
-            error::INVALID_PARAMS,
-            format!(
-                "binding {} resolves provider '{}' not '{}'",
-                binding.id,
-                auth_profile.provider.as_str(),
-                parsed.provider,
-            ),
-        );
-    }
-    if let Err(e) = validate_oauth_login_binding(&backend_profile, &auth_profile, resolved.identity)
-    {
-        return RpcResponse::error(id, error::INVALID_PARAMS, e.to_string());
-    }
-    let poll_lease = match runtime.oauth_flow_authority().begin_device_code_poll(
-        &parsed.device_code,
-        &auth_binding,
-        resolved.identity,
     ) {
-        Ok(lease) => lease,
-        Err(err) => return oauth_device_state_error(id, err),
-    };
-    let http = reqwest::Client::new();
-    let outcome = match poll_device_code(
-        &http,
-        &resolved.endpoints,
-        &parsed.device_code,
-        resolved.client_secret,
-    )
-    .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            return RpcResponse::error(
-                id,
-                error::INTERNAL_ERROR,
-                format!("device-code poll failed: {e}"),
-            );
+        Ok(target) => target,
+        Err(error_value) => {
+            return RpcResponse::error(id, error::INVALID_PARAMS, error_value.to_string());
         }
     };
-    match outcome {
-        DevicePollOutcome::Pending => match finish_device_flow_poll(id.clone(), poll_lease) {
-            None => RpcResponse::success(id, WireDeviceCompleteResult::Pending),
-            Some(resp) => resp,
-        },
-        DevicePollOutcome::SlowDown => match finish_device_flow_poll(id.clone(), poll_lease) {
-            None => RpcResponse::success(id, WireDeviceCompleteResult::SlowDown),
-            Some(resp) => resp,
-        },
-        DevicePollOutcome::AccessDenied => match consume_terminal_device_flow(
-            id.clone(),
-            &runtime.generated_auth_lease_handle(),
-            &auth_binding,
-            poll_lease,
-        ) {
-            None => RpcResponse::success(id, WireDeviceCompleteResult::AccessDenied),
-            Some(resp) => resp,
-        },
-        DevicePollOutcome::Expired => match consume_terminal_device_flow(
-            id.clone(),
-            &runtime.generated_auth_lease_handle(),
-            &auth_binding,
-            poll_lease,
-        ) {
-            None => RpcResponse::success(id, WireDeviceCompleteResult::Expired),
-            Some(resp) => resp,
-        },
-        DevicePollOutcome::Ready(result) => {
-            if let Err(response) = require_provider_auth_persistence(runtime, id.clone()) {
-                return response;
-            }
-            let expires_at = match result.expires_at_from(chrono::Utc::now()) {
-                Ok(expires_at) => expires_at,
-                Err(e) => {
-                    return RpcResponse::error(
-                        id,
-                        error::INTERNAL_ERROR,
-                        format!("token expiry is invalid: {e}"),
-                    );
-                }
-            };
-            let tokens = PersistedTokens {
-                auth_mode: resolved.auth_mode,
-                primary_secret: Some(result.access_token),
-                refresh_token: result.refresh_token,
-                id_token: result.id_token,
-                expires_at,
-                last_refresh: Some(chrono::Utc::now()),
-                scopes: result
-                    .scope
-                    .as_deref()
-                    .map(|s| s.split_whitespace().map(String::from).collect())
-                    .unwrap_or_default(),
-                account_id: None,
-                metadata: serde_json::Value::Null,
-            };
-            if let Some(resp) = save_tokens_and_consume_device_flow(
-                id.clone(),
-                runtime,
-                &auth_binding,
-                &tokens,
-                poll_lease,
-            )
-            .await
-            {
-                return resp;
-            }
+    let config = match load_config(runtime).await {
+        Ok(config) => config,
+        Err(response) => return response.with_id(id),
+    };
+    let service = match host_auth_service(runtime) {
+        Ok(service) => service,
+        Err(error_value) => return host_auth_error_response(id, error_value),
+    };
+    match service
+        .device_poll(&config, &target, &parsed.device_code)
+        .await
+    {
+        Ok(meerkat::HostAuthDevicePoll::Pending) => {
+            RpcResponse::success(id, WireDeviceCompleteResult::Pending)
+        }
+        Ok(meerkat::HostAuthDevicePoll::SlowDown) => {
+            RpcResponse::success(id, WireDeviceCompleteResult::SlowDown)
+        }
+        Ok(meerkat::HostAuthDevicePoll::AccessDenied) => {
+            RpcResponse::success(id, WireDeviceCompleteResult::AccessDenied)
+        }
+        Ok(meerkat::HostAuthDevicePoll::Expired) => {
+            RpcResponse::success(id, WireDeviceCompleteResult::Expired)
+        }
+        Ok(meerkat::HostAuthDevicePoll::Ready(completed)) => {
             tracing::info!(
                 target: "meerkat::auth::audit",
-                binding_key = ?auth_binding,
+                binding_key = ?completed.auth_binding,
                 action = "login_device_complete",
                 provider = %parsed.provider,
-                has_refresh_token = %tokens.refresh_token.is_some(),
+                has_refresh_token = %completed.has_refresh_token,
                 "OAuth device-flow login completed via RPC"
             );
             RpcResponse::success(
                 id,
                 WireDeviceCompleteResult::Ready {
-                    identity: Box::new(WireBindingIdentity::from(&auth_binding)),
-                    profile_id: auth_profile.id,
+                    identity: Box::new(WireBindingIdentity::from(&completed.auth_binding)),
+                    profile_id: completed.profile_id,
                     provider: parsed.provider,
-                    expires_at: expires_at.map(|e| e.to_rfc3339()),
-                    has_refresh_token: tokens.refresh_token.is_some(),
-                    scopes: tokens.scopes,
+                    expires_at: completed.expires_at.map(|expires| expires.to_rfc3339()),
+                    has_refresh_token: completed.has_refresh_token,
+                    scopes: completed.scopes,
                 },
             )
         }
+        Err(error_value) => host_auth_error_response(id, error_value),
     }
 }
 
@@ -1772,7 +1750,7 @@ pub async fn handle_auth_login_provision_api_key(
     };
     let target = match resolve_oauth_target(
         runtime,
-        Provider::Anthropic,
+        Some(Provider::Anthropic),
         Some(realm_id),
         Some(binding_id),
         parsed.profile_id.as_deref(),
@@ -1788,6 +1766,7 @@ pub async fn handle_auth_login_provision_api_key(
         return r;
     }
     let auth_binding = target.auth_binding;
+    let credential_identity = target.credential_identity;
     let backend_profile = target.backend;
     let auth_profile = target.auth_profile;
     if let Err(e) = validate_oauth_target_binding_for_auth_mode(
@@ -1805,7 +1784,7 @@ pub async fn handle_auth_login_provision_api_key(
     let provision_provider = OAuthProviderIdentity::AnthropicConsoleApiKey;
     let provision_redirect_uri = a_oauth::MANUAL_REDIRECT_URL;
     let provision_state = match flow_authority.start(
-        auth_binding.clone(),
+        credential_identity.clone(),
         provision_provider,
         provision_redirect_uri.to_string(),
         "provision-api-key".to_string(),
@@ -1824,7 +1803,7 @@ pub async fn handle_auth_login_provision_api_key(
         Err(r) => {
             let _ = flow_authority.consume(
                 &provision_state,
-                &auth_binding,
+                &credential_identity,
                 provision_provider,
                 provision_redirect_uri,
             );
@@ -1838,36 +1817,31 @@ pub async fn handle_auth_login_provision_api_key(
     // TokenStore/AuthMachine commit and terminal flow consume.
     let endpoints = a_oauth::console_endpoints(a_oauth::MANUAL_REDIRECT_URL);
     let oauth_runtime = a_oauth::AnthropicOAuthRuntime::new(
-        persistence,
+        persistence.clone(),
         endpoints,
-        TokenKey::from_auth_binding(&auth_binding),
+        TokenKey::from_credential_identity(&credential_identity),
     );
     match oauth_runtime
         .provision_api_key_tokens(&parsed.access_token)
         .await
     {
         Ok(tokens) => {
-            if let Err(resp) = save_tokens_and_consume_browser_flow(
-                id.clone(),
-                runtime,
-                &auth_binding,
-                &tokens,
-                OwnedBrowserFlowConsume {
-                    authority: Arc::clone(&flow_authority),
-                    state: provision_state.clone(),
-                    provider: provision_provider,
-                    redirect_uri: provision_redirect_uri.to_string(),
-                },
-            )
-            .await
+            if let Err(error_value) =
+                meerkat_providers::browser_login::save_oauth_tokens_and_consume_browser_flow(
+                    persistence,
+                    runtime.generated_auth_lease_handle(),
+                    credential_identity.clone(),
+                    tokens.clone(),
+                    meerkat_providers::browser_login::BrowserOAuthFlowCommit {
+                        authority: Arc::clone(&flow_authority),
+                        state: provision_state.clone(),
+                        provider: provision_provider,
+                        redirect_uri: provision_redirect_uri.to_string(),
+                    },
+                )
+                .await
             {
-                let _ = flow_authority.consume(
-                    &provision_state,
-                    &auth_binding,
-                    provision_provider,
-                    provision_redirect_uri,
-                );
-                return resp;
+                return RpcResponse::error(id, error::INTERNAL_ERROR, error_value.to_string());
             }
             RpcResponse::success(
                 id,
@@ -1884,7 +1858,7 @@ pub async fn handle_auth_login_provision_api_key(
         Err(e) => {
             let _ = flow_authority.consume(
                 &provision_state,
-                &auth_binding,
+                &credential_identity,
                 provision_provider,
                 provision_redirect_uri,
             );
@@ -1906,7 +1880,7 @@ pub async fn handle_auth_status_get(
         Ok(v) => v,
         Err(r) => return r.with_id(id),
     };
-    let (auth_binding, _binding, auth_profile) = match resolve_binding_identity(
+    let (auth_binding, binding, auth_profile) = match resolve_binding_identity_for_read(
         runtime,
         &parsed.realm_id,
         &parsed.binding_id,
@@ -1917,9 +1891,10 @@ pub async fn handle_auth_status_get(
         Ok(v) => v,
         Err(r) => return r.with_id(id),
     };
+    let credential_identity = binding.credential_identity(&auth_binding);
     let auth_lease = runtime.auth_lease_handle();
     let generated_auth_lease = runtime.generated_auth_lease_handle();
-    let lease_key = LeaseKey::from_auth_binding(&auth_binding);
+    let lease_key = LeaseKey::from_credential_identity(&credential_identity);
     let now = chrono::Utc::now();
     if let Err(err) = auth_lease.observe_credential_freshness(
         &lease_key,
@@ -1958,10 +1933,10 @@ pub async fn handle_auth_status_get(
                 // A store fault during rehydration is a real error, not
                 // absent credentials: collapsing it would report a store
                 // failure as "no credentials"/Unknown status.
-                match meerkat_core::rehydrate_marked_tokens_for_status(
+                match meerkat_core::rehydrate_marked_tokens_for_status_for_identity(
                     store.as_ref(),
                     &generated_auth_lease,
-                    &auth_binding,
+                    &credential_identity,
                     expected_mode,
                     now,
                 )
@@ -1984,7 +1959,7 @@ pub async fn handle_auth_status_get(
         } else if let Some(store) = token_store.as_ref() {
             // A store-load fault is a real error, not absent credentials.
             stored = match store
-                .load(&TokenKey::from_auth_binding(&auth_binding))
+                .load(&TokenKey::from_credential_identity(&credential_identity))
                 .await
             {
                 Ok(stored) => stored,
@@ -2059,7 +2034,7 @@ pub async fn handle_auth_logout(
         Ok(v) => v,
         Err(r) => return r.with_id(id),
     };
-    let (auth_binding, _binding, auth_profile) = match resolve_binding_identity(
+    let (auth_binding, binding, auth_profile) = match resolve_binding_identity(
         runtime,
         &parsed.realm_id,
         &parsed.binding_id,
@@ -2070,12 +2045,19 @@ pub async fn handle_auth_logout(
         Ok(v) => v,
         Err(r) => return r.with_id(id),
     };
-    if let Err(response) = require_provider_auth_persistence(runtime, id.clone()) {
-        return response;
-    }
-    if let Err(resp) = clear_tokens_and_publish_lifecycle(id.clone(), runtime, &auth_binding).await
+    let persistence = match require_provider_auth_persistence(runtime, id.clone()) {
+        Ok(persistence) => persistence,
+        Err(response) => return response,
+    };
+    if let Err(error) =
+        meerkat_core::clear_tokens_and_publish_lifecycle_released_coordinated_for_identity(
+            persistence,
+            runtime.generated_auth_lease_handle(),
+            binding.credential_identity(&auth_binding),
+        )
+        .await
     {
-        return resp;
+        return RpcResponse::error(id, error::INTERNAL_ERROR, error.to_string());
     }
     tracing::info!(
         target: "meerkat::auth::audit",
@@ -2300,6 +2282,7 @@ mod tests {
             meerkat_core::ProviderBindingConfig {
                 backend_profile: "openai_backend".into(),
                 auth_profile: "openai_managed".into(),
+                credential_account: None,
                 default_model: None,
                 policy: Default::default(),
                 provider_default: false,
@@ -2342,6 +2325,7 @@ mod tests {
             meerkat_core::ProviderBindingConfig {
                 backend_profile: "chatgpt_backend".into(),
                 auth_profile: "openai_oauth".into(),
+                credential_account: None,
                 default_model: None,
                 policy: Default::default(),
                 provider_default: false,
@@ -2401,6 +2385,7 @@ mod tests {
             meerkat_core::ProviderBindingConfig {
                 backend_profile: "openai_backend".into(),
                 auth_profile: "openai_external".into(),
+                credential_account: None,
                 default_model: None,
                 policy: Default::default(),
                 provider_default: false,
@@ -2443,6 +2428,7 @@ mod tests {
             meerkat_core::ProviderBindingConfig {
                 backend_profile: "google_backend".into(),
                 auth_profile: "google_api_key".into(),
+                credential_account: None,
                 default_model: None,
                 policy: Default::default(),
                 provider_default: false,
@@ -2500,6 +2486,7 @@ mod tests {
             meerkat_core::ProviderBindingConfig {
                 backend_profile: "anthropic_backend".into(),
                 auth_profile: "anthropic_api_key".into(),
+                credential_account: None,
                 default_model: None,
                 policy: Default::default(),
                 provider_default: false,
@@ -2604,7 +2591,7 @@ mod tests {
 
         fn finish_device_poll(
             &self,
-            _target: &AuthBindingRef,
+            _target: &meerkat_core::AuthCredentialIdentity,
             _device_code: &str,
         ) -> Result<(), OAuthFlowError> {
             Ok(())
@@ -2612,7 +2599,7 @@ mod tests {
 
         fn consume_device_flow(
             &self,
-            _target: &AuthBindingRef,
+            _target: &meerkat_core::AuthCredentialIdentity,
             _device_code: &str,
             _provider: OAuthProviderIdentity,
         ) -> Result<(), OAuthFlowError> {
@@ -2624,7 +2611,7 @@ mod tests {
 
         fn expire_device_flow(
             &self,
-            _target: &AuthBindingRef,
+            _target: &meerkat_core::AuthCredentialIdentity,
             _device_code: &str,
         ) -> Result<(), OAuthFlowError> {
             Ok(())
@@ -2640,7 +2627,7 @@ mod tests {
 
         fn start(
             &self,
-            _target: AuthBindingRef,
+            _target: meerkat_core::AuthCredentialIdentity,
             _provider: meerkat_providers::oauth_flow::OAuthProviderIdentity,
             _redirect_uri: String,
             _pkce_verifier: String,
@@ -2651,7 +2638,7 @@ mod tests {
         fn verify(
             &self,
             _state: &str,
-            _target: &AuthBindingRef,
+            _target: &meerkat_core::AuthCredentialIdentity,
             _provider: meerkat_providers::oauth_flow::OAuthProviderIdentity,
             _redirect_uri: &str,
         ) -> Result<meerkat_providers::oauth_flow::OAuthFlowRecord, OAuthFlowError> {
@@ -2661,7 +2648,7 @@ mod tests {
         fn consume(
             &self,
             _state: &str,
-            _target: &AuthBindingRef,
+            _target: &meerkat_core::AuthCredentialIdentity,
             _provider: meerkat_providers::oauth_flow::OAuthProviderIdentity,
             _redirect_uri: &str,
         ) -> Result<meerkat_providers::oauth_flow::OAuthFlowRecord, OAuthFlowError> {
@@ -2673,7 +2660,7 @@ mod tests {
 
         fn admit_device_code(
             &self,
-            _target: AuthBindingRef,
+            _target: meerkat_core::AuthCredentialIdentity,
             _provider: meerkat_providers::oauth_flow::OAuthProviderIdentity,
             _device_code: String,
             _expires_in: std::time::Duration,
@@ -2684,7 +2671,7 @@ mod tests {
         fn verify_device_code(
             &self,
             _device_code: &str,
-            _target: &AuthBindingRef,
+            _target: &meerkat_core::AuthCredentialIdentity,
             _provider: meerkat_providers::oauth_flow::OAuthProviderIdentity,
         ) -> Result<meerkat_providers::oauth_flow::OAuthDeviceFlowRecord, OAuthFlowError> {
             unreachable!("browser consume rollback test only consumes")
@@ -2693,7 +2680,7 @@ mod tests {
         fn begin_device_code_poll(
             &self,
             _device_code: &str,
-            _target: &AuthBindingRef,
+            _target: &meerkat_core::AuthCredentialIdentity,
             _provider: meerkat_providers::oauth_flow::OAuthProviderIdentity,
         ) -> Result<OAuthDevicePollLease, OAuthFlowError> {
             unreachable!("browser consume rollback test only consumes")
@@ -2975,7 +2962,7 @@ mod tests {
         assert!(matches!(
             unrelated_runtime.oauth_flow_authority().consume(
                 state,
-                &openai_auth_binding(),
+                &credential_identity(&openai_auth_binding()),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 redirect_uri,
             ),
@@ -2988,7 +2975,7 @@ mod tests {
             .oauth_flow_authority()
             .consume(
                 state,
-                &openai_auth_binding(),
+                &credential_identity(&openai_auth_binding()),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 redirect_uri,
             )
@@ -3021,7 +3008,7 @@ mod tests {
             .oauth_flow_authority()
             .consume(
                 state,
-                &openai_auth_binding(),
+                &credential_identity(&openai_auth_binding()),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 redirect_uri,
             )
@@ -3126,7 +3113,7 @@ mod tests {
         // owning-realm binding is unconsumable here.
         let consumed = runtime.oauth_flow_authority().consume(
             "any-state",
-            &openai_auth_binding(),
+            &credential_identity(&openai_auth_binding()),
             meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
             redirect_uri,
         );
@@ -3362,7 +3349,7 @@ mod tests {
         let mut admitted = 0usize;
         loop {
             match authority.start(
-                openai_auth_binding(),
+                credential_identity(&openai_auth_binding()),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 format!("http://127.0.0.1:{admitted}/callback"),
                 format!("verifier-{admitted}"),
@@ -3420,7 +3407,7 @@ mod tests {
         let state = runtime
             .oauth_flow_authority()
             .start(
-                openai_auth_binding(),
+                credential_identity(&openai_auth_binding()),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 redirect_uri.to_string(),
                 "verifier".to_string(),
@@ -3451,7 +3438,7 @@ mod tests {
             .oauth_flow_authority()
             .consume(
                 &state,
-                &openai_auth_binding(),
+                &credential_identity(&openai_auth_binding()),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 redirect_uri,
             )
@@ -3465,7 +3452,7 @@ mod tests {
         runtime
             .oauth_flow_authority()
             .admit_device_code(
-                openai_auth_binding(),
+                credential_identity(&openai_auth_binding()),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::GoogleCodeAssist,
                 "device-code".to_string(),
                 std::time::Duration::from_secs(600),
@@ -3476,14 +3463,14 @@ mod tests {
             .oauth_flow_authority()
             .begin_device_code_poll(
                 "device-code",
-                &openai_auth_binding(),
+                &credential_identity(&openai_auth_binding()),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::GoogleCodeAssist,
             )
             .expect("device completion poll begins");
         assert!(matches!(
             runtime.oauth_flow_authority().begin_device_code_poll(
                 "device-code",
-                &openai_auth_binding(),
+                &credential_identity(&openai_auth_binding()),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::GoogleCodeAssist,
             ),
             Err(OAuthFlowError::LifecycleRejected {
@@ -3498,7 +3485,7 @@ mod tests {
             .oauth_flow_authority()
             .begin_device_code_poll(
                 "device-code",
-                &openai_auth_binding(),
+                &credential_identity(&openai_auth_binding()),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::GoogleCodeAssist,
             )
             .expect("dropped RPC completion poll releases runtime authority");
@@ -3510,7 +3497,7 @@ mod tests {
         runtime
             .oauth_flow_authority()
             .admit_device_code(
-                openai_auth_binding(),
+                credential_identity(&openai_auth_binding()),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::GoogleCodeAssist,
                 "device-code".to_string(),
                 std::time::Duration::from_secs(600),
@@ -3523,7 +3510,7 @@ mod tests {
             let _poll = authority
                 .begin_device_code_poll(
                     "device-code",
-                    &openai_auth_binding(),
+                    &credential_identity(&openai_auth_binding()),
                     meerkat_providers::oauth_flow::OAuthProviderIdentity::GoogleCodeAssist,
                 )
                 .expect("device completion poll begins");
@@ -3534,7 +3521,7 @@ mod tests {
         assert!(matches!(
             runtime.oauth_flow_authority().begin_device_code_poll(
                 "device-code",
-                &openai_auth_binding(),
+                &credential_identity(&openai_auth_binding()),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::GoogleCodeAssist,
             ),
             Err(OAuthFlowError::LifecycleRejected {
@@ -3550,7 +3537,7 @@ mod tests {
             .oauth_flow_authority()
             .begin_device_code_poll(
                 "device-code",
-                &openai_auth_binding(),
+                &credential_identity(&openai_auth_binding()),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::GoogleCodeAssist,
             )
             .expect("aborted RPC completion poll releases runtime authority");
@@ -3943,7 +3930,7 @@ mod tests {
         );
         registry
             .admit_device_code(
-                auth_binding.clone(),
+                credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::GoogleCodeAssist,
                 "device-code".to_string(),
                 std::time::Duration::from_secs(600),
@@ -3952,7 +3939,7 @@ mod tests {
         let poll_lease = registry
             .begin_device_code_poll(
                 "device-code",
-                &auth_binding,
+                &credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::GoogleCodeAssist,
             )
             .expect("device poll lease begins")
@@ -4167,7 +4154,7 @@ mod tests {
         ));
         let state = registry
             .start(
-                auth_binding.clone(),
+                credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 redirect_uri.to_string(),
                 "registry-only-verifier".to_string(),
@@ -4206,7 +4193,7 @@ mod tests {
         registry
             .verify(
                 &state,
-                &auth_binding,
+                &credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 redirect_uri,
             )
@@ -4233,7 +4220,7 @@ mod tests {
         );
         registry
             .admit_device_code(
-                auth_binding.clone(),
+                credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::GoogleCodeAssist,
                 "registry-only-device-code".to_string(),
                 std::time::Duration::from_secs(600),
@@ -4242,7 +4229,7 @@ mod tests {
         let poll_lease = registry
             .begin_device_code_poll(
                 "registry-only-device-code",
-                &auth_binding,
+                &credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::GoogleCodeAssist,
             )
             .expect("raw registry begins device poll");
@@ -4274,7 +4261,7 @@ mod tests {
         registry
             .verify_device_code(
                 "registry-only-device-code",
-                &auth_binding,
+                &credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::GoogleCodeAssist,
             )
             .expect("raw registry device success path is inert and remains unconsumed");
@@ -4369,7 +4356,7 @@ mod tests {
         .unwrap();
         let state = authority
             .start(
-                auth_binding.clone(),
+                credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 redirect_uri.to_string(),
                 "new-verifier".to_string(),
@@ -4385,7 +4372,7 @@ mod tests {
         let record = authority
             .verify(
                 &state,
-                &auth_binding,
+                &credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 redirect_uri,
             )
@@ -4430,7 +4417,7 @@ mod tests {
             .unwrap();
         let state = authority
             .start(
-                auth_binding.clone(),
+                credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 redirect_uri.to_string(),
                 "existing-flow-verifier".to_string(),
@@ -4465,7 +4452,7 @@ mod tests {
         let record = authority
             .verify(
                 &state,
-                &auth_binding,
+                &credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 redirect_uri,
             )
@@ -4507,7 +4494,7 @@ mod tests {
         let authority = runtime.oauth_flow_authority();
         authority
             .admit_device_code(
-                auth_binding.clone(),
+                credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::GoogleCodeAssist,
                 "device-code".to_string(),
                 std::time::Duration::from_secs(600),
@@ -4516,13 +4503,13 @@ mod tests {
         let poll_lease = authority
             .begin_device_code_poll(
                 "device-code",
-                &auth_binding,
+                &credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::GoogleCodeAssist,
             )
             .expect("device poll lease begins through runtime authority");
         meerkat_providers::oauth_flow::OAuthDevicePollLifecycle::expire_device_flow(
             auth_lease.as_ref(),
-            &auth_binding,
+            &credential_identity(&auth_binding),
             "device-code",
         )
         .expect("test removes the AuthMachine flow membership");
@@ -4567,7 +4554,7 @@ mod tests {
         let authority = runtime.oauth_flow_authority();
         let state = authority
             .start(
-                auth_binding.clone(),
+                credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 redirect_uri.to_string(),
                 "verifier".to_string(),
@@ -4576,7 +4563,7 @@ mod tests {
         authority
             .verify(
                 &state,
-                &auth_binding,
+                &credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 redirect_uri,
             )
@@ -4584,7 +4571,7 @@ mod tests {
         authority
             .consume(
                 &state,
-                &auth_binding,
+                &credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 redirect_uri,
             )
@@ -4638,7 +4625,7 @@ mod tests {
         let redirect_uri = "http://127.0.0.1/callback";
         let state = authority
             .start(
-                auth_binding.clone(),
+                credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::AnthropicConsoleApiKey,
                 redirect_uri.to_string(),
                 "console-verifier".to_string(),
@@ -4702,7 +4689,7 @@ mod tests {
         let authority = runtime.oauth_flow_authority();
         let old_state = authority
             .start(
-                auth_binding.clone(),
+                credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 redirect_uri.to_string(),
                 "old-verifier".to_string(),
@@ -4710,7 +4697,7 @@ mod tests {
             .expect("old browser flow admitted");
         let new_state = authority
             .start(
-                auth_binding.clone(),
+                credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 redirect_uri.to_string(),
                 "new-verifier".to_string(),
@@ -4743,7 +4730,7 @@ mod tests {
         let record = authority
             .verify(
                 &new_state,
-                &auth_binding,
+                &credential_identity(&auth_binding),
                 meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 redirect_uri,
             )
@@ -4832,4 +4819,8 @@ mod tests {
 
         assert_invalid_params_message(resp, "missing field `binding_id`");
     }
+}
+#[cfg(test)]
+fn credential_identity(binding: &AuthBindingRef) -> meerkat_core::AuthCredentialIdentity {
+    meerkat_core::AuthCredentialIdentity::from_auth_binding(binding)
 }

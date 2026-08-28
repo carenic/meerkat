@@ -56,9 +56,9 @@ use meerkat_core::{
     AgentExecutionSnapshot, Config, ConfigStore, ContentInput, ExternalToolSurfaceSnapshot,
     InstructionActivationAdmissionErrorCode, InstructionActivationReceipt,
     InstructionActivationRequest, PeerIngressRuntimeSnapshot, Session, SessionLlmIdentity,
-    SessionLlmIdentityOverride, SurfaceSessionRecoveryContext, SurfaceSessionRecoveryError,
-    SurfaceSessionRecoveryOverrides, SystemMessage, SystemPromptUpdateRequest,
-    SystemPromptUpdateResult, ToolScopeSnapshot, build_recovered_session,
+    SurfaceSessionRecoveryContext, SurfaceSessionRecoveryError, SurfaceSessionRecoveryOverrides,
+    SystemMessage, SystemPromptUpdateRequest, SystemPromptUpdateResult, ToolScopeSnapshot,
+    build_recovered_session,
 };
 use meerkat_core::{EventEnvelope, EventStream, InputId, RunId, StreamError};
 use meerkat_runtime::input_state::InputStatePersistenceRecord;
@@ -5424,40 +5424,22 @@ impl SessionRuntime {
         current: &SessionLlmIdentity,
         ov: &crate::handlers::turn::TurnOverrides,
     ) -> Result<SessionLlmIdentity, RpcError> {
-        let registry = self.model_registry().await?;
-        let provider = ov
-            .provider
-            .as_deref()
-            .map(parse_provider_override)
-            .transpose()
-            .map_err(|message| RpcError {
+        let request = SessionLlmReconfigureRequest {
+            model: ov.model.clone(),
+            provider: ov.provider.clone(),
+            self_hosted_server_id: ov.self_hosted_server_id.clone(),
+            provider_params: ov.provider_params.clone(),
+            auth_binding: ov.auth_binding.clone(),
+        };
+        self.llm_reconfigure_host()
+            .resolve_target_session_llm_identity(&request, current)
+            .await
+            .map(|resolved| resolved.target_identity)
+            .map_err(|err| RpcError {
                 code: error::INVALID_PARAMS,
-                message,
+                message: err.to_string(),
                 data: None,
-            })?;
-
-        meerkat_core::resolve_session_llm_identity_override(
-            current,
-            &registry,
-            SessionLlmIdentityOverride {
-                model: ov.model.as_deref(),
-                provider,
-                self_hosted_server_id: ov.self_hosted_server_id.as_deref(),
-                provider_params: ov
-                    .provider_params
-                    .as_ref()
-                    .map(meerkat_core::lifecycle::run_primitive::TurnMetadataOverride::as_ref),
-                auth_binding: ov
-                    .auth_binding
-                    .as_ref()
-                    .map(meerkat_core::lifecycle::run_primitive::TurnMetadataOverride::as_ref),
-            },
-        )
-        .map_err(|err| RpcError {
-            code: error::INVALID_PARAMS,
-            message: err.to_string(),
-            data: None,
-        })
+            })
     }
 
     fn apply_llm_identity_to_build_config(
@@ -12358,8 +12340,56 @@ mod tests {
         stream_calls: Arc<AtomicUsize>,
     }
 
+    struct CountingAgentLlmRequestAttempt {
+        inner: Arc<dyn meerkat_core::AgentLlmRequestAttempt>,
+        stream_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl meerkat_core::AgentLlmRequestAttempt for CountingAgentLlmRequestAttempt {
+        fn request_pressure(
+            &self,
+        ) -> Result<Option<meerkat_core::ProviderRequestPressure>, meerkat_core::AgentError>
+        {
+            self.inner.request_pressure()
+        }
+
+        async fn stream_response(
+            &self,
+        ) -> Result<meerkat_core::LlmStreamResult, meerkat_core::AgentError> {
+            self.stream_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner.stream_response().await
+        }
+    }
+
     #[async_trait]
     impl meerkat_core::AgentLlmClient for CountingAgentLlmClient {
+        fn prepare_request_attempt(
+            self: Arc<Self>,
+            messages: Arc<Vec<meerkat_core::Message>>,
+            tools: Arc<[Arc<meerkat_core::ToolDef>]>,
+            max_tokens: u32,
+            temperature: Option<f32>,
+            provider_params: Option<meerkat_core::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<Arc<dyn meerkat_core::AgentLlmRequestAttempt>, meerkat_core::AgentError>
+        {
+            let attempt = Arc::clone(&self.inner).prepare_request_attempt(
+                messages,
+                tools,
+                max_tokens,
+                temperature,
+                provider_params,
+            )?;
+            Ok(Arc::new(CountingAgentLlmRequestAttempt {
+                inner: attempt,
+                stream_calls: Arc::clone(&self.stream_calls),
+            }))
+        }
+
+        fn request_attempt_authority(&self) -> meerkat_core::RequestAttemptAuthority {
+            self.inner.request_attempt_authority()
+        }
+
         async fn stream_response(
             &self,
             messages: &[meerkat_core::Message],
@@ -13780,6 +13810,7 @@ mod tests {
             meerkat_core::ProviderBindingConfig {
                 backend_profile: "openai_backend".into(),
                 auth_profile: "openai_managed".into(),
+                credential_account: None,
                 default_model: None,
                 policy: Default::default(),
                 provider_default: false,
@@ -15690,7 +15721,7 @@ mod tests {
         let state = adapter
             .oauth_flow_authority()
             .start(
-                target.clone(),
+                meerkat_core::AuthCredentialIdentity::from_auth_binding(&target),
                 provider,
                 redirect_uri.to_string(),
                 "rpc-persistent-verifier".to_string(),
@@ -15706,7 +15737,12 @@ mod tests {
         );
         let flow = runtime
             .oauth_flow_authority()
-            .consume(&state, &target, provider, redirect_uri)
+            .consume(
+                &state,
+                &meerkat_core::AuthCredentialIdentity::from_auth_binding(&target),
+                provider,
+                redirect_uri,
+            )
             .expect("surface construction must preserve PersistenceBundle OAuth authority");
 
         assert_eq!(flow.pkce_verifier, "rpc-persistent-verifier");
