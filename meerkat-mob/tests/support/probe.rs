@@ -455,6 +455,7 @@ pub fn raw_bind_host_command_for_generation(
         expected_host_peer_id: resolved.peer_id.to_string(),
         expected_address: descriptor.address.clone(),
         bootstrap_proof: meerkat_mob::runtime::bridge_protocol::BridgeHostBootstrapProof::new(""),
+        delegated_bootstrap_proof: None,
         mob_id: mob_id.to_string(),
         required_capabilities: Default::default(),
     };
@@ -571,6 +572,7 @@ pub fn raw_materialize_member_command(
         spec,
         spec_digest,
         launch,
+        forked_participant_attachment: None,
     }))
 }
 

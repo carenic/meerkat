@@ -74,7 +74,15 @@ impl MobCommand {
             | Self::PreviewRunFlowAdmission { .. }
             | Self::RunFlow { .. }
             | Self::ConcludeObjective { .. }
-            | Self::BindObjectiveOwner { .. } => Some(ControlScope::SendCommand),
+            | Self::BindObjectiveOwner { .. }
+            // Minting a forked-participant capability hands a holder a
+            // delegable grant to drive a branch of the source's conversation:
+            // that is the same authority class as sending work into a member.
+            | Self::CreateForkedParticipant { .. }
+            | Self::AttachForkedParticipant { .. }
+            // Seating a branch as an ordinary member is a spawn AND a lease
+            // acquisition; both halves already require SendCommand.
+            | Self::SpawnAttachedForkedParticipant { .. } => Some(ControlScope::SendCommand),
 
             #[cfg(feature = "experimental-gpt-live")]
             Self::StartLiveBridgeOperation { .. }
@@ -85,7 +93,11 @@ impl MobCommand {
             Self::CancelAllWork { .. }
             | Self::CancelFlow { .. }
             | Self::ForceCancel { .. }
-            | Self::HardCancelMember { .. } => Some(ControlScope::Cancel),
+            | Self::HardCancelMember { .. }
+            // Revoking a capability terminalizes outstanding delegated work
+            // authority without retiring any member.
+            | Self::RevokeForkedParticipant { .. }
+            | Self::ReleaseForkedParticipant { .. } => Some(ControlScope::Cancel),
 
             // ── ReadHistory: member transcript reads (phase 6 — the
             //    ADJ-P5-13 marker's real verb) ──
@@ -126,9 +138,10 @@ impl MobCommand {
 
             // ── AdminHost: host-plane administration (A9: exactly
             //    bind/revoke hosts; supervisor authority is host-plane). ──
-            Self::BindHost { .. } | Self::RevokeHost { .. } | Self::RotateSupervisor { .. } => {
-                Some(ControlScope::AdminHost)
-            }
+            Self::BindHost { .. }
+            | Self::IssueHostBindingDescriptor { .. }
+            | Self::RevokeHost { .. }
+            | Self::RotateSupervisor { .. } => Some(ControlScope::AdminHost),
 
             // ── SubscribeEvents: the mob event journal surface ──
             Self::PollEvents { .. } | Self::ReplayAllEvents { .. } => {
@@ -160,6 +173,11 @@ impl MobCommand {
             // ── Internal / machine-authority plumbing (enumerated so the
             //    closed world stays reviewable) ──
             Self::SpawnProvisioned { .. }
+            // The attached-spawn completion is a pure forward of an ordinary
+            // spawn outcome back onto the actor task; its principal-class
+            // admission already happened on SpawnAttachedForkedParticipant.
+            | Self::CompleteAttachedForkedParticipantSpawn { .. }
+            | Self::CompleteHostForkedParticipantSpawn { .. }
             | Self::RevivePlacedMember { .. }
             | Self::HostStatusPollCompleted { .. }
             | Self::HostRuntimeIncarnationObserved { .. }
@@ -337,6 +355,9 @@ impl MobCommand {
             Self::BindHost { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(error));
             }
+            Self::IssueHostBindingDescriptor { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
             Self::RevokeHost { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(error));
             }
@@ -350,6 +371,27 @@ impl MobCommand {
                 let _ = reply_tx.send(Err(error));
             }
             Self::MemberHistory { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            Self::CreateForkedParticipant { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            Self::RevokeForkedParticipant { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            Self::AttachForkedParticipant { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            Self::ReleaseForkedParticipant { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            Self::SpawnAttachedForkedParticipant { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            Self::CompleteHostForkedParticipantSpawn { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            Self::CompleteAttachedForkedParticipantSpawn { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(error));
             }
             Self::MemberLiveOpen { reply_tx, .. } => {

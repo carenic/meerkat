@@ -1052,6 +1052,102 @@ pub(super) enum MobCommand {
             Result<super::member_history_proxy::MemberHistoryPageDomain, crate::MobError>,
         >,
     },
+    /// Create one source-owned forked-participant capability (issue #159).
+    /// Routed by CURRENT source residency: a local source is served by this
+    /// runtime's own [`ForkedParticipantService`], a placed source by the V6
+    /// `CreateForkedParticipant` command on its owning host. `SendCommand`-
+    /// scoped at chokepoint (a) — the capability is a delegable execution
+    /// grant over a branch of the source's conversation.
+    ///
+    /// [`ForkedParticipantService`]: crate::forked_participant::ForkedParticipantService
+    CreateForkedParticipant {
+        request: Box<super::forked_participant_routing::ForkedParticipantCreateRequest>,
+        reply_tx: oneshot::Sender<
+            Result<crate::forked_participant::ForkedParticipantRef, crate::MobError>,
+        >,
+    },
+    /// Revoke one source-owned forked-participant capability (issue #159).
+    /// Routed by the capability's OWN immutable owner route, never by current
+    /// source residency, so revocation still works after the source roster
+    /// member has retired. `Cancel`-scoped at chokepoint (a).
+    RevokeForkedParticipant {
+        capability: Box<crate::forked_participant::ForkedParticipantRef>,
+        reply_tx: oneshot::Sender<
+            Result<
+                crate::forked_participant::ForkedParticipantRevocationOutcome,
+                crate::MobError,
+            >,
+        >,
+    },
+    /// Attach a LOCAL source-owned forked participant to a temporary
+    /// coordinator. `SendCommand`-scoped at chokepoint (a).
+    AttachForkedParticipant {
+        capability: Box<crate::forked_participant::ForkedParticipantRef>,
+        attachment_id: crate::forked_participant::ForkedParticipantAttachmentId,
+        reply_tx: oneshot::Sender<
+            Result<crate::forked_participant::ForkedParticipantGrant, crate::MobError>,
+        >,
+    },
+    /// Release one LOCAL source-owned forked-participant attachment.
+    /// `Cancel`-scoped at chokepoint (a).
+    ReleaseForkedParticipant {
+        capability: Box<crate::forked_participant::ForkedParticipantRef>,
+        attachment_id: crate::forked_participant::ForkedParticipantAttachmentId,
+        reply_tx: oneshot::Sender<
+            Result<crate::forked_participant::ForkedParticipantReleaseOutcome, crate::MobError>,
+        >,
+    },
+    /// Seat a LOCAL source-owned forked participant as an ordinary member of
+    /// THIS mob. `SendCommand`-scoped at chokepoint (a) — seating a branch is
+    /// the same authority class as spawning a member and as taking the lease.
+    ///
+    /// One command owns the whole admission: spec validation, the capability
+    /// machine's `Attach`, durable attachment custody, and the ordinary Resume
+    /// spawn. The spawn's own completion returns through
+    /// [`Self::CompleteAttachedForkedParticipantSpawn`] so every verdict stays
+    /// on the serialized actor task.
+    SpawnAttachedForkedParticipant {
+        capability: Box<crate::forked_participant::ForkedParticipantRef>,
+        attachment_id: crate::forked_participant::ForkedParticipantAttachmentId,
+        spec: Box<super::handle::SpawnMemberSpec>,
+        reply_tx: oneshot::Sender<
+            Result<
+                super::forked_participant_routing::AttachedForkedParticipantSpawn,
+                crate::MobError,
+            >,
+        >,
+    },
+    /// Internal completion of one capability-aware attached spawn.
+    ///
+    /// The forwarding task performs NO semantic work: it only carries the
+    /// ordinary spawn outcome back onto the actor task, where the association
+    /// is recorded (success) or the exact attachment is released / its durable
+    /// obligation retained (failure). There is no principal lane here.
+    CompleteAttachedForkedParticipantSpawn {
+        custody: Box<super::actor::AttachedForkedParticipantCustody>,
+        spawn: Box<Result<super::handle::MemberSpawnReceipt, crate::MobError>>,
+        reply_tx: oneshot::Sender<
+            Result<
+                super::forked_participant_routing::AttachedForkedParticipantSpawn,
+                crate::MobError,
+            >,
+        >,
+    },
+    /// Reconciliation half of a HOST-owned capability seating. Internal: the
+    /// admission already happened on `SpawnAttachedForkedParticipant`, and the
+    /// forwarding task makes no decisions — it only carries the ordinary
+    /// placed spawn outcome back onto the actor task, which is the only place
+    /// allowed to read the seated roster incarnation.
+    CompleteHostForkedParticipantSpawn {
+        capability: Box<crate::forked_participant::ForkedParticipantRef>,
+        attachment_id: crate::forked_participant::ForkedParticipantAttachmentId,
+        host_id: crate::machines::mob_machine::HostId,
+        agent_identity: AgentIdentity,
+        spawn: Box<Result<super::handle::MemberSpawnReceipt, crate::MobError>>,
+        reply_tx: oneshot::Sender<
+            Result<super::forked_participant_routing::AttachedForkedParticipantSpawn, crate::MobError>,
+        >,
+    },
     /// Hard-cancel a member's in-flight run (§7.4 phase 6). Distinct from
     /// [`Self::ForceCancel`] (cooperative boundary cancel) by design: this is
     /// bounded exact-run convergence over the immediate user-interrupt
@@ -1155,6 +1251,16 @@ pub(super) enum MobCommand {
     BindHost {
         request: Box<super::handle::HostBindRequest>,
         reply_tx: oneshot::Sender<Result<super::handle::HostBindReport, MobError>>,
+    },
+    /// Internal council bootstrap: request the current one-time descriptor from
+    /// a host already bound to this source mob.
+    IssueHostBindingDescriptor {
+        host_id: String,
+        target_mob_id: MobId,
+        target_supervisor: super::bridge_protocol::BridgePeerSpec,
+        reply_tx: oneshot::Sender<
+            Result<super::bridge_protocol::BridgeHostBindingDescriptorIssuedResponse, MobError>,
+        >,
     },
     /// Revoke a bound (or bind-requested) member host. Bound hosts must first
     /// complete the authenticated remote revoke terminal; the local machine
@@ -1385,6 +1491,7 @@ impl MobCommand {
             Self::Reset { .. } => "Reset",
             Self::RotateSupervisor { .. } => "RotateSupervisor",
             Self::BindHost { .. } => "BindHost",
+            Self::IssueHostBindingDescriptor { .. } => "IssueHostBindingDescriptor",
             Self::RevokeHost { .. } => "RevokeHost",
             Self::GrantScopes { .. } => "GrantScopes",
             Self::RevokeScopes { .. } => "RevokeScopes",
@@ -1395,6 +1502,15 @@ impl MobCommand {
             Self::ForceCancel { .. } => "ForceCancel",
             Self::HardCancelMember { .. } => "HardCancelMember",
             Self::MemberHistory { .. } => "MemberHistory",
+            Self::CompleteHostForkedParticipantSpawn { .. } => "CompleteHostForkedParticipantSpawn",
+            Self::CreateForkedParticipant { .. } => "CreateForkedParticipant",
+            Self::RevokeForkedParticipant { .. } => "RevokeForkedParticipant",
+            Self::AttachForkedParticipant { .. } => "AttachForkedParticipant",
+            Self::ReleaseForkedParticipant { .. } => "ReleaseForkedParticipant",
+            Self::SpawnAttachedForkedParticipant { .. } => "SpawnAttachedForkedParticipant",
+            Self::CompleteAttachedForkedParticipantSpawn { .. } => {
+                "CompleteAttachedForkedParticipantSpawn"
+            }
             Self::MemberLiveOpen { .. } => "MemberLiveOpen",
             Self::MemberLiveClose { .. } => "MemberLiveClose",
             Self::MemberLiveStatus { .. } => "MemberLiveStatus",

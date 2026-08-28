@@ -9406,6 +9406,7 @@ async fn create_test_mob_with_run_store(
         identity_status: Arc::new(InMemoryMobIdentityStatusStore::new()),
         identity_status_projection_order: Default::default(),
         realm_profiles: None,
+        forked_participants: None,
     };
     let handle = MobBuilder::new(definition, storage)
         .with_session_service(service.clone())
@@ -11840,6 +11841,7 @@ async fn test_mob_builder_persists_spec_and_resume_requires_consistency() {
         identity_status: storage.identity_status.clone(),
         identity_status_projection_order: storage.identity_status_projection_order.clone(),
         realm_profiles: storage.realm_profiles.clone(),
+        forked_participants: storage.forked_participants.clone(),
     };
 
     let _handle = MobBuilder::new(definition.clone(), storage)
@@ -12438,6 +12440,7 @@ async fn test_existing_member_adoption_tool_update_and_resume_keep_identity_and_
         identity_status: identity_status.clone(),
         identity_status_projection_order: Default::default(),
         realm_profiles: None,
+        forked_participants: None,
     };
     let handle = MobBuilder::new(definition, storage)
         .with_session_service(service.clone())
@@ -12634,6 +12637,7 @@ async fn test_existing_member_adoption_tool_update_and_resume_keep_identity_and_
         identity_status,
         identity_status_projection_order: Default::default(),
         realm_profiles: None,
+        forked_participants: None,
     })
     .with_session_service(service.clone())
     .with_spawn_base_prompt_source(Arc::new(crate::StaticSpawnBasePromptSource(
@@ -12730,6 +12734,7 @@ async fn test_existing_member_adoption_preserves_prompt_sequence_without_spawn_p
         identity_status: Arc::new(InMemoryMobIdentityStatusStore::new()),
         identity_status_projection_order: Default::default(),
         realm_profiles: None,
+        forked_participants: None,
     };
     let handle = MobBuilder::new(definition, storage)
         .with_session_service(service.clone())
@@ -18691,13 +18696,13 @@ async fn test_restarted_peer_only_member_rebinds_when_supervisor_state_is_lost()
         )
         .await
         .expect("spawn live external worker");
-    let default_protocol_version =
-        meerkat_contracts::wire::supervisor_bridge::supervisor_bridge_default_protocol_version();
+    let peer_bind_protocol_version =
+        meerkat_contracts::wire::supervisor_bridge::BridgeProtocolVersion::V5;
     assert_eq!(external.bind_count(), 1, "initial spawn should bind once");
     assert_eq!(
         external.bind_protocol_versions().await,
-        vec![default_protocol_version],
-        "initial bridge bind should use the canonical default protocol version"
+        vec![peer_bind_protocol_version],
+        "peer-only bind should use its V5-compatible command shape"
     );
 
     external.forget_supervisor().await;
@@ -18716,8 +18721,8 @@ async fn test_restarted_peer_only_member_rebinds_when_supervisor_state_is_lost()
     );
     assert_eq!(
         external.bind_protocol_versions().await,
-        vec![default_protocol_version, default_protocol_version],
-        "restart rebind should keep reporting the canonical bridge protocol version"
+        vec![peer_bind_protocol_version, peer_bind_protocol_version],
+        "restart rebind should preserve the V5-compatible command shape"
     );
     assert_eq!(
         external.delivered_input_ids().await.len(),
@@ -18731,7 +18736,7 @@ async fn test_v4_resume_is_effect_free_until_explicit_rotation_then_adopts_direc
     let _serial = lock_real_comms_tests();
     let definition = with_unique_mob_id(
         sample_definition_with_external_backend(),
-        "v4-resume-explicit-v5-adoption",
+        "v4-resume-explicit-current-adoption",
     );
     let mob_id = definition.id.clone();
     let storage = MobStorage::in_memory();
@@ -18838,7 +18843,7 @@ async fn test_v4_resume_is_effect_free_until_explicit_rotation_then_adopts_direc
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             Err(error) => panic!(
-                "explicit rotation should commit V5 and adopt legacy peer-only members: {error:?}"
+                "explicit rotation should commit the current protocol and adopt legacy peer-only members: {error:?}"
             ),
         }
     };
@@ -18850,7 +18855,7 @@ async fn test_v4_resume_is_effect_free_until_explicit_rotation_then_adopts_direc
     assert_eq!(committed.epoch, report.current_epoch);
     assert_eq!(
         committed.protocol_version,
-        super::bridge_protocol::BridgeProtocolVersion::V5
+        super::bridge_protocol::BridgeProtocolVersion::default()
     );
     assert!(external.direct_member_fence().await.is_some());
     resumed
@@ -23103,6 +23108,7 @@ async fn test_cold_running_resume_reestablishes_autonomous_startup_ready_without
     let identity_member = storage.identity_member.clone();
     let identity_status = storage.identity_status.clone();
     let realm_profiles = storage.realm_profiles.clone();
+    let forked_participants = storage.forked_participants.clone();
     let handle = MobBuilder::new(sample_definition(), storage)
         .with_session_service(service.clone())
         .create()
@@ -23143,6 +23149,7 @@ async fn test_cold_running_resume_reestablishes_autonomous_startup_ready_without
         identity_status,
         identity_status_projection_order: Default::default(),
         realm_profiles,
+        forked_participants,
     })
     .with_session_service(restarted_service.clone())
     .notify_orchestrator_on_resume(false)
@@ -23228,6 +23235,7 @@ async fn assert_cold_running_local_resume_fails_closed(
     let identity_member = storage.identity_member.clone();
     let identity_status = storage.identity_status.clone();
     let realm_profiles = storage.realm_profiles.clone();
+    let forked_participants = storage.forked_participants.clone();
     let mut definition = sample_definition();
     if matches!(fault, ColdLocalReadinessFault::TurnDrivenRuntimeAdapter) {
         for profile in definition
@@ -23297,6 +23305,7 @@ async fn assert_cold_running_local_resume_fails_closed(
         identity_status,
         identity_status_projection_order: Default::default(),
         realm_profiles,
+        forked_participants,
     })
     .with_session_service(restarted_service.clone())
     .notify_orchestrator_on_resume(false)
@@ -27175,14 +27184,17 @@ async fn test_peer_only_members_accept_direct_turn_delivery_without_bridge_sessi
         )
         .await
         .expect_err("peer-only delivery must not silently drop runtime metadata");
-    assert!(matches!(
-        metadata_error,
-        MobError::UnsupportedForMode {
-            mode: crate::MobRuntimeMode::TurnDriven,
-            ref reason,
-        } if reason.contains("tracked turn event streams are not supported")
-            && reason.contains("peer-only")
-    ));
+    assert!(
+        matches!(
+            metadata_error,
+            MobError::UnsupportedForMode {
+                mode: crate::MobRuntimeMode::TurnDriven,
+                ref reason,
+            } if reason.contains("tracked turn completion is not supported")
+                && reason.contains("legacy peer-only")
+        ),
+        "unexpected metadata rejection: {metadata_error:?}"
+    );
     let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1);
     let event_error = peer_member
         .start_turn(
@@ -44628,6 +44640,7 @@ async fn test_explicit_fail_step_routes_generated_supervisor_escalation_effect()
         identity_status: Arc::new(InMemoryMobIdentityStatusStore::new()),
         identity_status_projection_order: Default::default(),
         realm_profiles: None,
+        forked_participants: None,
     };
     let handle = MobBuilder::new(definition.clone(), storage)
         .with_session_service(service)
@@ -45524,6 +45537,7 @@ async fn test_resume_from_events_restarts_autonomous_host_loops_from_runtime_mod
         identity_status: storage.identity_status.clone(),
         identity_status_projection_order: storage.identity_status_projection_order.clone(),
         realm_profiles: storage.realm_profiles.clone(),
+        forked_participants: storage.forked_participants.clone(),
     };
     let service = Arc::new(MockSessionService::new());
     let adapter = service.enable_runtime_adapter();
@@ -45638,6 +45652,7 @@ async fn test_explicit_resume_retains_wedged_attachment_retirement_for_level_tri
         identity_status: storage.identity_status.clone(),
         identity_status_projection_order: storage.identity_status_projection_order.clone(),
         realm_profiles: storage.realm_profiles.clone(),
+        forked_participants: storage.forked_participants.clone(),
     };
     let service = Arc::new(MockSessionService::new());
     let adapter = service.enable_runtime_adapter();
@@ -61806,6 +61821,7 @@ async fn create_test_mob_with_realm_store(
         identity_status: Arc::new(InMemoryMobIdentityStatusStore::new()),
         identity_status_projection_order: Default::default(),
         realm_profiles: Some(realm_store),
+        forked_participants: None,
     };
     let handle = MobBuilder::new(definition, storage)
         .with_session_service(service.clone())
@@ -61909,6 +61925,7 @@ async fn test_spawn_realm_ref_without_store_returns_error() {
         identity_status: Arc::new(InMemoryMobIdentityStatusStore::new()),
         identity_status_projection_order: Default::default(),
         realm_profiles: None, // no realm store
+        forked_participants: None,
     };
     let handle = MobBuilder::new(sample_definition_with_realm_ref_profile(), storage)
         .with_session_service(service)
@@ -65238,6 +65255,30 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::ParticipantNameOccupied {
             participant_name, ..
         } => format!("participant_name_occupied:{participant_name}"),
+        MobError::ForkedParticipantSourceIneligible { rejection, .. } => {
+            format!("forked_participant_source_ineligible:{rejection:?}")
+        }
+        MobError::ForkedParticipantOwnerHostUnavailable { rejection, .. } => {
+            format!("forked_participant_owner_host_unavailable:{rejection:?}")
+        }
+        MobError::ForkedParticipantRefused(error) => {
+            format!("forked_participant_refused:{error:?}")
+        }
+        MobError::ForkedParticipantRemoteLeaseUnsupported { operation } => {
+            format!("forked_participant_remote_lease_unsupported:{operation:?}")
+        }
+        MobError::ForkedParticipantResumeRequiresAttachment { .. } => {
+            "forked_participant_resume_requires_attachment".to_string()
+        }
+        MobError::ForkedParticipantAttachedSpawnSpecRejected { .. } => {
+            "forked_participant_attached_spawn_spec_rejected".to_string()
+        }
+        MobError::ForkedParticipantAttachmentCustodyUnrecorded { .. } => {
+            "forked_participant_attachment_custody_unrecorded".to_string()
+        }
+        MobError::ForkedParticipantAttachmentReleaseUnproven { .. } => {
+            "forked_participant_attachment_release_unproven".to_string()
+        }
     }
 }
 
@@ -68352,9 +68393,11 @@ impl HostDaemonStub {
             expected_peer_id: self.peer_id,
             pubkey: self.pubkey,
             address: self.address.clone(),
-            bootstrap_token: super::bridge_protocol::BridgeBootstrapToken::from(
+            bootstrap_token: Some(super::bridge_protocol::BridgeBootstrapToken::from(
                 "host-ceremony-token",
-            ),
+            )),
+            delegated_bootstrap_proof: None,
+            delegated_supervisor: None,
             live_endpoint: None,
         }
     }
