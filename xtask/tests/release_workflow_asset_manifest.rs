@@ -28,11 +28,50 @@ fn asset_verifier_path() -> PathBuf {
     path
 }
 
+fn provenance_verifier_path() -> PathBuf {
+    let mut path = manifest_script_path();
+    path.set_file_name("verify-release-asset-provenance");
+    path
+}
+
 fn read_workflow(path: &Path) -> serde_yaml::Value {
     let text = std::fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
     serde_yaml::from_str(&text)
         .unwrap_or_else(|error| panic!("cannot parse {} as YAML: {error}", path.display()))
+}
+
+#[test]
+fn release_workflows_use_the_repository_pinned_rust_toolchain() {
+    let release_path = workflow_yml_path();
+    let release = std::fs::read_to_string(&release_path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", release_path.display()));
+    assert!(
+        !release.contains("dtolnay/rust-toolchain@stable"),
+        "release jobs must not resolve a moving stable compiler"
+    );
+    assert_eq!(
+        release
+            .matches("uses: ./.github/actions/setup-rust-ci")
+            .count(),
+        5,
+        "all five Rust-using release jobs must use the pinned setup action"
+    );
+
+    let semver_path = release_path.with_file_name("release-semver-readiness.yml");
+    let semver = std::fs::read_to_string(&semver_path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", semver_path.display()));
+    assert!(
+        !semver.contains("dtolnay/rust-toolchain@stable"),
+        "semver readiness must not resolve a moving stable compiler"
+    );
+    assert_eq!(
+        semver
+            .matches("uses: ./.github/actions/setup-rust-ci")
+            .count(),
+        1,
+        "semver readiness must use the pinned setup action"
+    );
 }
 
 fn workflow_step<'a>(
@@ -211,6 +250,49 @@ fn release_asset_manifest_contract_stays_flat_and_collision_checked() {
         !manifest.contains("xargs sha256sum"),
         "checksums.sha256 must be rendered from public basenames, not staged paths"
     );
+}
+
+#[test]
+fn release_archives_require_exact_tag_build_provenance_before_publication() {
+    let path = workflow_yml_path();
+    let workflow = read_workflow(&path);
+
+    for (job, step, directory) in [
+        (
+            "publish_unix_release_and_homebrew",
+            "Verify exact-tag macOS/Linux build provenance",
+            "release-artifacts",
+        ),
+        (
+            "publish_github_release",
+            "Verify exact-tag release build provenance",
+            "prepared-release-artifacts",
+        ),
+    ] {
+        let script = step_script(&workflow, &path, job, step);
+        assert!(
+            script.contains(&format!(
+                "scripts/verify-release-asset-provenance {directory}"
+            )),
+            "{job} must verify provenance for {directory}; script:\n{script}"
+        );
+    }
+
+    let verifier_path = provenance_verifier_path();
+    let verifier = std::fs::read_to_string(&verifier_path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", verifier_path.display()));
+    for contract in [
+        "git rev-parse \"${release_tag}^{commit}\"",
+        "gh attestation verify",
+        "--repo \"${repository}\"",
+        "--source-digest \"${release_sha}\"",
+        "--signer-workflow \"${signer_workflow}\"",
+    ] {
+        assert!(
+            verifier.contains(contract),
+            "release provenance verifier must preserve `{contract}`; script:\n{verifier}"
+        );
+    }
 }
 
 fn expected_complete_archive_names(version: &str) -> Vec<String> {
