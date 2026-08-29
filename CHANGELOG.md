@@ -28,6 +28,8 @@ them.
 
 ## [Unreleased]
 
+## [0.8.31] - 2026-08-28
+
 ### Breaking
 
 - **Rust hook contracts gained committed-observation variants and payloads.**
@@ -57,9 +59,82 @@ them.
   generated Web SDK `WireOAuthProvider`; provider-runtime embedders may use
   `ProviderRuntimeCatalog::validate_binding_with_credential_identity`, and
   native hosts gain `HostAuthDeviceStart` / `HostAuthDevicePoll`.
+- **Additional Rust provider, bridge, hook, and forked-participant contracts
+  changed.** Exact-pinned downstreams must update exhaustive matches, struct
+  literals, derives, and helper calls for:
+  - `HostAuthError::{BrowserFlowUnsupported, DeviceFlowUnsupported,
+    InvalidExpiry}`;
+  - `AnthropicProviderRuntime::{UnwindSafe, RefUnwindSafe}`,
+    `GoogleProviderRuntime::{UnwindSafe, RefUnwindSafe}`, and
+    `OpenAiProviderRuntime::{UnwindSafe, RefUnwindSafe}`;
+  - `OAuthTargetValidationError::{BackendProviderMismatch,
+    BackendKindMismatch, ProviderMismatch, AuthMethodMismatch, SourceMismatch,
+    SharedIssuerRequiresAccountTarget, BindingInvalid}`;
+  - `BridgeMaterializePayload::forked_participant_attachment`,
+    `BridgeHostBindPayload::delegated_bootstrap_proof`,
+    `WireProviderBinding::credential_account`, and
+    `BridgeCapabilities::forked_participants`;
+  - `BridgeRejectionCause::{InvalidSupervisorSpec, InvalidPeerSpec,
+    AddressMismatch, Unsupported, Internal, BindAdmissionOutcomeUnknown,
+    StaleFence, StaleCursor, OversizedEvent, HistoryRowTooLarge, Unavailable,
+    RuntimeRetirementInProgress, ScopeDenied, SpecDigestMismatch,
+    MaterializeBuildRejected, ModelUnresolvable, AuthBindingUnresolvable,
+    McpCommandMissing, RealmBackendUnavailable, EnvKeyMissing,
+    HostEngineVersionChanged, ModelNotRealtime, LiveAdapterUnavailable,
+    LiveTransportUnavailable, LiveChannelAlreadyBound, LiveChannelNotFound,
+    LiveTransportUnsupported, ResumeSessionNotFound, CapabilityMissing,
+    LaunchModeUnsupported, LaunchModePlacementMismatch,
+    SessionOwnershipConflict}`;
+  - `ResolvedConnectionTarget::credential_identity`,
+    `ProviderBinding::credential_account`,
+    `SessionLlmRequestPolicy::credential_identity`,
+    `ProviderBindingConfig::credential_account`, and
+    `LeaseKey::{identity, realm, binding, profile}`;
+  - `LlmProviderErrorKind::{RequestTooLarge, ContentFiltered, ServerError,
+    ServerOverloaded, ConnectionReset, Unknown, StreamParseError,
+    IncompleteResponse}`;
+  - `PersistedAuthMode::{Adc, ComputeAdc, Bedrock, Vertex, Foundry, McpOauth,
+    ExternalTokens, ExternalAuthorizer, Command, GithubCopilotOauth}`;
+  - `OpenAiBackendKind::Copilot`, `GoogleBackendKind::Copilot`,
+    `AnthropicBackendKind::Copilot`,
+    `OpenAiAuthMethod::GitHubCopilotOauth`,
+    `GoogleAuthMethod::GitHubCopilotOauth`,
+    `AnthropicAuthMethod::GitHubCopilotOauth`, and
+    `OAuthProviderIdentity::GitHubCopilot`;
+  - `HookPoint::{RuntimeInputAccepted, RuntimeInputRejected,
+    RuntimeInputDeduplicated, PeerIngressCommitted, PeerEgressCommitted,
+    InteractionCompleted}`;
+  - `ProviderBindingError::{CredentialAccountRequiresPersistedAuth,
+    CredentialAccountContractMismatch,
+    CredentialAccountProfileOverrideMismatch}` and
+    `ConnectionTargetError::AmbiguousCredentialAccountBindings`;
+  - `GOOGLE_CLIENT_SECRET`, `ResolvedConnection::credential_identity`, and
+    `LlmError::{ContentFiltered, ContextLengthExceeded, ModelNotFound,
+    InvalidApiKey, Unknown, StreamParseError, IncompleteResponse}`;
+  - `DurableMarkerProtocol::{credential_kind_field, account_field}`;
+  - `MobHostActorConfig::forked_participant_sweep_interval`,
+    `MobHostBindingRecord::forked_participant_obligations`,
+    `MaterializedMemberRow::forked_participant_attachment`,
+    `HostMemberSubstrate::{forked_participant_realm,
+    forked_participant_store, forked_participant_source_runtime}`, and
+    `HostBindRequest::{delegated_bootstrap_proof, delegated_supervisor}`;
+  - `SqliteRealmProfileStore::Clone`;
+  - `MobError::{ForkedParticipantSourceIneligible, ForkedParticipantRefused,
+    ForkedParticipantResumeRequiresAttachment,
+    ForkedParticipantRemoteLeaseUnsupported,
+    ForkedParticipantOwnerHostUnavailable,
+    ForkedParticipantAttachedSpawnSpecRejected,
+    ForkedParticipantAttachmentCustodyUnrecorded,
+    ForkedParticipantAttachmentReleaseUnproven}`; and
+  - `record_materialized_member`.
 
 ### Added
 
+- Added the first-class `council` agent mob tool for bounded cross-context
+  deliberation using scoped, expiring forked-participant capabilities,
+  source-owned execution context, automatic non-secret remote-host binding,
+  explicit result merging, and cleanup/recovery through generated lifecycle
+  authority.
 - Added typed, observe-only post-commit hooks for runtime input acceptance,
   rejection, and deduplication; peer ingress and egress; and enriched
   interaction completion. Event streams remain the ordered/replay-aware
@@ -67,6 +142,18 @@ them.
 - Added native GitHub Copilot device authentication and account-scoped CAPI
   routing for OpenAI Responses/Chat Completions, Anthropic Messages, and
   Gemini Chat Completions, without a Copilot SDK or CLI dependency.
+
+### Fixed
+
+- Made schedule-host shutdown cancellation-safe: cancelled or dropped shutdown
+  futures stop in-flight work without later delivery, while awaited shutdown
+  retains the durable executor-lease release guarantee.
+- Ordered output-only identity convergence projections by storage authority,
+  mob, and canonical agent identity so delayed writes cannot regress diagnostics
+  or treat presentation timestamps as lifecycle authority.
+- Hardened release publication with exact-tree semver evidence, complete binary
+  asset/provenance checks, concurrent pre-push isolation, and a guarded
+  tag-to-registry critical path.
 
 ## [0.8.30] - 2026-08-26
 
@@ -9257,7 +9344,8 @@ tag, so its comparison link uses v0.3.0 as the exact ancestry base.
 
 Initial development release.
 
-[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.8.30...HEAD
+[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.8.31...HEAD
+[0.8.31]: https://github.com/lukacf/meerkat/compare/v0.8.30...v0.8.31
 [0.8.30]: https://github.com/lukacf/meerkat/compare/v0.8.29...v0.8.30
 [0.8.29]: https://github.com/lukacf/meerkat/compare/v0.8.28...v0.8.29
 [0.8.28]: https://github.com/lukacf/meerkat/compare/v0.8.27...v0.8.28
