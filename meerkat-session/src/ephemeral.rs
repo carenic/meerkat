@@ -57,8 +57,9 @@ use crate::staged_registry::{PromotionTicket, StagedSessionRegistry};
 pub use crate::turn_admission::ObservedSessionTailKind;
 use crate::turn_admission::{
     BeginOutcome, ClaimOutcome, RuntimeKeepAliveOutcome, RuntimeKeepAliveRequest,
-    StartTurnDispatchAuthorization, StartTurnDisposition, StartTurnDispositionOutcome,
-    StartTurnPublicTerminal, TurnAdmissionPhase, TurnAdmissionProjection, TurnAdmissionSlot,
+    SessionTeardownAuthorization, StartTurnDispatchAuthorization, StartTurnDisposition,
+    StartTurnDispositionOutcome, StartTurnPublicTerminal, TurnAdmissionPhase,
+    TurnAdmissionProjection, TurnAdmissionSlot,
 };
 
 /// Capacity for the internal agent event channel.
@@ -1373,7 +1374,6 @@ enum SessionCommand {
         reply_tx:
             oneshot::Sender<Result<HeadCanonicalRuntimeBoundaryAcknowledgeOutcome, AgentError>>,
     },
-    Shutdown,
 }
 
 impl SessionCommand {
@@ -1444,6 +1444,9 @@ struct SessionHandle {
     active_capacity_lease: Arc<std::sync::Mutex<SessionActiveCapacityLease>>,
     /// Wakes the running turn loop when an interrupt is requested.
     interrupt_notify: Arc<tokio::sync::Notify>,
+    /// Wakes the actor into its generated-authorized shutdown drain without
+    /// competing for capacity on the ordinary command queue.
+    shutdown_notify: Arc<tokio::sync::Notify>,
     /// Typed command sender for cancel-after-boundary requests; the agent
     /// task owns the receiver and drains it at the next boundary.
     cancel_after_boundary_handle: Option<CancelAfterBoundarySender>,
@@ -1670,6 +1673,7 @@ struct SessionTaskControl {
     llm_identity_tx: watch::Sender<SessionLlmIdentity>,
     turn_admission: Arc<std::sync::Mutex<TurnAdmissionSlot>>,
     interrupt_notify: Arc<tokio::sync::Notify>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
     session_event_tx: tokio::sync::broadcast::Sender<Arc<EventEnvelope<AgentEvent>>>,
     raw_session_event_tx: tokio::sync::broadcast::Sender<EventEnvelope<AgentEvent>>,
     #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
@@ -3526,11 +3530,21 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
     /// caller already encodes this (`Ok(()) | Err(NotFound) => Ok(())`); this
     /// makes the contract itself idempotent.
     pub async fn discard_live_session(&self, id: &SessionId) -> Result<(), SessionError> {
-        let handle = self.sessions.write().await.swap_remove(id);
-        let Some(handle) = handle else {
-            return Ok(());
+        let (handle, projection) = {
+            let mut sessions = self.sessions.write().await;
+            let Some(handle) = sessions.get(id) else {
+                return Ok(());
+            };
+            let projection = Self::request_live_session_handle_shutdown(id, handle)?;
+            handle.actor_witness.revoke();
+            let Some(handle) = sessions.swap_remove(id) else {
+                return Err(SessionError::Agent(AgentError::InternalError(format!(
+                    "session {id} disappeared during exact live actor discard"
+                ))));
+            };
+            (handle, projection)
         };
-        self.shutdown_removed_live_session_handle(id, handle).await;
+        self.shutdown_removed_live_session_handle(id, handle, projection);
         Ok(())
     }
 
@@ -3543,43 +3557,56 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         &self,
         witness: &LiveSessionActorWitness,
     ) -> Result<bool, SessionError> {
-        let handle = {
+        let (handle, projection) = {
             let mut sessions = self.sessions.write().await;
-            if !sessions
-                .get(witness.session_id())
-                .is_some_and(|handle| witness.is_handle(handle))
-            {
+            let Some(handle) = sessions.get(witness.session_id()) else {
+                return Ok(false);
+            };
+            if !witness.is_handle(handle) {
                 return Ok(false);
             }
-            sessions.swap_remove(witness.session_id())
+            let projection =
+                Self::request_live_session_handle_shutdown(witness.session_id(), handle)?;
+            handle.actor_witness.revoke();
+            let Some(handle) = sessions.swap_remove(witness.session_id()) else {
+                return Err(SessionError::Agent(AgentError::InternalError(format!(
+                    "session {} disappeared during exact live actor discard",
+                    witness.session_id()
+                ))));
+            };
+            (handle, projection)
         };
-        let Some(handle) = handle else {
-            return Ok(false);
-        };
-        self.shutdown_removed_live_session_handle(witness.session_id(), handle)
-            .await;
+        self.shutdown_removed_live_session_handle(witness.session_id(), handle, projection);
         Ok(true)
     }
 
-    async fn shutdown_removed_live_session_handle(&self, id: &SessionId, handle: SessionHandle) {
-        // Revoke the exact incarnation synchronously before any shutdown await.
-        // Prepared boundary authorities can now fail closed even while the
-        // actor is still processing the shutdown command.
-        handle.actor_witness.revoke();
+    fn request_live_session_handle_shutdown(
+        id: &SessionId,
+        handle: &SessionHandle,
+    ) -> Result<TurnAdmissionProjection, SessionError> {
+        let mut slot = lock_turn_admission(&handle.turn_admission);
+        slot.request_shutdown().map_err(|error| {
+            SessionError::Agent(AgentError::InternalError(format!(
+                "session {id} could not enter generated shutdown state: {error}"
+            )))
+        })?;
+        Ok(slot.projection())
+    }
+
+    fn shutdown_removed_live_session_handle(
+        &self,
+        id: &SessionId,
+        handle: SessionHandle,
+        projection: TurnAdmissionProjection,
+    ) {
         // Clear the singular typed materialization record. For a staged
         // session the registry-held capacity permit drops with it, so the
         // registry never retains a phantom record (or orphaned reservation)
         // for a session whose handle no longer exists.
         self.staged_registry.forget(id);
         handle.archive_snapshot_gate.close_for_snapshot();
-        let projection = {
-            let mut slot = lock_turn_admission(&handle.turn_admission);
-            slot.request_shutdown().ok().map(|_| slot.projection())
-        };
-        if let Some(projection) = projection {
-            handle.state_tx.send_replace(projection);
-        }
-        let _ = handle.command_tx.send(SessionCommand::Shutdown).await;
+        handle.state_tx.send_replace(projection);
+        handle.shutdown_notify.notify_one();
     }
 
     /// Prepare one exact active-turn model boundary and wait until its actor is
@@ -4745,22 +4772,54 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         self.session_registered.notified().await;
     }
 
-    /// Shut down all sessions.
+    /// Shut down all sessions on a legacy best-effort basis.
+    ///
+    /// Authorization failures are logged and the affected live handles remain
+    /// registered. Call [`Self::try_shutdown`] when shutdown failure must be
+    /// propagated to the caller.
     pub async fn shutdown(&self) {
-        let mut sessions = self.sessions.write().await;
-        for (id, handle) in sessions.drain(..) {
-            handle.actor_witness.revoke();
-            // Clear the singular typed materialization record with the handle;
-            // a staged session's registry-held permit drops with it.
-            self.staged_registry.forget(&id);
-            let projection = {
-                let mut slot = lock_turn_admission(&handle.turn_admission);
-                slot.request_shutdown().ok().map(|_| slot.projection())
-            };
-            if let Some(projection) = projection {
-                handle.state_tx.send_replace(projection);
+        if let Err(error) = self.try_shutdown().await {
+            tracing::error!(%error, "best-effort session service shutdown was incomplete");
+        }
+    }
+
+    /// Shut down all sessions, returning the first typed authorization failure.
+    ///
+    /// Every session is attempted. Handles whose generated teardown authority
+    /// rejects shutdown remain registered for a later retry.
+    pub async fn try_shutdown(&self) -> Result<(), SessionError> {
+        let (handles, first_error) = {
+            let mut sessions = self.sessions.write().await;
+            let pending = std::mem::take(&mut *sessions);
+            let mut handles = Vec::with_capacity(pending.len());
+            let mut first_error = None;
+            for (session_id, handle) in pending {
+                match Self::request_live_session_handle_shutdown(&session_id, &handle) {
+                    Ok(projection) => {
+                        handle.actor_witness.revoke();
+                        handles.push((session_id, handle, projection));
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            %session_id,
+                            "session service shutdown could not authorize exact actor teardown"
+                        );
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        sessions.insert(session_id, handle);
+                    }
+                }
             }
-            let _ = handle.command_tx.send(SessionCommand::Shutdown).await;
+            (handles, first_error)
+        };
+        for (session_id, handle, projection) in handles {
+            self.shutdown_removed_live_session_handle(&session_id, handle, projection);
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -5095,6 +5154,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
         let lossless_event_projection_tx = Arc::new(tokio::sync::Mutex::new(None));
         let interrupt_notify = Arc::new(tokio::sync::Notify::new());
+        let shutdown_notify = Arc::new(tokio::sync::Notify::new());
 
         // Spawn the session task using the platform-appropriate task API.
         #[cfg(not(target_arch = "wasm32"))]
@@ -5112,6 +5172,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
                 llm_identity_tx,
                 turn_admission: Arc::clone(&turn_admission),
                 interrupt_notify: interrupt_notify.clone(),
+                shutdown_notify: Arc::clone(&shutdown_notify),
                 session_event_tx: session_event_tx.clone(),
                 raw_session_event_tx: raw_session_event_tx.clone(),
                 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
@@ -5135,6 +5196,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
                 llm_identity_tx,
                 turn_admission: Arc::clone(&turn_admission),
                 interrupt_notify: interrupt_notify.clone(),
+                shutdown_notify: Arc::clone(&shutdown_notify),
                 session_event_tx: session_event_tx.clone(),
                 raw_session_event_tx: raw_session_event_tx.clone(),
                 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
@@ -5165,6 +5227,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             deferred_turn_state,
             active_capacity_lease,
             interrupt_notify,
+            shutdown_notify,
             cancel_after_boundary_handle,
             session_event_tx,
             raw_session_event_tx,
@@ -5172,10 +5235,10 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             lossless_event_projection_tx,
         };
 
-        let inserted = {
+        let rejected_handle = {
             let mut sessions = self.sessions.write().await;
             if sessions.contains_key(&session_id) {
-                false
+                Some(handle)
             } else {
                 sessions.insert(session_id.clone(), handle);
                 // Record the singular typed materialization fact keyed by
@@ -5188,14 +5251,31 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
                 }
                 // Notify waiters (e.g., CLI --stdin) that a session is available.
                 self.session_registered.notify_waiters();
-                true
+                None
             }
         };
-        if !inserted {
+        if let Some(handle) = rejected_handle {
             // Duplicate IDs are unexpected but can happen if the builder returns a reused ID.
             // Stop the task so it does not leak in the background.
-            actor_witness.revoke();
-            let _ = command_tx.send(SessionCommand::Shutdown).await;
+            let projection = match Self::request_live_session_handle_shutdown(&session_id, &handle)
+            {
+                Ok(projection) => projection,
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        %session_id,
+                        "duplicate session actor could not enter generated shutdown state; actor parked"
+                    );
+                    let _park_task = tokio::spawn(async move {
+                        let _parked_handle = handle;
+                        std::future::pending::<()>().await;
+                    });
+                    return Err(error);
+                }
+            };
+            handle.actor_witness.revoke();
+            handle.state_tx.send_replace(projection);
+            handle.shutdown_notify.notify_one();
             return Err(SessionError::Agent(
                 meerkat_core::error::AgentError::InternalError(format!(
                     "Duplicate session ID generated: {session_id}"
@@ -5214,7 +5294,15 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             // actor is already visible. Compare-and-remove that exact
             // incarnation before returning so the older witness retained
             // by the slot cannot strand an unaddressable replacement.
-            let _ = self.discard_live_session_actor(&actor_witness).await;
+            if let Err(cleanup_error) = self.discard_live_session_actor(&actor_witness).await {
+                tracing::error!(
+                    publish_error = %error,
+                    %cleanup_error,
+                    %session_id,
+                    "actor witness publication and exact actor cleanup both failed"
+                );
+                return Err(cleanup_error);
+            }
             return Err(error);
         }
 
@@ -5630,76 +5718,31 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
     }
 
     async fn archive(&self, id: &SessionId) -> Result<(), SessionError> {
-        // Reserve shutdown capacity without retaining the global live-session
-        // registry. A saturated session must not block reads, interrupts, or
-        // unrelated session work while archive waits for its own actor.
-        let (mut sessions, shutdown_permit) = loop {
-            let expected_sender = {
-                let sessions = self.sessions.read().await;
-                sessions
-                    .get(id)
-                    .ok_or_else(|| SessionError::NotFound { id: id.clone() })?
-                    .command_tx
-                    .clone()
-            };
-            let reserved = expected_sender.clone().reserve_owned().await;
-            let sessions = self.sessions.write().await;
-            let Some(current) = sessions.get(id) else {
-                return Err(SessionError::NotFound { id: id.clone() });
-            };
-            if !current.command_tx.same_channel(&expected_sender) {
-                // The logical session was rematerialized while capacity was
-                // pending. Drop any old-channel permit and retry against the
-                // exact current actor; stale capacity is never authority.
-                drop(sessions);
-                drop(reserved);
-                continue;
-            }
-            let shutdown_permit = reserved.map_err(|_| {
-                SessionError::Agent(meerkat_core::error::AgentError::InternalError(
-                    "Session task exited before archive shutdown could be reserved".to_string(),
-                ))
-            })?;
-            break (sessions, shutdown_permit);
-        };
+        let mut sessions = self.sessions.write().await;
         // Every remaining awaitable realization resource is acquired before
-        // asking the document machine to authorize the lifecycle change.
-        // Cancellation while acquiring the archived-view guard therefore
-        // leaves both registries and every live-handle carrier untouched.
+        // asking either generated machine to authorize the lifecycle change.
         // Global lock order for the only operation that needs both registries:
         // live sessions, then archived views. Readers never retain an archived
         // view guard while acquiring the live registry.
         let mut archived_views = self.archived_views.write().await;
+        let handle = sessions
+            .get(id)
+            .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
         // Standalone archive still changes the canonical session-document
-        // lifecycle fact. Obtain the generated Active -> Archived verdict
-        // only after effect realization can complete without another await.
+        // lifecycle fact. Obtain its generated Active -> Archived verdict
+        // before mutating the live actor's turn-admission authority.
         authorize_standalone_archive(id)?;
+        let projection = Self::request_live_session_handle_shutdown(id, handle)?;
+        handle.actor_witness.revoke();
         let handle = sessions
             .swap_remove(id)
             .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
         let archived_view = Self::archived_view_from_handle(id, &handle);
         archived_views.insert(id.clone(), archived_view);
 
-        handle.actor_witness.revoke();
-        // Clear the singular typed materialization record with the handle; a
-        // staged session's registry-held permit drops with it, freeing the
-        // reserved capacity.
-        self.staged_registry.forget(id);
-        handle.archive_snapshot_gate.close_for_snapshot();
-
-        let projection = {
-            let mut slot = lock_turn_admission(&handle.turn_admission);
-            slot.request_shutdown().ok().map(|_| slot.projection())
-        };
-        if let Some(projection) = projection {
-            handle.state_tx.send_replace(projection);
-        }
         drop(archived_views);
         drop(sessions);
-        // The reserved permit turns shutdown delivery into the final
-        // synchronous realization step: there is no post-verdict cancellation
-        // point that can strand the two registries in different lifecycles.
-        drop(shutdown_permit.send(SessionCommand::Shutdown));
+        self.shutdown_removed_live_session_handle(id, handle, projection);
         Ok(())
     }
 
@@ -6211,7 +6254,7 @@ fn restore_deferred_turn_inputs(
 }
 
 /// D1 drain obligation: called from both `ShuttingDown` entry points (the
-/// `Shutdown` command handler and the `StartTurn` finalize-to-shutdown path).
+/// out-of-band shutdown wake and the `StartTurn` finalize-to-shutdown path).
 /// Closes the command channel so senders receive an error, drains any
 /// already-buffered commands resolving each waiter with its typed
 /// benign/terminal outcome, then closes the machine-owned drain obligation
@@ -6224,7 +6267,7 @@ async fn drain_session_task_commands<A: SessionAgent>(
     next_seq: &mut u64,
     source: &EventSourceIdentity,
     transcript_authority_generation: &mut u64,
-) {
+) -> SessionTeardownAuthorization {
     // Prevent any new commands from entering the buffer.
     commands.close();
 
@@ -6406,28 +6449,25 @@ async fn drain_session_task_commands<A: SessionAgent>(
             SessionCommand::SyncSessionFromDurableSnapshot { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(meerkat_core::error::AgentError::Cancelled));
             }
-            SessionCommand::Shutdown => {
-                // Already in ShuttingDown; redundant Shutdown is a no-op.
-            }
         }
     }
 
-    // Close the machine-owned drain obligation and authorize teardown.
-    {
+    // Close the machine-owned drain obligation and authorize teardown. A
+    // generated-authority failure parks the actor fail-closed: dropping the
+    // task would otherwise make mechanical control flow the teardown authority.
+    let teardown_authorization = {
         let mut slot = lock_turn_admission(&control.turn_admission);
-        if let Err(err) = slot.resolve_pending_admission_drained() {
-            tracing::warn!(
-                error = %err,
-                "failed to close pending-admission drain obligation; \
-                 teardown will not be authorized by the machine"
+        slot.resolve_pending_admission_drained()
+            .and_then(|()| slot.authorize_session_teardown())
+    };
+    match teardown_authorization {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "generated session teardown authorization failed after command drain; actor parked"
             );
-            return;
-        }
-        if let Err(err) = slot.authorize_session_teardown() {
-            tracing::warn!(
-                error = %err,
-                "failed to authorize session teardown after drain obligation closed"
-            );
+            std::future::pending::<SessionTeardownAuthorization>().await
         }
     }
 }
@@ -6451,9 +6491,50 @@ async fn session_task<A: SessionAgent>(
     // SessionAgent's potentially mutable identity inside the task.
     let source = EventSourceIdentity::session(session_id.clone());
 
-    loop {
-        let Some(cmd) = commands.recv().await else {
-            break;
+    let teardown_authorization = loop {
+        let cmd = tokio::select! {
+            biased;
+            () = control.shutdown_notify.notified() => {
+                break drain_session_task_commands(
+                    &mut commands,
+                    &mut agent,
+                    &session_id,
+                    &control,
+                    &mut next_seq,
+                    &source,
+                    &mut transcript_authority_generation,
+                )
+                .await;
+            }
+            command = commands.recv() => command,
+        };
+        let Some(cmd) = cmd else {
+            let shutdown_projection = {
+                let mut slot = lock_turn_admission(&control.turn_admission);
+                slot.request_shutdown().map(|_| slot.projection())
+            };
+            let projection = match shutdown_projection {
+                Ok(projection) => projection,
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        %session_id,
+                        "closed session command channel could not enter generated shutdown state; actor parked"
+                    );
+                    std::future::pending::<TurnAdmissionProjection>().await
+                }
+            };
+            control.state_tx.send_replace(projection);
+            break drain_session_task_commands(
+                &mut commands,
+                &mut agent,
+                &session_id,
+                &control,
+                &mut next_seq,
+                &source,
+                &mut transcript_authority_generation,
+            )
+            .await;
         };
         if cmd.advances_transcript_authority_generation() {
             transcript_authority_generation = transcript_authority_generation.saturating_add(1);
@@ -6899,7 +6980,7 @@ async fn session_task<A: SessionAgent>(
                                 SessionTurnExecutionOutcome::without_machine_terminal(Err(error)),
                             );
                             if shutting_down {
-                                drain_session_task_commands(
+                                break drain_session_task_commands(
                                     &mut commands,
                                     &mut agent,
                                     &session_id,
@@ -6909,7 +6990,6 @@ async fn session_task<A: SessionAgent>(
                                     &mut transcript_authority_generation,
                                 )
                                 .await;
-                                break;
                             }
                             continue;
                         }
@@ -7178,7 +7258,7 @@ async fn session_task<A: SessionAgent>(
                 });
                 if shutting_down {
                     // D1: drain queued admission work before exiting.
-                    drain_session_task_commands(
+                    break drain_session_task_commands(
                         &mut commands,
                         &mut agent,
                         &session_id,
@@ -7188,7 +7268,6 @@ async fn session_task<A: SessionAgent>(
                         &mut transcript_authority_generation,
                     )
                     .await;
-                    break;
                 }
             }
             SessionCommand::ExportSession { reply_tx } => {
@@ -7641,30 +7720,9 @@ async fn session_task<A: SessionAgent>(
                     agent.acknowledge_head_canonical_runtime_boundary(&successor_head_token);
                 let _ = reply_tx.send(result);
             }
-            SessionCommand::Shutdown => {
-                let next_projection = {
-                    let mut slot = lock_turn_admission(&control.turn_admission);
-                    let next_phase = slot.request_shutdown().ok();
-                    next_phase.map(|_| slot.projection())
-                };
-                if let Some(projection) = next_projection {
-                    control.state_tx.send_replace(projection);
-                }
-                // D1: drain queued admission work before exiting.
-                drain_session_task_commands(
-                    &mut commands,
-                    &mut agent,
-                    &session_id,
-                    &control,
-                    &mut next_seq,
-                    &source,
-                    &mut transcript_authority_generation,
-                )
-                .await;
-                break;
-            }
         }
-    }
+    };
+    teardown_authorization.complete_task_exit();
 }
 
 #[cfg(test)]
@@ -9527,6 +9585,9 @@ mod archive_shutdown_drain_tests {
     struct DrainProbeHooks {
         entered_run: Arc<tokio::sync::Notify>,
         release_run: Arc<tokio::sync::Semaphore>,
+        entered_control: Arc<tokio::sync::Notify>,
+        release_control: Arc<tokio::sync::Semaphore>,
+        actor_dropped: Arc<tokio::sync::Notify>,
         /// When set, the next pending-tool-results effect handler fires
         /// `request_shutdown` on the installed turn-admission slot. That
         /// handler is the last synchronous agent seam before `begin`, so this
@@ -9541,6 +9602,9 @@ mod archive_shutdown_drain_tests {
             Self {
                 entered_run: Arc::new(tokio::sync::Notify::new()),
                 release_run: Arc::new(tokio::sync::Semaphore::new(0)),
+                entered_control: Arc::new(tokio::sync::Notify::new()),
+                release_control: Arc::new(tokio::sync::Semaphore::new(0)),
+                actor_dropped: Arc::new(tokio::sync::Notify::new()),
                 yank_shutdown_before_begin: Arc::new(AtomicBool::new(false)),
                 turn_admission: Arc::new(std::sync::Mutex::new(None)),
             }
@@ -9571,6 +9635,12 @@ mod archive_shutdown_drain_tests {
         identity: SessionLlmIdentity,
         hooks: DrainProbeHooks,
         transient_turn_context_state: meerkat_core::TransientTurnContextStateHandle,
+    }
+
+    impl Drop for DrainProbeAgent {
+        fn drop(&mut self) {
+            self.hooks.actor_dropped.notify_one();
+        }
     }
 
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -9663,6 +9733,17 @@ mod archive_shutdown_drain_tests {
                         ))
                     })?;
             }
+            Ok(())
+        }
+
+        async fn abort_uncommitted_compaction_projections(&mut self) -> Result<(), AgentError> {
+            self.hooks.entered_control.notify_one();
+            self.hooks
+                .release_control
+                .acquire()
+                .await
+                .expect("drain probe control release semaphore should stay open")
+                .forget();
             Ok(())
         }
 
@@ -9934,11 +10015,8 @@ mod archive_shutdown_drain_tests {
         );
     }
 
-    /// Pin (GREEN): once archive completed, a fresh context application is a
-    /// typed `NotFound` — the archived-session public contract — and never a
-    /// hung waiter.
     #[tokio::test]
-    async fn cancelled_archive_waiting_for_shutdown_capacity_preserves_live_session() {
+    async fn archive_does_not_wait_for_saturated_command_queue() {
         let hooks = DrainProbeHooks::new();
         let service = Arc::new(EphemeralSessionService::new(
             DrainProbeBuilder {
@@ -9970,8 +10048,8 @@ mod archive_shutdown_drain_tests {
             .await
             .expect("turn should enter the probe run");
 
-        // Fill every command slot. Archive may snapshot A's actor sender, but
-        // it must remain lock-free and pre-verdict while reserving capacity.
+        // Fill every command slot. Archive must use the out-of-band shutdown
+        // wake rather than competing for ordinary command capacity.
         let mut queued_probe_replies = Vec::with_capacity(COMMAND_CHANNEL_CAPACITY);
         for _ in 0..COMMAND_CHANNEL_CAPACITY {
             let (reply_tx, reply_rx) = oneshot::channel();
@@ -9982,17 +10060,29 @@ mod archive_shutdown_drain_tests {
             queued_probe_replies.push(reply_rx);
         }
 
-        let mut archive = Box::pin(service.archive(&session_id));
+        tokio::time::timeout(Duration::from_secs(1), service.archive(&session_id))
+            .await
+            .expect("archive must not wait for shutdown command capacity")
+            .expect("archive must succeed");
+
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), archive.as_mut())
+            !service
+                .has_live_session(&session_id)
                 .await
-                .is_err(),
-            "archive must wait for reserved shutdown capacity"
+                .expect("archived session live query"),
+            "archive must remove the exact live actor"
+        );
+        assert!(
+            service
+                .archived_views
+                .read()
+                .await
+                .contains_key(&session_id),
+            "archive must publish the archived view"
         );
 
-        // Waiting on A's saturated queue must not retain the global sessions
-        // writer. Unrelated session B stays promptly readable through both the
-        // public live-query and the read path used by interrupt dispatch.
+        // Unrelated session B stays promptly readable through both the public
+        // live-query and the read path used by interrupt dispatch.
         let other_is_live = tokio::time::timeout(
             Duration::from_secs(1),
             service.has_live_session(&other_session_id),
@@ -10009,45 +10099,91 @@ mod archive_shutdown_drain_tests {
             matches!(other_interrupt, Err(SessionError::NotRunning { .. })),
             "idle B should remain promptly readable and report NotRunning, got {other_interrupt:?}"
         );
-        drop(archive);
-
-        // Dropping the pending future releases its locks and reservation wait;
-        // no machine verdict or registry/authority mutation may have happened.
-        {
-            let sessions = service.sessions.read().await;
-            let handle = sessions
-                .get(&session_id)
-                .expect("cancelled pre-verdict archive preserves live handle");
-            assert!(handle.actor_witness.is_live());
-            assert!(!handle.command_tx.is_closed());
-        }
-        assert!(
-            !service
-                .archived_views
-                .read()
-                .await
-                .contains_key(&session_id),
-            "cancelled pre-verdict archive must not publish an archived view"
-        );
-
-        // The preserved session remains fully operable and can subsequently be
-        // archived once the actor is allowed to drain the queued commands.
+        // The in-flight turn finishes, observes ShuttingDown, and drains every
+        // command that was buffered before archive closed the actor channel.
         hooks.release_run.add_permits(1);
         let run_result = tokio::time::timeout(WAITER_TIMEOUT, turn)
             .await
             .expect("turn task should finish")
             .expect("turn task should not panic")
-            .expect("preserved turn must succeed");
+            .expect("in-flight turn must complete");
         assert_eq!(run_result.text, "ran");
-        service
-            .archive(&session_id)
-            .await
-            .expect("archive succeeds after capacity becomes available");
-        drop(queued_probe_replies);
+        for reply in queued_probe_replies {
+            tokio::time::timeout(WAITER_TIMEOUT, reply)
+                .await
+                .expect("queued command must drain")
+                .expect("queued command reply sender must remain live");
+        }
         service
             .archive(&other_session_id)
             .await
             .expect("cleanup unrelated session");
+    }
+
+    #[tokio::test]
+    async fn discard_live_session_actor_does_not_wait_for_saturated_command_queue() {
+        let hooks = DrainProbeHooks::new();
+        let service = Arc::new(EphemeralSessionService::new(
+            DrainProbeBuilder {
+                hooks: hooks.clone(),
+            },
+            1,
+        ));
+        let created = service
+            .create_session(create_request())
+            .await
+            .expect("create session");
+        let session_id = created.session_id;
+        let command_tx = command_tx_for(service.as_ref(), &session_id).await;
+        let witness = service
+            .live_session_actor_witness(&session_id)
+            .await
+            .expect("live actor witness");
+
+        let (control_reply_tx, control_reply_rx) = oneshot::channel();
+        command_tx
+            .send(SessionCommand::AbortUncommittedCompactionProjections {
+                reply_tx: control_reply_tx,
+            })
+            .await
+            .expect("send actor-blocking control command");
+        tokio::time::timeout(WAITER_TIMEOUT, hooks.entered_control.notified())
+            .await
+            .expect("actor should enter the blocking control command");
+
+        let mut queued_probe_replies = Vec::with_capacity(COMMAND_CHANNEL_CAPACITY);
+        for _ in 0..COMMAND_CHANNEL_CAPACITY {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            command_tx
+                .send(SessionCommand::VisibleToolDefs { reply_tx })
+                .await
+                .expect("blocked actor keeps its command receiver alive");
+            queued_probe_replies.push(reply_rx);
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            service.discard_live_session_actor(&witness),
+        )
+        .await
+        .expect("discard must not wait for shutdown command capacity")
+        .expect("discard should succeed");
+
+        hooks.release_control.add_permits(1);
+        tokio::time::timeout(WAITER_TIMEOUT, control_reply_rx)
+            .await
+            .expect("in-flight control command must resolve")
+            .expect("in-flight control reply sender must remain live")
+            .expect("in-flight control command must complete");
+        for reply in queued_probe_replies {
+            tokio::time::timeout(WAITER_TIMEOUT, reply)
+                .await
+                .expect("queued command must drain")
+                .expect("queued command reply sender must remain live");
+        }
+        tokio::time::timeout(WAITER_TIMEOUT, command_tx.closed())
+            .await
+            .expect("Notify-driven shutdown must close the actor command channel");
     }
 
     /// Regression (0.7.2): `discard_live_session` must be idempotent.
@@ -10108,8 +10244,8 @@ mod archive_shutdown_drain_tests {
 
         service.archive(&session_id).await.expect("archive");
 
-        // The session task exits once it has processed the Shutdown command;
-        // the command channel closes with it.
+        // The session task exits once it has observed the out-of-band shutdown
+        // wake; the command channel closes with it.
         tokio::time::timeout(WAITER_TIMEOUT, command_tx.closed())
             .await
             .expect("session task should exit after archive");
@@ -10121,6 +10257,47 @@ mod archive_shutdown_drain_tests {
             "the session task must close the machine-owned drain obligation \
              (ResolvePendingAdmissionDrained) before it exits"
         );
+    }
+
+    #[tokio::test]
+    async fn closed_command_channel_authorizes_teardown_before_task_exit() {
+        let hooks = DrainProbeHooks::new();
+        let service = EphemeralSessionService::new(
+            DrainProbeBuilder {
+                hooks: hooks.clone(),
+            },
+            1,
+        );
+        let created = service
+            .create_session(create_request())
+            .await
+            .expect("create deferred session");
+        let turn_admission = turn_admission_for(&service, &created.session_id).await;
+
+        drop(service);
+
+        tokio::time::timeout(WAITER_TIMEOUT, hooks.actor_dropped.notified())
+            .await
+            .expect("closed command channel must let the actor exit");
+        let slot = lock_turn_admission(&turn_admission);
+        assert_eq!(slot.phase(), TurnAdmissionPhase::ShuttingDown);
+        assert!(
+            !slot.admission_drain_pending(),
+            "channel-close teardown must close the generated drain obligation before actor exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_preserves_legacy_unit_return() {
+        let service = EphemeralSessionService::new(
+            DrainProbeBuilder {
+                hooks: DrainProbeHooks::new(),
+            },
+            1,
+        );
+
+        let shutdown_output: () = service.shutdown().await;
+        assert_eq!(shutdown_output, ());
     }
 }
 

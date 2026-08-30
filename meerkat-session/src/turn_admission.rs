@@ -154,6 +154,15 @@ pub(crate) struct TurnAdmissionSlot {
     projection: TurnAdmissionProjection,
 }
 
+#[must_use = "session teardown authorization must be consumed at the actor exit boundary"]
+pub(crate) struct SessionTeardownAuthorization {
+    _private: (),
+}
+
+impl SessionTeardownAuthorization {
+    pub(crate) fn complete_task_exit(self) {}
+}
+
 impl TurnAdmissionSlot {
     pub(crate) fn new() -> Self {
         let mut slot = Self {
@@ -518,15 +527,30 @@ impl TurnAdmissionSlot {
 
     /// Signal to the machine that teardown may proceed. Accepted only after
     /// the drain obligation has been closed.
-    pub(crate) fn authorize_session_teardown(&mut self) -> Result<(), TurnAdmissionError> {
+    pub(crate) fn authorize_session_teardown(
+        &mut self,
+    ) -> Result<SessionTeardownAuthorization, TurnAdmissionError> {
         let from = self.phase();
-        self.authority
-            .authorize_session_teardown()
-            .map(|_| ())
-            .map_err(|_| TurnAdmissionError {
+        let effects =
+            self.authority
+                .authorize_session_teardown()
+                .map_err(|_| TurnAdmissionError {
+                    from,
+                    op: "authorize_session_teardown",
+                })?;
+        if effects.iter().any(|effect| {
+            matches!(
+                effect,
+                authority::SessionTurnAdmissionEffect::SessionTeardownAuthorized
+            )
+        }) {
+            Ok(SessionTeardownAuthorization { _private: () })
+        } else {
+            Err(TurnAdmissionError {
                 from,
                 op: "authorize_session_teardown",
             })
+        }
     }
 
     fn refresh_projection(&mut self) -> Result<(), TurnAdmissionError> {
@@ -876,6 +900,7 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod shutdown_drain_machine_tests {
+    use super::TurnAdmissionSlot;
     use crate::generated::session_turn_admission::{
         PendingContinuationDisposition, RuntimeKeepAlivePersistenceDecision,
         RuntimeKeepAliveRequest, SessionTurnAdmissionEffect, SessionTurnAdmissionMachineAuthority,
@@ -1056,6 +1081,28 @@ mod shutdown_drain_machine_tests {
             effect,
             SessionTurnAdmissionEffect::SessionTeardownAuthorized
         )));
+        assert!(authority.state().teardown_authorized);
+        assert!(
+            authority.authorize_session_teardown().is_err(),
+            "generated teardown authorization must be one-shot"
+        );
+    }
+
+    #[test]
+    fn session_teardown_authorization_mints_one_shell_witness() {
+        let mut slot = TurnAdmissionSlot::new();
+        slot.request_shutdown()
+            .expect("idle shutdown should enter draining");
+        slot.resolve_pending_admission_drained()
+            .expect("drain obligation should close");
+
+        slot.authorize_session_teardown()
+            .expect("first authorization should mint the teardown witness")
+            .complete_task_exit();
+        assert!(
+            slot.authorize_session_teardown().is_err(),
+            "a second authorization must be rejected without minting a witness"
+        );
     }
 
     #[test]

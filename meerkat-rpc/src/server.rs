@@ -1426,7 +1426,15 @@ impl<R: AsyncBufRead + Unpin, W: TransportWriter> RpcServer<R, W> {
         // runtime where client disconnect should not destroy state).
         self.request_executor.shutdown_and_abort_stragglers().await;
         if !self.skip_shutdown_on_eof {
-            self.router.runtime().shutdown().await;
+            self.router
+                .runtime()
+                .try_shutdown()
+                .await
+                .map_err(|error| {
+                    ServerError::Io(std::io::Error::other(format!(
+                        "session shutdown error: {error}"
+                    )))
+                })?;
         }
         Ok(())
     }
