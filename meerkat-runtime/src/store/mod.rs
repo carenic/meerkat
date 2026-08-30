@@ -2200,7 +2200,6 @@ pub struct PreparedRuntimeSessionCommitResult {
     profile: RuntimeSessionPersistenceProfile,
     outcome: PreparedRuntimeSessionCommitOutcome,
     recovery_status: Option<RecoveryCommitStatus>,
-    downstream_projection_required: bool,
     authority: Option<RuntimeSessionAuthority>,
 }
 
@@ -2213,10 +2212,6 @@ impl PreparedRuntimeSessionCommitResult {
             profile,
             outcome: PreparedRuntimeSessionCommitOutcome::Applied,
             recovery_status: None,
-            // RuntimeStore is the sole full-body authority for WholeBlob and
-            // owns the small catalog projection for both profiles. No boundary
-            // requires a downstream SessionStore body mirror.
-            downstream_projection_required: false,
             authority: Some(authority),
         }
     }
@@ -2228,7 +2223,6 @@ impl PreparedRuntimeSessionCommitResult {
             profile,
             outcome: PreparedRuntimeSessionCommitOutcome::Applied,
             recovery_status: None,
-            downstream_projection_required: false,
             authority: None,
         }
     }
@@ -2278,11 +2272,18 @@ impl PreparedRuntimeSessionCommitResult {
         self.recovery_status
     }
 
-    /// Whether the caller must publish a separate compatibility projection
-    /// after this commit.
+    /// Legacy query for a downstream `SessionStore` body projection.
+    ///
+    /// RuntimeStore now owns the authoritative body and catalog projection for
+    /// every persistence profile, so a successful prepared boundary never
+    /// requires a second body mirror.
+    #[deprecated(
+        since = "0.8.32",
+        note = "prepared runtime boundaries no longer require a downstream SessionStore body projection; this compatibility query always returns false"
+    )]
     #[must_use]
     pub const fn downstream_projection_required(&self) -> bool {
-        self.downstream_projection_required
+        false
     }
 
     /// Exact session authority committed in this boundary, or `None` when the
@@ -2290,6 +2291,23 @@ impl PreparedRuntimeSessionCommitResult {
     #[must_use]
     pub fn authority(&self) -> Option<&RuntimeSessionAuthority> {
         self.authority.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod prepared_boundary_result_compatibility_tests {
+    use super::{PreparedRuntimeSessionCommitResult, RuntimeSessionPersistenceProfile};
+
+    #[test]
+    #[allow(deprecated)]
+    fn downstream_projection_query_remains_source_compatible_and_false() {
+        let result = PreparedRuntimeSessionCommitResult::receipt_only(
+            RuntimeSessionPersistenceProfile::WholeBlobV1,
+        );
+        let query: fn(&PreparedRuntimeSessionCommitResult) -> bool =
+            PreparedRuntimeSessionCommitResult::downstream_projection_required;
+
+        assert!(!query(&result));
     }
 }
 
@@ -7181,9 +7199,9 @@ pub(crate) fn pending_terminal_owner_fixture(
         owner_runtime_generation: Some(1),
         owner_runtime_epoch_id: Some("indexed-epoch".to_string()),
         candidate_owner_input_id: input_id.clone(),
-        candidate: (!published).then_some(candidate),
+        released_0831_candidate: None,
         candidate_digest,
-        completion_input_ids: (!published).then_some(recipients),
+        released_0831_completion_input_ids: None,
         completion_input_ids_digest,
         phase,
     };
