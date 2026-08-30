@@ -3026,9 +3026,8 @@ mod tests {
     const ED25519_PUBLIC_KEY_7: &str = "ed25519:BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
 
     /// T-B12 (DEC-P7B-18, ADJ-P7-6): the LLM-visible delegation roster is
-    /// snapshot-pinned — phase 7 adds NOTHING here. No live, no host, no
-    /// grant, no member-history tools; drift into the agent-facing surface
-    /// must be a reviewed roster change, never an accident.
+    /// snapshot-pinned. No live, host, grant, or member-history tools may drift
+    /// into the agent-facing surface without a reviewed roster change.
     #[test]
     fn agent_tool_roster_unchanged() {
         let names = |defs: Arc<[Arc<ToolDef>]>| -> Vec<String> {
@@ -3045,6 +3044,7 @@ mod tests {
                 "mob_destroy",
                 "mob_spawn_member",
                 "fork_off",
+                "council",
                 "mob_retire_member",
                 "mob_check_member",
                 "mob_list_members",
@@ -3071,6 +3071,7 @@ mod tests {
                 "mob_destroy",
                 "mob_spawn_member",
                 "fork_off",
+                "council",
                 "mob_retire_member",
                 "mob_check_member",
                 "mob_list_members",
@@ -4409,10 +4410,11 @@ mod tests {
     #[test]
     fn test_all_tool_definitions_present() {
         let defs = build_tool_defs();
-        assert_eq!(defs.len(), 12);
+        assert_eq!(defs.len(), 13);
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"delegate"));
         assert!(names.contains(&"fork_off"));
+        assert!(names.contains(&"council"));
         assert!(names.contains(&"conclude_objective"));
         assert!(names.contains(&"mob_create"));
         assert!(names.contains(&"mob_destroy"));
