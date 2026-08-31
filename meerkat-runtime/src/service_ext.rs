@@ -213,6 +213,59 @@ pub trait SessionServiceRuntimeExt: Send + Sync {
         ))
     }
 
+    /// Every committed handoff whose durable log entry has no terminal record.
+    ///
+    /// Reads the committed log and returns typed candidates. It answers only
+    /// "what does the durable log still owe"; whether a candidate is actionable
+    /// is decided by the realization seam, which additionally requires the
+    /// originating run's committed boundary receipt.
+    ///
+    /// The default is an empty list because a runtime adapter that carries no
+    /// durable session can never hold a committed handoff — that is a true
+    /// answer, not a stub.
+    async fn committed_model_routing_handoffs_awaiting_decision(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Vec<crate::meerkat_machine_types::CommittedModelRoutingHandoff>, RuntimeDriverError>
+    {
+        Ok(Vec::new())
+    }
+
+    /// Realize one committed handoff while the caller already holds this
+    /// session's turn-finalization boundary.
+    ///
+    /// Unlike the read above, the default here REFUSES: reaching it means a
+    /// candidate was produced and then could not be acted on, and silently
+    /// reporting success would strand the request forever.
+    async fn realize_committed_model_routing_handoff_under_turn_finalization_boundary(
+        &self,
+        _session_id: &SessionId,
+        _handoff: crate::meerkat_machine_types::CommittedModelRoutingHandoff,
+    ) -> Result<crate::meerkat_machine_types::ModelRoutingHandoffRealization, RuntimeDriverError>
+    {
+        Err(RuntimeDriverError::Internal(
+            "committed model-routing handoff realization is not supported by this runtime adapter"
+                .into(),
+        ))
+    }
+
+    /// Resolve every still-pending committed handoff as archived because the
+    /// session reached lifecycle terminality.
+    ///
+    /// Terminality is generated status, never a Session-log record: the log is
+    /// a handoff outbox written by runs, and a session that ended is not a run
+    /// that decided. Hosts call this at the archive boundary; it is idempotent
+    /// and refuses to walk back an already-realized handoff.
+    async fn archive_unresolved_model_routing_handoffs(
+        &self,
+        _session_id: &SessionId,
+        _request_ids: Vec<meerkat_core::image_generation::SwitchTurnRequestId>,
+    ) -> Result<(), RuntimeDriverError> {
+        Err(RuntimeDriverError::Internal(
+            "model-routing handoff archival is not supported by this runtime adapter".into(),
+        ))
+    }
+
     async fn begin_image_operation(
         &self,
         _session_id: &SessionId,

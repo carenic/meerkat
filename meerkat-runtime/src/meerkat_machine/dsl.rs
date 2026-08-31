@@ -4003,6 +4003,16 @@ pub enum RoutingSwitchTurnTerminal {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum RoutingHandoffPhase {
+    #[default]
+    Imported,
+    Claimed,
+    Realized,
+    Denied,
+    Archived,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum RoutingDenialReason {
     #[default]
     CapabilityPolicy,

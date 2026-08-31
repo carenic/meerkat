@@ -121,6 +121,7 @@ mod head_metadata;
 mod import_0810;
 mod instruction_activation;
 pub mod model_routing_control;
+pub mod model_routing_handoff_staging;
 mod system_prompt_update;
 mod transcript_history;
 

@@ -501,6 +501,83 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         }
     }
 
+    async fn committed_model_routing_handoffs_awaiting_decision(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<crate::meerkat_machine_types::CommittedModelRoutingHandoff>, RuntimeDriverError>
+    {
+        // No reconfigure host means this runtime has no durable session
+        // surface at all: nothing can have committed a handoff, and nothing
+        // could realize one. That is genuinely "nothing owed", not a failure —
+        // and treating it as a failure tears down the runtime loop on every
+        // lap for every host that never installs one.
+        let Ok(host) = self.llm_reconfigure_host() else {
+            return Ok(Vec::new());
+        };
+        let history = host
+            .load_live_session_model_routing_control_history(session_id)
+            .await?;
+        Ok(history
+            .awaiting_decision()
+            .map(
+                |record| crate::meerkat_machine_types::CommittedModelRoutingHandoff {
+                    request_id: *record.request_id(),
+                    originating_run_id: record.originating_run_id().clone(),
+                    intent: record.intent().clone(),
+                },
+            )
+            .collect())
+    }
+
+    async fn realize_committed_model_routing_handoff_under_turn_finalization_boundary(
+        &self,
+        session_id: &SessionId,
+        handoff: crate::meerkat_machine_types::CommittedModelRoutingHandoff,
+    ) -> Result<crate::meerkat_machine_types::ModelRoutingHandoffRealization, RuntimeDriverError>
+    {
+        match self
+            .execute_meerkat_machine_command(
+                None,
+                MeerkatMachineCommand::RealizeCommittedModelRoutingHandoff {
+                    session_id: session_id.clone(),
+                    handoff: Box::new(handoff),
+                },
+            )
+            .await
+            .map_err(MeerkatMachine::driver_error_from_command_error)?
+        {
+            MeerkatMachineCommandResult::ModelRoutingHandoffRealization(realization) => {
+                Ok(*realization)
+            }
+            other => Err(RuntimeDriverError::Internal(format!(
+                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::realize_committed_model_routing_handoff_under_turn_finalization_boundary: {other:?}"
+            ))),
+        }
+    }
+
+    async fn archive_unresolved_model_routing_handoffs(
+        &self,
+        session_id: &SessionId,
+        request_ids: Vec<meerkat_core::image_generation::SwitchTurnRequestId>,
+    ) -> Result<(), RuntimeDriverError> {
+        match self
+            .execute_meerkat_machine_command(
+                None,
+                MeerkatMachineCommand::ArchiveUnresolvedModelRoutingHandoffs {
+                    session_id: session_id.clone(),
+                    request_ids,
+                },
+            )
+            .await
+            .map_err(MeerkatMachine::driver_error_from_command_error)?
+        {
+            MeerkatMachineCommandResult::Unit => Ok(()),
+            other => Err(RuntimeDriverError::Internal(format!(
+                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::archive_unresolved_model_routing_handoffs: {other:?}"
+            ))),
+        }
+    }
+
     async fn admit_model_routing_assistant_turn(
         &self,
         session_id: &SessionId,

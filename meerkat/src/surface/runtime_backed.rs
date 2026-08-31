@@ -1358,6 +1358,84 @@ pub fn persistent_runtime_post_stop_cleanup_handle_for_actor_slot<
     })
 }
 
+/// Build the shared pre-dequeue realization handle for one runtime-backed
+/// session.
+///
+/// This is the single implementation every runtime-backed surface returns.
+/// Duplicating it per surface would let one skin quietly ship a session where a
+/// committed handoff is never realized, and that failure is invisible: the
+/// session simply keeps answering on the old model as if nothing was ever
+/// requested.
+///
+/// It needs only the `MeerkatMachine` and the session id, because the machine
+/// already owns the generated lifecycle, the boundary receipts, and the
+/// reconfigure host that reads and writes the durable log.
+pub fn persistent_runtime_pre_dequeue_handle(
+    adapter: Arc<meerkat_runtime::MeerkatMachine>,
+    session_id: SessionId,
+) -> Arc<dyn meerkat_core::lifecycle::CoreExecutorPreDequeueHandle> {
+    Arc::new(RuntimeModelRoutingHandoffPreDequeueHandle {
+        adapter,
+        session_id,
+    })
+}
+
+struct RuntimeModelRoutingHandoffPreDequeueHandle {
+    adapter: Arc<meerkat_runtime::MeerkatMachine>,
+    session_id: SessionId,
+}
+
+#[async_trait::async_trait]
+impl meerkat_core::lifecycle::CoreExecutorPreDequeueHandle
+    for RuntimeModelRoutingHandoffPreDequeueHandle
+{
+    async fn realize_committed_handoffs_under_turn_finalization_boundary(
+        &self,
+    ) -> Result<meerkat_core::lifecycle::CorePreDequeueOutcome, CoreExecutorError> {
+        use meerkat_core::lifecycle::CorePreDequeueOutcome;
+        use meerkat_runtime::{ModelRoutingHandoffRealization, SessionServiceRuntimeExt};
+
+        let pending = self
+            .adapter
+            .committed_model_routing_handoffs_awaiting_decision(&self.session_id)
+            .await
+            .map_err(|error| CoreExecutorError::control_failed_runtime(error.to_string()))?;
+        if pending.is_empty() {
+            return Ok(CorePreDequeueOutcome::NothingPending);
+        }
+        let mut realized_any = false;
+        for handoff in pending {
+            let request_id = handoff.request_id;
+            match self
+                .adapter
+                .realize_committed_model_routing_handoff_under_turn_finalization_boundary(
+                    &self.session_id,
+                    handoff,
+                )
+                .await
+                .map_err(|error| {
+                    // A failed realization must not let the pending input
+                    // proceed under an identity the session was told to leave.
+                    CoreExecutorError::control_failed_runtime(error.to_string())
+                })? {
+                ModelRoutingHandoffRealization::Realized { .. }
+                | ModelRoutingHandoffRealization::Denied { .. } => realized_any = true,
+                ModelRoutingHandoffRealization::AlreadyExact => {}
+                ModelRoutingHandoffRealization::Held { reason } => {
+                    return Err(CoreExecutorError::control_failed_runtime(format!(
+                        "committed model-routing handoff {request_id:?} is held: {reason}"
+                    )));
+                }
+            }
+        }
+        Ok(if realized_any {
+            CorePreDequeueOutcome::Realized
+        } else {
+            CorePreDequeueOutcome::NothingPending
+        })
+    }
+}
+
 /// Build the stable outer mutation boundary shared by runtime-loop, direct,
 /// and non-turn session writers for one SessionId.
 pub fn persistent_runtime_turn_finalization_boundary_handle<B: SessionAgentBuilder + 'static>(
@@ -1747,6 +1825,15 @@ impl<B: SessionAgentBuilder + 'static> CoreExecutor for PersistentRuntimeExecuto
     ) -> Option<Arc<dyn CoreExecutorTurnFinalizationBoundaryHandle>> {
         Some(persistent_runtime_turn_finalization_boundary_handle(
             Arc::clone(&self.service),
+            self.session_id.clone(),
+        ))
+    }
+
+    fn pre_dequeue_handle(
+        &self,
+    ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPreDequeueHandle>> {
+        Some(persistent_runtime_pre_dequeue_handle(
+            Arc::clone(&self.adapter),
             self.session_id.clone(),
         ))
     }

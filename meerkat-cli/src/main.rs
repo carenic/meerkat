@@ -9822,6 +9822,29 @@ impl meerkat_core::lifecycle::CoreExecutor for CliRuntimeExecutor {
         }
     }
 
+    /// The one shared facade-owned realization handle.
+    ///
+    /// Gated on `session-store` for the same reason the boundary handle is: a
+    /// CLI build without durable sessions has no committed handoff log to read,
+    /// and the tool is never registered for it either.
+    fn pre_dequeue_handle(
+        &self,
+    ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPreDequeueHandle>> {
+        #[cfg(feature = "session-store")]
+        {
+            self.persistent_service.as_ref().map(|_| {
+                meerkat::surface::persistent_runtime_pre_dequeue_handle(
+                    Arc::clone(&self.runtime_adapter),
+                    self.session_id.clone(),
+                )
+            })
+        }
+        #[cfg(not(feature = "session-store"))]
+        {
+            None
+        }
+    }
+
     async fn apply(
         &mut self,
         run_id: meerkat_core::lifecycle::RunId,

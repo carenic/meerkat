@@ -719,6 +719,16 @@ impl CoreExecutor for SessionRuntimeExecutor {
         )
     }
 
+    /// The one shared facade-owned realization handle.
+    fn pre_dequeue_handle(
+        &self,
+    ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPreDequeueHandle>> {
+        Some(meerkat::surface::persistent_runtime_pre_dequeue_handle(
+            self.runtime.runtime_adapter(),
+            self.session_id.clone(),
+        ))
+    }
+
     async fn apply(
         &mut self,
         run_id: meerkat_core::lifecycle::RunId,
@@ -1035,6 +1045,23 @@ impl CoreExecutor for MobRpcRuntimeExecutor {
             session_service: Arc::clone(&self.session_service),
             session_id: self.session_id.clone(),
         }))
+    }
+
+    /// The one shared facade-owned realization handle, when this mob member is
+    /// bound to a runtime at all.
+    ///
+    /// A `MobRpcRuntimeExecutor` without a `SessionRuntime` is driving a member
+    /// whose turns never pass through a runtime loop, so there is no
+    /// pre-dequeue point to hook and no committed handoff it could realize.
+    fn pre_dequeue_handle(
+        &self,
+    ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPreDequeueHandle>> {
+        self.runtime.as_ref().map(|runtime| {
+            meerkat::surface::persistent_runtime_pre_dequeue_handle(
+                runtime.runtime_adapter(),
+                self.session_id.clone(),
+            )
+        })
     }
 
     async fn apply(

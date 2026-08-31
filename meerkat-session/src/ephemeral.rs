@@ -1154,6 +1154,25 @@ enum SessionCommand {
         state: Option<Box<meerkat_core::SessionToolVisibilityState>>,
         reply_tx: oneshot::Sender<Result<(), meerkat_core::error::AgentError>>,
     },
+    /// Append one resolution record to the live session's committed
+    /// model-routing handoff log.
+    ///
+    /// Routed through the actor rather than mutated on an exported copy
+    /// because the actor owns the live `Session`; writing to a clone would
+    /// produce a record the next persist could not see. The caller holds the
+    /// turn-finalization boundary, so the actor is idle and this cannot
+    /// interleave with a turn.
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    AppendModelRoutingControlRecord {
+        record:
+            Box<meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord>,
+        reply_tx: oneshot::Sender<
+            Result<
+                meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
+                meerkat_core::error::AgentError,
+            >,
+        >,
+    },
     #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
     SyncSessionFromDurableSnapshot {
         // Boxed: a full Session is by far the largest payload on this channel.
@@ -2069,6 +2088,24 @@ pub trait SessionAgent: Send {
     ) -> Result<(), meerkat_core::error::AgentError> {
         Err(meerkat_core::error::AgentError::ConfigError(
             "tool visibility updates are not supported by this session agent".to_string(),
+        ))
+    }
+
+    /// Append one resolution record to the live session's committed
+    /// model-routing handoff log.
+    ///
+    /// Refuses by default rather than succeeding vacuously: an agent that
+    /// cannot record a resolution must not let the realization seam believe a
+    /// durable terminal was written.
+    fn append_model_routing_control_record(
+        &mut self,
+        _record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
+    ) -> Result<
+        meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
+        meerkat_core::error::AgentError,
+    > {
+        Err(meerkat_core::error::AgentError::ConfigError(
+            "model-routing handoff resolutions are not supported by this session agent".to_string(),
         ))
     }
 
@@ -3236,6 +3273,42 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             .map_err(|_| {
                 SessionError::Agent(meerkat_core::error::AgentError::InternalError(
                     "Session task dropped uncommitted compaction abort reply".to_string(),
+                ))
+            })?
+            .map_err(SessionError::Agent)
+    }
+
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    pub(crate) async fn append_session_model_routing_control_record(
+        &self,
+        id: &SessionId,
+        record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
+    ) -> Result<
+        meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
+        SessionError,
+    > {
+        let sessions = self.sessions.read().await;
+        let handle = sessions
+            .get(id)
+            .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .command_tx
+            .send(SessionCommand::AppendModelRoutingControlRecord {
+                record: Box::new(record),
+                reply_tx,
+            })
+            .await
+            .map_err(|_| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                    "Session task has exited".to_string(),
+                ))
+            })?;
+        reply_rx
+            .await
+            .map_err(|_| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                    "Session task dropped the reply channel".to_string(),
                 ))
             })?
             .map_err(SessionError::Agent)
@@ -6446,6 +6519,10 @@ async fn drain_session_task_commands<A: SessionAgent>(
                 let _ = reply_tx.send(Err(meerkat_core::error::AgentError::Cancelled));
             }
             #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+            SessionCommand::AppendModelRoutingControlRecord { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(meerkat_core::error::AgentError::Cancelled));
+            }
+            #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
             SessionCommand::SyncSessionFromDurableSnapshot { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(meerkat_core::error::AgentError::Cancelled));
             }
@@ -6596,6 +6673,11 @@ async fn session_task<A: SessionAgent>(
             #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
             SessionCommand::SetToolVisibilityState { state, reply_tx } => {
                 let _ = reply_tx.send(agent.set_tool_visibility_state(state.map(|state| *state)));
+                continue;
+            }
+            #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+            SessionCommand::AppendModelRoutingControlRecord { record, reply_tx } => {
+                let _ = reply_tx.send(agent.append_model_routing_control_record(*record));
                 continue;
             }
             #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]

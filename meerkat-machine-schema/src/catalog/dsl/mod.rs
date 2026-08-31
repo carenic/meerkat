@@ -2148,6 +2148,10 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                 ],
             ),
             NamedTypeBinding::string_enum(
+                "RoutingHandoffPhase",
+                &["Imported", "Claimed", "Realized", "Denied", "Archived"],
+            ),
+            NamedTypeBinding::string_enum(
                 "RoutingSwitchTurnPhase",
                 &[
                     "Requested",

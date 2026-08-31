@@ -65,6 +65,13 @@ struct ImageGenerationToolBinding {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+struct BrainSwapToolBinding {
+    staging:
+        Arc<meerkat_core::session::model_routing_handoff_staging::ModelRoutingHandoffStagingSlot>,
+    models: Vec<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 struct WebSearchToolBinding {
     executor: Arc<dyn meerkat_llm_core::WebSearchExecutor>,
     visibility: ToolCategoryOverride,
@@ -77,6 +84,8 @@ struct BlobToolBinding {
 
 #[cfg(not(target_arch = "wasm32"))]
 const IMAGE_GENERATION_TOOL_NAMES: &[&str] = &["generate_image"];
+#[cfg(not(target_arch = "wasm32"))]
+const BRAIN_SWAP_TOOL_NAMES: &[&str] = &[crate::builtin::brain_swap::BRAIN_SWAP_TOOL_NAME];
 #[cfg(not(target_arch = "wasm32"))]
 const WEB_SEARCH_TOOL_NAMES: &[&str] = &["web_search"];
 #[cfg(not(target_arch = "wasm32"))]
@@ -105,6 +114,8 @@ pub struct CompositeDispatcher {
     durable_shell_runtime: Option<DurableShellJobRuntime>,
     #[cfg(not(target_arch = "wasm32"))]
     image_generation_runtime: Option<ImageGenerationToolBinding>,
+    #[cfg(not(target_arch = "wasm32"))]
+    brain_swap_runtime: Option<BrainSwapToolBinding>,
     #[cfg(not(target_arch = "wasm32"))]
     web_search_runtime: Option<WebSearchToolBinding>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -136,6 +147,8 @@ impl CompositeDispatcher {
                 2
             } else if IMAGE_GENERATION_TOOL_NAMES.contains(&name) {
                 3
+            } else if BRAIN_SWAP_TOOL_NAMES.contains(&name) {
+                4
             } else {
                 0
             }
@@ -305,6 +318,7 @@ impl CompositeDispatcher {
             job_manager,
             durable_shell_runtime,
             image_generation_runtime: None,
+            brain_swap_runtime: None,
             web_search_runtime: None,
             blob_tools: None,
             allowed_tools,
@@ -360,6 +374,8 @@ impl CompositeDispatcher {
             #[cfg(not(target_arch = "wasm32"))]
             image_generation_runtime: None,
             #[cfg(not(target_arch = "wasm32"))]
+            brain_swap_runtime: None,
+            #[cfg(not(target_arch = "wasm32"))]
             web_search_runtime: None,
             #[cfg(not(target_arch = "wasm32"))]
             blob_tools: None,
@@ -402,6 +418,53 @@ impl CompositeDispatcher {
         ));
         self.allowed_tools.insert(tool.name().to_string());
         self.builtin_tools.push(tool);
+        self.normalize_optional_builtin_order();
+    }
+
+    /// Register the permanent model-switch builtin, but only when switching is
+    /// actually possible.
+    ///
+    /// Two conditions, both necessary:
+    ///
+    /// * more than one DISTINCT model resolved as reachable — one model is not
+    ///   a choice, and offering a switch that can only fail is worse than not
+    ///   offering it;
+    /// * `realization_host_ready` — the runtime can actually apply a committed
+    ///   handoff. Without it the tool would durably record requests that
+    ///   nothing would ever act on, which is a silent black hole rather than a
+    ///   degraded mode.
+    ///
+    /// The binding is retained so an ops-lifecycle rebind reproduces the exact
+    /// same registration decision instead of quietly dropping the tool.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn register_brain_swap_tool(
+        &mut self,
+        staging: Arc<
+            meerkat_core::session::model_routing_handoff_staging::ModelRoutingHandoffStagingSlot,
+        >,
+        models: Vec<String>,
+        realization_host_ready: bool,
+    ) {
+        self.remove_optional_builtin_family(BRAIN_SWAP_TOOL_NAMES);
+        self.brain_swap_runtime = None;
+        if !realization_host_ready {
+            self.normalize_optional_builtin_order();
+            return;
+        }
+        let tool = crate::builtin::brain_swap::BrainSwapTool::new(
+            Arc::clone(&staging),
+            models.iter().cloned(),
+        );
+        if tool.available_model_count() <= 1 {
+            self.normalize_optional_builtin_order();
+            return;
+        }
+        let resolved_policy = self.builtin_config.resolve();
+        if resolved_policy.is_enabled(tool.name(), tool.default_enabled()) {
+            self.allowed_tools.insert(tool.name().to_string());
+        }
+        self.builtin_tools.push(Arc::new(tool));
+        self.brain_swap_runtime = Some(BrainSwapToolBinding { staging, models });
         self.normalize_optional_builtin_order();
     }
 
@@ -1066,6 +1129,7 @@ impl AgentToolDispatcher for CompositeDispatcher {
             if owned.job_manager.is_none()
                 && rebound_external.is_none()
                 && owned.image_generation_runtime.is_none()
+                && owned.brain_swap_runtime.is_none()
                 && owned.web_search_runtime.is_none()
                 && owned.blob_tools.is_none()
             {
@@ -1091,6 +1155,11 @@ impl AgentToolDispatcher for CompositeDispatcher {
             }
             if let Some(binding) = owned.image_generation_runtime.take() {
                 rebound.register_image_generation_tool(binding.runtime, binding.visibility);
+            }
+            if let Some(binding) = owned.brain_swap_runtime.take() {
+                // Reaching this arm means the tool was registered before the
+                // rebind, which already proved the realization host was ready.
+                rebound.register_brain_swap_tool(binding.staging, binding.models, true);
             }
             if let Some(binding) = owned.web_search_runtime.take() {
                 rebound.register_web_search_tool(binding.executor, binding.visibility);

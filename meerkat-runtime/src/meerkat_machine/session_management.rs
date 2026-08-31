@@ -358,6 +358,12 @@ impl meerkat_core::lifecycle::CoreExecutor for MachineManagedPostStopExecutor {
         self.inner.turn_finalization_boundary_handle()
     }
 
+    fn pre_dequeue_handle(
+        &self,
+    ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPreDequeueHandle>> {
+        self.inner.pre_dequeue_handle()
+    }
+
     async fn apply(
         &mut self,
         run_id: meerkat_core::lifecycle::RunId,

@@ -2563,6 +2563,22 @@ pub enum RoutingSwitchTurnTerminal {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum RoutingHandoffPhase {
+    /// A committed request was observed and bound to its exact originating
+    /// run, but nothing has been attempted for it yet.
+    #[default]
+    Imported,
+    /// This runtime owns the request and is applying it.
+    Claimed,
+    /// The routing change was applied and durably recorded.
+    Realized,
+    /// The request was refused at its decision point.
+    Denied,
+    /// The session reached lifecycle terminality before the request resolved.
+    Archived,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum RoutingDenialReason {
     #[default]
     CapabilityPolicy,
@@ -3130,6 +3146,11 @@ macro_rules! meerkat_catalog_machine_dsl {
             model_routing_image_plan_denials: Map<String, Enum<RoutingImagePlanDenialReason>>,
             model_routing_approval_phases: Map<String, Enum<RoutingApprovalPhase>>,
             model_routing_approval_parent_kind: Map<String, Enum<RoutingApprovalParentKind>>,
+            model_routing_handoff_phase: Map<String, Enum<RoutingHandoffPhase>>,
+            model_routing_handoff_run: Map<String, String>,
+            model_routing_handoff_target: Map<String, String>,
+            model_routing_handoff_applied_model: Map<String, String>,
+            model_routing_handoff_denials: Map<String, Enum<RoutingDenialReason>>,
 
             // --- Registration substate ---
             registration_phase: RegistrationPhase,
@@ -3784,6 +3805,11 @@ macro_rules! meerkat_catalog_machine_dsl {
             model_routing_image_plan_denials = EmptyMap,
             model_routing_approval_phases = EmptyMap,
             model_routing_approval_parent_kind = EmptyMap,
+            model_routing_handoff_phase = EmptyMap,
+            model_routing_handoff_run = EmptyMap,
+            model_routing_handoff_target = EmptyMap,
+            model_routing_handoff_applied_model = EmptyMap,
+            model_routing_handoff_denials = EmptyMap,
             // Registration substate
             registration_phase = RegistrationPhase::Queuing,
             unregister_runtime_loop_drain_pending = false,
@@ -4526,6 +4552,31 @@ macro_rules! meerkat_catalog_machine_dsl {
             },
             CompleteUntilChangedSwitchTurnReconfigure { request_id: String },
             AdmitModelRoutingAssistantTurn,
+            // Committed cross-run routing handoff lifecycle. The Session log is
+            // an append-only handoff record; these inputs carry that committed
+            // fact into machine authority, which is where claim, convergence,
+            // conflict, realization, and terminality are actually decided.
+            ImportCommittedModelRoutingHandoff {
+                request_id: String,
+                originating_run_id: String,
+                target_model: String,
+            },
+            ClaimModelRoutingHandoff {
+                request_id: String,
+                originating_run_id: String,
+                target_model: String,
+            },
+            RealizeModelRoutingHandoff {
+                request_id: String,
+                originating_run_id: String,
+                target_model: String,
+                applied_model: String,
+            },
+            DenyModelRoutingHandoff {
+                request_id: String,
+                reason: Enum<RoutingDenialReason>,
+            },
+            ArchiveUnresolvedModelRoutingHandoff { request_id: String },
             BeginImageOperation {
                 operation_id: String,
                 target_model: String,
@@ -10537,6 +10588,205 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
             to Idle
             emit ModelRoutingStatusChanged { topology_epoch: self.model_routing_topology_epoch }
+        }
+
+        // Committed cross-run routing handoff lifecycle.
+        //
+        // The Session log records that a run asked for a permanent change; it
+        // decides nothing. These transitions are where the request becomes
+        // actionable, where a retry converges instead of rotating identity
+        // twice, and where a contradictory restatement is refused. Every arm is
+        // keyed on the request identity AND its exact originating run AND its
+        // exact intended target, so a matching request id alone can never move
+        // a handoff that belongs to a different run or a different model.
+        //
+        // Guard-fail is the conflict channel: an input that matches no arm is
+        // refused by the kernel rather than being silently absorbed.
+        transition ImportCommittedModelRoutingHandoffFirst {
+            per_phase [Idle, Attached, Running]
+            on input ImportCommittedModelRoutingHandoff {
+                request_id, originating_run_id, target_model
+            }
+            guard "session_registered" { self.session_id != None }
+            guard "not_yet_imported" {
+                !self.model_routing_handoff_phase.contains_key(request_id)
+            }
+            update {
+                self.model_routing_handoff_phase.insert(request_id, RoutingHandoffPhase::Imported);
+                self.model_routing_handoff_run.insert(request_id, originating_run_id);
+                self.model_routing_handoff_target.insert(request_id, target_model);
+            }
+            to Idle
+        }
+
+        // Re-importing the identical committed fact is the ordinary steady
+        // state: the log is append-only, so every later lap observes the same
+        // record again until it terminalizes.
+        transition ImportCommittedModelRoutingHandoffAlreadyExact {
+            per_phase [Idle, Attached, Running]
+            on input ImportCommittedModelRoutingHandoff {
+                request_id, originating_run_id, target_model
+            }
+            guard "session_registered" { self.session_id != None }
+            guard "already_imported_exactly" {
+                self.model_routing_handoff_run.get_cloned(request_id) == Some(originating_run_id)
+                && self.model_routing_handoff_target.get_cloned(request_id) == Some(target_model)
+            }
+            to Idle
+        }
+
+        transition ClaimModelRoutingHandoffImported {
+            per_phase [Idle, Attached, Running]
+            on input ClaimModelRoutingHandoff {
+                request_id, originating_run_id, target_model
+            }
+            guard "session_registered" { self.session_id != None }
+            guard "imported_exactly" {
+                self.model_routing_handoff_phase.get_copied(request_id)
+                    == Some(RoutingHandoffPhase::Imported)
+                && self.model_routing_handoff_run.get_cloned(request_id) == Some(originating_run_id)
+                && self.model_routing_handoff_target.get_cloned(request_id) == Some(target_model)
+            }
+            update {
+                self.model_routing_handoff_phase.insert(request_id, RoutingHandoffPhase::Claimed);
+            }
+            to Idle
+        }
+
+        // A claim interrupted before realization is retried on the next lap.
+        // Re-claiming the same request for the same target is a no-op, not a
+        // second attempt at rotation.
+        transition ClaimModelRoutingHandoffAlreadyClaimed {
+            per_phase [Idle, Attached, Running]
+            on input ClaimModelRoutingHandoff {
+                request_id, originating_run_id, target_model
+            }
+            guard "session_registered" { self.session_id != None }
+            guard "already_claimed_exactly" {
+                self.model_routing_handoff_phase.get_copied(request_id)
+                    == Some(RoutingHandoffPhase::Claimed)
+                && self.model_routing_handoff_run.get_cloned(request_id) == Some(originating_run_id)
+                && self.model_routing_handoff_target.get_cloned(request_id) == Some(target_model)
+            }
+            to Idle
+        }
+
+        // Convergence for an already-settled request: the durable record and
+        // the machine agree, so the caller has nothing left to do.
+        transition ClaimModelRoutingHandoffAlreadyRealized {
+            per_phase [Idle, Attached, Running]
+            on input ClaimModelRoutingHandoff {
+                request_id, originating_run_id, target_model
+            }
+            guard "session_registered" { self.session_id != None }
+            guard "already_realized_exactly" {
+                self.model_routing_handoff_phase.get_copied(request_id)
+                    == Some(RoutingHandoffPhase::Realized)
+                && self.model_routing_handoff_run.get_cloned(request_id) == Some(originating_run_id)
+                && self.model_routing_handoff_target.get_cloned(request_id) == Some(target_model)
+            }
+            to Idle
+        }
+
+        // Realization is the generated terminal. It runs only after the caller
+        // has durably recorded the Realized record, so this transition marks a
+        // fact rather than authorizing one.
+        transition RealizeModelRoutingHandoffClaimed {
+            per_phase [Idle, Attached, Running]
+            on input RealizeModelRoutingHandoff {
+                request_id, originating_run_id, target_model, applied_model
+            }
+            guard "session_registered" { self.session_id != None }
+            guard "claimed_exactly" {
+                self.model_routing_handoff_phase.get_copied(request_id)
+                    == Some(RoutingHandoffPhase::Claimed)
+                && self.model_routing_handoff_run.get_cloned(request_id) == Some(originating_run_id)
+                && self.model_routing_handoff_target.get_cloned(request_id) == Some(target_model)
+            }
+            update {
+                self.model_routing_handoff_phase.insert(request_id, RoutingHandoffPhase::Realized);
+                self.model_routing_handoff_applied_model.insert(request_id, applied_model);
+            }
+            to Idle
+            emit ModelRoutingStatusChanged { topology_epoch: self.model_routing_topology_epoch }
+        }
+
+        transition RealizeModelRoutingHandoffAlreadyRealized {
+            per_phase [Idle, Attached, Running]
+            on input RealizeModelRoutingHandoff {
+                request_id, originating_run_id, target_model, applied_model
+            }
+            guard "session_registered" { self.session_id != None }
+            guard "already_realized_with_same_identity" {
+                self.model_routing_handoff_phase.get_copied(request_id)
+                    == Some(RoutingHandoffPhase::Realized)
+                && self.model_routing_handoff_run.get_cloned(request_id) == Some(originating_run_id)
+                && self.model_routing_handoff_target.get_cloned(request_id) == Some(target_model)
+                && self.model_routing_handoff_applied_model.get_cloned(request_id)
+                    == Some(applied_model)
+            }
+            to Idle
+        }
+
+        transition DenyModelRoutingHandoffPending {
+            per_phase [Idle, Attached, Running]
+            on input DenyModelRoutingHandoff { request_id, reason }
+            guard "session_registered" { self.session_id != None }
+            guard "pending" {
+                self.model_routing_handoff_phase.get_copied(request_id)
+                    == Some(RoutingHandoffPhase::Imported)
+                || self.model_routing_handoff_phase.get_copied(request_id)
+                    == Some(RoutingHandoffPhase::Claimed)
+            }
+            update {
+                self.model_routing_handoff_phase.insert(request_id, RoutingHandoffPhase::Denied);
+                self.model_routing_handoff_denials.insert(request_id, reason);
+            }
+            to Idle
+            emit ModelRoutingStatusChanged { topology_epoch: self.model_routing_topology_epoch }
+        }
+
+        transition DenyModelRoutingHandoffAlreadyDenied {
+            per_phase [Idle, Attached, Running]
+            on input DenyModelRoutingHandoff { request_id, reason }
+            guard "session_registered" { self.session_id != None }
+            guard "already_denied_for_same_reason" {
+                self.model_routing_handoff_phase.get_copied(request_id)
+                    == Some(RoutingHandoffPhase::Denied)
+                && self.model_routing_handoff_denials.get_copied(request_id) == Some(reason)
+            }
+            to Idle
+        }
+
+        // Session lifecycle terminality resolves an unfinished handoff as
+        // generated status. It is deliberately NOT a Session log record: the
+        // log is a handoff outbox written by runs, and a session that ended is
+        // not a run that decided.
+        transition ArchiveUnresolvedModelRoutingHandoffPending {
+            per_phase [Idle, Attached, Running, Retired]
+            on input ArchiveUnresolvedModelRoutingHandoff { request_id }
+            guard "session_registered" { self.session_id != None }
+            guard "pending" {
+                self.model_routing_handoff_phase.get_copied(request_id)
+                    == Some(RoutingHandoffPhase::Imported)
+                || self.model_routing_handoff_phase.get_copied(request_id)
+                    == Some(RoutingHandoffPhase::Claimed)
+            }
+            update {
+                self.model_routing_handoff_phase.insert(request_id, RoutingHandoffPhase::Archived);
+            }
+            to Idle
+        }
+
+        transition ArchiveUnresolvedModelRoutingHandoffAlreadyArchived {
+            per_phase [Idle, Attached, Running, Retired]
+            on input ArchiveUnresolvedModelRoutingHandoff { request_id }
+            guard "session_registered" { self.session_id != None }
+            guard "already_archived" {
+                self.model_routing_handoff_phase.get_copied(request_id)
+                    == Some(RoutingHandoffPhase::Archived)
+            }
+            to Idle
         }
 
         transition AdmitPendingFiniteSwitchTurn {

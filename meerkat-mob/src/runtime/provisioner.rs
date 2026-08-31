@@ -8020,6 +8020,27 @@ impl CoreExecutor for MobSessionRuntimeExecutor {
         }))
     }
 
+    /// The one shared facade-owned realization handle.
+    ///
+    /// Mob members are ordinary runtime-backed sessions; a member that stages a
+    /// permanent switch must get the same cross-run realization the top-level
+    /// surfaces get, or the feature would silently be surface-conditional.
+    ///
+    /// Native-only because the facade helper lives behind
+    /// `meerkat/session-store`: a browser runtime has no durable session to
+    /// carry a committed handoff, and never registers the builtin that writes
+    /// one. On wasm32 the trait default (`None`) applies, which is the correct
+    /// declaration rather than a stub.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pre_dequeue_handle(
+        &self,
+    ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPreDequeueHandle>> {
+        Some(meerkat::surface::persistent_runtime_pre_dequeue_handle(
+            Arc::clone(&self.runtime_adapter),
+            self.bridge_session_id.clone(),
+        ))
+    }
+
     async fn apply(
         &mut self,
         run_id: CoreRunId,

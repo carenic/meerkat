@@ -7813,6 +7813,68 @@ impl std::fmt::Display for RoutingDenialReason {
     serde::Serialize,
     serde::Deserialize,
 )]
+pub enum RoutingHandoffPhase {
+    #[default]
+    #[serde(rename = "Imported")]
+    Imported,
+    #[serde(rename = "Claimed")]
+    Claimed,
+    #[serde(rename = "Realized")]
+    Realized,
+    #[serde(rename = "Denied")]
+    Denied,
+    #[serde(rename = "Archived")]
+    Archived,
+}
+impl RoutingHandoffPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Imported => "Imported",
+            Self::Claimed => "Claimed",
+            Self::Realized => "Realized",
+            Self::Denied => "Denied",
+            Self::Archived => "Archived",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for RoutingHandoffPhase {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Imported" => Ok(Self::Imported),
+            "Claimed" => Ok(Self::Claimed),
+            "Realized" => Ok(Self::Realized),
+            "Denied" => Ok(Self::Denied),
+            "Archived" => Ok(Self::Archived),
+            other => Err(format!("invalid RoutingHandoffPhase value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for RoutingHandoffPhase {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for RoutingHandoffPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum RoutingImageApprovalReason {
     #[default]
     #[serde(rename = "CrossProvider")]
@@ -12576,6 +12638,11 @@ pub struct State {
     pub model_routing_approval_phases: std::collections::BTreeMap<String, RoutingApprovalPhase>,
     pub model_routing_approval_parent_kind:
         std::collections::BTreeMap<String, RoutingApprovalParentKind>,
+    pub model_routing_handoff_phase: std::collections::BTreeMap<String, RoutingHandoffPhase>,
+    pub model_routing_handoff_run: std::collections::BTreeMap<String, String>,
+    pub model_routing_handoff_target: std::collections::BTreeMap<String, String>,
+    pub model_routing_handoff_applied_model: std::collections::BTreeMap<String, String>,
+    pub model_routing_handoff_denials: std::collections::BTreeMap<String, RoutingDenialReason>,
     pub registration_phase: RegistrationPhase,
     pub unregister_runtime_loop_drain_pending: bool,
     pub unregister_comms_drain_exit_pending: bool,
@@ -13464,6 +13531,34 @@ pub mod inputs {
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct AdmitModelRoutingAssistantTurn {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ImportCommittedModelRoutingHandoff {
+        pub request_id: String,
+        pub originating_run_id: String,
+        pub target_model: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ClaimModelRoutingHandoff {
+        pub request_id: String,
+        pub originating_run_id: String,
+        pub target_model: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RealizeModelRoutingHandoff {
+        pub request_id: String,
+        pub originating_run_id: String,
+        pub target_model: String,
+        pub applied_model: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct DenyModelRoutingHandoff {
+        pub request_id: String,
+        pub reason: RoutingDenialReason,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ArchiveUnresolvedModelRoutingHandoff {
+        pub request_id: String,
+    }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct BeginImageOperation {
         pub operation_id: String,
@@ -15315,6 +15410,11 @@ pub enum Input {
     RequestUntilChangedSwitchTurn(inputs::RequestUntilChangedSwitchTurn),
     CompleteUntilChangedSwitchTurnReconfigure(inputs::CompleteUntilChangedSwitchTurnReconfigure),
     AdmitModelRoutingAssistantTurn(inputs::AdmitModelRoutingAssistantTurn),
+    ImportCommittedModelRoutingHandoff(inputs::ImportCommittedModelRoutingHandoff),
+    ClaimModelRoutingHandoff(inputs::ClaimModelRoutingHandoff),
+    RealizeModelRoutingHandoff(inputs::RealizeModelRoutingHandoff),
+    DenyModelRoutingHandoff(inputs::DenyModelRoutingHandoff),
+    ArchiveUnresolvedModelRoutingHandoff(inputs::ArchiveUnresolvedModelRoutingHandoff),
     BeginImageOperation(inputs::BeginImageOperation),
     DenyImageOperationPlan(inputs::DenyImageOperationPlan),
     ActivateImageOperationOverride(inputs::ActivateImageOperationOverride),
@@ -15722,6 +15822,15 @@ impl Input {
                 InputKind::CompleteUntilChangedSwitchTurnReconfigure
             }
             Self::AdmitModelRoutingAssistantTurn(_) => InputKind::AdmitModelRoutingAssistantTurn,
+            Self::ImportCommittedModelRoutingHandoff(_) => {
+                InputKind::ImportCommittedModelRoutingHandoff
+            }
+            Self::ClaimModelRoutingHandoff(_) => InputKind::ClaimModelRoutingHandoff,
+            Self::RealizeModelRoutingHandoff(_) => InputKind::RealizeModelRoutingHandoff,
+            Self::DenyModelRoutingHandoff(_) => InputKind::DenyModelRoutingHandoff,
+            Self::ArchiveUnresolvedModelRoutingHandoff(_) => {
+                InputKind::ArchiveUnresolvedModelRoutingHandoff
+            }
             Self::BeginImageOperation(_) => InputKind::BeginImageOperation,
             Self::DenyImageOperationPlan(_) => InputKind::DenyImageOperationPlan,
             Self::ActivateImageOperationOverride(_) => InputKind::ActivateImageOperationOverride,
@@ -16194,6 +16303,11 @@ pub enum InputKind {
     RequestUntilChangedSwitchTurn,
     CompleteUntilChangedSwitchTurnReconfigure,
     AdmitModelRoutingAssistantTurn,
+    ImportCommittedModelRoutingHandoff,
+    ClaimModelRoutingHandoff,
+    RealizeModelRoutingHandoff,
+    DenyModelRoutingHandoff,
+    ArchiveUnresolvedModelRoutingHandoff,
     BeginImageOperation,
     DenyImageOperationPlan,
     ActivateImageOperationOverride,
@@ -18941,6 +19055,41 @@ pub enum TransitionId {
     CompleteUntilChangedSwitchTurnReconfigureIdle,
     CompleteUntilChangedSwitchTurnReconfigureAttached,
     CompleteUntilChangedSwitchTurnReconfigureRunning,
+    ImportCommittedModelRoutingHandoffFirstIdle,
+    ImportCommittedModelRoutingHandoffFirstAttached,
+    ImportCommittedModelRoutingHandoffFirstRunning,
+    ImportCommittedModelRoutingHandoffAlreadyExactIdle,
+    ImportCommittedModelRoutingHandoffAlreadyExactAttached,
+    ImportCommittedModelRoutingHandoffAlreadyExactRunning,
+    ClaimModelRoutingHandoffImportedIdle,
+    ClaimModelRoutingHandoffImportedAttached,
+    ClaimModelRoutingHandoffImportedRunning,
+    ClaimModelRoutingHandoffAlreadyClaimedIdle,
+    ClaimModelRoutingHandoffAlreadyClaimedAttached,
+    ClaimModelRoutingHandoffAlreadyClaimedRunning,
+    ClaimModelRoutingHandoffAlreadyRealizedIdle,
+    ClaimModelRoutingHandoffAlreadyRealizedAttached,
+    ClaimModelRoutingHandoffAlreadyRealizedRunning,
+    RealizeModelRoutingHandoffClaimedIdle,
+    RealizeModelRoutingHandoffClaimedAttached,
+    RealizeModelRoutingHandoffClaimedRunning,
+    RealizeModelRoutingHandoffAlreadyRealizedIdle,
+    RealizeModelRoutingHandoffAlreadyRealizedAttached,
+    RealizeModelRoutingHandoffAlreadyRealizedRunning,
+    DenyModelRoutingHandoffPendingIdle,
+    DenyModelRoutingHandoffPendingAttached,
+    DenyModelRoutingHandoffPendingRunning,
+    DenyModelRoutingHandoffAlreadyDeniedIdle,
+    DenyModelRoutingHandoffAlreadyDeniedAttached,
+    DenyModelRoutingHandoffAlreadyDeniedRunning,
+    ArchiveUnresolvedModelRoutingHandoffPendingIdle,
+    ArchiveUnresolvedModelRoutingHandoffPendingAttached,
+    ArchiveUnresolvedModelRoutingHandoffPendingRunning,
+    ArchiveUnresolvedModelRoutingHandoffPendingRetired,
+    ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedIdle,
+    ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedAttached,
+    ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedRunning,
+    ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedRetired,
     AdmitPendingFiniteSwitchTurnIdle,
     AdmitPendingFiniteSwitchTurnAttached,
     AdmitPendingFiniteSwitchTurnRunning,
@@ -21255,6 +21404,11 @@ pub fn initial_state() -> State {
         model_routing_image_plan_denials: Default::default(),
         model_routing_approval_phases: Default::default(),
         model_routing_approval_parent_kind: Default::default(),
+        model_routing_handoff_phase: Default::default(),
+        model_routing_handoff_run: Default::default(),
+        model_routing_handoff_target: Default::default(),
+        model_routing_handoff_applied_model: Default::default(),
+        model_routing_handoff_denials: Default::default(),
         registration_phase: RegistrationPhase::Queuing,
         unregister_runtime_loop_drain_pending: false,
         unregister_comms_drain_exit_pending: false,

@@ -5767,6 +5767,32 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         self.discard_live_session_unfenced(id).await
     }
 
+    /// Append one model-routing handoff resolution to the live session.
+    ///
+    /// Deliberately does NOT persist: the realization seam appends and then
+    /// persists as one caller-ordered pair, so a persistence failure is
+    /// attributable to the caller's transaction rather than hidden inside this
+    /// mutation.
+    pub async fn append_live_model_routing_control_record_under_runtime_turn_boundary(
+        &self,
+        id: &SessionId,
+        record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
+    ) -> Result<
+        meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
+        SessionError,
+    > {
+        let _recovery_guard = self.recovery_gate_for_session(id).await.lock_owned().await;
+        let _ = self.discard_stale_live_session_if_needed(id).await?;
+        if let Some(session) = self.load_authoritative_session_base(id).await? {
+            self.reject_if_archived_session(id, &session)
+                .await
+                .map_err(crate::control_error_into_session_error)?;
+        }
+        self.inner
+            .append_session_model_routing_control_record(id, record)
+            .await
+    }
+
     pub async fn dispatch_external_tool_call(
         &self,
         id: &SessionId,

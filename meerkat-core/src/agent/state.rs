@@ -696,6 +696,76 @@ where
         Ok(())
     }
 
+    /// Discard any staged permanent routing intent.
+    ///
+    /// Called at every run start so an intent staged by a run that ended
+    /// without earning promotion cannot be inherited by the next one.
+    pub(crate) fn clear_staged_model_routing_handoff(&self) {
+        if let Some(staging) = self.model_routing_handoff_staging.as_ref() {
+            staging.clear();
+        }
+    }
+
+    /// Promote this run's staged permanent routing intent into the committed
+    /// append-only handoff log, binding it to the exact originating run.
+    ///
+    /// This is the ONLY promotion path, and it is deliberately invoked only
+    /// from clean terminal boundaries — ordinary completion and successful
+    /// extraction — immediately before that run's final checkpoint, so the
+    /// request and the transcript that produced it commit together or not at
+    /// all. Nothing else in the run may call it.
+    ///
+    /// The staged slot is consumed rather than read, so a re-entered boundary
+    /// cannot append the same request twice. An already-recorded exact
+    /// duplicate is accepted as idempotent; every other incoherence is a fatal
+    /// internal error, because a request the model was told was accepted must
+    /// not silently vanish.
+    async fn promote_staged_model_routing_handoff(
+        &mut self,
+        run_id: &RunId,
+    ) -> Result<(), AgentError> {
+        let Some(staging) = self.model_routing_handoff_staging.clone() else {
+            return Ok(());
+        };
+        let staged = staging.take().map_err(|error| {
+            AgentError::InternalError(format!(
+                "failed to read staged model-routing handoff: {error}"
+            ))
+        })?;
+        let Some(staged) = staged else {
+            return Ok(());
+        };
+        let record = staged
+            .into_committed_request(run_id.clone())
+            .map_err(|error| {
+                AgentError::InternalError(format!(
+                    "staged model-routing handoff is not a representable durable request: {error}"
+                ))
+            })?;
+        self.session
+            .append_model_routing_control_record(record)
+            .map_err(|error| {
+                AgentError::InternalError(format!(
+                    "failed to commit staged model-routing handoff: {error}"
+                ))
+            })?;
+        Ok(())
+    }
+
+    /// Promote (if anything is staged) and then take the ordinary final
+    /// checkpoint, in that order.
+    ///
+    /// The ordering is the contract: the request must be part of the same
+    /// session state the checkpoint persists, never a follow-up write that a
+    /// crash could separate from the transcript that authorized it.
+    async fn commit_model_routing_handoff_and_save_session(
+        &mut self,
+        run_id: &RunId,
+    ) -> Result<(), AgentError> {
+        self.promote_staged_model_routing_handoff(run_id).await?;
+        self.save_session_best_effort(run_id).await
+    }
+
     fn publish_pending_sticky_model_fallback(&mut self) -> Result<(), AgentError> {
         let pending = self
             .pending_sticky_model_fallback_activation
@@ -6257,7 +6327,8 @@ where
         })?;
         self.execute_turn_effects(&t, ctx.turn_count, ctx.event_tx)
             .await?;
-        self.save_session_best_effort(ctx.run_id).await?;
+        self.commit_model_routing_handoff_and_save_session(ctx.run_id)
+            .await?;
         if let Some(structured_output) = result.structured_output.clone() {
             self.emit_extraction_succeeded_event(
                 structured_output,
@@ -6433,8 +6504,11 @@ where
         self.execute_turn_effects(&t, ctx.turn_count, ctx.event_tx)
             .await?;
 
-        // Save session
-        self.save_session_best_effort(ctx.run_id).await?;
+        // Save session. A permanent routing request staged by this run is
+        // promoted into the committed handoff log first, so it lands in the
+        // same checkpoint as the transcript that authorized it.
+        self.commit_model_routing_handoff_and_save_session(ctx.run_id)
+            .await?;
 
         Ok(CallingLlmStep::Done(Ok(result)))
     }

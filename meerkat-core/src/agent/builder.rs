@@ -79,6 +79,8 @@ pub struct AgentBuilder {
         Option<Arc<dyn crate::memory::CompactionCommitCoordinator>>,
     pub(super) skill_engine: Option<Arc<crate::skills::SkillRuntime>>,
     pub(super) checkpointer: Option<Arc<dyn crate::SessionCheckpointer>>,
+    pub(super) model_routing_handoff_staging:
+        Option<Arc<crate::session::model_routing_handoff_staging::ModelRoutingHandoffStagingSlot>>,
     pub(super) blob_store: Option<Arc<dyn crate::BlobStore>>,
     pub(super) silent_comms_intents: Vec<String>,
     pub(super) ops_lifecycle: Option<Arc<dyn crate::ops_lifecycle::OpsLifecycleRegistry>>,
@@ -247,6 +249,7 @@ impl AgentBuilder {
             compaction_commit_coordinator: None,
             skill_engine: None,
             checkpointer: None,
+            model_routing_handoff_staging: None,
             blob_store: None,
             silent_comms_intents: Vec::new(),
             ops_lifecycle: None,
@@ -721,6 +724,7 @@ impl AgentBuilder {
             run_completed_event_emitted: false,
             silent_comms_intents: self.silent_comms_intents,
             checkpointer: self.checkpointer,
+            model_routing_handoff_staging: self.model_routing_handoff_staging,
             latest_run_checkpoint_receipt: None,
             blob_store: self.blob_store,
             event_tap: self
@@ -916,6 +920,18 @@ impl AgentBuilder {
     /// Set the session checkpointer for keep-alive persistence.
     pub fn with_checkpointer(mut self, cp: Arc<dyn crate::SessionCheckpointer>) -> Self {
         self.checkpointer = Some(cp);
+        self
+    }
+
+    /// Share the run-local staging slot a permanent-routing tool writes into.
+    ///
+    /// The agent is the only promoter: it clears the slot at each run boundary
+    /// and commits its contents exclusively on a clean terminal run.
+    pub fn with_model_routing_handoff_staging(
+        mut self,
+        staging: Arc<crate::session::model_routing_handoff_staging::ModelRoutingHandoffStagingSlot>,
+    ) -> Self {
+        self.model_routing_handoff_staging = Some(staging);
         self
     }
 

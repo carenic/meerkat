@@ -164,6 +164,31 @@ fn preserve_credential_account_affinity(
     Ok(())
 }
 
+/// Resolve a model-only switch target through the canonical seams.
+///
+/// Model-only is the whole point: provider, provider parameters, and
+/// credentials come from the session's current identity plus the existing
+/// account-affinity rule, never from the caller. That is what makes it safe to
+/// let a model name a target — it can move within what the session was already
+/// entitled to, and nowhere else.
+pub(crate) fn resolve_model_only_reconfigure_target_identity(
+    config: &Config,
+    registry: &ModelRegistry,
+    current: &SessionLlmIdentity,
+    target_model: &str,
+) -> Result<SessionLlmIdentity, RuntimeDriverError> {
+    let request = SessionLlmReconfigureRequest {
+        model: Some(target_model.to_string()),
+        provider: None,
+        self_hosted_server_id: None,
+        provider_params: None,
+        auth_binding: None,
+    };
+    let mut target = resolve_reconfigure_target_llm_identity(registry, current, &request)?;
+    preserve_credential_account_affinity(config, current, &request, &mut target)?;
+    Ok(target)
+}
+
 /// Live-session operations required by the runtime-owned LLM reconfigure
 /// transaction.
 ///
@@ -241,6 +266,25 @@ pub trait SessionRuntimeLlmReconfigureService: Send + Sync {
         &self,
         session_id: &SessionId,
     ) -> Result<(), SessionError>;
+
+    /// Read the committed model-routing handoff log from the live session.
+    async fn live_model_routing_control_history(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<
+        meerkat_core::session::model_routing_control::SessionModelRoutingControlHistory,
+        SessionError,
+    >;
+
+    /// Append one resolution to that log, leaving persistence to the caller.
+    async fn append_live_model_routing_control_record_under_runtime_turn_boundary(
+        &self,
+        session_id: &SessionId,
+        record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
+    ) -> Result<
+        meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
+        SessionError,
+    >;
 }
 
 async fn preferred_hot_swap_realm(
@@ -383,6 +427,34 @@ impl SessionRuntimeLlmReconfigureService for PersistentSessionService<FactoryAge
         self.discard_live_session_under_runtime_turn_boundary(session_id)
             .await
     }
+
+    async fn live_model_routing_control_history(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<
+        meerkat_core::session::model_routing_control::SessionModelRoutingControlHistory,
+        SessionError,
+    > {
+        Ok(self
+            .export_live_session(session_id)
+            .await?
+            .model_routing_control()
+            .clone())
+    }
+
+    async fn append_live_model_routing_control_record_under_runtime_turn_boundary(
+        &self,
+        session_id: &SessionId,
+        record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
+    ) -> Result<
+        meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
+        SessionError,
+    > {
+        PersistentSessionService::<FactoryAgentBuilder>::append_live_model_routing_control_record_under_runtime_turn_boundary(
+            self, session_id, record,
+        )
+        .await
+    }
 }
 
 #[async_trait::async_trait]
@@ -509,6 +581,38 @@ impl SessionRuntimeLlmReconfigureService for EphemeralSessionService<FactoryAgen
         session_id: &SessionId,
     ) -> Result<(), SessionError> {
         self.discard_live_session(session_id).await
+    }
+
+    async fn live_model_routing_control_history(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<
+        meerkat_core::session::model_routing_control::SessionModelRoutingControlHistory,
+        SessionError,
+    > {
+        Ok(self
+            .export_session(session_id)
+            .await?
+            .model_routing_control()
+            .clone())
+    }
+
+    // Ephemeral sessions have no durable boundary, so a committed cross-run
+    // handoff can never exist for them and this can never legitimately be
+    // reached. Refusing keeps that impossibility loud instead of recording a
+    // resolution into state that is about to disappear.
+    async fn append_live_model_routing_control_record_under_runtime_turn_boundary(
+        &self,
+        _session_id: &SessionId,
+        _record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
+    ) -> Result<
+        meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
+        SessionError,
+    > {
+        Err(SessionError::Agent(AgentError::ConfigError(
+            "ephemeral sessions cannot record durable model-routing handoff resolutions"
+                .to_string(),
+        )))
     }
 }
 
@@ -992,6 +1096,35 @@ impl SessionLlmReconfigureHost for SessionRuntimeLlmReconfigureHost {
             .await
             .map_err(session_error_to_runtime_driver)
     }
+
+    async fn load_live_session_model_routing_control_history(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<
+        meerkat_core::session::model_routing_control::SessionModelRoutingControlHistory,
+        RuntimeDriverError,
+    > {
+        self.service
+            .live_model_routing_control_history(session_id)
+            .await
+            .map_err(session_error_to_runtime_driver)
+    }
+
+    async fn append_live_session_model_routing_control_record(
+        &self,
+        session_id: &SessionId,
+        record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
+    ) -> Result<
+        meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
+        RuntimeDriverError,
+    > {
+        self.service
+            .append_live_model_routing_control_record_under_runtime_turn_boundary(
+                session_id, record,
+            )
+            .await
+            .map_err(session_error_to_runtime_driver)
+    }
 }
 
 #[cfg(test)]
@@ -1087,6 +1220,27 @@ mod tests {
             _session_id: &SessionId,
         ) -> Result<(), SessionError> {
             unreachable!("realm selection does not discard")
+        }
+
+        async fn live_model_routing_control_history(
+            &self,
+            _session_id: &SessionId,
+        ) -> Result<
+            meerkat_core::session::model_routing_control::SessionModelRoutingControlHistory,
+            SessionError,
+        > {
+            unreachable!("realm selection does not read the handoff log")
+        }
+
+        async fn append_live_model_routing_control_record_under_runtime_turn_boundary(
+            &self,
+            _session_id: &SessionId,
+            _record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
+        ) -> Result<
+            meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
+            SessionError,
+        > {
+            unreachable!("realm selection does not record handoff resolutions")
         }
     }
 

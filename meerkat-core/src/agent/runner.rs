@@ -2104,6 +2104,7 @@ where
         self.terminal_error_metadata = None;
         self.run_completed_hooks_applied = false;
         self.run_completed_event_emitted = false;
+        self.clear_staged_model_routing_handoff();
 
         // Apply canonical per-turn skill references staged by the surface.
         // Resolved activations travel as typed `SkillContext` blocks prepended
@@ -2344,6 +2345,7 @@ where
         self.terminal_error_metadata = None;
         self.run_completed_hooks_applied = false;
         self.run_completed_event_emitted = false;
+        self.clear_staged_model_routing_handoff();
 
         // Run-start hooks own the start veto on the pending-continuation path
         // too: they must run — and be able to deny — BEFORE we publish
@@ -2630,6 +2632,10 @@ impl Agent<dyn AgentLlmClient, dyn AgentToolDispatcher, dyn AgentSessionStore> {
             transient_turn_context_state: crate::session::TransientTurnContextStateHandle::new(),
             default_event_tx: None,
             checkpointer: None,
+            // An isolated operation agent runs on a disposable session
+            // snapshot with no checkpointer, so it can neither be told to
+            // stage a permanent routing handoff nor commit one.
+            model_routing_handoff_staging: None,
             latest_run_checkpoint_receipt: None,
             blob_store: self.blob_store.clone(),
             terminal_error_detail: None,

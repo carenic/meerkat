@@ -187,6 +187,72 @@ pub struct SwitchTurnRequest {
     pub approval_reason: Option<SwitchTurnApprovalReason>,
 }
 
+/// One committed cross-run routing request, as read back from the durable
+/// append-only handoff log.
+///
+/// Carries the exact request identity, the exact originating run, and the full
+/// typed intent, because every generated lifecycle arm is keyed on all three.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedModelRoutingHandoff {
+    pub request_id: SwitchTurnRequestId,
+    pub originating_run_id: meerkat_core::lifecycle::RunId,
+    pub intent: SwitchTurnIntent,
+}
+
+/// Why a committed handoff could not be realized on this pass.
+///
+/// Every variant leaves the request pending in the durable log: a hold is not
+/// a decision, and the next pass retries. Denial is a separate, terminal
+/// outcome and is never reached through this type.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ModelRoutingHandoffHoldReason {
+    /// The originating run has no committed boundary receipt yet, so the
+    /// request is not actionable. Realizing here would let a run that never
+    /// committed redirect the session.
+    #[error("originating run {run_id} has no committed boundary receipt")]
+    OriginatingBoundaryUncommitted {
+        run_id: meerkat_core::lifecycle::RunId,
+    },
+    /// The target could not be resolved to a usable identity right now, most
+    /// commonly because the model is unavailable to this session's
+    /// credentials. The input stays unattempted rather than being served by
+    /// the identity the request asked to leave.
+    #[error("target model '{target_model}' is not resolvable for this session: {detail}")]
+    TargetUnresolvable {
+        target_model: meerkat_core::lifecycle::run_primitive::ModelId,
+        detail: String,
+    },
+}
+
+/// The outcome of one attempt to realize a committed handoff.
+///
+/// Deliberately NOT `#[non_exhaustive]`: realized, already-exact, held, and
+/// denied is the complete space, and every caller must decide explicitly
+/// whether the pending input may now be admitted. A wildcard arm would let a
+/// future outcome inherit whichever branch happened to be the fallback, which
+/// for this decision means admitting work under the wrong identity.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModelRoutingHandoffRealization {
+    /// The switch was applied and the durable `Realized` record was written
+    /// before this returned.
+    Realized {
+        applied_identity: Box<meerkat_core::SessionLlmIdentity>,
+    },
+    /// Machine authority already holds this exact request as realized; the
+    /// durable log already agrees. Nothing was rotated a second time.
+    AlreadyExact,
+    /// The request remains pending and the next input must not be admitted
+    /// under the old identity assumption.
+    Held {
+        reason: ModelRoutingHandoffHoldReason,
+    },
+    /// The request was refused at its decision point and terminalized.
+    Denied {
+        reason: meerkat_core::image_generation::SwitchTurnDenialReason,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageOperationRoutingRequest {
     pub operation_id: ImageOperationId,
@@ -254,6 +320,46 @@ pub trait SessionLlmReconfigureHost: Send + Sync {
 
     /// Caller must hold the turn-finalization boundary.
     async fn persist_live_session(&self, session_id: &SessionId) -> Result<(), RuntimeDriverError>;
+
+    /// Read the committed append-only model-routing handoff log.
+    ///
+    /// Runtime-backed hosts must implement this: without it a committed
+    /// request is invisible to the realization seam, which is silently
+    /// equivalent to dropping it. The default is a typed refusal rather than
+    /// an empty history, so an unimplemented host holds instead of pretending
+    /// nothing was ever requested.
+    ///
+    /// Caller must hold the turn-finalization boundary.
+    async fn load_live_session_model_routing_control_history(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<
+        meerkat_core::session::model_routing_control::SessionModelRoutingControlHistory,
+        RuntimeDriverError,
+    > {
+        Err(RuntimeDriverError::Internal(
+            "session llm reconfigure host does not expose the model-routing handoff log"
+                .to_string(),
+        ))
+    }
+
+    /// Append one record to the committed handoff log and leave it staged on
+    /// the live session for the caller's subsequent persist.
+    ///
+    /// Caller must hold the turn-finalization boundary.
+    async fn append_live_session_model_routing_control_record(
+        &self,
+        _session_id: &SessionId,
+        _record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
+    ) -> Result<
+        meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
+        RuntimeDriverError,
+    > {
+        Err(RuntimeDriverError::Internal(
+            "session llm reconfigure host cannot record model-routing handoff resolutions"
+                .to_string(),
+        ))
+    }
 
     /// Caller must hold the turn-finalization boundary.
     async fn discard_live_session(&self, session_id: &SessionId) -> Result<(), RuntimeDriverError>;
@@ -470,6 +576,24 @@ pub(crate) enum MeerkatMachineCommand {
     AdmitModelRoutingAssistantTurn {
         session_id: SessionId,
     },
+    /// Realize one committed cross-run routing handoff while the caller
+    /// already holds this session's turn-finalization boundary.
+    ///
+    /// This is one command rather than five because the sequence — verify the
+    /// originating boundary receipt, import, claim, resolve, switch, record,
+    /// terminalize — has no safe intermediate resting point. A caller able to
+    /// stop halfway could leave the machine claiming a request the durable log
+    /// never learned about.
+    RealizeCommittedModelRoutingHandoff {
+        session_id: SessionId,
+        handoff: Box<CommittedModelRoutingHandoff>,
+    },
+    /// Resolve every still-pending committed handoff as archived because the
+    /// session reached lifecycle terminality.
+    ArchiveUnresolvedModelRoutingHandoffs {
+        session_id: SessionId,
+        request_ids: Vec<SwitchTurnRequestId>,
+    },
     BeginImageOperation {
         session_id: SessionId,
         request: Box<ImageOperationRoutingRequest>,
@@ -579,6 +703,7 @@ pub(crate) enum MeerkatMachineCommandResult {
     ResolvedSessionLlmCapabilities(Option<SessionLlmCapabilitySurface>),
     SessionModelRoutingStatus(SessionModelRoutingStatus),
     SwitchTurnControlResult(SwitchTurnControlResult),
+    ModelRoutingHandoffRealization(Box<ModelRoutingHandoffRealization>),
     ImageOperationRoutingResult(ImageOperationRoutingResult),
     ImageOperationPhase(ImageOperationPhase),
     ImageOperationTerminalClass(ImageOperationTerminalClass),
@@ -1581,6 +1706,11 @@ pub enum MeerkatMachineCatalogInput {
     RequestFiniteSwitchTurn,
     RequestUntilChangedSwitchTurn,
     AdmitModelRoutingAssistantTurn,
+    ImportCommittedModelRoutingHandoff,
+    ClaimModelRoutingHandoff,
+    RealizeModelRoutingHandoff,
+    DenyModelRoutingHandoff,
+    ArchiveUnresolvedModelRoutingHandoff,
     BeginImageOperation,
     DenyImageOperationPlan,
     ActivateImageOperationOverride,
@@ -1629,6 +1759,11 @@ impl MeerkatMachineCatalogInput {
         Self::RequestFiniteSwitchTurn,
         Self::RequestUntilChangedSwitchTurn,
         Self::AdmitModelRoutingAssistantTurn,
+        Self::ImportCommittedModelRoutingHandoff,
+        Self::ClaimModelRoutingHandoff,
+        Self::RealizeModelRoutingHandoff,
+        Self::DenyModelRoutingHandoff,
+        Self::ArchiveUnresolvedModelRoutingHandoff,
         Self::BeginImageOperation,
         Self::DenyImageOperationPlan,
         Self::ActivateImageOperationOverride,
@@ -1688,6 +1823,17 @@ impl MeerkatMachineCatalogInput {
             Self::AdmitModelRoutingAssistantTurn => {
                 MeerkatMachineInputVariant::AdmitModelRoutingAssistantTurn
             }
+            Self::ImportCommittedModelRoutingHandoff => {
+                MeerkatMachineInputVariant::ImportCommittedModelRoutingHandoff
+            }
+            Self::ClaimModelRoutingHandoff => MeerkatMachineInputVariant::ClaimModelRoutingHandoff,
+            Self::RealizeModelRoutingHandoff => {
+                MeerkatMachineInputVariant::RealizeModelRoutingHandoff
+            }
+            Self::DenyModelRoutingHandoff => MeerkatMachineInputVariant::DenyModelRoutingHandoff,
+            Self::ArchiveUnresolvedModelRoutingHandoff => {
+                MeerkatMachineInputVariant::ArchiveUnresolvedModelRoutingHandoff
+            }
             Self::BeginImageOperation => MeerkatMachineInputVariant::BeginImageOperation,
             Self::DenyImageOperationPlan => MeerkatMachineInputVariant::DenyImageOperationPlan,
             Self::ActivateImageOperationOverride => {
@@ -1744,6 +1890,11 @@ impl MeerkatMachineCatalogInput {
             Self::RequestFiniteSwitchTurn => "RequestFiniteSwitchTurn",
             Self::RequestUntilChangedSwitchTurn => "RequestUntilChangedSwitchTurn",
             Self::AdmitModelRoutingAssistantTurn => "AdmitModelRoutingAssistantTurn",
+            Self::ImportCommittedModelRoutingHandoff => "ImportCommittedModelRoutingHandoff",
+            Self::ClaimModelRoutingHandoff => "ClaimModelRoutingHandoff",
+            Self::RealizeModelRoutingHandoff => "RealizeModelRoutingHandoff",
+            Self::DenyModelRoutingHandoff => "DenyModelRoutingHandoff",
+            Self::ArchiveUnresolvedModelRoutingHandoff => "ArchiveUnresolvedModelRoutingHandoff",
             Self::BeginImageOperation => "BeginImageOperation",
             Self::DenyImageOperationPlan => "DenyImageOperationPlan",
             Self::ActivateImageOperationOverride => "ActivateImageOperationOverride",
@@ -1816,6 +1967,10 @@ impl MeerkatMachineCommandVariant {
             Self::AdmitModelRoutingAssistantTurn => {
                 Some(MeerkatMachineCatalogInput::AdmitModelRoutingAssistantTurn)
             }
+            // Both handoff commands drive several catalog inputs as one
+            // sequence, so neither IS a single catalog input.
+            Self::RealizeCommittedModelRoutingHandoff
+            | Self::ArchiveUnresolvedModelRoutingHandoffs => None,
             Self::BeginImageOperation => Some(MeerkatMachineCatalogInput::BeginImageOperation),
             Self::DenyImageOperationPlan => {
                 Some(MeerkatMachineCatalogInput::DenyImageOperationPlan)
@@ -2052,6 +2207,26 @@ const fn meerkat_machine_command_classification(
             MeerkatMachineCommandClassification::CatalogInput(
                 MeerkatMachineCatalogInput::AdmitModelRoutingAssistantTurn,
             )
+        }
+        // Realization drives the whole committed-handoff lifecycle plus the
+        // until-changed switch chain it applies, so it classifies to every
+        // catalog input it can reach — including the denial arm, which is the
+        // terminal outcome when the switch itself is refused.
+        MeerkatMachineCommandVariant::RealizeCommittedModelRoutingHandoff => {
+            MeerkatMachineCommandClassification::CatalogInputs(&[
+                MeerkatMachineCatalogInput::ImportCommittedModelRoutingHandoff,
+                MeerkatMachineCatalogInput::ClaimModelRoutingHandoff,
+                MeerkatMachineCatalogInput::RealizeModelRoutingHandoff,
+                MeerkatMachineCatalogInput::DenyModelRoutingHandoff,
+                MeerkatMachineCatalogInput::RequestUntilChangedSwitchTurn,
+                MeerkatMachineCatalogInput::SetModelRoutingBaseline,
+            ])
+        }
+        MeerkatMachineCommandVariant::ArchiveUnresolvedModelRoutingHandoffs => {
+            MeerkatMachineCommandClassification::CatalogInputs(&[
+                MeerkatMachineCatalogInput::ImportCommittedModelRoutingHandoff,
+                MeerkatMachineCatalogInput::ArchiveUnresolvedModelRoutingHandoff,
+            ])
         }
         MeerkatMachineCommandVariant::BeginImageOperation => {
             MeerkatMachineCommandClassification::CatalogInput(

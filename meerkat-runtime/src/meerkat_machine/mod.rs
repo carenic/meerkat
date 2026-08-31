@@ -9565,6 +9565,8 @@ impl MeerkatMachine {
                 | MeerkatMachineCommand::ConfigureModelRoutingBaseline { .. }
                 | MeerkatMachineCommand::SessionModelRoutingStatus { .. }
                 | MeerkatMachineCommand::RequestSwitchTurn { .. }
+                | MeerkatMachineCommand::RealizeCommittedModelRoutingHandoff { .. }
+                | MeerkatMachineCommand::ArchiveUnresolvedModelRoutingHandoffs { .. }
                 | MeerkatMachineCommand::AdmitModelRoutingAssistantTurn { .. }
                 | MeerkatMachineCommand::BeginImageOperation { .. }
                 | MeerkatMachineCommand::DenyImageOperationPlan { .. }

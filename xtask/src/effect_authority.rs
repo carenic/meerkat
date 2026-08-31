@@ -191,6 +191,7 @@ const CORE_EXECUTOR_PURE_FORWARD_METHODS: &[&str] = &[
     "interrupt_handle",
     "publication_handle",
     "turn_finalization_boundary_handle",
+    "pre_dequeue_handle",
     "apply",
     "checkpoint_committed_session_snapshot",
     "acknowledge_committed_session_boundary",

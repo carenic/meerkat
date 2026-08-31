@@ -580,8 +580,9 @@ pub use meerkat_machine::{
     standalone_tool_visibility_owner,
 };
 pub use meerkat_machine_types::{
-    HydratedSessionLlmState, ImageOperationRoutingRequest, ImageOperationRoutingResult,
-    ModelRoutingApprovalDisposition, ModelRoutingRealtimePolicy, ResolvedSessionLlmReconfigure,
+    CommittedModelRoutingHandoff, HydratedSessionLlmState, ImageOperationRoutingRequest,
+    ImageOperationRoutingResult, ModelRoutingApprovalDisposition, ModelRoutingHandoffHoldReason,
+    ModelRoutingHandoffRealization, ModelRoutingRealtimePolicy, ResolvedSessionLlmReconfigure,
     SessionLlmCapabilitySurface, SessionLlmCapabilitySurfaceStatus, SessionLlmReconfigureHost,
     SessionLlmReconfigureReport, SessionLlmReconfigureRequest, SessionToolVisibilityDelta,
 };

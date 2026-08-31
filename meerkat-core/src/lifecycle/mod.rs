@@ -23,9 +23,10 @@ pub use core_executor::{
     CommittedSessionBoundaryAuthority, CoreApplyFailureCause, CoreApplyFailureCauseKind,
     CoreBoundaryStageError, CoreBoundaryStageOutput, CoreControlFailureCause,
     CoreControlFailureCauseKind, CoreExecutor, CoreExecutorBoundaryHandle, CoreExecutorError,
-    CoreExecutorInterruptHandle, CoreExecutorPostStopCleanupHandle, CoreExecutorPublicationHandle,
-    CoreExecutorTeardownReason, CoreExecutorTurnFinalizationBoundaryHandle,
-    CoreExecutorTurnFinalizationGuard, CoreInteractionTerminalPublicationReceipt,
+    CoreExecutorInterruptHandle, CoreExecutorPostStopCleanupHandle, CoreExecutorPreDequeueHandle,
+    CoreExecutorPublicationHandle, CoreExecutorTeardownReason,
+    CoreExecutorTurnFinalizationBoundaryHandle, CoreExecutorTurnFinalizationGuard,
+    CoreInteractionTerminalPublicationReceipt, CorePreDequeueOutcome,
 };
 pub use identifiers::{InputId, RunId, WaitRequestId};
 pub use run_event::RunEvent;
