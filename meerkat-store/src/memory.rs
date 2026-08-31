@@ -525,6 +525,11 @@ impl MemoryStoreState {
         head: &SessionHead,
     ) -> Result<(), SessionStoreError> {
         let id = session.id();
+        meerkat_core::session_store::validate_model_routing_control_durable_transition(
+            id,
+            session.model_routing_control(),
+            Some(&head.model_routing_control),
+        )?;
         let live = session.messages();
         let prev_count = usize::try_from(head.message_count)
             .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
@@ -758,6 +763,11 @@ impl SessionStore for MemoryStore {
         let mut state = self.state.write().await;
         state.stats.whole_blob_saves += 1;
         if let Some(stored) = state.heads.get(session.id()).cloned() {
+            meerkat_core::session_store::validate_model_routing_control_durable_transition(
+                session.id(),
+                session.model_routing_control(),
+                Some(&stored.0.model_routing_control),
+            )?;
             let incoming_revision = session
                 .transcript_content_digest()
                 .map_err(SessionStoreError::from)?;
@@ -824,6 +834,12 @@ impl SessionStore for MemoryStore {
         if let Some((head, _token)) = state.heads.get(session.id()).cloned() {
             return state.write_head_canonical_session(session, &head);
         }
+        let previous = state.sessions.get(session.id());
+        meerkat_core::session_store::validate_model_routing_control_durable_transition(
+            session.id(),
+            session.model_routing_control(),
+            previous.map(Session::model_routing_control),
+        )?;
         state.sessions.insert(session.id().clone(), session.clone());
         Ok(())
     }

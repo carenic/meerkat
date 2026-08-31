@@ -95,10 +95,9 @@ impl EphemeralSessionStore {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl SessionStore for EphemeralSessionStore {
     async fn save(&self, session: &Session) -> Result<(), meerkat_store::SessionStoreError> {
-        self.sessions
-            .write()
-            .await
-            .insert(session.id().clone(), session.clone());
+        let mut sessions = self.sessions.write().await;
+        meerkat_core::session_store::append_only_save_guard(session, sessions.get(session.id()))?;
+        sessions.insert(session.id().clone(), session.clone());
         Ok(())
     }
 

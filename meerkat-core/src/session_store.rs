@@ -287,6 +287,11 @@ pub fn append_only_save_guard_with_witness(
             "incoming",
         )?;
     }
+    validate_model_routing_control_durable_transition(
+        incoming.id(),
+        incoming.model_routing_control(),
+        previous.map(Session::model_routing_control),
+    )?;
 
     let Some(previous) = previous else {
         if incoming_state.is_some() {
@@ -312,11 +317,6 @@ pub fn append_only_save_guard_with_witness(
             reason: format!("previous transcript history state is malformed: {err}"),
         }
     })?;
-    validate_model_routing_control_transition(
-        incoming.id(),
-        incoming.model_routing_control(),
-        previous.model_routing_control(),
-    )?;
     let incoming_has_history = incoming_state.is_some();
     if previous_state.is_some() && !incoming_has_history {
         return Err(SessionStoreError::InvalidTranscriptRewrite {
@@ -491,6 +491,11 @@ pub fn authoritative_projection_current_revision_guard(
     previous: Option<&Session>,
     expected_current_revision: Option<&str>,
 ) -> Result<(), SessionStoreError> {
+    validate_model_routing_control_durable_transition(
+        incoming.id(),
+        incoming.model_routing_control(),
+        previous.map(Session::model_routing_control),
+    )?;
     let previous_token = previous.map(session_projection_cas_token).transpose()?;
     if previous_token.as_deref() == expected_current_revision {
         return Ok(());
@@ -1138,10 +1143,10 @@ pub fn transcript_rewrite_save_guard(
             ),
         });
     }
-    validate_model_routing_control_transition(
+    validate_model_routing_control_durable_transition(
         incoming.id(),
         incoming.model_routing_control(),
-        previous.model_routing_control(),
+        Some(previous.model_routing_control()),
     )?;
     let previous_revision = previous.transcript_revision().map_err(|err| {
         SessionStoreError::InvalidTranscriptRewrite {
@@ -1312,14 +1317,17 @@ pub trait SessionStore: Send + Sync {
     ///
     /// Implementations MUST reject a save whose message history is
     /// shorter than the previously persisted row for the same `SessionId`
-    /// — see the trait-level doc on the append-only contract.
+    /// — see the trait-level doc on the append-only contract. Every write path
+    /// must also call [`validate_model_routing_control_durable_transition`] so a
+    /// stale writer cannot drop or resurrect committed routing-control records.
     async fn save(&self, session: &Session) -> Result<(), SessionStoreError>;
 
     /// Save a same-SessionId transcript rewrite.
     ///
     /// This is the only `SessionStore` path allowed to replace or shrink the
     /// current message projection. Implementations must validate `commit`
-    /// against the previously persisted head before writing `session`.
+    /// against the previously persisted head before writing `session`, while
+    /// still preserving the committed model-routing control history.
     async fn save_transcript_rewrite(
         &self,
         session: &Session,
@@ -1338,7 +1346,8 @@ pub trait SessionStore: Send + Sync {
     /// has already accepted the semantic mutation, and the `SessionStore` row is
     /// a rebuildable projection. Normal callers must use [`SessionStore::save`]
     /// or [`SessionStore::save_transcript_rewrite`] so the store boundary keeps
-    /// enforcing append-only/CAS semantics.
+    /// enforcing append-only/CAS semantics. Projection status does not authorize
+    /// replacing the Session-owned model-routing control history.
     async fn save_authoritative_projection(
         &self,
         session: &Session,
@@ -3342,6 +3351,25 @@ impl PreparedHeadCanonicalMutation {
         observed_head: Option<SessionHead>,
     ) -> Result<Self, SessionStoreError> {
         let id = session.id().clone();
+        if let Some(head) = observed_head.as_ref()
+            && &head.id != session.id()
+        {
+            return Err(SessionStoreError::InvalidTranscriptRewrite {
+                id,
+                reason: format!(
+                    "observed head belongs to session {}, not {}",
+                    head.id,
+                    session.id()
+                ),
+            });
+        }
+        validate_model_routing_control_durable_transition(
+            session.id(),
+            session.model_routing_control(),
+            observed_head
+                .as_ref()
+                .map(|head| &head.model_routing_control),
+        )?;
         let realtime_suffix =
             session
                 .prepare_realtime_component_event_suffix()
@@ -3363,24 +3391,6 @@ impl PreparedHeadCanonicalMutation {
             observed_head.as_ref()
         {
             validate_session_head_component_roots(head)?;
-            if &head.id != session.id() {
-                return Err(SessionStoreError::InvalidTranscriptRewrite {
-                    id,
-                    reason: format!(
-                        "observed head belongs to session {}, not {}",
-                        head.id,
-                        session.id()
-                    ),
-                });
-            }
-            // Defense in depth: the prepared head-canonical mutation derives a
-            // successor from the live session, so it must also refuse a
-            // successor whose handoff log does not extend the observed head's.
-            validate_model_routing_control_transition(
-                session.id(),
-                session.model_routing_control(),
-                &head.model_routing_control,
-            )?;
             if head.realtime_event_prefix.as_ref() != Some(&acknowledged_realtime) {
                 return Err(SessionStoreError::TranscriptContinuityViolation {
                     id: session.id().clone(),
@@ -3712,6 +3722,7 @@ impl PreparedHeadCanonicalMutation {
             || session.created_at() != self.successor_head.created_at
             || session.updated_at() != self.successor_head.updated_at
             || session.total_usage() != self.successor_head.usage
+            || session.model_routing_control() != &self.successor_head.model_routing_control
         {
             return Err(invalid(
                 "live Session envelope changed after prepared successor was sealed".to_string(),
@@ -4283,6 +4294,11 @@ impl PreparedHeadCanonicalRewriteMutation {
                 reason: "observed rewrite head belongs to another session".to_string(),
             });
         }
+        validate_model_routing_control_durable_transition(
+            session.id(),
+            session.model_routing_control(),
+            Some(&observed_head.model_routing_control),
+        )?;
         let observed_message_prefix =
             observed_head.message_row_prefix.as_ref().ok_or_else(|| {
                 SessionStoreError::InvalidTranscriptRewrite {
@@ -5392,10 +5408,10 @@ pub fn head_canonical_plain_save_guard_with_prefix_witness(
     if stored_rewrite_prefix.occurrence_count() != stored_rewrite_count {
         return Err(SessionStoreError::Corrupted(incoming.id().clone()));
     }
-    validate_model_routing_control_transition(
+    validate_model_routing_control_durable_transition(
         incoming.id(),
         incoming.model_routing_control(),
-        previous_slim.model_routing_control(),
+        Some(previous_slim.model_routing_control()),
     )?;
     incoming
         .validate_transcript_history_state()
@@ -5471,20 +5487,28 @@ pub fn head_canonical_plain_save_guard_with_prefix_witness(
     })
 }
 
-/// Refuse a durable transition that does not extend the committed
-/// model-routing handoff log.
+/// Validate one durable model-routing control-history transition.
 ///
-/// The in-memory history enforces append-only within one document, but nothing
-/// stopped a stale writer from presenting a session or head built from an older
-/// materialization. That silently DROPPED a durably committed owed handoff, and
-/// symmetrically RESURRECTED a settled one — which would let the pre-admission
-/// seam rotate the model a second time for an already-applied request. The
-/// committed log is durable authority, so a successor must extend it.
-fn validate_model_routing_control_transition(
+/// Every session/head write path uses this guard. The incoming history must be
+/// coherent even on first save; when a committed predecessor exists, the
+/// incoming history must also preserve its exact prefix.
+pub fn validate_model_routing_control_durable_transition(
     id: &SessionId,
     incoming: &crate::session::model_routing_control::SessionModelRoutingControlHistory,
-    committed: &crate::session::model_routing_control::SessionModelRoutingControlHistory,
+    committed: Option<&crate::session::model_routing_control::SessionModelRoutingControlHistory>,
 ) -> Result<(), SessionStoreError> {
+    incoming
+        .validate_coherent()
+        .map_err(|error| SessionStoreError::InvalidTranscriptRewrite {
+            id: id.clone(),
+            reason: format!("incoming model-routing control history is incoherent: {error}"),
+        })?;
+    let Some(committed) = committed else {
+        return Ok(());
+    };
+    committed
+        .validate_coherent()
+        .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
     if incoming.extends(committed) {
         return Ok(());
     }
@@ -5497,17 +5521,6 @@ fn validate_model_routing_control_transition(
             incoming.len()
         ),
     })
-}
-
-fn validate_model_routing_control_extension(
-    head: &SessionHead,
-    stored_head: &SessionHead,
-) -> Result<(), SessionStoreError> {
-    validate_model_routing_control_transition(
-        &head.id,
-        &head.model_routing_control,
-        &stored_head.model_routing_control,
-    )
 }
 
 /// Shared `save_head` transition validator so guard semantics stay uniform
@@ -5524,6 +5537,11 @@ pub fn validate_save_head_transition(
     recorded_rewrites: u64,
 ) -> Result<(), SessionStoreError> {
     validate_session_head_storage_representation(head)?;
+    validate_model_routing_control_durable_transition(
+        &head.id,
+        &head.model_routing_control,
+        stored.map(|(stored_head, _)| &stored_head.model_routing_control),
+    )?;
     if session_head_has_component_roots(head) {
         return Err(SessionStoreError::InvalidTranscriptRewrite {
             id: head.id.clone(),
@@ -5612,7 +5630,6 @@ pub fn validate_save_head_transition(
     if let Some((stored_head, _)) = stored {
         validate_session_head_component_roots(stored_head)?;
         validate_session_head_metadata_identity(stored_head)?;
-        validate_model_routing_control_extension(head, stored_head)?;
         if stored_head.metadata_identity.is_some() && !session_head_has_component_roots(stored_head)
         {
             return Err(SessionStoreError::Corrupted(stored_head.id.clone()));
@@ -9422,8 +9439,12 @@ mod tests {
             // A stale writer presents a head built before the handoff was
             // committed. Dropping it would lose a durable obligation.
             let stale = head_canonical_head(&base_session());
-            let error = validate_model_routing_control_extension(&stale, &stored)
-                .expect_err("a shrinking handoff log must be refused");
+            let error = validate_model_routing_control_durable_transition(
+                &stale.id,
+                &stale.model_routing_control,
+                Some(&stored.model_routing_control),
+            )
+            .expect_err("a shrinking handoff log must be refused");
             assert!(
                 matches!(error, SessionStoreError::InvalidTranscriptRewrite { .. }),
                 "expected InvalidTranscriptRewrite, got {error:?}"
@@ -9435,8 +9456,12 @@ mod tests {
                 .append_model_routing_control_record(owed_handoff("gpt-5.5"))
                 .expect("second request appends");
             let extended = head_canonical_head(&extended_session);
-            validate_model_routing_control_extension(&extended, &stored)
-                .expect("adding a record is a legal extension");
+            validate_model_routing_control_durable_transition(
+                &extended.id,
+                &extended.model_routing_control,
+                Some(&stored.model_routing_control),
+            )
+            .expect("adding a record is a legal extension");
         }
     }
 }

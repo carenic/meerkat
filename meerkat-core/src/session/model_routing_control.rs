@@ -23,13 +23,17 @@
 //! does the committed log literally say", which is why they are named for
 //! records rather than for lifecycle status.
 //!
+//! Archive terminality is deliberately absent. It is generated status owned by
+//! the session-document lifecycle, not a Session-log record or a caller-held
+//! capability.
+//!
 //! # Vocabulary
 //!
 //! The *intent* vocabulary is not new: a committed record carries the existing
 //! [`SwitchTurnRequestId`] and [`SwitchTurnIntent`], so the durable log and the
 //! live switch-turn control surface cannot drift into two dialects for one
 //! fact. The only nouns minted here are the durable record, its history, its
-//! record-level disposition, and the abandon reason — none of which existed.
+//! record-level disposition, and the append outcome/error.
 //!
 //! These nouns must never be conflated with input-lifecycle vocabulary: a
 //! routing intent survives across runs and is carried by the session document,
@@ -46,7 +50,7 @@
 //!   that owes no handoff is byte-identical to one written before this existed.
 //!   No released `Session` is rewritten, no importer is needed, and
 //!   `SESSION_VERSION` stays 3.
-//! * **(b) an exact v3 → v4 importer.** Rejected. Doctrine currently sanctions
+//! * **(b) an exact v3 to v4 importer.** Rejected. Doctrine currently sanctions
 //!   exactly one historical importer (the frozen released-0.8.10 lane), and a
 //!   second one would have to re-derive every `HeadCanonical` head token to
 //!   restamp the version. That is a whole-corpus rewrite bought for a property
@@ -70,137 +74,33 @@
 //!   preimage, so a stripped or tampered head no longer re-derives its stored
 //!   token and reads fail closed as `Corrupted`. That binding is therefore
 //!   load-bearing, not decorative.
+//! * **History decode** — deserialization routes through [`Self::from_records`],
+//!   so duplicate, orphaned, resurrected, or scoped records fail closed in
+//!   every embedding carrier, including `SessionHead`.
 //! * **Durable save transition** — the committed log is append-only across
-//!   saves, enforced by a prefix-extension check in every guard that accepts a
-//!   whole `Session` or a successor head: the plain append-only guard, the
-//!   transcript-rewrite guard, and both head-canonical guards. That covers the
-//!   WholeBlob and head-canonical lanes on every store. Without it a stale
-//!   writer silently drops an owed handoff, or resurrects a settled one and
-//!   causes a second model rotation.
+//!   saves, enforced by one successor-coherence plus prefix-extension guard in
+//!   every whole-session and head-canonical write path. Prefix alone is not
+//!   enough: `Requested, Realized, Requested` still extends the first two bytes
+//!   conceptually, but resurrects a settled request.
 //!
 //! # Deliberately deferred (named, not silent)
 //!
-//! * Wiring [`SessionArchiveControlTerminalizationAuthorization::authorize_session_archive`]
-//!   into the archive realization path is Phase 2 work; this module ships the
-//!   decision seam only.
+//! * Archive/destroy terminality is generated status in a later phase. Nothing
+//!   in Phase 0 mutates this log at a session boundary.
 //! * The claim/pending lifecycle (a request that generated authority has
 //!   claimed but not yet realized) is NOT represented here. It is machine
 //!   state, not durable document state, and lands with the generated
 //!   model-routing lifecycle in Phase 1.
 
-use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::generated::session_document;
+use serde::{Deserialize, Deserializer, Serialize};
+
 use crate::image_generation::{
     SwitchTurnDenialReason, SwitchTurnDuration, SwitchTurnIntent, SwitchTurnOrigin,
     SwitchTurnRequestId,
 };
 use crate::lifecycle::identifiers::RunId;
-
-/// Why a committed routing intent was terminalized without a decision.
-///
-/// Abandonment is the authoritative session-boundary path: the boundary that
-/// ends the document's life also ends any handoff it still owes. Ordinary
-/// graceful teardown is deliberately not a reason — a process exit does not
-/// settle an owed handoff.
-///
-/// Deliberately NOT `Default`: an abandon reason must always be produced by the
-/// boundary that actually terminalized the document, never defaulted into
-/// existence by a caller assembling a record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum ModelRoutingIntentAbandonReason {
-    /// The authoritative archive boundary terminalized the document.
-    SessionArchived,
-}
-
-/// Machine-minted permission to terminalize owed handoffs at a session
-/// boundary.
-///
-/// Opaque and deliberately NOT `Clone`: it is a capability, not a value. The
-/// only way to obtain one is
-/// [`Self::authorize_session_archive`], which actually invokes the generated
-/// `SessionDocumentMachineAuthority` and classifies the verdict it emits. A
-/// public effect literal is explicitly NOT accepted as capability, because a
-/// generated effect enum is constructible from any crate and would make the
-/// seal decorative.
-#[derive(Debug)]
-pub struct SessionArchiveControlTerminalizationAuthorization {
-    document: session_document::SessionDocumentKey,
-    reason: ModelRoutingIntentAbandonReason,
-}
-
-impl SessionArchiveControlTerminalizationAuthorization {
-    /// Drive the generated session-document archive decision and mint
-    /// terminalization authority iff the machine itself authorizes an archive
-    /// that rewrites the durable document.
-    ///
-    /// This applies the input to the real generated authority, so the verdict
-    /// cannot be forged: a caller who has not driven the machine to an
-    /// `Archive` verdict has nothing to hand us. An `AlreadyArchived` verdict,
-    /// or an archive that does not rewrite the document, terminalizes nothing —
-    /// the record either already landed with the first archive commit or there
-    /// is no document to append to.
-    ///
-    /// The emitted effects are returned so the caller still realizes the rest
-    /// of the archive; this is a decision seam, not a second archive owner.
-    pub fn authorize_session_archive(
-        authority: &mut session_document::SessionDocumentMachineAuthority,
-        session_id: session_document::SessionDocumentKey,
-        runtime_backed: bool,
-        durable_document_present: bool,
-        runtime_observation: session_document::SessionArchiveRuntimeObservation,
-    ) -> Result<
-        (Vec<session_document::SessionDocumentEffect>, Option<Self>),
-        session_document::SessionDocumentError,
-    > {
-        let effects = authority.archive_session_document(
-            session_id.clone(),
-            runtime_backed,
-            durable_document_present,
-            runtime_observation,
-        )?;
-        let authorization = effects
-            .iter()
-            .find_map(|effect| Self::from_machine_effect(&session_id, effect));
-        Ok((effects, authorization))
-    }
-
-    /// Recognize a machine-emitted archive verdict that authorizes
-    /// terminalization of `document`.
-    ///
-    /// Crate-private on purpose: the public door is
-    /// [`Self::authorize_session_archive`], which produces the effect by
-    /// driving the machine. A foreign crate cannot reach this with a literal.
-    pub(crate) fn from_machine_effect(
-        document: &session_document::SessionDocumentKey,
-        effect: &session_document::SessionDocumentEffect,
-    ) -> Option<Self> {
-        match effect {
-            session_document::SessionDocumentEffect::SessionArchiveResolved {
-                disposition: session_document::SessionArchiveDisposition::Archive,
-                write_document: true,
-                ..
-            } => Some(Self {
-                document: document.clone(),
-                reason: ModelRoutingIntentAbandonReason::SessionArchived,
-            }),
-            _ => None,
-        }
-    }
-
-    /// The exact document this capability authorizes, and only this one.
-    #[must_use]
-    pub const fn document(&self) -> &session_document::SessionDocumentKey {
-        &self.document
-    }
-
-    #[must_use]
-    pub const fn reason(&self) -> ModelRoutingIntentAbandonReason {
-        self.reason
-    }
-}
 
 /// One durable record in the append-only model-routing control history.
 ///
@@ -240,14 +140,6 @@ pub enum SessionModelRoutingControlRecord {
         intent: SwitchTurnIntent,
         reason: SwitchTurnDenialReason,
     },
-    /// The routing change was terminalized at an authoritative session
-    /// boundary without ever reaching a decision.
-    ModelRoutingIntentAbandoned {
-        request_id: SwitchTurnRequestId,
-        originating_run_id: RunId,
-        intent: SwitchTurnIntent,
-        reason: ModelRoutingIntentAbandonReason,
-    },
 }
 
 impl SessionModelRoutingControlRecord {
@@ -276,8 +168,7 @@ impl SessionModelRoutingControlRecord {
         match self {
             Self::ModelRoutingIntentRequested { request_id, .. }
             | Self::ModelRoutingIntentRealized { request_id, .. }
-            | Self::ModelRoutingIntentDenied { request_id, .. }
-            | Self::ModelRoutingIntentAbandoned { request_id, .. } => request_id,
+            | Self::ModelRoutingIntentDenied { request_id, .. } => request_id,
         }
     }
 
@@ -292,9 +183,6 @@ impl SessionModelRoutingControlRecord {
             }
             | Self::ModelRoutingIntentDenied {
                 originating_run_id, ..
-            }
-            | Self::ModelRoutingIntentAbandoned {
-                originating_run_id, ..
             } => originating_run_id,
         }
     }
@@ -304,8 +192,7 @@ impl SessionModelRoutingControlRecord {
         match self {
             Self::ModelRoutingIntentRequested { intent, .. }
             | Self::ModelRoutingIntentRealized { intent, .. }
-            | Self::ModelRoutingIntentDenied { intent, .. }
-            | Self::ModelRoutingIntentAbandoned { intent, .. } => intent,
+            | Self::ModelRoutingIntentDenied { intent, .. } => intent,
         }
     }
 
@@ -320,9 +207,6 @@ impl SessionModelRoutingControlRecord {
                 ModelRoutingIntentRecordDisposition::Realized
             }
             Self::ModelRoutingIntentDenied { .. } => ModelRoutingIntentRecordDisposition::Denied,
-            Self::ModelRoutingIntentAbandoned { .. } => {
-                ModelRoutingIntentRecordDisposition::Abandoned
-            }
         }
     }
 }
@@ -353,8 +237,6 @@ pub enum ModelRoutingIntentRecordDisposition {
     Realized,
     /// The request was denied at its decision point.
     Denied,
-    /// The request was abandoned at an authoritative session boundary.
-    Abandoned,
 }
 
 impl ModelRoutingIntentRecordDisposition {
@@ -362,7 +244,7 @@ impl ModelRoutingIntentRecordDisposition {
     ///
     /// `Requested` is the one waiting disposition; everything else is terminal.
     /// Waiting and terminal are distinct variants rather than a boolean field so
-    /// no caller can invent a fifth "maybe done" reading.
+    /// no caller can invent another "maybe done" reading.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         !matches!(self, Self::Requested)
@@ -385,7 +267,7 @@ pub enum ModelRoutingControlAppendOutcome {
     AlreadyRecorded,
 }
 
-/// Fail-closed refusals for an incoherent append.
+/// Fail-closed refusals for an incoherent append or persisted log.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ModelRoutingControlAppendError {
@@ -407,38 +289,29 @@ pub enum ModelRoutingControlAppendError {
     /// The intent cannot be expressed as a durable cross-run handoff.
     #[error("model-routing intent {request_id:?} is not an until-changed model-origin switch")]
     UnsupportedIntent { request_id: SwitchTurnRequestId },
-    /// An abandon record was offered without boundary terminalization
-    /// authority.
-    ///
-    /// Abandonment is reachable only through
-    /// [`SessionModelRoutingControlHistory::terminalize_awaiting_for_boundary`],
-    /// which demands a machine-minted
-    /// [`SessionArchiveControlTerminalizationAuthorization`].
-    #[error(
-        "model-routing intent {request_id:?} cannot be abandoned without machine-minted boundary authority"
-    )]
-    UnauthorizedAbandon { request_id: SwitchTurnRequestId },
     /// A persisted log carried the same record twice.
     ///
     /// Silently collapsing it would make decode disagree with the bytes, so an
     /// incoherent persisted log fails closed instead of being normalized.
     #[error("persisted model-routing log carries a duplicate record for intent {request_id:?}")]
     DuplicateRecord { request_id: SwitchTurnRequestId },
-    /// Boundary terminalization authority was minted for a different document.
-    #[error(
-        "archive terminalization authority for document {authorized:?} cannot terminalize document {applied_to:?}"
-    )]
-    BoundaryAuthorizationSubjectMismatch {
-        authorized: session_document::SessionDocumentKey,
-        applied_to: session_document::SessionDocumentKey,
-    },
 }
 
 /// Ordered, append-only committed model-routing control history.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct SessionModelRoutingControlHistory {
     records: Vec<SessionModelRoutingControlRecord>,
+}
+
+impl<'de> Deserialize<'de> for SessionModelRoutingControlHistory {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let records = Vec::<SessionModelRoutingControlRecord>::deserialize(deserializer)?;
+        Self::from_records(records).map_err(serde::de::Error::custom)
+    }
 }
 
 impl SessionModelRoutingControlHistory {
@@ -478,17 +351,12 @@ impl SessionModelRoutingControlHistory {
     pub fn from_records(
         records: Vec<SessionModelRoutingControlRecord>,
     ) -> Result<Self, ModelRoutingControlAppendError> {
-        let mut history = Self::new();
-        for record in records {
-            let request_id = *record.request_id();
-            match history.append_authorized(record)? {
-                ModelRoutingControlAppendOutcome::Appended => {}
-                ModelRoutingControlAppendOutcome::AlreadyRecorded => {
-                    return Err(ModelRoutingControlAppendError::DuplicateRecord { request_id });
-                }
-            }
-        }
-        Ok(history)
+        validate_record_sequence(&records)?;
+        Ok(Self { records })
+    }
+
+    pub(crate) fn validate_coherent(&self) -> Result<(), ModelRoutingControlAppendError> {
+        validate_record_sequence(&self.records)
     }
 
     /// Whether this log is a prefix extension of `predecessor`.
@@ -531,7 +399,7 @@ impl SessionModelRoutingControlHistory {
     pub fn awaiting_decision(
         &self,
     ) -> impl Iterator<Item = &SessionModelRoutingControlRecord> + '_ {
-        let settled: std::collections::BTreeSet<&SwitchTurnRequestId> = self
+        let settled: BTreeSet<&SwitchTurnRequestId> = self
             .records
             .iter()
             .filter(|record| record.disposition().is_terminal())
@@ -546,119 +414,68 @@ impl SessionModelRoutingControlHistory {
     ///
     /// Exactly-equal duplicates are idempotent; anything that would make the
     /// committed log ambiguous is refused with a typed error.
-    ///
-    /// An `Abandoned` record is refused outright: abandonment is a session
-    /// boundary decision and is reachable only through
-    /// [`Self::terminalize_awaiting_for_boundary`], which demands machine-minted
-    /// authority. This is what makes the seal real rather than advisory — a
-    /// public enum variant is constructible from any crate, so the *append*
-    /// must be the thing that refuses it.
     pub fn append(
         &mut self,
         record: SessionModelRoutingControlRecord,
     ) -> Result<ModelRoutingControlAppendOutcome, ModelRoutingControlAppendError> {
-        if matches!(
-            record,
-            SessionModelRoutingControlRecord::ModelRoutingIntentAbandoned { .. }
-        ) {
-            return Err(ModelRoutingControlAppendError::UnauthorizedAbandon {
-                request_id: *record.request_id(),
-            });
+        let outcome =
+            classify_record_transition(self.latest_record_for(record.request_id()), &record)?;
+        if matches!(outcome, ModelRoutingControlAppendOutcome::Appended) {
+            self.records.push(record);
         }
-        self.append_authorized(record)
+        Ok(outcome)
     }
+}
 
-    /// Append one already-authorized record.
-    ///
-    /// Crate-private: the public door is [`Self::append`], which refuses
-    /// abandonment. Boundary terminalization and persisted-log revalidation are
-    /// the only callers permitted to carry an `Abandoned` record.
-    pub(crate) fn append_authorized(
-        &mut self,
-        record: SessionModelRoutingControlRecord,
-    ) -> Result<ModelRoutingControlAppendOutcome, ModelRoutingControlAppendError> {
+fn classify_record_transition(
+    previous: Option<&SessionModelRoutingControlRecord>,
+    record: &SessionModelRoutingControlRecord,
+) -> Result<ModelRoutingControlAppendOutcome, ModelRoutingControlAppendError> {
+    let request_id = *record.request_id();
+    if !intent_is_durable_handoff(record.intent()) {
+        return Err(ModelRoutingControlAppendError::UnsupportedIntent { request_id });
+    }
+    let Some(previous) = previous else {
+        if record.disposition().is_terminal() {
+            return Err(ModelRoutingControlAppendError::UnknownRequest { request_id });
+        }
+        return Ok(ModelRoutingControlAppendOutcome::Appended);
+    };
+    if previous == record {
+        return Ok(ModelRoutingControlAppendOutcome::AlreadyRecorded);
+    }
+    if previous.originating_run_id() != record.originating_run_id()
+        || previous.intent() != record.intent()
+    {
+        return Err(ModelRoutingControlAppendError::ConflictingIntent { request_id });
+    }
+    let disposition = previous.disposition();
+    if disposition.is_terminal() {
+        return Err(ModelRoutingControlAppendError::AfterTerminal {
+            request_id,
+            disposition,
+        });
+    }
+    if record.disposition().is_awaiting_decision() {
+        return Err(ModelRoutingControlAppendError::ConflictingIntent { request_id });
+    }
+    Ok(ModelRoutingControlAppendOutcome::Appended)
+}
+
+fn validate_record_sequence(
+    records: &[SessionModelRoutingControlRecord],
+) -> Result<(), ModelRoutingControlAppendError> {
+    let mut latest = BTreeMap::<SwitchTurnRequestId, &SessionModelRoutingControlRecord>::new();
+    for record in records {
         let request_id = *record.request_id();
-        if !intent_is_durable_handoff(record.intent()) {
-            return Err(ModelRoutingControlAppendError::UnsupportedIntent { request_id });
-        }
-        match self.latest_record_for(&request_id) {
-            None => {
-                if record.disposition().is_terminal() {
-                    return Err(ModelRoutingControlAppendError::UnknownRequest { request_id });
-                }
-                self.records.push(record);
-                Ok(ModelRoutingControlAppendOutcome::Appended)
+        match classify_record_transition(latest.get(&request_id).copied(), record)? {
+            ModelRoutingControlAppendOutcome::Appended => {
+                latest.insert(request_id, record);
             }
-            Some(existing) => {
-                if existing == &record {
-                    return Ok(ModelRoutingControlAppendOutcome::AlreadyRecorded);
-                }
-                if existing.originating_run_id() != record.originating_run_id()
-                    || existing.intent() != record.intent()
-                {
-                    return Err(ModelRoutingControlAppendError::ConflictingIntent { request_id });
-                }
-                let disposition = existing.disposition();
-                if disposition.is_terminal() {
-                    return Err(ModelRoutingControlAppendError::AfterTerminal {
-                        request_id,
-                        disposition,
-                    });
-                }
-                if record.disposition().is_awaiting_decision() {
-                    // Unreachable by construction: an exactly-equal request
-                    // returned above, and one differing in run or intent was
-                    // already refused as a conflict. Fail closed rather than
-                    // report a silent idempotent no-op.
-                    return Err(ModelRoutingControlAppendError::ConflictingIntent { request_id });
-                }
-                self.records.push(record);
-                Ok(ModelRoutingControlAppendOutcome::Appended)
+            ModelRoutingControlAppendOutcome::AlreadyRecorded => {
+                return Err(ModelRoutingControlAppendError::DuplicateRecord { request_id });
             }
         }
     }
-
-    /// Terminalize every still-waiting request at an authoritative session
-    /// boundary, returning the records that were appended.
-    ///
-    /// `document` is the session this history belongs to. A capability minted
-    /// by archiving some OTHER document is refused: an unforgeable capability
-    /// with no subject would still let a caller archive a throwaway document
-    /// and use the result to destroy a live session's owed handoff.
-    pub fn terminalize_awaiting_for_boundary(
-        &mut self,
-        document: &session_document::SessionDocumentKey,
-        authorization: &SessionArchiveControlTerminalizationAuthorization,
-    ) -> Result<Vec<SessionModelRoutingControlRecord>, ModelRoutingControlAppendError> {
-        if authorization.document() != document {
-            return Err(
-                ModelRoutingControlAppendError::BoundaryAuthorizationSubjectMismatch {
-                    authorized: authorization.document().clone(),
-                    applied_to: document.clone(),
-                },
-            );
-        }
-        let reason = authorization.reason();
-        let pending: Vec<SessionModelRoutingControlRecord> = self
-            .awaiting_decision()
-            .map(
-                |record| SessionModelRoutingControlRecord::ModelRoutingIntentAbandoned {
-                    request_id: *record.request_id(),
-                    originating_run_id: record.originating_run_id().clone(),
-                    intent: record.intent().clone(),
-                    reason,
-                },
-            )
-            .collect();
-        let mut appended = Vec::with_capacity(pending.len());
-        for record in pending {
-            if matches!(
-                self.append_authorized(record.clone()),
-                Ok(ModelRoutingControlAppendOutcome::Appended)
-            ) {
-                appended.push(record);
-            }
-        }
-        Ok(appended)
-    }
+    Ok(())
 }

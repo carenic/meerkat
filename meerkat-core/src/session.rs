@@ -6664,28 +6664,6 @@ impl Session {
         Ok(outcome)
     }
 
-    /// Terminalize owed handoffs at an authoritative session boundary.
-    ///
-    /// `authorization` can only be minted from the generated session-document
-    /// archive verdict, and it must have been minted for THIS session's own
-    /// document key — a capability from another document is refused.
-    pub fn terminalize_model_routing_control_for_boundary(
-        &mut self,
-        authorization: &model_routing_control::SessionArchiveControlTerminalizationAuthorization,
-    ) -> Result<
-        Vec<model_routing_control::SessionModelRoutingControlRecord>,
-        model_routing_control::ModelRoutingControlAppendError,
-    > {
-        let document = session_document::SessionDocumentKey::new(self.id.to_string());
-        let appended = self
-            .model_routing_control
-            .terminalize_awaiting_for_boundary(&document, authorization)?;
-        if !appended.is_empty() {
-            self.mark_content_mutated(SystemTime::now());
-        }
-        Ok(appended)
-    }
-
     /// Fork the session at a specific message index
     ///
     /// Creates a new session with a subset of messages. The messages are copied

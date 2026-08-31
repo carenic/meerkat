@@ -786,6 +786,15 @@ impl SessionStore for JsonlStore {
             .acquire_session_write_lock(session.id())
             .await
             .map_err(into_session_store_error)?;
+        let previous = self
+            .load_impl(session.id())
+            .await
+            .map_err(into_session_store_error)?;
+        meerkat_core::session_store::validate_model_routing_control_durable_transition(
+            session.id(),
+            session.model_routing_control(),
+            previous.as_ref().map(Session::model_routing_control),
+        )?;
         self.save_impl(session)
             .await
             .map_err(into_session_store_error)

@@ -15,8 +15,8 @@ use meerkat_core::lifecycle::identifiers::RunId;
 use meerkat_core::lifecycle::run_primitive::ModelId;
 use meerkat_core::session::model_routing_control::{
     ModelRoutingControlAppendError, ModelRoutingControlAppendOutcome,
-    ModelRoutingIntentAbandonReason, ModelRoutingIntentRecordDisposition,
-    SessionModelRoutingControlHistory, SessionModelRoutingControlRecord,
+    ModelRoutingIntentRecordDisposition, SessionModelRoutingControlHistory,
+    SessionModelRoutingControlRecord,
 };
 use meerkat_core::{Message, Session, SessionLlmIdentity, UserMessage};
 
@@ -57,6 +57,19 @@ fn requested(
         .expect("until-changed model-origin intent is a durable handoff")
 }
 
+fn realized(
+    request_id: &SwitchTurnRequestId,
+    run: &RunId,
+    model: &str,
+) -> SessionModelRoutingControlRecord {
+    SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
+        request_id: *request_id,
+        originating_run_id: run.clone(),
+        intent: intent(model),
+        applied_identity: identity(model),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Record shape and serde
 // ---------------------------------------------------------------------------
@@ -79,12 +92,6 @@ fn every_record_variant_round_trips_through_json() {
             intent: intent("claude-opus-5"),
             reason: SwitchTurnDenialReason::UnsupportedModel,
         },
-        SessionModelRoutingControlRecord::ModelRoutingIntentAbandoned {
-            request_id,
-            originating_run_id: run.clone(),
-            intent: intent("claude-opus-5"),
-            reason: ModelRoutingIntentAbandonReason::SessionArchived,
-        },
     ];
 
     for record in variants {
@@ -105,12 +112,35 @@ fn every_record_variant_round_trips_through_json() {
 
 #[test]
 fn record_tag_names_the_model_routing_domain() {
-    let record = requested(&new_request_id(), &RunId::new(), "gpt-5.5");
-    let encoded = serde_json::to_value(&record).expect("record serializes");
-    assert_eq!(
-        encoded["record"], "model_routing_intent_requested",
-        "the durable tag must name the model-routing domain, never a generic staged/applied word"
-    );
+    let request_id = new_request_id();
+    let run = RunId::new();
+    let records = [
+        (
+            requested(&request_id, &run, "gpt-5.5"),
+            "model_routing_intent_requested",
+        ),
+        (
+            realized(&request_id, &run, "gpt-5.5"),
+            "model_routing_intent_realized",
+        ),
+        (
+            SessionModelRoutingControlRecord::ModelRoutingIntentDenied {
+                request_id,
+                originating_run_id: run,
+                intent: intent("gpt-5.5"),
+                reason: SwitchTurnDenialReason::UnsupportedModel,
+            },
+            "model_routing_intent_denied",
+        ),
+    ];
+    for (record, expected_tag) in records {
+        let encoded = serde_json::to_value(&record).expect("record serializes");
+        assert_eq!(
+            encoded["record"], expected_tag,
+            "durable tags must use stable model-routing nouns"
+        );
+        assert!(encoded["record"].is_string(), "record tags are strings");
+    }
 }
 
 #[test]
@@ -120,7 +150,6 @@ fn record_disposition_distinguishes_waiting_from_terminal() {
     for terminal in [
         ModelRoutingIntentRecordDisposition::Realized,
         ModelRoutingIntentRecordDisposition::Denied,
-        ModelRoutingIntentRecordDisposition::Abandoned,
     ] {
         assert!(terminal.is_terminal(), "{terminal:?} must be terminal");
         assert!(
@@ -366,256 +395,82 @@ fn from_records_revalidates_a_persisted_log() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Archive terminalization is machine-authorized
-// ---------------------------------------------------------------------------
+fn invalid_persisted_histories() -> Vec<(&'static str, Vec<SessionModelRoutingControlRecord>)> {
+    let duplicate_id = new_request_id();
+    let duplicate_run = RunId::new();
+    let duplicate = requested(&duplicate_id, &duplicate_run, "claude-opus-5");
 
-mod archive {
-    use super::*;
-    use meerkat_core::generated::session_document::{
-        SessionArchiveRuntimeObservation, SessionDocumentKey, SessionDocumentLifecycle,
-        SessionDocumentMachineAuthority,
-    };
-    use meerkat_core::session::model_routing_control::SessionArchiveControlTerminalizationAuthorization;
+    let orphan_id = new_request_id();
+    let orphan_run = RunId::new();
 
-    /// Drive the real generated machine to an Active document, then archive it.
-    ///
-    /// Nothing here fabricates a verdict: the authorization can only come back
-    /// from the machine's own emitted effects.
-    fn archive_document(
-        key: SessionDocumentKey,
-        durable_document_present: bool,
-    ) -> Option<SessionArchiveControlTerminalizationAuthorization> {
-        let mut authority = SessionDocumentMachineAuthority::new();
-        authority
-            .recover_session_lifecycle_terminal(key.clone(), SessionDocumentLifecycle::Active)
-            .expect("seed the machine-owned lifecycle registry");
-        let (_effects, authorization) =
-            SessionArchiveControlTerminalizationAuthorization::authorize_session_archive(
-                &mut authority,
-                key,
-                false,
-                durable_document_present,
-                SessionArchiveRuntimeObservation::Absent,
-            )
-            .expect("archive decision applies");
-        authorization
-    }
+    let resurrected_id = new_request_id();
+    let resurrected_run = RunId::new();
 
-    /// Archive the document a `Session` actually is.
-    fn archive_session_document(
-        session: &Session,
-        durable_document_present: bool,
-    ) -> Option<SessionArchiveControlTerminalizationAuthorization> {
-        archive_document(
-            SessionDocumentKey::new(session.id().to_string()),
-            durable_document_present,
-        )
-    }
-
-    /// Archive a document the machine already considers Archived.
-    fn archive_already_archived_document()
-    -> Option<SessionArchiveControlTerminalizationAuthorization> {
-        let mut authority = SessionDocumentMachineAuthority::new();
-        let key = SessionDocumentKey::new("session-already-archived");
-        authority
-            .recover_session_lifecycle_terminal(key.clone(), SessionDocumentLifecycle::Archived)
-            .expect("seed the machine-owned lifecycle registry");
-        let (_effects, authorization) =
-            SessionArchiveControlTerminalizationAuthorization::authorize_session_archive(
-                &mut authority,
-                key,
-                false,
-                true,
-                SessionArchiveRuntimeObservation::Absent,
-            )
-            .expect("archive decision applies");
-        authorization
-    }
-
-    #[test]
-    fn the_machine_mints_terminalization_only_for_a_document_writing_archive() {
-        assert!(
-            archive_document(SessionDocumentKey::new("session-under-archive"), true).is_some(),
-            "a document-writing archive verdict authorizes terminalization"
-        );
-        assert!(
-            archive_document(SessionDocumentKey::new("session-under-archive"), false).is_none(),
-            "an archive that does not rewrite the document has nothing to append to"
-        );
-        assert!(
-            archive_already_archived_document().is_none(),
-            "an already-archived verdict must not authorize a second terminalization"
-        );
-    }
-
-    #[test]
-    fn an_abandon_record_cannot_be_appended_without_boundary_authority() {
-        // The abandon variant is publicly constructible — a generated/public
-        // enum always is. The seal therefore lives in the APPEND, not in the
-        // variant: this is the exact bypass a reviewer proved against an
-        // earlier draft.
-        let request_id = new_request_id();
-        let run = RunId::new();
-        let mut history = SessionModelRoutingControlHistory::new();
-        history
-            .append(requested(&request_id, &run, "claude-opus-5"))
-            .expect("request appends");
-
-        let error = history
-            .append(
-                SessionModelRoutingControlRecord::ModelRoutingIntentAbandoned {
-                    request_id,
-                    originating_run_id: run,
-                    intent: intent("claude-opus-5"),
-                    reason: ModelRoutingIntentAbandonReason::SessionArchived,
+    let scoped_id = new_request_id();
+    vec![
+        ("duplicate", vec![duplicate.clone(), duplicate]),
+        (
+            "orphan terminal",
+            vec![realized(&orphan_id, &orphan_run, "claude-opus-5")],
+        ),
+        (
+            "settled request resurrection",
+            vec![
+                requested(&resurrected_id, &resurrected_run, "claude-opus-5"),
+                realized(&resurrected_id, &resurrected_run, "claude-opus-5"),
+                requested(&resurrected_id, &resurrected_run, "claude-opus-5"),
+            ],
+        ),
+        (
+            "scoped intent",
+            vec![
+                SessionModelRoutingControlRecord::ModelRoutingIntentRequested {
+                    request_id: scoped_id,
+                    originating_run_id: RunId::new(),
+                    intent: SwitchTurnIntent {
+                        target_model: ModelId::new("claude-opus-5"),
+                        duration: SwitchTurnDuration::Finite {
+                            duration:
+                                meerkat_core::image_generation::FiniteScopedTurnDuration::OneTurn,
+                        },
+                        origin: SwitchTurnOrigin::Model {
+                            reason: SwitchTurnReasonTextDisposition::NotProvided,
+                        },
+                    },
                 },
-            )
-            .expect_err("an unauthorized abandon must be refused");
-        assert!(
-            matches!(
-                error,
-                ModelRoutingControlAppendError::UnauthorizedAbandon { .. }
-            ),
-            "expected UnauthorizedAbandon, got {error:?}"
-        );
-        assert_eq!(
-            history.disposition_of(&request_id),
-            Some(ModelRoutingIntentRecordDisposition::Requested),
-            "a refused abandon must leave the handoff owed"
-        );
+            ],
+        ),
+    ]
+}
+
+#[test]
+fn history_deserialize_refuses_every_incoherent_sequence() {
+    for (case, records) in invalid_persisted_histories() {
+        let encoded = serde_json::to_value(records).expect("records serialize");
+        let result = serde_json::from_value::<SessionModelRoutingControlHistory>(encoded);
+        assert!(result.is_err(), "{case} must fail strict history decode");
     }
+}
 
-    #[test]
-    fn the_session_boundary_method_terminalizes_every_owed_handoff() {
-        let (mut session, request_id) = session_with_owed_handoff();
-        let authorization =
-            archive_session_document(&session, true).expect("machine authorizes terminalization");
+#[test]
+fn session_head_deserialize_transitively_refuses_every_incoherent_sequence() {
+    let mut session = Session::new();
+    session.push(user_message());
+    let head = meerkat_core::session_store::SessionHead::from_session(
+        &session,
+        meerkat_core::session_store::TranscriptStrandId::root(),
+        0,
+    )
+    .expect("head projects");
 
-        let appended = session
-            .terminalize_model_routing_control_for_boundary(&authorization)
-            .expect("the capability names this document");
-        assert_eq!(appended.len(), 1, "the owed handoff must be terminalized");
-        assert_eq!(
-            session.model_routing_control().disposition_of(&request_id),
-            Some(ModelRoutingIntentRecordDisposition::Abandoned)
+    for (case, records) in invalid_persisted_histories() {
+        let mut encoded = serde_json::to_value(&head).expect("head serializes");
+        encoded.as_object_mut().expect("head is an object").insert(
+            "model_routing_control".to_string(),
+            serde_json::to_value(records).expect("records serialize"),
         );
-        assert!(
-            session
-                .model_routing_control()
-                .awaiting_decision()
-                .next()
-                .is_none(),
-            "nothing may still be awaiting a decision after the archive boundary"
-        );
-
-        // Re-running the boundary is a no-op, not a second abandon record.
-        assert!(
-            session
-                .terminalize_model_routing_control_for_boundary(&authorization)
-                .expect("the capability names this document")
-                .is_empty()
-        );
-        assert_eq!(session.model_routing_control().len(), 2);
-    }
-
-    #[test]
-    fn an_abandoned_handoff_survives_serialization() {
-        let (mut session, request_id) = session_with_owed_handoff();
-        let authorization =
-            archive_session_document(&session, true).expect("machine authorizes terminalization");
-        session
-            .terminalize_model_routing_control_for_boundary(&authorization)
-            .expect("the capability names this document");
-
-        let encoded = serde_json::to_value(&session).expect("session serializes");
-        let decoded: Session = serde_json::from_value(encoded).expect("session deserializes");
-        assert_eq!(
-            decoded.model_routing_control().disposition_of(&request_id),
-            Some(ModelRoutingIntentRecordDisposition::Abandoned),
-            "an abandoned handoff must survive the durable round-trip as terminal"
-        );
-        assert!(
-            decoded
-                .model_routing_control()
-                .awaiting_decision()
-                .next()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn a_capability_minted_for_another_document_cannot_terminalize_this_one() {
-        // The guardian's probe: mint a capability by archiving a throwaway
-        // document, then apply it to a live, never-archived session. An
-        // unforgeable capability with no SUBJECT is still an authority hole.
-        let (mut session, request_id) = session_with_owed_handoff();
-        let foreign = archive_document(
-            SessionDocumentKey::new("some-other-document-entirely"),
-            true,
-        )
-        .expect("machine authorizes terminalization of the other document");
-
-        let error = session
-            .terminalize_model_routing_control_for_boundary(&foreign)
-            .expect_err("a capability for another document must be refused");
-        assert!(
-            matches!(
-                error,
-                ModelRoutingControlAppendError::BoundaryAuthorizationSubjectMismatch { .. }
-            ),
-            "expected BoundaryAuthorizationSubjectMismatch, got {error:?}"
-        );
-        assert_eq!(
-            session.model_routing_control().disposition_of(&request_id),
-            Some(ModelRoutingIntentRecordDisposition::Requested),
-            "a refused cross-document terminalization must leave the handoff owed"
-        );
-
-        // The session's own capability still works.
-        let own =
-            archive_session_document(&session, true).expect("machine authorizes this document");
-        assert_eq!(
-            session
-                .terminalize_model_routing_control_for_boundary(&own)
-                .expect("the capability names this document")
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn the_archive_boundary_does_not_disturb_already_terminal_records() {
-        let realized_id = new_request_id();
-        let run = RunId::new();
-        let mut history = SessionModelRoutingControlHistory::new();
-        history
-            .append(requested(&realized_id, &run, "claude-opus-5"))
-            .expect("request appends");
-        history
-            .append(
-                SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
-                    request_id: realized_id,
-                    originating_run_id: run,
-                    intent: intent("claude-opus-5"),
-                    applied_identity: identity("claude-opus-5"),
-                },
-            )
-            .expect("realized appends");
-
-        let document = SessionDocumentKey::new("session-under-archive");
-        let authorization =
-            archive_document(document.clone(), true).expect("machine authorizes terminalization");
-        assert!(
-            history
-                .terminalize_awaiting_for_boundary(&document, &authorization)
-                .expect("the capability names this document")
-                .is_empty()
-        );
-        assert_eq!(
-            history.disposition_of(&realized_id),
-            Some(ModelRoutingIntentRecordDisposition::Realized)
-        );
+        let result = serde_json::from_value::<meerkat_core::session_store::SessionHead>(encoded);
+        assert!(result.is_err(), "{case} must fail SessionHead decode");
     }
 }
 
