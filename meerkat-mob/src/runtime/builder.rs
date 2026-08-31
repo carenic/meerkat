@@ -10070,6 +10070,18 @@ impl MobBuilder {
             let identity_reconcile_holder_id = format!("mob:{}", definition.id);
             let identity_reconcile_incarnation_id =
                 meerkat_core::ops::OperationId::new().to_string();
+            let recovered_member_status_observed_at_ms = dsl_authority
+                .state()
+                .member_last_observed_at_ms
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(0);
+            let (_, next_member_status_observed_at_ms) =
+                super::actor::advance_member_status_observation_clock(
+                    recovered_member_status_observed_at_ms,
+                    super::actor::member_status_wall_clock_ms()?,
+                )?;
 
             let mut actor = MobActor {
                 definition,
@@ -10122,6 +10134,10 @@ impl MobBuilder {
                 lifecycle_tasks: tokio::task::JoinSet::new(),
                 pending_lifecycle_delivery_error: None,
                 actor_io_tasks: tokio::task::JoinSet::new(),
+                member_status_observation_permits: Arc::new(tokio::sync::Semaphore::new(
+                    super::actor::MAX_PENDING_MEMBER_STATUS_OBSERVATIONS,
+                )),
+                next_member_status_observed_at_ms,
                 member_live_mutation_tasks: tokio::task::JoinSet::new(),
                 member_live_open_cleanup_obligations: BTreeMap::new(),
                 member_live_open_cleanup_inflight: BTreeSet::new(),

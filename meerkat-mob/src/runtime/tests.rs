@@ -67,7 +67,7 @@ use meerkat_store::{MemoryStore, SessionStore};
 use serde::Serialize;
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1715,6 +1715,8 @@ struct MockSessionService {
     /// Records (session_id, prompt) for each create_session call.
     prompts: RwLock<Vec<(SessionId, String)>>,
     session_read_calls: AtomicU64,
+    session_read_not_found_remaining: AtomicU64,
+    resume_authority_absent_remaining: AtomicU64,
     create_requests: RwLock<Vec<CreateSessionRecord>>,
     /// Records whether each create_session had external_tools configured.
     create_with_external_tools: RwLock<Vec<bool>>,
@@ -1828,6 +1830,10 @@ struct MockSessionService {
     flow_turn_max_in_flight: Arc<AtomicU64>,
     execution_snapshot_delay_ms: AtomicU64,
     execution_snapshot_started: tokio::sync::Notify,
+    execution_snapshot_calls: AtomicU64,
+    execution_snapshots: std::sync::Mutex<VecDeque<meerkat_core::agent::AgentExecutionSnapshot>>,
+    session_read_barriers: RwLock<HashMap<SessionId, Arc<TestRuntimeControlBarrier>>>,
+    session_read_started: tokio::sync::Notify,
     create_session_delay_ms: AtomicU64,
     load_persisted_session_delay_ms: AtomicU64,
     load_persisted_session_started: tokio::sync::Notify,
@@ -1898,6 +1904,8 @@ impl MockSessionService {
             session_counter: AtomicU64::new(0),
             prompts: RwLock::new(Vec::new()),
             session_read_calls: AtomicU64::new(0),
+            session_read_not_found_remaining: AtomicU64::new(0),
+            resume_authority_absent_remaining: AtomicU64::new(0),
             create_requests: RwLock::new(Vec::new()),
             create_with_external_tools: RwLock::new(Vec::new()),
             create_with_compaction_curators: RwLock::new(Vec::new()),
@@ -1957,6 +1965,10 @@ impl MockSessionService {
             flow_turn_max_in_flight: Arc::new(AtomicU64::new(0)),
             execution_snapshot_delay_ms: AtomicU64::new(0),
             execution_snapshot_started: tokio::sync::Notify::new(),
+            execution_snapshot_calls: AtomicU64::new(0),
+            execution_snapshots: std::sync::Mutex::new(VecDeque::new()),
+            session_read_barriers: RwLock::new(HashMap::new()),
+            session_read_started: tokio::sync::Notify::new(),
             create_session_delay_ms: AtomicU64::new(0),
             load_persisted_session_delay_ms: AtomicU64::new(0),
             load_persisted_session_started: tokio::sync::Notify::new(),
@@ -2529,12 +2541,49 @@ impl MockSessionService {
             .store(delay_ms, Ordering::Relaxed);
     }
 
+    fn set_execution_snapshots(
+        &self,
+        snapshots: impl IntoIterator<Item = meerkat_core::agent::AgentExecutionSnapshot>,
+    ) {
+        *self
+            .execution_snapshots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshots.into_iter().collect();
+    }
+
+    fn execution_snapshot_calls(&self) -> u64 {
+        self.execution_snapshot_calls.load(Ordering::Relaxed)
+    }
+
     fn session_read_calls(&self) -> u64 {
         self.session_read_calls.load(Ordering::Relaxed)
     }
 
+    fn fail_next_session_read_as_absent(&self) {
+        self.session_read_not_found_remaining
+            .store(1, Ordering::Release);
+        self.resume_authority_absent_remaining
+            .store(1, Ordering::Release);
+    }
+
     async fn wait_for_execution_snapshot(&self) {
         self.execution_snapshot_started.notified().await;
+    }
+
+    async fn install_session_read_barrier(
+        &self,
+        session_id: SessionId,
+    ) -> Arc<TestRuntimeControlBarrier> {
+        let barrier = Arc::new(TestRuntimeControlBarrier::new());
+        self.session_read_barriers
+            .write()
+            .await
+            .insert(session_id, Arc::clone(&barrier));
+        barrier
+    }
+
+    async fn wait_for_session_read(&self) {
+        self.session_read_started.notified().await;
     }
 
     async fn wait_for_load_persisted_session(&self) {
@@ -3418,6 +3467,20 @@ impl SessionService for MockSessionService {
 
     async fn read(&self, id: &SessionId) -> Result<SessionView, SessionError> {
         self.session_read_calls.fetch_add(1, Ordering::Relaxed);
+        let return_not_found = self
+            .session_read_not_found_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
+        let barrier = self.session_read_barriers.write().await.remove(id);
+        if let Some(barrier) = barrier {
+            self.session_read_started.notify_one();
+            barrier.wait_for_release().await;
+        }
+        if return_not_found {
+            return Err(SessionError::NotFound { id: id.clone() });
+        }
         let session = self
             .live_session_clone(id)
             .await
@@ -3893,6 +3956,15 @@ impl MobSessionService for MockSessionService {
         &self,
         session_id: &SessionId,
     ) -> Result<SessionResumeAuthority, SessionError> {
+        if self
+            .resume_authority_absent_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Ok(SessionResumeAuthority::default());
+        }
         let _authority_guard = self.resume_authority_gate.lock().await;
         let session = self
             .persisted_sessions
@@ -4207,12 +4279,18 @@ impl MobSessionService for MockSessionService {
         &self,
         _session_id: &SessionId,
     ) -> Result<Option<meerkat_core::agent::AgentExecutionSnapshot>, SessionError> {
+        self.execution_snapshot_calls
+            .fetch_add(1, Ordering::Relaxed);
         self.execution_snapshot_started.notify_one();
         let delay_ms = self.execution_snapshot_delay_ms.load(Ordering::Relaxed);
         if delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
-        Ok(None)
+        Ok(self
+            .execution_snapshots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front())
     }
 
     async fn archive_with_mob_lifecycle_authority(
@@ -8658,7 +8736,7 @@ async fn apply_operator_race_machine_input(
         .expect("operator execution-fence race setup transition");
 }
 
-async fn seed_operator_execution_residency(handle: &MobHandle) {
+async fn seed_operator_execution_residency(handle: &MobHandle, member_session_id: &str) {
     use crate::machines::mob_machine as dsl;
 
     let identity = dsl::AgentIdentity::from("member-a");
@@ -8771,7 +8849,7 @@ async fn seed_operator_execution_residency(handle: &MobHandle) {
             profile_material_digest: profile_digest,
             external_addressable: false,
             runtime_mode: dsl::SpawnPolicyRuntimeMode::TurnDriven,
-            bridge_session_id: Some(dsl::SessionId::from("member-session-a")),
+            bridge_session_id: Some(dsl::SessionId::from(member_session_id)),
             replacing: None,
             member_peer_endpoint: Some(dsl::MemberPeerEndpoint {
                 name: dsl::PeerName::from("member-a"),
@@ -8874,7 +8952,7 @@ async fn pending_member_operator_request_is_revalidated_at_actor_dispatch_after_
         .create()
         .await
         .expect("create operator execution-fence race mob");
-    seed_operator_execution_residency(&handle).await;
+    seed_operator_execution_residency(&handle, "member-session-a").await;
 
     let seams = Arc::new(OperatorExecutionRaceSeams {
         mob_id: handle.mob_id().clone(),
@@ -9112,7 +9190,7 @@ async fn member_operator_projection_is_revalidated_after_result_capture() {
 
     let definition = with_unique_mob_id(sample_definition(), "operator-projection-fence-race");
     let (handle, _service) = create_test_mob(definition).await;
-    seed_operator_execution_residency(&handle).await;
+    seed_operator_execution_residency(&handle, "member-session-a").await;
 
     let projection_captured = Arc::new(tokio::sync::Notify::new());
     let release_validation = Arc::new(tokio::sync::Notify::new());
@@ -54131,6 +54209,667 @@ async fn test_busy_member_execution_snapshot_cannot_block_mob_lifecycle_commands
         Some(crate::runtime::handle::MemberRunState::Unknown),
         "a timed-out execution observation must be represented truthfully as unknown"
     );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestActorLoopProbeEvent {
+    ActorLoopStalled { stall_id: u64 },
+    ActorLoopRecovered { stall_id: u64 },
+}
+
+async fn run_single_actor_loop_probe(
+    mut reply_rx: tokio::sync::oneshot::Receiver<Result<MobState, MobError>>,
+    budget: Duration,
+    event_tx: tokio::sync::mpsc::UnboundedSender<TestActorLoopProbeEvent>,
+) -> Result<MobState, MobError> {
+    match tokio::time::timeout(budget, &mut reply_rx).await {
+        Ok(reply) => reply
+            .map_err(|_| MobError::ActorReplyChannelClosed)
+            .and_then(std::convert::identity),
+        Err(_) => {
+            let stall_id = 1;
+            event_tx
+                .send(TestActorLoopProbeEvent::ActorLoopStalled { stall_id })
+                .map_err(|_| MobError::Internal("test actor-loop probe sink closed".to_string()))?;
+            let result = reply_rx
+                .await
+                .map_err(|_| MobError::ActorReplyChannelClosed)
+                .and_then(std::convert::identity);
+            event_tx
+                .send(TestActorLoopProbeEvent::ActorLoopRecovered { stall_id })
+                .map_err(|_| MobError::Internal("test actor-loop probe sink closed".to_string()))?;
+            result
+        }
+    }
+}
+
+fn test_member_execution_snapshot(
+    boundary_count: u32,
+    tool_calls_pending: u32,
+) -> meerkat_core::agent::AgentExecutionSnapshot {
+    meerkat_core::agent::AgentExecutionSnapshot {
+        loop_state: meerkat_core::state::LoopState::WaitingForOps,
+        turn_phase: meerkat_core::turn_execution_authority::TurnPhase::WaitingForOps,
+        turn_terminal: false,
+        active_run_id: Some(meerkat_core::RunId::new()),
+        terminal_run_id: None,
+        primitive_kind: meerkat_core::turn_execution_authority::TurnPrimitiveKind::ConversationTurn,
+        admitted_content_shape: Some(
+            meerkat_core::turn_execution_authority::ContentShape::Conversation,
+        ),
+        vision_enabled: false,
+        image_tool_results_enabled: false,
+        tool_calls_pending,
+        pending_operation_ids: None,
+        barrier_operation_ids: Vec::new(),
+        has_barrier_ops: false,
+        barrier_satisfied: true,
+        boundary_count,
+        cancel_after_boundary: false,
+        terminal_outcome: meerkat_core::turn_execution_authority::TurnTerminalOutcome::None,
+        terminal_cause_kind: None,
+        extraction_attempts: 0,
+        max_extraction_retries: 0,
+        applied_cursor: 0,
+    }
+}
+
+#[tokio::test]
+async fn test_placed_member_status_skips_controller_session_progress_observation() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let placed_session_id = SessionId::new();
+    seed_operator_execution_residency(&handle, &placed_session_id.to_string()).await;
+    let snapshot = handle
+        .member_status(&AgentIdentity::from("member-a"))
+        .await
+        .expect("placed member status");
+
+    assert_eq!(service.session_read_calls(), 0);
+    assert_eq!(service.execution_snapshot_calls(), 0);
+    assert!(
+        snapshot.progress.is_none(),
+        "placed member progress is not controller-local"
+    );
+    handle.shutdown().await.expect("shutdown test mob");
+}
+
+#[tokio::test]
+async fn test_member_status_observation_clock_is_unique_and_tracks_wall_time() {
+    assert_eq!(
+        super::actor::advance_member_status_observation_clock(100, 200)
+            .expect("wall clock advancement"),
+        (200, 201)
+    );
+    assert_eq!(
+        super::actor::advance_member_status_observation_clock(201, 200)
+            .expect("same-millisecond logical advancement"),
+        (201, 202)
+    );
+    assert!(matches!(
+        super::actor::advance_member_status_observation_clock(u64::MAX, u64::MAX),
+        Err(MobError::Internal(_))
+    ));
+
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let identity = AgentIdentity::from("status-clock");
+    handle
+        .spawn(ProfileName::from("worker"), identity.clone(), None)
+        .await
+        .expect("spawn clock member");
+    service.set_execution_snapshots([
+        test_member_execution_snapshot(1, 1),
+        test_member_execution_snapshot(2, 2),
+    ]);
+    handle
+        .member_status(&identity)
+        .await
+        .expect("first status observation");
+    let dsl_identity = crate::machines::mob_machine::AgentIdentity::from_domain(&identity);
+    let first_order = *handle
+        .machine_state_watch_rx
+        .borrow()
+        .member_last_observed_at_ms
+        .get(&dsl_identity)
+        .expect("first observation order");
+    handle
+        .member_status(&identity)
+        .await
+        .expect("second status observation");
+    assert!(
+        handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_last_observed_at_ms
+            .get(&dsl_identity)
+            .is_some_and(|second_order| *second_order > first_order),
+        "actor-issued order must increase strictly for sequential observations"
+    );
+    handle.shutdown().await.expect("shutdown test mob");
+}
+
+#[tokio::test]
+async fn test_member_status_lane_serializes_absence_before_success() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let identity = AgentIdentity::from("status-late-absence");
+    let session_id = handle
+        .spawn(ProfileName::from("worker"), identity.clone(), None)
+        .await
+        .expect("spawn late-absence member")
+        .bridge_session_id()
+        .expect("late-absence member is session-backed")
+        .clone();
+    service.fail_next_session_read_as_absent();
+    let first_read_barrier = service.install_session_read_barrier(session_id).await;
+
+    let stale_absence_rx = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::ProjectMemberStatus {
+            agent_identity: identity.clone(),
+            reply_tx,
+        })
+        .await
+        .expect("enqueue stale absence observation");
+    tokio::time::timeout(Duration::from_secs(1), service.wait_for_session_read())
+        .await
+        .expect("stale absence should enter its session read");
+    let busy = handle
+        .member_status(&identity)
+        .await
+        .expect_err("a second observation must not overlap the first");
+    assert!(matches!(
+        busy,
+        MobError::LifecycleOperationAdmissionPending {
+            ref intent,
+            stage: "observation_lane_saturated"
+        } if intent == "member_status_observation"
+    ));
+
+    first_read_barrier.release_all();
+    stale_absence_rx
+        .await
+        .expect("stale absence reply channel")
+        .expect("first absence should resolve under exclusive lane custody");
+    handle.shutdown().await.expect("shutdown test mob");
+}
+
+#[tokio::test]
+async fn test_member_status_observation_lane_saturates_and_releases() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let mut blocked = Vec::new();
+    for index in 0..super::actor::MAX_PENDING_MEMBER_STATUS_OBSERVATIONS {
+        let identity = AgentIdentity::from(format!("status-saturated-{index}"));
+        let session_id = handle
+            .spawn(ProfileName::from("worker"), identity.clone(), None)
+            .await
+            .expect("spawn saturation member")
+            .bridge_session_id()
+            .expect("saturation member is session-backed")
+            .clone();
+        let barrier = service.install_session_read_barrier(session_id).await;
+        let reply_rx = handle
+            .enqueue_actor_command_for_test(|reply_tx| MobCommand::ProjectMemberStatus {
+                agent_identity: identity,
+                reply_tx,
+            })
+            .await
+            .expect("enqueue saturated status");
+        tokio::time::timeout(Duration::from_secs(1), service.wait_for_session_read())
+            .await
+            .expect("status observation should occupy its lane permit");
+        blocked.push((barrier, reply_rx));
+    }
+
+    let overflow_identity = AgentIdentity::from("status-saturated-overflow");
+    handle
+        .spawn(ProfileName::from("worker"), overflow_identity.clone(), None)
+        .await
+        .expect("spawn overflow member");
+    let overflow = handle
+        .member_status(&overflow_identity)
+        .await
+        .expect_err("full observation lane must refuse immediately");
+    assert!(matches!(
+        overflow,
+        MobError::LifecycleOperationAdmissionPending {
+            ref intent,
+            stage: "observation_lane_saturated"
+        } if intent == "member_status_observation"
+    ));
+    assert_eq!(
+        overflow.failure_class(),
+        crate::MobFailureClass::RuntimeRejected
+    );
+    assert_eq!(
+        overflow.wire_error_code(),
+        Some(meerkat_contracts::ErrorCode::SessionBusy)
+    );
+    assert_eq!(
+        overflow
+            .structured_data()
+            .expect("busy observation carries typed data")["authority_retained"],
+        false
+    );
+
+    let (released_barrier, released_rx) = blocked.remove(0);
+    released_barrier.release_all();
+    released_rx
+        .await
+        .expect("released observation reply channel")
+        .expect("released observation completes");
+    handle
+        .member_status(&overflow_identity)
+        .await
+        .expect("released permit admits a subsequent observation");
+
+    for (barrier, reply_rx) in blocked {
+        barrier.release_all();
+        reply_rx
+            .await
+            .expect("blocked observation reply channel")
+            .expect("blocked observation completes");
+    }
+    handle.shutdown().await.expect("shutdown test mob");
+}
+
+#[tokio::test]
+async fn test_member_status_target_change_redrives_after_respawn() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let identity = AgentIdentity::from("status-target-redrive");
+    let old_session_id = handle
+        .spawn(ProfileName::from("worker"), identity.clone(), None)
+        .await
+        .expect("spawn redrive predecessor")
+        .bridge_session_id()
+        .expect("redrive predecessor is session-backed")
+        .clone();
+    let old_read_barrier = service.install_session_read_barrier(old_session_id).await;
+    let status_rx = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::ProjectMemberStatus {
+            agent_identity: identity.clone(),
+            reply_tx,
+        })
+        .await
+        .expect("enqueue predecessor status observation");
+    tokio::time::timeout(Duration::from_secs(1), service.wait_for_session_read())
+        .await
+        .expect("predecessor status should enter its session read");
+
+    let replacement = handle
+        .respawn(identity, None)
+        .await
+        .expect("respawn status target");
+    let replacement_session_id = handle
+        .get_member(&replacement.identity)
+        .await
+        .expect("replacement member lookup")
+        .expect("replacement member")
+        .member_ref
+        .bridge_session_id()
+        .expect("replacement is session-backed")
+        .clone();
+    old_read_barrier.release_all();
+    let snapshot = tokio::time::timeout(Duration::from_secs(2), status_rx)
+        .await
+        .expect("status redrive should complete")
+        .expect("status redrive reply channel")
+        .expect("status redrive result");
+    assert_eq!(
+        snapshot.current_bridge_session_id(),
+        Some(&replacement_session_id)
+    );
+    assert_eq!(
+        snapshot.runtime_identity_fields(),
+        Some((&replacement.agent_runtime_id, replacement.fence_token))
+    );
+    handle.shutdown().await.expect("shutdown test mob");
+}
+
+#[tokio::test]
+async fn test_member_status_completion_cancels_while_mailbox_is_full() {
+    let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(1);
+    let (queued_reply_tx, _queued_reply_rx) = tokio::sync::oneshot::channel();
+    command_tx
+        .send(super::scope_gate::RoutedMobCommand::internal(
+            MobCommand::QueryPhase {
+                reply_tx: queued_reply_tx,
+            },
+        ))
+        .await
+        .expect("fill test mailbox");
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let observation_permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let observation_permit = Arc::clone(&observation_permits)
+        .try_acquire_owned()
+        .expect("test observation permit");
+    let completion = tokio::spawn(super::actor::enqueue_member_status_observation(
+        command_tx,
+        AgentIdentity::from("status-full-mailbox"),
+        super::state::MemberStatusProjectionTarget {
+            bridge_session_id: None,
+            include_local_session_details: false,
+            agent_runtime_id: None,
+            fence_token: None,
+        },
+        super::state::MemberStatusSessionObservation {
+            output_preview: None,
+            tokens_used: 0,
+            genuinely_absent: false,
+            execution_snapshot: None,
+            observed_at_ms: 1,
+        },
+        observation_permit,
+        reply_tx,
+    ));
+    tokio::task::yield_now().await;
+    drop(reply_rx);
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(1), completion)
+            .await
+            .expect("closed receiver should release mailbox reservation wait")
+            .expect("completion task should not panic")
+    );
+    assert_eq!(
+        observation_permits.available_permits(),
+        1,
+        "cancellation must release the transferred observation permit"
+    );
+    assert!(
+        command_rx.try_recv().is_ok(),
+        "cancellation must not enqueue the abandoned completion"
+    );
+    assert!(command_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn test_member_status_session_read_does_not_close_actor_tool_dependency_cycle() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let blocked_identity = AgentIdentity::from("status-cycle-member");
+    let blocked_session_id = handle
+        .spawn(ProfileName::from("worker"), blocked_identity.clone(), None)
+        .await
+        .expect("spawn cycle member")
+        .bridge_session_id()
+        .expect("cycle member is session-backed")
+        .clone();
+    let observer_identity = AgentIdentity::from("status-cycle-observer");
+    handle
+        .spawn(ProfileName::from("worker"), observer_identity.clone(), None)
+        .await
+        .expect("spawn observer member");
+    service
+        .active_sessions
+        .write()
+        .await
+        .insert(blocked_session_id.clone());
+    let session_read_barrier = service
+        .install_session_read_barrier(blocked_session_id.clone())
+        .await;
+
+    let blocked_status_rx = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::ProjectMemberStatus {
+            agent_identity: blocked_identity,
+            reply_tx,
+        })
+        .await
+        .expect("enqueue blocking member status");
+    tokio::time::timeout(Duration::from_secs(1), service.wait_for_session_read())
+        .await
+        .expect("member status should enter the session read");
+
+    let heartbeat_rx = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::QueryPhase { reply_tx })
+        .await
+        .expect("enqueue actor heartbeat");
+    let (probe_event_tx, mut probe_event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut probe_task = tokio::spawn(run_single_actor_loop_probe(
+        heartbeat_rx,
+        Duration::from_millis(250),
+        probe_event_tx,
+    ));
+
+    let tool_list_rx = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::ProjectMemberList {
+            include_retiring: false,
+            reply_tx,
+        })
+        .await
+        .expect("enqueue active-turn mob_list_members tool command");
+    let tool_release = Arc::clone(&session_read_barrier);
+    let active_turn_tool = tokio::spawn(async move {
+        let result = tool_list_rx
+            .await
+            .map_err(|_| MobError::ActorReplyChannelClosed)
+            .and_then(std::convert::identity);
+        tool_release.release_all();
+        result
+    });
+    let unrelated_status_rx = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::ProjectMemberStatus {
+            agent_identity: observer_identity,
+            reply_tx,
+        })
+        .await
+        .expect("enqueue unrelated member status");
+    let unrelated_error = unrelated_status_rx
+        .await
+        .expect("unrelated status reply channel")
+        .expect_err("the single observation lane must reject overlap");
+    assert!(matches!(
+        unrelated_error,
+        MobError::LifecycleOperationAdmissionPending {
+            intent,
+            stage: "observation_lane_saturated"
+        } if intent == "member_status_observation"
+    ));
+
+    let heartbeat = match tokio::time::timeout(Duration::from_secs(1), &mut probe_task).await {
+        Ok(result) => result
+            .expect("probe task should not panic")
+            .expect("heartbeat should return the mob phase"),
+        Err(_) => {
+            session_read_barrier.release_all();
+            let _ = active_turn_tool.await;
+            let _ = blocked_status_rx.await;
+            panic!("member status session I/O stalled the actor");
+        }
+    };
+    assert_eq!(heartbeat, MobState::Running);
+    assert!(matches!(
+        probe_event_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+    ));
+    active_turn_tool
+        .await
+        .expect("active-turn tool task should not panic")
+        .expect("actor-routed list command should complete and release the turn");
+    blocked_status_rx
+        .await
+        .expect("blocking status reply channel")
+        .expect("off-actor session read should complete after turn release");
+
+    service
+        .active_sessions
+        .write()
+        .await
+        .remove(&blocked_session_id);
+    handle.shutdown().await.expect("shutdown test mob");
+}
+
+#[tokio::test]
+async fn test_actor_loop_probe_emits_one_correlated_recovery_for_blocked_head() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let blocked_head_rx = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::ParkActorForObservationTest {
+            entered_tx,
+            release_rx,
+            reply_tx,
+        })
+        .await
+        .expect("enqueue test-only blocked head");
+    entered_rx.await.expect("actor should enter blocked head");
+
+    let heartbeat_rx = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::QueryPhase { reply_tx })
+        .await
+        .expect("enqueue actor heartbeat behind blocked head");
+    let (probe_event_tx, mut probe_event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let probe_task = tokio::spawn(run_single_actor_loop_probe(
+        heartbeat_rx,
+        Duration::from_millis(250),
+        probe_event_tx,
+    ));
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), probe_event_rx.recv())
+            .await
+            .expect("blocked heartbeat should emit a stall")
+            .expect("probe event channel should remain open"),
+        TestActorLoopProbeEvent::ActorLoopStalled { stall_id: 1 }
+    );
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    assert!(matches!(
+        probe_event_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    release_tx.send(()).expect("release blocked actor head");
+    blocked_head_rx
+        .await
+        .expect("blocked head reply should be delivered")
+        .expect("test-only blocked head should release cleanly");
+    assert_eq!(
+        probe_task
+            .await
+            .expect("probe task should not panic")
+            .expect("heartbeat should recover"),
+        MobState::Running
+    );
+    assert_eq!(
+        probe_event_rx
+            .recv()
+            .await
+            .expect("probe should emit exact correlated recovery"),
+        TestActorLoopProbeEvent::ActorLoopRecovered { stall_id: 1 }
+    );
+    assert!(matches!(
+        probe_event_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+    ));
+
+    handle.shutdown().await.expect("shutdown test mob");
+}
+
+#[tokio::test]
+async fn test_actor_loop_probe_does_not_stall_when_member_status_read_is_available() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let identity = AgentIdentity::from("status-cycle-falsifier");
+    handle
+        .spawn(ProfileName::from("worker"), identity.clone(), None)
+        .await
+        .expect("spawn falsifier member");
+
+    let status_rx = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::ProjectMemberStatus {
+            agent_identity: identity,
+            reply_tx,
+        })
+        .await
+        .expect("enqueue immediately readable member status");
+    let heartbeat_rx = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::QueryPhase { reply_tx })
+        .await
+        .expect("enqueue actor heartbeat");
+    let (probe_event_tx, mut probe_event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    status_rx
+        .await
+        .expect("status reply channel")
+        .expect("available member status should complete");
+    assert_eq!(
+        run_single_actor_loop_probe(heartbeat_rx, Duration::from_secs(1), probe_event_tx)
+            .await
+            .expect("heartbeat should complete within its budget"),
+        MobState::Running
+    );
+    assert!(matches!(
+        probe_event_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+    ));
+
+    handle.shutdown().await.expect("shutdown test mob");
+}
+
+#[tokio::test]
+async fn test_dropped_member_status_receiver_cancels_owned_session_read() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let identity = AgentIdentity::from("status-closed-receiver");
+    let session_id = handle
+        .spawn(ProfileName::from("worker"), identity.clone(), None)
+        .await
+        .expect("spawn closed-receiver member")
+        .bridge_session_id()
+        .expect("closed-receiver member is session-backed")
+        .clone();
+    let read_barrier = service.install_session_read_barrier(session_id).await;
+    let status_rx = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::ProjectMemberStatus {
+            agent_identity: identity,
+            reply_tx,
+        })
+        .await
+        .expect("enqueue cancellable member status");
+    tokio::time::timeout(Duration::from_secs(1), service.wait_for_session_read())
+        .await
+        .expect("owned session read should start");
+    assert_eq!(Arc::strong_count(&read_barrier), 2);
+
+    drop(status_rx);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while Arc::strong_count(&read_barrier) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("closed receiver should cancel the owned read future");
+    assert_eq!(
+        handle.status().await.expect("actor remains responsive"),
+        MobState::Running
+    );
+
+    handle.shutdown().await.expect("shutdown test mob");
+}
+
+#[tokio::test]
+async fn test_shutdown_aborts_owned_member_status_read() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let identity = AgentIdentity::from("status-shutdown-cleanup");
+    let session_id = handle
+        .spawn(ProfileName::from("worker"), identity.clone(), None)
+        .await
+        .expect("spawn shutdown-cleanup member")
+        .bridge_session_id()
+        .expect("shutdown-cleanup member is session-backed")
+        .clone();
+    let read_barrier = service.install_session_read_barrier(session_id).await;
+    let status_rx = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::ProjectMemberStatus {
+            agent_identity: identity,
+            reply_tx,
+        })
+        .await
+        .expect("enqueue member status before shutdown");
+    tokio::time::timeout(Duration::from_secs(1), service.wait_for_session_read())
+        .await
+        .expect("owned session read should start");
+    assert_eq!(Arc::strong_count(&read_barrier), 2);
+
+    tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
+        .await
+        .expect("shutdown should abort and join owned session reads")
+        .expect("shutdown should succeed");
+    assert_eq!(Arc::strong_count(&read_barrier), 1);
+    assert!(status_rx.await.is_err());
 }
 
 #[tokio::test]
