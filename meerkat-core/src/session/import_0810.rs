@@ -925,6 +925,10 @@ fn released_session_from_serde(
         transcript_history_metadata_validation:
             TranscriptHistoryMetadataValidation::RequiresValidation,
         usage: serde_repr.usage,
+        // Released 0.8.10 state predates the handoff log entirely: an imported
+        // document owes nothing.
+        model_routing_control:
+            crate::session::model_routing_control::SessionModelRoutingControlHistory::new(),
     })
 }
 

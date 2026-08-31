@@ -2073,6 +2073,15 @@ pub struct SessionHead {
     /// the authenticated map named by `metadata_identity`. Released inline
     /// heads retain their previous map until the one-time importer adopts them.
     pub metadata: serde_json::Map<String, serde_json::Value>,
+    /// Committed model-routing handoff log carried by this physical head.
+    ///
+    /// Skipped when empty so pre-existing head rows stay byte-identical.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::session::model_routing_control::SessionModelRoutingControlHistory::is_empty"
+    )]
+    pub model_routing_control:
+        crate::session::model_routing_control::SessionModelRoutingControlHistory,
     /// Sealed sparse-Merkle transition shared by the actor Session and every
     /// prepared successor. A cold-loaded head carries a verified full snapshot;
     /// an ordinary successor carries only changed cells and proofs. Neither is
@@ -2099,6 +2108,7 @@ impl PartialEq for SessionHead {
             && self.usage == other.usage
             && self.metadata_identity == other.metadata_identity
             && self.metadata == other.metadata
+            && self.model_routing_control == other.model_routing_control
     }
 }
 
@@ -2667,6 +2677,7 @@ impl SessionHead {
             metadata_identity,
             metadata,
             metadata_projection,
+            model_routing_control: session.model_routing_control().clone(),
         };
         validate_session_head_storage_representation(&head)?;
         Ok(head)
@@ -2946,6 +2957,7 @@ impl SessionHead {
             mut metadata,
             metadata_projection,
             message_row_prefix,
+            model_routing_control,
             ..
         } = self;
         let installed_metadata_projection = match (metadata_identity, metadata_projection) {
@@ -2974,6 +2986,7 @@ impl SessionHead {
             updated_at,
             metadata,
             usage,
+            model_routing_control,
             installed_metadata_projection,
         )
         .map_err(|err| {
@@ -3035,6 +3048,17 @@ struct DigestAddressedSessionHeadCas<'a> {
     updated_at: &'a SystemTime,
     usage: &'a Usage,
     metadata_identity: &'a SessionHeadMetadataIdentity,
+    /// Authenticated committed model-routing handoff log.
+    ///
+    /// Skipped when empty so every head written before the handoff log existed
+    /// keeps a byte-identical preimage under the same `format_version`. A head
+    /// that actually carries records authenticates them here, so a dropped or
+    /// tampered handoff cannot pass CAS verification.
+    #[serde(
+        skip_serializing_if = "<[crate::session::model_routing_control::SessionModelRoutingControlRecord]>::is_empty"
+    )]
+    model_routing_control:
+        &'a [crate::session::model_routing_control::SessionModelRoutingControlRecord],
 }
 
 pub fn session_head_cas_token(head: &SessionHead) -> Result<String, SessionStoreError> {
@@ -3073,6 +3097,7 @@ pub fn session_head_cas_token(head: &SessionHead) -> Result<String, SessionStore
                 updated_at: &head.updated_at,
                 usage: &head.usage,
                 metadata_identity,
+                model_routing_control: head.model_routing_control.records(),
             };
             (
                 "head-v5-sha256:",
@@ -5349,6 +5374,11 @@ pub fn head_canonical_plain_save_guard_with_prefix_witness(
     if stored_rewrite_prefix.occurrence_count() != stored_rewrite_count {
         return Err(SessionStoreError::Corrupted(incoming.id().clone()));
     }
+    validate_model_routing_control_transition(
+        incoming.id(),
+        incoming.model_routing_control(),
+        previous_slim.model_routing_control(),
+    )?;
     incoming
         .validate_transcript_history_state()
         .map_err(|err| SessionStoreError::InvalidTranscriptRewrite {
@@ -5429,6 +5459,45 @@ pub fn head_canonical_plain_save_guard_with_prefix_witness(
 /// `stored` is the current row plus its CAS token; `new_strand_len` is the
 /// persisted row count of `head.strand`; `recorded_rewrites` is the total
 /// number of recorded rewrite rows (adopted + unadopted).
+/// Refuse a durable transition that does not extend the committed
+/// model-routing handoff log.
+///
+/// The in-memory history enforces append-only within one document, but nothing
+/// stopped a stale writer from presenting a session or head built from an older
+/// materialization. That silently DROPPED a durably committed owed handoff, and
+/// symmetrically RESURRECTED a settled one — which would let the pre-admission
+/// seam rotate the model a second time for an already-applied request. The
+/// committed log is durable authority, so a successor must extend it.
+fn validate_model_routing_control_transition(
+    id: &SessionId,
+    incoming: &crate::session::model_routing_control::SessionModelRoutingControlHistory,
+    committed: &crate::session::model_routing_control::SessionModelRoutingControlHistory,
+) -> Result<(), SessionStoreError> {
+    if incoming.extends(committed) {
+        return Ok(());
+    }
+    Err(SessionStoreError::InvalidTranscriptRewrite {
+        id: id.clone(),
+        reason: format!(
+            "model-routing handoff log must extend the committed log: \
+             committed covers {} records, successor covers {} and diverges",
+            committed.len(),
+            incoming.len()
+        ),
+    })
+}
+
+fn validate_model_routing_control_extension(
+    head: &SessionHead,
+    stored_head: &SessionHead,
+) -> Result<(), SessionStoreError> {
+    validate_model_routing_control_transition(
+        &head.id,
+        &head.model_routing_control,
+        &stored_head.model_routing_control,
+    )
+}
+
 pub fn validate_save_head_transition(
     head: &SessionHead,
     stored: Option<(&SessionHead, &str)>,
@@ -5525,6 +5594,7 @@ pub fn validate_save_head_transition(
     if let Some((stored_head, _)) = stored {
         validate_session_head_component_roots(stored_head)?;
         validate_session_head_metadata_identity(stored_head)?;
+        validate_model_routing_control_extension(head, stored_head)?;
         if stored_head.metadata_identity.is_some() && !session_head_has_component_roots(stored_head)
         {
             return Err(SessionStoreError::Corrupted(stored_head.id.clone()));
@@ -5679,6 +5749,9 @@ pub fn validate_commit_rewrite_transition(
         metadata_identity: stored.metadata_identity.clone(),
         metadata: stored.metadata.clone(),
         metadata_projection: stored.metadata_projection.clone(),
+        // A rewrite edits transcript content; it never settles an owed
+        // model-routing handoff, so the stored log carries forward exactly.
+        model_routing_control: stored.model_routing_control.clone(),
     })
 }
 
@@ -9131,5 +9204,221 @@ mod tests {
             .is_well_formed(),
             "a replacement ending before the shared prefix must not pass"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Model-routing handoff log: HeadCanonical (v5 CAS preimage) contracts
+    // -----------------------------------------------------------------------
+
+    mod model_routing_handoff_head_canonical {
+        use super::*;
+        use crate::image_generation::{
+            SwitchTurnDuration, SwitchTurnIntent, SwitchTurnOrigin,
+            SwitchTurnReasonTextDisposition, SwitchTurnRequestId,
+        };
+        use crate::lifecycle::identifiers::RunId;
+        use crate::lifecycle::run_primitive::ModelId;
+        use crate::session::model_routing_control::SessionModelRoutingControlRecord;
+
+        fn owed_handoff(model: &str) -> SessionModelRoutingControlRecord {
+            SessionModelRoutingControlRecord::request(
+                SwitchTurnRequestId::new(uuid::Uuid::new_v4()),
+                RunId::new(),
+                SwitchTurnIntent {
+                    target_model: ModelId::new(model),
+                    duration: SwitchTurnDuration::UntilChanged,
+                    origin: SwitchTurnOrigin::Model {
+                        reason: SwitchTurnReasonTextDisposition::NotProvided,
+                    },
+                },
+            )
+            .expect("until-changed model-origin intent is a durable handoff")
+        }
+
+        fn base_session() -> Session {
+            let mut session = Session::new();
+            session.push(Message::User(UserMessage::text("hello".to_string())));
+            session
+        }
+
+        /// Project the digest-addressed head so these assertions exercise the
+        /// v5 `DigestAddressedSessionHeadCas` preimage, not the legacy inline
+        /// whole-head encoding.
+        fn head_canonical_head(session: &Session) -> SessionHead {
+            let message_row_prefix =
+                SessionMessageRowPrefixAccumulator::from_messages(session.messages())
+                    .expect("row prefix derives");
+            let head = SessionHead::from_session_with_message_row_prefix(
+                session,
+                TranscriptStrandId::root(),
+                0,
+                message_row_prefix,
+                Some(TranscriptRewritePrefixAccumulator::default()),
+                None,
+                true,
+            )
+            .expect("head-canonical head projects");
+            assert!(
+                head.metadata_identity.is_some(),
+                "fixture must exercise the HeadCanonical path"
+            );
+            head
+        }
+
+        #[test]
+        fn head_canonical_token_is_unchanged_when_no_handoff_is_owed() {
+            // Compatibility evidence: an absent handoff log keeps the v5
+            // preimage byte-identical, so already-persisted heads keep their
+            // exact CAS tokens and need no format bump or migration.
+            let head = head_canonical_head(&base_session());
+            assert!(head.model_routing_control.is_empty());
+            let preimage = serde_json::to_value(DigestAddressedSessionHeadCas {
+                format_version: 5,
+                id: &head.id,
+                version: head.version,
+                strand: &head.strand,
+                head_revision: &head.head_revision,
+                message_count: head.message_count,
+                message_row_prefix: &head.message_row_prefix,
+                row_lineage_anchor: &head.row_lineage_anchor,
+                rewrite_count: head.rewrite_count,
+                rewrite_prefix: &head.rewrite_prefix,
+                graph_prefix: &head.graph_prefix,
+                realtime_event_prefix: &head.realtime_event_prefix,
+                created_at: &head.created_at,
+                updated_at: &head.updated_at,
+                usage: &head.usage,
+                metadata_identity: head
+                    .metadata_identity
+                    .as_ref()
+                    .expect("head-canonical identity"),
+                model_routing_control: head.model_routing_control.records(),
+            })
+            .expect("preimage serializes");
+            assert!(
+                preimage.get("model_routing_control").is_none(),
+                "an empty handoff log must not enter the authenticated preimage"
+            );
+        }
+
+        #[test]
+        fn head_canonical_token_binds_an_owed_handoff() {
+            // Hold every other head field constant so the assertion isolates
+            // the handoff log itself rather than an incidental timestamp.
+            let plain = head_canonical_head(&base_session());
+            let plain_token = session_head_cas_token(&plain).expect("token derives");
+
+            let mut owed = plain;
+            owed.model_routing_control
+                .append(owed_handoff("claude-opus-5"))
+                .expect("request appends");
+            let owed_token = session_head_cas_token(&owed).expect("token derives");
+
+            assert_ne!(
+                plain_token, owed_token,
+                "the authenticated head must bind an owed handoff; otherwise a dropped or \
+                 injected handoff passes CAS verification"
+            );
+        }
+
+        #[test]
+        fn head_canonical_token_binds_the_exact_handoff_target() {
+            let base = head_canonical_head(&base_session());
+            let request_id = SwitchTurnRequestId::new(uuid::Uuid::new_v4());
+            let run = RunId::new();
+            let request = |model: &str| {
+                SessionModelRoutingControlRecord::request(
+                    request_id.clone(),
+                    run.clone(),
+                    SwitchTurnIntent {
+                        target_model: ModelId::new(model),
+                        duration: SwitchTurnDuration::UntilChanged,
+                        origin: SwitchTurnOrigin::Model {
+                            reason: SwitchTurnReasonTextDisposition::NotProvided,
+                        },
+                    },
+                )
+                .expect("durable handoff")
+            };
+
+            let mut opus = base.clone();
+            opus.model_routing_control
+                .append(request("claude-opus-5"))
+                .expect("request appends");
+            let mut gpt = base;
+            gpt.model_routing_control
+                .append(request("gpt-5.5"))
+                .expect("request appends");
+
+            assert_ne!(
+                session_head_cas_token(&opus).expect("token derives"),
+                session_head_cas_token(&gpt).expect("token derives"),
+                "the authenticated head must bind the exact target, not merely presence"
+            );
+        }
+
+        #[test]
+        fn an_old_reader_that_strips_the_head_log_fails_closed_on_the_cas_token() {
+            // SessionHead is deliberately NOT deny_unknown_fields, so an old
+            // binary would silently drop this field. The head CAS binding is
+            // therefore the load-bearing fail-closed mechanism for this
+            // carrier, and it must stay pinned.
+            let mut session = base_session();
+            session
+                .append_model_routing_control_record(owed_handoff("claude-opus-5"))
+                .expect("request appends");
+            let head = head_canonical_head(&session);
+            let stored_token = session_head_cas_token(&head).expect("stored token derives");
+
+            let mut encoded = serde_json::to_value(&head).expect("head serializes");
+            assert!(
+                encoded
+                    .as_object_mut()
+                    .expect("head row is an object")
+                    .remove("model_routing_control")
+                    .is_some(),
+                "the populated head row must actually carry the log"
+            );
+            let stripped: SessionHead =
+                serde_json::from_value(encoded).expect("an old reader silently accepts the row");
+            assert!(
+                stripped.model_routing_control.is_empty(),
+                "an old reader does drop the field — that is exactly why CAS must catch it"
+            );
+
+            let stripped_token = session_head_cas_token(&stripped).expect("stripped token derives");
+            assert_ne!(
+                stripped_token, stored_token,
+                "a stripped handoff log must not re-derive the stored head token"
+            );
+        }
+
+        #[test]
+        fn a_head_transition_must_extend_the_committed_handoff_log() {
+            let mut committed_session = base_session();
+            committed_session
+                .append_model_routing_control_record(owed_handoff("claude-opus-5"))
+                .expect("request appends");
+            let stored = head_canonical_head(&committed_session);
+
+            // A stale writer presents a head built before the handoff was
+            // committed. Dropping it would lose a durable obligation.
+            let stale = head_canonical_head(&base_session());
+            let error = validate_model_routing_control_extension(&stale, &stored)
+                .expect_err("a shrinking handoff log must be refused");
+            assert!(
+                matches!(error, SessionStoreError::InvalidTranscriptRewrite { .. }),
+                "expected InvalidTranscriptRewrite, got {error:?}"
+            );
+
+            // Extending is legal.
+            let mut extended_session = committed_session.clone();
+            extended_session
+                .append_model_routing_control_record(owed_handoff("gpt-5.5"))
+                .expect("second request appends");
+            let extended = head_canonical_head(&extended_session);
+            validate_model_routing_control_extension(&extended, &stored)
+                .expect("adding a record is a legal extension");
+        }
     }
 }
