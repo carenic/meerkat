@@ -53,7 +53,7 @@ fn requested(
     run: &RunId,
     model: &str,
 ) -> SessionModelRoutingControlRecord {
-    SessionModelRoutingControlRecord::request(request_id.clone(), run.clone(), intent(model))
+    SessionModelRoutingControlRecord::request(*request_id, run.clone(), intent(model))
         .expect("until-changed model-origin intent is a durable handoff")
 }
 
@@ -68,19 +68,19 @@ fn every_record_variant_round_trips_through_json() {
     let variants = vec![
         requested(&request_id, &run, "claude-opus-5"),
         SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
-            request_id: request_id.clone(),
+            request_id,
             originating_run_id: run.clone(),
             intent: intent("claude-opus-5"),
             applied_identity: identity("claude-opus-5"),
         },
         SessionModelRoutingControlRecord::ModelRoutingIntentDenied {
-            request_id: request_id.clone(),
+            request_id,
             originating_run_id: run.clone(),
             intent: intent("claude-opus-5"),
             reason: SwitchTurnDenialReason::UnsupportedModel,
         },
         SessionModelRoutingControlRecord::ModelRoutingIntentAbandoned {
-            request_id: request_id.clone(),
+            request_id,
             originating_run_id: run.clone(),
             intent: intent("claude-opus-5"),
             reason: ModelRoutingIntentAbandonReason::SessionArchived,
@@ -208,7 +208,7 @@ fn terminal_record_requires_a_committed_request() {
     let error = history
         .append(
             SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
-                request_id: request_id.clone(),
+                request_id,
                 originating_run_id: RunId::new(),
                 intent: intent("claude-opus-5"),
                 applied_identity: identity("claude-opus-5"),
@@ -231,7 +231,7 @@ fn exact_terminal_replay_is_idempotent_but_a_different_terminal_is_refused() {
         .expect("request appends");
 
     let realized = SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
-        request_id: request_id.clone(),
+        request_id,
         originating_run_id: run.clone(),
         intent: intent("claude-opus-5"),
         applied_identity: identity("claude-opus-5"),
@@ -251,7 +251,7 @@ fn exact_terminal_replay_is_idempotent_but_a_different_terminal_is_refused() {
 
     let error = history
         .append(SessionModelRoutingControlRecord::ModelRoutingIntentDenied {
-            request_id: request_id.clone(),
+            request_id,
             originating_run_id: run,
             intent: intent("claude-opus-5"),
             reason: SwitchTurnDenialReason::UnsupportedModel,
@@ -281,7 +281,7 @@ fn a_request_that_is_not_an_until_changed_model_switch_is_unrepresentable() {
             reason: SwitchTurnReasonTextDisposition::NotProvided,
         },
     };
-    let error = SessionModelRoutingControlRecord::request(request_id.clone(), RunId::new(), finite)
+    let error = SessionModelRoutingControlRecord::request(request_id, RunId::new(), finite)
         .expect_err("a finite scoped override is not a durable handoff");
     assert!(
         matches!(
@@ -321,7 +321,7 @@ fn awaiting_decision_reports_only_undecided_requests() {
     history
         .append(
             SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
-                request_id: settled.clone(),
+                request_id: settled,
                 originating_run_id: run.clone(),
                 intent: intent("claude-opus-5"),
                 applied_identity: identity("claude-opus-5"),
@@ -334,9 +334,9 @@ fn awaiting_decision_reports_only_undecided_requests() {
 
     let awaiting: Vec<_> = history
         .awaiting_decision()
-        .map(|record| record.request_id().clone())
+        .map(|record| *record.request_id())
         .collect();
-    assert_eq!(awaiting, vec![waiting.clone()]);
+    assert_eq!(awaiting, vec![waiting]);
     assert_eq!(
         history.disposition_of(&settled),
         Some(ModelRoutingIntentRecordDisposition::Realized)
@@ -382,11 +382,11 @@ mod archive {
     ///
     /// Nothing here fabricates a verdict: the authorization can only come back
     /// from the machine's own emitted effects.
-    fn archive_active_document(
+    fn archive_document(
+        key: SessionDocumentKey,
         durable_document_present: bool,
     ) -> Option<SessionArchiveControlTerminalizationAuthorization> {
         let mut authority = SessionDocumentMachineAuthority::new();
-        let key = SessionDocumentKey::new("session-under-archive");
         authority
             .recover_session_lifecycle_terminal(key.clone(), SessionDocumentLifecycle::Active)
             .expect("seed the machine-owned lifecycle registry");
@@ -400,6 +400,17 @@ mod archive {
             )
             .expect("archive decision applies");
         authorization
+    }
+
+    /// Archive the document a `Session` actually is.
+    fn archive_session_document(
+        session: &Session,
+        durable_document_present: bool,
+    ) -> Option<SessionArchiveControlTerminalizationAuthorization> {
+        archive_document(
+            SessionDocumentKey::new(session.id().to_string()),
+            durable_document_present,
+        )
     }
 
     /// Archive a document the machine already considers Archived.
@@ -425,11 +436,11 @@ mod archive {
     #[test]
     fn the_machine_mints_terminalization_only_for_a_document_writing_archive() {
         assert!(
-            archive_active_document(true).is_some(),
+            archive_document(SessionDocumentKey::new("session-under-archive"), true).is_some(),
             "a document-writing archive verdict authorizes terminalization"
         );
         assert!(
-            archive_active_document(false).is_none(),
+            archive_document(SessionDocumentKey::new("session-under-archive"), false).is_none(),
             "an archive that does not rewrite the document has nothing to append to"
         );
         assert!(
@@ -479,9 +490,11 @@ mod archive {
     fn the_session_boundary_method_terminalizes_every_owed_handoff() {
         let (mut session, request_id) = session_with_owed_handoff();
         let authorization =
-            archive_active_document(true).expect("machine authorizes terminalization");
+            archive_session_document(&session, true).expect("machine authorizes terminalization");
 
-        let appended = session.terminalize_model_routing_control_for_boundary(&authorization);
+        let appended = session
+            .terminalize_model_routing_control_for_boundary(&authorization)
+            .expect("the capability names this document");
         assert_eq!(appended.len(), 1, "the owed handoff must be terminalized");
         assert_eq!(
             session.model_routing_control().disposition_of(&request_id),
@@ -500,6 +513,7 @@ mod archive {
         assert!(
             session
                 .terminalize_model_routing_control_for_boundary(&authorization)
+                .expect("the capability names this document")
                 .is_empty()
         );
         assert_eq!(session.model_routing_control().len(), 2);
@@ -509,8 +523,10 @@ mod archive {
     fn an_abandoned_handoff_survives_serialization() {
         let (mut session, request_id) = session_with_owed_handoff();
         let authorization =
-            archive_active_document(true).expect("machine authorizes terminalization");
-        session.terminalize_model_routing_control_for_boundary(&authorization);
+            archive_session_document(&session, true).expect("machine authorizes terminalization");
+        session
+            .terminalize_model_routing_control_for_boundary(&authorization)
+            .expect("the capability names this document");
 
         let encoded = serde_json::to_value(&session).expect("session serializes");
         let decoded: Session = serde_json::from_value(encoded).expect("session deserializes");
@@ -525,6 +541,46 @@ mod archive {
                 .awaiting_decision()
                 .next()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_capability_minted_for_another_document_cannot_terminalize_this_one() {
+        // The guardian's probe: mint a capability by archiving a throwaway
+        // document, then apply it to a live, never-archived session. An
+        // unforgeable capability with no SUBJECT is still an authority hole.
+        let (mut session, request_id) = session_with_owed_handoff();
+        let foreign = archive_document(
+            SessionDocumentKey::new("some-other-document-entirely"),
+            true,
+        )
+        .expect("machine authorizes terminalization of the other document");
+
+        let error = session
+            .terminalize_model_routing_control_for_boundary(&foreign)
+            .expect_err("a capability for another document must be refused");
+        assert!(
+            matches!(
+                error,
+                ModelRoutingControlAppendError::BoundaryAuthorizationSubjectMismatch { .. }
+            ),
+            "expected BoundaryAuthorizationSubjectMismatch, got {error:?}"
+        );
+        assert_eq!(
+            session.model_routing_control().disposition_of(&request_id),
+            Some(ModelRoutingIntentRecordDisposition::Requested),
+            "a refused cross-document terminalization must leave the handoff owed"
+        );
+
+        // The session's own capability still works.
+        let own =
+            archive_session_document(&session, true).expect("machine authorizes this document");
+        assert_eq!(
+            session
+                .terminalize_model_routing_control_for_boundary(&own)
+                .expect("the capability names this document")
+                .len(),
+            1
         );
     }
 
@@ -547,11 +603,13 @@ mod archive {
             )
             .expect("realized appends");
 
+        let document = SessionDocumentKey::new("session-under-archive");
         let authorization =
-            archive_active_document(true).expect("machine authorizes terminalization");
+            archive_document(document.clone(), true).expect("machine authorizes terminalization");
         assert!(
             history
-                .terminalize_awaiting_for_boundary(&authorization)
+                .terminalize_awaiting_for_boundary(&document, &authorization)
+                .expect("the capability names this document")
                 .is_empty()
         );
         assert_eq!(

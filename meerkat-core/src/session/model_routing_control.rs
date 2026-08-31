@@ -71,13 +71,16 @@
 //!   token and reads fail closed as `Corrupted`. That binding is therefore
 //!   load-bearing, not decorative.
 //! * **Durable save transition** — the committed log is append-only across
-//!   saves, enforced by a prefix-extension check at the head transition. Without
-//!   it a stale writer silently drops an owed handoff, or resurrects a settled
-//!   one and causes a second model rotation.
+//!   saves, enforced by a prefix-extension check in every guard that accepts a
+//!   whole `Session` or a successor head: the plain append-only guard, the
+//!   transcript-rewrite guard, and both head-canonical guards. That covers the
+//!   WholeBlob and head-canonical lanes on every store. Without it a stale
+//!   writer silently drops an owed handoff, or resurrects a settled one and
+//!   causes a second model rotation.
 //!
 //! # Deliberately deferred (named, not silent)
 //!
-//! * Wiring [`ModelRoutingIntentBoundaryTerminalization::authorize_session_archive`]
+//! * Wiring [`SessionArchiveControlTerminalizationAuthorization::authorize_session_archive`]
 //!   into the archive realization path is Phase 2 work; this module ships the
 //!   decision seam only.
 //! * The claim/pending lifecycle (a request that generated authority has
@@ -124,6 +127,7 @@ pub enum ModelRoutingIntentAbandonReason {
 /// seal decorative.
 #[derive(Debug)]
 pub struct SessionArchiveControlTerminalizationAuthorization {
+    document: session_document::SessionDocumentKey,
     reason: ModelRoutingIntentAbandonReason,
 }
 
@@ -152,22 +156,25 @@ impl SessionArchiveControlTerminalizationAuthorization {
         session_document::SessionDocumentError,
     > {
         let effects = authority.archive_session_document(
-            session_id,
+            session_id.clone(),
             runtime_backed,
             durable_document_present,
             runtime_observation,
         )?;
-        let authorization = effects.iter().find_map(Self::from_machine_effect);
+        let authorization = effects
+            .iter()
+            .find_map(|effect| Self::from_machine_effect(&session_id, effect));
         Ok((effects, authorization))
     }
 
     /// Recognize a machine-emitted archive verdict that authorizes
-    /// terminalization.
+    /// terminalization of `document`.
     ///
     /// Crate-private on purpose: the public door is
     /// [`Self::authorize_session_archive`], which produces the effect by
     /// driving the machine. A foreign crate cannot reach this with a literal.
     pub(crate) fn from_machine_effect(
+        document: &session_document::SessionDocumentKey,
         effect: &session_document::SessionDocumentEffect,
     ) -> Option<Self> {
         match effect {
@@ -176,10 +183,17 @@ impl SessionArchiveControlTerminalizationAuthorization {
                 write_document: true,
                 ..
             } => Some(Self {
+                document: document.clone(),
                 reason: ModelRoutingIntentAbandonReason::SessionArchived,
             }),
             _ => None,
         }
+    }
+
+    /// The exact document this capability authorizes, and only this one.
+    #[must_use]
+    pub const fn document(&self) -> &session_document::SessionDocumentKey {
+        &self.document
     }
 
     #[must_use]
@@ -399,7 +413,7 @@ pub enum ModelRoutingControlAppendError {
     /// Abandonment is reachable only through
     /// [`SessionModelRoutingControlHistory::terminalize_awaiting_for_boundary`],
     /// which demands a machine-minted
-    /// [`ModelRoutingIntentBoundaryTerminalization`].
+    /// [`SessionArchiveControlTerminalizationAuthorization`].
     #[error(
         "model-routing intent {request_id:?} cannot be abandoned without machine-minted boundary authority"
     )]
@@ -410,6 +424,14 @@ pub enum ModelRoutingControlAppendError {
     /// incoherent persisted log fails closed instead of being normalized.
     #[error("persisted model-routing log carries a duplicate record for intent {request_id:?}")]
     DuplicateRecord { request_id: SwitchTurnRequestId },
+    /// Boundary terminalization authority was minted for a different document.
+    #[error(
+        "archive terminalization authority for document {authorized:?} cannot terminalize document {applied_to:?}"
+    )]
+    BoundaryAuthorizationSubjectMismatch {
+        authorized: session_document::SessionDocumentKey,
+        applied_to: session_document::SessionDocumentKey,
+    },
 }
 
 /// Ordered, append-only committed model-routing control history.
@@ -599,13 +621,23 @@ impl SessionModelRoutingControlHistory {
     /// Terminalize every still-waiting request at an authoritative session
     /// boundary, returning the records that were appended.
     ///
-    /// The `authorization` argument is the whole point: only generated
-    /// session-document archive authority can mint one, so no surface can
-    /// hand-append an abandon record.
+    /// `document` is the session this history belongs to. A capability minted
+    /// by archiving some OTHER document is refused: an unforgeable capability
+    /// with no subject would still let a caller archive a throwaway document
+    /// and use the result to destroy a live session's owed handoff.
     pub fn terminalize_awaiting_for_boundary(
         &mut self,
+        document: &session_document::SessionDocumentKey,
         authorization: &SessionArchiveControlTerminalizationAuthorization,
-    ) -> Vec<SessionModelRoutingControlRecord> {
+    ) -> Result<Vec<SessionModelRoutingControlRecord>, ModelRoutingControlAppendError> {
+        if authorization.document() != document {
+            return Err(
+                ModelRoutingControlAppendError::BoundaryAuthorizationSubjectMismatch {
+                    authorized: authorization.document().clone(),
+                    applied_to: document.clone(),
+                },
+            );
+        }
         let reason = authorization.reason();
         let pending: Vec<SessionModelRoutingControlRecord> = self
             .awaiting_decision()
@@ -627,6 +659,6 @@ impl SessionModelRoutingControlHistory {
                 appended.push(record);
             }
         }
-        appended
+        Ok(appended)
     }
 }

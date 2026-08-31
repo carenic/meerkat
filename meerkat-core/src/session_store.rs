@@ -312,6 +312,11 @@ pub fn append_only_save_guard_with_witness(
             reason: format!("previous transcript history state is malformed: {err}"),
         }
     })?;
+    validate_model_routing_control_transition(
+        incoming.id(),
+        incoming.model_routing_control(),
+        previous.model_routing_control(),
+    )?;
     let incoming_has_history = incoming_state.is_some();
     if previous_state.is_some() && !incoming_has_history {
         return Err(SessionStoreError::InvalidTranscriptRewrite {
@@ -1133,6 +1138,11 @@ pub fn transcript_rewrite_save_guard(
             ),
         });
     }
+    validate_model_routing_control_transition(
+        incoming.id(),
+        incoming.model_routing_control(),
+        previous.model_routing_control(),
+    )?;
     let previous_revision = previous.transcript_revision().map_err(|err| {
         SessionStoreError::InvalidTranscriptRewrite {
             id: incoming.id().clone(),
@@ -3363,6 +3373,14 @@ impl PreparedHeadCanonicalMutation {
                     ),
                 });
             }
+            // Defense in depth: the prepared head-canonical mutation derives a
+            // successor from the live session, so it must also refuse a
+            // successor whose handoff log does not extend the observed head's.
+            validate_model_routing_control_transition(
+                session.id(),
+                session.model_routing_control(),
+                &head.model_routing_control,
+            )?;
             if head.realtime_event_prefix.as_ref() != Some(&acknowledged_realtime) {
                 return Err(SessionStoreError::TranscriptContinuityViolation {
                     id: session.id().clone(),
@@ -5453,12 +5471,6 @@ pub fn head_canonical_plain_save_guard_with_prefix_witness(
     })
 }
 
-/// Shared `save_head` transition validator so guard semantics stay uniform
-/// across [`IncrementalSessionStore`] backends.
-///
-/// `stored` is the current row plus its CAS token; `new_strand_len` is the
-/// persisted row count of `head.strand`; `recorded_rewrites` is the total
-/// number of recorded rewrite rows (adopted + unadopted).
 /// Refuse a durable transition that does not extend the committed
 /// model-routing handoff log.
 ///
@@ -5498,6 +5510,12 @@ fn validate_model_routing_control_extension(
     )
 }
 
+/// Shared `save_head` transition validator so guard semantics stay uniform
+/// across [`IncrementalSessionStore`] backends.
+///
+/// `stored` is the current row plus its CAS token; `new_strand_len` is the
+/// persisted row count of `head.strand`; `recorded_rewrites` is the total
+/// number of recorded rewrite rows (adopted + unadopted).
 pub fn validate_save_head_transition(
     head: &SessionHead,
     stored: Option<(&SessionHead, &str)>,
@@ -9328,7 +9346,7 @@ mod tests {
             let run = RunId::new();
             let request = |model: &str| {
                 SessionModelRoutingControlRecord::request(
-                    request_id.clone(),
+                    request_id,
                     run.clone(),
                     SwitchTurnIntent {
                         target_model: ModelId::new(model),
