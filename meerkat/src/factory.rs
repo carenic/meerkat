@@ -7474,6 +7474,18 @@ impl AgentFactory {
     }
 }
 
+/// The live A→B `brain_swap` proof over the real runtime loop.
+///
+/// It lives inside this module rather than in `meerkat/tests/` because the
+/// availability logic it must NOT bypass reads the factory's own provider
+/// registry: proving the ordinary registration path requires substituting a
+/// credential-free provider runtime in that private slot, and exposing a
+/// public setter purely to let a test reach it would widen the production
+/// surface for no production reason.
+#[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod brain_swap_runtime_loop_ab_tests;
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[allow(clippy::items_after_test_module)]

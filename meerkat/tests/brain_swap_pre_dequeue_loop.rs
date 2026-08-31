@@ -1,32 +1,40 @@
-//! The pre-dequeue hook, proven through the real runtime loop.
+//! The pre-dequeue hook's fail-closed half, proven through the real runtime
+//! loop.
 //!
-//! Every other test in this feature drives realization by calling the runtime
-//! method directly. That leaves one thing unproven and it is the thing most
-//! likely to silently rot: whether the runtime LOOP actually invokes the hook,
-//! at the right point, before it serves the next input.
+//! The positive half — a committed `brain_swap` request actually moving the
+//! next provider call from model A to model B, under both WholeBlob and
+//! HeadCanonical — lives in
+//! `meerkat/src/factory/brain_swap_runtime_loop_ab_tests.rs`. It has to live
+//! in-crate because proving the ORDINARY registration path means substituting
+//! a credential-free provider runtime in the factory's own private registry
+//! slot, which no external test can reach and which no production caller needs
+//! a setter for.
 //!
-//! This file builds a real runtime-backed service over a real realm, runs a
-//! real turn to obtain a real committed boundary receipt, writes a committed
-//! `Requested` record bound to that exact run, and then submits the next input
-//! through the ordinary admission path. Nothing here calls the realization
-//! method.
+//! This file proves the other half, which no positive test can: what happens
+//! when a committed request CANNOT be proven. It builds a real runtime-backed
+//! service over a real realm, runs a real turn to obtain a real committed
+//! boundary receipt, writes a committed `Requested` record bound to a run that
+//! never committed anything, and then submits the next input through the
+//! ordinary admission path. Nothing here calls the realization method.
 //!
-//! # What this cannot prove, and why
+//! # Why the seeding is out of band, and what that costs
 //!
-//! It cannot show the next provider call landing on model B. Reaching that
-//! requires the `brain_swap` builtin to be registered, which requires a
-//! non-empty proven-availability set, which requires the session to resolve a
-//! real provider client. Supplying a mock through `default_llm_client` sets
-//! `llm_client_override`, and the factory deliberately advertises NO models in
-//! that case — a client override means the session is not talking to a
-//! registry-resolved provider, so no catalog model is provably reachable. The
-//! mock that would make the test convenient is exactly what makes the feature
-//! correctly unavailable. Proving the B call therefore needs live credentials,
-//! not a better fixture.
+//! The only in-band writer of a committed request is the `brain_swap` builtin,
+//! and it commits the request AS PART OF the originating run's clean boundary.
+//! An unprovable request is therefore not constructible in band by
+//! construction: the thing that makes it unprovable is the absence of the very
+//! boundary that would have written it. Seeding it out of band is the only way
+//! to reach this state, and it is a property of the state, not of the feature.
 //!
-//! What it does prove is the load-bearing half: a committed request reaches the
-//! loop, the loop acts on it before admitting work, and when realization cannot
-//! complete the pending input is NOT served under the old identity.
+//! That constraint is also why only HeadCanonical is covered here. WholeBlob
+//! refuses an ordinary session write that would re-encode a store-owned
+//! provisional candidate, so the out-of-band persist fails with
+//! `ordinary WholeBlob write cannot bypass or re-encode a store-owned
+//! provisional candidate` before the handoff is ever consulted. A WholeBlob
+//! row here would then pass for entirely the wrong reason — a store-authority
+//! conflict this fixture manufactured, not the pre-dequeue hold — which is
+//! worse than no coverage. WholeBlob's in-band coverage is the A→B proof named
+//! above.
 
 #![cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
@@ -119,18 +127,10 @@ fn until_changed_model_intent(target: &str) -> SwitchTurnIntent {
 /// A committed request whose originating run never committed a boundary must
 /// hold, and the hold must block the pending input rather than serving it.
 ///
-/// `seed_before_first_turn` exists because the two backends tolerate different
-/// seeding. HeadCanonical accepts an out-of-band persist between turns, so the
-/// stronger shape runs there: one healthy turn first, proving the loop was fine
-/// until the handoff appeared. WholeBlob refuses an ordinary write that would
-/// re-encode a store-owned provisional candidate, so its request must be seeded
-/// before any turn has produced one. That is a constraint on how this test can
-/// plant the record, not on the feature: in production the record is appended
-/// inside the run and committed by the ordinary boundary, never out of band.
-async fn uncommitted_origin_blocks_the_next_input(
-    backend: meerkat_store::RealmBackend,
-    seed_before_first_turn: bool,
-) {
+/// One healthy turn runs first, so the fixture also shows the loop was fine
+/// until the unprovable handoff appeared: the second input is not blocked by
+/// anything this harness did to the session, only by the seeded record.
+async fn uncommitted_origin_blocks_the_next_input(backend: meerkat_store::RealmBackend) {
     let temp = tempfile::tempdir().expect("tempdir");
     let (service, adapter) = build_service(temp.path(), backend).await;
 
@@ -154,13 +154,11 @@ async fn uncommitted_origin_blocks_the_next_input(
         .expect("attach executor");
 
     // One ordinary turn proves the loop is healthy before the handoff exists.
-    if !seed_before_first_turn {
-        let first = run_prompt(&adapter, &session_id, "first").await;
-        assert!(
-            matches!(first, CompletionOutcome::Completed(_)),
-            "the baseline turn must complete: {first:?}"
-        );
-    }
+    let first = run_prompt(&adapter, &session_id, "first").await;
+    assert!(
+        matches!(first, CompletionOutcome::Completed(_)),
+        "the baseline turn must complete: {first:?}"
+    );
 
     // Seed a committed request bound to a run that never committed anything.
     let orphan_run = RunId::new();
@@ -192,21 +190,5 @@ async fn uncommitted_origin_blocks_the_next_input(
 
 #[tokio::test]
 async fn head_canonical_uncommitted_origin_blocks_the_next_input() {
-    uncommitted_origin_blocks_the_next_input(meerkat_store::RealmBackend::Sqlite, false).await;
+    uncommitted_origin_blocks_the_next_input(meerkat_store::RealmBackend::Sqlite).await;
 }
-
-// WholeBlob (jsonl) is NOT covered here, and the omission is deliberate.
-//
-// This test has to plant a committed request out of band, because the only
-// in-band writer is the `brain_swap` builtin, which cannot be registered under
-// a mock client. WholeBlob refuses an ordinary session write that would
-// re-encode a store-owned provisional candidate, so the out-of-band persist
-// poisons the next boundary commit with
-// `ordinary WholeBlob write cannot bypass or re-encode a store-owned
-// provisional candidate` — before the handoff is ever consulted.
-//
-// A test asserting "the next input was not served" would then pass for
-// entirely the wrong reason: the input fails on a store-authority conflict
-// this fixture manufactured, not on the pre-dequeue hold. That is worse than
-// no coverage, so there is none. Covering WholeBlob honestly requires the
-// builtin to be registered, which requires live provider credentials.
