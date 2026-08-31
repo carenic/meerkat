@@ -63,6 +63,7 @@ pub struct OpenAiClient {
     /// invocation. Used for ExternalAuthorizer flows that produce a
     /// DynamicAuthorizer envelope (host-managed OAuth refresh, etc.).
     authorizer: Option<std::sync::Arc<dyn meerkat_core::HttpAuthorizer>>,
+    supports_image_input: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,46 +132,50 @@ fn web_search_message_annotations(value: &Value) -> Option<Vec<Value>> {
     (!web_citations.is_empty()).then_some(web_citations)
 }
 
-fn project_openai_content_blocks(blocks: &[ContentBlock]) -> Vec<ContentBlock> {
+fn project_openai_content_blocks(
+    replay_application: &mut meerkat_core::ReplayApplication<'_>,
+    message: meerkat_core::ReplayMessageIndex,
+    blocks: &[ContentBlock],
+) -> Result<Vec<ContentBlock>, LlmError> {
     blocks
         .iter()
-        .map(|block| match block {
-            ContentBlock::Text { .. } => block.clone(),
-            ContentBlock::Image {
-                data: ImageData::Inline { .. },
-                ..
-            } => block.clone(),
-            ContentBlock::Image { .. } | ContentBlock::Video { .. } => ContentBlock::Text {
-                text: block.text_projection().into_owned(),
-            },
-            _ => ContentBlock::Text {
-                text: block.text_projection().into_owned(),
-            },
+        .enumerate()
+        .map(|(block_index, block)| {
+            let subject = meerkat_core::ReplaySubject::UserContent {
+                message,
+                block: meerkat_core::ReplayUserContentIndex(block_index),
+            };
+            let projected = match replay_application
+                .next(subject)
+                .map_err(|error| invalid_replay(error.to_string()))?
+            {
+                meerkat_core::ReplayDisposition::Preserve => block.clone(),
+                meerkat_core::ReplayDisposition::LowerToText => ContentBlock::Text {
+                    text: block.text_projection().into_owned(),
+                },
+                disposition => {
+                    return Err(invalid_replay(format!(
+                        "OpenAI replay cannot apply user-content disposition {disposition:?}"
+                    )));
+                }
+            };
+            replay_application
+                .record_content(subject, block, &projected)
+                .map_err(|error| invalid_replay(error.to_string()))?;
+            Ok(projected)
         })
         .collect()
 }
 
 fn project_openai_tool_result(
+    replay_application: &mut meerkat_core::ReplayApplication<'_>,
+    message: meerkat_core::ReplayMessageIndex,
+    result_index: meerkat_core::ReplayToolResultIndex,
     result: &ToolResult,
-    image_tool_results: bool,
 ) -> Result<ToolResult, LlmError> {
-    if result.has_video() {
-        return Err(invalid_replay(
-            "video blocks are not supported in OpenAI tool results",
-        ));
-    }
-    if !image_tool_results {
-        return Ok(ToolResult::new(
-            result.tool_use_id.clone(),
-            result.text_content(),
-            result.is_error,
-        ));
-    }
-    Ok(ToolResult::with_blocks(
-        result.tool_use_id.clone(),
-        project_openai_content_blocks(&result.content),
-        result.is_error,
-    ))
+    replay_application
+        .project_tool_result(message, result_index, result)
+        .map_err(|error| invalid_replay(error.to_string()))
 }
 
 fn openai_reasoning_replayable(
@@ -273,103 +278,114 @@ fn openai_continuation_plan(request: &LlmRequest) -> Option<OpenAiContinuationPl
 }
 
 fn project_openai_assistant_blocks(
+    replay_application: &mut meerkat_core::ReplayApplication<'_>,
+    message: meerkat_core::ReplayMessageIndex,
     mode: OpenAiReplayProjectionMode,
     blocks: &[AssistantBlock],
-) -> Vec<AssistantBlock> {
+) -> Result<Vec<AssistantBlock>, LlmError> {
     let mut projected = Vec::with_capacity(blocks.len());
-    let mut has_output_item = false;
+    let has_output_item = blocks.iter().any(|block| match block {
+        AssistantBlock::Text { text, .. } | AssistantBlock::Transcript { text, .. } => {
+            !text.is_empty()
+        }
+        AssistantBlock::ToolUse { .. } => true,
+        AssistantBlock::ServerToolContent { content, .. } => {
+            openai_server_tool_content_replayable(mode, content)
+        }
+        AssistantBlock::Reasoning { .. } | AssistantBlock::Image { .. } => false,
+        _ => false,
+    });
 
-    for block in blocks {
+    for (block_index, block) in blocks.iter().enumerate() {
         let projected_block = match block {
             AssistantBlock::Text { text, .. } if text.is_empty() => None,
             AssistantBlock::Text { .. } | AssistantBlock::ToolUse { .. } => {
-                has_output_item = true;
-                Some(block.clone())
+                Some(meerkat_core::ReplayWireFamily::OpenAi.strip_foreign_metadata(block.clone()))
             }
             // Spoken transcripts replay back to the provider as plain text;
             // OpenAI Responses API sees the assistant's visible output
             // regardless of capture lane.
             AssistantBlock::Transcript { text, .. } if text.is_empty() => None,
-            AssistantBlock::Transcript { text, .. } => {
-                has_output_item = true;
-                Some(AssistantBlock::Text {
-                    text: text.clone(),
-                    meta: None,
-                })
-            }
-            AssistantBlock::Reasoning { meta, .. } if openai_reasoning_replayable(mode, meta) => {
-                Some(block.clone())
+            AssistantBlock::Transcript { text, .. } => Some(AssistantBlock::Text {
+                text: text.clone(),
+                meta: None,
+            }),
+            AssistantBlock::Reasoning { meta, .. }
+                if has_output_item && openai_reasoning_replayable(mode, meta) =>
+            {
+                Some(meerkat_core::ReplayWireFamily::OpenAi.strip_foreign_metadata(block.clone()))
             }
             AssistantBlock::ServerToolContent { content, .. }
                 if openai_server_tool_content_replayable(mode, content) =>
             {
-                has_output_item = true;
-                Some(block.clone())
+                Some(meerkat_core::ReplayWireFamily::OpenAi.strip_foreign_metadata(block.clone()))
             }
             AssistantBlock::Reasoning { .. }
             | AssistantBlock::ServerToolContent { .. }
             | AssistantBlock::Image { .. } => None,
-            _ => None,
+            _ => {
+                return Err(invalid_replay(
+                    "OpenAI replay cannot project an unknown assistant block",
+                ));
+            }
         };
+        replay_application
+            .record_assistant(
+                meerkat_core::ReplaySubject::AssistantBlock {
+                    message,
+                    block: meerkat_core::ReplayAssistantBlockIndex(block_index),
+                },
+                block,
+                projected_block.as_ref(),
+            )
+            .map_err(|error| invalid_replay(error.to_string()))?;
+        let source_meta = meerkat_core::replay_provider_metadata(block);
+        if let Some(meta) = source_meta {
+            replay_application
+                .record_provider_metadata(
+                    meerkat_core::ReplaySubject::ProviderMetadata {
+                        message,
+                        block: meerkat_core::ReplayAssistantBlockIndex(block_index),
+                    },
+                    meta,
+                    block,
+                    projected_block.as_ref(),
+                )
+                .map_err(|error| invalid_replay(error.to_string()))?;
+        }
 
         if let Some(block) = projected_block {
             projected.push(block);
         }
     }
 
-    if has_output_item {
-        projected
-    } else {
-        Vec::new()
-    }
+    Ok(projected)
 }
 
-fn tool_ids_from_assistant(message: &Message) -> HashSet<String> {
-    match message {
-        Message::BlockAssistant(assistant) => assistant
-            .blocks
-            .iter()
-            .filter_map(|block| match block {
-                AssistantBlock::ToolUse { id, .. } => Some(id.clone()),
-                _ => None,
-            })
-            .collect(),
-        _ => HashSet::new(),
-    }
-}
-
-fn validate_tool_results(
-    provider: &str,
-    pending: HashSet<String>,
-    results: &[ToolResult],
-) -> Result<(), LlmError> {
-    let actual: HashSet<String> = results
-        .iter()
-        .map(|result| result.tool_use_id.clone())
-        .collect();
-    if actual == pending {
-        Ok(())
-    } else {
-        Err(invalid_replay(format!(
-            "{provider} replay projection found tool results that are not adjacent to matching tool uses"
-        )))
-    }
-}
-
-pub(crate) fn project_openai_replay_messages(
+#[cfg(test)]
+fn project_openai_replay_messages(
     messages: &[Message],
     mode: OpenAiReplayProjectionMode,
 ) -> Result<Vec<Message>, LlmError> {
-    project_openai_replay_messages_for_capabilities(messages, mode, true)
+    project_openai_replay_messages_for_capabilities(messages, mode, true, true)
 }
 
 pub(crate) fn project_openai_replay_messages_for_capabilities(
     messages: &[Message],
     mode: OpenAiReplayProjectionMode,
+    image_input: bool,
+    image_tool_results: bool,
+) -> Result<Vec<Message>, LlmError> {
+    project_openai_replay_messages_for_target(messages, mode, image_input, image_tool_results)
+}
+
+pub(crate) fn project_openai_replay_messages_for_target(
+    messages: &[Message],
+    mode: OpenAiReplayProjectionMode,
+    image_input: bool,
     image_tool_results: bool,
 ) -> Result<Vec<Message>, LlmError> {
     let mut projected = Vec::with_capacity(messages.len());
-    let mut pending_tool_ids: Option<HashSet<String>> = None;
     // Responses can now accept image parts in `function_call_output.output`.
     // This projection intentionally preserves inline tool-result images across
     // the replayed history for capable models, matching Anthropic semantics.
@@ -377,22 +393,66 @@ pub(crate) fn project_openai_replay_messages_for_capabilities(
     // fresh-vs-historical projection policy instead of changing this default.
     let image_tool_results =
         matches!(mode, OpenAiReplayProjectionMode::Responses) && image_tool_results;
+    let replay_plan = meerkat_core::ReplayPlan::build(
+        messages,
+        meerkat_core::ReplayTarget::new(
+            meerkat_core::ReplayWireFamily::OpenAi,
+            image_input,
+            false,
+            image_tool_results,
+            if image_tool_results {
+                meerkat_core::ReplayToolResultProjection::PreserveBlocks
+            } else {
+                meerkat_core::ReplayToolResultProjection::CollapseToText
+            },
+            match mode {
+                OpenAiReplayProjectionMode::Responses => {
+                    meerkat_core::ReplayReasoningProjection::ProviderNative
+                }
+                OpenAiReplayProjectionMode::ChatCompletions => {
+                    meerkat_core::ReplayReasoningProjection::Omit
+                }
+            },
+        ),
+    )
+    .map_err(|error| invalid_replay(error.to_string()))?;
+    let mut replay_application = replay_plan.application();
 
-    for message in messages {
+    for (message_index, message) in messages.iter().enumerate() {
+        let message_index = meerkat_core::ReplayMessageIndex(message_index);
+        if let Message::SystemNotice(notice) = message {
+            let projected_notice = replay_application
+                .project_system_notice(message_index, notice)
+                .map_err(|error| invalid_replay(error.to_string()))?;
+            projected.push(Message::SystemNotice(projected_notice));
+            continue;
+        }
+        replay_application
+            .record_message(
+                meerkat_core::ReplaySubject::Message(message_index),
+                message,
+                match message {
+                    Message::System(_) => Some(message),
+                    _ => None,
+                },
+            )
+            .map_err(|error| invalid_replay(error.to_string()))?;
         if let Message::ToolResults {
             results,
             created_at,
         } = message
         {
-            let Some(pending) = pending_tool_ids.take() else {
-                return Err(invalid_replay(
-                    "OpenAI replay projection found tool results without preceding tool use",
-                ));
-            };
-            validate_tool_results("OpenAI", pending, results)?;
             let results = results
                 .iter()
-                .map(|result| project_openai_tool_result(result, image_tool_results))
+                .enumerate()
+                .map(|(result_index, result)| {
+                    project_openai_tool_result(
+                        &mut replay_application,
+                        message_index,
+                        meerkat_core::ReplayToolResultIndex(result_index),
+                        result,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             projected.push(Message::ToolResults {
                 results,
@@ -402,16 +462,26 @@ pub(crate) fn project_openai_replay_messages_for_capabilities(
         }
 
         let next_message = match message {
-            Message::System(_) | Message::SystemNotice(_) => Some(message.clone()),
+            Message::System(_) => Some(message.clone()),
+            Message::SystemNotice(_) => unreachable!("handled above"),
             Message::User(user) => Some(Message::User(UserMessage {
-                content: project_openai_content_blocks(&user.content),
+                content: project_openai_content_blocks(
+                    &mut replay_application,
+                    message_index,
+                    &user.content,
+                )?,
                 render_metadata: user.render_metadata.clone(),
                 identity: user.identity.clone(),
                 transcript_role: user.transcript_role,
                 created_at: user.created_at,
             })),
             Message::BlockAssistant(assistant) => {
-                let blocks = project_openai_assistant_blocks(mode, &assistant.blocks);
+                let blocks = project_openai_assistant_blocks(
+                    &mut replay_application,
+                    message_index,
+                    mode,
+                    &assistant.blocks,
+                )?;
                 if blocks.is_empty() {
                     None
                 } else {
@@ -429,26 +499,12 @@ pub(crate) fn project_openai_replay_messages_for_capabilities(
         let Some(message) = next_message else {
             continue;
         };
-
-        if pending_tool_ids.is_some() {
-            return Err(invalid_replay(
-                "OpenAI replay projection found a tool use without adjacent tool results",
-            ));
-        }
-
-        let tool_ids = tool_ids_from_assistant(&message);
-        if !tool_ids.is_empty() {
-            pending_tool_ids = Some(tool_ids);
-        }
         projected.push(message);
     }
 
-    if pending_tool_ids.is_some() {
-        return Err(invalid_replay(
-            "OpenAI replay projection found a trailing tool use without tool results",
-        ));
-    }
-
+    replay_plan
+        .validate_projected(messages, &projected, replay_application)
+        .map_err(|error| invalid_replay(error.to_string()))?;
     Ok(projected)
 }
 
@@ -501,6 +557,7 @@ impl OpenAiClient {
             http,
             extra_headers: Vec::new(),
             authorizer: None,
+            supports_image_input: true,
         }
     }
 
@@ -542,6 +599,12 @@ impl OpenAiClient {
         authorizer: std::sync::Arc<dyn meerkat_core::HttpAuthorizer>,
     ) -> Self {
         self.authorizer = Some(authorizer);
+        self
+    }
+
+    #[must_use]
+    pub fn with_image_input_support(mut self, supports_image_input: bool) -> Self {
+        self.supports_image_input = supports_image_input;
         self
     }
 
@@ -636,7 +699,7 @@ impl OpenAiClient {
     }
 
     /// Build request body for OpenAI Responses API
-    fn build_request_body(&self, request: &LlmRequest) -> Result<Value, LlmError> {
+    pub(crate) fn build_request_body(&self, request: &LlmRequest) -> Result<Value, LlmError> {
         let author_explicit_breakpoints = openai_tag(request).is_some_and(|tag| {
             tag.prompt_cache_enabled != Some(false)
                 && tag.prompt_cache_options.is_some_and(|options| {
@@ -2164,7 +2227,12 @@ fn ensure_additional_properties_false(value: &mut Value) {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl LlmClient for OpenAiClient {
     fn project_replay_messages(&self, messages: &[Message]) -> Result<Vec<Message>, LlmError> {
-        project_openai_replay_messages(messages, OpenAiReplayProjectionMode::Responses)
+        project_openai_replay_messages_for_capabilities(
+            messages,
+            OpenAiReplayProjectionMode::Responses,
+            self.supports_image_input,
+            true,
+        )
     }
 
     fn request_pressure(
@@ -3269,6 +3337,12 @@ mod tests {
                             response_id: None,
                         })),
                     },
+                    AssistantBlock::Reasoning {
+                        text: "foreign reasoning".to_string(),
+                        meta: Some(Box::new(ProviderMeta::Anthropic {
+                            signature: "signature".to_string(),
+                        })),
+                    },
                     AssistantBlock::ServerToolContent {
                         id: Some("ws_status".to_string()),
                         kind: ServerToolKind::WebSearch,
@@ -3326,6 +3400,10 @@ mod tests {
                 ],
                 false,
             )]),
+            Message::SystemNotice(SystemNoticeMessage::new(
+                meerkat_core::SystemNoticeKind::Generic,
+                "control intent",
+            )),
         ];
 
         let projected = client.project_replay_messages(&messages)?;
@@ -3357,6 +3435,10 @@ mod tests {
                 .any(|block| matches!(block, AssistantBlock::Reasoning { .. })),
             "OpenAI Responses replay projection should keep OpenAI reasoning blocks"
         );
+        assert!(!assistant.blocks.iter().any(|block| matches!(
+            block,
+            AssistantBlock::Reasoning { text, .. } if text == "foreign reasoning"
+        )));
         assert!(assistant.blocks.iter().any(|block| matches!(
             block,
             AssistantBlock::ServerToolContent { content, .. }
@@ -3422,6 +3504,31 @@ mod tests {
         assert_eq!(output[0]["text"], "tool text");
         assert_eq!(output[1]["type"], "input_image");
         assert_eq!(output[1]["image_url"], "data:image/png;base64,CCCC");
+        assert!(matches!(projected[3], Message::SystemNotice(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn non_vision_openai_replay_lowers_inline_images_to_text()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let client = OpenAiClient::new("test-key".to_string()).with_image_input_support(false);
+        let messages = vec![Message::User(UserMessage::with_blocks(vec![
+            ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: ImageData::Inline {
+                    data: "AAAA".to_string(),
+                },
+            },
+        ]))];
+
+        let projected = client.project_replay_messages(&messages)?;
+        let Message::User(user) = &projected[0] else {
+            return Err("expected projected user message".into());
+        };
+        assert!(matches!(
+            user.content.as_slice(),
+            [ContentBlock::Text { .. }]
+        ));
         Ok(())
     }
 
@@ -7887,7 +7994,7 @@ mod tests {
         };
 
         let client = OpenAiClient::new("test-key".to_string());
-        let request = LlmRequest::new(
+        let mut request = LlmRequest::new(
             "gpt-5.4",
             vec![Message::SystemNotice(SystemNoticeMessage::with_block(
                 SystemNoticeKind::Comms,
@@ -7919,6 +8026,9 @@ mod tests {
                 },
             ))],
         );
+        request.messages = client
+            .project_replay_messages(&request.messages)
+            .expect("project system notice");
 
         let body = client.build_request_body(&request).expect("build request");
         let input = body["input"].as_array().expect("input array");
@@ -8104,5 +8214,137 @@ mod tests {
         let tools = body["tools"].as_array().expect("tools should be array");
         assert_eq!(tools.len(), 1, "should only have the regular tool");
         assert_eq!(tools[0]["type"], "function");
+    }
+
+    #[tokio::test]
+    async fn stream_dispatch_applies_non_vision_replay_to_captured_request() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let payload = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+            "data: {\"type\":\"response.done\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+        )
+        .to_string();
+        let (base_url, server) =
+            spawn_openai_stub_server_with_body(payload, Arc::clone(&seen)).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url)
+            .with_image_input_support(false);
+        let request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::SystemNotice(SystemNoticeMessage::with_block(
+                meerkat_core::SystemNoticeKind::ExternalEvent,
+                None,
+                SystemNoticeBlock::ExternalEvent {
+                    source: "console".to_string(),
+                    event_type: "operator_message".to_string(),
+                    summary: None,
+                    body: Some("inspect this".to_string()),
+                    payload: None,
+                    content: vec![ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        data: ImageData::Inline {
+                            data: "NESTED_IMAGE_BYTES".to_string(),
+                        },
+                    }],
+                },
+            ))],
+        );
+
+        let events = client.stream(&request).collect::<Vec<_>>().await;
+        assert!(events.iter().all(Result::is_ok));
+        let bodies = seen.lock().expect("request body capture lock");
+        assert_eq!(bodies.len(), 1);
+        let encoded = serde_json::to_string(&bodies[0]).expect("encode captured request");
+        assert!(!encoded.contains("NESTED_IMAGE_BYTES"));
+        assert!(!encoded.contains("input_image"));
+        assert!(encoded.contains("[image: image/png]"));
+        server.abort();
+    }
+
+    #[test]
+    fn replay_projection_rejects_duplicate_tool_use_ids() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let args = serde_json::value::RawValue::from_string("{}".to_string())
+            .unwrap_or_else(|error| panic!("test args: {error}"));
+        let messages = [
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![
+                    AssistantBlock::ToolUse {
+                        id: "duplicate".to_string(),
+                        name: "a".to_string(),
+                        args: args.clone(),
+                        meta: None,
+                    },
+                    AssistantBlock::ToolUse {
+                        id: "duplicate".to_string(),
+                        name: "b".to_string(),
+                        args,
+                        meta: None,
+                    },
+                ],
+                StopReason::ToolUse,
+            )),
+            Message::tool_results(vec![ToolResult::new(
+                "duplicate".to_string(),
+                "result".to_string(),
+                false,
+            )]),
+        ];
+        assert!(matches!(
+            client.project_replay_messages(&messages),
+            Err(LlmError::InvalidRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn replay_projection_rejects_duplicate_tool_result_ids() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let args = serde_json::value::RawValue::from_string("{}".to_string())
+            .unwrap_or_else(|error| panic!("test args: {error}"));
+        let messages = [
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::ToolUse {
+                    id: "tool".to_string(),
+                    name: "a".to_string(),
+                    args,
+                    meta: None,
+                }],
+                StopReason::ToolUse,
+            )),
+            Message::tool_results(vec![
+                ToolResult::new("tool".to_string(), "first".to_string(), false),
+                ToolResult::new("tool".to_string(), "second".to_string(), false),
+            ]),
+        ];
+        assert!(matches!(
+            client.project_replay_messages(&messages),
+            Err(LlmError::InvalidRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn replay_projection_rejects_mismatched_tool_result_id() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let args = serde_json::value::RawValue::from_string("{}".to_string())
+            .unwrap_or_else(|error| panic!("test args: {error}"));
+        let messages = [
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::ToolUse {
+                    id: "tool".to_string(),
+                    name: "a".to_string(),
+                    args,
+                    meta: None,
+                }],
+                StopReason::ToolUse,
+            )),
+            Message::tool_results(vec![ToolResult::new(
+                "other".to_string(),
+                "result".to_string(),
+                false,
+            )]),
+        ];
+        assert!(matches!(
+            client.project_replay_messages(&messages),
+            Err(LlmError::InvalidRequest { .. })
+        ));
     }
 }

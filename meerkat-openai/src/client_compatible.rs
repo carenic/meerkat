@@ -92,6 +92,7 @@ pub struct OpenAiCompatibleClient {
     supports_temperature: bool,
     supports_thinking: bool,
     supports_reasoning: bool,
+    supports_image_input: bool,
     supports_image_tool_results: bool,
     post_finish_trailer_window: Duration,
 }
@@ -147,6 +148,7 @@ impl OpenAiCompatibleClient {
             supports_temperature: options.supports_temperature,
             supports_thinking: options.supports_thinking,
             supports_reasoning: options.supports_reasoning,
+            supports_image_input: true,
             supports_image_tool_results: options.supports_image_tool_results,
             post_finish_trailer_window: DEFAULT_POST_FINISH_TRAILER_WINDOW,
         }
@@ -163,6 +165,12 @@ impl OpenAiCompatibleClient {
 
     pub fn with_provider(mut self, provider: Provider) -> Self {
         self.provider = provider;
+        self
+    }
+
+    #[must_use]
+    pub fn with_image_input_support(mut self, supports_image_input: bool) -> Self {
+        self.supports_image_input = supports_image_input;
         self
     }
 
@@ -676,6 +684,7 @@ impl LlmClient for OpenAiCompatibleClient {
         project_openai_replay_messages_for_capabilities(
             messages,
             mode,
+            self.supports_image_input,
             self.supports_image_tool_results,
         )
     }
@@ -1350,7 +1359,7 @@ struct ChatPromptTokensDetails {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use axum::body::to_bytes;
@@ -1468,6 +1477,34 @@ mod tests {
             axum::serve(listener, app).await.expect("serve test server");
         });
         (format!("http://{addr}/v1"), handle)
+    }
+
+    async fn spawn_compatible_replay_capture_server(
+        mode: OpenAiCompatibleMode,
+        payload: String,
+    ) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+        let request_bodies = Arc::new(Mutex::new(Vec::new()));
+        let route = match mode {
+            OpenAiCompatibleMode::Responses => "/v1/responses",
+            OpenAiCompatibleMode::ChatCompletions => "/v1/chat/completions",
+        };
+        let app = Router::new()
+            .route(route, post(responses_sse))
+            .with_state(ResponsesStubState {
+                payload,
+                auth_headers: Arc::new(Mutex::new(Vec::new())),
+                request_bodies: Arc::clone(&request_bodies),
+            });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind replay capture server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve replay capture server");
+        });
+        (format!("http://{addr}/v1"), request_bodies, handle)
     }
 
     #[derive(Clone)]
@@ -1765,8 +1802,16 @@ mod tests {
     fn chat_completions_system_notice_with_image_emits_typed_image_part() {
         use meerkat_core::{ContentBlock, ImageData, SystemNoticeKind, SystemNoticeMessage};
 
-        let messages = OpenAiCompatibleClient::convert_to_chat_messages(&[Message::SystemNotice(
-            SystemNoticeMessage::with_block(
+        let client = OpenAiCompatibleClient::new_with_options(
+            OpenAiCompatibleMode::ChatCompletions,
+            "remote-model".to_string(),
+            "https://example.test".to_string(),
+            None,
+            options(true, true, true, true),
+        )
+        .with_image_input_support(true);
+        let projected = client
+            .project_replay_messages(&[Message::SystemNotice(SystemNoticeMessage::with_block(
                 SystemNoticeKind::ExternalEvent,
                 None,
                 SystemNoticeBlock::ExternalEvent {
@@ -1782,9 +1827,10 @@ mod tests {
                         },
                     }],
                 },
-            ),
-        )])
-        .expect("convert chat messages");
+            ))])
+            .expect("project chat messages");
+        let messages =
+            OpenAiCompatibleClient::convert_to_chat_messages(&projected).expect("convert chat");
 
         assert_eq!(messages[0]["role"], "user");
         let content = messages[0]["content"].as_array().expect("content array");
@@ -3094,5 +3140,228 @@ mod tests {
             value["properties"]["outer"]["properties"]["inner"]["additionalProperties"],
             Value::Bool(false)
         );
+    }
+
+    #[test]
+    fn self_hosted_replay_uses_openai_wire_family_for_metadata() {
+        use meerkat_core::ProviderMeta;
+
+        let client = OpenAiCompatibleClient::new_with_options(
+            OpenAiCompatibleMode::Responses,
+            "remote-model".to_string(),
+            "https://example.test".to_string(),
+            None,
+            options(true, true, true, true),
+        );
+        assert_eq!(client.provider(), Provider::SelfHosted);
+        let messages = vec![Message::BlockAssistant(BlockAssistantMessage::new(
+            vec![
+                AssistantBlock::Text {
+                    text: "visible".to_string(),
+                    meta: None,
+                },
+                AssistantBlock::Reasoning {
+                    text: "openai".to_string(),
+                    meta: Some(Box::new(ProviderMeta::OpenAi {
+                        id: "rs_1".to_string(),
+                        encrypted_content: Some("ciphertext".to_string()),
+                        phase: Some("reasoning".to_string()),
+                        response_id: None,
+                    })),
+                },
+                AssistantBlock::Reasoning {
+                    text: "anthropic".to_string(),
+                    meta: Some(Box::new(ProviderMeta::Anthropic {
+                        signature: "foreign".to_string(),
+                    })),
+                },
+                AssistantBlock::Reasoning {
+                    text: "gemini".to_string(),
+                    meta: Some(Box::new(ProviderMeta::Gemini {
+                        thought_signature: "foreign".to_string(),
+                    })),
+                },
+            ],
+            StopReason::EndTurn,
+        ))];
+
+        let projected = client
+            .project_replay_messages(&messages)
+            .expect("SelfHosted OpenAI-family projection");
+        let Message::BlockAssistant(assistant) = &projected[0] else {
+            panic!("expected projected assistant message");
+        };
+        assert_eq!(assistant.blocks.len(), 2);
+        assert!(
+            matches!(assistant.blocks[1], AssistantBlock::Reasoning { meta: Some(ref meta), .. } if matches!(meta.as_ref(), ProviderMeta::OpenAi { .. }))
+        );
+        assert!(assistant.blocks.iter().all(|block| !matches!(
+            block,
+            AssistantBlock::Reasoning { text, .. } if text == "anthropic" || text == "gemini"
+        )));
+    }
+
+    #[test]
+    fn non_vision_self_hosted_replay_lowers_inline_images_to_text() {
+        let client = OpenAiCompatibleClient::new_with_options(
+            OpenAiCompatibleMode::Responses,
+            "remote-model".to_string(),
+            "https://example.test".to_string(),
+            None,
+            options(true, true, true, true),
+        )
+        .with_image_input_support(false);
+        let messages = vec![Message::User(UserMessage::with_blocks(vec![
+            ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: ImageData::Inline {
+                    data: "AAAA".to_string(),
+                },
+            },
+        ]))];
+
+        let projected = client
+            .project_replay_messages(&messages)
+            .expect("non-vision SelfHosted replay should lower image history");
+        let Message::User(user) = &projected[0] else {
+            panic!("expected projected user message");
+        };
+        assert!(matches!(
+            user.content.as_slice(),
+            [ContentBlock::Text { .. }]
+        ));
+    }
+
+    async fn assert_compatible_dispatch_strips_nested_image(mode: OpenAiCompatibleMode) {
+        use meerkat_core::{SystemNoticeKind, SystemNoticeMessage};
+
+        let payload = match mode {
+            OpenAiCompatibleMode::Responses => concat!(
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+                "data: {\"type\":\"response.done\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+            ),
+            OpenAiCompatibleMode::ChatCompletions => concat!(
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+        }
+        .to_string();
+        let (base_url, request_bodies, server) =
+            spawn_compatible_replay_capture_server(mode, payload).await;
+        let client = OpenAiCompatibleClient::new_with_options(
+            mode,
+            "remote-model".to_string(),
+            base_url,
+            None,
+            options(true, true, true, true),
+        )
+        .with_image_input_support(false);
+        let request = LlmRequest::new(
+            "remote-model",
+            vec![Message::SystemNotice(SystemNoticeMessage::with_block(
+                SystemNoticeKind::ExternalEvent,
+                None,
+                SystemNoticeBlock::ExternalEvent {
+                    source: "console".to_string(),
+                    event_type: "operator_message".to_string(),
+                    summary: None,
+                    body: Some("inspect this".to_string()),
+                    payload: None,
+                    content: vec![ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        data: ImageData::Inline {
+                            data: "NESTED_IMAGE_BYTES".to_string(),
+                        },
+                    }],
+                },
+            ))],
+        );
+
+        let events = client.stream(&request).collect::<Vec<_>>().await;
+        assert!(events.iter().all(Result::is_ok));
+        let bodies = request_bodies.lock().expect("request body capture lock");
+        assert_eq!(bodies.len(), 1);
+        let encoded = serde_json::to_string(&bodies[0]).expect("encode request body");
+        assert!(!encoded.contains("NESTED_IMAGE_BYTES"));
+        assert!(!encoded.contains("input_image"));
+        assert!(!encoded.contains("image_url"));
+        assert!(encoded.contains("[image: image/png]"));
+        drop(bodies);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn compatible_responses_dispatch_strips_nested_images_from_captured_request() {
+        assert_compatible_dispatch_strips_nested_image(OpenAiCompatibleMode::Responses).await;
+    }
+
+    #[tokio::test]
+    async fn compatible_chat_dispatch_strips_nested_images_from_captured_request() {
+        assert_compatible_dispatch_strips_nested_image(OpenAiCompatibleMode::ChatCompletions).await;
+    }
+
+    #[tokio::test]
+    async fn compatible_stream_dispatch_serializes_exact_collapsed_tool_result() {
+        for mode in [
+            OpenAiCompatibleMode::Responses,
+            OpenAiCompatibleMode::ChatCompletions,
+        ] {
+            let payload = match mode {
+                OpenAiCompatibleMode::Responses => concat!(
+                    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+                    "data: {\"type\":\"response.done\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+                ),
+                OpenAiCompatibleMode::ChatCompletions => concat!(
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            }
+            .to_string();
+            let (base_url, request_bodies, server) =
+                spawn_compatible_replay_capture_server(mode, payload).await;
+            let client = OpenAiCompatibleClient::new_with_options(
+                mode,
+                "remote-model".to_string(),
+                base_url,
+                None,
+                options(true, true, true, false),
+            );
+            let request = LlmRequest::new(
+                "remote-model",
+                vec![
+                    Message::BlockAssistant(BlockAssistantMessage::new(
+                        vec![AssistantBlock::ToolUse {
+                            id: "call-1".to_string(),
+                            name: "lookup".to_string(),
+                            args: serde_json::value::RawValue::from_string("{}".to_string())
+                                .expect("valid tool arguments"),
+                            meta: None,
+                        }],
+                        StopReason::ToolUse,
+                    )),
+                    Message::tool_results(vec![ToolResult::with_blocks(
+                        "call-1".to_string(),
+                        vec![
+                            ContentBlock::Text {
+                                text: "first".to_string(),
+                            },
+                            ContentBlock::Text {
+                                text: "second".to_string(),
+                            },
+                        ],
+                        false,
+                    )]),
+                ],
+            );
+
+            let events = client.stream(&request).collect::<Vec<_>>().await;
+            assert!(events.iter().all(Result::is_ok));
+            let bodies = request_bodies.lock().expect("request body capture lock");
+            assert_eq!(bodies.len(), 1);
+            let encoded = serde_json::to_string(&bodies[0]).expect("encode request body");
+            assert!(encoded.contains("first\\nsecond"));
+            drop(bodies);
+            server.abort();
+        }
     }
 }
