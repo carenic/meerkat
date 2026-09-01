@@ -10602,8 +10602,15 @@ macro_rules! meerkat_catalog_machine_dsl {
         //
         // Guard-fail is the conflict channel: an input that matches no arm is
         // refused by the kernel rather than being silently absorbed.
+        //
+        // Import is admissible while `Retired` because archive-time
+        // terminalization must be able to name a request no runtime ever
+        // imported, and it runs after the durable runtime terminal has
+        // committed. Import alone routes nothing: `Claim` and `Realize` stay
+        // alive-only, so a retired session can reach `Archived` and nothing
+        // else.
         transition ImportCommittedModelRoutingHandoffFirst {
-            per_phase [Idle, Attached, Running]
+            per_phase [Idle, Attached, Running, Retired]
             on input ImportCommittedModelRoutingHandoff {
                 request_id, originating_run_id, target_model
             }
@@ -10623,7 +10630,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         // state: the log is append-only, so every later lap observes the same
         // record again until it terminalizes.
         transition ImportCommittedModelRoutingHandoffAlreadyExact {
-            per_phase [Idle, Attached, Running]
+            per_phase [Idle, Attached, Running, Retired]
             on input ImportCommittedModelRoutingHandoff {
                 request_id, originating_run_id, target_model
             }
@@ -10758,12 +10765,17 @@ macro_rules! meerkat_catalog_machine_dsl {
             to Idle
         }
 
-        // Session lifecycle terminality resolves an unfinished handoff as
-        // generated status. It is deliberately NOT a Session log record: the
-        // log is a handoff outbox written by runs, and a session that ended is
-        // not a run that decided.
+        // Session lifecycle terminality resolves an unfinished handoff. This
+        // transition is the decision; the session-archive shell mirrors it into
+        // the durable log as an exact abandoned record, because generated phase
+        // is in-memory and a restart would otherwise re-owe a request the
+        // session can never serve.
+        //
+        // It runs while `Retired`, after the durable runtime terminal has
+        // committed, so a failed archive can never leave a live session holding
+        // a half-terminal handoff.
         transition ArchiveUnresolvedModelRoutingHandoffPending {
-            per_phase [Idle, Attached, Running, Retired]
+            per_phase [Retired]
             on input ArchiveUnresolvedModelRoutingHandoff { request_id }
             guard "session_registered" { self.session_id != None }
             guard "pending" {
@@ -10779,7 +10791,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         }
 
         transition ArchiveUnresolvedModelRoutingHandoffAlreadyArchived {
-            per_phase [Idle, Attached, Running, Retired]
+            per_phase [Retired]
             on input ArchiveUnresolvedModelRoutingHandoff { request_id }
             guard "session_registered" { self.session_id != None }
             guard "already_archived" {

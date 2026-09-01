@@ -1663,27 +1663,6 @@ impl MeerkatMachine {
                     meerkat_core::image_generation::ImageOperationPhase::Terminal { terminal },
                 ))
             }
-            MeerkatMachineCommand::ArchiveUnresolvedModelRoutingHandoffs {
-                session_id,
-                request_ids,
-            } => {
-                let _mutation_guard = self
-                    .lock_current_control_durability_ready_session_mutation_gate(&session_id)
-                    .await?;
-                for request_id in request_ids {
-                    let request_key = switch_request_key(request_id);
-                    self.apply_session_dsl_input(
-                        &session_id,
-                        crate::meerkat_machine::dsl::MeerkatMachineInput::ArchiveUnresolvedModelRoutingHandoff {
-                            request_id: request_key,
-                        },
-                        "ArchiveUnresolvedModelRoutingHandoff",
-                    )
-                    .await
-                    .map_err(RuntimeControlPlaneError::Internal)?;
-                }
-                Ok(MeerkatMachineCommandResult::Unit)
-            }
             MeerkatMachineCommand::RealizeCommittedModelRoutingHandoff {
                 session_id,
                 handoff,
@@ -1912,6 +1891,77 @@ impl MeerkatMachine {
             .await
             .map_err(|error| RuntimeControlPlaneError::StoreError(error.to_string()))?;
         Ok(!receipts.is_empty())
+    }
+
+    /// Import each exact committed fact, then ask generated authority to
+    /// archive it.
+    ///
+    /// Import comes first and is fail-closed: the durable log is the source of
+    /// the request identity, its originating run, and its target, so a machine
+    /// that disagrees with any of the three is corruption rather than a
+    /// convergence case. A request no runtime ever imported is exactly the one
+    /// an archive must terminalize, which is why import is admissible while
+    /// retired.
+    ///
+    /// This helper is deliberately reachable only from the archive-lease
+    /// realization after its durable Retired commit. Exposing it through the
+    /// ordinary runtime adapter would be a forgeable archive capability: a
+    /// caller could create generated `Archived` state without inheriting the
+    /// durable-terminal retry obligation.
+    ///
+    /// A refused archive is classified by reading generated state rather than
+    /// by pre-checking it: the machine decides. Finding a realized or denied
+    /// generated request in this exact durable-Requested batch is an
+    /// inconsistency, not a reason to silently omit its durable terminal.
+    pub(super) async fn archive_unresolved_model_routing_handoffs_inner(
+        &self,
+        session_id: &SessionId,
+        handoffs: &[crate::meerkat_machine_types::CommittedModelRoutingHandoff],
+    ) -> Result<Vec<meerkat_core::image_generation::SwitchTurnRequestId>, RuntimeControlPlaneError>
+    {
+        let mut archived = Vec::with_capacity(handoffs.len());
+        for handoff in handoffs {
+            let request_key = switch_request_key(handoff.request_id);
+            self.apply_session_dsl_input(
+                session_id,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::ImportCommittedModelRoutingHandoff {
+                    request_id: request_key.clone(),
+                    originating_run_id: handoff.originating_run_id.to_string(),
+                    target_model: handoff.intent.target_model.to_string(),
+                },
+                "ImportCommittedModelRoutingHandoff",
+            )
+            .await
+            .map_err(RuntimeControlPlaneError::Internal)?;
+            match self
+                .apply_session_dsl_input(
+                    session_id,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::ArchiveUnresolvedModelRoutingHandoff {
+                        request_id: request_key.clone(),
+                    },
+                    "ArchiveUnresolvedModelRoutingHandoff",
+                )
+                .await
+            {
+                Ok(_) => archived.push(handoff.request_id),
+                Err(reason) => {
+                    let state = self.session_dsl_state(session_id).await?;
+                    match state.model_routing_handoff_phase.get(&request_key) {
+                        Some(
+                            crate::meerkat_machine::dsl::RoutingHandoffPhase::Realized
+                            | crate::meerkat_machine::dsl::RoutingHandoffPhase::Denied,
+                        ) => {
+                            return Err(RuntimeControlPlaneError::Internal(format!(
+                                "durable model-routing handoff {:?} is still Requested but generated authority already settled it; refusing to archive without an exact durable terminal",
+                                handoff.request_id
+                            )));
+                        }
+                        _ => return Err(RuntimeControlPlaneError::Internal(reason)),
+                    }
+                }
+            }
+        }
+        Ok(archived)
     }
 
     /// Realize one committed cross-run routing handoff.
@@ -2758,6 +2808,67 @@ mod tests {
             other => panic!(
                 "expected a typed InvalidState{{state}} for the unbound session, got {other:?}"
             ),
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_path_imports_never_seen_committed_handoff_and_is_idempotent() {
+        let machine = MeerkatMachine::ephemeral();
+        let session_id = SessionId::new();
+        machine
+            .register_session(session_id.clone())
+            .await
+            .expect("register session");
+        machine
+            .apply_session_dsl_input(
+                &session_id,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::Retire {
+                    session_id: crate::meerkat_machine::dsl::SessionId::from_domain(&session_id),
+                },
+                "Retire",
+            )
+            .await
+            .expect("archive test must first reach generated Retired");
+
+        let request_id =
+            meerkat_core::image_generation::SwitchTurnRequestId::new(uuid::Uuid::new_v4());
+        let handoff = crate::meerkat_machine_types::CommittedModelRoutingHandoff {
+            request_id,
+            originating_run_id: meerkat_core::lifecycle::RunId::new(),
+            intent: meerkat_core::image_generation::SwitchTurnIntent {
+                target_model: meerkat_core::lifecycle::run_primitive::ModelId::new("claude-opus-5"),
+                duration: meerkat_core::image_generation::SwitchTurnDuration::UntilChanged,
+                origin: meerkat_core::image_generation::SwitchTurnOrigin::Model {
+                    reason:
+                        meerkat_core::image_generation::SwitchTurnReasonTextDisposition::NotProvided,
+                },
+            },
+        };
+
+        for pass in 0..2 {
+            let archived = machine
+                .archive_unresolved_model_routing_handoffs_inner(
+                    &session_id,
+                    std::slice::from_ref(&handoff),
+                )
+                .await
+                .expect("exact archive retry converges");
+            assert_eq!(archived, vec![request_id], "archive pass {pass}");
+            let state = machine
+                .session_dsl_state(&session_id)
+                .await
+                .expect("observe generated archive state");
+            assert_eq!(
+                state.lifecycle_phase,
+                crate::meerkat_machine::dsl::MeerkatPhase::Retired,
+                "handoff import/archive must not revive the retired session"
+            );
+            assert_eq!(
+                state
+                    .model_routing_handoff_phase
+                    .get(&switch_request_key(request_id)),
+                Some(&crate::meerkat_machine::dsl::RoutingHandoffPhase::Archived)
+            );
         }
     }
 

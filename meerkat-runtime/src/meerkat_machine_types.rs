@@ -602,12 +602,6 @@ pub(crate) enum MeerkatMachineCommand {
         session_id: SessionId,
         handoff: Box<CommittedModelRoutingHandoff>,
     },
-    /// Resolve every still-pending committed handoff as archived because the
-    /// session reached lifecycle terminality.
-    ArchiveUnresolvedModelRoutingHandoffs {
-        session_id: SessionId,
-        request_ids: Vec<SwitchTurnRequestId>,
-    },
     BeginImageOperation {
         session_id: SessionId,
         request: Box<ImageOperationRoutingRequest>,
@@ -1148,6 +1142,10 @@ meerkat_machine_runtime_internal_inputs!(
         McpServerReload,
     ],
     ModelRoutingLifecycle => [
+        // Not a caller command: the archive-lease choke invokes this only
+        // after its durable Retired commit and inherits the exact durable-log
+        // terminalization obligation.
+        ArchiveUnresolvedModelRoutingHandoff,
         CommitStickyModelFallback,
         ModelRoutingStatus,
         RequestFiniteSwitchTurn,
@@ -1724,7 +1722,6 @@ pub enum MeerkatMachineCatalogInput {
     ClaimModelRoutingHandoff,
     RealizeModelRoutingHandoff,
     DenyModelRoutingHandoff,
-    ArchiveUnresolvedModelRoutingHandoff,
     BeginImageOperation,
     DenyImageOperationPlan,
     ActivateImageOperationOverride,
@@ -1777,7 +1774,6 @@ impl MeerkatMachineCatalogInput {
         Self::ClaimModelRoutingHandoff,
         Self::RealizeModelRoutingHandoff,
         Self::DenyModelRoutingHandoff,
-        Self::ArchiveUnresolvedModelRoutingHandoff,
         Self::BeginImageOperation,
         Self::DenyImageOperationPlan,
         Self::ActivateImageOperationOverride,
@@ -1845,9 +1841,6 @@ impl MeerkatMachineCatalogInput {
                 MeerkatMachineInputVariant::RealizeModelRoutingHandoff
             }
             Self::DenyModelRoutingHandoff => MeerkatMachineInputVariant::DenyModelRoutingHandoff,
-            Self::ArchiveUnresolvedModelRoutingHandoff => {
-                MeerkatMachineInputVariant::ArchiveUnresolvedModelRoutingHandoff
-            }
             Self::BeginImageOperation => MeerkatMachineInputVariant::BeginImageOperation,
             Self::DenyImageOperationPlan => MeerkatMachineInputVariant::DenyImageOperationPlan,
             Self::ActivateImageOperationOverride => {
@@ -1908,7 +1901,6 @@ impl MeerkatMachineCatalogInput {
             Self::ClaimModelRoutingHandoff => "ClaimModelRoutingHandoff",
             Self::RealizeModelRoutingHandoff => "RealizeModelRoutingHandoff",
             Self::DenyModelRoutingHandoff => "DenyModelRoutingHandoff",
-            Self::ArchiveUnresolvedModelRoutingHandoff => "ArchiveUnresolvedModelRoutingHandoff",
             Self::BeginImageOperation => "BeginImageOperation",
             Self::DenyImageOperationPlan => "DenyImageOperationPlan",
             Self::ActivateImageOperationOverride => "ActivateImageOperationOverride",
@@ -1981,10 +1973,9 @@ impl MeerkatMachineCommandVariant {
             Self::AdmitModelRoutingAssistantTurn => {
                 Some(MeerkatMachineCatalogInput::AdmitModelRoutingAssistantTurn)
             }
-            // Both handoff commands drive several catalog inputs as one
-            // sequence, so neither IS a single catalog input.
-            Self::RealizeCommittedModelRoutingHandoff
-            | Self::ArchiveUnresolvedModelRoutingHandoffs => None,
+            // Handoff realization drives several catalog inputs as one
+            // sequence, so it is not itself a single catalog input.
+            Self::RealizeCommittedModelRoutingHandoff => None,
             Self::BeginImageOperation => Some(MeerkatMachineCatalogInput::BeginImageOperation),
             Self::DenyImageOperationPlan => {
                 Some(MeerkatMachineCatalogInput::DenyImageOperationPlan)
@@ -2234,12 +2225,6 @@ const fn meerkat_machine_command_classification(
                 MeerkatMachineCatalogInput::DenyModelRoutingHandoff,
                 MeerkatMachineCatalogInput::RequestUntilChangedSwitchTurn,
                 MeerkatMachineCatalogInput::SetModelRoutingBaseline,
-            ])
-        }
-        MeerkatMachineCommandVariant::ArchiveUnresolvedModelRoutingHandoffs => {
-            MeerkatMachineCommandClassification::CatalogInputs(&[
-                MeerkatMachineCatalogInput::ImportCommittedModelRoutingHandoff,
-                MeerkatMachineCatalogInput::ArchiveUnresolvedModelRoutingHandoff,
             ])
         }
         MeerkatMachineCommandVariant::BeginImageOperation => {

@@ -2862,6 +2862,18 @@ ImportCommittedModelRoutingHandoffFirstRunning(request_id, originating_run_id, t
     /\ UnchangedFrame_4f40aeaa45c4bb9b
 
 
+ImportCommittedModelRoutingHandoffFirstRetired(request_id, originating_run_id, target_model) ==
+    /\ phase = "Retired"
+    /\ (session_id # None)
+    /\ ~((request_id \in DOMAIN model_routing_handoff_phase))
+    /\ phase' = "Retired"
+    /\ model_step_count' = model_step_count + 1
+    /\ model_routing_handoff_phase' = MapSet(model_routing_handoff_phase, request_id, "Imported")
+    /\ model_routing_handoff_run' = MapSet(model_routing_handoff_run, request_id, originating_run_id)
+    /\ model_routing_handoff_target' = MapSet(model_routing_handoff_target, request_id, target_model)
+    /\ UnchangedFrame_4f40aeaa45c4bb9b
+
+
 ImportCommittedModelRoutingHandoffAlreadyExactIdle(request_id, originating_run_id, target_model) ==
     /\ phase = "Idle"
     /\ (session_id # None)
@@ -2885,6 +2897,15 @@ ImportCommittedModelRoutingHandoffAlreadyExactRunning(request_id, originating_ru
     /\ (session_id # None)
     /\ (((IF (request_id \in DOMAIN model_routing_handoff_run) THEN Some((IF request_id \in DOMAIN model_routing_handoff_run THEN model_routing_handoff_run[request_id] ELSE "None")) ELSE None) = Some(originating_run_id)) /\ ((IF (request_id \in DOMAIN model_routing_handoff_target) THEN Some((IF request_id \in DOMAIN model_routing_handoff_target THEN model_routing_handoff_target[request_id] ELSE "None")) ELSE None) = Some(target_model)))
     /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_52a0b93e6aba6e00
+
+
+ImportCommittedModelRoutingHandoffAlreadyExactRetired(request_id, originating_run_id, target_model) ==
+    /\ phase = "Retired"
+    /\ (session_id # None)
+    /\ (((IF (request_id \in DOMAIN model_routing_handoff_run) THEN Some((IF request_id \in DOMAIN model_routing_handoff_run THEN model_routing_handoff_run[request_id] ELSE "None")) ELSE None) = Some(originating_run_id)) /\ ((IF (request_id \in DOMAIN model_routing_handoff_target) THEN Some((IF request_id \in DOMAIN model_routing_handoff_target THEN model_routing_handoff_target[request_id] ELSE "None")) ELSE None) = Some(target_model)))
+    /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_52a0b93e6aba6e00
 
@@ -3093,36 +3114,6 @@ DenyModelRoutingHandoffAlreadyDeniedRunning(request_id, reason) ==
     /\ UnchangedFrame_52a0b93e6aba6e00
 
 
-ArchiveUnresolvedModelRoutingHandoffPendingIdle(request_id) ==
-    /\ phase = "Idle"
-    /\ (session_id # None)
-    /\ (IF ((IF (request_id \in DOMAIN model_routing_handoff_phase) THEN Some((IF request_id \in DOMAIN model_routing_handoff_phase THEN model_routing_handoff_phase[request_id] ELSE "None")) ELSE None) = Some("Imported")) THEN TRUE ELSE ((IF (request_id \in DOMAIN model_routing_handoff_phase) THEN Some((IF request_id \in DOMAIN model_routing_handoff_phase THEN model_routing_handoff_phase[request_id] ELSE "None")) ELSE None) = Some("Claimed")))
-    /\ phase' = "Idle"
-    /\ model_step_count' = model_step_count + 1
-    /\ model_routing_handoff_phase' = MapSet(model_routing_handoff_phase, request_id, "Archived")
-    /\ UnchangedFrame_c506cea05d5c097d
-
-
-ArchiveUnresolvedModelRoutingHandoffPendingAttached(request_id) ==
-    /\ phase = "Attached"
-    /\ (session_id # None)
-    /\ (IF ((IF (request_id \in DOMAIN model_routing_handoff_phase) THEN Some((IF request_id \in DOMAIN model_routing_handoff_phase THEN model_routing_handoff_phase[request_id] ELSE "None")) ELSE None) = Some("Imported")) THEN TRUE ELSE ((IF (request_id \in DOMAIN model_routing_handoff_phase) THEN Some((IF request_id \in DOMAIN model_routing_handoff_phase THEN model_routing_handoff_phase[request_id] ELSE "None")) ELSE None) = Some("Claimed")))
-    /\ phase' = "Attached"
-    /\ model_step_count' = model_step_count + 1
-    /\ model_routing_handoff_phase' = MapSet(model_routing_handoff_phase, request_id, "Archived")
-    /\ UnchangedFrame_c506cea05d5c097d
-
-
-ArchiveUnresolvedModelRoutingHandoffPendingRunning(request_id) ==
-    /\ phase = "Running"
-    /\ (session_id # None)
-    /\ (IF ((IF (request_id \in DOMAIN model_routing_handoff_phase) THEN Some((IF request_id \in DOMAIN model_routing_handoff_phase THEN model_routing_handoff_phase[request_id] ELSE "None")) ELSE None) = Some("Imported")) THEN TRUE ELSE ((IF (request_id \in DOMAIN model_routing_handoff_phase) THEN Some((IF request_id \in DOMAIN model_routing_handoff_phase THEN model_routing_handoff_phase[request_id] ELSE "None")) ELSE None) = Some("Claimed")))
-    /\ phase' = "Running"
-    /\ model_step_count' = model_step_count + 1
-    /\ model_routing_handoff_phase' = MapSet(model_routing_handoff_phase, request_id, "Archived")
-    /\ UnchangedFrame_c506cea05d5c097d
-
-
 ArchiveUnresolvedModelRoutingHandoffPendingRetired(request_id) ==
     /\ phase = "Retired"
     /\ (session_id # None)
@@ -3131,33 +3122,6 @@ ArchiveUnresolvedModelRoutingHandoffPendingRetired(request_id) ==
     /\ model_step_count' = model_step_count + 1
     /\ model_routing_handoff_phase' = MapSet(model_routing_handoff_phase, request_id, "Archived")
     /\ UnchangedFrame_c506cea05d5c097d
-
-
-ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedIdle(request_id) ==
-    /\ phase = "Idle"
-    /\ (session_id # None)
-    /\ ((IF (request_id \in DOMAIN model_routing_handoff_phase) THEN Some((IF request_id \in DOMAIN model_routing_handoff_phase THEN model_routing_handoff_phase[request_id] ELSE "None")) ELSE None) = Some("Archived"))
-    /\ phase' = "Idle"
-    /\ model_step_count' = model_step_count + 1
-    /\ UnchangedFrame_52a0b93e6aba6e00
-
-
-ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedAttached(request_id) ==
-    /\ phase = "Attached"
-    /\ (session_id # None)
-    /\ ((IF (request_id \in DOMAIN model_routing_handoff_phase) THEN Some((IF request_id \in DOMAIN model_routing_handoff_phase THEN model_routing_handoff_phase[request_id] ELSE "None")) ELSE None) = Some("Archived"))
-    /\ phase' = "Attached"
-    /\ model_step_count' = model_step_count + 1
-    /\ UnchangedFrame_52a0b93e6aba6e00
-
-
-ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedRunning(request_id) ==
-    /\ phase = "Running"
-    /\ (session_id # None)
-    /\ ((IF (request_id \in DOMAIN model_routing_handoff_phase) THEN Some((IF request_id \in DOMAIN model_routing_handoff_phase THEN model_routing_handoff_phase[request_id] ELSE "None")) ELSE None) = Some("Archived"))
-    /\ phase' = "Running"
-    /\ model_step_count' = model_step_count + 1
-    /\ UnchangedFrame_52a0b93e6aba6e00
 
 
 ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedRetired(request_id) ==
@@ -32050,9 +32014,11 @@ Next ==
     \/ \E request_id \in StringValues : \E originating_run_id \in StringValues : \E target_model \in StringValues : ImportCommittedModelRoutingHandoffFirstIdle(request_id, originating_run_id, target_model)
     \/ \E request_id \in StringValues : \E originating_run_id \in StringValues : \E target_model \in StringValues : ImportCommittedModelRoutingHandoffFirstAttached(request_id, originating_run_id, target_model)
     \/ \E request_id \in StringValues : \E originating_run_id \in StringValues : \E target_model \in StringValues : ImportCommittedModelRoutingHandoffFirstRunning(request_id, originating_run_id, target_model)
+    \/ \E request_id \in StringValues : \E originating_run_id \in StringValues : \E target_model \in StringValues : ImportCommittedModelRoutingHandoffFirstRetired(request_id, originating_run_id, target_model)
     \/ \E request_id \in StringValues : \E originating_run_id \in StringValues : \E target_model \in StringValues : ImportCommittedModelRoutingHandoffAlreadyExactIdle(request_id, originating_run_id, target_model)
     \/ \E request_id \in StringValues : \E originating_run_id \in StringValues : \E target_model \in StringValues : ImportCommittedModelRoutingHandoffAlreadyExactAttached(request_id, originating_run_id, target_model)
     \/ \E request_id \in StringValues : \E originating_run_id \in StringValues : \E target_model \in StringValues : ImportCommittedModelRoutingHandoffAlreadyExactRunning(request_id, originating_run_id, target_model)
+    \/ \E request_id \in StringValues : \E originating_run_id \in StringValues : \E target_model \in StringValues : ImportCommittedModelRoutingHandoffAlreadyExactRetired(request_id, originating_run_id, target_model)
     \/ \E request_id \in StringValues : \E originating_run_id \in StringValues : \E target_model \in StringValues : ClaimModelRoutingHandoffImportedIdle(request_id, originating_run_id, target_model)
     \/ \E request_id \in StringValues : \E originating_run_id \in StringValues : \E target_model \in StringValues : ClaimModelRoutingHandoffImportedAttached(request_id, originating_run_id, target_model)
     \/ \E request_id \in StringValues : \E originating_run_id \in StringValues : \E target_model \in StringValues : ClaimModelRoutingHandoffImportedRunning(request_id, originating_run_id, target_model)
@@ -32074,13 +32040,7 @@ Next ==
     \/ \E request_id \in StringValues : \E reason \in RoutingDenialReasonValues : DenyModelRoutingHandoffAlreadyDeniedIdle(request_id, reason)
     \/ \E request_id \in StringValues : \E reason \in RoutingDenialReasonValues : DenyModelRoutingHandoffAlreadyDeniedAttached(request_id, reason)
     \/ \E request_id \in StringValues : \E reason \in RoutingDenialReasonValues : DenyModelRoutingHandoffAlreadyDeniedRunning(request_id, reason)
-    \/ \E request_id \in StringValues : ArchiveUnresolvedModelRoutingHandoffPendingIdle(request_id)
-    \/ \E request_id \in StringValues : ArchiveUnresolvedModelRoutingHandoffPendingAttached(request_id)
-    \/ \E request_id \in StringValues : ArchiveUnresolvedModelRoutingHandoffPendingRunning(request_id)
     \/ \E request_id \in StringValues : ArchiveUnresolvedModelRoutingHandoffPendingRetired(request_id)
-    \/ \E request_id \in StringValues : ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedIdle(request_id)
-    \/ \E request_id \in StringValues : ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedAttached(request_id)
-    \/ \E request_id \in StringValues : ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedRunning(request_id)
     \/ \E request_id \in StringValues : ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedRetired(request_id)
     \/ AdmitPendingFiniteSwitchTurnIdle
     \/ AdmitPendingFiniteSwitchTurnAttached

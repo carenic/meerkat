@@ -2615,6 +2615,11 @@ runtime_internal_inputs!(
         AttachMobIngress,
         AttachSessionIngress,
         AuthorizeSupervisor,
+        // Archive handoff terminalization is runtime-internal by construction:
+        // only the archive-lease choke invokes it after the durable Retired
+        // commit, then mirrors the exact generated verdict into the Session
+        // log. A caller-facing command would be a forgeable archive capability.
+        ArchiveUnresolvedModelRoutingHandoff,
         PrepareTerminalSupervisorCleanupBindings,
         RecoverSupervisorBinding,
         RecoverSupervisorRevocationPending,

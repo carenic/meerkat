@@ -259,12 +259,31 @@ fn realizing_an_unclaimed_request_is_refused() {
     );
 }
 
-/// Archive terminality is generated status. It resolves a pending handoff
-/// without any Session-log record, and is itself idempotent.
+/// Archive terminality is generated status whose durable mechanical mirror is
+/// written by the archive chokepoint. It is admitted only after the session
+/// itself reached generated Retired and is idempotent there.
 #[test]
-fn archiving_a_pending_handoff_is_generated_status_and_idempotent() {
+fn archiving_a_pending_handoff_requires_retired_and_is_idempotent() {
     let mut authority = registered_authority();
     import(&mut authority, REQUEST, RUN, TARGET).expect("import");
+    MeerkatMachineMutator::apply(
+        &mut authority,
+        MeerkatMachineInput::ArchiveUnresolvedModelRoutingHandoff {
+            request_id: REQUEST.to_string(),
+        },
+    )
+    .expect_err("an active session cannot mint an archived handoff");
+    assert_eq!(
+        phase(&authority, REQUEST),
+        Some(RoutingHandoffPhase::Imported)
+    );
+    MeerkatMachineMutator::apply(
+        &mut authority,
+        MeerkatMachineInput::Retire {
+            session_id: SessionId("session-1".to_string()),
+        },
+    )
+    .expect("session retires before handoff archive");
     for _ in 0..2 {
         MeerkatMachineMutator::apply(
             &mut authority,

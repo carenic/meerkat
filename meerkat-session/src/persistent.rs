@@ -2929,49 +2929,27 @@ impl<'a> MachineSessionArchiveProtocol<'a> {
         lease: Option<meerkat_runtime::MachineSessionArchiveLease>,
         stored_only_publication_handle: Option<Arc<dyn CoreExecutorPublicationHandle>>,
         post_commit_hook: Option<Arc<dyn meerkat_runtime::MachineSessionArchivePostCommitHook>>,
+        archive_handoffs: &[meerkat_runtime::CommittedModelRoutingHandoff],
         deadline: meerkat_core::time_compat::Instant,
-    ) -> Result<(), SessionError> {
+    ) -> Result<Vec<meerkat_core::image_generation::SwitchTurnRequestId>, SessionError> {
         let lease = lease.ok_or_else(|| {
             SessionError::Agent(AgentError::InternalError(format!(
                 "machine archive authorized runtime retirement for session {id} without an exact archive lease"
             )))
         })?;
-        let retire = match (stored_only_publication_handle, post_commit_hook) {
-            (Some(publication_handle), Some(post_commit_hook)) => self
-                .runtime_adapter
-                .retire_session_with_archive_lease_publication_handle_and_post_commit_hook_before(
-                    lease,
-                    publication_handle,
-                    post_commit_hook,
-                    deadline,
-                )
-                .await,
-            (Some(publication_handle), None) => {
-                self.runtime_adapter
-                    .retire_session_with_archive_lease_and_publication_handle_before(
-                        lease,
-                        publication_handle,
-                        deadline,
-                    )
-                    .await
-            }
-            (None, Some(post_commit_hook)) => {
-                self.runtime_adapter
-                    .retire_session_with_archive_lease_and_post_commit_hook_before(
-                        lease,
-                        post_commit_hook,
-                        deadline,
-                    )
-                    .await
-            }
-            (None, None) => {
-                self.runtime_adapter
-                    .retire_session_with_archive_lease_before(lease, deadline)
-                    .await
-            }
-        };
-        retire
-            .map(|_| ())
+        // One entry point for every publisher/hook combination: the committed
+        // handoff terminalization must run inside the exact retire commit, and
+        // a second call shape would be a second place to forget it.
+        self.runtime_adapter
+            .retire_session_with_archive_lease_terminalizing_model_routing_handoffs_before(
+                lease,
+                stored_only_publication_handle,
+                post_commit_hook,
+                archive_handoffs,
+                deadline,
+            )
+            .await
+            .map(|(_report, archived)| archived)
             .map_err(|error| archive_runtime_control_error(id, error))
     }
 }
@@ -10155,6 +10133,119 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         Ok(result)
     }
 
+    /// Read the exact committed handoffs the durable body still owes, together
+    /// with the body they were read from.
+    ///
+    /// The durable committed body — not the live actor's copy — is both the
+    /// source and the write base, and deliberately so. It is the only thing
+    /// that survives the archive: a request that lives solely in actor memory
+    /// dies with the actor and owes nothing, while writing a terminal against a
+    /// base that never carried the request would be refused as
+    /// `UnknownRequest`. Reading and writing the same base makes those two
+    /// facts one fact.
+    ///
+    /// Returns `None` when nothing is owed, so an ordinary archive pays one
+    /// cheap emptiness check and no extra store read.
+    async fn committed_model_routing_handoffs_owed_at_archive(
+        &self,
+        id: &SessionId,
+        observed_snapshot: Option<&Session>,
+    ) -> Result<Option<(Session, Vec<meerkat_runtime::CommittedModelRoutingHandoff>)>, SessionError>
+    {
+        // A live actor is materialized from the durable body, so an empty live
+        // history proves an empty durable history. Sessions that never asked
+        // for a permanent model change never load a second copy.
+        if observed_snapshot.is_some_and(|session| session.model_routing_control().is_empty()) {
+            return Ok(None);
+        }
+        let Some(base) = self.load_persisted_session_for_archive(id).await? else {
+            return Ok(None);
+        };
+        let owed: Vec<meerkat_runtime::CommittedModelRoutingHandoff> = base
+            .model_routing_control()
+            .awaiting_decision()
+            .map(|record| meerkat_runtime::CommittedModelRoutingHandoff {
+                request_id: *record.request_id(),
+                originating_run_id: record.originating_run_id().clone(),
+                intent: record.intent().clone(),
+            })
+            .collect();
+        if owed.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((base, owed)))
+    }
+
+    /// Mirror the generated archive verdict into the durable handoff log.
+    ///
+    /// Runs only after the durable runtime archive terminal has committed, so
+    /// this can never leave a still-live session holding an abandoned intent.
+    /// A failure here fails the archive, and the retry re-reads the same
+    /// unchanged durable base and re-drives the same idempotent generated
+    /// verdict — the log is an exact-retry outbox, not a second truth.
+    ///
+    /// Only identities generated authority actually archived are written. The
+    /// append itself is the second guard: an exactly-equal record converges,
+    /// and a record offered over an already-terminal one is refused.
+    async fn commit_archived_model_routing_handoff_terminals(
+        &self,
+        id: &SessionId,
+        mut base: Session,
+        owed: &[meerkat_runtime::CommittedModelRoutingHandoff],
+        archived: &[meerkat_core::image_generation::SwitchTurnRequestId],
+    ) -> Result<(), SessionError> {
+        if owed.len() != archived.len()
+            || !owed
+                .iter()
+                .map(|handoff| handoff.request_id)
+                .eq(archived.iter().copied())
+        {
+            return Err(SessionError::Agent(AgentError::InternalError(format!(
+                "generated archive verdict for session {id} did not cover the exact durable model-routing handoff batch"
+            ))));
+        }
+        let mut appended = false;
+        for handoff in owed {
+            let outcome = base
+                .append_model_routing_control_record(
+                    meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord::ModelRoutingIntentAbandoned {
+                        request_id: handoff.request_id,
+                        originating_run_id: handoff.originating_run_id.clone(),
+                        intent: handoff.intent.clone(),
+                    },
+                )
+                .map_err(|error| {
+                    SessionError::Agent(AgentError::InternalError(format!(
+                        "archive could not terminalize committed model-routing handoff for session {id}: {error}"
+                    )))
+                })?;
+            if matches!(
+                outcome,
+                meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome::Appended
+            ) {
+                appended = true;
+            }
+        }
+        if !appended {
+            return Ok(());
+        }
+        match self.runtime_store.session_persistence_profile() {
+            RuntimeSessionPersistenceProfile::WholeBlobV1 => {
+                self.save_normalized_session(base).await.map(|_| ())
+            }
+            RuntimeSessionPersistenceProfile::HeadCanonicalV1 => self
+                .persist_detached_head_canonical_session(
+                    base,
+                    "archived model-routing handoff terminalization",
+                )
+                .await
+                .map(|_| ()),
+            profile => Err(SessionError::Agent(AgentError::InternalError(format!(
+                "unsupported runtime session persistence profile {profile} while terminalizing committed model-routing handoffs for session {id}"
+            )))),
+        }
+    }
+
     /// Archive with a concrete machine protocol. Runtime-backed surfaces must
     /// use this path so the canonical SessionDocumentMachine archive verdict
     /// is realized by the RuntimeStore-owned `MeerkatMachine::Retire`
@@ -10346,6 +10437,30 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 }
                 Err(err) => return Err(err),
             };
+            // A committed cross-run routing handoff the durable log still owes
+            // must not survive this archive: after a restart it would still read
+            // as awaiting a decision, and the next owner to revive the document
+            // would realize a switch for a session that ended. Read the exact
+            // owed set now, under the archive locks; generated authority
+            // terminalizes it inside the retire commit, and the durable record
+            // is written only once that commit landed.
+            let owed_handoffs = self
+                .committed_model_routing_handoffs_owed_at_archive(id, archived_snapshot.as_ref())
+                .await?;
+            if owed_handoffs.is_some() && archive_lease.is_none() {
+                // Without a runtime lease there is no generated authority to
+                // decide terminality and no durable archive terminal to anchor
+                // it to. Refuse rather than invent a terminal; the request stays
+                // exactly as actionable as it was.
+                return Err(SessionError::Agent(AgentError::InternalError(format!(
+                    "archive for session {id} owes committed model-routing handoff terminalization but holds no runtime archive lease"
+                ))));
+            }
+            let owed_handoff_facts: Vec<meerkat_runtime::CommittedModelRoutingHandoff> =
+                owed_handoffs
+                    .as_ref()
+                    .map(|(_, owed)| owed.clone())
+                    .unwrap_or_default();
             // Drive the canonical SessionDocumentMachine archive decision. The
             // machine owns the session-document lifecycle-terminal fact for ALL
             // profiles (LUC-524 R004 fold): this shell extracts only pure
@@ -10418,7 +10533,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     )))
                 })?;
             if disposition == SessionArchiveDisposition::AlreadyArchived {
-                if (archive_lease_has_attached_publisher || post_commit_hook.is_some())
+                if (archive_lease_has_attached_publisher
+                    || post_commit_hook.is_some()
+                    || !owed_handoff_facts.is_empty())
                     && archive_lease.is_some()
                 {
                     // Retirement may invoke an arbitrary actor publication
@@ -10427,15 +10544,37 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     // the absorbing document verdict means no later archive
                     // observation from this attempt needs to be retained.
                     drop(recovery_guard.take());
-                    machine_archive
+                    let archived_handoffs = machine_archive
                         .retire_session(
                             id,
                             archive_lease.take(),
                             stored_only_publication_handle.clone(),
                             post_commit_hook.clone(),
+                            &owed_handoff_facts,
                             deadline,
                         )
                         .await?;
+                    // The durable archive terminal is already committed, so a
+                    // still-owed handoff must be discharged before this attempt
+                    // absorbs. This is the exact retry for an earlier attempt
+                    // whose durable write failed after its retire landed.
+                    if let Some((base, owed)) = owed_handoffs {
+                        recovery_guard = Some(
+                            acquire_archive_recovery_gate_before(
+                                id,
+                                Arc::clone(&recovery_gate),
+                                deadline,
+                            )
+                            .await?,
+                        );
+                        self.commit_archived_model_routing_handoff_terminals(
+                            id,
+                            base,
+                            &owed,
+                            &archived_handoffs,
+                        )
+                        .await?;
+                    }
                 }
                 // Machine-decided idempotent re-archive verdict; the public
                 // surface contract for an archived session is NotFound.
@@ -10468,8 +10607,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             // under this exact retained lease, so the idempotent retire
             // commit is driven for it even when no lifecycle transition
             // remains.
-            let drive_runtime_retire =
-                retire_runtime || (post_commit_hook.is_some() && archive_lease.is_some());
+            let drive_runtime_retire = retire_runtime
+                || ((post_commit_hook.is_some() || !owed_handoff_facts.is_empty())
+                    && archive_lease.is_some());
             if drive_runtime_retire {
                 // The runtime process task must run without either M or R.
                 // M moves into retire_session and is released before its
@@ -10482,28 +10622,32 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                         archive_lease.take(),
                         stored_only_publication_handle.clone(),
                         post_commit_hook.clone(),
+                        &owed_handoff_facts,
                         deadline,
                     )
                     .await;
-                if let Err(err) = retire_result {
-                    // Fail closed: the archive operation fails and the RuntimeStore
-                    // content body remains unchanged. A retried archive re-drives
-                    // the lifecycle transition. Keep the checkpointer cancelled so
-                    // the rejected live actor cannot race that retry with stale
-                    // content.
-                    // Release the gate before asking the live task to shut down so a
-                    // checkpoint already waiting on the mutex can observe cancellation
-                    // and exit instead of deadlocking teardown.
-                    drop(gate_guard.take());
-                    if let Err(discard_error) = self.inner.discard_live_session(id).await {
-                        tracing::warn!(
-                            session_id = %id,
-                            error = %discard_error,
-                            "failed to evict live session after RuntimeStore lifecycle retirement failed"
-                        );
+                let archived_handoffs = match retire_result {
+                    Ok(archived_handoffs) => archived_handoffs,
+                    Err(err) => {
+                        // Fail closed: the archive operation fails and the RuntimeStore
+                        // content body remains unchanged. A retried archive re-drives
+                        // the lifecycle transition. Keep the checkpointer cancelled so
+                        // the rejected live actor cannot race that retry with stale
+                        // content.
+                        // Release the gate before asking the live task to shut down so a
+                        // checkpoint already waiting on the mutex can observe cancellation
+                        // and exit instead of deadlocking teardown.
+                        drop(gate_guard.take());
+                        if let Err(discard_error) = self.inner.discard_live_session(id).await {
+                            tracing::warn!(
+                                session_id = %id,
+                                error = %discard_error,
+                                "failed to evict live session after RuntimeStore lifecycle retirement failed"
+                            );
+                        }
+                        return Err(err);
                     }
-                    return Err(err);
-                }
+                };
                 recovery_guard = Some(
                     acquire_archive_recovery_gate_before(
                         id,
@@ -10512,6 +10656,19 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     )
                     .await?,
                 );
+                // The durable archive terminal is committed. Mirror the exact
+                // generated handoff verdict into the durable log before the
+                // live actor is torn down; a failure here fails the archive and
+                // the retry converges through the AlreadyArchived path above.
+                if let Some((base, owed)) = owed_handoffs {
+                    self.commit_archived_model_routing_handoff_terminals(
+                        id,
+                        base,
+                        &owed,
+                        &archived_handoffs,
+                    )
+                    .await?;
+                }
             }
 
             let live_result = self.inner.archive(id).await;
@@ -12302,6 +12459,9 @@ mod tests {
         TranscriptEditRunningBehavior, TranscriptRewriteReason, TranscriptRewriteSelection,
     };
     use meerkat_core::session::SESSION_METADATA_KEY;
+    use meerkat_core::session::model_routing_control::{
+        ModelRoutingIntentRecordDisposition, SessionModelRoutingControlRecord,
+    };
     use meerkat_core::session_store::{SessionHeadCas, TranscriptStrandId};
     use meerkat_core::types::{
         ContentBlock, ContentInput, ImageData, Message, StopReason, ToolCall, ToolResult,
@@ -12641,6 +12801,7 @@ mod tests {
             inner: meerkat_runtime::SqliteRuntimeStore::new_head_canonical(&database_path)
                 .expect("head-canonical runtime store"),
             fail_commits: AtomicBool::new(false),
+            fail_lifecycle_commits: AtomicBool::new(false),
         });
         let store: Arc<dyn SessionStore> = Arc::new(
             meerkat_store::SqliteSessionStore::open(&database_path)
@@ -14632,12 +14793,19 @@ mod tests {
     struct FailingHeadCanonicalCommitRuntimeStore {
         inner: meerkat_runtime::SqliteRuntimeStore,
         fail_commits: AtomicBool,
+        fail_lifecycle_commits: AtomicBool,
     }
 
     #[async_trait::async_trait]
     impl RuntimeStore for FailingHeadCanonicalCommitRuntimeStore {
         fn session_authority_ops(&self) -> &dyn meerkat_runtime::store::RuntimeSessionAuthorityOps {
             self.inner.session_authority_ops()
+        }
+
+        fn input_state_batch_cas_implementation_profile(
+            &self,
+        ) -> meerkat_runtime::store::InputStateBatchCasImplementationProfile {
+            self.inner.input_state_batch_cas_implementation_profile()
         }
 
         async fn commit_prepared_session_boundary(
@@ -14705,6 +14873,16 @@ mod tests {
             self.inner.load_input_states(runtime_id).await
         }
 
+        async fn load_input_states_with_versions(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<
+            meerkat_runtime::store::PreparedRecoveryInputSnapshot,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner.load_input_states_with_versions(runtime_id).await
+        }
+
         async fn load_boundary_receipt(
             &self,
             runtime_id: &LogicalRuntimeId,
@@ -14762,12 +14940,95 @@ mod tests {
             self.inner.persist_input_state(runtime_id, state).await
         }
 
+        async fn compare_and_swap_input_states_atomically(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            expected: &[StoredInputState],
+            replacements: &[InputStatePersistenceRecord],
+        ) -> Result<
+            meerkat_runtime::store::InputStateBatchCasOutcome,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner
+                .compare_and_swap_input_states_atomically(runtime_id, expected, replacements)
+                .await
+        }
+
+        async fn compare_and_swap_input_states_atomically_with_fence(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            expected: &[StoredInputState],
+            replacements: &[InputStatePersistenceRecord],
+            write_fence: Arc<dyn meerkat_runtime::store::RuntimeStoreWriteFence>,
+        ) -> Result<
+            meerkat_runtime::store::FencedInputStateBatchCasOutcome,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner
+                .compare_and_swap_input_states_atomically_with_fence(
+                    runtime_id,
+                    expected,
+                    replacements,
+                    write_fence,
+                )
+                .await
+        }
+
+        async fn compare_and_swap_recovery_input_states_atomically(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            expected_revision: meerkat_runtime::store::RecoveryInputSetRevision,
+            mutations: &[meerkat_runtime::store::RecoveryInputStateMutation],
+        ) -> Result<
+            meerkat_runtime::store::InputStateBatchCasOutcome,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner
+                .compare_and_swap_recovery_input_states_atomically(
+                    runtime_id,
+                    expected_revision,
+                    mutations,
+                )
+                .await
+        }
+
+        async fn compare_and_swap_recovery_input_states_atomically_with_fence(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            expected_revision: meerkat_runtime::store::RecoveryInputSetRevision,
+            mutations: &[meerkat_runtime::store::RecoveryInputStateMutation],
+            write_fence: Arc<dyn meerkat_runtime::store::RuntimeStoreWriteFence>,
+        ) -> Result<
+            meerkat_runtime::store::FencedInputStateBatchCasOutcome,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner
+                .compare_and_swap_recovery_input_states_atomically_with_fence(
+                    runtime_id,
+                    expected_revision,
+                    mutations,
+                    write_fence,
+                )
+                .await
+        }
+
         async fn load_input_state(
             &self,
             runtime_id: &LogicalRuntimeId,
             input_id: &InputId,
         ) -> Result<Option<StoredInputState>, meerkat_runtime::store::RuntimeStoreError> {
             self.inner.load_input_state(runtime_id, input_id).await
+        }
+
+        async fn load_pending_terminal_owner_ids_page(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            after: Option<&InputId>,
+            limit: usize,
+        ) -> Result<Vec<InputId>, meerkat_runtime::store::RuntimeStoreError> {
+            self.inner
+                .load_pending_terminal_owner_ids_page(runtime_id, after, limit)
+                .await
         }
 
         async fn load_machine_lifecycle_record(
@@ -14777,15 +15038,105 @@ mod tests {
             self.inner.load_machine_lifecycle_record(runtime_id).await
         }
 
+        async fn observe_machine_lifecycle(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<
+            meerkat_runtime::store::MachineLifecycleObservation,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner.observe_machine_lifecycle(runtime_id).await
+        }
+
+        async fn compare_and_swap_machine_lifecycle(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            expected: meerkat_runtime::store::MachineLifecycleExpectedVersion,
+            replacement: meerkat_runtime::store::MachineLifecycleCommit,
+        ) -> Result<
+            meerkat_runtime::store::MachineLifecycleCasOutcome,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            if self.fail_lifecycle_commits.load(Ordering::Acquire) {
+                return Err(meerkat_runtime::store::RuntimeStoreError::WriteFailed(
+                    "synthetic head-canonical lifecycle commit failure".to_string(),
+                ));
+            }
+            self.inner
+                .compare_and_swap_machine_lifecycle(runtime_id, expected, replacement)
+                .await
+        }
+
+        async fn compare_and_swap_machine_lifecycle_with_fence(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            expected: meerkat_runtime::store::MachineLifecycleExpectedVersion,
+            replacement: meerkat_runtime::store::MachineLifecycleCommit,
+            write_fence: Arc<dyn meerkat_runtime::store::RuntimeStoreWriteFence>,
+        ) -> Result<
+            meerkat_runtime::store::FencedMachineLifecycleCasOutcome,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            if self.fail_lifecycle_commits.load(Ordering::Acquire) {
+                return Err(meerkat_runtime::store::RuntimeStoreError::WriteFailed(
+                    "synthetic head-canonical lifecycle commit failure".to_string(),
+                ));
+            }
+            self.inner
+                .compare_and_swap_machine_lifecycle_with_fence(
+                    runtime_id,
+                    expected,
+                    replacement,
+                    write_fence,
+                )
+                .await
+        }
+
         async fn commit_machine_lifecycle(
             &self,
             runtime_id: &LogicalRuntimeId,
             commit: meerkat_runtime::store::MachineLifecycleCommit,
             input_states: &[InputStatePersistenceRecord],
         ) -> Result<(), meerkat_runtime::store::RuntimeStoreError> {
+            if self.fail_lifecycle_commits.load(Ordering::Acquire) {
+                return Err(meerkat_runtime::store::RuntimeStoreError::WriteFailed(
+                    "synthetic head-canonical lifecycle commit failure".to_string(),
+                ));
+            }
             self.inner
                 .commit_machine_lifecycle(runtime_id, commit, input_states)
                 .await
+        }
+
+        async fn persist_ops_lifecycle(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            snapshot: &meerkat_runtime::ops_lifecycle::PersistedOpsSnapshot,
+        ) -> Result<(), meerkat_runtime::store::RuntimeStoreError> {
+            self.inner.persist_ops_lifecycle(runtime_id, snapshot).await
+        }
+
+        async fn initialize_ops_lifecycle_if_absent(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            candidate: &meerkat_runtime::ops_lifecycle::PersistedOpsSnapshot,
+        ) -> Result<
+            meerkat_runtime::ops_lifecycle::PersistedOpsSnapshot,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner
+                .initialize_ops_lifecycle_if_absent(runtime_id, candidate)
+                .await
+        }
+
+        async fn load_ops_lifecycle(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<
+            Option<meerkat_runtime::ops_lifecycle::PersistedOpsSnapshot>,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner.load_ops_lifecycle(runtime_id).await
         }
     }
 
@@ -25573,6 +25924,554 @@ mod tests {
             service.comms_runtime(&created.session_id).await.is_some(),
             "runtime turn sync must preserve live comms mechanics"
         );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ArchiveHandoffProfile {
+        WholeBlob,
+        HeadCanonical,
+    }
+
+    impl ArchiveHandoffProfile {
+        const ALL: [Self; 2] = [Self::WholeBlob, Self::HeadCanonical];
+    }
+
+    enum ArchiveHandoffFailureControl {
+        WholeBlob(Arc<GatedSnapshotRuntimeStore>),
+        HeadCanonical(Arc<FailingHeadCanonicalCommitRuntimeStore>),
+    }
+
+    impl ArchiveHandoffFailureControl {
+        fn fail_lifecycle_commits(&self, fail: bool) {
+            match self {
+                Self::WholeBlob(store) => store.set_fail_machine_lifecycle_commits(fail),
+                Self::HeadCanonical(store) => {
+                    store.fail_lifecycle_commits.store(fail, Ordering::Release);
+                }
+            }
+        }
+
+        fn fail_next_document_commit(&self) {
+            match self {
+                Self::WholeBlob(store) => store.fail_snapshot_commit_in(1),
+                Self::HeadCanonical(store) => {
+                    store.fail_commits.store(true, Ordering::Release);
+                }
+            }
+        }
+
+        fn allow_document_commits(&self) {
+            match self {
+                Self::WholeBlob(store) => store.set_fail_snapshot_commits(false),
+                Self::HeadCanonical(store) => {
+                    store.fail_commits.store(false, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    struct ArchiveHandoffFixture {
+        service: PersistentSessionService<DummyBuilder>,
+        machine: Arc<MeerkatMachine>,
+        session_store: Arc<dyn SessionStore>,
+        runtime_store: Arc<dyn RuntimeStore>,
+        blob_store: Arc<dyn BlobStore>,
+        failures: ArchiveHandoffFailureControl,
+        session_id: SessionId,
+        _storage_dir: Option<tempfile::TempDir>,
+    }
+
+    impl ArchiveHandoffFixture {
+        async fn new(profile: ArchiveHandoffProfile, session: Session) -> Self {
+            let session_id = session.id().clone();
+            let (session_store, runtime_store, failures, storage_dir): (
+                Arc<dyn SessionStore>,
+                Arc<dyn RuntimeStore>,
+                ArchiveHandoffFailureControl,
+                Option<tempfile::TempDir>,
+            ) = match profile {
+                ArchiveHandoffProfile::WholeBlob => {
+                    let runtime_store = Arc::new(GatedSnapshotRuntimeStore::new());
+                    (
+                        Arc::new(MemoryStore::new()),
+                        Arc::clone(&runtime_store) as Arc<dyn RuntimeStore>,
+                        ArchiveHandoffFailureControl::WholeBlob(runtime_store),
+                        None,
+                    )
+                }
+                ArchiveHandoffProfile::HeadCanonical => {
+                    let storage_dir =
+                        tempfile::tempdir_in(".").expect("head-canonical archive test directory");
+                    let database_path = storage_dir.path().join("runtime.sqlite3");
+                    let runtime_store = Arc::new(FailingHeadCanonicalCommitRuntimeStore {
+                        inner: meerkat_runtime::SqliteRuntimeStore::new_head_canonical(
+                            &database_path,
+                        )
+                        .expect("head-canonical runtime store"),
+                        fail_commits: AtomicBool::new(false),
+                        fail_lifecycle_commits: AtomicBool::new(false),
+                    });
+                    let session_store: Arc<dyn SessionStore> = Arc::new(
+                        meerkat_store::SqliteSessionStore::open(&database_path)
+                            .expect("co-located head-canonical session store"),
+                    );
+                    (
+                        session_store,
+                        Arc::clone(&runtime_store) as Arc<dyn RuntimeStore>,
+                        ArchiveHandoffFailureControl::HeadCanonical(runtime_store),
+                        Some(storage_dir),
+                    )
+                }
+            };
+            let blob_store = memory_blob_store();
+            let service = PersistentSessionService::new(
+                DummyBuilder,
+                4,
+                Arc::clone(&session_store),
+                Arc::clone(&runtime_store),
+                Arc::clone(&blob_store),
+            );
+            match profile {
+                ArchiveHandoffProfile::WholeBlob => {
+                    service
+                        .save_normalized_session(session)
+                        .await
+                        .expect("seed committed WholeBlob handoff");
+                }
+                ArchiveHandoffProfile::HeadCanonical => {
+                    service
+                        .persist_detached_head_canonical_session(
+                            session,
+                            "archive handoff test seed",
+                        )
+                        .await
+                        .expect("seed committed HeadCanonical handoff");
+                }
+            }
+            let machine = Arc::new(MeerkatMachine::persistent(
+                Arc::clone(&runtime_store),
+                Arc::clone(&blob_store),
+            ));
+            machine
+                .register_session(session_id.clone())
+                .await
+                .expect("register archive handoff session without importing its request");
+            Self {
+                service,
+                machine,
+                session_store,
+                runtime_store,
+                blob_store,
+                failures,
+                session_id,
+                _storage_dir: storage_dir,
+            }
+        }
+
+        async fn archive(&self) -> Result<(), SessionError> {
+            let _turn_boundary = self
+                .service
+                .acquire_runtime_turn_finalization_guard(&self.session_id)
+                .await;
+            self.service
+                .archive_with_machine_protocol_under_runtime_turn_boundary_and_hook_before(
+                    &self.session_id,
+                    MachineSessionArchiveProtocol::from_machine(self.machine.as_ref()),
+                    meerkat_core::time_compat::Instant::now() + std::time::Duration::from_secs(10),
+                    None,
+                )
+                .await
+        }
+
+        async fn durable_body(&self) -> Session {
+            self.service
+                .load_persisted_session_for_archive(&self.session_id)
+                .await
+                .expect("load committed archive handoff body")
+                .expect("archive handoff body remains present")
+        }
+
+        async fn seed_originating_boundary(&self, run_id: RunId) {
+            let body = self.durable_body().await;
+            let receipt = meerkat_core::RunBoundaryReceiptDraft {
+                run_id: run_id.clone(),
+                boundary: RunApplyBoundary::RunStart,
+                contributing_input_ids: Vec::new(),
+                conversation_digest: Some(
+                    body.transcript_content_digest()
+                        .expect("digest archive handoff fixture"),
+                ),
+                message_count: body.messages().len(),
+            }
+            .into_sequenced(0);
+            self.runtime_store
+                .commit_prepared_session_boundary(
+                    &PersistentSessionService::<DummyBuilder>::runtime_id_for_session(
+                        &self.session_id,
+                    ),
+                    meerkat_runtime::PreparedRuntimeSessionCommit::success(
+                        None,
+                        receipt,
+                        Vec::new(),
+                        Some(self.session_id.clone()),
+                    ),
+                )
+                .await
+                .expect("seed exact committed originating boundary");
+            assert!(
+                self.runtime_store
+                    .load_boundary_receipt(
+                        &PersistentSessionService::<DummyBuilder>::runtime_id_for_session(
+                            &self.session_id,
+                        ),
+                        &run_id,
+                        0,
+                    )
+                    .await
+                    .expect("read originating boundary")
+                    .is_some()
+            );
+        }
+    }
+
+    fn archive_handoff_intent(model: &str) -> meerkat_core::image_generation::SwitchTurnIntent {
+        meerkat_core::image_generation::SwitchTurnIntent {
+            target_model: meerkat_core::lifecycle::run_primitive::ModelId::new(model),
+            duration: meerkat_core::image_generation::SwitchTurnDuration::UntilChanged,
+            origin: meerkat_core::image_generation::SwitchTurnOrigin::Model {
+                reason:
+                    meerkat_core::image_generation::SwitchTurnReasonTextDisposition::NotProvided,
+            },
+        }
+    }
+
+    fn archive_handoff_requested(
+        request_id: meerkat_core::image_generation::SwitchTurnRequestId,
+        run_id: RunId,
+        model: &str,
+    ) -> SessionModelRoutingControlRecord {
+        SessionModelRoutingControlRecord::request(request_id, run_id, archive_handoff_intent(model))
+            .expect("archive fixture intent is a durable handoff")
+    }
+
+    fn new_archive_handoff_request_id() -> meerkat_core::image_generation::SwitchTurnRequestId {
+        serde_json::from_value(
+            serde_json::to_value(RunId::new()).expect("serialize request-id UUID source"),
+        )
+        .expect("deserialize request-id UUID")
+    }
+
+    fn session_with_requested_archive_handoff()
+    -> (Session, meerkat_runtime::CommittedModelRoutingHandoff) {
+        let mut session = Session::new();
+        let handoff = meerkat_runtime::CommittedModelRoutingHandoff {
+            request_id: new_archive_handoff_request_id(),
+            originating_run_id: RunId::new(),
+            intent: archive_handoff_intent("claude-opus-5"),
+        };
+        session
+            .append_model_routing_control_record(
+                SessionModelRoutingControlRecord::request(
+                    handoff.request_id,
+                    handoff.originating_run_id.clone(),
+                    handoff.intent.clone(),
+                )
+                .expect("archive fixture request"),
+            )
+            .expect("append archive fixture request");
+        (session, handoff)
+    }
+
+    fn assert_handoff_abandoned(
+        session: &Session,
+        handoff: &meerkat_runtime::CommittedModelRoutingHandoff,
+    ) {
+        assert_eq!(
+            session
+                .model_routing_control()
+                .disposition_of(&handoff.request_id),
+            Some(ModelRoutingIntentRecordDisposition::Abandoned)
+        );
+        assert!(
+            session
+                .model_routing_control()
+                .awaiting_decision()
+                .next()
+                .is_none(),
+            "an archived session must owe no model-routing decision"
+        );
+        assert_eq!(
+            session.model_routing_control().records().len(),
+            2,
+            "the archive terminal extends the request exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_routing_handoff_archive_terminalizes_never_imported_in_both_profiles() {
+        for profile in ArchiveHandoffProfile::ALL {
+            let (session, handoff) = session_with_requested_archive_handoff();
+            let fixture = ArchiveHandoffFixture::new(profile, session).await;
+
+            fixture
+                .archive()
+                .await
+                .unwrap_or_else(|error| panic!("{profile:?} archive failed: {error}"));
+
+            assert_eq!(
+                meerkat_runtime::store::load_runtime_state(
+                    fixture.runtime_store.as_ref(),
+                    &PersistentSessionService::<DummyBuilder>::runtime_id_for_session(
+                        &fixture.session_id,
+                    ),
+                )
+                .await
+                .expect("read archive runtime terminal"),
+                Some(RuntimeState::Retired)
+            );
+            assert_handoff_abandoned(&fixture.durable_body().await, &handoff);
+        }
+    }
+
+    #[tokio::test]
+    async fn model_routing_handoff_archive_terminalizes_boundary_held_in_both_profiles() {
+        for profile in ArchiveHandoffProfile::ALL {
+            let (session, handoff) = session_with_requested_archive_handoff();
+            let fixture = ArchiveHandoffFixture::new(profile, session).await;
+            let _turn_boundary = fixture
+                .service
+                .acquire_runtime_turn_finalization_guard(&fixture.session_id)
+                .await;
+            let realization = meerkat_runtime::SessionServiceRuntimeExt::
+                realize_committed_model_routing_handoff_under_turn_finalization_boundary(
+                    fixture.machine.as_ref(),
+                    &fixture.session_id,
+                    handoff.clone(),
+                )
+                .await
+                .expect("an uncommitted origin is a typed hold");
+            assert!(matches!(
+                realization,
+                meerkat_runtime::ModelRoutingHandoffRealization::Held {
+                    reason:
+                        meerkat_runtime::ModelRoutingHandoffHoldReason::
+                            OriginatingBoundaryUncommitted { .. }
+                }
+            ));
+            drop(_turn_boundary);
+
+            fixture
+                .archive()
+                .await
+                .unwrap_or_else(|error| panic!("{profile:?} held archive failed: {error}"));
+            assert_handoff_abandoned(&fixture.durable_body().await, &handoff);
+        }
+    }
+
+    #[tokio::test]
+    async fn model_routing_handoff_archive_preserves_realized_and_denied_in_both_profiles() {
+        for profile in ArchiveHandoffProfile::ALL {
+            let mut session = Session::new();
+            let realized_request = new_archive_handoff_request_id();
+            let realized_run = RunId::new();
+            session
+                .append_model_routing_control_record(archive_handoff_requested(
+                    realized_request,
+                    realized_run.clone(),
+                    "claude-opus-5",
+                ))
+                .expect("append realized request");
+            session
+                .append_model_routing_control_record(
+                    SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
+                        request_id: realized_request,
+                        originating_run_id: realized_run,
+                        intent: archive_handoff_intent("claude-opus-5"),
+                        applied_identity: Box::new(meerkat_core::SessionLlmIdentity {
+                            model: "claude-opus-5".to_string(),
+                            provider: meerkat_core::Provider::Anthropic,
+                            self_hosted_server_id: None,
+                            provider_params: None,
+                            auth_binding: None,
+                        }),
+                    },
+                )
+                .expect("append realized terminal");
+            let denied_request = new_archive_handoff_request_id();
+            let denied_run = RunId::new();
+            session
+                .append_model_routing_control_record(archive_handoff_requested(
+                    denied_request,
+                    denied_run.clone(),
+                    "gpt-5.5",
+                ))
+                .expect("append denied request");
+            session
+                .append_model_routing_control_record(
+                    SessionModelRoutingControlRecord::ModelRoutingIntentDenied {
+                        request_id: denied_request,
+                        originating_run_id: denied_run,
+                        intent: archive_handoff_intent("gpt-5.5"),
+                        reason: meerkat_core::image_generation::SwitchTurnDenialReason::
+                            UnsupportedModel,
+                    },
+                )
+                .expect("append denied terminal");
+            let expected = session.model_routing_control().records().to_vec();
+            let fixture = ArchiveHandoffFixture::new(profile, session).await;
+
+            fixture
+                .archive()
+                .await
+                .unwrap_or_else(|error| panic!("{profile:?} settled archive failed: {error}"));
+            let durable = fixture.durable_body().await;
+            assert_eq!(durable.model_routing_control().records(), expected);
+            assert!(
+                durable
+                    .model_routing_control()
+                    .records()
+                    .iter()
+                    .all(|record| !matches!(
+                        record,
+                        SessionModelRoutingControlRecord::ModelRoutingIntentAbandoned { .. }
+                    ))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn model_routing_handoff_archive_preterminal_failure_stays_active_in_both_profiles() {
+        for profile in ArchiveHandoffProfile::ALL {
+            let (session, handoff) = session_with_requested_archive_handoff();
+            let fixture = ArchiveHandoffFixture::new(profile, session).await;
+            fixture
+                .seed_originating_boundary(handoff.originating_run_id.clone())
+                .await;
+            fixture.failures.fail_lifecycle_commits(true);
+
+            let error = fixture
+                .archive()
+                .await
+                .expect_err("runtime lifecycle persistence failure must fail archive");
+            assert!(
+                error.to_string().contains("lifecycle commit failure"),
+                "{profile:?} surfaced unexpected archive error: {error:?}"
+            );
+            fixture.failures.fail_lifecycle_commits(false);
+
+            assert_ne!(
+                meerkat_runtime::store::load_runtime_state(
+                    fixture.runtime_store.as_ref(),
+                    &PersistentSessionService::<DummyBuilder>::runtime_id_for_session(
+                        &fixture.session_id,
+                    ),
+                )
+                .await
+                .expect("read active runtime state"),
+                Some(RuntimeState::Retired),
+                "failed archive must not commit session terminality"
+            );
+            let durable = fixture.durable_body().await;
+            assert_eq!(
+                durable
+                    .model_routing_control()
+                    .disposition_of(&handoff.request_id),
+                Some(ModelRoutingIntentRecordDisposition::Requested)
+            );
+            assert_eq!(
+                durable.model_routing_control().awaiting_decision().count(),
+                1
+            );
+            fixture
+                .service
+                .read(&fixture.session_id)
+                .await
+                .expect("failed pre-terminal archive leaves the session active");
+            assert!(
+                fixture
+                    .runtime_store
+                    .load_boundary_receipt(
+                        &PersistentSessionService::<DummyBuilder>::runtime_id_for_session(
+                            &fixture.session_id,
+                        ),
+                        &handoff.originating_run_id,
+                        0,
+                    )
+                    .await
+                    .expect("read actionability receipt")
+                    .is_some(),
+                "the still-Requested handoff retains its committed-boundary proof"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn model_routing_handoff_archive_retry_finishes_abandoned_in_both_profiles() {
+        for profile in ArchiveHandoffProfile::ALL {
+            let (session, handoff) = session_with_requested_archive_handoff();
+            let fixture = ArchiveHandoffFixture::new(profile, session).await;
+            fixture.failures.fail_next_document_commit();
+
+            let first_error = fixture
+                .archive()
+                .await
+                .expect_err("injected abandoned-record persistence failure must surface");
+            assert!(
+                first_error.to_string().contains("boundary commit failure")
+                    || first_error.to_string().contains("snapshot commit failure"),
+                "{profile:?} surfaced unexpected terminal persistence error: {first_error:?}"
+            );
+            assert_eq!(
+                meerkat_runtime::store::load_runtime_state(
+                    fixture.runtime_store.as_ref(),
+                    &PersistentSessionService::<DummyBuilder>::runtime_id_for_session(
+                        &fixture.session_id,
+                    ),
+                )
+                .await
+                .expect("read committed runtime terminal"),
+                Some(RuntimeState::Retired),
+                "the injected failure must occur after runtime terminality"
+            );
+            assert_eq!(
+                fixture
+                    .durable_body()
+                    .await
+                    .model_routing_control()
+                    .disposition_of(&handoff.request_id),
+                Some(ModelRoutingIntentRecordDisposition::Requested),
+                "first failure must leave the durable outbox retryable"
+            );
+
+            fixture.failures.allow_document_commits();
+            let retry = fixture.archive().await;
+            assert!(
+                matches!(retry, Err(SessionError::NotFound { .. })),
+                "AlreadyArchived retry preserves the public NotFound contract: {retry:?}"
+            );
+            assert_handoff_abandoned(&fixture.durable_body().await, &handoff);
+
+            let restarted_service = PersistentSessionService::new(
+                DummyBuilder,
+                4,
+                Arc::clone(&fixture.session_store),
+                Arc::clone(&fixture.runtime_store),
+                Arc::clone(&fixture.blob_store),
+            );
+            restarted_service
+                .revive_archived_session_with_machine_authority(
+                    &fixture.session_id,
+                    fixture.machine.session_control_authority(),
+                )
+                .await
+                .expect("revive archived session after durable handoff convergence");
+            let revived = restarted_service
+                .load_persisted_session_for_archive(&fixture.session_id)
+                .await
+                .expect("load revived session")
+                .expect("revived session body remains present");
+            assert_handoff_abandoned(&revived, &handoff);
+        }
     }
 
     #[tokio::test]

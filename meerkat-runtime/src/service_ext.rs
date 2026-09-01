@@ -249,23 +249,6 @@ pub trait SessionServiceRuntimeExt: Send + Sync {
         ))
     }
 
-    /// Resolve every still-pending committed handoff as archived because the
-    /// session reached lifecycle terminality.
-    ///
-    /// Terminality is generated status, never a Session-log record: the log is
-    /// a handoff outbox written by runs, and a session that ended is not a run
-    /// that decided. Hosts call this at the archive boundary; it is idempotent
-    /// and refuses to walk back an already-realized handoff.
-    async fn archive_unresolved_model_routing_handoffs(
-        &self,
-        _session_id: &SessionId,
-        _request_ids: Vec<meerkat_core::image_generation::SwitchTurnRequestId>,
-    ) -> Result<(), RuntimeDriverError> {
-        Err(RuntimeDriverError::Internal(
-            "model-routing handoff archival is not supported by this runtime adapter".into(),
-        ))
-    }
-
     async fn begin_image_operation(
         &self,
         _session_id: &SessionId,

@@ -456,7 +456,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ClaimModelRoutingHandoff`(request_id: String, originating_run_id: String, target_model: String)
 - `RealizeModelRoutingHandoff`(request_id: String, originating_run_id: String, target_model: String, applied_model: String)
 - `DenyModelRoutingHandoff`(request_id: String, reason: RoutingDenialReason)
-- `ArchiveUnresolvedModelRoutingHandoff`(request_id: String)
 - `BeginImageOperation`(operation_id: String, target_model: String, target_realtime_capable: Bool, requires_approval: Bool, approval_available: Bool, approval_denied: Bool, approval_reason: Option<RoutingImageApprovalReason>, realtime_detach_allowed: Bool, requires_scoped_override: Bool)
 - `DenyImageOperationPlan`(operation_id: String, reason: RoutingImagePlanDenialReason, terminal_payload: String)
 - `ActivateImageOperationOverride`(operation_id: String, target_model: String, target_realtime_capable: Bool)
@@ -532,6 +531,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RequestFiniteSwitchTurn`(request_id: String, target_model: String, turns: u64, target_realtime_capable: Bool, requires_approval: Bool, approval_available: Bool, approval_denied: Bool, approval_reason: Option<RoutingSwitchApprovalReason>, realtime_detach_allowed: Bool)
 - `RequestUntilChangedSwitchTurn`(request_id: String, target_model: String, target_realtime_capable: Bool, requires_approval: Bool, approval_available: Bool, approval_denied: Bool, approval_reason: Option<RoutingSwitchApprovalReason>, realtime_detach_allowed: Bool)
 - `CompleteUntilChangedSwitchTurnReconfigure`(request_id: String)
+- `ArchiveUnresolvedModelRoutingHandoff`(request_id: String)
 - `ResolveLiveBoundaryContextReceipt`(run_id: RunId, input_id: String)
 - `CommitTerminalBoundarySequence`(run_id: RunId, boundary_sequence: u64)
 - `LiveBoundaryUnavailable`(input_id: String)
@@ -2630,6 +2630,14 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `not_yet_imported`
 - To: `Running`
 
+### `ImportCommittedModelRoutingHandoffFirstRetired`
+- From: `Retired`
+- On: `ImportCommittedModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- Guards:
+  - `session_registered`
+  - `not_yet_imported`
+- To: `Retired`
+
 ### `ImportCommittedModelRoutingHandoffAlreadyExactIdle`
 - From: `Idle`
 - On: `ImportCommittedModelRoutingHandoff`(request_id, originating_run_id, target_model)
@@ -2653,6 +2661,14 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_registered`
   - `already_imported_exactly`
 - To: `Running`
+
+### `ImportCommittedModelRoutingHandoffAlreadyExactRetired`
+- From: `Retired`
+- On: `ImportCommittedModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- Guards:
+  - `session_registered`
+  - `already_imported_exactly`
+- To: `Retired`
 
 ### `ClaimModelRoutingHandoffImportedIdle`
 - From: `Idle`
@@ -2828,30 +2844,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `already_denied_for_same_reason`
 - To: `Running`
 
-### `ArchiveUnresolvedModelRoutingHandoffPendingIdle`
-- From: `Idle`
-- On: `ArchiveUnresolvedModelRoutingHandoff`(request_id)
-- Guards:
-  - `session_registered`
-  - `pending`
-- To: `Idle`
-
-### `ArchiveUnresolvedModelRoutingHandoffPendingAttached`
-- From: `Attached`
-- On: `ArchiveUnresolvedModelRoutingHandoff`(request_id)
-- Guards:
-  - `session_registered`
-  - `pending`
-- To: `Attached`
-
-### `ArchiveUnresolvedModelRoutingHandoffPendingRunning`
-- From: `Running`
-- On: `ArchiveUnresolvedModelRoutingHandoff`(request_id)
-- Guards:
-  - `session_registered`
-  - `pending`
-- To: `Running`
-
 ### `ArchiveUnresolvedModelRoutingHandoffPendingRetired`
 - From: `Retired`
 - On: `ArchiveUnresolvedModelRoutingHandoff`(request_id)
@@ -2859,30 +2851,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_registered`
   - `pending`
 - To: `Retired`
-
-### `ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedIdle`
-- From: `Idle`
-- On: `ArchiveUnresolvedModelRoutingHandoff`(request_id)
-- Guards:
-  - `session_registered`
-  - `already_archived`
-- To: `Idle`
-
-### `ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedAttached`
-- From: `Attached`
-- On: `ArchiveUnresolvedModelRoutingHandoff`(request_id)
-- Guards:
-  - `session_registered`
-  - `already_archived`
-- To: `Attached`
-
-### `ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedRunning`
-- From: `Running`
-- On: `ArchiveUnresolvedModelRoutingHandoff`(request_id)
-- Guards:
-  - `session_registered`
-  - `already_archived`
-- To: `Running`
 
 ### `ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedRetired`
 - From: `Retired`

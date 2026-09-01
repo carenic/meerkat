@@ -314,6 +314,7 @@ impl SessionLlmReconfigureHost for ScriptedReconfigureHost {
             SessionModelRoutingControlRecord::ModelRoutingIntentRequested { .. } => "requested",
             SessionModelRoutingControlRecord::ModelRoutingIntentRealized { .. } => "realized",
             SessionModelRoutingControlRecord::ModelRoutingIntentDenied { .. } => "denied",
+            SessionModelRoutingControlRecord::ModelRoutingIntentAbandoned { .. } => "abandoned",
             _ => "unknown",
         };
         self.record(HostCall::AppendRecord(label));

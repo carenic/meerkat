@@ -437,6 +437,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ImportCommittedModelRoutingHandoffFirstRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `ImportCommittedModelRoutingHandoffFirstRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `ImportCommittedModelRoutingHandoffAlreadyExactIdle`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -444,6 +447,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `ImportCommittedModelRoutingHandoffAlreadyExactRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ImportCommittedModelRoutingHandoffAlreadyExactRetired`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `ClaimModelRoutingHandoffImportedIdle`
@@ -509,25 +515,7 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `DenyModelRoutingHandoffAlreadyDeniedRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
-- `ArchiveUnresolvedModelRoutingHandoffPendingIdle`
-  - anchors: (unclaimed)
-  - scenarios: (unclaimed)
-- `ArchiveUnresolvedModelRoutingHandoffPendingAttached`
-  - anchors: (unclaimed)
-  - scenarios: (unclaimed)
-- `ArchiveUnresolvedModelRoutingHandoffPendingRunning`
-  - anchors: (unclaimed)
-  - scenarios: (unclaimed)
 - `ArchiveUnresolvedModelRoutingHandoffPendingRetired`
-  - anchors: (unclaimed)
-  - scenarios: (unclaimed)
-- `ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedIdle`
-  - anchors: (unclaimed)
-  - scenarios: (unclaimed)
-- `ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedAttached`
-  - anchors: (unclaimed)
-  - scenarios: (unclaimed)
-- `ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedRetired`

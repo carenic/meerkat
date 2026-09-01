@@ -23,9 +23,17 @@
 //! does the committed log literally say", which is why they are named for
 //! records rather than for lifecycle status.
 //!
-//! Archive terminality is deliberately absent. It is generated status owned by
-//! the session-document lifecycle, not a Session-log record or a caller-held
-//! capability.
+//! Archive terminality is generated status: the `MeerkatMachine` handoff
+//! lifecycle decides it through `ArchiveUnresolvedModelRoutingHandoff`. The
+//! [`SessionModelRoutingControlRecord::ModelRoutingIntentAbandoned`] record
+//! here is the durable *mechanical log* of that decision and nothing more.
+//! It exists because generated state is in-memory: without a committed record,
+//! a request left unresolved by an archived session would still read as
+//! `awaiting_decision` after a restart and would be realized by whichever
+//! owner revived the document. Appending it is not a caller-held
+//! terminalization capability — no authorization token exists, and the only
+//! production writer is the single session-archive chokepoint, which appends
+//! exactly what generated authority already archived.
 //!
 //! # Vocabulary
 //!
@@ -85,8 +93,6 @@
 //!
 //! # Deliberately deferred (named, not silent)
 //!
-//! * Archive/destroy terminality is generated status in a later phase. Nothing
-//!   in Phase 0 mutates this log at a session boundary.
 //! * The claim/pending lifecycle (a request that generated authority has
 //!   claimed but not yet realized) is NOT represented here. It is machine
 //!   state, not durable document state, and lands with the generated
@@ -140,6 +146,21 @@ pub enum SessionModelRoutingControlRecord {
         intent: SwitchTurnIntent,
         reason: SwitchTurnDenialReason,
     },
+    /// The session reached lifecycle terminality before the request resolved.
+    ///
+    /// Deliberately not spelled as a denial: nothing refused the switch, and
+    /// no switch-turn decision point was ever reached. The session's life
+    /// ended while the request was still owed, so it can never be realized.
+    ///
+    /// This is the durable projection of the generated `Archived` handoff
+    /// phase. It is only ever appended by the session-archive chokepoint,
+    /// after generated authority has archived that exact request, and only
+    /// once the archive terminal is durably committed.
+    ModelRoutingIntentAbandoned {
+        request_id: SwitchTurnRequestId,
+        originating_run_id: RunId,
+        intent: SwitchTurnIntent,
+    },
 }
 
 impl SessionModelRoutingControlRecord {
@@ -168,7 +189,8 @@ impl SessionModelRoutingControlRecord {
         match self {
             Self::ModelRoutingIntentRequested { request_id, .. }
             | Self::ModelRoutingIntentRealized { request_id, .. }
-            | Self::ModelRoutingIntentDenied { request_id, .. } => request_id,
+            | Self::ModelRoutingIntentDenied { request_id, .. }
+            | Self::ModelRoutingIntentAbandoned { request_id, .. } => request_id,
         }
     }
 
@@ -183,6 +205,9 @@ impl SessionModelRoutingControlRecord {
             }
             | Self::ModelRoutingIntentDenied {
                 originating_run_id, ..
+            }
+            | Self::ModelRoutingIntentAbandoned {
+                originating_run_id, ..
             } => originating_run_id,
         }
     }
@@ -192,7 +217,8 @@ impl SessionModelRoutingControlRecord {
         match self {
             Self::ModelRoutingIntentRequested { intent, .. }
             | Self::ModelRoutingIntentRealized { intent, .. }
-            | Self::ModelRoutingIntentDenied { intent, .. } => intent,
+            | Self::ModelRoutingIntentDenied { intent, .. }
+            | Self::ModelRoutingIntentAbandoned { intent, .. } => intent,
         }
     }
 
@@ -207,6 +233,9 @@ impl SessionModelRoutingControlRecord {
                 ModelRoutingIntentRecordDisposition::Realized
             }
             Self::ModelRoutingIntentDenied { .. } => ModelRoutingIntentRecordDisposition::Denied,
+            Self::ModelRoutingIntentAbandoned { .. } => {
+                ModelRoutingIntentRecordDisposition::Abandoned
+            }
         }
     }
 }
@@ -237,6 +266,9 @@ pub enum ModelRoutingIntentRecordDisposition {
     Realized,
     /// The request was denied at its decision point.
     Denied,
+    /// The session reached lifecycle terminality before the request resolved,
+    /// so the request can never be realized.
+    Abandoned,
 }
 
 impl ModelRoutingIntentRecordDisposition {

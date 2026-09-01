@@ -92,6 +92,11 @@ fn every_record_variant_round_trips_through_json() {
             intent: intent("claude-opus-5"),
             reason: SwitchTurnDenialReason::UnsupportedModel,
         },
+        SessionModelRoutingControlRecord::ModelRoutingIntentAbandoned {
+            request_id,
+            originating_run_id: run.clone(),
+            intent: intent("claude-opus-5"),
+        },
     ];
 
     for record in variants {
@@ -126,11 +131,19 @@ fn record_tag_names_the_model_routing_domain() {
         (
             SessionModelRoutingControlRecord::ModelRoutingIntentDenied {
                 request_id,
-                originating_run_id: run,
+                originating_run_id: run.clone(),
                 intent: intent("gpt-5.5"),
                 reason: SwitchTurnDenialReason::UnsupportedModel,
             },
             "model_routing_intent_denied",
+        ),
+        (
+            SessionModelRoutingControlRecord::ModelRoutingIntentAbandoned {
+                request_id,
+                originating_run_id: run,
+                intent: intent("gpt-5.5"),
+            },
+            "model_routing_intent_abandoned",
         ),
     ];
     for (record, expected_tag) in records {
@@ -150,6 +163,7 @@ fn record_disposition_distinguishes_waiting_from_terminal() {
     for terminal in [
         ModelRoutingIntentRecordDisposition::Realized,
         ModelRoutingIntentRecordDisposition::Denied,
+        ModelRoutingIntentRecordDisposition::Abandoned,
     ] {
         assert!(terminal.is_terminal(), "{terminal:?} must be terminal");
         assert!(
@@ -296,6 +310,48 @@ fn exact_terminal_replay_is_idempotent_but_a_different_terminal_is_refused() {
         ),
         "expected AfterTerminal(Realized), got {error:?}"
     );
+}
+
+#[test]
+fn abandoned_is_an_idempotent_terminal_and_cannot_overwrite_a_settled_request() {
+    let request_id = new_request_id();
+    let run = RunId::new();
+    let mut history = SessionModelRoutingControlHistory::new();
+    history
+        .append(requested(&request_id, &run, "claude-opus-5"))
+        .expect("request appends");
+    let abandoned = SessionModelRoutingControlRecord::ModelRoutingIntentAbandoned {
+        request_id,
+        originating_run_id: run.clone(),
+        intent: intent("claude-opus-5"),
+    };
+    assert_eq!(
+        history
+            .append(abandoned.clone())
+            .expect("archive terminal appends"),
+        ModelRoutingControlAppendOutcome::Appended
+    );
+    assert_eq!(
+        history
+            .append(abandoned)
+            .expect("exact archive retry converges"),
+        ModelRoutingControlAppendOutcome::AlreadyRecorded
+    );
+    let error = history
+        .append(SessionModelRoutingControlRecord::ModelRoutingIntentDenied {
+            request_id,
+            originating_run_id: run,
+            intent: intent("claude-opus-5"),
+            reason: SwitchTurnDenialReason::UnsupportedModel,
+        })
+        .expect_err("a denial cannot overwrite the archive terminal");
+    assert!(matches!(
+        error,
+        ModelRoutingControlAppendError::AfterTerminal {
+            disposition: ModelRoutingIntentRecordDisposition::Abandoned,
+            ..
+        }
+    ));
 }
 
 #[test]
