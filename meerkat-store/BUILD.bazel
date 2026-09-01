@@ -263,6 +263,61 @@ rust_test(
 )
 
 rust_test(
+    name = "model_routing_handoff_resume_test",
+    aliases = aliases(
+        package_name = "meerkat-store",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "model_routing_handoff_resume",
+    crate_root = "tests/model_routing_handoff_resume.rs",
+    crate_features = [
+        "jsonl",
+        "memory",
+        "sqlite",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = [
+        "tests/model_routing_handoff_resume.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.8.31",
+        "CARGO_BIN_NAME": "model_routing_handoff_resume",
+        "CARGO_MANIFEST_DIR": "./meerkat-store",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "small",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "33554432",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "meerkat-store",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//meerkat-core:meerkat_core",
+        "//meerkat-schedule:meerkat_schedule",
+        "//meerkat-sqlite:meerkat_sqlite",
+        "//meerkat-store-conformance:meerkat_store_conformance",
+        "//meerkat-store:meerkat_store",
+    ] + all_crate_deps(
+        package_name = "meerkat-store",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "rct_contracts_test",
     aliases = aliases(
         package_name = "meerkat-store",
@@ -707,6 +762,7 @@ test_suite(
         ":conformance_test",
         ":legacy_text_json_upgrade_carry_test",
         ":meerkat_store_unit_test",
+        ":model_routing_handoff_resume_test",
         ":rct_contracts_test",
         ":schedule_atomic_mutation_test",
         ":schedule_machine_state_projection_test",
