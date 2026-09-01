@@ -4,6 +4,7 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MobMachineCatalogInput {
+    AdvanceDefinitionEpoch,
     RunFlow,
     CreateRunSeed,
     CreateFrameSeed,
@@ -205,6 +206,7 @@ pub enum MobMachineCatalogInput {
 
 impl MobMachineCatalogInput {
     pub const ALL: &'static [Self] = &[
+        Self::AdvanceDefinitionEpoch,
         Self::RunFlow,
         Self::CreateRunSeed,
         Self::CreateFrameSeed,
@@ -409,6 +411,7 @@ impl MobMachineCatalogInput {
         self,
     ) -> meerkat_machine_schema::catalog::dsl::mob_machine::MobMachineInputVariant {
         match self {
+            Self::AdvanceDefinitionEpoch => meerkat_machine_schema::catalog::dsl::mob_machine::MobMachineInputVariant::AdvanceDefinitionEpoch,
             Self::RunFlow => meerkat_machine_schema::catalog::dsl::mob_machine::MobMachineInputVariant::RunFlow,
             Self::CreateRunSeed => meerkat_machine_schema::catalog::dsl::mob_machine::MobMachineInputVariant::CreateRunSeed,
             Self::CreateFrameSeed => meerkat_machine_schema::catalog::dsl::mob_machine::MobMachineInputVariant::CreateFrameSeed,
@@ -612,6 +615,7 @@ impl MobMachineCatalogInput {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::AdvanceDefinitionEpoch => "AdvanceDefinitionEpoch",
             Self::RunFlow => "RunFlow",
             Self::CreateRunSeed => "CreateRunSeed",
             Self::CreateFrameSeed => "CreateFrameSeed",

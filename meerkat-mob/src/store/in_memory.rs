@@ -3,6 +3,9 @@
 use super::forked_participant::{
     ForkedParticipantRecord, ForkedParticipantStore, forked_participant_exact_reference,
 };
+use super::private::{
+    self, MobDefinitionEpochAppendOutcome, MobDefinitionEpochPersistenceAuthority,
+};
 use super::realm_profile::{RealmProfileStore, StoredRealmProfile};
 use super::temporary_council::{TemporaryCouncilRecord, TemporaryCouncilStore};
 use super::{
@@ -26,11 +29,12 @@ use super::{
     MobPlacedSpawnPendingPersistenceAuthority, MobRunStore, MobRuntimeMetadataStore, MobSpecStore,
     MobStoreError, PlacedSpawnCarrierPhase, PromotePlacedSpawnBindingResult,
     SupervisorAuthorityDeletionAuthority, SupervisorAuthorityPersistenceAuthority,
-    SupervisorAuthorityRecord, SystemMobIdentityStoreClock, external_delivery_repair_now_ms,
-    identity_member_target_state, identity_structural_projection_is_anchor,
-    identity_wiring_target_state, next_external_delivery_repair_state, private,
-    step_failed_event_identity, terminal_event_identity, validate_external_delivery_terminal,
-    validate_identity_member_commit_authority, validate_identity_wiring_commit_authority,
+    SupervisorAuthorityRecord, SystemMobIdentityStoreClock, current_definition_authority,
+    external_delivery_repair_now_ms, identity_member_target_state,
+    identity_structural_projection_is_anchor, identity_wiring_target_state,
+    next_external_delivery_repair_state, step_failed_event_identity, terminal_event_identity,
+    validate_external_delivery_terminal, validate_identity_member_commit_authority,
+    validate_identity_wiring_commit_authority, validate_initial_mob_created_events,
     validate_mob_event_write_authority,
 };
 #[cfg(feature = "runtime-adapter")]
@@ -137,6 +141,7 @@ where
 pub struct InMemoryMobEventStore {
     aggregate: Arc<RwLock<InMemoryMobAggregateState>>,
     event_tx: broadcast::Sender<MobEvent>,
+    definition_resume_gate: Arc<RwLock<()>>,
     #[cfg(any(test, feature = "test-support"))]
     fail_clear: AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
@@ -161,6 +166,7 @@ impl Default for InMemoryMobEventStore {
         Self {
             aggregate: Arc::new(RwLock::new(InMemoryMobAggregateState::default())),
             event_tx,
+            definition_resume_gate: Arc::new(RwLock::new(())),
             #[cfg(any(test, feature = "test-support"))]
             fail_clear: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
@@ -273,7 +279,74 @@ impl InMemoryMobEventStore {
     }
 }
 
-impl private::MobEventStoreSealed for InMemoryMobEventStore {}
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl private::MobEventStoreSealed for InMemoryMobEventStore {
+    fn definition_resume_gate(&self) -> Arc<RwLock<()>> {
+        Arc::clone(&self.definition_resume_gate)
+    }
+
+    async fn append_definition_epoch(
+        &self,
+        event: NewMobEvent,
+        authority: &MobDefinitionEpochPersistenceAuthority,
+    ) -> Result<MobDefinitionEpochAppendOutcome, MobStoreError> {
+        authority.verify_event(&event)?;
+        let mut aggregate = self.aggregate.write().await;
+        let event_head_cursor = aggregate
+            .events
+            .iter()
+            .filter(|existing| existing.mob_id == event.mob_id)
+            .map(|existing| existing.cursor)
+            .max()
+            .unwrap_or(0);
+        if event_head_cursor != authority.event_head_cursor {
+            return Err(MobStoreError::DefinitionEpochEventHeadConflict {
+                mob_id: event.mob_id,
+                expected: authority.event_head_cursor,
+                actual: event_head_cursor,
+            });
+        }
+        let current = current_definition_authority(&aggregate.events, &event.mob_id)?;
+        let current_epoch = current.as_ref().map_or(0, |(_, epoch)| *epoch);
+        if current_epoch == authority.epoch {
+            let existing = aggregate
+                .events
+                .iter()
+                .rev()
+                .find(|existing| {
+                    existing.mob_id == event.mob_id && existing.kind == event.kind
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    MobStoreError::CasConflict(format!(
+                        "mob '{}' definition epoch {} is already committed with different authority",
+                        event.mob_id, authority.epoch
+                    ))
+                })?;
+            return Ok(MobDefinitionEpochAppendOutcome::AlreadyCommitted(existing));
+        }
+        if current_epoch != authority.previous_epoch {
+            return Err(MobStoreError::SpecRevisionConflict {
+                mob_id: event.mob_id,
+                expected: Some(authority.previous_epoch),
+                actual: current_epoch,
+            });
+        }
+        let events = &mut aggregate.events;
+        let cursor = events.last().map_or(1, |existing| existing.cursor + 1);
+        let stored = MobEvent {
+            cursor,
+            timestamp: event.timestamp.unwrap_or_else(Utc::now),
+            mob_id: event.mob_id,
+            kind: event.kind,
+        };
+        events.push(stored.clone());
+        drop(aggregate);
+        let _ = self.event_tx.send(stored.clone());
+        Ok(MobDefinitionEpochAppendOutcome::Appended(stored))
+    }
+}
 
 type ExternalBindingOverlayMap = BTreeMap<
     (MobId, crate::ids::AgentIdentity, crate::ids::Generation),
@@ -2840,6 +2913,7 @@ impl MobEventStore for InMemoryMobEventStore {
         }
 
         let mut aggregate = self.aggregate.write().await;
+        validate_initial_mob_created_events(&aggregate.events, std::slice::from_ref(&event))?;
         let events = &mut aggregate.events;
         let cursor = events.last().map_or(1, |existing| existing.cursor + 1);
         let stored = MobEvent {
@@ -2864,7 +2938,6 @@ impl MobEventStore for InMemoryMobEventStore {
         }
         Ok(stored)
     }
-
     async fn append_terminal_event_if_absent(
         &self,
         event: NewMobEvent,
@@ -2970,6 +3043,7 @@ impl MobEventStore for InMemoryMobEventStore {
         }
 
         let mut aggregate = self.aggregate.write().await;
+        validate_initial_mob_created_events(&aggregate.events, &batch)?;
         let events = &mut aggregate.events;
         let mut results = Vec::with_capacity(batch.len());
         for event in batch {

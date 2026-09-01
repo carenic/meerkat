@@ -182,6 +182,44 @@ Persistent mob state is SQLite/WAL-backed through `SqliteMobStores`.
 In-memory storage is used for tests and WASM. The previous exclusive-handle mob
 store is gone.
 
+### Durable definition updates
+
+The structural event log owns the durable definition. `MobCreated` establishes
+definition epoch 1; each `MobDefinitionUpdated` is a strict MobMachine-authorized
+successor. The mob spec store is only a projection and its revision must equal
+the authoritative epoch.
+
+Trusted Rust hosts update a cold process-local mob before resume:
+
+```rust
+let revision = storage
+    .update_definition(expected_revision, updated_definition)
+    .await?;
+let snapshot = storage
+    .created_definition_snapshot()
+    .await?
+    .ok_or_else(|| anyhow!("mob definition is missing"))?;
+let mob = MobBuilder::for_resume_verified(storage, snapshot)
+    .with_session_service(session_service)
+    .resume()
+    .await?;
+```
+
+The event authority commits first under an atomic CAS. If the process fails
+before the projection write, exact retry or resume repairs the stale projection.
+`MobStorage::definition_projection_health()` exposes missing, stale, healthy,
+and diverged states. A same-revision content mismatch or projection-ahead state
+fails resume with `MobDefinitionProjectionMismatch`; consumers must not append
+raw events, write only the spec projection, or weaken this refusal.
+Hosts that inspect a definition before resume use the storage-minted
+`MobDefinitionSnapshot`. Verified resume compares its full definition, epoch,
+and authoritative `MobCreated`/`MobDefinitionUpdated` event cursor against the
+actual replay before repair or actuation; a concurrent update returns
+`MobDefinitionAuthorityChanged`. The verified resume claim holds the
+database's shared cross-process fence through runtime construction;
+`update_definition` takes the matching exclusive fence, so an external SQLite
+writer cannot cross the replay-to-actuation interval.
+
 Multi-host persistence is deliberately split. The controlling realm stores
 the mob, host bindings, placement, grants, route obligations, flow/work state,
 and merged event position. The owning member-host realm stores each placed

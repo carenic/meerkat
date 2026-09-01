@@ -387,6 +387,17 @@ pub enum MobEventKind {
         /// Full mob definition (serializable form, excluding runtime-only state).
         definition: Box<MobDefinition>,
     },
+    /// MobMachine-authorized replacement of the durable definition authority.
+    ///
+    /// The epoch is a strict successor of the preceding `MobCreated` (epoch 1)
+    /// or `MobDefinitionUpdated` event. The spec store is a recoverable
+    /// projection of this event, never an independent authority.
+    MobDefinitionUpdated {
+        /// Monotonic definition authority epoch.
+        epoch: u64,
+        /// Full replacement definition.
+        definition: Box<MobDefinition>,
+    },
     /// Generated MobMachine owner bridge-session binding for the mob.
     ///
     /// This event is a durable projection of `MobMachineEffect::OwnerBridgeSessionBound`.
@@ -1654,6 +1665,14 @@ mod tests {
     #[test]
     fn test_mob_created_roundtrip() {
         roundtrip(&MobEventKind::MobCreated {
+            definition: Box::new(sample_definition()),
+        });
+    }
+
+    #[test]
+    fn test_mob_definition_updated_roundtrip() {
+        roundtrip(&MobEventKind::MobDefinitionUpdated {
+            epoch: 2,
             definition: Box::new(sample_definition()),
         });
     }

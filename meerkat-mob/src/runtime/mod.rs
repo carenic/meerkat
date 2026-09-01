@@ -55,6 +55,7 @@ pub(crate) const FLOW_SYSTEM_MEMBER_ID_PREFIX: &str = "__flow_system_";
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use actor::IdentityStatusProjectionOrder;
+pub(crate) use builder::recover_definition_epoch_authority;
 
 pub(crate) fn flow_system_member_id() -> AgentIdentity {
     crate::ids::AgentIdentity::flow_system_provenance()

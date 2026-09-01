@@ -420,6 +420,7 @@ pub enum MobMachineShellMechanicReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MobMachineRuntimeInternalReason {
+    DefinitionEpochAuthority,
     EventObservationAuthority,
     FlowProjectionAuthority,
     RuntimeRejectionFeedback,
@@ -507,6 +508,10 @@ pub struct MobMachineRuntimeInternalClassificationRecord {
 
 const MOB_MACHINE_RUNTIME_INTERNAL_CLASSIFICATIONS:
     &[MobMachineRuntimeInternalClassificationRecord] = &[
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::AdvanceDefinitionEpoch,
+        reason: MobMachineRuntimeInternalReason::DefinitionEpochAuthority,
+    },
     MobMachineRuntimeInternalClassificationRecord {
         input: MobMachineCatalogInput::BeginSpawnExec,
         reason: MobMachineRuntimeInternalReason::SpawnExecLadderAuthority,

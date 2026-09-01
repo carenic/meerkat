@@ -534,7 +534,8 @@ pub(crate) struct MobMachineFlowAuthorityToken {
 
 macro_rules! non_flow_reducer_authority_mob_machine_inputs {
     () => {
-        mob_dsl::MobMachineInput::RunFlow { .. }
+        mob_dsl::MobMachineInput::AdvanceDefinitionEpoch { .. }
+            | mob_dsl::MobMachineInput::RunFlow { .. }
             | mob_dsl::MobMachineInput::CancelFlow { .. }
             | mob_dsl::MobMachineInput::FlowStatus
             | mob_dsl::MobMachineInput::ClassifyFlowRunTerminality { .. }
@@ -1790,7 +1791,8 @@ impl FlowAuthorityInputRecord {
                 body_frame_id,
                 body_frame_iteration,
             },
-            mob_dsl::MobMachineInput::CancelFlow { .. }
+            mob_dsl::MobMachineInput::AdvanceDefinitionEpoch { .. }
+            | mob_dsl::MobMachineInput::CancelFlow { .. }
             | mob_dsl::MobMachineInput::FlowStatus
             | mob_dsl::MobMachineInput::ClassifyFlowRunTerminality { .. }
             | mob_dsl::MobMachineInput::ClassifyFlowRunPublicResult { .. }

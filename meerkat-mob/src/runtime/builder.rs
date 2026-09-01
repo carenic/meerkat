@@ -1,6 +1,7 @@
 use super::*;
 use crate::machines::mob_machine as mob_dsl;
 use crate::store::authority_validating_mob_run_store;
+use crate::store::private::MobEventStoreSealed as _;
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
 use meerkat_core::comms::{
@@ -527,7 +528,9 @@ pub struct MobBuilder {
 
 enum BuilderMode {
     Create(Arc<MobDefinition>),
-    Resume,
+    Resume {
+        expected_definition: Option<crate::storage::MobDefinitionSnapshot>,
+    },
 }
 
 #[derive(Clone)]
@@ -4000,6 +4003,30 @@ fn seed_mob_authority_sync_from_events(
     for event in events {
         match &event.kind {
             MobEventKind::MobCreated { .. } => {}
+            MobEventKind::MobDefinitionUpdated { epoch, .. } => {
+                let current_epoch = authority.state().definition_epoch;
+                if *epoch <= current_epoch {
+                    continue;
+                }
+                let next_epoch = current_epoch.checked_add(1).ok_or_else(|| {
+                    MobError::Internal(format!(
+                        "mob definition epoch is exhausted at {current_epoch}"
+                    ))
+                })?;
+                if next_epoch != *epoch {
+                    return Err(MobError::Internal(format!(
+                        "recovered mob definition epoch sequence is invalid: current {current_epoch}, event {epoch}"
+                    )));
+                }
+                apply_seeded_mob_input(
+                    authority,
+                    mob_dsl::MobMachineInput::AdvanceDefinitionEpoch {
+                        expected_epoch: current_epoch,
+                        next_epoch: *epoch,
+                    },
+                    "recover_mob_definition_epoch",
+                )?;
+            }
             MobEventKind::MobOwnerBridgeSessionBound {
                 bridge_session_id,
                 destroy_on_owner_archive,
@@ -4437,6 +4464,61 @@ fn seed_mob_authority_sync_from_events(
     }
     seed_mob_definition_spawn_policy(authority, definition, "recover_definition_spawn_policy")?;
     Ok(())
+}
+
+fn recover_definition_epoch_from_history(
+    authority: &mut crate::machines::mob_machine::MobMachineAuthority,
+    events: &[crate::event::MobEvent],
+) -> Result<(), MobError> {
+    for event in events {
+        if let MobEventKind::MobDefinitionUpdated { epoch, .. } = &event.kind {
+            let current_epoch = authority.state().definition_epoch;
+            let next_epoch = current_epoch.checked_add(1).ok_or_else(|| {
+                MobError::Internal(format!(
+                    "mob definition epoch is exhausted at {current_epoch}"
+                ))
+            })?;
+            if *epoch != next_epoch {
+                return Err(MobError::Internal(format!(
+                    "recovered mob definition epoch sequence is invalid: expected {next_epoch}, found {epoch}"
+                )));
+            }
+            apply_seeded_mob_input(
+                authority,
+                mob_dsl::MobMachineInput::AdvanceDefinitionEpoch {
+                    expected_epoch: current_epoch,
+                    next_epoch,
+                },
+                "recover_mob_definition_epoch_history",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn recover_definition_epoch_authority(
+    events: &[crate::event::MobEvent],
+    definition: &MobDefinition,
+) -> Result<crate::machines::mob_machine::MobMachineAuthority, MobError> {
+    let epoch_start = events
+        .iter()
+        .rposition(|event| matches!(event.kind, MobEventKind::MobReset))
+        .map_or(0, |position| position + 1);
+    let mut authority = seed_mob_authority();
+    seed_mob_definition_spawn_policy(
+        &mut authority,
+        definition,
+        "recover_definition_epoch_spawn_policy",
+    )?;
+    recover_definition_epoch_from_history(&mut authority, events)?;
+    seed_mob_authority_sync_from_events(
+        &mut authority,
+        &events[epoch_start..],
+        definition,
+        false,
+        &BTreeSet::new(),
+    )?;
+    Ok(authority)
 }
 
 /// Recover the exact respawn-topology intent carried by each retirement
@@ -7246,8 +7328,25 @@ impl MobBuilder {
 
     /// Create a builder that resumes a mob from persisted events.
     pub fn for_resume(storage: MobStorage) -> Self {
+        Self::for_resume_mode(storage, None)
+    }
+
+    /// Create a builder whose resume is bound to a storage-minted definition snapshot.
+    pub fn for_resume_verified(
+        storage: MobStorage,
+        expected_definition: crate::storage::MobDefinitionSnapshot,
+    ) -> Self {
+        Self::for_resume_mode(storage, Some(expected_definition))
+    }
+
+    fn for_resume_mode(
+        storage: MobStorage,
+        expected_definition: Option<crate::storage::MobDefinitionSnapshot>,
+    ) -> Self {
         Self {
-            mode: BuilderMode::Resume,
+            mode: BuilderMode::Resume {
+                expected_definition,
+            },
             storage,
             session_service: None,
             #[cfg(feature = "runtime-adapter")]
@@ -7484,7 +7583,7 @@ impl MobBuilder {
 
             let definition = match mode {
                 BuilderMode::Create(definition) => definition,
-                BuilderMode::Resume => {
+                BuilderMode::Resume { .. } => {
                     return Err(MobError::Internal(
                         "MobBuilder::create() cannot be used with for_resume(); call resume()"
                             .to_string(),
@@ -7582,12 +7681,7 @@ impl MobBuilder {
                     })
                     .await?;
             }
-            Self::sync_definition_with_spec_store(
-                storage.specs.clone(),
-                definition.id.clone(),
-                definition.as_ref(),
-            )
-            .await?;
+            Self::sync_definition_with_spec_store(&storage, definition.as_ref(), 1).await?;
             Self::ensure_supervisor_authority(
                 storage.runtime_metadata.clone(),
                 definition.id.clone(),
@@ -7712,11 +7806,21 @@ impl MobBuilder {
         #[cfg(not(feature = "runtime-adapter"))]
         let runtime_adapter: RuntimeAdapterOption = None;
 
-        if !matches!(mode, BuilderMode::Resume) {
-            return Err(MobError::Internal(
-                "MobBuilder::resume() requires MobBuilder::for_resume(storage)".to_string(),
-            ));
-        }
+        let expected_definition = match mode {
+            BuilderMode::Resume {
+                expected_definition,
+            } => expected_definition,
+            BuilderMode::Create(_) => {
+                return Err(MobError::Internal(
+                    "MobBuilder::resume() requires MobBuilder::for_resume(storage)".to_string(),
+                ));
+            }
+        };
+        let _definition_resume_guard = if expected_definition.is_some() {
+            Some(storage.events.acquire_definition_resume_claim().await?)
+        } else {
+            None
+        };
 
         let session_service = session_service
             .ok_or_else(|| MobError::Internal("session_service is required".into()))?;
@@ -7731,6 +7835,23 @@ impl MobBuilder {
         // §8 check deferred until after definition recovery — the definition
         // comes from the event log, so we can't check profiles before replay.
         let (all_events, definition) = storage.replay_with_created_definition().await?;
+        let actual_definition = MobStorage::current_definition_snapshot_for_log(&all_events)?;
+        if let Some(expected) = expected_definition.as_ref()
+            && actual_definition.as_ref().is_none_or(|actual| {
+                expected.epoch() != actual.epoch()
+                    || expected.event_cursor() != actual.event_cursor()
+                    || expected.definition() != actual.definition()
+            })
+        {
+            return Err(MobError::MobDefinitionAuthorityChanged {
+                expected_epoch: expected.epoch(),
+                expected_event_cursor: expected.event_cursor(),
+                actual_epoch: actual_definition.as_ref().map(|actual| actual.epoch()),
+                actual_event_cursor: actual_definition
+                    .as_ref()
+                    .map(|actual| actual.event_cursor()),
+            });
+        }
         let definition = definition.ok_or_else(|| {
             MobError::Internal(
                 "cannot resume mob: no MobCreated event found in storage".to_string(),
@@ -7752,12 +7873,16 @@ impl MobBuilder {
         // Validate authority-operation journals before definition/spec sync
         // or any other recovery mutation/repair write.
         super::actor::validate_host_authority_anchor_epoch_boundaries(&mob_events)?;
-        Self::sync_definition_with_spec_store(
-            storage.specs.clone(),
-            definition.id.clone(),
-            &definition,
-        )
-        .await?;
+        let definition_epoch =
+            crate::store::current_definition_authority(&mob_events, &definition.id)?
+                .map(|(_, epoch)| epoch)
+                .ok_or_else(|| {
+                    MobError::Internal(format!(
+                        "cannot resume mob '{}': definition authority disappeared during replay",
+                        definition.id
+                    ))
+                })?;
+        Self::sync_definition_with_spec_store(&storage, &definition, definition_epoch).await?;
 
         let definition = Arc::new(definition);
         let mut diagnostics = crate::validate::validate_definition(&definition);
@@ -7775,6 +7900,7 @@ impl MobBuilder {
             );
         }
         let mut initial_dsl_authority = Box::new(seed_mob_authority());
+        recover_definition_epoch_from_history(&mut initial_dsl_authority, &mob_events)?;
         recover_owner_bridge_session_authority_from_history(
             &mut initial_dsl_authority,
             &mob_events,
@@ -8339,21 +8465,14 @@ impl MobBuilder {
     }
 
     async fn sync_definition_with_spec_store(
-        specs: Arc<dyn crate::store::MobSpecStore>,
-        mob_id: MobId,
+        storage: &MobStorage,
         definition: &MobDefinition,
+        definition_epoch: u64,
     ) -> Result<(), MobError> {
-        match specs.get_spec(&mob_id).await? {
-            Some((stored, _revision)) if stored != *definition => Err(MobError::Internal(
-                "persisted spec store definition does not match MobCreated runtime definition"
-                    .to_string(),
-            )),
-            Some(_) => Ok(()),
-            None => {
-                let _ = specs.put_spec(&mob_id, definition, None).await?;
-                Ok(())
-            }
-        }
+        storage
+            .converge_definition_projection(definition, definition_epoch)
+            .await
+            .map(|_| ())
     }
 
     async fn ensure_supervisor_authority(

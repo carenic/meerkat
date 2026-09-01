@@ -69,7 +69,122 @@ use tokio::sync::broadcast;
 pub type MobEventReceiver = broadcast::Receiver<MobEvent>;
 
 pub(crate) mod private {
-    pub trait MobEventStoreSealed {}
+    use super::MobStoreError;
+    use crate::event::{MobEvent, MobEventKind, NewMobEvent};
+    use crate::ids::MobId;
+    use crate::machines::mob_machine as mob_dsl;
+    #[cfg(target_arch = "wasm32")]
+    use crate::tokio;
+    use std::sync::Arc;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct MobDefinitionEpochPersistenceAuthority {
+        pub(super) previous_epoch: u64,
+        pub(super) epoch: u64,
+        pub(super) mob_id: MobId,
+        pub(super) event_head_cursor: u64,
+    }
+
+    impl MobDefinitionEpochPersistenceAuthority {
+        pub(crate) fn from_transition(
+            mob_id: MobId,
+            event_head_cursor: u64,
+            transition: &mob_dsl::MobMachineTransition,
+        ) -> Result<Self, MobStoreError> {
+            let Some((previous_epoch, epoch)) =
+                transition.effects().iter().find_map(|effect| match effect {
+                    mob_dsl::MobMachineEffect::DefinitionEpochAdvanced {
+                        previous_epoch,
+                        epoch,
+                    } => Some((*previous_epoch, *epoch)),
+                    _ => None,
+                })
+            else {
+                return Err(MobStoreError::Internal(
+                    "generated definition-epoch persistence authority effect is absent".to_string(),
+                ));
+            };
+            Ok(Self {
+                previous_epoch,
+                epoch,
+                mob_id,
+                event_head_cursor,
+            })
+        }
+
+        pub(super) fn verify_event(&self, event: &NewMobEvent) -> Result<(), MobStoreError> {
+            let MobEventKind::MobDefinitionUpdated { epoch, definition } = &event.kind else {
+                return Err(MobStoreError::Internal(
+                    "definition-epoch authority requires MobDefinitionUpdated".to_string(),
+                ));
+            };
+            if event.mob_id != definition.id || event.mob_id != self.mob_id || *epoch != self.epoch
+            {
+                return Err(MobStoreError::Internal(
+                    "definition-epoch authority does not match the proposed event".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub enum MobDefinitionEpochAppendOutcome {
+        Appended(MobEvent),
+        AlreadyCommitted(MobEvent),
+    }
+
+    pub enum MobDefinitionUpdateClaim {
+        Process(tokio::sync::OwnedRwLockWriteGuard<()>),
+        #[cfg(not(target_arch = "wasm32"))]
+        Sqlite {
+            _process: tokio::sync::OwnedRwLockWriteGuard<()>,
+            _fence: meerkat_sqlite::ExclusiveFence,
+        },
+    }
+
+    pub enum MobDefinitionResumeClaim {
+        Process(tokio::sync::OwnedRwLockReadGuard<()>),
+        #[cfg(not(target_arch = "wasm32"))]
+        Sqlite {
+            _process: tokio::sync::OwnedRwLockReadGuard<()>,
+            _guard: meerkat_sqlite::OperationGuard,
+        },
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    pub trait MobEventStoreSealed: Send + Sync {
+        fn definition_resume_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
+            static GATE: std::sync::OnceLock<Arc<tokio::sync::RwLock<()>>> =
+                std::sync::OnceLock::new();
+            Arc::clone(GATE.get_or_init(|| Arc::new(tokio::sync::RwLock::new(()))))
+        }
+
+        async fn acquire_definition_update_claim(
+            &self,
+        ) -> Result<MobDefinitionUpdateClaim, MobStoreError> {
+            Ok(MobDefinitionUpdateClaim::Process(
+                self.definition_resume_gate().write_owned().await,
+            ))
+        }
+
+        async fn acquire_definition_resume_claim(
+            &self,
+        ) -> Result<MobDefinitionResumeClaim, MobStoreError> {
+            Ok(MobDefinitionResumeClaim::Process(
+                self.definition_resume_gate().read_owned().await,
+            ))
+        }
+
+        async fn append_definition_epoch(
+            &self,
+            _event: NewMobEvent,
+            _authority: &MobDefinitionEpochPersistenceAuthority,
+        ) -> Result<MobDefinitionEpochAppendOutcome, MobStoreError> {
+            Err(MobStoreError::DefinitionEpochPersistenceUnavailable)
+        }
+    }
 }
 
 pub(crate) fn terminal_event_identity(kind: &MobEventKind) -> Option<(&RunId, &FlowId)> {
@@ -87,14 +202,17 @@ pub(crate) fn terminal_event_identity(kind: &MobEventKind) -> Option<(&RunId, &F
     }
 }
 
-/// Identity member/wiring projection events are current structural anchors,
-/// not disposable history. Until the store has compacted current-head
-/// representations, timestamp pruning must retain the full reducer inputs so
-/// live targets cannot become spuriously absent after restart.
+/// Current structural authority events are not disposable history.
+///
+/// Until the store has compacted current-head representations, timestamp
+/// pruning must retain definition, member, and wiring reducer inputs so live
+/// authority cannot become spuriously absent after restart.
 pub(crate) fn identity_structural_projection_is_anchor(kind: &MobEventKind) -> bool {
     matches!(
         kind,
-        MobEventKind::MemberSpawned(_)
+        MobEventKind::MobCreated { .. }
+            | MobEventKind::MobDefinitionUpdated { .. }
+            | MobEventKind::MemberSpawned(_)
             | MobEventKind::MemberRetirementStarted { .. }
             | MobEventKind::RemoteMemberRuntimeRetired { .. }
             | MobEventKind::RemoteMemberSupervisorRevoked { .. }
@@ -201,6 +319,35 @@ pub enum MobStoreError {
         actual: u64,
     },
 
+    /// A raw append attempted to bypass the generated definition-epoch authority.
+    #[error("MobDefinitionUpdated requires the sealed definition-epoch CAS seam")]
+    DefinitionEpochAuthorityRequired,
+
+    /// A second MobCreated event attempted to replace existing definition authority.
+    #[error("mob {mob_id} already has durable definition authority")]
+    MobDefinitionAlreadyCreated { mob_id: MobId },
+
+    /// The event head changed after MobMachine authorized the definition update.
+    #[error(
+        "mob {mob_id} definition epoch event-head conflict: expected cursor {expected}, actual {actual}"
+    )]
+    DefinitionEpochEventHeadConflict {
+        mob_id: MobId,
+        expected: u64,
+        actual: u64,
+    },
+
+    /// Definition authority and projection diverged during transactional CAS revalidation.
+    #[error(
+        "mob {mob_id} definition projection mismatch ({kind}): authority epoch {authority_epoch}, projection revision {projection_revision}"
+    )]
+    MobDefinitionProjectionMismatch {
+        mob_id: MobId,
+        authority_epoch: u64,
+        projection_revision: u64,
+        kind: crate::error::MobDefinitionProjectionMismatchKind,
+    },
+
     /// The backend cannot provide the requested frame-aware atomic operation.
     #[error("frame-aware atomic persistence unavailable for operation '{operation}'")]
     FrameAtomicPersistenceUnavailable { operation: FrameAtomicOperation },
@@ -209,6 +356,10 @@ pub enum MobStoreError {
     /// append the structural member or wiring event in one backend transaction.
     #[error("identity structural-event atomic persistence is unavailable")]
     IdentityMemberAtomicPersistenceUnavailable,
+
+    /// This event store cannot atomically compare and append a definition epoch.
+    #[error("durable mob definition-epoch persistence is unavailable")]
+    DefinitionEpochPersistenceUnavailable,
 
     /// This identity store cannot retain its authority serialization guard
     /// across a runtime target mutation.
@@ -995,6 +1146,9 @@ impl MobIdentityStoreClock for SystemMobIdentityStoreClock {
 }
 
 pub(crate) fn validate_mob_event_write_authority(kind: &MobEventKind) -> Result<(), MobStoreError> {
+    if matches!(kind, MobEventKind::MobDefinitionUpdated { .. }) {
+        return Err(MobStoreError::DefinitionEpochAuthorityRequired);
+    }
     if let MobEventKind::StepTargetFailed {
         error_report,
         error,
@@ -1008,6 +1162,74 @@ pub(crate) fn validate_mob_event_write_authority(kind: &MobEventKind) -> Result<
         }
     }
     Ok(())
+}
+
+pub(crate) fn validate_initial_mob_created_events(
+    existing: &[MobEvent],
+    proposed: &[NewMobEvent],
+) -> Result<(), MobStoreError> {
+    let Some((created_index, created)) = proposed
+        .iter()
+        .enumerate()
+        .find(|(_, event)| matches!(&event.kind, MobEventKind::MobCreated { .. }))
+    else {
+        return Ok(());
+    };
+    let duplicate_in_batch = proposed[created_index + 1..]
+        .iter()
+        .any(|event| matches!(&event.kind, MobEventKind::MobCreated { .. }));
+    if !existing.is_empty() || created_index != 0 || duplicate_in_batch {
+        return Err(MobStoreError::MobDefinitionAlreadyCreated {
+            mob_id: created.mob_id.clone(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn current_definition_authority(
+    events: &[MobEvent],
+    mob_id: &MobId,
+) -> Result<Option<(MobDefinition, u64)>, MobStoreError> {
+    let mut current: Option<(MobDefinition, u64)> = None;
+    for event in events.iter().filter(|event| &event.mob_id == mob_id) {
+        match &event.kind {
+            MobEventKind::MobCreated { definition } => {
+                if &definition.id != mob_id {
+                    return Err(MobStoreError::Internal(format!(
+                        "MobCreated carries id '{}' under event partition '{mob_id}'",
+                        definition.id
+                    )));
+                }
+                current = Some((*definition.clone(), 1));
+            }
+            MobEventKind::MobDefinitionUpdated { epoch, definition } => {
+                let Some((_, current_epoch)) = current.as_ref() else {
+                    return Err(MobStoreError::Internal(format!(
+                        "mob '{mob_id}' has definition epoch {epoch} without a preceding MobCreated"
+                    )));
+                };
+                let expected = (*current_epoch).checked_add(1).ok_or_else(|| {
+                    MobStoreError::Internal(format!(
+                        "mob '{mob_id}' definition epoch is exhausted at {current_epoch}"
+                    ))
+                })?;
+                if *epoch != expected {
+                    return Err(MobStoreError::Internal(format!(
+                        "mob '{mob_id}' definition epoch sequence is invalid: expected {expected}, found {epoch}"
+                    )));
+                }
+                if &definition.id != mob_id {
+                    return Err(MobStoreError::Internal(format!(
+                        "mob definition epoch {epoch} carries id '{}' under event partition '{mob_id}'",
+                        definition.id
+                    )));
+                }
+                current = Some((*definition.clone(), *epoch));
+            }
+            _ => {}
+        }
+    }
+    Ok(current)
 }
 
 /// Persisted runtime-side supervisor authority for a mob.
