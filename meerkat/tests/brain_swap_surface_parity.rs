@@ -14,7 +14,7 @@
 
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const SHARED_HELPER: &str = "persistent_runtime_pre_dequeue_handle";
 const HOOK_FN: &str = "fn pre_dequeue_handle(";
@@ -42,10 +42,14 @@ const NON_RUNTIME_BACKED_SOURCES: &[(&str, &str)] = &[
 ];
 
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("workspace root is the crate's parent")
-        .to_path_buf()
+    std::env::var_os("MEERKAT_WORKSPACE_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .filter(|root| root.join("Cargo.toml").is_file())
+        })
+        .expect("test must run from the workspace or through scripts/repo-cargo")
 }
 
 fn read(relative: &str) -> String {
