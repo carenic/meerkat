@@ -100,7 +100,8 @@ struct ScriptedReconfigureHost {
     calls: Mutex<Vec<HostCall>>,
     history: Mutex<SessionModelRoutingControlHistory>,
     current_identity: Mutex<SessionLlmIdentity>,
-    resolve_fails: Mutex<Option<String>>,
+    preflight_fails: Mutex<Option<String>>,
+    append_fails: Mutex<Option<String>>,
     persist_fails: Mutex<Option<String>>,
 }
 
@@ -137,7 +138,8 @@ impl ScriptedReconfigureHost {
             calls: Mutex::new(Vec::new()),
             history: Mutex::new(history),
             current_identity: Mutex::new(identity(MODEL_A)),
-            resolve_fails: Mutex::new(None),
+            preflight_fails: Mutex::new(None),
+            append_fails: Mutex::new(None),
             persist_fails: Mutex::new(None),
         }
     }
@@ -173,16 +175,23 @@ impl ScriptedReconfigureHost {
             .clone()
     }
 
-    fn fail_resolve(&self, reason: &str) {
+    fn fail_persist(&self, reason: &str) {
         *self
-            .resolve_fails
+            .persist_fails
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason.to_string());
     }
 
-    fn fail_persist(&self, reason: &str) {
+    fn fail_append(&self, reason: &str) {
         *self
-            .persist_fails
+            .append_fails
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason.to_string());
+    }
+
+    fn fail_preflight(&self, reason: &str) {
+        *self
+            .preflight_fails
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason.to_string());
     }
@@ -221,14 +230,6 @@ impl SessionLlmReconfigureHost for ScriptedReconfigureHost {
         _current_identity: &SessionLlmIdentity,
     ) -> Result<ResolvedSessionLlmReconfigure, RuntimeDriverError> {
         self.record(HostCall::Resolve);
-        if let Some(reason) = self
-            .resolve_fails
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        {
-            return Err(RuntimeDriverError::Internal(reason));
-        }
         let model = request.model.clone().unwrap_or_else(|| MODEL_B.to_string());
         Ok(ResolvedSessionLlmReconfigure {
             target_identity: identity(&model),
@@ -248,6 +249,22 @@ impl SessionLlmReconfigureHost for ScriptedReconfigureHost {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = identity.clone();
         Ok(())
+    }
+
+    async fn preflight_target_session_llm_identity(
+        &self,
+        _session_id: &SessionId,
+        _target_identity: &SessionLlmIdentity,
+    ) -> Result<(), RuntimeDriverError> {
+        match self
+            .preflight_fails
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            Some(reason) => Err(RuntimeDriverError::Internal(reason)),
+            None => Ok(()),
+        }
     }
 
     async fn apply_live_session_tool_visibility_state(
@@ -300,6 +317,14 @@ impl SessionLlmReconfigureHost for ScriptedReconfigureHost {
             _ => "unknown",
         };
         self.record(HostCall::AppendRecord(label));
+        if let Some(reason) = self
+            .append_fails
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return Err(RuntimeDriverError::Internal(reason));
+        }
         let mut history = self
             .history
             .lock()
@@ -552,7 +577,9 @@ async fn an_unresolvable_target_holds_typed_with_zero_identity_rebinding() {
         Some(run),
     )
     .await;
-    fixture.host.fail_resolve("model-b is unavailable");
+    fixture
+        .host
+        .fail_preflight("model-b provider client is unavailable");
     let pending = fixture
         .adapter
         .committed_model_routing_handoffs_awaiting_decision(&fixture.session_id)
@@ -640,6 +667,75 @@ async fn an_exact_replay_after_realization_converges_already_exact() {
         fixture.host.history().len(),
         2,
         "convergence must not append a second terminal record"
+    );
+}
+
+/// Existing host seams can fail the terminal append after the reconfigure
+/// transaction has already persisted B. The retry must observe the exact live
+/// target and finish the record/generated terminal without applying B again.
+#[tokio::test]
+async fn retry_after_b_persist_before_realized_append_does_not_rotate_twice() {
+    let run = RunId::new();
+    let fixture = fixture_with(
+        committed_request_history(request_id(8), &run, MODEL_B),
+        Some(run),
+    )
+    .await;
+    fixture.host.fail_append("crash before Realized append");
+    let handoff = fixture
+        .adapter
+        .committed_model_routing_handoffs_awaiting_decision(&fixture.session_id)
+        .await
+        .expect("read committed log")
+        .into_iter()
+        .next()
+        .expect("one pending handoff");
+
+    fixture
+        .adapter
+        .realize_committed_model_routing_handoff_under_turn_finalization_boundary(
+            &fixture.session_id,
+            handoff.clone(),
+        )
+        .await
+        .expect_err("the injected terminal-append crash must surface");
+    assert_eq!(
+        fixture.host.identity_applications(),
+        vec![MODEL_B.to_string()],
+        "the first attempt must have durably reached B before the append seam failed"
+    );
+    assert_eq!(
+        fixture.host.history().len(),
+        1,
+        "the failed append must leave only Requested durable"
+    );
+
+    *fixture
+        .host
+        .append_fails
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    let retry = fixture
+        .adapter
+        .realize_committed_model_routing_handoff_under_turn_finalization_boundary(
+            &fixture.session_id,
+            handoff,
+        )
+        .await
+        .expect("retry must converge from the exact persisted B identity");
+    assert!(
+        matches!(retry, ModelRoutingHandoffRealization::Realized { .. }),
+        "retry must finish the request, got {retry:?}"
+    );
+    assert_eq!(
+        fixture.host.identity_applications(),
+        vec![MODEL_B.to_string()],
+        "AlreadyExact identity convergence must not perform a second rotation"
+    );
+    assert_eq!(fixture.host.history().len(), 2);
+    assert!(
+        fixture.host.history().awaiting_decision().next().is_none(),
+        "retry must append the one missing terminal"
     );
 }
 

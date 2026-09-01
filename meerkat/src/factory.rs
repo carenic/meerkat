@@ -5252,10 +5252,41 @@ impl AgentFactory {
         };
         let agent_llm_client_was_overridden = build_config.agent_llm_client_override.is_some();
         let raw_llm_client_was_overridden = build_config.llm_client_override.is_some();
+        #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+        let handoff_bootstrap_identity = build_config
+            .resume_session
+            .as_ref()
+            .and_then(|session| {
+                session
+                    .model_routing_control()
+                    .awaiting_decision()
+                    .next()
+            })
+            .and_then(|record| {
+                let current_identity = SessionLlmIdentity {
+                    model: build_config.model.clone(),
+                    provider,
+                    self_hosted_server_id: self_hosted_server_id.clone(),
+                    provider_params: build_config.provider_params.clone(),
+                    auth_binding: build_config.auth_binding.clone(),
+                };
+                crate::session_runtime::llm_reconfigure::resolve_model_only_reconfigure_target_identity(
+                    config,
+                    &registry,
+                    &current_identity,
+                    record.intent().target_model.as_str(),
+                )
+                .ok()
+                // The temporary client is adapted under the still-canonical
+                // persisted identity until pre-dequeue realizes the request.
+                // A cross-provider client cannot safely impersonate that
+                // identity, so retain the original materialization failure.
+                .filter(|target| target.provider == provider)
+            });
 
         // 3. Create LLM client (split out for opt-level=0 stack-frame size;
         // see `resolve_llm_client_phase`).
-        let resolved_llm_client_phase = self
+        let primary_llm_client_phase = self
             .resolve_llm_client_phase(
                 config,
                 &registry,
@@ -5263,7 +5294,49 @@ impl AgentFactory {
                 &self_hosted_server_id,
                 &mut build_config,
             )
-            .await?;
+            .await;
+        #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+        let resolved_llm_client_phase = match primary_llm_client_phase {
+            Ok(resolved) => resolved,
+            Err(primary_error @ BuildAgentError::LlmClient(_)) => {
+                let Some(bootstrap_identity) = handoff_bootstrap_identity.as_ref() else {
+                    return Err(primary_error);
+                };
+                let auth_lease_handle = match &build_config.runtime_build_mode {
+                    RuntimeBuildMode::SessionOwned(bindings) => Some(bindings.auth_lease().clone()),
+                    RuntimeBuildMode::StandaloneEphemeral => None,
+                };
+                let bootstrap_client = match self
+                    .build_llm_client_for_identity_with_auth_lease_in_realm(
+                        config,
+                        bootstrap_identity,
+                        auth_lease_handle,
+                        build_config.realm_id.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(client) => client,
+                    Err(error) => {
+                        tracing::debug!(
+                            current_model = %build_config.model,
+                            target_model = %bootstrap_identity.model,
+                            primary_error = %primary_error,
+                            target_error = %error,
+                            "committed model-routing handoff could not bootstrap cold materialization"
+                        );
+                        return Err(primary_error);
+                    }
+                };
+                ResolvedLlmClientPhase {
+                    llm_client: Some(bootstrap_client),
+                    credential_identity: None,
+                    auto_image_generation_executor: None,
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        #[cfg(any(not(feature = "session-store"), target_arch = "wasm32"))]
+        let resolved_llm_client_phase = primary_llm_client_phase?;
         let llm_client = resolved_llm_client_phase.llm_client;
         let resolved_auth_credential_identity = resolved_llm_client_phase.credential_identity;
         #[cfg(not(target_arch = "wasm32"))]

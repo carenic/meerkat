@@ -303,6 +303,20 @@ pub trait SessionLlmReconfigureHost: Send + Sync {
         current_identity: &meerkat_core::SessionLlmIdentity,
     ) -> Result<ResolvedSessionLlmReconfigure, RuntimeDriverError>;
 
+    /// Prove that the resolved target can construct a usable turn client now.
+    ///
+    /// Committed cross-run handoffs call this before entering the persistent
+    /// reconfigure transaction. A temporary credential or provider outage is a
+    /// retriable hold at that boundary, not permission to consume the pending
+    /// input on the old identity.
+    async fn preflight_target_session_llm_identity(
+        &self,
+        _session_id: &SessionId,
+        _target_identity: &meerkat_core::SessionLlmIdentity,
+    ) -> Result<(), RuntimeDriverError> {
+        Ok(())
+    }
+
     /// Caller must hold the turn-finalization boundary.
     async fn apply_live_session_llm_identity(
         &self,

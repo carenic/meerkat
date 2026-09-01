@@ -8,6 +8,7 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use meerkat_core::ToolMutationClass;
 use meerkat_core::lifecycle::run_primitive::ModelId;
@@ -197,6 +198,7 @@ async fn unknown_arguments_are_refused_without_staging() {
 /// reaching the gate — not a class invented by the fixture.
 struct SingleBuiltinDispatcher {
     tool: Arc<BrainSwapTool>,
+    dispatch_count: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -217,6 +219,7 @@ impl meerkat_core::AgentToolDispatcher for SingleBuiltinDispatcher {
         &self,
         call: meerkat_core::ToolCallView<'_>,
     ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+        self.dispatch_count.fetch_add(1, Ordering::SeqCst);
         let args: Value = serde_json::from_str(call.args.get())
             .map_err(|error| meerkat_core::ToolError::execution_failed(error.to_string()))?;
         match self.tool.call(args).await {
@@ -231,44 +234,121 @@ impl meerkat_core::AgentToolDispatcher for SingleBuiltinDispatcher {
     }
 }
 
-#[tokio::test]
-async fn a_read_only_policy_denies_the_tool_before_it_can_stage() {
-    use meerkat_core::ops::ToolAccessPolicy;
+fn gated_builtin(
+    tool: BrainSwapTool,
+    policy: meerkat_core::ops::ToolAccessPolicy,
+) -> (
+    meerkat_core::ExecutionPolicyGatedDispatcher<dyn meerkat_core::AgentToolDispatcher>,
+    Arc<AtomicUsize>,
+) {
     use meerkat_core::{AgentToolDispatcher, ExecutionPolicyGatedDispatcher, ToolExecutionPolicy};
 
-    let (staging, tool) = tool_with(&["model-a", "model-b"]);
+    let dispatch_count = Arc::new(AtomicUsize::new(0));
     let inner: Arc<dyn AgentToolDispatcher> = Arc::new(SingleBuiltinDispatcher {
         tool: Arc::new(tool),
+        dispatch_count: Arc::clone(&dispatch_count),
     });
-    let gated = ExecutionPolicyGatedDispatcher::new(
-        Arc::clone(&inner),
-        ToolExecutionPolicy::resolve(ToolAccessPolicy::ReadOnly).expect("read-only resolves"),
-    );
+    (
+        ExecutionPolicyGatedDispatcher::new(
+            inner,
+            ToolExecutionPolicy::resolve(policy).expect("policy resolves"),
+        ),
+        dispatch_count,
+    )
+}
 
+async fn dispatch_brain_swap(
+    dispatcher: &dyn meerkat_core::AgentToolDispatcher,
+) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
     let args =
         serde_json::value::RawValue::from_string(json!({"target_model": "model-b"}).to_string())
             .expect("raw args");
-    let error = gated
+    dispatcher
         .dispatch(meerkat_core::ToolCallView {
             id: "call-1",
             name: BRAIN_SWAP_TOOL_NAME,
             args: &args,
         })
         .await
-        .expect_err("a mutating builtin must be denied under a read-only policy");
-    assert_eq!(error.error_code(), "access_denied");
-    assert!(
-        staging.peek().expect("readable").is_none(),
-        "the refusal must precede execution: nothing may be staged"
-    );
+}
 
-    // The model-visible list is unchanged, so prompt caching is preserved and
-    // the denial is a dispatch-time fact rather than a hidden catalog edit.
+fn assert_model_visible(dispatcher: &dyn meerkat_core::AgentToolDispatcher) {
     assert!(
-        gated
+        dispatcher
             .tools()
             .iter()
             .any(|def| def.name.as_ref() == BRAIN_SWAP_TOOL_NAME),
-        "the read-only gate must not rewrite the advertised tool list"
+        "the call-level gate must not rewrite the advertised tool list"
     );
+}
+
+async fn assert_denied_before_dispatch(policy: meerkat_core::ops::ToolAccessPolicy) {
+    let (staging, tool) = tool_with(&["model-a", "model-b"]);
+    let (gated, dispatch_count) = gated_builtin(tool, policy);
+    let error = dispatch_brain_swap(&gated)
+        .await
+        .expect_err("policy must deny brain_swap");
+    assert_eq!(error.error_code(), "access_denied");
+    assert_eq!(
+        dispatch_count.load(Ordering::SeqCst),
+        0,
+        "denial must happen before the owning dispatcher is called"
+    );
+    assert!(
+        staging.peek().expect("readable").is_none(),
+        "denial must happen before the builtin can stage"
+    );
+    assert_model_visible(&gated);
+}
+
+#[tokio::test]
+async fn a_read_only_policy_denies_the_tool_before_inner_dispatch() {
+    use meerkat_core::ops::ToolAccessPolicy;
+
+    assert_denied_before_dispatch(ToolAccessPolicy::ReadOnly).await;
+}
+
+#[tokio::test]
+async fn a_deny_list_entry_denies_the_tool_before_inner_dispatch() {
+    use meerkat_core::ops::ToolAccessPolicy;
+
+    assert_denied_before_dispatch(ToolAccessPolicy::DenyList(
+        [BRAIN_SWAP_TOOL_NAME].into_iter().collect(),
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn a_nonmatching_allow_list_denies_the_tool_before_inner_dispatch() {
+    use meerkat_core::ops::ToolAccessPolicy;
+
+    assert_denied_before_dispatch(ToolAccessPolicy::AllowList(
+        ["datetime"].into_iter().collect(),
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn an_exact_allow_list_dispatches_once_and_stages_the_target() {
+    use meerkat_core::ops::ToolAccessPolicy;
+
+    let (staging, tool) = tool_with(&["model-a", "model-b"]);
+    let (gated, dispatch_count) = gated_builtin(
+        tool,
+        ToolAccessPolicy::AllowList([BRAIN_SWAP_TOOL_NAME].into_iter().collect()),
+    );
+    let outcome = dispatch_brain_swap(&gated)
+        .await
+        .expect("an exact allow-list entry must dispatch");
+    assert!(!outcome.result.is_error);
+    assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        staging
+            .peek()
+            .expect("readable")
+            .expect("target staged")
+            .target_model(),
+        &ModelId::new("model-b")
+    );
+    assert_model_visible(&gated);
 }

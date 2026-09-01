@@ -1662,9 +1662,10 @@ pub enum CorePreDequeueOutcome {
     Realized,
 }
 
-/// Endpoint invoked once per runtime-loop lap, while the caller already holds
-/// this session's turn-finalization boundary and BEFORE queue authority is
-/// claimed or any input is dequeued.
+/// Endpoint invoked once per queue-bearing runtime-loop lap, while the caller
+/// already holds this session's turn-finalization boundary and BEFORE queue
+/// authority is claimed or any input is dequeued. An idle lap with no admitted
+/// input does not realize cross-run work early.
 ///
 /// # Why this position, exactly
 ///

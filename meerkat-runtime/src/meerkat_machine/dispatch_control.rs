@@ -2022,25 +2022,51 @@ impl MeerkatMachine {
             }
         };
 
-        let switch_result = match self
-            .apply_switch_turn_request(
-                session_id,
-                crate::meerkat_machine_types::SwitchTurnRequest {
-                    request_id: handoff.request_id,
-                    intent: handoff.intent.clone(),
-                    target_realtime: crate::meerkat_machine_types::ModelRoutingRealtimePolicy {
-                        target_realtime_capable: resolved.target_capability_surface.realtime,
-                        allow_realtime_detach: false,
-                    },
-                    approval:
-                        crate::meerkat_machine_types::ModelRoutingApprovalDisposition::NotRequired,
-                    approval_reason: None,
-                },
-            )
-            .await
+        let target_already_applied = hydrated.current_identity == resolved.target_identity;
+        if !target_already_applied
+            && let Err(error) = host
+                .preflight_target_session_llm_identity(session_id, &resolved.target_identity)
+                .await
         {
-            Ok(result) => result,
-            Err(error) => return Err(error),
+            return Ok(ModelRoutingHandoffRealization::Held {
+                reason: ModelRoutingHandoffHoldReason::TargetUnresolvable {
+                    target_model,
+                    detail: error.to_string(),
+                },
+            });
+        }
+
+        let switch_result = if target_already_applied {
+            // A prior attempt may have durably persisted the target identity and
+            // then crashed before appending the handoff terminal. Re-applying
+            // here would perform a second unsafe rotation. The exact hydrated
+            // identity is enough to finish the still-claimed request.
+            meerkat_core::image_generation::SwitchTurnControlResult::Applied {
+                request_id: handoff.request_id,
+                target_model: handoff.intent.target_model.clone(),
+                duration: handoff.intent.duration.clone(),
+            }
+        } else {
+            match self
+                .apply_switch_turn_request(
+                    session_id,
+                    crate::meerkat_machine_types::SwitchTurnRequest {
+                        request_id: handoff.request_id,
+                        intent: handoff.intent.clone(),
+                        target_realtime: crate::meerkat_machine_types::ModelRoutingRealtimePolicy {
+                            target_realtime_capable: resolved.target_capability_surface.realtime,
+                            allow_realtime_detach: false,
+                        },
+                        approval:
+                            crate::meerkat_machine_types::ModelRoutingApprovalDisposition::NotRequired,
+                        approval_reason: None,
+                    },
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => return Err(error),
+            }
         };
 
         match switch_result {

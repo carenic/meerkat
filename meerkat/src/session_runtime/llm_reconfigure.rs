@@ -1029,6 +1029,16 @@ impl SessionLlmReconfigureHost for SessionRuntimeLlmReconfigureHost {
         })
     }
 
+    async fn preflight_target_session_llm_identity(
+        &self,
+        session_id: &SessionId,
+        target_identity: &SessionLlmIdentity,
+    ) -> Result<(), RuntimeDriverError> {
+        self.build_adapter_for_session_llm_identity(session_id, target_identity)
+            .await
+            .map(|_| ())
+    }
+
     async fn apply_live_session_llm_identity(
         &self,
         session_id: &SessionId,
