@@ -5032,6 +5032,8 @@ pub fn scripted_member_client_calling_tool_then_completing(
 /// Test-held release gate for [`scripted_member_client_stalling`].
 #[derive(Clone)]
 pub struct StallGate {
+    entered: Arc<AtomicBool>,
+    entered_notify: Arc<tokio::sync::Notify>,
     released: Arc<AtomicBool>,
     notify: Arc<tokio::sync::Notify>,
 }
@@ -5040,9 +5042,29 @@ impl StallGate {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
+            entered: Arc::new(AtomicBool::new(false)),
+            entered_notify: Arc::new(tokio::sync::Notify::new()),
             released: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Wait until the scripted stream has entered its parked state.
+    pub async fn wait_until_entered(&self) {
+        while !self.entered.load(Ordering::SeqCst) {
+            let notified = self.entered_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.entered.load(Ordering::SeqCst) {
+                return;
+            }
+            (&mut notified).await;
+        }
+    }
+
+    fn mark_entered(&self) {
+        self.entered.store(true, Ordering::SeqCst);
+        self.entered_notify.notify_waiters();
     }
 
     /// Release every parked (and future) stalled stream.
@@ -5091,6 +5113,7 @@ impl meerkat_client::LlmClient for StallingClient {
             |(gate, model, emitted)| async move {
                 match emitted {
                     0 => {
+                        gate.mark_entered();
                         gate.wait().await;
                         Some((
                             Ok(meerkat_client::LlmEvent::TextDelta {
