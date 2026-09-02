@@ -408,7 +408,7 @@ if grep -Fq 'MEERKAT_GCP_BUILDBUDDY_CI_MAX_SECONDS' .github/workflows/buildbuddy
   grep -Fq '. ./scripts/build-backend-env' Makefile &&
   grep -Fq 'CARGO="${CARGO:-$ROOT/scripts/repo-cargo}"' scripts/pre-push-unit.sh &&
   grep -Fq 'scripts/agent-gate" --staged' scripts/test-changed-crates.sh &&
-  grep -Fq 'scripts/agent-gate" --committed --clippy-only' scripts/pre-push-clippy.sh; then
+  grep -Fq 'exec "$AGENT_GATE" --committed --clippy-only' scripts/pre-push-clippy.sh; then
   pass "CI and local BuildBuddy opt-in switches are wired consistently"
 else
   bad "CI or BuildBuddy opt-in switch is not wired consistently"
