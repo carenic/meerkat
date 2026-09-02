@@ -22884,6 +22884,7 @@ impl MobActor {
                     let dsl = self.dsl_authority.state();
                     let _ = reply_tx.send(super::state::MobDslT2Snapshot {
                         destroy_admitted: dsl.destroy_admitted,
+                        definition_epoch: dsl.definition_epoch,
                         flow_authority_schema_version: dsl.flow_authority_schema_version,
                         owner_bridge_session_id: dsl.owner_bridge_session_id.clone(),
                         owner_bridge_destroy_on_archive: dsl.owner_bridge_destroy_on_archive,

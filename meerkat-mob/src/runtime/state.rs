@@ -101,6 +101,7 @@ impl Default for MobLifecycleSnapshot {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MobDslT2Snapshot {
     pub destroy_admitted: bool,
+    pub definition_epoch: u64,
     pub flow_authority_schema_version: u64,
     pub owner_bridge_session_id: Option<crate::machines::mob_machine::SessionId>,
     pub owner_bridge_destroy_on_archive: bool,

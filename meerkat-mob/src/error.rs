@@ -185,6 +185,24 @@ pub enum MobFailureClass {
     MobRejected,
 }
 
+/// Typed reason a durable definition authority and its spec projection cannot converge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobDefinitionProjectionMismatchKind {
+    /// The projection claims a revision newer than the event-log authority.
+    ProjectionAhead,
+    /// Authority and projection claim the same epoch but carry different definitions.
+    DefinitionMismatch,
+}
+
+impl std::fmt::Display for MobDefinitionProjectionMismatchKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProjectionAhead => f.write_str("projection_ahead"),
+            Self::DefinitionMismatch => f.write_str("definition_mismatch"),
+        }
+    }
+}
+
 impl std::fmt::Display for MobMemberCapability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -531,6 +549,28 @@ pub enum MobError {
         mob_id: MobId,
         expected: Option<u64>,
         actual: u64,
+    },
+
+    /// Durable definition authority and its spec projection disagree at boot.
+    #[error(
+        "mob {mob_id} definition projection mismatch ({kind}): authority epoch {authority_epoch}, projection revision {projection_revision}"
+    )]
+    MobDefinitionProjectionMismatch {
+        mob_id: MobId,
+        authority_epoch: u64,
+        projection_revision: u64,
+        kind: MobDefinitionProjectionMismatchKind,
+    },
+
+    /// Canonical definition authority changed after a storage-minted preflight snapshot.
+    #[error(
+        "mob definition authority changed before resume: expected epoch {expected_epoch} at event cursor {expected_event_cursor}, actual epoch {actual_epoch:?} at event cursor {actual_event_cursor:?}"
+    )]
+    MobDefinitionAuthorityChanged {
+        expected_epoch: u64,
+        expected_event_cursor: u64,
+        actual_epoch: Option<u64>,
+        actual_event_cursor: Option<u64>,
     },
 
     /// Schema validation failed for a step output.
@@ -1113,6 +1153,17 @@ impl From<crate::store::MobStoreError> for MobError {
                 mob_id,
                 expected,
                 actual,
+            },
+            crate::store::MobStoreError::MobDefinitionProjectionMismatch {
+                mob_id,
+                authority_epoch,
+                projection_revision,
+                kind,
+            } => Self::MobDefinitionProjectionMismatch {
+                mob_id,
+                authority_epoch,
+                projection_revision,
+                kind,
             },
             crate::store::MobStoreError::FrameAtomicPersistenceUnavailable { operation } => {
                 Self::FrameAtomicPersistenceUnavailable { operation }

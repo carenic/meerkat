@@ -3999,6 +3999,7 @@ runtime_internal_inputs!(
     MOB_MACHINE_RUNTIME_INTERNAL_INPUTS,
     mob_machine::MobMachineInputVariant,
     [
+        AdvanceDefinitionEpoch,
         AuthorizeFlowFrameReducerCommand,
         AuthorizeFlowRunReducerCommand,
         AuthorizeLoopIterationReducerCommand,

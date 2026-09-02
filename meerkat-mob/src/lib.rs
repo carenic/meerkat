@@ -126,7 +126,8 @@ pub use definition::{MobDefinition, MobDefinitionSourceIdentity, MobDefinitionSo
 pub use error::{
     FlowStepDispatchRejectKind, ForkSourceUnavailableCause, ForkedParticipantLeaseOperation,
     ForkedParticipantOwnerHostRejection, ForkedParticipantSourceRejection,
-    MemberProvisionFailureCause, MobError, MobFailureClass, RuntimeEffectKind,
+    MemberProvisionFailureCause, MobDefinitionProjectionMismatchKind, MobError, MobFailureClass,
+    RuntimeEffectKind,
 };
 pub use event::{
     AttributedEvent, FlowCancelClass, MemberWireEdge, MobEvent, MobEventKind, NewMobEvent,
@@ -173,6 +174,9 @@ pub use mob_machine::{
     canonical_mob_machine_runtime_internal_classifications,
     canonical_mob_machine_runtime_internal_input_variant_manifest,
     canonical_mob_machine_runtime_internal_manifest,
+};
+pub use storage::{
+    MobDefinitionProjectionHealth, MobDefinitionRevision, MobDefinitionSnapshot, MobStorage,
 };
 pub use workgraph_attention::{
     lower_agent_identity_attention_target, lower_agent_identity_owner_key,
@@ -308,7 +312,6 @@ pub use runtime::{MobpackCallableConfig, MobpackRunOutcome, MobpackRunSpec};
 pub use runtime::{SpawnBasePromptSource, StaticSpawnBasePromptSource};
 pub use runtime_mode::MobRuntimeMode;
 pub use spec::SpecValidator;
-pub use storage::MobStorage;
 pub use store::{
     ExternalBindingOverlayRecord, ExternalBindingOverlayStatus, InMemoryMobEventStore,
     InMemoryMobIdentityStatusStore, InMemoryMobIdentityStore, InMemoryMobRunStore,

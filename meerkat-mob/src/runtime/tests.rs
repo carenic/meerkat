@@ -4809,6 +4809,7 @@ impl FaultInjectedMobEventStore {
     fn kind_label(kind: &MobEventKind) -> &'static str {
         match kind {
             MobEventKind::MobCreated { .. } => "MobCreated",
+            MobEventKind::MobDefinitionUpdated { .. } => "MobDefinitionUpdated",
             MobEventKind::MobCompleted => "MobCompleted",
             MobEventKind::MobDestroying => "MobDestroying",
             MobEventKind::MobDestroyStorageFinalizing => "MobDestroyStorageFinalizing",
@@ -11901,12 +11902,15 @@ async fn test_mob_builder_create_rejects_mismatched_spec_store_definition() {
         Ok(_) => panic!("create should fail when persisted spec mismatches runtime definition"),
         Err(error) => error,
     };
-    assert!(
-        error
-            .to_string()
-            .contains("persisted spec store definition does not match"),
-        "error should explain spec-store mismatch"
-    );
+    assert!(matches!(
+        error,
+        MobError::MobDefinitionProjectionMismatch {
+            kind: crate::MobDefinitionProjectionMismatchKind::DefinitionMismatch,
+            authority_epoch: 1,
+            projection_revision: 1,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -11968,12 +11972,180 @@ async fn test_mob_builder_persists_spec_and_resume_requires_consistency() {
         Ok(_) => panic!("resume should fail when persisted spec mismatches runtime definition"),
         Err(error) => error,
     };
-    assert!(
-        error
-            .to_string()
-            .contains("persisted spec store definition does not match"),
-        "resume should enforce spec-store consistency"
+    assert!(matches!(
+        error,
+        MobError::MobDefinitionProjectionMismatch {
+            kind: crate::MobDefinitionProjectionMismatchKind::ProjectionAhead,
+            authority_epoch: 1,
+            projection_revision: 2,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn durable_definition_update_adds_profile_and_resume_uses_latest_epoch() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let directory = tempfile::tempdir().expect("temporary mob directory");
+    let database = directory.path().join("mob.db");
+    let storage = MobStorage::persistent(&database).expect("open persistent mob storage");
+    let definition = sample_definition();
+    let mut updated = definition.clone();
+    let added_profile = updated
+        .profiles
+        .get(&ProfileName::from("worker"))
+        .expect("worker profile exists")
+        .clone();
+    updated
+        .profiles
+        .insert(ProfileName::from("reviewer"), added_profile);
+
+    let handle = MobBuilder::new(definition, storage.clone())
+        .with_session_service(service.clone())
+        .allow_ephemeral_sessions(true)
+        .create()
+        .await
+        .expect("create mob");
+    let worker = AgentIdentity::from("existing-worker");
+    let original_session = handle
+        .spawn(ProfileName::from("worker"), worker.clone(), None)
+        .await
+        .expect("spawn existing member")
+        .bridge_session_id()
+        .expect("session-backed member")
+        .clone();
+    handle.shutdown().await.expect("stop process-local actor");
+    drop(handle);
+    let stale_snapshot = storage
+        .created_definition_snapshot()
+        .await
+        .expect("read initial definition authority")
+        .expect("initial definition authority exists");
+    drop(storage);
+
+    let storage = MobStorage::persistent(&database).expect("reopen for definition update");
+    let revision = storage
+        .update_definition(1, updated.clone())
+        .await
+        .expect("advance durable definition");
+    assert_eq!(revision.epoch, 2);
+    assert_eq!(revision.projection_revision, 2);
+    let current_snapshot = storage
+        .created_definition_snapshot()
+        .await
+        .expect("read updated definition authority")
+        .expect("updated definition authority exists");
+    drop(storage);
+
+    let stale_resume_storage =
+        MobStorage::persistent(&database).expect("reopen for stale verified resume");
+    let stale_error = match MobBuilder::for_resume_verified(stale_resume_storage, stale_snapshot)
+        .with_session_service(service.clone())
+        .allow_ephemeral_sessions(true)
+        .resume()
+        .await
+    {
+        Ok(_) => panic!("verified resume must reject a concurrent definition epoch"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        stale_error,
+        MobError::MobDefinitionAuthorityChanged {
+            expected_epoch: 1,
+            actual_epoch: Some(2),
+            ..
+        }
+    ));
+
+    let storage = MobStorage::persistent(&database).expect("reopen for resume");
+    let resumed = MobBuilder::for_resume_verified(storage.clone(), current_snapshot)
+        .with_session_service(service)
+        .allow_ephemeral_sessions(true)
+        .resume()
+        .await
+        .expect("resume latest definition epoch");
+    assert!(resumed.definition().profiles.contains_key("reviewer"));
+    let resumed_member = resumed
+        .member_status(&worker)
+        .await
+        .expect("existing member resumes");
+    assert_eq!(
+        resumed_member.current_bridge_session_id(),
+        Some(&original_session),
+        "adding a profile must preserve the existing durable member/session routing"
     );
+    let (projected, projected_revision) = storage
+        .specs
+        .get_spec(&updated.id)
+        .await
+        .expect("read spec projection")
+        .expect("spec projection exists");
+    assert_eq!(projected, updated);
+    assert_eq!(projected_revision, 2);
+
+    let events = resumed.events().replay_all().await.expect("replay events");
+    assert!(events.iter().any(|event| matches!(
+        &event.kind,
+        MobEventKind::MobDefinitionUpdated { epoch: 2, definition }
+            if definition.profiles.contains_key("reviewer")
+    )));
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event.kind, MobEventKind::MobCompleted)),
+        "a definition update must not manufacture lifecycle completion"
+    );
+    resumed.shutdown().await.expect("shutdown resumed actor");
+}
+
+#[tokio::test]
+async fn verified_resume_reports_missing_definition_authority_as_changed() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let definition = sample_definition();
+    storage
+        .events
+        .append(NewMobEvent {
+            mob_id: definition.id.clone(),
+            timestamp: None,
+            kind: MobEventKind::MobCreated {
+                definition: Box::new(definition.clone()),
+            },
+        })
+        .await
+        .expect("append initial definition");
+    storage
+        .specs
+        .put_spec(&definition.id, &definition, None)
+        .await
+        .expect("write initial projection");
+    let snapshot = storage
+        .created_definition_snapshot()
+        .await
+        .expect("read definition snapshot")
+        .expect("definition snapshot exists");
+    storage.events.clear().await.expect("clear event authority");
+
+    let error = match MobBuilder::for_resume_verified(storage, snapshot)
+        .with_session_service(service)
+        .allow_ephemeral_sessions(true)
+        .resume()
+        .await
+    {
+        Ok(_) => panic!("verified resume must reject missing definition authority"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        MobError::MobDefinitionAuthorityChanged {
+            expected_epoch: 1,
+            actual_epoch: None,
+            actual_event_cursor: None,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -63413,6 +63585,7 @@ enum MobRuntimeParityOutcomeKind {
 struct MobRuntimeParitySnapshotSummary {
     phase: String,
     destroy_admitted: bool,
+    definition_epoch: u64,
     flow_authority_schema_version: u64,
     owner_bridge_session_id: Option<String>,
     owner_bridge_destroy_on_archive: bool,
@@ -64727,6 +64900,7 @@ async fn mob_runtime_parity_snapshot_summary(
         .unwrap_or_default();
     let (
         destroy_admitted,
+        definition_epoch,
         member_state_markers,
         wiring_edges,
         external_peer_edges,
@@ -64780,6 +64954,7 @@ async fn mob_runtime_parity_snapshot_summary(
         .map(|snap| {
             (
                 snap.destroy_admitted,
+                snap.definition_epoch,
                 snap.member_state_markers
                     .into_iter()
                     .map(|(k, v)| (format!("{k:?}"), format!("{v:?}")))
@@ -64956,6 +65131,7 @@ async fn mob_runtime_parity_snapshot_summary(
         .unwrap_or_else(|| {
             (
                 false,
+                1,
                 BTreeMap::new(),
                 BTreeSet::new(),
                 BTreeSet::new(),
@@ -65014,6 +65190,7 @@ async fn mob_runtime_parity_snapshot_summary(
     Some(MobRuntimeParitySnapshotSummary {
         phase: phase.as_str().to_string(),
         destroy_admitted,
+        definition_epoch,
         flow_authority_schema_version,
         owner_bridge_session_id,
         owner_bridge_destroy_on_archive,
@@ -65469,6 +65646,7 @@ fn mob_runtime_parity_field_value(
             snapshot.pending_session_ingress_detach_runtime_ids.clone(),
         )),
         "topology_epoch" => Some(MobRuntimeParityExprValue::U64(snapshot.topology_epoch)),
+        "definition_epoch" => Some(MobRuntimeParityExprValue::U64(snapshot.definition_epoch)),
         "spawn_policy_enabled" => Some(MobRuntimeParityExprValue::Bool(
             snapshot.spawn_policy_enabled,
         )),
@@ -66063,6 +66241,12 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
             "frame_atomic_persistence_unavailable".to_string()
         }
         MobError::SpecRevisionConflict { .. } => "spec_revision_conflict".to_string(),
+        MobError::MobDefinitionProjectionMismatch { kind, .. } => {
+            format!("mob_definition_projection_mismatch:{kind}")
+        }
+        MobError::MobDefinitionAuthorityChanged { .. } => {
+            "mob_definition_authority_changed".to_string()
+        }
         MobError::SchemaValidation { .. } => "schema_validation".to_string(),
         MobError::InsufficientTargets { .. } => "insufficient_targets".to_string(),
         MobError::TopologyViolation { .. } => "topology_violation".to_string(),

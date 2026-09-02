@@ -7555,4 +7555,73 @@ mod tests {
         MobMachineMutator::apply(&mut authority, MobMachineInput::Reset)
             .expect("reset is admitted after certified no-effect custody closure");
     }
+
+    #[test]
+    fn definition_epoch_advance_requires_idle_running_authority_and_strict_cas() {
+        let mut authority = MobMachineAuthority::new();
+        let advanced = MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::AdvanceDefinitionEpoch {
+                expected_epoch: 1,
+                next_epoch: 2,
+            },
+        )
+        .expect("idle running authority advances its definition epoch");
+        assert_eq!(authority.state().definition_epoch, 2);
+        assert!(advanced.effects().iter().any(|effect| matches!(
+            effect,
+            MobMachineEffect::DefinitionEpochAdvanced {
+                previous_epoch: 1,
+                epoch: 2,
+            }
+        )));
+        assert!(
+            MobMachineMutator::apply(
+                &mut authority,
+                MobMachineInput::AdvanceDefinitionEpoch {
+                    expected_epoch: 1,
+                    next_epoch: 2,
+                },
+            )
+            .is_err(),
+            "stale epoch CAS must fail closed"
+        );
+
+        let mut busy_state = authority.state().clone();
+        busy_state.active_run_count = 1;
+        let mut busy =
+            MobMachineAuthority::recover_from_state(busy_state).expect("recover busy authority");
+        assert!(
+            MobMachineMutator::apply(
+                &mut busy,
+                MobMachineInput::AdvanceDefinitionEpoch {
+                    expected_epoch: 2,
+                    next_epoch: 3,
+                },
+            )
+            .is_err(),
+            "an active flow run must block definition mutation"
+        );
+
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::BeginPlacedCompletionLifecycleQuiesce {
+                intent: PlacedCompletionLifecycleIntentKind::Complete,
+            },
+        )
+        .expect("begin completion");
+        MobMachineMutator::apply(&mut authority, MobMachineInput::Complete)
+            .expect("complete idle mob");
+        assert!(
+            MobMachineMutator::apply(
+                &mut authority,
+                MobMachineInput::AdvanceDefinitionEpoch {
+                    expected_epoch: 2,
+                    next_epoch: 3,
+                },
+            )
+            .is_err(),
+            "completed lifecycle must block definition mutation"
+        );
+    }
 }

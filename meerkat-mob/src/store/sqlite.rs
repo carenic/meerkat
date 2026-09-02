@@ -6,6 +6,10 @@
 use super::forked_participant::{
     ForkedParticipantRecord, ForkedParticipantStore, forked_participant_exact_reference,
 };
+use super::private::{
+    self, MobDefinitionEpochAppendOutcome, MobDefinitionEpochPersistenceAuthority,
+    MobDefinitionResumeClaim, MobDefinitionUpdateClaim,
+};
 use super::realm_profile::{RealmProfileStore, StoredRealmProfile};
 use super::temporary_council::{TemporaryCouncilRecord, TemporaryCouncilStore};
 use super::{
@@ -30,12 +34,13 @@ use super::{
     MobPlacedSpawnPendingPersistenceAuthority, MobRunStore, MobRuntimeMetadataStore, MobSpecStore,
     MobStoreError, PlacedSpawnCarrierPhase, PromotePlacedSpawnBindingResult,
     SupervisorAuthorityDeletionAuthority, SupervisorAuthorityPersistenceAuthority,
-    SupervisorAuthorityRecord, SystemMobIdentityStoreClock, external_delivery_repair_now_ms,
-    identity_member_target_state, identity_structural_projection_is_anchor,
-    identity_wiring_target_state, next_external_delivery_repair_state, private,
-    step_failed_event_identity, terminal_event_identity, validate_external_delivery_record,
-    validate_external_delivery_terminal, validate_identity_member_commit_authority,
-    validate_identity_wiring_commit_authority, validate_mob_event_write_authority,
+    SupervisorAuthorityRecord, SystemMobIdentityStoreClock, current_definition_authority,
+    external_delivery_repair_now_ms, identity_member_target_state,
+    identity_structural_projection_is_anchor, identity_wiring_target_state,
+    next_external_delivery_repair_state, step_failed_event_identity, terminal_event_identity,
+    validate_external_delivery_record, validate_external_delivery_terminal,
+    validate_identity_member_commit_authority, validate_identity_wiring_commit_authority,
+    validate_initial_mob_created_events, validate_mob_event_write_authority,
 };
 #[cfg(feature = "runtime-adapter")]
 use super::{
@@ -2520,6 +2525,7 @@ struct SqliteMobEventBus {
     latest_broadcast_cursor: Mutex<u64>,
     catch_up_lock: Mutex<()>,
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    definition_resume_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl std::fmt::Debug for SqliteMobEventBus {
@@ -2540,6 +2546,7 @@ impl SqliteMobEventBus {
             latest_broadcast_cursor: Mutex::new(latest_cursor),
             catch_up_lock: Mutex::new(()),
             watcher: Mutex::new(None),
+            definition_resume_gate: Arc::new(tokio::sync::RwLock::new(())),
         });
         bus.start_external_watch();
         Ok(bus)
@@ -7118,7 +7125,303 @@ impl std::fmt::Debug for SqliteMobEventStore {
 
 const EVENT_CURSOR_KEY: &str = "next_cursor";
 
-impl private::MobEventStoreSealed for SqliteMobEventStore {}
+fn validate_initial_mob_created_sqlite(
+    tx: &Transaction<'_>,
+    proposed: &[NewMobEvent],
+) -> Result<(), MobStoreError> {
+    if !proposed
+        .iter()
+        .any(|event| matches!(&event.kind, MobEventKind::MobCreated { .. }))
+    {
+        return Ok(());
+    }
+    let has_existing = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM mob_events LIMIT 1)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(se)?;
+    if has_existing {
+        let mob_id = proposed
+            .iter()
+            .find(|event| matches!(&event.kind, MobEventKind::MobCreated { .. }))
+            .map(|event| event.mob_id.clone())
+            .ok_or_else(|| {
+                MobStoreError::Internal(
+                    "MobCreated SQLite validation lost its proposed creation event".to_string(),
+                )
+            })?;
+        return Err(MobStoreError::MobDefinitionAlreadyCreated { mob_id });
+    }
+    validate_initial_mob_created_events(&[], proposed)
+}
+
+#[async_trait]
+impl private::MobEventStoreSealed for SqliteMobEventStore {
+    fn definition_resume_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
+        Arc::clone(&self.event_bus.definition_resume_gate)
+    }
+
+    async fn acquire_definition_update_claim(
+        &self,
+    ) -> Result<MobDefinitionUpdateClaim, MobStoreError> {
+        let process = self.definition_resume_gate().write_owned().await;
+        let path = self.path.clone();
+        let fence = tokio::task::spawn_blocking(move || {
+            meerkat_sqlite::ExclusiveFence::acquire(&path, Duration::from_secs(30))
+        })
+        .await
+        .map_err(|error| {
+            MobStoreError::Internal(format!(
+                "definition update fence task failed before acquisition: {error}"
+            ))
+        })?
+        .map_err(|error| MobStoreError::Internal(error.to_string()))?;
+        Ok(MobDefinitionUpdateClaim::Sqlite {
+            _process: process,
+            _fence: fence,
+        })
+    }
+
+    async fn acquire_definition_resume_claim(
+        &self,
+    ) -> Result<MobDefinitionResumeClaim, MobStoreError> {
+        let process = self.definition_resume_gate().read_owned().await;
+        let path = self.path.clone();
+        let guard = tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            loop {
+                match meerkat_sqlite::OperationGuard::for_database(&path) {
+                    Ok(guard) => return Ok(guard),
+                    Err(meerkat_sqlite::SqliteStoreError::MaintenanceFenceHeld { .. })
+                        if started.elapsed() < Duration::from_secs(30) =>
+                    {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+        .await
+        .map_err(|error| {
+            MobStoreError::Internal(format!(
+                "verified resume fence task failed before acquisition: {error}"
+            ))
+        })?
+        .map_err(|error| MobStoreError::Internal(error.to_string()))?;
+        Ok(MobDefinitionResumeClaim::Sqlite {
+            _process: process,
+            _guard: guard,
+        })
+    }
+
+    async fn append_definition_epoch(
+        &self,
+        event: NewMobEvent,
+        authority: &MobDefinitionEpochPersistenceAuthority,
+    ) -> Result<MobDefinitionEpochAppendOutcome, MobStoreError> {
+        authority.verify_event(&event)?;
+        let path = self.path.clone();
+        let previous_epoch = authority.previous_epoch;
+        let epoch = authority.epoch;
+        let expected_event_head_cursor = authority.event_head_cursor;
+        let (outcome, appended) = run_sqlite_task(move || {
+            let mut conn = open_connection(&path)?;
+            let tx = begin_immediate(&mut conn)?;
+            let mut stmt = tx
+                .prepare("SELECT event_json FROM mob_events ORDER BY cursor")
+                .map_err(se)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .map_err(se)?;
+            let mut events = Vec::new();
+            for row in rows {
+                let bytes = row.map_err(se)?;
+                events.push(
+                    decode_stored_mob_event(&bytes)
+                        .map_err(|error| MobStoreError::Serialization(error.to_string()))?,
+                );
+            }
+            drop(stmt);
+
+            let event_head_cursor = events
+                .iter()
+                .filter(|existing| existing.mob_id == event.mob_id)
+                .map(|existing| existing.cursor)
+                .max()
+                .unwrap_or(0);
+            if event_head_cursor != expected_event_head_cursor {
+                return Err(MobStoreError::DefinitionEpochEventHeadConflict {
+                    mob_id: event.mob_id,
+                    expected: expected_event_head_cursor,
+                    actual: event_head_cursor,
+                });
+            }
+            let current = current_definition_authority(&events, &event.mob_id)?;
+            let current_epoch = current.as_ref().map_or(0, |(_, epoch)| *epoch);
+            let projected_bytes: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT spec_json FROM mob_specs WHERE mob_id = ?1",
+                    params![event.mob_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(se)?;
+            let projected = projected_bytes
+                .as_deref()
+                .map(decode_json::<StoredSpec>)
+                .transpose()?;
+            let proposed = match &event.kind {
+                MobEventKind::MobDefinitionUpdated { definition, .. } => (**definition).clone(),
+                _ => {
+                    return Err(MobStoreError::Internal(
+                        "definition epoch append received a non-definition event".to_string(),
+                    ));
+                }
+            };
+            if current_epoch == epoch {
+                let existing = events
+                    .into_iter()
+                    .rev()
+                    .find(|existing| {
+                        existing.mob_id == event.mob_id && existing.kind == event.kind
+                    })
+                    .ok_or_else(|| {
+                        MobStoreError::CasConflict(format!(
+                            "mob '{}' definition epoch {epoch} is already committed with different authority",
+                            event.mob_id
+                        ))
+                    })?;
+                match projected {
+                    Some(stored) if stored.revision == epoch && stored.definition == proposed => {}
+                    Some(stored) if stored.revision < epoch => {
+                        let payload = StoredSpec {
+                            definition: proposed.clone(),
+                            revision: epoch,
+                        };
+                        tx.execute(
+                            "INSERT OR REPLACE INTO mob_specs (mob_id, spec_json) VALUES (?1, ?2)",
+                            params![event.mob_id.as_str(), encode_json(&payload)?],
+                        )
+                        .map_err(se)?;
+                    }
+                    Some(stored) if stored.revision > epoch => {
+                        return Err(MobStoreError::MobDefinitionProjectionMismatch {
+                            mob_id: event.mob_id,
+                            authority_epoch: epoch,
+                            projection_revision: stored.revision,
+                            kind: crate::error::MobDefinitionProjectionMismatchKind::ProjectionAhead,
+                        });
+                    }
+                    Some(stored) => {
+                        return Err(MobStoreError::MobDefinitionProjectionMismatch {
+                            mob_id: event.mob_id,
+                            authority_epoch: epoch,
+                            projection_revision: stored.revision,
+                            kind: crate::error::MobDefinitionProjectionMismatchKind::DefinitionMismatch,
+                        });
+                    }
+                    None => {
+                        let payload = StoredSpec {
+                            definition: proposed.clone(),
+                            revision: epoch,
+                        };
+                        tx.execute(
+                            "INSERT INTO mob_specs (mob_id, spec_json) VALUES (?1, ?2)",
+                            params![event.mob_id.as_str(), encode_json(&payload)?],
+                        )
+                        .map_err(se)?;
+                    }
+                }
+                tx.commit().map_err(se)?;
+                return Ok((
+                    MobDefinitionEpochAppendOutcome::AlreadyCommitted(existing),
+                    false,
+                ));
+            }
+            if current_epoch != previous_epoch {
+                return Err(MobStoreError::SpecRevisionConflict {
+                    mob_id: event.mob_id,
+                    expected: Some(previous_epoch),
+                    actual: current_epoch,
+                });
+            }
+            let Some(projected) = projected else {
+                return Err(MobStoreError::CasConflict(format!(
+                    "mob '{}' definition projection is absent at authority epoch {previous_epoch}",
+                    event.mob_id
+                )));
+            };
+            if projected.revision > previous_epoch {
+                return Err(MobStoreError::MobDefinitionProjectionMismatch {
+                    mob_id: event.mob_id,
+                    authority_epoch: previous_epoch,
+                    projection_revision: projected.revision,
+                    kind: crate::error::MobDefinitionProjectionMismatchKind::ProjectionAhead,
+                });
+            }
+            if projected.revision == previous_epoch
+                && current
+                    .as_ref()
+                    .is_some_and(|(definition, _)| definition != &projected.definition)
+            {
+                return Err(MobStoreError::MobDefinitionProjectionMismatch {
+                    mob_id: event.mob_id,
+                    authority_epoch: previous_epoch,
+                    projection_revision: projected.revision,
+                    kind: crate::error::MobDefinitionProjectionMismatchKind::DefinitionMismatch,
+                });
+            }
+            if projected.revision != previous_epoch {
+                return Err(MobStoreError::CasConflict(format!(
+                    "mob '{}' definition projection changed during epoch CAS",
+                    event.mob_id
+                )));
+            }
+
+            let cursor = next_event_cursor(&tx)?;
+            let stored = MobEvent {
+                cursor,
+                timestamp: event.timestamp.unwrap_or_else(Utc::now),
+                mob_id: event.mob_id,
+                kind: event.kind,
+            };
+            let projected = StoredSpec {
+                definition: proposed,
+                revision: epoch,
+            };
+            tx.execute(
+                "UPDATE mob_specs SET spec_json = ?2 WHERE mob_id = ?1",
+                params![stored.mob_id.as_str(), encode_json(&projected)?],
+            )
+            .map_err(se)?;
+            let encoded = encode_stored_mob_event(&stored)
+                .map_err(|error| MobStoreError::Serialization(error.to_string()))?;
+            tx.execute(
+                "INSERT INTO mob_events (cursor, mob_id, event_json) VALUES (?1, ?2, ?3)",
+                params![cursor_to_i64(cursor)?, stored.mob_id.as_str(), encoded],
+            )
+            .map_err(se)?;
+            set_next_cursor(&tx, checked_event_cursor_successor(cursor)?)?;
+            tx.commit().map_err(se)?;
+            Ok((
+                MobDefinitionEpochAppendOutcome::Appended(stored),
+                true,
+            ))
+        })
+        .await?;
+        if appended {
+            match &outcome {
+                MobDefinitionEpochAppendOutcome::Appended(event) => {
+                    self.event_bus.publish_committed(event.clone());
+                }
+                MobDefinitionEpochAppendOutcome::AlreadyCommitted(_) => {}
+            }
+        }
+        Ok(outcome)
+    }
+}
 
 #[async_trait]
 impl MobEventStore for SqliteMobEventStore {
@@ -7764,6 +8067,7 @@ impl MobEventStore for SqliteMobEventStore {
         let stored = run_sqlite_task(move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
+            validate_initial_mob_created_sqlite(&tx, std::slice::from_ref(&event))?;
             let cursor = next_event_cursor(&tx)?;
             let stored = MobEvent {
                 cursor,
@@ -7936,6 +8240,7 @@ impl MobEventStore for SqliteMobEventStore {
         let stored = run_sqlite_task(move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
+            validate_initial_mob_created_sqlite(&tx, &batch)?;
             let mut cursor = next_event_cursor(&tx)?;
             let mut results = Vec::with_capacity(batch.len());
             for event in batch {
