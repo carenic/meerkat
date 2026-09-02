@@ -120,6 +120,8 @@ mod digest_accumulator;
 mod head_metadata;
 mod import_0810;
 mod instruction_activation;
+pub mod model_routing_control;
+pub mod model_routing_handoff_staging;
 mod system_prompt_update;
 mod transcript_history;
 
@@ -831,6 +833,13 @@ pub struct Session {
     transcript_history_metadata_validation: TranscriptHistoryMetadataValidation,
     /// Cumulative token usage across all LLM calls in this session
     usage: Usage,
+    /// Durable append-only model-routing control history.
+    ///
+    /// A committed handoff log, not routing authority: the canonical routing
+    /// baseline stays owned by generated machine state. Records let a run
+    /// request a permanent model change that a later, different owner realizes
+    /// once this run has durably committed.
+    model_routing_control: Box<model_routing_control::SessionModelRoutingControlHistory>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -852,6 +861,8 @@ struct SessionSerde {
     metadata: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
     usage: Usage,
+    #[serde(default)]
+    model_routing_control: Vec<model_routing_control::SessionModelRoutingControlRecord>,
 }
 
 /// Borrowed serialization view for Session. The persisted shape deliberately
@@ -867,6 +878,10 @@ struct SessionSerdeRef<'a> {
     updated_at: &'a SystemTime,
     metadata: &'a serde_json::Map<String, serde_json::Value>,
     usage: &'a Usage,
+    #[serde(
+        skip_serializing_if = "<[model_routing_control::SessionModelRoutingControlRecord]>::is_empty"
+    )]
+    model_routing_control: &'a [model_routing_control::SessionModelRoutingControlRecord],
 }
 
 /// Borrowed transient WholeBlob metadata overlay.
@@ -924,6 +939,10 @@ struct SessionWholeBlobSerdeRef<'a> {
     updated_at: &'a SystemTime,
     metadata: SessionWholeBlobMetadataRef<'a>,
     usage: &'a Usage,
+    #[serde(
+        skip_serializing_if = "<[model_routing_control::SessionModelRoutingControlRecord]>::is_empty"
+    )]
+    model_routing_control: &'a [model_routing_control::SessionModelRoutingControlRecord],
 }
 
 /// Bind every persisted field of `session` into the borrowed encode view.
@@ -945,6 +964,7 @@ fn persisted_envelope_ref<'a>(
         updated_at: &session.updated_at,
         metadata: metadata_override.unwrap_or(&session.metadata),
         usage: &session.usage,
+        model_routing_control: session.model_routing_control.records(),
     }
 }
 
@@ -985,6 +1005,7 @@ impl Serialize for Session {
                 realtime: self.realtime_transcript.whole_blob_projection(),
             },
             usage: &self.usage,
+            model_routing_control: self.model_routing_control.records(),
         };
         serde_repr.serialize(serializer)
     }
@@ -1138,6 +1159,12 @@ impl<'de> Deserialize<'de> for Session {
             ));
         }
         let history_caches = Box::<SessionHistoryCaches>::default();
+        let model_routing_control = Box::new(
+            model_routing_control::SessionModelRoutingControlHistory::from_records(
+                serde_repr.model_routing_control,
+            )
+            .map_err(<D::Error as serde::de::Error>::custom)?,
+        );
         let mut session = Session {
             version,
             id: serde_repr.id,
@@ -1153,6 +1180,7 @@ impl<'de> Deserialize<'de> for Session {
                 TranscriptHistoryMetadataValidation::Validated
             },
             usage: serde_repr.usage,
+            model_routing_control,
         };
         if let Some(TranscriptHistoryWireKind::Current) = history_wire_kind {
             let state = compact_transcript_history_metadata_for_snapshot(&mut session.metadata)
@@ -1511,6 +1539,7 @@ impl Session {
         updated_at: SystemTime,
         metadata: serde_json::Map<String, serde_json::Value>,
         usage: Usage,
+        model_routing_control: model_routing_control::SessionModelRoutingControlHistory,
         head_canonical_metadata: Option<Arc<SessionHeadMetadataProjection>>,
     ) -> Result<Self, String> {
         let version =
@@ -1551,6 +1580,7 @@ impl Session {
             realtime_transcript,
             history_caches,
             usage,
+            model_routing_control: Box::new(model_routing_control),
         };
         if let Some(projection) = head_canonical_metadata {
             session
@@ -3393,6 +3423,9 @@ impl Session {
             history_caches: Box::default(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: Usage::default(),
+            model_routing_control: Box::new(
+                model_routing_control::SessionModelRoutingControlHistory::new(),
+            ),
         }
     }
 
@@ -5874,8 +5907,19 @@ impl Session {
             updated_at: head_updated_at,
             metadata: head_metadata,
             usage: head_usage,
+            model_routing_control: head_model_routing_control,
         } = persisted_envelope_ref(head, None);
         self.usage = head_usage.clone();
+        // The committed handoff log is durable-head truth, exactly like usage:
+        // recovery adopts the head's records rather than retaining a local tail
+        // that the durable head never acknowledged.
+        *self.model_routing_control =
+            model_routing_control::SessionModelRoutingControlHistory::from_records(
+                head_model_routing_control.to_vec(),
+            )
+            .map_err(|error| {
+                format!("durable-head model-routing control history is malformed: {error}")
+            })?;
         // `head` was materialized from the exact authenticated metadata state
         // that owns these general values. Adopt that baseline together with
         // the values instead of diffing or re-hashing the complete map.
@@ -6120,6 +6164,7 @@ impl Session {
             history_caches: Box::default(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: self.usage.clone(),
+            model_routing_control: self.model_routing_control.clone(),
         }
     }
 
@@ -6590,6 +6635,39 @@ impl Session {
             .filter(MobToolAuthorityContext::is_generated_authority_context)
     }
 
+    /// The committed model-routing control history.
+    ///
+    /// Read-only by design: appends go through
+    /// [`Self::append_model_routing_control_record`] so the log's
+    /// well-formedness rules cannot be bypassed.
+    #[must_use]
+    pub fn model_routing_control(
+        &self,
+    ) -> &model_routing_control::SessionModelRoutingControlHistory {
+        &self.model_routing_control
+    }
+
+    /// Append one committed model-routing control record.
+    ///
+    /// The append is idempotent for an exactly-equal record and refuses,
+    /// typed, anything that would make the committed log ambiguous.
+    pub fn append_model_routing_control_record(
+        &mut self,
+        record: model_routing_control::SessionModelRoutingControlRecord,
+    ) -> Result<
+        model_routing_control::ModelRoutingControlAppendOutcome,
+        model_routing_control::ModelRoutingControlAppendError,
+    > {
+        let outcome = self.model_routing_control.append(record)?;
+        if matches!(
+            outcome,
+            model_routing_control::ModelRoutingControlAppendOutcome::Appended
+        ) {
+            self.mark_content_mutated(SystemTime::now());
+        }
+        Ok(outcome)
+    }
+
     /// Fork the session at a specific message index
     ///
     /// Creates a new session with a subset of messages. The messages are copied
@@ -6609,6 +6687,13 @@ impl Session {
             history_caches: Box::default(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: self.usage.clone(),
+            // A fork is a new session identity with its own run lineage. An
+            // owed handoff belongs to the originating session's runtime, so it
+            // must not be inherited: otherwise parent and fork could each
+            // realize the same committed intent.
+            model_routing_control: Box::new(
+                model_routing_control::SessionModelRoutingControlHistory::new(),
+            ),
         }
     }
 
@@ -6783,6 +6868,11 @@ impl Session {
             history_caches: Box::default(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: self.usage.clone(),
+            // See `fork_at`: a new identity inherits no handoff log at all,
+            // owed or settled.
+            model_routing_control: Box::new(
+                model_routing_control::SessionModelRoutingControlHistory::new(),
+            ),
         }
     }
 }

@@ -44,7 +44,7 @@ use support::{
     ControllingMob, REAL_COMMS_TEST_LOCK, ScriptedForkedParticipantTamper, StallGate,
     control_principal, create_controlling_mob, create_controlling_mob_with_builder,
     member_identity_of, scripted_member_client_stalling, spawn_peer_comms_endpoint,
-    spawn_scripted_host_peer, spawn_scripted_member_turn_responder, wait_until,
+    spawn_scripted_host_peer, spawn_scripted_member_turn_responder,
 };
 
 const TTL: Duration = Duration::from_secs(600);
@@ -229,20 +229,17 @@ async fn local_create_refuses_a_running_source() {
         .await
         .expect("member send admits");
 
-    // The parked stream holds the member's runtime in Running; poll until the
-    // capability lane observes it rather than racing the admission.
-    wait_until("the local source is observed as busy", || {
-        let controlling = &controlling;
-        async move {
-            match create(controlling, "researcher", "req-busy").await {
-                Err(error @ MobError::ForkedParticipantSourceIneligible { .. }) => {
-                    source_rejection(&error) == ForkedParticipantSourceRejection::SourceBusy
-                }
-                _ => false,
-            }
-        }
-    })
-    .await;
+    // Wait for the provider stream itself to park before invoking the mutating
+    // create operation. Polling create can reserve the request while the
+    // admitted turn is still transitioning into Running.
+    gate.wait_until_entered().await;
+    let error = create(&controlling, "researcher", "req-busy")
+        .await
+        .expect_err("a running source cannot create a forked participant");
+    assert_eq!(
+        source_rejection(&error),
+        ForkedParticipantSourceRejection::SourceBusy
+    );
 
     // Nothing was reserved for the refused request.
     assert!(

@@ -7261,6 +7261,13 @@ pub fn apply_prepared_head_canonical_mutation_in_txn(
     tx: &Transaction<'_>,
     mutation: &PreparedHeadCanonicalMutation,
 ) -> Result<HeadCanonicalMutationApplyOutcome, SessionStoreError> {
+    meerkat_core::session_store::validate_model_routing_control_durable_transition(
+        mutation.session_id(),
+        &mutation.successor_head().model_routing_control,
+        mutation
+            .predecessor_head()
+            .map(|head| &head.model_routing_control),
+    )?;
     let current = head_row_in_txn(tx, mutation.session_id())?;
     if let Some((current_head, stored_token)) = current.as_ref() {
         let canonical_token = session_head_cas_token(current_head)?;
@@ -7934,6 +7941,11 @@ pub fn apply_prepared_head_canonical_rewrite_mutation_in_txn(
     tx: &Transaction<'_>,
     mutation: &PreparedHeadCanonicalRewriteMutation,
 ) -> Result<HeadCanonicalMutationApplyOutcome, SessionStoreError> {
+    meerkat_core::session_store::validate_model_routing_control_durable_transition(
+        mutation.session_id(),
+        &mutation.successor_head().model_routing_control,
+        Some(&mutation.predecessor_head().model_routing_control),
+    )?;
     let current = head_row_in_txn(tx, mutation.session_id())?;
     if let Some((current_head, stored_token)) = current.as_ref() {
         let canonical_token = session_head_cas_token(current_head)?;
@@ -8118,6 +8130,11 @@ fn write_head_canonical_session_in_txn(
     head: &SessionHead,
 ) -> Result<(), SessionStoreError> {
     let id = session.id();
+    meerkat_core::session_store::validate_model_routing_control_durable_transition(
+        id,
+        session.model_routing_control(),
+        Some(&head.model_routing_control),
+    )?;
     let live = session.messages();
     let prev_count = usize::try_from(head.message_count)
         .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
@@ -8305,6 +8322,13 @@ impl SessionStore for SqliteSessionStore {
                 write_head_canonical_session_in_txn(tx, &session, &head)?;
                 return Ok(());
             }
+            let previous =
+                load_session_snapshot_in_txn(tx, session.id()).map_err(into_session_store_error)?;
+            meerkat_core::session_store::validate_model_routing_control_durable_transition(
+                session.id(),
+                session.model_routing_control(),
+                previous.as_ref().map(Session::model_routing_control),
+            )?;
             write_session_snapshot_in_txn(tx, &session).map_err(into_session_store_error)?;
             Ok(())
         })

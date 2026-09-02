@@ -2,6 +2,8 @@
 //!
 //! The Agent struct ties together all components and runs the agent loop.
 
+#[cfg(test)]
+mod brain_swap_promotion_tests;
 mod builder;
 pub mod comms_impl;
 pub mod compact;
@@ -2544,6 +2546,13 @@ where
     /// Wired by `AgentBuilder::with_checkpointer`, installed by
     /// `PersistentSessionService`, and consumed only by active-run persistence.
     pub(crate) checkpointer: Option<Arc<dyn crate::SessionCheckpointer>>,
+    /// Run-local slot a permanent-routing tool stages its intent into.
+    ///
+    /// Held here because the agent is the only owner that knows whether a run
+    /// reached a clean terminal boundary, which is the sole condition under
+    /// which staged intent may become a committed request.
+    pub(crate) model_routing_handoff_staging:
+        Option<Arc<crate::session::model_routing_handoff_staging::ModelRoutingHandoffStagingSlot>>,
     /// Latest successful provisional physical write for the active run.
     ///
     /// This is actor-local transport state, never Session domain state. The

@@ -428,6 +428,99 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `CompleteUntilChangedSwitchTurnReconfigureRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `ImportCommittedModelRoutingHandoffFirstIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ImportCommittedModelRoutingHandoffFirstAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ImportCommittedModelRoutingHandoffFirstRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ImportCommittedModelRoutingHandoffFirstRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ImportCommittedModelRoutingHandoffAlreadyExactIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ImportCommittedModelRoutingHandoffAlreadyExactAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ImportCommittedModelRoutingHandoffAlreadyExactRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ImportCommittedModelRoutingHandoffAlreadyExactRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClaimModelRoutingHandoffImportedIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClaimModelRoutingHandoffImportedAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClaimModelRoutingHandoffImportedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClaimModelRoutingHandoffAlreadyClaimedIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClaimModelRoutingHandoffAlreadyClaimedAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClaimModelRoutingHandoffAlreadyClaimedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClaimModelRoutingHandoffAlreadyRealizedIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClaimModelRoutingHandoffAlreadyRealizedAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClaimModelRoutingHandoffAlreadyRealizedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RealizeModelRoutingHandoffClaimedIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RealizeModelRoutingHandoffClaimedAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RealizeModelRoutingHandoffClaimedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RealizeModelRoutingHandoffAlreadyRealizedIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RealizeModelRoutingHandoffAlreadyRealizedAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RealizeModelRoutingHandoffAlreadyRealizedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `DenyModelRoutingHandoffPendingIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `DenyModelRoutingHandoffPendingAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `DenyModelRoutingHandoffPendingRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `DenyModelRoutingHandoffAlreadyDeniedIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `DenyModelRoutingHandoffAlreadyDeniedAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `DenyModelRoutingHandoffAlreadyDeniedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ArchiveUnresolvedModelRoutingHandoffPendingRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `AdmitPendingFiniteSwitchTurnIdle`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)

@@ -2482,6 +2482,8 @@ enum LiveSessionSyncCause {
     Authority(LiveSessionAuthorityReason),
     /// Synchronization driven by post-transcript-rewrite live convergence.
     TranscriptRewriteCommitted,
+    /// Synchronization after a detached model-routing terminal became durable.
+    ModelRoutingTerminalCommitted,
 }
 
 impl LiveSessionSyncCause {
@@ -2500,6 +2502,9 @@ impl LiveSessionSyncCause {
                 LiveSessionAuthorityReason::StoredTranscriptRevisionDiverged,
             ) => "stored_transcript_revision_diverged",
             LiveSessionSyncCause::TranscriptRewriteCommitted => "transcript_rewrite_committed",
+            LiveSessionSyncCause::ModelRoutingTerminalCommitted => {
+                "model_routing_terminal_committed"
+            }
         }
     }
 }
@@ -2929,49 +2934,27 @@ impl<'a> MachineSessionArchiveProtocol<'a> {
         lease: Option<meerkat_runtime::MachineSessionArchiveLease>,
         stored_only_publication_handle: Option<Arc<dyn CoreExecutorPublicationHandle>>,
         post_commit_hook: Option<Arc<dyn meerkat_runtime::MachineSessionArchivePostCommitHook>>,
+        archive_handoffs: &[meerkat_runtime::CommittedModelRoutingHandoff],
         deadline: meerkat_core::time_compat::Instant,
-    ) -> Result<(), SessionError> {
+    ) -> Result<Vec<meerkat_core::image_generation::SwitchTurnRequestId>, SessionError> {
         let lease = lease.ok_or_else(|| {
             SessionError::Agent(AgentError::InternalError(format!(
                 "machine archive authorized runtime retirement for session {id} without an exact archive lease"
             )))
         })?;
-        let retire = match (stored_only_publication_handle, post_commit_hook) {
-            (Some(publication_handle), Some(post_commit_hook)) => self
-                .runtime_adapter
-                .retire_session_with_archive_lease_publication_handle_and_post_commit_hook_before(
-                    lease,
-                    publication_handle,
-                    post_commit_hook,
-                    deadline,
-                )
-                .await,
-            (Some(publication_handle), None) => {
-                self.runtime_adapter
-                    .retire_session_with_archive_lease_and_publication_handle_before(
-                        lease,
-                        publication_handle,
-                        deadline,
-                    )
-                    .await
-            }
-            (None, Some(post_commit_hook)) => {
-                self.runtime_adapter
-                    .retire_session_with_archive_lease_and_post_commit_hook_before(
-                        lease,
-                        post_commit_hook,
-                        deadline,
-                    )
-                    .await
-            }
-            (None, None) => {
-                self.runtime_adapter
-                    .retire_session_with_archive_lease_before(lease, deadline)
-                    .await
-            }
-        };
-        retire
-            .map(|_| ())
+        // One entry point for every publisher/hook combination: the committed
+        // handoff terminalization must run inside the exact retire commit, and
+        // a second call shape would be a second place to forget it.
+        self.runtime_adapter
+            .retire_session_with_archive_lease_terminalizing_model_routing_handoffs_before(
+                lease,
+                stored_only_publication_handle,
+                post_commit_hook,
+                archive_handoffs,
+                deadline,
+            )
+            .await
+            .map(|(_report, archived)| archived)
             .map_err(|error| archive_runtime_control_error(id, error))
     }
 }
@@ -5765,6 +5748,153 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     ) -> Result<(), SessionError> {
         let _recovery_guard = self.recovery_gate_for_session(id).await.lock_owned().await;
         self.discard_live_session_unfenced(id).await
+    }
+
+    /// Durably commit one model-routing terminal before converging the live actor.
+    ///
+    /// The candidate is cloned from committed authority, never from the actor.
+    /// The detached task owns the recovery guard, so caller cancellation cannot
+    /// interrupt the durable commit or the mandatory live convergence.
+    pub async fn commit_model_routing_control_record_durable_first(
+        self: Arc<Self>,
+        id: &SessionId,
+        record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
+    ) -> Result<(), SessionError> {
+        let recovery_guard = self.recovery_gate_for_session(id).await.lock_owned().await;
+        let _ = self.discard_stale_live_session_if_needed(id).await?;
+        if let Some(session) = self.load_authoritative_session_base(id).await? {
+            self.reject_if_archived_session(id, &session)
+                .await
+                .map_err(crate::control_error_into_session_error)?;
+        }
+
+        let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+        let owner = Arc::clone(&self);
+        let session_id = id.clone();
+        tokio::spawn(async move {
+            // Held for the whole transaction, including after the caller is
+            // gone. Dropping it earlier would let the next admission observe a
+            // half-applied commit.
+            let _recovery_guard = recovery_guard;
+            let outcome = owner
+                .persist_model_routing_control_record_durable_first(&session_id, record)
+                .await;
+            let _ = outcome_tx.send(outcome);
+        });
+
+        match outcome_rx.await {
+            Ok(outcome) => outcome,
+            // The task owns the transaction; it cannot vanish without sending
+            // unless the runtime itself is shutting down under it.
+            Err(_) => Err(SessionError::Agent(AgentError::InternalError(format!(
+                "model-routing resolution commit for session {id} ended without reporting an outcome"
+            )))),
+        }
+    }
+
+    async fn persist_model_routing_control_record_durable_first(
+        &self,
+        id: &SessionId,
+        record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
+    ) -> Result<(), SessionError> {
+        let expected_record = record.clone();
+        let mut candidate = self
+            .load_authoritative_session_base(id)
+            .await?
+            .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
+        self.reject_if_archived_session(id, &candidate)
+            .await
+            .map_err(crate::control_error_into_session_error)?;
+        candidate
+            .append_model_routing_control_record(record)
+            .map_err(|error| {
+                SessionError::Agent(AgentError::InternalError(format!(
+                    "failed to prepare model-routing terminal for session {id}: {error}"
+                )))
+            })?;
+
+        let persistence = match self.runtime_store.session_persistence_profile() {
+            RuntimeSessionPersistenceProfile::WholeBlobV1 => {
+                self.save_normalized_session(candidate).await
+            }
+            RuntimeSessionPersistenceProfile::HeadCanonicalV1 => {
+                self.persist_detached_head_canonical_session(candidate, "model-routing terminal")
+                    .await
+            }
+            profile => {
+                return Err(SessionError::Agent(AgentError::InternalError(format!(
+                    "unsupported runtime session persistence profile {profile} while committing model-routing terminal for session {id}"
+                ))));
+            }
+        };
+        let committed = match persistence {
+            Ok(committed) => committed,
+            Err(persistence_error) => {
+                match self.load_authoritative_session_base(id).await {
+                    Ok(Some(committed))
+                        if committed
+                            .model_routing_control()
+                            .records()
+                            .contains(&expected_record) =>
+                    {
+                        // The store may report an error after the atomic commit
+                        // landed. The exact committed record is sufficient
+                        // authority to finish convergence rather than exposing
+                        // a stale actor or attempting a second rotation.
+                        committed
+                    }
+                    Ok(_) => return Err(persistence_error),
+                    Err(read_error) => {
+                        self.fatalize_live_session_after_ambiguous_durable_commit(id)
+                            .await;
+                        return Err(SessionError::runtime_executor_stopped(format!(
+                            "model-routing terminal persistence for session {id} failed ({persistence_error}) and committed authority could not be read ({read_error}); the live actor was fatalized because the durable outcome is ambiguous"
+                        )));
+                    }
+                }
+            }
+        };
+
+        self.converge_live_session_after_model_routing_terminal(&committed)
+            .await
+    }
+
+    async fn converge_live_session_after_model_routing_terminal(
+        &self,
+        committed: &Session,
+    ) -> Result<(), SessionError> {
+        if !self.inner.has_live_session(committed.id()).await? {
+            return Ok(());
+        }
+        match self
+            .synchronize_live_session_from_durable(
+                committed.id(),
+                committed,
+                LiveSessionSyncCause::ModelRoutingTerminalCommitted,
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(sync_error) => match self.discard_live_session_unfenced(committed.id()).await {
+                Ok(()) | Err(SessionError::NotFound { .. }) => Ok(()),
+                Err(discard_error) => {
+                    self.fatalize_live_session_after_ambiguous_durable_commit(committed.id())
+                        .await;
+                    Err(SessionError::runtime_executor_stopped(format!(
+                        "model-routing terminal committed durably for session {} but live convergence failed ({sync_error}) and discard failed ({discard_error}); the stale actor was fatalized",
+                        committed.id()
+                    )))
+                }
+            },
+        }
+    }
+
+    async fn fatalize_live_session_after_ambiguous_durable_commit(&self, id: &SessionId) {
+        self.inner
+            .fatalize_live_session_after_durable_convergence_failure(id)
+            .await;
+        self.checkpointer_gates.lock().await.remove(id);
+        self.live_checkpointers.lock().await.remove(id);
     }
 
     pub async fn dispatch_external_tool_call(
@@ -8686,8 +8816,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
 
     /// Prepare an actor-owned boundary with bounded typed control candidates.
     ///
-    /// WholeBlob rejects these candidates because that profile persists its
-    /// inline state through the ordinary normalized snapshot path.
+    /// WholeBlob rejects the deferred-state candidate because that profile
+    /// persists its inline state through the ordinary normalized snapshot
+    /// path.
     async fn prepare_runtime_boundary_with_control_overrides(
         &self,
         id: &SessionId,
@@ -10129,6 +10260,119 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         Ok(result)
     }
 
+    /// Read the exact committed handoffs the durable body still owes, together
+    /// with the body they were read from.
+    ///
+    /// The durable committed body — not the live actor's copy — is both the
+    /// source and the write base, and deliberately so. It is the only thing
+    /// that survives the archive: a request that lives solely in actor memory
+    /// dies with the actor and owes nothing, while writing a terminal against a
+    /// base that never carried the request would be refused as
+    /// `UnknownRequest`. Reading and writing the same base makes those two
+    /// facts one fact.
+    ///
+    /// Returns `None` when nothing is owed, so an ordinary archive pays one
+    /// cheap emptiness check and no extra store read.
+    async fn committed_model_routing_handoffs_owed_at_archive(
+        &self,
+        id: &SessionId,
+        observed_snapshot: Option<&Session>,
+    ) -> Result<Option<(Session, Vec<meerkat_runtime::CommittedModelRoutingHandoff>)>, SessionError>
+    {
+        // A live actor is materialized from the durable body, so an empty live
+        // history proves an empty durable history. Sessions that never asked
+        // for a permanent model change never load a second copy.
+        if observed_snapshot.is_some_and(|session| session.model_routing_control().is_empty()) {
+            return Ok(None);
+        }
+        let Some(base) = self.load_persisted_session_for_archive(id).await? else {
+            return Ok(None);
+        };
+        let owed: Vec<meerkat_runtime::CommittedModelRoutingHandoff> = base
+            .model_routing_control()
+            .awaiting_decision()
+            .map(|record| meerkat_runtime::CommittedModelRoutingHandoff {
+                request_id: *record.request_id(),
+                originating_run_id: record.originating_run_id().clone(),
+                intent: record.intent().clone(),
+            })
+            .collect();
+        if owed.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((base, owed)))
+    }
+
+    /// Mirror the generated archive verdict into the durable handoff log.
+    ///
+    /// Runs only after the durable runtime archive terminal has committed, so
+    /// this can never leave a still-live session holding an abandoned intent.
+    /// A failure here fails the archive, and the retry re-reads the same
+    /// unchanged durable base and re-drives the same idempotent generated
+    /// verdict — the log is an exact-retry outbox, not a second truth.
+    ///
+    /// Only identities generated authority actually archived are written. The
+    /// append itself is the second guard: an exactly-equal record converges,
+    /// and a record offered over an already-terminal one is refused.
+    async fn commit_archived_model_routing_handoff_terminals(
+        &self,
+        id: &SessionId,
+        mut base: Session,
+        owed: &[meerkat_runtime::CommittedModelRoutingHandoff],
+        archived: &[meerkat_core::image_generation::SwitchTurnRequestId],
+    ) -> Result<(), SessionError> {
+        if owed.len() != archived.len()
+            || !owed
+                .iter()
+                .map(|handoff| handoff.request_id)
+                .eq(archived.iter().copied())
+        {
+            return Err(SessionError::Agent(AgentError::InternalError(format!(
+                "generated archive verdict for session {id} did not cover the exact durable model-routing handoff batch"
+            ))));
+        }
+        let mut appended = false;
+        for handoff in owed {
+            let outcome = base
+                .append_model_routing_control_record(
+                    meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord::ModelRoutingIntentAbandoned {
+                        request_id: handoff.request_id,
+                        originating_run_id: handoff.originating_run_id.clone(),
+                        intent: handoff.intent.clone(),
+                    },
+                )
+                .map_err(|error| {
+                    SessionError::Agent(AgentError::InternalError(format!(
+                        "archive could not terminalize committed model-routing handoff for session {id}: {error}"
+                    )))
+                })?;
+            if matches!(
+                outcome,
+                meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome::Appended
+            ) {
+                appended = true;
+            }
+        }
+        if !appended {
+            return Ok(());
+        }
+        match self.runtime_store.session_persistence_profile() {
+            RuntimeSessionPersistenceProfile::WholeBlobV1 => {
+                self.save_normalized_session(base).await.map(|_| ())
+            }
+            RuntimeSessionPersistenceProfile::HeadCanonicalV1 => self
+                .persist_detached_head_canonical_session(
+                    base,
+                    "archived model-routing handoff terminalization",
+                )
+                .await
+                .map(|_| ()),
+            profile => Err(SessionError::Agent(AgentError::InternalError(format!(
+                "unsupported runtime session persistence profile {profile} while terminalizing committed model-routing handoffs for session {id}"
+            )))),
+        }
+    }
+
     /// Archive with a concrete machine protocol. Runtime-backed surfaces must
     /// use this path so the canonical SessionDocumentMachine archive verdict
     /// is realized by the RuntimeStore-owned `MeerkatMachine::Retire`
@@ -10320,6 +10564,30 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 }
                 Err(err) => return Err(err),
             };
+            // A committed cross-run routing handoff the durable log still owes
+            // must not survive this archive: after a restart it would still read
+            // as awaiting a decision, and the next owner to revive the document
+            // would realize a switch for a session that ended. Read the exact
+            // owed set now, under the archive locks; generated authority
+            // terminalizes it inside the retire commit, and the durable record
+            // is written only once that commit landed.
+            let owed_handoffs = self
+                .committed_model_routing_handoffs_owed_at_archive(id, archived_snapshot.as_ref())
+                .await?;
+            if owed_handoffs.is_some() && archive_lease.is_none() {
+                // Without a runtime lease there is no generated authority to
+                // decide terminality and no durable archive terminal to anchor
+                // it to. Refuse rather than invent a terminal; the request stays
+                // exactly as actionable as it was.
+                return Err(SessionError::Agent(AgentError::InternalError(format!(
+                    "archive for session {id} owes committed model-routing handoff terminalization but holds no runtime archive lease"
+                ))));
+            }
+            let owed_handoff_facts: Vec<meerkat_runtime::CommittedModelRoutingHandoff> =
+                owed_handoffs
+                    .as_ref()
+                    .map(|(_, owed)| owed.clone())
+                    .unwrap_or_default();
             // Drive the canonical SessionDocumentMachine archive decision. The
             // machine owns the session-document lifecycle-terminal fact for ALL
             // profiles (LUC-524 R004 fold): this shell extracts only pure
@@ -10392,7 +10660,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     )))
                 })?;
             if disposition == SessionArchiveDisposition::AlreadyArchived {
-                if (archive_lease_has_attached_publisher || post_commit_hook.is_some())
+                if (archive_lease_has_attached_publisher
+                    || post_commit_hook.is_some()
+                    || !owed_handoff_facts.is_empty())
                     && archive_lease.is_some()
                 {
                     // Retirement may invoke an arbitrary actor publication
@@ -10401,15 +10671,37 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     // the absorbing document verdict means no later archive
                     // observation from this attempt needs to be retained.
                     drop(recovery_guard.take());
-                    machine_archive
+                    let archived_handoffs = machine_archive
                         .retire_session(
                             id,
                             archive_lease.take(),
                             stored_only_publication_handle.clone(),
                             post_commit_hook.clone(),
+                            &owed_handoff_facts,
                             deadline,
                         )
                         .await?;
+                    // The durable archive terminal is already committed, so a
+                    // still-owed handoff must be discharged before this attempt
+                    // absorbs. This is the exact retry for an earlier attempt
+                    // whose durable write failed after its retire landed.
+                    if let Some((base, owed)) = owed_handoffs {
+                        recovery_guard = Some(
+                            acquire_archive_recovery_gate_before(
+                                id,
+                                Arc::clone(&recovery_gate),
+                                deadline,
+                            )
+                            .await?,
+                        );
+                        self.commit_archived_model_routing_handoff_terminals(
+                            id,
+                            base,
+                            &owed,
+                            &archived_handoffs,
+                        )
+                        .await?;
+                    }
                 }
                 // Machine-decided idempotent re-archive verdict; the public
                 // surface contract for an archived session is NotFound.
@@ -10442,8 +10734,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             // under this exact retained lease, so the idempotent retire
             // commit is driven for it even when no lifecycle transition
             // remains.
-            let drive_runtime_retire =
-                retire_runtime || (post_commit_hook.is_some() && archive_lease.is_some());
+            let drive_runtime_retire = retire_runtime
+                || ((post_commit_hook.is_some() || !owed_handoff_facts.is_empty())
+                    && archive_lease.is_some());
             if drive_runtime_retire {
                 // The runtime process task must run without either M or R.
                 // M moves into retire_session and is released before its
@@ -10456,28 +10749,32 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                         archive_lease.take(),
                         stored_only_publication_handle.clone(),
                         post_commit_hook.clone(),
+                        &owed_handoff_facts,
                         deadline,
                     )
                     .await;
-                if let Err(err) = retire_result {
-                    // Fail closed: the archive operation fails and the RuntimeStore
-                    // content body remains unchanged. A retried archive re-drives
-                    // the lifecycle transition. Keep the checkpointer cancelled so
-                    // the rejected live actor cannot race that retry with stale
-                    // content.
-                    // Release the gate before asking the live task to shut down so a
-                    // checkpoint already waiting on the mutex can observe cancellation
-                    // and exit instead of deadlocking teardown.
-                    drop(gate_guard.take());
-                    if let Err(discard_error) = self.inner.discard_live_session(id).await {
-                        tracing::warn!(
-                            session_id = %id,
-                            error = %discard_error,
-                            "failed to evict live session after RuntimeStore lifecycle retirement failed"
-                        );
+                let archived_handoffs = match retire_result {
+                    Ok(archived_handoffs) => archived_handoffs,
+                    Err(err) => {
+                        // Fail closed: the archive operation fails and the RuntimeStore
+                        // content body remains unchanged. A retried archive re-drives
+                        // the lifecycle transition. Keep the checkpointer cancelled so
+                        // the rejected live actor cannot race that retry with stale
+                        // content.
+                        // Release the gate before asking the live task to shut down so a
+                        // checkpoint already waiting on the mutex can observe cancellation
+                        // and exit instead of deadlocking teardown.
+                        drop(gate_guard.take());
+                        if let Err(discard_error) = self.inner.discard_live_session(id).await {
+                            tracing::warn!(
+                                session_id = %id,
+                                error = %discard_error,
+                                "failed to evict live session after RuntimeStore lifecycle retirement failed"
+                            );
+                        }
+                        return Err(err);
                     }
-                    return Err(err);
-                }
+                };
                 recovery_guard = Some(
                     acquire_archive_recovery_gate_before(
                         id,
@@ -10486,6 +10783,19 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     )
                     .await?,
                 );
+                // The durable archive terminal is committed. Mirror the exact
+                // generated handoff verdict into the durable log before the
+                // live actor is torn down; a failure here fails the archive and
+                // the retry converges through the AlreadyArchived path above.
+                if let Some((base, owed)) = owed_handoffs {
+                    self.commit_archived_model_routing_handoff_terminals(
+                        id,
+                        base,
+                        &owed,
+                        &archived_handoffs,
+                    )
+                    .await?;
+                }
             }
 
             let live_result = self.inner.archive(id).await;
@@ -12276,6 +12586,9 @@ mod tests {
         TranscriptEditRunningBehavior, TranscriptRewriteReason, TranscriptRewriteSelection,
     };
     use meerkat_core::session::SESSION_METADATA_KEY;
+    use meerkat_core::session::model_routing_control::{
+        ModelRoutingIntentRecordDisposition, SessionModelRoutingControlRecord,
+    };
     use meerkat_core::session_store::{SessionHeadCas, TranscriptStrandId};
     use meerkat_core::types::{
         ContentBlock, ContentInput, ImageData, Message, StopReason, ToolCall, ToolResult,
@@ -12611,11 +12924,10 @@ mod tests {
     async fn instruction_activation_head_commit_failure_discards_the_mutated_actor() {
         let tempdir = tempfile::tempdir().expect("runtime store tempdir");
         let database_path = tempdir.path().join("runtime.sqlite3");
-        let runtime_store = Arc::new(FailingHeadCanonicalCommitRuntimeStore {
-            inner: meerkat_runtime::SqliteRuntimeStore::new_head_canonical(&database_path)
+        let runtime_store = Arc::new(FailingHeadCanonicalCommitRuntimeStore::new(
+            meerkat_runtime::SqliteRuntimeStore::new_head_canonical(&database_path)
                 .expect("head-canonical runtime store"),
-            fail_commits: AtomicBool::new(false),
-        });
+        ));
         let store: Arc<dyn SessionStore> = Arc::new(
             meerkat_store::SqliteSessionStore::open(&database_path)
                 .expect("co-located head-canonical session store"),
@@ -14606,12 +14918,76 @@ mod tests {
     struct FailingHeadCanonicalCommitRuntimeStore {
         inner: meerkat_runtime::SqliteRuntimeStore,
         fail_commits: AtomicBool,
+        fail_after_session_boundary_commit: AtomicBool,
+        fail_lifecycle_commits: AtomicBool,
+        /// Deterministic suspension point inside the durable session-boundary
+        /// commit, mirroring the WholeBlob gate. The detached candidate is
+        /// prepared, but neither durable authority nor live state has advanced.
+        pause_session_boundary_commit: AtomicBool,
+        entered_session_boundary_commit: tokio::sync::Notify,
+        release_session_boundary_commit: tokio::sync::Notify,
+        pause_after_session_boundary_commit: AtomicBool,
+        entered_after_session_boundary_commit: tokio::sync::Notify,
+        release_after_session_boundary_commit: tokio::sync::Notify,
+    }
+
+    impl FailingHeadCanonicalCommitRuntimeStore {
+        fn new(inner: meerkat_runtime::SqliteRuntimeStore) -> Self {
+            Self {
+                inner,
+                fail_commits: AtomicBool::new(false),
+                fail_after_session_boundary_commit: AtomicBool::new(false),
+                fail_lifecycle_commits: AtomicBool::new(false),
+                pause_session_boundary_commit: AtomicBool::new(false),
+                entered_session_boundary_commit: tokio::sync::Notify::new(),
+                release_session_boundary_commit: tokio::sync::Notify::new(),
+                pause_after_session_boundary_commit: AtomicBool::new(false),
+                entered_after_session_boundary_commit: tokio::sync::Notify::new(),
+                release_after_session_boundary_commit: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn set_pause_session_boundary_commit(&self, pause: bool) {
+            self.pause_session_boundary_commit
+                .store(pause, Ordering::Release);
+        }
+
+        async fn await_session_boundary_commit_entered(&self) {
+            self.entered_session_boundary_commit.notified().await;
+        }
+
+        fn release_session_boundary_commit(&self) {
+            self.pause_session_boundary_commit
+                .store(false, Ordering::Release);
+            self.release_session_boundary_commit.notify_waiters();
+        }
+
+        fn set_pause_after_session_boundary_commit(&self, pause: bool) {
+            self.pause_after_session_boundary_commit
+                .store(pause, Ordering::Release);
+        }
+
+        async fn await_after_session_boundary_commit_entered(&self) {
+            self.entered_after_session_boundary_commit.notified().await;
+        }
+
+        fn release_after_session_boundary_commit(&self) {
+            self.pause_after_session_boundary_commit
+                .store(false, Ordering::Release);
+            self.release_after_session_boundary_commit.notify_waiters();
+        }
     }
 
     #[async_trait::async_trait]
     impl RuntimeStore for FailingHeadCanonicalCommitRuntimeStore {
         fn session_authority_ops(&self) -> &dyn meerkat_runtime::store::RuntimeSessionAuthorityOps {
             self.inner.session_authority_ops()
+        }
+
+        fn input_state_batch_cas_implementation_profile(
+            &self,
+        ) -> meerkat_runtime::store::InputStateBatchCasImplementationProfile {
+            self.inner.input_state_batch_cas_implementation_profile()
         }
 
         async fn commit_prepared_session_boundary(
@@ -14622,14 +14998,41 @@ mod tests {
             meerkat_runtime::store::PreparedRuntimeSessionCommitResult,
             meerkat_runtime::store::RuntimeStoreError,
         > {
+            if self.pause_session_boundary_commit.load(Ordering::Acquire) {
+                let released = self.release_session_boundary_commit.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                self.entered_session_boundary_commit.notify_waiters();
+                released.await;
+            }
             if self.fail_commits.load(Ordering::Acquire) {
                 return Err(meerkat_runtime::store::RuntimeStoreError::WriteFailed(
                     "synthetic head-canonical boundary commit failure".to_string(),
                 ));
             }
-            self.inner
+            let result = self
+                .inner
                 .commit_prepared_session_boundary(runtime_id, request)
-                .await
+                .await?;
+            if self
+                .fail_after_session_boundary_commit
+                .swap(false, Ordering::AcqRel)
+            {
+                return Err(meerkat_runtime::store::RuntimeStoreError::WriteFailed(
+                    "synthetic head-canonical post-commit reporting failure".to_string(),
+                ));
+            }
+            if self
+                .pause_after_session_boundary_commit
+                .load(Ordering::Acquire)
+            {
+                let released = self.release_after_session_boundary_commit.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                self.entered_after_session_boundary_commit.notify_waiters();
+                released.await;
+            }
+            Ok(result)
         }
 
         async fn commit_session_snapshot(
@@ -14677,6 +15080,16 @@ mod tests {
         ) -> Result<Vec<meerkat_runtime::InputStateRow>, meerkat_runtime::store::RuntimeStoreError>
         {
             self.inner.load_input_states(runtime_id).await
+        }
+
+        async fn load_input_states_with_versions(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<
+            meerkat_runtime::store::PreparedRecoveryInputSnapshot,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner.load_input_states_with_versions(runtime_id).await
         }
 
         async fn load_boundary_receipt(
@@ -14736,12 +15149,95 @@ mod tests {
             self.inner.persist_input_state(runtime_id, state).await
         }
 
+        async fn compare_and_swap_input_states_atomically(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            expected: &[StoredInputState],
+            replacements: &[InputStatePersistenceRecord],
+        ) -> Result<
+            meerkat_runtime::store::InputStateBatchCasOutcome,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner
+                .compare_and_swap_input_states_atomically(runtime_id, expected, replacements)
+                .await
+        }
+
+        async fn compare_and_swap_input_states_atomically_with_fence(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            expected: &[StoredInputState],
+            replacements: &[InputStatePersistenceRecord],
+            write_fence: Arc<dyn meerkat_runtime::store::RuntimeStoreWriteFence>,
+        ) -> Result<
+            meerkat_runtime::store::FencedInputStateBatchCasOutcome,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner
+                .compare_and_swap_input_states_atomically_with_fence(
+                    runtime_id,
+                    expected,
+                    replacements,
+                    write_fence,
+                )
+                .await
+        }
+
+        async fn compare_and_swap_recovery_input_states_atomically(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            expected_revision: meerkat_runtime::store::RecoveryInputSetRevision,
+            mutations: &[meerkat_runtime::store::RecoveryInputStateMutation],
+        ) -> Result<
+            meerkat_runtime::store::InputStateBatchCasOutcome,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner
+                .compare_and_swap_recovery_input_states_atomically(
+                    runtime_id,
+                    expected_revision,
+                    mutations,
+                )
+                .await
+        }
+
+        async fn compare_and_swap_recovery_input_states_atomically_with_fence(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            expected_revision: meerkat_runtime::store::RecoveryInputSetRevision,
+            mutations: &[meerkat_runtime::store::RecoveryInputStateMutation],
+            write_fence: Arc<dyn meerkat_runtime::store::RuntimeStoreWriteFence>,
+        ) -> Result<
+            meerkat_runtime::store::FencedInputStateBatchCasOutcome,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner
+                .compare_and_swap_recovery_input_states_atomically_with_fence(
+                    runtime_id,
+                    expected_revision,
+                    mutations,
+                    write_fence,
+                )
+                .await
+        }
+
         async fn load_input_state(
             &self,
             runtime_id: &LogicalRuntimeId,
             input_id: &InputId,
         ) -> Result<Option<StoredInputState>, meerkat_runtime::store::RuntimeStoreError> {
             self.inner.load_input_state(runtime_id, input_id).await
+        }
+
+        async fn load_pending_terminal_owner_ids_page(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            after: Option<&InputId>,
+            limit: usize,
+        ) -> Result<Vec<InputId>, meerkat_runtime::store::RuntimeStoreError> {
+            self.inner
+                .load_pending_terminal_owner_ids_page(runtime_id, after, limit)
+                .await
         }
 
         async fn load_machine_lifecycle_record(
@@ -14751,15 +15247,105 @@ mod tests {
             self.inner.load_machine_lifecycle_record(runtime_id).await
         }
 
+        async fn observe_machine_lifecycle(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<
+            meerkat_runtime::store::MachineLifecycleObservation,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner.observe_machine_lifecycle(runtime_id).await
+        }
+
+        async fn compare_and_swap_machine_lifecycle(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            expected: meerkat_runtime::store::MachineLifecycleExpectedVersion,
+            replacement: meerkat_runtime::store::MachineLifecycleCommit,
+        ) -> Result<
+            meerkat_runtime::store::MachineLifecycleCasOutcome,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            if self.fail_lifecycle_commits.load(Ordering::Acquire) {
+                return Err(meerkat_runtime::store::RuntimeStoreError::WriteFailed(
+                    "synthetic head-canonical lifecycle commit failure".to_string(),
+                ));
+            }
+            self.inner
+                .compare_and_swap_machine_lifecycle(runtime_id, expected, replacement)
+                .await
+        }
+
+        async fn compare_and_swap_machine_lifecycle_with_fence(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            expected: meerkat_runtime::store::MachineLifecycleExpectedVersion,
+            replacement: meerkat_runtime::store::MachineLifecycleCommit,
+            write_fence: Arc<dyn meerkat_runtime::store::RuntimeStoreWriteFence>,
+        ) -> Result<
+            meerkat_runtime::store::FencedMachineLifecycleCasOutcome,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            if self.fail_lifecycle_commits.load(Ordering::Acquire) {
+                return Err(meerkat_runtime::store::RuntimeStoreError::WriteFailed(
+                    "synthetic head-canonical lifecycle commit failure".to_string(),
+                ));
+            }
+            self.inner
+                .compare_and_swap_machine_lifecycle_with_fence(
+                    runtime_id,
+                    expected,
+                    replacement,
+                    write_fence,
+                )
+                .await
+        }
+
         async fn commit_machine_lifecycle(
             &self,
             runtime_id: &LogicalRuntimeId,
             commit: meerkat_runtime::store::MachineLifecycleCommit,
             input_states: &[InputStatePersistenceRecord],
         ) -> Result<(), meerkat_runtime::store::RuntimeStoreError> {
+            if self.fail_lifecycle_commits.load(Ordering::Acquire) {
+                return Err(meerkat_runtime::store::RuntimeStoreError::WriteFailed(
+                    "synthetic head-canonical lifecycle commit failure".to_string(),
+                ));
+            }
             self.inner
                 .commit_machine_lifecycle(runtime_id, commit, input_states)
                 .await
+        }
+
+        async fn persist_ops_lifecycle(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            snapshot: &meerkat_runtime::ops_lifecycle::PersistedOpsSnapshot,
+        ) -> Result<(), meerkat_runtime::store::RuntimeStoreError> {
+            self.inner.persist_ops_lifecycle(runtime_id, snapshot).await
+        }
+
+        async fn initialize_ops_lifecycle_if_absent(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+            candidate: &meerkat_runtime::ops_lifecycle::PersistedOpsSnapshot,
+        ) -> Result<
+            meerkat_runtime::ops_lifecycle::PersistedOpsSnapshot,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner
+                .initialize_ops_lifecycle_if_absent(runtime_id, candidate)
+                .await
+        }
+
+        async fn load_ops_lifecycle(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<
+            Option<meerkat_runtime::ops_lifecycle::PersistedOpsSnapshot>,
+            meerkat_runtime::store::RuntimeStoreError,
+        > {
+            self.inner.load_ops_lifecycle(runtime_id).await
         }
     }
 
@@ -14768,6 +15354,7 @@ mod tests {
         hidden_snapshot_loads: AtomicUsize,
         fail_snapshot_loads: AtomicBool,
         fail_snapshot_commits: AtomicBool,
+        fail_after_session_boundary_commit: AtomicBool,
         snapshot_commit_count: AtomicUsize,
         fail_snapshot_commit_ordinal: AtomicUsize,
         fail_machine_lifecycle_commits: AtomicBool,
@@ -14781,6 +15368,15 @@ mod tests {
         pause_machine_lifecycle_commit: AtomicBool,
         entered_machine_lifecycle_commit: tokio::sync::Notify,
         release_machine_lifecycle_commit: tokio::sync::Notify,
+        /// Deterministic suspension point inside the durable session-boundary
+        /// commit. The detached candidate is prepared, but neither durable
+        /// authority nor live state has advanced.
+        pause_session_boundary_commit: AtomicBool,
+        entered_session_boundary_commit: tokio::sync::Notify,
+        release_session_boundary_commit: tokio::sync::Notify,
+        pause_after_session_boundary_commit: AtomicBool,
+        entered_after_session_boundary_commit: tokio::sync::Notify,
+        release_after_session_boundary_commit: tokio::sync::Notify,
     }
 
     impl GatedSnapshotRuntimeStore {
@@ -14790,6 +15386,7 @@ mod tests {
                 hidden_snapshot_loads: AtomicUsize::new(0),
                 fail_snapshot_loads: AtomicBool::new(false),
                 fail_snapshot_commits: AtomicBool::new(false),
+                fail_after_session_boundary_commit: AtomicBool::new(false),
                 snapshot_commit_count: AtomicUsize::new(0),
                 fail_snapshot_commit_ordinal: AtomicUsize::new(usize::MAX),
                 fail_machine_lifecycle_commits: AtomicBool::new(false),
@@ -14803,11 +15400,47 @@ mod tests {
                 pause_machine_lifecycle_commit: AtomicBool::new(false),
                 entered_machine_lifecycle_commit: tokio::sync::Notify::new(),
                 release_machine_lifecycle_commit: tokio::sync::Notify::new(),
+                pause_session_boundary_commit: AtomicBool::new(false),
+                entered_session_boundary_commit: tokio::sync::Notify::new(),
+                release_session_boundary_commit: tokio::sync::Notify::new(),
+                pause_after_session_boundary_commit: AtomicBool::new(false),
+                entered_after_session_boundary_commit: tokio::sync::Notify::new(),
+                release_after_session_boundary_commit: tokio::sync::Notify::new(),
             }
         }
 
         fn set_fail_snapshot_commits(&self, fail: bool) {
             self.fail_snapshot_commits.store(fail, Ordering::Release);
+        }
+
+        fn set_pause_session_boundary_commit(&self, pause: bool) {
+            self.pause_session_boundary_commit
+                .store(pause, Ordering::Release);
+        }
+
+        async fn await_session_boundary_commit_entered(&self) {
+            self.entered_session_boundary_commit.notified().await;
+        }
+
+        fn release_session_boundary_commit(&self) {
+            self.pause_session_boundary_commit
+                .store(false, Ordering::Release);
+            self.release_session_boundary_commit.notify_waiters();
+        }
+
+        fn set_pause_after_session_boundary_commit(&self, pause: bool) {
+            self.pause_after_session_boundary_commit
+                .store(pause, Ordering::Release);
+        }
+
+        async fn await_after_session_boundary_commit_entered(&self) {
+            self.entered_after_session_boundary_commit.notified().await;
+        }
+
+        fn release_after_session_boundary_commit(&self) {
+            self.pause_after_session_boundary_commit
+                .store(false, Ordering::Release);
+            self.release_after_session_boundary_commit.notify_waiters();
         }
 
         fn set_fail_snapshot_loads(&self, fail: bool) {
@@ -15153,6 +15786,13 @@ mod tests {
                 .snapshot_commit_count
                 .fetch_add(1, Ordering::AcqRel)
                 .saturating_add(1);
+            if self.pause_session_boundary_commit.load(Ordering::Acquire) {
+                let released = self.release_session_boundary_commit.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                self.entered_session_boundary_commit.notify_waiters();
+                released.await;
+            }
             if self.fail_snapshot_commits.load(Ordering::Acquire) {
                 return Err(meerkat_runtime::store::RuntimeStoreError::WriteFailed(
                     "synthetic runtime snapshot commit failure".to_string(),
@@ -15182,9 +15822,29 @@ mod tests {
                     )
                     .await?;
             }
-            self.inner
+            let result = self
+                .inner
                 .commit_prepared_session_boundary(runtime_id, request)
-                .await
+                .await?;
+            if self
+                .fail_after_session_boundary_commit
+                .swap(false, Ordering::AcqRel)
+            {
+                return Err(meerkat_runtime::store::RuntimeStoreError::WriteFailed(
+                    "synthetic WholeBlob post-commit reporting failure".to_string(),
+                ));
+            }
+            if self
+                .pause_after_session_boundary_commit
+                .load(Ordering::Acquire)
+            {
+                let released = self.release_after_session_boundary_commit.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                self.entered_after_session_boundary_commit.notify_waiters();
+                released.await;
+            }
+            Ok(result)
         }
 
         async fn commit_session_snapshot(
@@ -16199,6 +16859,7 @@ mod tests {
                     *poisoned.into_inner() = session;
                 }
             }
+            self.pending_head_canonical_boundary = None;
             Ok(())
         }
     }
@@ -25547,6 +26208,1214 @@ mod tests {
             service.comms_runtime(&created.session_id).await.is_some(),
             "runtime turn sync must preserve live comms mechanics"
         );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ArchiveHandoffProfile {
+        WholeBlob,
+        HeadCanonical,
+    }
+
+    impl ArchiveHandoffProfile {
+        const ALL: [Self; 2] = [Self::WholeBlob, Self::HeadCanonical];
+    }
+
+    enum ArchiveHandoffFailureControl {
+        WholeBlob(Arc<GatedSnapshotRuntimeStore>),
+        HeadCanonical(Arc<FailingHeadCanonicalCommitRuntimeStore>),
+    }
+
+    impl ArchiveHandoffFailureControl {
+        fn fail_lifecycle_commits(&self, fail: bool) {
+            match self {
+                Self::WholeBlob(store) => store.set_fail_machine_lifecycle_commits(fail),
+                Self::HeadCanonical(store) => {
+                    store.fail_lifecycle_commits.store(fail, Ordering::Release);
+                }
+            }
+        }
+
+        fn fail_next_document_commit(&self) {
+            match self {
+                Self::WholeBlob(store) => store.fail_snapshot_commit_in(1),
+                Self::HeadCanonical(store) => {
+                    store.fail_commits.store(true, Ordering::Release);
+                }
+            }
+        }
+
+        fn allow_document_commits(&self) {
+            match self {
+                Self::WholeBlob(store) => store.set_fail_snapshot_commits(false),
+                Self::HeadCanonical(store) => {
+                    store.fail_commits.store(false, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    struct ArchiveHandoffFixture {
+        service: PersistentSessionService<DummyBuilder>,
+        machine: Arc<MeerkatMachine>,
+        session_store: Arc<dyn SessionStore>,
+        runtime_store: Arc<dyn RuntimeStore>,
+        blob_store: Arc<dyn BlobStore>,
+        failures: ArchiveHandoffFailureControl,
+        session_id: SessionId,
+        _storage_dir: Option<tempfile::TempDir>,
+    }
+
+    impl ArchiveHandoffFixture {
+        async fn new(profile: ArchiveHandoffProfile, session: Session) -> Self {
+            let session_id = session.id().clone();
+            let (session_store, runtime_store, failures, storage_dir): (
+                Arc<dyn SessionStore>,
+                Arc<dyn RuntimeStore>,
+                ArchiveHandoffFailureControl,
+                Option<tempfile::TempDir>,
+            ) = match profile {
+                ArchiveHandoffProfile::WholeBlob => {
+                    let runtime_store = Arc::new(GatedSnapshotRuntimeStore::new());
+                    (
+                        Arc::new(MemoryStore::new()),
+                        Arc::clone(&runtime_store) as Arc<dyn RuntimeStore>,
+                        ArchiveHandoffFailureControl::WholeBlob(runtime_store),
+                        None,
+                    )
+                }
+                ArchiveHandoffProfile::HeadCanonical => {
+                    let storage_dir =
+                        tempfile::tempdir_in(".").expect("head-canonical archive test directory");
+                    let database_path = storage_dir.path().join("runtime.sqlite3");
+                    let runtime_store = Arc::new(FailingHeadCanonicalCommitRuntimeStore::new(
+                        meerkat_runtime::SqliteRuntimeStore::new_head_canonical(&database_path)
+                            .expect("head-canonical runtime store"),
+                    ));
+                    let session_store: Arc<dyn SessionStore> = Arc::new(
+                        meerkat_store::SqliteSessionStore::open(&database_path)
+                            .expect("co-located head-canonical session store"),
+                    );
+                    (
+                        session_store,
+                        Arc::clone(&runtime_store) as Arc<dyn RuntimeStore>,
+                        ArchiveHandoffFailureControl::HeadCanonical(runtime_store),
+                        Some(storage_dir),
+                    )
+                }
+            };
+            let blob_store = memory_blob_store();
+            let service = PersistentSessionService::new(
+                DummyBuilder,
+                4,
+                Arc::clone(&session_store),
+                Arc::clone(&runtime_store),
+                Arc::clone(&blob_store),
+            );
+            match profile {
+                ArchiveHandoffProfile::WholeBlob => {
+                    service
+                        .save_normalized_session(session)
+                        .await
+                        .expect("seed committed WholeBlob handoff");
+                }
+                ArchiveHandoffProfile::HeadCanonical => {
+                    service
+                        .persist_detached_head_canonical_session(
+                            session,
+                            "archive handoff test seed",
+                        )
+                        .await
+                        .expect("seed committed HeadCanonical handoff");
+                }
+            }
+            let machine = Arc::new(MeerkatMachine::persistent(
+                Arc::clone(&runtime_store),
+                Arc::clone(&blob_store),
+            ));
+            machine
+                .register_session(session_id.clone())
+                .await
+                .expect("register archive handoff session without importing its request");
+            Self {
+                service,
+                machine,
+                session_store,
+                runtime_store,
+                blob_store,
+                failures,
+                session_id,
+                _storage_dir: storage_dir,
+            }
+        }
+
+        async fn archive(&self) -> Result<(), SessionError> {
+            let _turn_boundary = self
+                .service
+                .acquire_runtime_turn_finalization_guard(&self.session_id)
+                .await;
+            self.service
+                .archive_with_machine_protocol_under_runtime_turn_boundary_and_hook_before(
+                    &self.session_id,
+                    MachineSessionArchiveProtocol::from_machine(self.machine.as_ref()),
+                    meerkat_core::time_compat::Instant::now() + std::time::Duration::from_secs(10),
+                    None,
+                )
+                .await
+        }
+
+        async fn durable_body(&self) -> Session {
+            self.service
+                .load_persisted_session_for_archive(&self.session_id)
+                .await
+                .expect("load committed archive handoff body")
+                .expect("archive handoff body remains present")
+        }
+
+        async fn seed_originating_boundary(&self, run_id: RunId) {
+            let body = self.durable_body().await;
+            let receipt = meerkat_core::RunBoundaryReceiptDraft {
+                run_id: run_id.clone(),
+                boundary: RunApplyBoundary::RunStart,
+                contributing_input_ids: Vec::new(),
+                conversation_digest: Some(
+                    body.transcript_content_digest()
+                        .expect("digest archive handoff fixture"),
+                ),
+                message_count: body.messages().len(),
+            }
+            .into_sequenced(0);
+            self.runtime_store
+                .commit_prepared_session_boundary(
+                    &PersistentSessionService::<DummyBuilder>::runtime_id_for_session(
+                        &self.session_id,
+                    ),
+                    meerkat_runtime::PreparedRuntimeSessionCommit::success(
+                        None,
+                        receipt,
+                        Vec::new(),
+                        Some(self.session_id.clone()),
+                    ),
+                )
+                .await
+                .expect("seed exact committed originating boundary");
+            assert!(
+                self.runtime_store
+                    .load_boundary_receipt(
+                        &PersistentSessionService::<DummyBuilder>::runtime_id_for_session(
+                            &self.session_id,
+                        ),
+                        &run_id,
+                        0,
+                    )
+                    .await
+                    .expect("read originating boundary")
+                    .is_some()
+            );
+        }
+    }
+
+    fn archive_handoff_intent(model: &str) -> meerkat_core::image_generation::SwitchTurnIntent {
+        meerkat_core::image_generation::SwitchTurnIntent {
+            target_model: meerkat_core::lifecycle::run_primitive::ModelId::new(model),
+            duration: meerkat_core::image_generation::SwitchTurnDuration::UntilChanged,
+            origin: meerkat_core::image_generation::SwitchTurnOrigin::Model {
+                reason:
+                    meerkat_core::image_generation::SwitchTurnReasonTextDisposition::NotProvided,
+            },
+        }
+    }
+
+    fn archive_handoff_requested(
+        request_id: meerkat_core::image_generation::SwitchTurnRequestId,
+        run_id: RunId,
+        model: &str,
+    ) -> SessionModelRoutingControlRecord {
+        SessionModelRoutingControlRecord::request(request_id, run_id, archive_handoff_intent(model))
+            .expect("archive fixture intent is a durable handoff")
+    }
+
+    fn new_archive_handoff_request_id() -> meerkat_core::image_generation::SwitchTurnRequestId {
+        serde_json::from_value(
+            serde_json::to_value(RunId::new()).expect("serialize request-id UUID source"),
+        )
+        .expect("deserialize request-id UUID")
+    }
+
+    fn session_with_requested_archive_handoff()
+    -> (Session, meerkat_runtime::CommittedModelRoutingHandoff) {
+        let mut session = Session::new();
+        let handoff = meerkat_runtime::CommittedModelRoutingHandoff {
+            request_id: new_archive_handoff_request_id(),
+            originating_run_id: RunId::new(),
+            intent: archive_handoff_intent("claude-opus-5"),
+        };
+        session
+            .append_model_routing_control_record(
+                SessionModelRoutingControlRecord::request(
+                    handoff.request_id,
+                    handoff.originating_run_id.clone(),
+                    handoff.intent.clone(),
+                )
+                .expect("archive fixture request"),
+            )
+            .expect("append archive fixture request");
+        (session, handoff)
+    }
+
+    fn assert_handoff_abandoned(
+        session: &Session,
+        handoff: &meerkat_runtime::CommittedModelRoutingHandoff,
+    ) {
+        assert_eq!(
+            session
+                .model_routing_control()
+                .disposition_of(&handoff.request_id),
+            Some(ModelRoutingIntentRecordDisposition::Abandoned)
+        );
+        assert!(
+            session
+                .model_routing_control()
+                .awaiting_decision()
+                .next()
+                .is_none(),
+            "an archived session must owe no model-routing decision"
+        );
+        assert_eq!(
+            session.model_routing_control().records().len(),
+            2,
+            "the archive terminal extends the request exactly once"
+        );
+    }
+
+    /// Which durable store the cancellation-safety tests run against. Both
+    /// branches prepare the terminal on a detached candidate, then commit
+    /// through their profile-owned persistence path.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TerminalCommitProfile {
+        WholeBlob,
+        HeadCanonical,
+    }
+
+    impl TerminalCommitProfile {
+        const ALL: [Self; 2] = [Self::WholeBlob, Self::HeadCanonical];
+    }
+
+    /// The deterministic pause point, whichever store is underneath.
+    enum TerminalCommitGate {
+        WholeBlob(Arc<GatedSnapshotRuntimeStore>),
+        HeadCanonical(Arc<FailingHeadCanonicalCommitRuntimeStore>),
+    }
+
+    impl TerminalCommitGate {
+        fn pause(&self) {
+            match self {
+                Self::WholeBlob(store) => store.set_pause_session_boundary_commit(true),
+                Self::HeadCanonical(store) => store.set_pause_session_boundary_commit(true),
+            }
+        }
+
+        async fn entered(&self) {
+            match self {
+                Self::WholeBlob(store) => store.await_session_boundary_commit_entered().await,
+                Self::HeadCanonical(store) => store.await_session_boundary_commit_entered().await,
+            }
+        }
+
+        fn release(&self) {
+            match self {
+                Self::WholeBlob(store) => store.release_session_boundary_commit(),
+                Self::HeadCanonical(store) => store.release_session_boundary_commit(),
+            }
+        }
+
+        fn fail_commits(&self, fail: bool) {
+            match self {
+                Self::WholeBlob(store) => store.set_fail_snapshot_commits(fail),
+                Self::HeadCanonical(store) => store.fail_commits.store(fail, Ordering::Release),
+            }
+        }
+
+        fn fail_after_commit_once(&self) {
+            match self {
+                Self::WholeBlob(store) => {
+                    store
+                        .fail_after_session_boundary_commit
+                        .store(true, Ordering::Release);
+                }
+                Self::HeadCanonical(store) => {
+                    store
+                        .fail_after_session_boundary_commit
+                        .store(true, Ordering::Release);
+                }
+            }
+        }
+
+        fn pause_after_commit(&self) {
+            match self {
+                Self::WholeBlob(store) => {
+                    store.set_pause_after_session_boundary_commit(true);
+                }
+                Self::HeadCanonical(store) => {
+                    store.set_pause_after_session_boundary_commit(true);
+                }
+            }
+        }
+
+        async fn entered_after_commit(&self) {
+            match self {
+                Self::WholeBlob(store) => {
+                    store.await_after_session_boundary_commit_entered().await;
+                }
+                Self::HeadCanonical(store) => {
+                    store.await_after_session_boundary_commit_entered().await;
+                }
+            }
+        }
+
+        fn release_after_commit(&self) {
+            match self {
+                Self::WholeBlob(store) => store.release_after_session_boundary_commit(),
+                Self::HeadCanonical(store) => store.release_after_session_boundary_commit(),
+            }
+        }
+    }
+
+    /// A real `PersistentSessionService` whose durable session-boundary commit
+    /// can be stopped after detached preparation but before durable authority
+    /// advances.
+    struct CancellableTerminalCommitFixture {
+        service: Arc<PersistentSessionService<DummyBuilder>>,
+        gate: TerminalCommitGate,
+        runtime_store: Arc<dyn RuntimeStore>,
+        session_id: SessionId,
+        handoff: meerkat_runtime::CommittedModelRoutingHandoff,
+        _storage_dir: Option<tempfile::TempDir>,
+    }
+
+    impl CancellableTerminalCommitFixture {
+        async fn new(profile: TerminalCommitProfile) -> Self {
+            let (session_store, runtime_store, gate, storage_dir): (
+                Arc<dyn SessionStore>,
+                Arc<dyn RuntimeStore>,
+                TerminalCommitGate,
+                Option<tempfile::TempDir>,
+            ) = match profile {
+                TerminalCommitProfile::WholeBlob => {
+                    let store = Arc::new(GatedSnapshotRuntimeStore::new());
+                    (
+                        Arc::new(MemoryStore::new()),
+                        Arc::clone(&store) as Arc<dyn RuntimeStore>,
+                        TerminalCommitGate::WholeBlob(store),
+                        None,
+                    )
+                }
+                TerminalCommitProfile::HeadCanonical => {
+                    let storage_dir = tempfile::tempdir_in(".")
+                        .expect("head-canonical cancellation test directory");
+                    let database_path = storage_dir.path().join("runtime.sqlite3");
+                    let store = Arc::new(FailingHeadCanonicalCommitRuntimeStore::new(
+                        meerkat_runtime::SqliteRuntimeStore::new_head_canonical(&database_path)
+                            .expect("head-canonical runtime store"),
+                    ));
+                    let session_store: Arc<dyn SessionStore> = Arc::new(
+                        meerkat_store::SqliteSessionStore::open(&database_path)
+                            .expect("co-located head-canonical session store"),
+                    );
+                    (
+                        session_store,
+                        Arc::clone(&store) as Arc<dyn RuntimeStore>,
+                        TerminalCommitGate::HeadCanonical(store),
+                        Some(storage_dir),
+                    )
+                }
+            };
+            let blob_store = memory_blob_store();
+            let service = Arc::new(PersistentSessionService::new(
+                DummyBuilder,
+                4,
+                session_store,
+                Arc::clone(&runtime_store),
+                Arc::clone(&blob_store),
+            ));
+            let (session, handoff) = session_with_requested_archive_handoff();
+            let created = service
+                .create_session(resume_request(session))
+                .await
+                .expect("resume a session that already owes a routing request");
+            let session_id = created.session_id;
+            service
+                .persist_live_session_now(&session_id)
+                .await
+                .expect("commit the owed request durably before the test begins");
+            Self {
+                service,
+                gate,
+                runtime_store,
+                session_id,
+                handoff,
+                _storage_dir: storage_dir,
+            }
+        }
+
+        fn realized_record(&self) -> SessionModelRoutingControlRecord {
+            SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
+                request_id: self.handoff.request_id,
+                originating_run_id: self.handoff.originating_run_id.clone(),
+                intent: self.handoff.intent.clone(),
+                applied_identity: Box::new(meerkat_core::SessionLlmIdentity {
+                    model: "claude-opus-5".to_string(),
+                    provider: meerkat_core::Provider::Anthropic,
+                    self_hosted_server_id: None,
+                    provider_params: None,
+                    auth_binding: None,
+                }),
+            }
+        }
+
+        fn commit(
+            &self,
+        ) -> impl std::future::Future<Output = Result<(), SessionError>> + Send + use<> {
+            let service = Arc::clone(&self.service);
+            let session_id = self.session_id.clone();
+            let record = self.realized_record();
+            async move {
+                service
+                    .commit_model_routing_control_record_durable_first(&session_id, record)
+                    .await
+            }
+        }
+
+        async fn durable_body(&self) -> Session {
+            self.service
+                .load_committed_runtime_session_for_body(
+                    &self.session_id,
+                    "cancellation-safety durable read",
+                )
+                .await
+                .expect("read committed body")
+                .expect("committed body remains present")
+        }
+
+        /// The store-issued authority token for the last COMMITTED boundary.
+        ///
+        /// Used instead of a body read while a commit is mid-flight because it
+        /// gives the same profile-independent proof for WholeBlob and
+        /// HeadCanonical: the token moves if and only if the boundary committed.
+        async fn durable_authority_token(&self) -> Option<String> {
+            self.runtime_store
+                .load_session_boundary_authority(
+                    &PersistentSessionService::<DummyBuilder>::runtime_id_for_session(
+                        &self.session_id,
+                    ),
+                )
+                .await
+                .expect("read committed session authority")
+                .map(|authority| {
+                    PreparedRuntimeBoundaryIdentity::from_runtime_authority(
+                        &authority,
+                        &self.session_id,
+                    )
+                    .expect("committed authority identifies this session")
+                    .authority_token
+                })
+        }
+
+        /// A body read that tolerates an in-flight durable tail, for polling.
+        async fn try_durable_disposition(&self) -> Option<ModelRoutingIntentRecordDisposition> {
+            self.service
+                .load_committed_runtime_session_for_body(
+                    &self.session_id,
+                    "cancellation-safety durable poll",
+                )
+                .await
+                .ok()
+                .flatten()
+                .and_then(|session| {
+                    session
+                        .model_routing_control()
+                        .disposition_of(&self.handoff.request_id)
+                })
+        }
+
+        /// What the next pre-dequeue would read: committed authority.
+        async fn durable_disposition(&self) -> Option<ModelRoutingIntentRecordDisposition> {
+            self.durable_body()
+                .await
+                .model_routing_control()
+                .disposition_of(&self.handoff.request_id)
+        }
+
+        async fn live_disposition(&self) -> Option<ModelRoutingIntentRecordDisposition> {
+            match self
+                .service
+                .export_session_with_labels(&self.session_id)
+                .await
+            {
+                Ok(session) => session
+                    .model_routing_control()
+                    .disposition_of(&self.handoff.request_id),
+                Err(SessionError::NotFound { .. }) => None,
+                Err(error) => unreachable!("read live body: {error}"),
+            }
+        }
+
+        /// The invariant the whole seam exists to hold: a resolution visible in
+        /// live state must also be on disk. A live-only terminal would let the
+        /// request stop being owed with nothing durable behind it.
+        async fn assert_no_live_only_terminal(&self, at: &str) {
+            if self.live_disposition().await == Some(ModelRoutingIntentRecordDisposition::Realized)
+            {
+                assert_eq!(
+                    self.durable_disposition().await,
+                    Some(ModelRoutingIntentRecordDisposition::Realized),
+                    "{at}: live reported a realized handoff that durable authority never received"
+                );
+            }
+        }
+
+        async fn await_durable_realized(&self, why: &str) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while self.try_durable_disposition().await
+                != Some(ModelRoutingIntentRecordDisposition::Realized)
+            {
+                assert!(std::time::Instant::now() < deadline, "{why}");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        async fn await_live_realized(&self, why: &str) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while self.live_disposition().await
+                != Some(ModelRoutingIntentRecordDisposition::Realized)
+            {
+                assert!(std::time::Instant::now() < deadline, "{why}");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    /// Dropping the caller BEFORE the transaction can even start leaves the
+    /// request owed. Nothing is half-applied, and the debt is still visible to
+    /// the next pre-dequeue.
+    #[tokio::test]
+    async fn model_routing_terminal_commit_cancelled_before_it_starts_leaves_the_request_owed() {
+        for profile in TerminalCommitProfile::ALL {
+            let fixture = CancellableTerminalCommitFixture::new(profile).await;
+
+            // Hold the gate the commit must take first, so the future is
+            // guaranteed to be suspended before it has done anything at all.
+            let blocked_gate = fixture
+                .service
+                .recovery_gate_for_session(&fixture.session_id)
+                .await
+                .lock_owned()
+                .await;
+
+            let mut commit = Box::pin(fixture.commit());
+            tokio::select! {
+                biased;
+                _ = &mut commit => {
+                    unreachable!("{profile:?}: the commit cannot progress while its gate is held")
+                }
+                () = std::future::ready(()) => {}
+            }
+            drop(commit);
+            drop(blocked_gate);
+            tokio::task::yield_now().await;
+
+            assert_eq!(
+                fixture.durable_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Requested),
+                "{profile:?}: a commit cancelled before it started must leave the request owed"
+            );
+            fixture
+                .assert_no_live_only_terminal("cancelled before start")
+                .await;
+        }
+    }
+
+    /// Dropping the caller before the durable commit cannot interrupt the
+    /// detached transaction, and the live actor remains on committed authority
+    /// until that commit lands.
+    #[tokio::test]
+    async fn model_routing_terminal_commit_survives_cancellation_before_durable_commit() {
+        for profile in TerminalCommitProfile::ALL {
+            let fixture = CancellableTerminalCommitFixture::new(profile).await;
+            let authority_before = fixture.durable_authority_token().await;
+            fixture.gate.pause();
+
+            let mut commit = Box::pin(fixture.commit());
+            tokio::select! {
+                outcome = &mut commit => unreachable!(
+                    "{profile:?}: the commit cannot finish while its store is paused: {outcome:?}"
+                ),
+                () = fixture.gate.entered() => {}
+            }
+
+            // Durable-first means the actor is untouched while the document
+            // commit is paused.
+            assert_eq!(
+                fixture.live_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Requested),
+                "{profile:?}: the paused commit must not expose a live-only terminal"
+            );
+            assert_eq!(
+                fixture.durable_authority_token().await,
+                authority_before,
+                "{profile:?}: the paused commit must not have reached durable authority yet"
+            );
+
+            // The caller goes away exactly here.
+            drop(commit);
+            fixture.gate.release();
+
+            fixture
+                .await_durable_realized(&format!(
+                    "{profile:?}: the abandoned transaction never committed; cancelling the \
+                     caller tore it in half"
+                ))
+                .await;
+            assert_ne!(
+                fixture.durable_authority_token().await,
+                authority_before,
+                "{profile:?}: the durable boundary must have advanced"
+            );
+            assert_eq!(
+                fixture.durable_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized),
+                "{profile:?}: committed authority must carry the exact terminal"
+            );
+            assert_eq!(
+                fixture.live_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized),
+                "{profile:?}: live and durable must agree once the transaction completes"
+            );
+            fixture
+                .assert_no_live_only_terminal("after abandoned commit completed")
+                .await;
+        }
+    }
+
+    /// Dropping the caller after the durable commit but before actor sync cannot
+    /// lose the terminal or admit a second identity rotation.
+    #[tokio::test]
+    async fn model_routing_terminal_commit_cancelled_after_durable_commit_still_reads_terminal() {
+        for profile in TerminalCommitProfile::ALL {
+            let fixture = CancellableTerminalCommitFixture::new(profile).await;
+            fixture.gate.pause_after_commit();
+
+            let mut commit = Box::pin(fixture.commit());
+            tokio::select! {
+                outcome = &mut commit => unreachable!(
+                    "{profile:?}: the commit cannot finish while post-commit convergence is paused: {outcome:?}"
+                ),
+                () = fixture.gate.entered_after_commit() => {}
+            }
+            assert_eq!(
+                fixture.durable_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized),
+                "{profile:?}: durable authority must already carry the terminal"
+            );
+            assert_eq!(
+                fixture.live_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Requested),
+                "{profile:?}: the actor must still expose its committed predecessor before sync"
+            );
+            drop(commit);
+            fixture.gate.release_after_commit();
+            fixture
+                .await_live_realized(&format!(
+                    "{profile:?}: detached post-commit convergence did not update the actor"
+                ))
+                .await;
+
+            assert_eq!(
+                fixture.durable_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized),
+                "{profile:?}: the next pre-dequeue must read the exact terminal, not a debt"
+            );
+            assert_eq!(
+                fixture.live_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized),
+            );
+
+            // Converges instead of rotating a second time: the log carries
+            // exactly one request and one terminal for it.
+            let body = fixture.durable_body().await;
+            assert_eq!(
+                body.model_routing_control().records().len(),
+                2,
+                "{profile:?}: an unobserved commit must not be applied twice"
+            );
+            assert!(
+                body.model_routing_control()
+                    .awaiting_decision()
+                    .next()
+                    .is_none(),
+                "{profile:?}: the realized request must no longer be owed"
+            );
+        }
+    }
+
+    /// A durable commit that fails must leave the request owed and must not
+    /// expose the detached terminal through live state.
+    #[tokio::test]
+    async fn model_routing_terminal_commit_failure_leaves_the_request_owed_in_both_profiles() {
+        for profile in TerminalCommitProfile::ALL {
+            let fixture = CancellableTerminalCommitFixture::new(profile).await;
+            fixture.gate.fail_commits(true);
+
+            let error = fixture
+                .commit()
+                .await
+                .expect_err("a failing durable commit must surface as an error");
+            fixture.gate.fail_commits(false);
+
+            assert_eq!(
+                fixture.durable_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Requested),
+                "{profile:?}: a failed commit must leave the request owed ({error})"
+            );
+            assert_ne!(
+                fixture.live_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized),
+                "{profile:?}: a failed commit must not strand the terminal in live state"
+            );
+            fixture
+                .assert_no_live_only_terminal("after a failed commit")
+                .await;
+            assert_eq!(
+                fixture
+                    .durable_body()
+                    .await
+                    .model_routing_control()
+                    .records()
+                    .len(),
+                1,
+                "{profile:?}: a failed commit must not leave a partial terminal on disk"
+            );
+        }
+    }
+
+    /// Once the terminal is durable, an ordinary later persistence of the live
+    /// session must not be able to roll it back. This is the regression the
+    /// whole ordering exists to prevent: live is the thing that gets written,
+    /// so if live could lag durable, the next boundary would erase the handoff.
+    #[tokio::test]
+    async fn a_committed_model_routing_terminal_cannot_be_regressed_by_a_later_persist() {
+        for profile in TerminalCommitProfile::ALL {
+            let fixture = CancellableTerminalCommitFixture::new(profile).await;
+            if profile == TerminalCommitProfile::HeadCanonical {
+                fixture
+                    .service
+                    .prepare_runtime_boundary(
+                        &fixture.session_id,
+                        "stale role-boundary regression seed",
+                        None,
+                    )
+                    .await
+                    .expect("prepare a predecessor HeadCanonical actor boundary");
+            }
+            fixture
+                .commit()
+                .await
+                .unwrap_or_else(|error| unreachable!("{profile:?}: commit terminal: {error}"));
+            assert_eq!(
+                fixture.durable_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized)
+            );
+
+            // An ordinary full-session persistence, exactly like the one the
+            // next turn boundary performs.
+            fixture
+                .service
+                .persist_live_session_now(&fixture.session_id)
+                .await
+                .unwrap_or_else(|error| unreachable!("{profile:?}: ordinary persist: {error}"));
+
+            assert_eq!(
+                fixture.durable_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized),
+                "{profile:?}: an ordinary persist regressed a committed handoff terminal"
+            );
+            assert_eq!(
+                fixture
+                    .durable_body()
+                    .await
+                    .model_routing_control()
+                    .records()
+                    .len(),
+                2,
+                "{profile:?}: an ordinary persist must not duplicate or drop handoff records"
+            );
+            let _ = &fixture.runtime_store;
+        }
+    }
+
+    #[tokio::test]
+    async fn post_commit_sync_and_discard_failure_fatalizes_the_stale_actor() {
+        for profile in TerminalCommitProfile::ALL {
+            let fixture = CancellableTerminalCommitFixture::new(profile).await;
+            fixture.service.inner.fail_next_durable_sync();
+            fixture.service.inner.fail_next_discard();
+
+            let error = fixture
+                .commit()
+                .await
+                .expect_err("fatal live convergence failure must surface");
+            assert!(
+                error.to_string().contains("stale actor was fatalized"),
+                "{profile:?}: unexpected convergence error: {error}"
+            );
+            assert_eq!(
+                fixture.durable_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized),
+                "{profile:?}: fatal live convergence cannot roll back durable authority"
+            );
+            assert!(
+                matches!(
+                    fixture
+                        .service
+                        .export_live_session(&fixture.session_id)
+                        .await,
+                    Err(SessionError::NotFound { .. })
+                ),
+                "{profile:?}: a stale actor that could not be discarded must be unregistered"
+            );
+            assert!(
+                matches!(
+                    fixture
+                        .service
+                        .persist_live_session_now(&fixture.session_id)
+                        .await,
+                    Err(SessionError::NotFound { .. })
+                ),
+                "{profile:?}: the fatalized actor must not retain an ordinary persist path"
+            );
+            assert_eq!(
+                fixture.service.inner.fatalized_actor_task_terminations(),
+                1,
+                "{profile:?}: fatalization must abort and join the detached actor task"
+            );
+            assert_eq!(
+                fixture
+                    .durable_body()
+                    .await
+                    .model_routing_control()
+                    .records()
+                    .len(),
+                2,
+                "{profile:?}: fatalization must preserve exactly one durable terminal"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn post_commit_reporting_failure_converges_from_exact_durable_authority() {
+        for profile in TerminalCommitProfile::ALL {
+            let fixture = CancellableTerminalCommitFixture::new(profile).await;
+            fixture.gate.fail_after_commit_once();
+
+            fixture.commit().await.unwrap_or_else(|error| {
+                unreachable!(
+                    "{profile:?}: an exact committed terminal must settle a post-commit reporting failure: {error}"
+                )
+            });
+
+            assert_eq!(
+                fixture.durable_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized)
+            );
+            assert_eq!(
+                fixture.live_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized),
+                "{profile:?}: the live actor must converge from exact committed authority"
+            );
+            fixture
+                .service
+                .persist_live_session_now(&fixture.session_id)
+                .await
+                .unwrap_or_else(|error| {
+                    unreachable!("{profile:?}: ordinary persistence after convergence: {error}")
+                });
+            assert_eq!(
+                fixture
+                    .durable_body()
+                    .await
+                    .model_routing_control()
+                    .records()
+                    .len(),
+                2,
+                "{profile:?}: reconciliation must not duplicate or regress the terminal"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn model_routing_handoff_archive_terminalizes_never_imported_in_both_profiles() {
+        for profile in ArchiveHandoffProfile::ALL {
+            let (session, handoff) = session_with_requested_archive_handoff();
+            let fixture = ArchiveHandoffFixture::new(profile, session).await;
+
+            fixture
+                .archive()
+                .await
+                .unwrap_or_else(|error| panic!("{profile:?} archive failed: {error}"));
+
+            assert_eq!(
+                meerkat_runtime::store::load_runtime_state(
+                    fixture.runtime_store.as_ref(),
+                    &PersistentSessionService::<DummyBuilder>::runtime_id_for_session(
+                        &fixture.session_id,
+                    ),
+                )
+                .await
+                .expect("read archive runtime terminal"),
+                Some(RuntimeState::Retired)
+            );
+            assert_handoff_abandoned(&fixture.durable_body().await, &handoff);
+        }
+    }
+
+    #[tokio::test]
+    async fn model_routing_handoff_archive_terminalizes_boundary_held_in_both_profiles() {
+        for profile in ArchiveHandoffProfile::ALL {
+            let (session, handoff) = session_with_requested_archive_handoff();
+            let fixture = ArchiveHandoffFixture::new(profile, session).await;
+            let _turn_boundary = fixture
+                .service
+                .acquire_runtime_turn_finalization_guard(&fixture.session_id)
+                .await;
+            let realization = meerkat_runtime::SessionServiceRuntimeExt::
+                realize_committed_model_routing_handoff_under_turn_finalization_boundary(
+                    fixture.machine.as_ref(),
+                    &fixture.session_id,
+                    handoff.clone(),
+                )
+                .await
+                .expect("an uncommitted origin is a typed hold");
+            assert!(matches!(
+                realization,
+                meerkat_runtime::ModelRoutingHandoffRealization::Held {
+                    reason:
+                        meerkat_runtime::ModelRoutingHandoffHoldReason::
+                            OriginatingBoundaryUncommitted { .. }
+                }
+            ));
+            drop(_turn_boundary);
+
+            fixture
+                .archive()
+                .await
+                .unwrap_or_else(|error| panic!("{profile:?} held archive failed: {error}"));
+            assert_handoff_abandoned(&fixture.durable_body().await, &handoff);
+        }
+    }
+
+    #[tokio::test]
+    async fn model_routing_handoff_archive_preserves_realized_and_denied_in_both_profiles() {
+        for profile in ArchiveHandoffProfile::ALL {
+            let mut session = Session::new();
+            let realized_request = new_archive_handoff_request_id();
+            let realized_run = RunId::new();
+            session
+                .append_model_routing_control_record(archive_handoff_requested(
+                    realized_request,
+                    realized_run.clone(),
+                    "claude-opus-5",
+                ))
+                .expect("append realized request");
+            session
+                .append_model_routing_control_record(
+                    SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
+                        request_id: realized_request,
+                        originating_run_id: realized_run,
+                        intent: archive_handoff_intent("claude-opus-5"),
+                        applied_identity: Box::new(meerkat_core::SessionLlmIdentity {
+                            model: "claude-opus-5".to_string(),
+                            provider: meerkat_core::Provider::Anthropic,
+                            self_hosted_server_id: None,
+                            provider_params: None,
+                            auth_binding: None,
+                        }),
+                    },
+                )
+                .expect("append realized terminal");
+            let denied_request = new_archive_handoff_request_id();
+            let denied_run = RunId::new();
+            session
+                .append_model_routing_control_record(archive_handoff_requested(
+                    denied_request,
+                    denied_run.clone(),
+                    "gpt-5.5",
+                ))
+                .expect("append denied request");
+            session
+                .append_model_routing_control_record(
+                    SessionModelRoutingControlRecord::ModelRoutingIntentDenied {
+                        request_id: denied_request,
+                        originating_run_id: denied_run,
+                        intent: archive_handoff_intent("gpt-5.5"),
+                        reason: meerkat_core::image_generation::SwitchTurnDenialReason::
+                            UnsupportedModel,
+                    },
+                )
+                .expect("append denied terminal");
+            let expected = session.model_routing_control().records().to_vec();
+            let fixture = ArchiveHandoffFixture::new(profile, session).await;
+
+            fixture
+                .archive()
+                .await
+                .unwrap_or_else(|error| panic!("{profile:?} settled archive failed: {error}"));
+            let durable = fixture.durable_body().await;
+            assert_eq!(durable.model_routing_control().records(), expected);
+            assert!(
+                durable
+                    .model_routing_control()
+                    .records()
+                    .iter()
+                    .all(|record| !matches!(
+                        record,
+                        SessionModelRoutingControlRecord::ModelRoutingIntentAbandoned { .. }
+                    ))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn model_routing_handoff_archive_preterminal_failure_stays_active_in_both_profiles() {
+        for profile in ArchiveHandoffProfile::ALL {
+            let (session, handoff) = session_with_requested_archive_handoff();
+            let fixture = ArchiveHandoffFixture::new(profile, session).await;
+            fixture
+                .seed_originating_boundary(handoff.originating_run_id.clone())
+                .await;
+            fixture.failures.fail_lifecycle_commits(true);
+
+            let error = fixture
+                .archive()
+                .await
+                .expect_err("runtime lifecycle persistence failure must fail archive");
+            assert!(
+                error.to_string().contains("lifecycle commit failure"),
+                "{profile:?} surfaced unexpected archive error: {error:?}"
+            );
+            fixture.failures.fail_lifecycle_commits(false);
+
+            assert_ne!(
+                meerkat_runtime::store::load_runtime_state(
+                    fixture.runtime_store.as_ref(),
+                    &PersistentSessionService::<DummyBuilder>::runtime_id_for_session(
+                        &fixture.session_id,
+                    ),
+                )
+                .await
+                .expect("read active runtime state"),
+                Some(RuntimeState::Retired),
+                "failed archive must not commit session terminality"
+            );
+            let durable = fixture.durable_body().await;
+            assert_eq!(
+                durable
+                    .model_routing_control()
+                    .disposition_of(&handoff.request_id),
+                Some(ModelRoutingIntentRecordDisposition::Requested)
+            );
+            assert_eq!(
+                durable.model_routing_control().awaiting_decision().count(),
+                1
+            );
+            fixture
+                .service
+                .read(&fixture.session_id)
+                .await
+                .expect("failed pre-terminal archive leaves the session active");
+            assert!(
+                fixture
+                    .runtime_store
+                    .load_boundary_receipt(
+                        &PersistentSessionService::<DummyBuilder>::runtime_id_for_session(
+                            &fixture.session_id,
+                        ),
+                        &handoff.originating_run_id,
+                        0,
+                    )
+                    .await
+                    .expect("read actionability receipt")
+                    .is_some(),
+                "the still-Requested handoff retains its committed-boundary proof"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn model_routing_handoff_archive_retry_finishes_abandoned_in_both_profiles() {
+        for profile in ArchiveHandoffProfile::ALL {
+            let (session, handoff) = session_with_requested_archive_handoff();
+            let fixture = ArchiveHandoffFixture::new(profile, session).await;
+            fixture.failures.fail_next_document_commit();
+
+            let first_error = fixture
+                .archive()
+                .await
+                .expect_err("injected abandoned-record persistence failure must surface");
+            assert!(
+                first_error.to_string().contains("boundary commit failure")
+                    || first_error.to_string().contains("snapshot commit failure"),
+                "{profile:?} surfaced unexpected terminal persistence error: {first_error:?}"
+            );
+            assert_eq!(
+                meerkat_runtime::store::load_runtime_state(
+                    fixture.runtime_store.as_ref(),
+                    &PersistentSessionService::<DummyBuilder>::runtime_id_for_session(
+                        &fixture.session_id,
+                    ),
+                )
+                .await
+                .expect("read committed runtime terminal"),
+                Some(RuntimeState::Retired),
+                "the injected failure must occur after runtime terminality"
+            );
+            assert_eq!(
+                fixture
+                    .durable_body()
+                    .await
+                    .model_routing_control()
+                    .disposition_of(&handoff.request_id),
+                Some(ModelRoutingIntentRecordDisposition::Requested),
+                "first failure must leave the durable outbox retryable"
+            );
+
+            fixture.failures.allow_document_commits();
+            let retry = fixture.archive().await;
+            assert!(
+                matches!(retry, Err(SessionError::NotFound { .. })),
+                "AlreadyArchived retry preserves the public NotFound contract: {retry:?}"
+            );
+            assert_handoff_abandoned(&fixture.durable_body().await, &handoff);
+
+            let restarted_service = PersistentSessionService::new(
+                DummyBuilder,
+                4,
+                Arc::clone(&fixture.session_store),
+                Arc::clone(&fixture.runtime_store),
+                Arc::clone(&fixture.blob_store),
+            );
+            restarted_service
+                .revive_archived_session_with_machine_authority(
+                    &fixture.session_id,
+                    fixture.machine.session_control_authority(),
+                )
+                .await
+                .expect("revive archived session after durable handoff convergence");
+            let revived = restarted_service
+                .load_persisted_session_for_archive(&fixture.session_id)
+                .await
+                .expect("load revived session")
+                .expect("revived session body remains present");
+            assert_handoff_abandoned(&revived, &handoff);
+        }
     }
 
     #[tokio::test]

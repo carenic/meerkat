@@ -52,6 +52,17 @@ pub type AttachedActorPublicationRefreshFn = Arc<
         + Sync,
 >;
 
+/// Build a runtime-backed service WITHOUT a session-LLM reconfigure host.
+///
+/// Explicit-host owners only. The caller takes responsibility for installing a
+/// host before any agent is built; a surface that installs none ships sessions
+/// that can accept a `brain_swap` call and never realize it. Product surfaces
+/// should call
+/// [`build_runtime_backed_service_with_default_reconfigure_host`] instead.
+///
+/// RPC deliberately stays on this path because it installs its own host with
+/// late-bound default-client, config, and staged-registry wiring; routing it
+/// through the wrapper would install a second, shadowing host.
 #[cfg(feature = "session-store")]
 pub fn build_runtime_backed_service(
     builder: FactoryAgentBuilder,
@@ -67,6 +78,87 @@ pub fn build_runtime_backed_service(
         DEFAULT_RUNTIME_BACKED_ARCHIVED_HISTORY_CAPACITY,
         persistence,
     )
+}
+
+/// Build a runtime-backed service that already has the canonical session-LLM
+/// reconfigure host installed.
+///
+/// This is the composition every product surface should use. The low-level
+/// [`build_runtime_backed_service`] leaves the reconfigure host UNSET, and an
+/// unset host is not a missing convenience — it is a session that advertises
+/// `brain_swap` to the model, accepts the call, commits the request, and then
+/// can never realize it, because the pre-dequeue seam has no host to read the
+/// committed log through. Nothing about that failure is visible at the surface
+/// that shipped it.
+///
+/// Installing here also fixes the ordering hazard: the host must exist before
+/// any agent is built, since the first turn can stage a handoff. The blueprint
+/// is captured before the builder is moved into the service, then installed
+/// against the concrete service the moment it exists.
+#[cfg(feature = "session-store")]
+pub fn build_runtime_backed_service_with_default_reconfigure_host(
+    builder: FactoryAgentBuilder,
+    max_sessions: usize,
+    persistence: crate::PersistenceBundle,
+    config_state_path: std::path::PathBuf,
+) -> (
+    Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    Arc<MeerkatMachine>,
+) {
+    build_runtime_backed_service_with_capacities_and_default_reconfigure_host(
+        builder,
+        max_sessions,
+        DEFAULT_RUNTIME_BACKED_ARCHIVED_HISTORY_CAPACITY,
+        persistence,
+        config_state_path,
+    )
+}
+
+/// Capacity-explicit sibling of
+/// [`build_runtime_backed_service_with_default_reconfigure_host`].
+#[cfg(feature = "session-store")]
+pub fn build_runtime_backed_service_with_capacities_and_default_reconfigure_host(
+    builder: FactoryAgentBuilder,
+    active_session_capacity: usize,
+    archived_history_capacity: usize,
+    persistence: crate::PersistenceBundle,
+    config_state_path: std::path::PathBuf,
+) -> (
+    Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    Arc<MeerkatMachine>,
+) {
+    // Captured BEFORE the builder moves into the service: the blueprint needs
+    // the builder's factory, config store, and late-bound client/realm slots.
+    //
+    // The default-client slot is seeded from the builder's own configured
+    // default rather than forced empty. A host that injected a default client
+    // means it for every client this runtime builds, and reconfigure is not an
+    // exception — silently ignoring it here would give hosted surfaces
+    // different reconfigure semantics from the explicit-host path, which is
+    // exactly the kind of surface-conditional behaviour this wrapper exists to
+    // remove. When no default is configured the slot stays empty and target
+    // resolution goes through the provider registry as usual.
+    let blueprint =
+        crate::session_runtime::llm_reconfigure::SessionRuntimeLlmReconfigureHostBlueprint::new(
+            &builder,
+            config_state_path,
+            Arc::new(std::sync::RwLock::new(builder.default_llm_client.clone())),
+        );
+    let (service, adapter) = build_runtime_backed_service_with_capacities(
+        builder,
+        active_session_capacity,
+        archived_history_capacity,
+        persistence,
+    );
+    let service = Arc::new(service);
+    blueprint.install(
+        &adapter,
+        Arc::clone(&service)
+            as Arc<
+                dyn crate::session_runtime::llm_reconfigure::SessionRuntimeLlmReconfigureService,
+            >,
+    );
+    (service, adapter)
 }
 
 #[cfg(feature = "session-store")]
@@ -1358,6 +1450,17 @@ pub fn persistent_runtime_post_stop_cleanup_handle_for_actor_slot<
     })
 }
 
+/// Build the shared pre-dequeue realization handle for one runtime-backed
+/// session.
+///
+/// Re-exported from `meerkat_runtime`, which owns the single implementation.
+/// It lives there because the handle needs only the `MeerkatMachine` and the
+/// session id, and because the mob provisioner must return the SAME handle
+/// while depending on the runtime rather than on this crate's `session-store`
+/// feature. Keeping this name here preserves the one helper every surface
+/// calls.
+pub use meerkat_runtime::persistent_runtime_pre_dequeue_handle;
+
 /// Build the stable outer mutation boundary shared by runtime-loop, direct,
 /// and non-turn session writers for one SessionId.
 pub fn persistent_runtime_turn_finalization_boundary_handle<B: SessionAgentBuilder + 'static>(
@@ -1747,6 +1850,15 @@ impl<B: SessionAgentBuilder + 'static> CoreExecutor for PersistentRuntimeExecuto
     ) -> Option<Arc<dyn CoreExecutorTurnFinalizationBoundaryHandle>> {
         Some(persistent_runtime_turn_finalization_boundary_handle(
             Arc::clone(&self.service),
+            self.session_id.clone(),
+        ))
+    }
+
+    fn pre_dequeue_handle(
+        &self,
+    ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPreDequeueHandle>> {
+        Some(persistent_runtime_pre_dequeue_handle(
+            Arc::clone(&self.adapter),
             self.session_id.clone(),
         ))
     }

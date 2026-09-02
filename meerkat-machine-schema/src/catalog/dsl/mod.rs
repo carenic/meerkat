@@ -2148,6 +2148,32 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                 ],
             ),
             NamedTypeBinding::string_enum(
+                "RoutingHandoffPhase",
+                &["Imported", "Claimed", "Realized", "Denied", "Archived"],
+            ),
+            NamedTypeBinding::string("RoutingAppliedModel"),
+            // One record per committed handoff request.
+            //
+            // Deliberately a single keyed record rather than five parallel
+            // maps keyed by the same request id. Parallel maps make partial
+            // writes representable — a phase without its run, a target without
+            // its phase — and every one of those maps costs a slot in the
+            // machine state that is copied into every future carrying it.
+            // `applied_model` and `denial_reason` are optional because they
+            // are outcome facts: exactly one of them is set, and only at the
+            // terminal that produces it.
+            NamedTypeBinding::type_path_struct(
+                "ModelRoutingHandoffRecord",
+                "crate::catalog::dsl::meerkat_machine::ModelRoutingHandoffRecord",
+                vec![
+                    TypePathStructField::named("phase", "RoutingHandoffPhase"),
+                    TypePathStructField::string("originating_run"),
+                    TypePathStructField::string("target_model"),
+                    TypePathStructField::optional_named("applied_model", "RoutingAppliedModel"),
+                    TypePathStructField::optional_named("denial_reason", "RoutingDenialReason"),
+                ],
+            ),
+            NamedTypeBinding::string_enum(
                 "RoutingSwitchTurnPhase",
                 &[
                     "Requested",
@@ -2611,6 +2637,11 @@ runtime_internal_inputs!(
         AttachMobIngress,
         AttachSessionIngress,
         AuthorizeSupervisor,
+        // Archive handoff terminalization is runtime-internal by construction:
+        // only the archive-lease choke invokes it after the durable Retired
+        // commit, then mirrors the exact generated verdict into the Session
+        // log. A caller-facing command would be a forgeable archive capability.
+        ArchiveUnresolvedModelRoutingHandoff,
         PrepareTerminalSupervisorCleanupBindings,
         RecoverSupervisorBinding,
         RecoverSupervisorRevocationPending,

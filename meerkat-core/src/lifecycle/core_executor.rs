@@ -1649,6 +1649,53 @@ pub trait CoreExecutorTurnFinalizationBoundaryHandle: Send + Sync {
     ) -> Result<Box<dyn CoreExecutorTurnFinalizationGuard>, CoreExecutorError>;
 }
 
+/// What one pre-dequeue realization pass concluded.
+///
+/// The two outcomes are kept distinct rather than collapsed into a boolean so
+/// callers cannot read "nothing to do" as "something was done".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CorePreDequeueOutcome {
+    /// No committed work was owed; the next input may be admitted unchanged.
+    NothingPending,
+    /// Committed work was realized and durably recorded before this return.
+    Realized,
+}
+
+/// Endpoint invoked once per queue-bearing runtime-loop lap, while the caller
+/// already holds this session's turn-finalization boundary and BEFORE queue
+/// authority is claimed or any input is dequeued. An idle lap with no admitted
+/// input does not realize cross-run work early.
+///
+/// # Why this position, exactly
+///
+/// A committed cross-run handoff is only actionable after its originating run
+/// boundary has landed, and it must take effect before the next input is
+/// attempted — otherwise the input the handoff was meant to redirect is served
+/// by the old identity and the request silently misses by one turn. The
+/// interval between "boundary held" and "queue authority claimed" is the only
+/// point where both are simultaneously true, and it is also the only point at
+/// which the session actor is provably idle, so realization needs no boundary
+/// reacquisition, no self-call into the session task, and no provisional
+/// checkpoint.
+///
+/// # Contract
+///
+/// * The caller holds the turn-finalization boundary. Implementations MUST NOT
+///   reacquire it; doing so self-deadlocks.
+/// * Implementations must be idempotent across laps: an already-realized
+///   handoff converges instead of rotating identity a second time.
+/// * A failure returns typed and leaves the pending input unattempted, so a
+///   held or denied handoff can never be papered over by serving the input
+///   with the wrong identity.
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+pub trait CoreExecutorPreDequeueHandle: Send + Sync {
+    async fn realize_committed_handoffs_under_turn_finalization_boundary(
+        &self,
+    ) -> Result<CorePreDequeueOutcome, CoreExecutorError>;
+}
+
 /// The interface core exposes for the runtime layer to apply run primitives.
 ///
 /// The runtime layer creates an implementation that wraps an `Agent` and
@@ -1712,6 +1759,18 @@ pub trait CoreExecutor: Send + Sync {
     fn turn_finalization_boundary_handle(
         &self,
     ) -> Option<Arc<dyn CoreExecutorTurnFinalizationBoundaryHandle>> {
+        None
+    }
+
+    /// Optional endpoint for realizing committed cross-run handoffs before the
+    /// next input is dequeued.
+    ///
+    /// Returning `None` is the correct answer for every executor that cannot
+    /// own durable cross-run state — standalone, ephemeral, and WASM surfaces
+    /// included. It is an ownership declaration, not a stub: such an executor
+    /// also never advertises the tool that stages the handoff, so there is
+    /// nothing committed for it to miss.
+    fn pre_dequeue_handle(&self) -> Option<Arc<dyn CoreExecutorPreDequeueHandle>> {
         None
     }
 

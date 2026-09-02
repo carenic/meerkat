@@ -42377,6 +42377,9 @@ fn summarize_runtime_parity_command_result(result: &MeerkatMachineCommandResult)
         MeerkatMachineCommandResult::SwitchTurnControlResult(result) => {
             format!("switch_turn_control_result:{result:?}")
         }
+        MeerkatMachineCommandResult::ModelRoutingHandoffRealization(realization) => {
+            format!("model_routing_handoff_realization:{realization:?}")
+        }
         MeerkatMachineCommandResult::ImageOperationRoutingResult(result) => {
             format!("image_operation_routing_result:{result:?}")
         }

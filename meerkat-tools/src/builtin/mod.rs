@@ -17,6 +17,9 @@
 
 #[cfg(feature = "comms")]
 pub mod comms;
+// Staging-only, so it is wasm-safe by construction; the surfaces that cannot
+// realize a handoff simply never register it.
+pub mod brain_swap;
 pub mod composite;
 pub mod config;
 #[cfg(not(target_arch = "wasm32"))]

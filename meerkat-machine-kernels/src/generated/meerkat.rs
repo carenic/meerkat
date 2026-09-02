@@ -5148,6 +5148,8 @@ impl std::fmt::Display for MobPeerOverlayCommandKind {
     }
 }
 pub type MobToolCallerProvenance = meerkat_core::service::MobToolCallerProvenance;
+pub type ModelRoutingHandoffRecord =
+    meerkat_machine_schema::catalog::dsl::meerkat_machine::ModelRoutingHandoffRecord;
 #[allow(non_camel_case_types)]
 #[derive(
     Debug,
@@ -12576,6 +12578,7 @@ pub struct State {
     pub model_routing_approval_phases: std::collections::BTreeMap<String, RoutingApprovalPhase>,
     pub model_routing_approval_parent_kind:
         std::collections::BTreeMap<String, RoutingApprovalParentKind>,
+    pub model_routing_handoff: std::collections::BTreeMap<String, ModelRoutingHandoffRecord>,
     pub registration_phase: RegistrationPhase,
     pub unregister_runtime_loop_drain_pending: bool,
     pub unregister_comms_drain_exit_pending: bool,
@@ -13464,6 +13467,35 @@ pub mod inputs {
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct AdmitModelRoutingAssistantTurn {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ImportCommittedModelRoutingHandoff {
+        pub request_id: String,
+        pub record: ModelRoutingHandoffRecord,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ClaimModelRoutingHandoff {
+        pub request_id: String,
+        pub observed: ModelRoutingHandoffRecord,
+        pub record: ModelRoutingHandoffRecord,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RealizeModelRoutingHandoff {
+        pub request_id: String,
+        pub observed: ModelRoutingHandoffRecord,
+        pub record: ModelRoutingHandoffRecord,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct DenyModelRoutingHandoff {
+        pub request_id: String,
+        pub observed: ModelRoutingHandoffRecord,
+        pub record: ModelRoutingHandoffRecord,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ArchiveUnresolvedModelRoutingHandoff {
+        pub request_id: String,
+        pub observed: ModelRoutingHandoffRecord,
+        pub record: ModelRoutingHandoffRecord,
+    }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct BeginImageOperation {
         pub operation_id: String,
@@ -15315,6 +15347,11 @@ pub enum Input {
     RequestUntilChangedSwitchTurn(inputs::RequestUntilChangedSwitchTurn),
     CompleteUntilChangedSwitchTurnReconfigure(inputs::CompleteUntilChangedSwitchTurnReconfigure),
     AdmitModelRoutingAssistantTurn(inputs::AdmitModelRoutingAssistantTurn),
+    ImportCommittedModelRoutingHandoff(inputs::ImportCommittedModelRoutingHandoff),
+    ClaimModelRoutingHandoff(inputs::ClaimModelRoutingHandoff),
+    RealizeModelRoutingHandoff(inputs::RealizeModelRoutingHandoff),
+    DenyModelRoutingHandoff(inputs::DenyModelRoutingHandoff),
+    ArchiveUnresolvedModelRoutingHandoff(inputs::ArchiveUnresolvedModelRoutingHandoff),
     BeginImageOperation(inputs::BeginImageOperation),
     DenyImageOperationPlan(inputs::DenyImageOperationPlan),
     ActivateImageOperationOverride(inputs::ActivateImageOperationOverride),
@@ -15722,6 +15759,15 @@ impl Input {
                 InputKind::CompleteUntilChangedSwitchTurnReconfigure
             }
             Self::AdmitModelRoutingAssistantTurn(_) => InputKind::AdmitModelRoutingAssistantTurn,
+            Self::ImportCommittedModelRoutingHandoff(_) => {
+                InputKind::ImportCommittedModelRoutingHandoff
+            }
+            Self::ClaimModelRoutingHandoff(_) => InputKind::ClaimModelRoutingHandoff,
+            Self::RealizeModelRoutingHandoff(_) => InputKind::RealizeModelRoutingHandoff,
+            Self::DenyModelRoutingHandoff(_) => InputKind::DenyModelRoutingHandoff,
+            Self::ArchiveUnresolvedModelRoutingHandoff(_) => {
+                InputKind::ArchiveUnresolvedModelRoutingHandoff
+            }
             Self::BeginImageOperation(_) => InputKind::BeginImageOperation,
             Self::DenyImageOperationPlan(_) => InputKind::DenyImageOperationPlan,
             Self::ActivateImageOperationOverride(_) => InputKind::ActivateImageOperationOverride,
@@ -16194,6 +16240,11 @@ pub enum InputKind {
     RequestUntilChangedSwitchTurn,
     CompleteUntilChangedSwitchTurnReconfigure,
     AdmitModelRoutingAssistantTurn,
+    ImportCommittedModelRoutingHandoff,
+    ClaimModelRoutingHandoff,
+    RealizeModelRoutingHandoff,
+    DenyModelRoutingHandoff,
+    ArchiveUnresolvedModelRoutingHandoff,
     BeginImageOperation,
     DenyImageOperationPlan,
     ActivateImageOperationOverride,
@@ -18941,6 +18992,37 @@ pub enum TransitionId {
     CompleteUntilChangedSwitchTurnReconfigureIdle,
     CompleteUntilChangedSwitchTurnReconfigureAttached,
     CompleteUntilChangedSwitchTurnReconfigureRunning,
+    ImportCommittedModelRoutingHandoffFirstIdle,
+    ImportCommittedModelRoutingHandoffFirstAttached,
+    ImportCommittedModelRoutingHandoffFirstRunning,
+    ImportCommittedModelRoutingHandoffFirstRetired,
+    ImportCommittedModelRoutingHandoffAlreadyExactIdle,
+    ImportCommittedModelRoutingHandoffAlreadyExactAttached,
+    ImportCommittedModelRoutingHandoffAlreadyExactRunning,
+    ImportCommittedModelRoutingHandoffAlreadyExactRetired,
+    ClaimModelRoutingHandoffImportedIdle,
+    ClaimModelRoutingHandoffImportedAttached,
+    ClaimModelRoutingHandoffImportedRunning,
+    ClaimModelRoutingHandoffAlreadyClaimedIdle,
+    ClaimModelRoutingHandoffAlreadyClaimedAttached,
+    ClaimModelRoutingHandoffAlreadyClaimedRunning,
+    ClaimModelRoutingHandoffAlreadyRealizedIdle,
+    ClaimModelRoutingHandoffAlreadyRealizedAttached,
+    ClaimModelRoutingHandoffAlreadyRealizedRunning,
+    RealizeModelRoutingHandoffClaimedIdle,
+    RealizeModelRoutingHandoffClaimedAttached,
+    RealizeModelRoutingHandoffClaimedRunning,
+    RealizeModelRoutingHandoffAlreadyRealizedIdle,
+    RealizeModelRoutingHandoffAlreadyRealizedAttached,
+    RealizeModelRoutingHandoffAlreadyRealizedRunning,
+    DenyModelRoutingHandoffPendingIdle,
+    DenyModelRoutingHandoffPendingAttached,
+    DenyModelRoutingHandoffPendingRunning,
+    DenyModelRoutingHandoffAlreadyDeniedIdle,
+    DenyModelRoutingHandoffAlreadyDeniedAttached,
+    DenyModelRoutingHandoffAlreadyDeniedRunning,
+    ArchiveUnresolvedModelRoutingHandoffPendingRetired,
+    ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedRetired,
     AdmitPendingFiniteSwitchTurnIdle,
     AdmitPendingFiniteSwitchTurnAttached,
     AdmitPendingFiniteSwitchTurnRunning,
@@ -21255,6 +21337,7 @@ pub fn initial_state() -> State {
         model_routing_image_plan_denials: Default::default(),
         model_routing_approval_phases: Default::default(),
         model_routing_approval_parent_kind: Default::default(),
+        model_routing_handoff: Default::default(),
         registration_phase: RegistrationPhase::Queuing,
         unregister_runtime_loop_drain_pending: false,
         unregister_comms_drain_exit_pending: false,

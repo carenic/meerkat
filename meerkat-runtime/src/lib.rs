@@ -580,8 +580,9 @@ pub use meerkat_machine::{
     standalone_tool_visibility_owner,
 };
 pub use meerkat_machine_types::{
-    HydratedSessionLlmState, ImageOperationRoutingRequest, ImageOperationRoutingResult,
-    ModelRoutingApprovalDisposition, ModelRoutingRealtimePolicy, ResolvedSessionLlmReconfigure,
+    CommittedModelRoutingHandoff, HydratedSessionLlmState, ImageOperationRoutingRequest,
+    ImageOperationRoutingResult, ModelRoutingApprovalDisposition, ModelRoutingHandoffHoldReason,
+    ModelRoutingHandoffRealization, ModelRoutingRealtimePolicy, ResolvedSessionLlmReconfigure,
     SessionLlmCapabilitySurface, SessionLlmCapabilitySurfaceStatus, SessionLlmReconfigureHost,
     SessionLlmReconfigureReport, SessionLlmReconfigureRequest, SessionToolVisibilityDelta,
 };
@@ -1060,7 +1061,7 @@ pub use runtime_event::{
     RuntimeProjectionEvent, RuntimeStateChangeEvent, RuntimeTopologyEvent,
 };
 pub use runtime_state::{RuntimeState, RuntimeStateTransitionError};
-pub use service_ext::SessionServiceRuntimeExt;
+pub use service_ext::{SessionServiceRuntimeExt, persistent_runtime_pre_dequeue_handle};
 #[cfg(feature = "sqlite-store")]
 pub use store::SqliteRuntimeStore;
 pub use store::{

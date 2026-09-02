@@ -2632,6 +2632,16 @@ impl CoreExecutor for McpSessionRuntimeExecutor {
         )
     }
 
+    /// The one shared facade-owned realization handle.
+    fn pre_dequeue_handle(
+        &self,
+    ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPreDequeueHandle>> {
+        Some(meerkat::surface::persistent_runtime_pre_dequeue_handle(
+            Arc::clone(&self.context.runtime_adapter),
+            self.session_id.clone(),
+        ))
+    }
+
     async fn apply(
         &mut self,
         run_id: meerkat_core::lifecycle::RunId,

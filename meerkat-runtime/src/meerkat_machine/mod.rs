@@ -7503,6 +7503,12 @@ pub struct MeerkatMachineShared {
     blob_store: Option<Arc<dyn BlobStore>>,
     /// Runtime-owned shell seam for live session LLM reconfiguration I/O.
     llm_reconfigure_host: StdRwLock<Option<Arc<dyn SessionLlmReconfigureHost>>>,
+    /// Shared readiness flag mirroring `llm_reconfigure_host.is_some()`.
+    ///
+    /// Handed to every model-routing handle so a factory build can ask whether
+    /// this runtime can actually realize a committed handoff, rather than
+    /// inferring it from build mode alone.
+    reconfigure_host_ready: Arc<std::sync::atomic::AtomicBool>,
     /// Machine-wide injected member-observation host (multi-host mobs
     /// DEC-P6E-2; the `llm_reconfigure_host` precedent). Serves the
     /// `ReadMemberHistory` / `PollMemberEvents` drain arms and directed-turn
@@ -8925,6 +8931,7 @@ impl MeerkatMachine {
                 store: None,
                 blob_store: None,
                 llm_reconfigure_host: StdRwLock::new(None),
+                reconfigure_host_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 member_observation_host: StdRwLock::new(None),
                 member_live_host: StdRwLock::new(None),
                 #[cfg(feature = "live")]
@@ -9004,6 +9011,7 @@ impl MeerkatMachine {
                 store: Some(store),
                 blob_store: Some(blob_store),
                 llm_reconfigure_host: StdRwLock::new(None),
+                reconfigure_host_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 member_observation_host: StdRwLock::new(None),
                 member_live_host: StdRwLock::new(None),
                 #[cfg(feature = "live")]
@@ -9083,6 +9091,7 @@ impl MeerkatMachine {
                 store: Some(store),
                 blob_store: Some(Arc::new(UnavailableBlobStore)),
                 llm_reconfigure_host: StdRwLock::new(None),
+                reconfigure_host_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 member_observation_host: StdRwLock::new(None),
                 member_live_host: StdRwLock::new(None),
                 #[cfg(feature = "live")]
@@ -9565,6 +9574,7 @@ impl MeerkatMachine {
                 | MeerkatMachineCommand::ConfigureModelRoutingBaseline { .. }
                 | MeerkatMachineCommand::SessionModelRoutingStatus { .. }
                 | MeerkatMachineCommand::RequestSwitchTurn { .. }
+                | MeerkatMachineCommand::RealizeCommittedModelRoutingHandoff { .. }
                 | MeerkatMachineCommand::AdmitModelRoutingAssistantTurn { .. }
                 | MeerkatMachineCommand::BeginImageOperation { .. }
                 | MeerkatMachineCommand::DenyImageOperationPlan { .. }

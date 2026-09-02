@@ -28,6 +28,18 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- Added `brain_swap`, a model-authored permanent model switch that takes effect
+  before the next input is admitted. The current run remains on its original
+  model; committed requests survive restart and resolve through the existing
+  model-routing, auth-binding, and account-affinity authority. The tool is a
+  `builtins`-category `Mutating` tool and is registered by default only when the
+  runtime can prove more than one distinct model is available. Consequently,
+  builtins-enabled unrestricted sessions receive it automatically; read-only
+  and exact allow/deny policies still gate invocation. In MobKit, an application
+  policy constrains it only for members explicitly bound to that policy provider.
+
 ### Fixed
 
 - Isolated concurrent Rust release-package verification into per-crate Cargo

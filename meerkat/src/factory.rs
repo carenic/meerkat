@@ -69,6 +69,78 @@ use tokio_with_wasm::alias::sync::mpsc;
 
 use crate::model_fallback::{ModelFallbackCandidate, ModelFallbackClient};
 
+/// The DISTINCT models this session could permanently switch to.
+///
+/// Availability here means something specific and deliberately narrow: a model
+/// is available only if the canonical model-only resolver can route it from the
+/// session's CURRENT identity — preserving provider selection rules and
+/// credential-account affinity — AND the identity that resolution lands on has
+/// already been proven constructible during this build.
+///
+/// That second condition is why `proven_identities` is required rather than
+/// inferred. Enumerating the catalog would advertise models the session has no
+/// credentials for, and the model would discover that only by requesting a
+/// switch that later fails at realization, one turn after it was told the
+/// request was accepted.
+///
+/// The result is keyed by model id, so several provider routes converging on
+/// one model contribute one entry. "How many models can I choose between" is
+/// the question the registration gate asks; route multiplicity is not an
+/// answer to it.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+fn brain_swap_available_models_for_resolved_identity(
+    config: &Config,
+    registry: &ModelRegistry,
+    current: &SessionLlmIdentity,
+    proven_identities: &[SessionLlmIdentity],
+) -> Vec<String> {
+    let mut models = std::collections::BTreeSet::new();
+    for (provider, _) in registry.provider_defaults() {
+        for entry in registry
+            .entries_for_provider(provider)
+            .filter(|entry| entry.release_stage != meerkat_core::ModelReleaseStage::Experimental)
+        {
+            let Ok(target) =
+                crate::session_runtime::llm_reconfigure::resolve_model_only_reconfigure_target_identity(
+                    config,
+                    registry,
+                    current,
+                    &entry.id,
+                )
+            else {
+                continue;
+            };
+            // Compare everything EXCEPT the model: the proof we need is that
+            // this provider/server/params/credential route works, and the model
+            // id is the one thing the switch is allowed to change.
+            //
+            // An unset target binding is not a mismatch. `None` means "resolve
+            // the credential the ordinary way for this provider", which is
+            // exactly what the proven identity already did — the proven route
+            // IS that resolution's result. Requiring a literal `Some` match
+            // here would exclude every cross-provider target whose credential
+            // identity is not an account (the ordinary API-key case), because
+            // account affinity is the only thing that fills the binding in
+            // early, and it deliberately declines when there is no account to
+            // preserve. That would silently make `brain_swap` same-provider-only
+            // for most configurations.
+            if !proven_identities.iter().any(|proven| {
+                proven.provider == target.provider
+                    && proven.self_hosted_server_id == target.self_hosted_server_id
+                    && proven.provider_params == target.provider_params
+                    && match &target.auth_binding {
+                        Some(binding) => proven.auth_binding.as_ref() == Some(binding),
+                        None => true,
+                    }
+            }) {
+                continue;
+            }
+            models.insert(entry.id.clone());
+        }
+    }
+    models.into_iter().collect()
+}
+
 #[cfg(feature = "comms")]
 use crate::compose_tools_with_comms_and_post_commit_hooks;
 #[cfg(not(target_arch = "wasm32"))]
@@ -95,10 +167,9 @@ impl EphemeralSessionStore {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl SessionStore for EphemeralSessionStore {
     async fn save(&self, session: &Session) -> Result<(), meerkat_store::SessionStoreError> {
-        self.sessions
-            .write()
-            .await
-            .insert(session.id().clone(), session.clone());
+        let mut sessions = self.sessions.write().await;
+        meerkat_core::session_store::append_only_save_guard(session, sessions.get(session.id()))?;
+        sessions.insert(session.id().clone(), session.clone());
         Ok(())
     }
 
@@ -4857,6 +4928,9 @@ impl AgentFactory {
             None,
             ToolCategoryOverride::Inherit,
             None,
+            Vec::new(),
+            false,
+            None,
         )
         .await
     }
@@ -4885,6 +4959,11 @@ impl AgentFactory {
         image_generation_visibility: ToolCategoryOverride,
         web_search_executor: Option<Arc<dyn meerkat_llm_core::WebSearchExecutor>>,
         web_search_visibility: ToolCategoryOverride,
+        brain_swap_staging: Option<
+            Arc<meerkat_core::session::model_routing_handoff_staging::ModelRoutingHandoffStagingSlot>,
+        >,
+        brain_swap_models: Vec<String>,
+        brain_swap_realization_host_ready: bool,
         durable_shell_runtime: Option<meerkat_tools::builtin::shell::DurableShellJobRuntime>,
     ) -> Result<Arc<dyn AgentToolDispatcher>, CompositeDispatcherError> {
         let BuiltinDispatcherConfig {
@@ -4941,6 +5020,14 @@ impl AgentFactory {
 
         if let Some(executor) = web_search_executor {
             composite.register_web_search_tool(executor, web_search_visibility);
+        }
+
+        if let Some(staging) = brain_swap_staging {
+            composite.register_brain_swap_tool(
+                staging,
+                brain_swap_models,
+                brain_swap_realization_host_ready,
+            );
         }
 
         if let (Some(session_id), Some(machine), Some(executor), Some(planner), Some(blob_store)) = (
@@ -5179,10 +5266,41 @@ impl AgentFactory {
         };
         let agent_llm_client_was_overridden = build_config.agent_llm_client_override.is_some();
         let raw_llm_client_was_overridden = build_config.llm_client_override.is_some();
+        #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+        let handoff_bootstrap_identity = build_config
+            .resume_session
+            .as_ref()
+            .and_then(|session| {
+                session
+                    .model_routing_control()
+                    .awaiting_decision()
+                    .next()
+            })
+            .and_then(|record| {
+                let current_identity = SessionLlmIdentity {
+                    model: build_config.model.clone(),
+                    provider,
+                    self_hosted_server_id: self_hosted_server_id.clone(),
+                    provider_params: build_config.provider_params.clone(),
+                    auth_binding: build_config.auth_binding.clone(),
+                };
+                crate::session_runtime::llm_reconfigure::resolve_model_only_reconfigure_target_identity(
+                    config,
+                    &registry,
+                    &current_identity,
+                    record.intent().target_model.as_str(),
+                )
+                .ok()
+                // The temporary client is adapted under the still-canonical
+                // persisted identity until pre-dequeue realizes the request.
+                // A cross-provider client cannot safely impersonate that
+                // identity, so retain the original materialization failure.
+                .filter(|target| target.provider == provider)
+            });
 
         // 3. Create LLM client (split out for opt-level=0 stack-frame size;
         // see `resolve_llm_client_phase`).
-        let resolved_llm_client_phase = self
+        let primary_llm_client_phase = self
             .resolve_llm_client_phase(
                 config,
                 &registry,
@@ -5190,7 +5308,49 @@ impl AgentFactory {
                 &self_hosted_server_id,
                 &mut build_config,
             )
-            .await?;
+            .await;
+        #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+        let resolved_llm_client_phase = match primary_llm_client_phase {
+            Ok(resolved) => resolved,
+            Err(primary_error @ BuildAgentError::LlmClient(_)) => {
+                let Some(bootstrap_identity) = handoff_bootstrap_identity.as_ref() else {
+                    return Err(primary_error);
+                };
+                let auth_lease_handle = match &build_config.runtime_build_mode {
+                    RuntimeBuildMode::SessionOwned(bindings) => Some(bindings.auth_lease().clone()),
+                    RuntimeBuildMode::StandaloneEphemeral => None,
+                };
+                let bootstrap_client = match self
+                    .build_llm_client_for_identity_with_auth_lease_in_realm(
+                        config,
+                        bootstrap_identity,
+                        auth_lease_handle,
+                        build_config.realm_id.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(client) => client,
+                    Err(error) => {
+                        tracing::debug!(
+                            current_model = %build_config.model,
+                            target_model = %bootstrap_identity.model,
+                            primary_error = %primary_error,
+                            target_error = %error,
+                            "committed model-routing handoff could not bootstrap cold materialization"
+                        );
+                        return Err(primary_error);
+                    }
+                };
+                ResolvedLlmClientPhase {
+                    llm_client: Some(bootstrap_client),
+                    credential_identity: None,
+                    auto_image_generation_executor: None,
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        #[cfg(any(not(feature = "session-store"), target_arch = "wasm32"))]
+        let resolved_llm_client_phase = primary_llm_client_phase?;
         let llm_client = resolved_llm_client_phase.llm_client;
         let resolved_auth_credential_identity = resolved_llm_client_phase.credential_identity;
         #[cfg(not(target_arch = "wasm32"))]
@@ -5210,6 +5370,22 @@ impl AgentFactory {
             provider_params: build_config.provider_params.clone(),
             auth_binding: build_config.auth_binding.clone(),
         };
+        // A client override means the session is not talking to a
+        // registry-resolved provider at all, so no catalog model is provably
+        // reachable and permanent switching must not be advertised.
+        #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+        let brain_swap_current_identity =
+            if agent_llm_client_was_overridden || raw_llm_client_was_overridden {
+                None
+            } else {
+                Some(resolved_llm_identity.clone())
+            };
+        // Availability is proven, not assumed: an identity enters this set only
+        // after a client was actually constructed for it, which is the same
+        // evidence the fallback chain requires.
+        #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+        let mut brain_swap_proven_identities: Vec<SessionLlmIdentity> =
+            brain_swap_current_identity.iter().cloned().collect();
         let configured_credential_identity =
             if agent_llm_client_was_overridden || raw_llm_client_was_overridden {
                 Self::credential_identity_for_client_override(config, &resolved_llm_identity)
@@ -5412,6 +5588,8 @@ impl AgentFactory {
                     build_config.override_web_search,
                     session.id(),
                 )?;
+                #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+                brain_swap_proven_identities.push(identity.clone());
                 candidates.push(ModelFallbackCandidate {
                     target_profile,
                     request_policy,
@@ -5426,6 +5604,44 @@ impl AgentFactory {
         } else {
             llm_adapter
         };
+        #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+        let brain_swap_models =
+            brain_swap_current_identity
+                .as_ref()
+                .map_or_else(Vec::new, |current| {
+                    brain_swap_available_models_for_resolved_identity(
+                        config,
+                        &registry,
+                        current,
+                        &brain_swap_proven_identities,
+                    )
+                });
+        #[cfg(any(not(feature = "session-store"), target_arch = "wasm32"))]
+        let brain_swap_models: Vec<String> = Vec::new();
+
+        // Only a runtime-owned session can realize a committed handoff: the
+        // pre-dequeue seam lives in the runtime loop, and a standalone or
+        // ephemeral build has no such loop and no durable boundary. Advertising
+        // the tool there would durably record requests nothing would act on.
+        //
+        // Session-ownership alone is not enough, though. Realization also needs
+        // an installed session-LLM reconfigure host, because that is what reads
+        // the committed log and rebinds identity. A runtime-backed surface that
+        // constructs its service through the hostless builder and never
+        // installs one would otherwise ship sessions that accept `brain_swap`,
+        // commit the request, and silently never act on it. So the runtime
+        // itself is asked.
+        let brain_swap_realization_host_ready = match &build_config.runtime_build_mode {
+            RuntimeBuildMode::SessionOwned(bindings) => bindings
+                .model_routing()
+                .committed_handoff_realization_ready(),
+            _ => false,
+        } && !brain_swap_models.is_empty();
+        let brain_swap_staging = brain_swap_realization_host_ready.then(|| {
+            Arc::new(
+                meerkat_core::session::model_routing_handoff_staging::ModelRoutingHandoffStagingSlot::new(),
+            )
+        });
 
         // 5. Resolve max_tokens (config field is Option for realm-inheritance
         // presence; resolve the operative value here at point-of-use).
@@ -5840,6 +6056,9 @@ impl AgentFactory {
                         } else {
                             build_config.override_web_search
                         },
+                        brain_swap_staging.clone(),
+                        brain_swap_models,
+                        brain_swap_realization_host_ready,
                         durable_shell_runtime,
                     )
                     .await?
@@ -6809,6 +7028,13 @@ impl AgentFactory {
         if let Some(blob_store) = build_config.blob_store_override {
             builder = builder.with_blob_store(blob_store);
         }
+        // Share the exact slot the tool writes into. The agent is the only
+        // promoter, so if this is not wired the staged intent is simply
+        // discarded at the run boundary — which is the correct behaviour for a
+        // build that also never registered the tool.
+        if let Some(staging) = brain_swap_staging {
+            builder = builder.with_model_routing_handoff_staging(staging);
+        }
         builder = builder.with_ops_lifecycle(Arc::clone(&ops_lifecycle));
         match resolved_mode {
             RuntimeBuildMode::SessionOwned(bindings) => {
@@ -7344,6 +7570,18 @@ impl AgentFactory {
         })
     }
 }
+
+/// The live A→B `brain_swap` proof over the real runtime loop.
+///
+/// It lives inside this module rather than in `meerkat/tests/` because the
+/// availability logic it must NOT bypass reads the factory's own provider
+/// registry: proving the ordinary registration path requires substituting a
+/// credential-free provider runtime in that private slot, and exposing a
+/// public setter purely to let a test reach it would widen the production
+/// surface for no production reason.
+#[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod brain_swap_runtime_loop_ab_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -15106,6 +15344,11 @@ mod tests {
                 ToolCategoryOverride::Inherit,
                 None,
                 ToolCategoryOverride::Inherit,
+                // This fixture builds a dispatcher outside any runtime, so
+                // permanent switching is unavailable by construction.
+                None,
+                Vec::new(),
+                false,
                 None,
             )
             .await
@@ -15171,6 +15414,9 @@ mod tests {
                 None,
                 ToolCategoryOverride::Inherit,
                 None,
+                Vec::new(),
+                false,
+                None,
             )
             .await
             .expect("dispatcher should build without blob store");
@@ -15232,6 +15478,9 @@ mod tests {
                 None,
                 ToolCategoryOverride::Inherit,
                 None,
+                Vec::new(),
+                false,
+                None,
             )
             .await
             .expect("shell-only builtin composition should succeed");
@@ -15287,6 +15536,9 @@ mod tests {
                 ToolCategoryOverride::Inherit,
                 None,
                 ToolCategoryOverride::Inherit,
+                None,
+                Vec::new(),
+                false,
                 None,
             )
             .await
@@ -15353,6 +15605,11 @@ impl AgentFactory {
         image_generation_visibility: ToolCategoryOverride,
         web_search_executor: Option<Arc<dyn meerkat_llm_core::WebSearchExecutor>>,
         web_search_visibility: ToolCategoryOverride,
+        brain_swap_staging: Option<
+            Arc<meerkat_core::session::model_routing_handoff_staging::ModelRoutingHandoffStagingSlot>,
+        >,
+        brain_swap_models: Vec<String>,
+        brain_swap_realization_host_ready: bool,
         durable_shell_runtime: Option<meerkat_tools::builtin::shell::DurableShellJobRuntime>,
     ) -> Result<(Arc<dyn AgentToolDispatcher>, String), BuildAgentError> {
         let compose_image_generation =
@@ -15444,6 +15701,9 @@ impl AgentFactory {
                 image_generation_visibility,
                 web_search_executor,
                 web_search_visibility,
+                brain_swap_staging,
+                brain_swap_models,
+                brain_swap_realization_host_ready,
                 durable_shell_runtime,
             )
             .await?;

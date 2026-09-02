@@ -358,6 +358,12 @@ impl meerkat_core::lifecycle::CoreExecutor for MachineManagedPostStopExecutor {
         self.inner.turn_finalization_boundary_handle()
     }
 
+    fn pre_dequeue_handle(
+        &self,
+    ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPreDequeueHandle>> {
+        self.inner.pre_dequeue_handle()
+    }
+
     async fn apply(
         &mut self,
         run_id: meerkat_core::lifecycle::RunId,
@@ -10094,6 +10100,12 @@ impl MeerkatMachine {
             .llm_reconfigure_host
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(host);
+        // Publish readiness to every model-routing handle this machine has
+        // already handed out. Bindings are prepared per session, often before
+        // the surface installs its host, so the flag has to be shared rather
+        // than snapshotted.
+        self.reconfigure_host_ready
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Whether this concrete adapter has a shell host capable of realizing

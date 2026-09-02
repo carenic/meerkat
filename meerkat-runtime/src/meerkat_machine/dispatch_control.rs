@@ -1275,164 +1275,10 @@ impl MeerkatMachine {
             MeerkatMachineCommand::RequestSwitchTurn {
                 session_id,
                 request,
-            } => {
-                let mut _mutation_guard = Some(
-                    self.lock_current_control_durability_ready_session_mutation_gate(&session_id)
-                        .await?,
-                );
-                let request = *request;
-                let request_key = switch_request_key(request.request_id);
-                match &request.intent.duration {
-                    meerkat_core::image_generation::SwitchTurnDuration::Finite { duration } => {
-                        self.apply_session_dsl_input(
-                            &session_id,
-                            crate::meerkat_machine::dsl::MeerkatMachineInput::RequestFiniteSwitchTurn {
-                                request_id: request_key.clone(),
-                                target_model: request.intent.target_model.to_string(),
-                                turns: finite_turn_count(*duration),
-                                target_realtime_capable: request.target_realtime.target_realtime_capable,
-                                requires_approval: !matches!(
-                                    request.approval,
-                                    crate::meerkat_machine_types::ModelRoutingApprovalDisposition::NotRequired
-                                ),
-                                approval_available: !matches!(
-                                    request.approval,
-                                    crate::meerkat_machine_types::ModelRoutingApprovalDisposition::RequiredButUnavailable
-                                ),
-                                approval_denied: matches!(
-                                    request.approval,
-                                    crate::meerkat_machine_types::ModelRoutingApprovalDisposition::DeniedByUser
-                                ),
-                                approval_reason: request
-                                    .approval_reason
-                                    .map(routing_switch_approval_reason),
-                                realtime_detach_allowed: request.target_realtime.allow_realtime_detach,
-                            },
-                            "RequestSwitchTurn",
-                        )
-                        .await
-                        .map_err(RuntimeControlPlaneError::Internal)?;
-                    }
-                    meerkat_core::image_generation::SwitchTurnDuration::UntilChanged => {
-                        let previous_dsl_state = self
-                            .stage_session_dsl_input(
-                                &session_id,
-                                crate::meerkat_machine::dsl::MeerkatMachineInput::RequestUntilChangedSwitchTurn {
-                                    request_id: request_key.clone(),
-                                    target_model: request.intent.target_model.to_string(),
-                                    target_realtime_capable: request.target_realtime.target_realtime_capable,
-                                    requires_approval: !matches!(
-                                        request.approval,
-                                        crate::meerkat_machine_types::ModelRoutingApprovalDisposition::NotRequired
-                                    ),
-                                    approval_available: !matches!(
-                                        request.approval,
-                                        crate::meerkat_machine_types::ModelRoutingApprovalDisposition::RequiredButUnavailable
-                                    ),
-                                    approval_denied: matches!(
-                                        request.approval,
-                                        crate::meerkat_machine_types::ModelRoutingApprovalDisposition::DeniedByUser
-                                    ),
-                                    approval_reason: request
-                                        .approval_reason
-                                        .map(routing_switch_approval_reason),
-                                    realtime_detach_allowed: request.target_realtime.allow_realtime_detach,
-                                },
-                                "RequestSwitchTurn",
-                            )
-                            .await
-                            .map_err(RuntimeControlPlaneError::Internal)?;
-                        let status_state = self.session_dsl_state(&session_id).await?;
-                        if !status_state
-                            .model_routing_switch_denials
-                            .contains_key(&request_key)
-                        {
-                            let reconfigure = match self
-                                .prepare_reconfigure_session_llm_command(
-                                    &session_id,
-                                    crate::meerkat_machine_types::SessionLlmReconfigureRequest {
-                                        model: Some(request.intent.target_model.to_string()),
-                                        provider: None,
-                                        self_hosted_server_id: None,
-                                        provider_params: None,
-                                        auth_binding: None,
-                                    },
-                                )
-                                .await
-                            {
-                                Ok(command) => command,
-                                Err(err) => {
-                                    self.restore_session_dsl_state(&session_id, previous_dsl_state)
-                                        .await;
-                                    return Err(RuntimeControlPlaneError::Internal(
-                                        err.to_string(),
-                                    ));
-                                }
-                            };
-                            drop(_mutation_guard.take());
-                            let reconfigure_result =
-                                Box::pin(self.execute_meerkat_machine_session_command(reconfigure))
-                                    .await;
-                            _mutation_guard = Some(
-                                self.lock_current_control_durability_ready_session_mutation_gate(
-                                    &session_id,
-                                )
-                                .await?,
-                            );
-                            if let Err(err) = reconfigure_result {
-                                self.restore_session_dsl_state(&session_id, previous_dsl_state)
-                                    .await;
-                                return Err(RuntimeControlPlaneError::Internal(err.to_string()));
-                            }
-                            self.apply_session_dsl_input(
-                                &session_id,
-                                crate::meerkat_machine::dsl::MeerkatMachineInput::SetModelRoutingBaseline {
-                                    baseline_model: request.intent.target_model.to_string(),
-                                    realtime_capable: request.target_realtime.target_realtime_capable,
-                                },
-                                "SetModelRoutingBaseline",
-                            )
-                            .await
-                            .map_err(RuntimeControlPlaneError::Internal)?;
-                            self.apply_session_dsl_input(
-                                &session_id,
-                                crate::meerkat_machine::dsl::MeerkatMachineInput::CompleteUntilChangedSwitchTurnReconfigure {
-                                    request_id: request_key.clone(),
-                                },
-                                "CompleteUntilChangedSwitchTurnReconfigure",
-                            )
-                            .await
-                            .map_err(RuntimeControlPlaneError::Internal)?;
-                        }
-                    }
-                }
-
-                let status_state = self.session_dsl_state(&session_id).await?;
-                if let Some(reason) = status_state.model_routing_switch_denials.get(&request_key) {
-                    let reason = switch_denial_from_routing(
-                        *reason,
-                        status_state
-                            .model_routing_switch_approval_reasons
-                            .get(&request_key)
-                            .copied(),
-                    )
-                    .map_err(RuntimeControlPlaneError::Internal)?;
-                    return Ok(MeerkatMachineCommandResult::SwitchTurnControlResult(
-                        meerkat_core::image_generation::SwitchTurnControlResult::Denied {
-                            request_id: request.request_id,
-                            reason,
-                        },
-                    ));
-                }
-
-                Ok(MeerkatMachineCommandResult::SwitchTurnControlResult(
-                    meerkat_core::image_generation::SwitchTurnControlResult::Applied {
-                        request_id: request.request_id,
-                        target_model: request.intent.target_model,
-                        duration: request.intent.duration,
-                    },
-                ))
-            }
+            } => Ok(MeerkatMachineCommandResult::SwitchTurnControlResult(
+                self.apply_switch_turn_request(&session_id, *request)
+                    .await?,
+            )),
             MeerkatMachineCommand::AdmitModelRoutingAssistantTurn { session_id } => {
                 let _mutation_guard = self
                     .lock_current_control_durability_ready_session_mutation_gate(&session_id)
@@ -1817,6 +1663,17 @@ impl MeerkatMachine {
                     meerkat_core::image_generation::ImageOperationPhase::Terminal { terminal },
                 ))
             }
+            MeerkatMachineCommand::RealizeCommittedModelRoutingHandoff {
+                session_id,
+                handoff,
+            } => {
+                let realization = self
+                    .realize_committed_model_routing_handoff_inner(&session_id, *handoff)
+                    .await?;
+                Ok(MeerkatMachineCommandResult::ModelRoutingHandoffRealization(
+                    Box::new(realization),
+                ))
+            }
             MeerkatMachineCommand::LoadBoundaryReceipt {
                 runtime_id,
                 run_id,
@@ -1841,6 +1698,823 @@ impl MeerkatMachine {
     }
 }
 
+impl MeerkatMachine {
+    /// The complete switch-turn chain, with no boundary acquisition of its own.
+    ///
+    /// This is the single body behind both entry points. The public
+    /// `SessionServiceRuntimeExt::request_switch_turn` acquires the
+    /// turn-finalization boundary and then reaches this through the command
+    /// router; the pre-dequeue realization seam already holds that boundary and
+    /// calls it directly. Extracting it was the point: a second copy of this
+    /// sequence would be a second place for the until-changed reconfigure
+    /// ordering to drift.
+    async fn apply_switch_turn_request(
+        &self,
+        session_id: &SessionId,
+        request: crate::meerkat_machine_types::SwitchTurnRequest,
+    ) -> Result<meerkat_core::image_generation::SwitchTurnControlResult, RuntimeControlPlaneError>
+    {
+        let mut _mutation_guard = Some(
+            self.lock_current_control_durability_ready_session_mutation_gate(session_id)
+                .await?,
+        );
+        let request_key = switch_request_key(request.request_id);
+        match &request.intent.duration {
+            meerkat_core::image_generation::SwitchTurnDuration::Finite { duration } => {
+                self.apply_session_dsl_input(
+                    session_id,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::RequestFiniteSwitchTurn {
+                        request_id: request_key.clone(),
+                        target_model: request.intent.target_model.to_string(),
+                        turns: finite_turn_count(*duration),
+                        target_realtime_capable: request.target_realtime.target_realtime_capable,
+                        requires_approval: !matches!(
+                            request.approval,
+                            crate::meerkat_machine_types::ModelRoutingApprovalDisposition::NotRequired
+                        ),
+                        approval_available: !matches!(
+                            request.approval,
+                            crate::meerkat_machine_types::ModelRoutingApprovalDisposition::RequiredButUnavailable
+                        ),
+                        approval_denied: matches!(
+                            request.approval,
+                            crate::meerkat_machine_types::ModelRoutingApprovalDisposition::DeniedByUser
+                        ),
+                        approval_reason: request
+                            .approval_reason
+                            .map(routing_switch_approval_reason),
+                        realtime_detach_allowed: request.target_realtime.allow_realtime_detach,
+                    },
+                    "RequestSwitchTurn",
+                )
+                .await
+                .map_err(RuntimeControlPlaneError::Internal)?;
+            }
+            meerkat_core::image_generation::SwitchTurnDuration::UntilChanged => {
+                let previous_dsl_state = self
+                    .stage_session_dsl_input(
+                        session_id,
+                        crate::meerkat_machine::dsl::MeerkatMachineInput::RequestUntilChangedSwitchTurn {
+                            request_id: request_key.clone(),
+                            target_model: request.intent.target_model.to_string(),
+                            target_realtime_capable: request.target_realtime.target_realtime_capable,
+                            requires_approval: !matches!(
+                                request.approval,
+                                crate::meerkat_machine_types::ModelRoutingApprovalDisposition::NotRequired
+                            ),
+                            approval_available: !matches!(
+                                request.approval,
+                                crate::meerkat_machine_types::ModelRoutingApprovalDisposition::RequiredButUnavailable
+                            ),
+                            approval_denied: matches!(
+                                request.approval,
+                                crate::meerkat_machine_types::ModelRoutingApprovalDisposition::DeniedByUser
+                            ),
+                            approval_reason: request
+                                .approval_reason
+                                .map(routing_switch_approval_reason),
+                            realtime_detach_allowed: request.target_realtime.allow_realtime_detach,
+                        },
+                        "RequestSwitchTurn",
+                    )
+                    .await
+                    .map_err(RuntimeControlPlaneError::Internal)?;
+                let status_state = self.session_dsl_state(session_id).await?;
+                if !status_state
+                    .model_routing_switch_denials
+                    .contains_key(&request_key)
+                {
+                    let reconfigure = match self
+                        .prepare_reconfigure_session_llm_command(
+                            session_id,
+                            crate::meerkat_machine_types::SessionLlmReconfigureRequest {
+                                model: Some(request.intent.target_model.to_string()),
+                                provider: None,
+                                self_hosted_server_id: None,
+                                provider_params: None,
+                                auth_binding: None,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(command) => command,
+                        Err(err) => {
+                            self.restore_session_dsl_state(session_id, previous_dsl_state)
+                                .await;
+                            return Err(RuntimeControlPlaneError::Internal(err.to_string()));
+                        }
+                    };
+                    drop(_mutation_guard.take());
+                    let reconfigure_result =
+                        Box::pin(self.execute_meerkat_machine_session_command(reconfigure)).await;
+                    _mutation_guard = Some(
+                        self.lock_current_control_durability_ready_session_mutation_gate(
+                            session_id,
+                        )
+                        .await?,
+                    );
+                    if let Err(err) = reconfigure_result {
+                        self.restore_session_dsl_state(session_id, previous_dsl_state)
+                            .await;
+                        return Err(RuntimeControlPlaneError::Internal(err.to_string()));
+                    }
+                    self.apply_session_dsl_input(
+                        session_id,
+                        crate::meerkat_machine::dsl::MeerkatMachineInput::SetModelRoutingBaseline {
+                            baseline_model: request.intent.target_model.to_string(),
+                            realtime_capable: request.target_realtime.target_realtime_capable,
+                        },
+                        "SetModelRoutingBaseline",
+                    )
+                    .await
+                    .map_err(RuntimeControlPlaneError::Internal)?;
+                    self.apply_session_dsl_input(
+                        session_id,
+                        crate::meerkat_machine::dsl::MeerkatMachineInput::CompleteUntilChangedSwitchTurnReconfigure {
+                            request_id: request_key.clone(),
+                        },
+                        "CompleteUntilChangedSwitchTurnReconfigure",
+                    )
+                    .await
+                    .map_err(RuntimeControlPlaneError::Internal)?;
+                }
+            }
+        }
+
+        let status_state = self.session_dsl_state(session_id).await?;
+        if let Some(reason) = status_state.model_routing_switch_denials.get(&request_key) {
+            let reason = switch_denial_from_routing(
+                *reason,
+                status_state
+                    .model_routing_switch_approval_reasons
+                    .get(&request_key)
+                    .copied(),
+            )
+            .map_err(RuntimeControlPlaneError::Internal)?;
+            return Ok(
+                meerkat_core::image_generation::SwitchTurnControlResult::Denied {
+                    request_id: request.request_id,
+                    reason,
+                },
+            );
+        }
+
+        Ok(
+            meerkat_core::image_generation::SwitchTurnControlResult::Applied {
+                request_id: request.request_id,
+                target_model: request.intent.target_model,
+                duration: request.intent.duration,
+            },
+        )
+    }
+
+    /// Whether the exact originating run left a committed boundary receipt.
+    ///
+    /// This is the gate that makes a handoff actionable. A committed request
+    /// record alone is not enough: the record and the runtime boundary commit
+    /// are written by different owners, and only the receipt proves the run
+    /// that authored the request actually landed.
+    async fn originating_run_boundary_committed(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+    ) -> Result<bool, RuntimeControlPlaneError> {
+        let Some(store) = self.store.as_ref() else {
+            // No RuntimeStore means no boundary receipts exist at all for this
+            // runtime, so nothing can ever be proven. Refuse rather than
+            // inventing evidence.
+            return Ok(false);
+        };
+        let runtime_id = Self::logical_runtime_id(session_id);
+        let receipts = store
+            .load_committed_boundary_receipts(&runtime_id, run_id)
+            .await
+            .map_err(|error| RuntimeControlPlaneError::StoreError(error.to_string()))?;
+        Ok(!receipts.is_empty())
+    }
+
+    /// Import each exact committed fact, then ask generated authority to
+    /// archive it.
+    ///
+    /// Import comes first and is fail-closed: the durable log is the source of
+    /// the request identity, its originating run, and its target, so a machine
+    /// that disagrees with any of the three is corruption rather than a
+    /// convergence case. A request no runtime ever imported is exactly the one
+    /// an archive must terminalize, which is why import is admissible while
+    /// retired.
+    ///
+    /// This helper is deliberately reachable only from the archive-lease
+    /// realization after its durable Retired commit. Exposing it through the
+    /// ordinary runtime adapter would be a forgeable archive capability: a
+    /// caller could create generated `Archived` state without inheriting the
+    /// durable-terminal retry obligation.
+    ///
+    /// A refused archive is classified by reading generated state rather than
+    /// by pre-checking it: the machine decides. Finding a realized or denied
+    /// generated request in this exact durable-Requested batch is an
+    /// inconsistency, not a reason to silently omit its durable terminal.
+    /// Read the record generated authority currently holds for `request_key`.
+    ///
+    /// Every handoff transition names the state it observed as well as the
+    /// state it proposes, so the machine can refuse a proposal built from a
+    /// stale read. This is the shell's half of that contract: it reports what
+    /// it actually saw, and never invents a record when none is present.
+    async fn observed_model_routing_handoff(
+        &self,
+        session_id: &SessionId,
+        request_key: &str,
+    ) -> Result<crate::meerkat_machine::dsl::ModelRoutingHandoffRecord, RuntimeControlPlaneError>
+    {
+        self.session_dsl_state(session_id)
+            .await?
+            .model_routing_handoff
+            .get(request_key)
+            .cloned()
+            .ok_or_else(|| {
+                RuntimeControlPlaneError::Internal(format!(
+                    "model-routing handoff {request_key} is absent from generated state where it was just observed"
+                ))
+            })
+    }
+
+    /// Drive generated authority to the terminal a durable record already
+    /// carries, for requests the machine only knows as pending.
+    ///
+    /// Every arm reads the durable record for its facts. Nothing here resolves
+    /// a model, rebinds an identity, or re-decides a denial: the decision
+    /// already happened and is on disk. This is bookkeeping catching up, and it
+    /// is deliberately the ONLY place where a generated terminal is minted
+    /// without a live decision behind it.
+    ///
+    /// A durable record whose run or target disagrees with the generated
+    /// record for the same request id is an inconsistency, not a state to
+    /// interpret — the machine's guards refuse it, and that refusal surfaces.
+    pub(super) async fn reconcile_committed_model_routing_terminals_inner(
+        &self,
+        session_id: &SessionId,
+        settled: &[meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord],
+    ) -> Result<(), RuntimeControlPlaneError> {
+        use meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord as DurableRecord;
+
+        for durable in settled {
+            let request_key = switch_request_key(*durable.request_id());
+            let Some(observed) = self
+                .session_dsl_state(session_id)
+                .await?
+                .model_routing_handoff
+                .get(&request_key)
+                .cloned()
+            else {
+                // The machine never imported this request. A settled request
+                // needs no generated presence, so there is nothing to catch up
+                // — importing one now would manufacture lifecycle state for a
+                // decision that is already over.
+                continue;
+            };
+            if !matches!(
+                observed.phase(),
+                crate::meerkat_machine::dsl::RoutingHandoffPhase::Imported
+                    | crate::meerkat_machine::dsl::RoutingHandoffPhase::Claimed
+            ) {
+                // Already terminal in the machine. Consistency between the two
+                // terminals is enforced where they are produced; nothing to do.
+                continue;
+            }
+
+            let run_key = durable.originating_run_id().to_string();
+            let target_model = durable.intent().target_model.to_string();
+            let _mutation_guard = self
+                .lock_current_control_durability_ready_session_mutation_gate(session_id)
+                .await?;
+            // A claim is required before either terminal, so an `Imported`
+            // record is advanced first. The claim carries the durable record's
+            // own run and target, so a disagreement is refused here rather than
+            // being carried into the terminal.
+            let observed =
+                if observed.phase() == crate::meerkat_machine::dsl::RoutingHandoffPhase::Imported {
+                    self.apply_session_dsl_input(
+                    session_id,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::ClaimModelRoutingHandoff {
+                        request_id: request_key.clone(),
+                        observed,
+                        record: crate::meerkat_machine::dsl::ModelRoutingHandoffRecord::claimed(
+                            run_key.clone(),
+                            target_model.clone(),
+                        )
+                        .map_err(handoff_record_error)?,
+                    },
+                    "ClaimModelRoutingHandoff",
+                )
+                .await
+                .map_err(RuntimeControlPlaneError::Internal)?;
+                    self.observed_model_routing_handoff(session_id, &request_key)
+                        .await?
+                } else {
+                    observed
+                };
+
+            match durable {
+                DurableRecord::ModelRoutingIntentRealized {
+                    applied_identity, ..
+                } => {
+                    self.apply_session_dsl_input(
+                        session_id,
+                        crate::meerkat_machine::dsl::MeerkatMachineInput::RealizeModelRoutingHandoff {
+                            request_id: request_key,
+                            observed,
+                            record:
+                                crate::meerkat_machine::dsl::ModelRoutingHandoffRecord::realized(
+                                    run_key,
+                                    target_model,
+                                    applied_identity.model.clone(),
+                                )
+                                .map_err(handoff_record_error)?,
+                        },
+                        "RealizeModelRoutingHandoff",
+                    )
+                    .await
+                    .map_err(RuntimeControlPlaneError::Internal)?;
+                }
+                DurableRecord::ModelRoutingIntentDenied { reason, .. } => {
+                    self.apply_session_dsl_input(
+                        session_id,
+                        crate::meerkat_machine::dsl::MeerkatMachineInput::DenyModelRoutingHandoff {
+                            request_id: request_key,
+                            observed,
+                            record: crate::meerkat_machine::dsl::ModelRoutingHandoffRecord::denied(
+                                run_key,
+                                target_model,
+                                routing_denial_from_switch(reason),
+                            )
+                            .map_err(handoff_record_error)?,
+                        },
+                        "DenyModelRoutingHandoff",
+                    )
+                    .await
+                    .map_err(RuntimeControlPlaneError::Internal)?;
+                }
+                // Abandonment is minted only by the archive chokepoint, which
+                // drives the generated terminal in the same step while the
+                // session is Retired. There is no live window to reconcile,
+                // and the archive transition is illegal from a live phase.
+                DurableRecord::ModelRoutingIntentAbandoned { .. }
+                | DurableRecord::ModelRoutingIntentRequested { .. } => {}
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn archive_unresolved_model_routing_handoffs_inner(
+        &self,
+        session_id: &SessionId,
+        handoffs: &[crate::meerkat_machine_types::CommittedModelRoutingHandoff],
+    ) -> Result<Vec<meerkat_core::image_generation::SwitchTurnRequestId>, RuntimeControlPlaneError>
+    {
+        let mut archived = Vec::with_capacity(handoffs.len());
+        for handoff in handoffs {
+            let request_key = switch_request_key(handoff.request_id);
+            let run_key = handoff.originating_run_id.to_string();
+            let target = handoff.intent.target_model.to_string();
+            if !self
+                .session_dsl_state(session_id)
+                .await?
+                .model_routing_handoff
+                .contains_key(&request_key)
+            {
+                self.apply_session_dsl_input(
+                    session_id,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::ImportCommittedModelRoutingHandoff {
+                        request_id: request_key.clone(),
+                        record: crate::meerkat_machine::dsl::ModelRoutingHandoffRecord::imported(
+                            run_key.clone(),
+                            target.clone(),
+                        )
+                        .map_err(handoff_record_error)?,
+                    },
+                    "ImportCommittedModelRoutingHandoff",
+                )
+                .await
+                .map_err(RuntimeControlPlaneError::Internal)?;
+            }
+            // The archive arm names the state it observed as well as the state
+            // it proposes. Import above either created the record or it was
+            // already present, so this read is that exact observation.
+            let observed = self
+                .observed_model_routing_handoff(session_id, &request_key)
+                .await?;
+            match self
+                .apply_session_dsl_input(
+                    session_id,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::ArchiveUnresolvedModelRoutingHandoff {
+                        request_id: request_key.clone(),
+                        observed,
+                        record: crate::meerkat_machine::dsl::ModelRoutingHandoffRecord::archived(
+                            run_key,
+                            target,
+                        )
+                        .map_err(handoff_record_error)?,
+                    },
+                    "ArchiveUnresolvedModelRoutingHandoff",
+                )
+                .await
+            {
+                Ok(_) => archived.push(handoff.request_id),
+                Err(reason) => {
+                    let state = self.session_dsl_state(session_id).await?;
+                    match state
+                        .model_routing_handoff
+                        .get(&request_key)
+                        .map(|record| record.phase())
+                    {
+                        Some(
+                            crate::meerkat_machine::dsl::RoutingHandoffPhase::Realized
+                            | crate::meerkat_machine::dsl::RoutingHandoffPhase::Denied,
+                        ) => {
+                            return Err(RuntimeControlPlaneError::Internal(format!(
+                                "durable model-routing handoff {:?} is still Requested but generated authority already settled it; refusing to archive without an exact durable terminal",
+                                handoff.request_id
+                            )));
+                        }
+                        _ => return Err(RuntimeControlPlaneError::Internal(reason)),
+                    }
+                }
+            }
+        }
+        Ok(archived)
+    }
+
+    /// Realize one committed cross-run routing handoff.
+    ///
+    /// Ordering is the contract, and it is not negotiable:
+    ///
+    /// 1. prove the originating run boundary committed,
+    /// 2. import and claim through generated authority,
+    /// 3. resolve the target fresh through the reconfigure host,
+    /// 4. run the existing until-changed switch chain, already inside the
+    ///    caller's turn-finalization boundary,
+    /// 5. append and persist the exact durable terminal record,
+    /// 6. only then mark the generated lifecycle terminal.
+    ///
+    /// Step 5 precedes step 6 so a crash between them leaves a durable record
+    /// the next pass converges on, rather than a machine that believes a
+    /// change happened with nothing on disk to show for it.
+    async fn realize_committed_model_routing_handoff_inner(
+        &self,
+        session_id: &SessionId,
+        handoff: crate::meerkat_machine_types::CommittedModelRoutingHandoff,
+    ) -> Result<
+        crate::meerkat_machine_types::ModelRoutingHandoffRealization,
+        RuntimeControlPlaneError,
+    > {
+        use crate::meerkat_machine_types::{
+            ModelRoutingHandoffHoldReason, ModelRoutingHandoffRealization,
+        };
+
+        let request_key = switch_request_key(handoff.request_id);
+        let run_key = handoff.originating_run_id.to_string();
+        let target_model = handoff.intent.target_model.clone();
+
+        if !self
+            .originating_run_boundary_committed(session_id, &handoff.originating_run_id)
+            .await?
+        {
+            return Ok(ModelRoutingHandoffRealization::Held {
+                reason: ModelRoutingHandoffHoldReason::OriginatingBoundaryUncommitted {
+                    run_id: handoff.originating_run_id,
+                },
+            });
+        }
+
+        {
+            let _mutation_guard = self
+                .lock_current_control_durability_ready_session_mutation_gate(session_id)
+                .await?;
+            // Import brings a committed fact the machine has not seen. If a
+            // record is already present this lap has nothing to import — and
+            // must not pretend otherwise: a request that has already advanced
+            // to Claimed or Realized is NOT an `Imported` record, so proposing
+            // one would be a false statement about observed state rather than
+            // a convergence.
+            if !self
+                .session_dsl_state(session_id)
+                .await?
+                .model_routing_handoff
+                .contains_key(&request_key)
+            {
+                self.apply_session_dsl_input(
+                    session_id,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::ImportCommittedModelRoutingHandoff {
+                        request_id: request_key.clone(),
+                        record: crate::meerkat_machine::dsl::ModelRoutingHandoffRecord::imported(
+                            run_key.clone(),
+                            target_model.to_string(),
+                        )
+                        .map_err(handoff_record_error)?,
+                    },
+                    "ImportCommittedModelRoutingHandoff",
+                )
+                .await
+                .map_err(RuntimeControlPlaneError::Internal)?;
+            }
+            let observed = self
+                .observed_model_routing_handoff(session_id, &request_key)
+                .await?;
+            // A generated `Realized` is convergence ONLY if the durable log
+            // agrees, exactly.
+            //
+            // Exactness is a statement about the committed record, so it is
+            // read rather than inferred from phase: the durable terminal must
+            // name the same request, the same originating run, the same target,
+            // and the identity the machine says was installed. Anything less —
+            // including a durable log that still owes this request — means the
+            // two authorities disagree about a routing change, and the durable
+            // one is what a restart reads. That fails closed instead of being
+            // interpreted as "already done".
+            if observed.phase() == crate::meerkat_machine::dsl::RoutingHandoffPhase::Realized {
+                let durable_matches = self
+                    .llm_reconfigure_host()
+                    .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?
+                    .load_live_session_model_routing_control_history(session_id)
+                    .await
+                    .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?
+                    .latest_record_for(&handoff.request_id)
+                    .is_some_and(|durable| {
+                        matches!(
+                            durable,
+                            meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
+                                applied_identity, ..
+                            } if applied_identity.model.as_str()
+                                == observed.applied_model().map_or("", |model| model.as_str())
+                        ) && durable.originating_run_id() == &handoff.originating_run_id
+                            && durable.intent().target_model == handoff.intent.target_model
+                    });
+                if durable_matches {
+                    return Ok(ModelRoutingHandoffRealization::AlreadyExact);
+                }
+                return Err(RuntimeControlPlaneError::Internal(format!(
+                    "generated authority reports model-routing handoff {:?} realized, but the \
+                     durable log carries no exactly matching realized record; refusing to \
+                     proceed on contradictory authorities",
+                    handoff.request_id
+                )));
+            }
+            self.apply_session_dsl_input(
+                session_id,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::ClaimModelRoutingHandoff {
+                    request_id: request_key.clone(),
+                    // The claim names the state it observed, so generated
+                    // authority refuses a proposal built from a stale read.
+                    observed,
+                    record: crate::meerkat_machine::dsl::ModelRoutingHandoffRecord::claimed(
+                        run_key.clone(),
+                        target_model.to_string(),
+                    )
+                    .map_err(handoff_record_error)?,
+                },
+                "ClaimModelRoutingHandoff",
+            )
+            .await
+            .map_err(RuntimeControlPlaneError::Internal)?;
+        }
+
+        let host = self
+            .llm_reconfigure_host()
+            .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
+        let hydrated = host
+            .hydrate_session_llm_state(session_id)
+            .await
+            .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
+        let resolve_request = crate::meerkat_machine_types::SessionLlmReconfigureRequest {
+            model: Some(target_model.to_string()),
+            provider: None,
+            self_hosted_server_id: None,
+            provider_params: None,
+            auth_binding: None,
+        };
+        let resolved = match host
+            .resolve_target_session_llm_identity(&resolve_request, &hydrated.current_identity)
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                // Resolution failure is a hold, never a denial: the target may
+                // be reachable on a later pass (credentials, catalog, network),
+                // and the pending input must simply stay unattempted.
+                return Ok(ModelRoutingHandoffRealization::Held {
+                    reason: ModelRoutingHandoffHoldReason::TargetUnresolvable {
+                        target_model,
+                        detail: error.to_string(),
+                    },
+                });
+            }
+        };
+
+        let target_already_applied = hydrated.current_identity == resolved.target_identity;
+        if !target_already_applied
+            && let Err(error) = host
+                .preflight_target_session_llm_identity(session_id, &resolved.target_identity)
+                .await
+        {
+            return Ok(ModelRoutingHandoffRealization::Held {
+                reason: ModelRoutingHandoffHoldReason::TargetUnresolvable {
+                    target_model,
+                    detail: error.to_string(),
+                },
+            });
+        }
+
+        let switch_result = if target_already_applied {
+            // A prior attempt may have durably persisted the target identity and
+            // then crashed before appending the handoff terminal. Re-applying
+            // here would perform a second unsafe rotation. The exact hydrated
+            // identity is enough to finish the still-claimed request.
+            meerkat_core::image_generation::SwitchTurnControlResult::Applied {
+                request_id: handoff.request_id,
+                target_model: handoff.intent.target_model.clone(),
+                duration: handoff.intent.duration.clone(),
+            }
+        } else {
+            match self
+                .apply_switch_turn_request(
+                    session_id,
+                    crate::meerkat_machine_types::SwitchTurnRequest {
+                        request_id: handoff.request_id,
+                        intent: handoff.intent.clone(),
+                        target_realtime: crate::meerkat_machine_types::ModelRoutingRealtimePolicy {
+                            target_realtime_capable: resolved.target_capability_surface.realtime,
+                            allow_realtime_detach: false,
+                        },
+                        approval:
+                            crate::meerkat_machine_types::ModelRoutingApprovalDisposition::NotRequired,
+                        approval_reason: None,
+                    },
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => return Err(error),
+            }
+        };
+
+        // The claimed record generated authority is holding right now. Both
+        // terminal arms below must name it, so it is read once here — after the
+        // switch chain and before either durable append.
+        let observed = self
+            .observed_model_routing_handoff(session_id, &request_key)
+            .await?;
+
+        match switch_result {
+            meerkat_core::image_generation::SwitchTurnControlResult::Applied { .. } => {
+                let applied_identity = self
+                    .current_session_llm_identity(session_id)
+                    .await?
+                    .unwrap_or(resolved.target_identity);
+                let record = meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
+                    request_id: handoff.request_id,
+                    originating_run_id: handoff.originating_run_id,
+                    intent: handoff.intent,
+                    applied_identity: Box::new(applied_identity.clone()),
+                };
+                self.record_and_persist_model_routing_handoff_resolution(
+                    session_id,
+                    host.as_ref(),
+                    record,
+                )
+                .await?;
+                let _mutation_guard = self
+                    .lock_current_control_durability_ready_session_mutation_gate(session_id)
+                    .await?;
+                self.apply_session_dsl_input(
+                    session_id,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::RealizeModelRoutingHandoff {
+                        request_id: request_key,
+                        record: crate::meerkat_machine::dsl::ModelRoutingHandoffRecord::realized(
+                            run_key,
+                            target_model.to_string(),
+                            applied_identity.model.clone(),
+                        )
+                        .map_err(handoff_record_error)?,
+                        observed,
+                    },
+                    "RealizeModelRoutingHandoff",
+                )
+                .await
+                .map_err(RuntimeControlPlaneError::Internal)?;
+                Ok(ModelRoutingHandoffRealization::Realized {
+                    applied_identity: Box::new(applied_identity),
+                })
+            }
+            meerkat_core::image_generation::SwitchTurnControlResult::Denied { reason, .. } => {
+                let record = meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord::ModelRoutingIntentDenied {
+                    request_id: handoff.request_id,
+                    originating_run_id: handoff.originating_run_id,
+                    intent: handoff.intent,
+                    reason: reason.clone(),
+                };
+                self.record_and_persist_model_routing_handoff_resolution(
+                    session_id,
+                    host.as_ref(),
+                    record,
+                )
+                .await?;
+                let _mutation_guard = self
+                    .lock_current_control_durability_ready_session_mutation_gate(session_id)
+                    .await?;
+                self.apply_session_dsl_input(
+                    session_id,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::DenyModelRoutingHandoff {
+                        request_id: request_key,
+                        record: crate::meerkat_machine::dsl::ModelRoutingHandoffRecord::denied(
+                            run_key,
+                            target_model.to_string(),
+                            routing_denial_from_switch(&reason),
+                        )
+                        .map_err(handoff_record_error)?,
+                        observed,
+                    },
+                    "DenyModelRoutingHandoff",
+                )
+                .await
+                .map_err(RuntimeControlPlaneError::Internal)?;
+                Ok(ModelRoutingHandoffRealization::Denied { reason })
+            }
+            // The realization request is minted with
+            // `ModelRoutingApprovalDisposition::NotRequired`, so the generated
+            // switch authority has no approval arm to take. Reaching this is a
+            // contradiction between the request we built and the verdict we
+            // got back, not a state to interpret.
+            meerkat_core::image_generation::SwitchTurnControlResult::AwaitingApproval {
+                approval_id,
+                ..
+            } => Err(RuntimeControlPlaneError::Internal(format!(
+                "committed model-routing handoff was minted without approval yet returned approval {approval_id} as pending"
+            ))),
+        }
+    }
+
+    /// Append the exact terminal record and persist it before any generated
+    /// terminal is marked.
+    ///
+    /// An exactly-equal record already present is accepted: a crash between
+    /// the persist and the generated terminal is expected, and the retry must
+    /// converge rather than refuse.
+    /// Durably commit one model-routing terminal record.
+    ///
+    /// Delegated to the host as ONE operation rather than an append followed by
+    /// a persist. Split across two calls, a failure between them leaves the
+    /// live session reporting a resolution the durable log never received: the
+    /// next pre-dequeue lap reads live, sees nothing owed, and admits the input
+    /// under the identity the handoff was committed to replace. The host owns
+    /// both steps and the compensation, so live state never claims a
+    /// resolution that is not on disk.
+    async fn record_and_persist_model_routing_handoff_resolution(
+        &self,
+        session_id: &SessionId,
+        host: &dyn SessionLlmReconfigureHost,
+        record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
+    ) -> Result<(), RuntimeControlPlaneError> {
+        host.commit_session_model_routing_control_record_durable_first(session_id, record)
+            .await
+            .map_err(|error| RuntimeControlPlaneError::StoreError(error.to_string()))
+    }
+
+    async fn current_session_llm_identity(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<meerkat_core::SessionLlmIdentity>, RuntimeControlPlaneError> {
+        let sessions = self.sessions.read().await;
+        let entry = sessions.get(session_id).ok_or_else(|| {
+            RuntimeControlPlaneError::NotFound(Self::logical_runtime_id(session_id))
+        })?;
+        let generated = {
+            let authority = entry
+                .dsl_authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            authority.state().current_session_llm_identity.clone()
+        };
+        generated
+            .map(meerkat_core::SessionLlmIdentity::try_from)
+            .transpose()
+            .map_err(RuntimeControlPlaneError::Internal)
+    }
+}
+
+/// Map a record-construction refusal onto the control-plane error type.
+///
+/// The constructors enforce the same identity invariants the decoder does, so
+/// a refusal here means the shell tried to build a record that could never
+/// survive its own round-trip. That is an internal contradiction, not a
+/// caller-visible condition.
+fn handoff_record_error(
+    error: crate::meerkat_machine::dsl::ModelRoutingHandoffRecordError,
+) -> RuntimeControlPlaneError {
+    RuntimeControlPlaneError::Internal(format!(
+        "failed to build a model-routing handoff record: {error}"
+    ))
+}
+
 fn switch_request_key(id: meerkat_core::image_generation::SwitchTurnRequestId) -> String {
     id.0.to_string()
 }
@@ -1860,6 +2534,43 @@ fn finite_turn_count(duration: meerkat_core::image_generation::FiniteScopedTurnD
 
 fn uuid_from_key(key: &str) -> Option<uuid::Uuid> {
     uuid::Uuid::parse_str(key).ok()
+}
+
+/// Project a surfaced denial back onto the generated denial vocabulary.
+///
+/// The inverse of `switch_denial_from_routing`. Total by construction: every
+/// surfaced reason names one generated reason, and the generated set is the
+/// smaller one, so the mapping cannot silently lose a case.
+fn routing_denial_from_switch(
+    reason: &meerkat_core::image_generation::SwitchTurnDenialReason,
+) -> super::dsl::RoutingDenialReason {
+    use meerkat_core::image_generation::SwitchTurnDenialReason;
+    match reason {
+        SwitchTurnDenialReason::ApprovalRequiredButUnavailable => {
+            super::dsl::RoutingDenialReason::ApprovalRequiredButUnavailable
+        }
+        SwitchTurnDenialReason::DeniedDuringApproval { .. } => {
+            super::dsl::RoutingDenialReason::DeniedDuringApproval
+        }
+        SwitchTurnDenialReason::ScopedOverrideConflict => {
+            super::dsl::RoutingDenialReason::ScopedOverrideConflict
+        }
+        SwitchTurnDenialReason::RealtimeTransportConflict => {
+            super::dsl::RoutingDenialReason::RealtimeTransportConflict
+        }
+        // The generated vocabulary is deliberately coarser than the surfaced
+        // one: these all mean "this model is not admissible for this session"
+        // and the generated machine makes no finer decision on them. Every
+        // variant is named rather than wildcarded, so adding a surfaced reason
+        // is a compile error here instead of a silent reclassification.
+        SwitchTurnDenialReason::UnsupportedModel
+        | SwitchTurnDenialReason::CapabilityPolicy
+        | SwitchTurnDenialReason::CostPolicy
+        | SwitchTurnDenialReason::SafetyPolicy
+        | SwitchTurnDenialReason::ProjectionUnsupported => {
+            super::dsl::RoutingDenialReason::CapabilityPolicy
+        }
+    }
 }
 
 fn switch_denial_from_routing(
@@ -2372,6 +3083,68 @@ mod tests {
             other => panic!(
                 "expected a typed InvalidState{{state}} for the unbound session, got {other:?}"
             ),
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_path_imports_never_seen_committed_handoff_and_is_idempotent() {
+        let machine = MeerkatMachine::ephemeral();
+        let session_id = SessionId::new();
+        machine
+            .register_session(session_id.clone())
+            .await
+            .expect("register session");
+        machine
+            .apply_session_dsl_input(
+                &session_id,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::Retire {
+                    session_id: crate::meerkat_machine::dsl::SessionId::from_domain(&session_id),
+                },
+                "Retire",
+            )
+            .await
+            .expect("archive test must first reach generated Retired");
+
+        let request_id =
+            meerkat_core::image_generation::SwitchTurnRequestId::new(uuid::Uuid::new_v4());
+        let handoff = crate::meerkat_machine_types::CommittedModelRoutingHandoff {
+            request_id,
+            originating_run_id: meerkat_core::lifecycle::RunId::new(),
+            intent: meerkat_core::image_generation::SwitchTurnIntent {
+                target_model: meerkat_core::lifecycle::run_primitive::ModelId::new("claude-opus-5"),
+                duration: meerkat_core::image_generation::SwitchTurnDuration::UntilChanged,
+                origin: meerkat_core::image_generation::SwitchTurnOrigin::Model {
+                    reason:
+                        meerkat_core::image_generation::SwitchTurnReasonTextDisposition::NotProvided,
+                },
+            },
+        };
+
+        for pass in 0..2 {
+            let archived = machine
+                .archive_unresolved_model_routing_handoffs_inner(
+                    &session_id,
+                    std::slice::from_ref(&handoff),
+                )
+                .await
+                .expect("exact archive retry converges");
+            assert_eq!(archived, vec![request_id], "archive pass {pass}");
+            let state = machine
+                .session_dsl_state(&session_id)
+                .await
+                .expect("observe generated archive state");
+            assert_eq!(
+                state.lifecycle_phase,
+                crate::meerkat_machine::dsl::MeerkatPhase::Retired,
+                "handoff import/archive must not revive the retired session"
+            );
+            assert_eq!(
+                state
+                    .model_routing_handoff
+                    .get(&switch_request_key(request_id))
+                    .map(|record| record.phase()),
+                Some(crate::meerkat_machine::dsl::RoutingHandoffPhase::Archived)
+            );
         }
     }
 

@@ -9822,6 +9822,29 @@ impl meerkat_core::lifecycle::CoreExecutor for CliRuntimeExecutor {
         }
     }
 
+    /// The one shared facade-owned realization handle.
+    ///
+    /// Gated on `session-store` for the same reason the boundary handle is: a
+    /// CLI build without durable sessions has no committed handoff log to read,
+    /// and the tool is never registered for it either.
+    fn pre_dequeue_handle(
+        &self,
+    ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPreDequeueHandle>> {
+        #[cfg(feature = "session-store")]
+        {
+            self.persistent_service.as_ref().map(|_| {
+                meerkat::surface::persistent_runtime_pre_dequeue_handle(
+                    Arc::clone(&self.runtime_adapter),
+                    self.session_id.clone(),
+                )
+            })
+        }
+        #[cfg(not(feature = "session-store"))]
+        {
+            None
+        }
+    }
+
     async fn apply(
         &mut self,
         run_id: meerkat_core::lifecycle::RunId,
@@ -10795,10 +10818,11 @@ fn build_cli_runtime_backed_service_with_defaults(
     factory: AgentFactory,
     config: Config,
     persistence: PersistenceBundle,
+    config_state_path: std::path::PathBuf,
     default_schedule_tools: Option<Arc<dyn AgentToolDispatcher>>,
     default_workgraph_tools: Option<Arc<dyn AgentToolDispatcher>>,
 ) -> (
-    meerkat::PersistentSessionService<FactoryAgentBuilder>,
+    Arc<meerkat::PersistentSessionService<FactoryAgentBuilder>>,
     Arc<meerkat_runtime::MeerkatMachine>,
 ) {
     let max_sessions = config.max_sessions();
@@ -10818,7 +10842,12 @@ fn build_cli_runtime_backed_service_with_defaults(
         );
     }
     let (service, runtime_adapter) =
-        meerkat::surface::build_runtime_backed_service(builder, max_sessions, persistence);
+        meerkat::surface::build_runtime_backed_service_with_default_reconfigure_host(
+            builder,
+            max_sessions,
+            persistence,
+            config_state_path,
+        );
     (service, runtime_adapter)
 }
 
@@ -11257,6 +11286,7 @@ async fn run_agent(
             factory,
             config.clone(),
             persistence.clone(),
+            config_base_dir.join("config_state.json"),
             default_schedule_tools,
             default_workgraph_tools,
         );
@@ -11268,8 +11298,9 @@ async fn run_agent(
             );
         }
 
-        // Wrap in Arc so we can share with the stdin reader task
-        let service = Arc::new(service);
+        // Already an Arc: the hosted runtime-backed builder returns one so the
+        // reconfigure host can hold the same service the surface shares with
+        // the stdin reader task.
 
         #[cfg(feature = "mob")]
         let run_mob_tools = if effective_mob {
@@ -11958,16 +11989,22 @@ async fn resume_session_with_llm_override(
         );
 
         log_stage("build_cli_persistent_service");
-        // Build persistent session service for resume — durable runtime semantics.
-        let max_sessions = config.max_sessions();
-        let (persistent_service, resume_adapter) =
-            meerkat::build_persistent_service_with_runtime_adapter(
-                factory,
-                config.clone(),
-                max_sessions,
-                persistence.clone(),
-            );
-        let service = Arc::new(persistent_service);
+        // Build persistent session service for resume — durable runtime
+        // semantics AND the canonical reconfigure host.
+        //
+        // Resume must not take the hostless path: the factory advertises
+        // `brain_swap` from the same config every other CLI path uses, so a
+        // resumed session would accept the call, commit the request, and never
+        // realize it. Routing through the shared CLI builder is what keeps
+        // resume identical to a fresh run.
+        let (service, resume_adapter) = build_cli_runtime_backed_service_with_defaults(
+            factory,
+            config.clone(),
+            persistence.clone(),
+            config_base_dir.join("config_state.json"),
+            None,
+            None,
+        );
 
         log_stage("compose_external_tool_dispatchers");
         #[cfg(feature = "mob")]
@@ -12418,10 +12455,12 @@ async fn get_or_create_cli_persistent_surface_from_bundle(
         factory,
         config,
         persistence,
+        meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
+            .root
+            .join("config_state.json"),
         default_schedule_tools,
         default_workgraph_tools,
     );
-    let service = Arc::new(service);
     #[cfg(all(feature = "mob", feature = "session-store"))]
     let mob_state_cache = Arc::new(CliMobStateCache::default());
     let schedule_host = if schedule_host_supported(schedule_service.store().kind()) {
@@ -25911,10 +25950,10 @@ default_model = "gpt-5.4"
             factory,
             Config::default(),
             persistence,
+            temp.path().join("config_state.json"),
             None,
             None,
         );
-        let service = Arc::new(service);
         let wrapper = MobCliSessionService::new(Arc::clone(&service));
         let unknown_session = SessionId::new();
         let authorities = [
@@ -26276,6 +26315,7 @@ default_model = "gpt-5.4"
             factory,
             Config::default(),
             persistence,
+            temp.path().join("config_state.json"),
             None,
             None,
         );
@@ -26307,6 +26347,7 @@ default_model = "gpt-5.4"
             factory,
             Config::default(),
             persistence,
+            temp.path().join("config_state.json"),
             None,
             None,
         );
@@ -26409,10 +26450,10 @@ default_model = "gpt-5.4"
             factory,
             Config::default(),
             persistence,
+            temp.path().join("config_state.json"),
             None,
             None,
         );
-        let service = Arc::new(service);
         let llm_override: Arc<dyn LlmClient> = Arc::new(CapturingLlmClient::new(
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(Mutex::new(None)),

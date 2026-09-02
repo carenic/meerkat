@@ -5820,6 +5820,39 @@ async fn process_queue(
             Err(_) => return true,
         }
 
+        // A handoff is defined to move the next admitted input, not to mutate
+        // an otherwise idle attachment. Returning to the outer wake loop when
+        // no queue entry exists also closes the observation race: an input
+        // admitted after this read carries its own wake and re-enters this path
+        // before any dequeue can occur.
+        if !driver.lock().await.has_queued_input_in_any_lane() {
+            return false;
+        }
+
+        // Realize any committed cross-run handoff now.
+        //
+        // Position is the contract: the turn-finalization boundary is already
+        // held and queue authority has NOT been claimed, so the session actor
+        // is provably idle and no input has been selected yet. Doing this after
+        // dequeue would serve the pending input with the identity the handoff
+        // was committed to replace, which is the exact off-by-one-turn bug this
+        // seam exists to prevent.
+        if let Some(pre_dequeue) = executor.pre_dequeue_handle()
+            && let Err(error) = pre_dequeue
+                .realize_committed_handoffs_under_turn_finalization_boundary()
+                .await
+        {
+            // Fail closed and leave the loop rather than admitting work under
+            // an identity assumption the durable log contradicts. The input
+            // stays unattempted and the request stays pending, so a later
+            // attachment converges instead of losing the request.
+            tracing::error!(
+                %error,
+                "failed to realize committed handoffs before input admission"
+            );
+            return true;
+        }
+
         #[cfg(any(test, feature = "test-support"))]
         authority_binding
             .run_before_queue_authority_test_hook()

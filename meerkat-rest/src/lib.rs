@@ -632,9 +632,13 @@ impl AppState {
             Some(workgraph_service.namespace_grant().clone()),
         );
         let (session_service, runtime_adapter) =
-            meerkat::surface::build_runtime_backed_service(builder, max_sessions, persistence);
+            meerkat::surface::build_runtime_backed_service_with_default_reconfigure_host(
+                builder,
+                max_sessions,
+                persistence,
+                realm_paths.root.join("config_state.json"),
+            );
         let auth_lease = runtime_adapter.generated_auth_lease_handle();
-        let session_service = Arc::new(session_service);
         #[cfg(feature = "mob")]
         let mob_session_service = session_service.clone();
 
@@ -1853,6 +1857,16 @@ impl CoreExecutor for RestSessionRuntimeExecutor {
                 self.session_id.clone(),
             ),
         )
+    }
+
+    /// The one shared facade-owned realization handle.
+    fn pre_dequeue_handle(
+        &self,
+    ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPreDequeueHandle>> {
+        Some(meerkat::surface::persistent_runtime_pre_dequeue_handle(
+            Arc::clone(&self.context.runtime_adapter),
+            self.session_id.clone(),
+        ))
     }
 
     async fn apply(

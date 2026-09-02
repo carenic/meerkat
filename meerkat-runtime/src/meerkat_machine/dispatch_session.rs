@@ -1427,7 +1427,8 @@ impl MeerkatMachine {
                     crate::handles::RuntimeModelRoutingHandle::new_with_visibility_owner(
                         Arc::clone(&shared_handle_authority),
                         Arc::clone(&tool_visibility_owner),
-                    ),
+                    )
+                    .with_reconfigure_host_readiness(Arc::clone(&self.reconfigure_host_ready)),
                 ),
                 Arc::new(RuntimeStickyModelFallbackCommitCoordinator {
                     session_id: session_id.clone(),

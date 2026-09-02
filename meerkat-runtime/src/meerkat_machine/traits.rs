@@ -501,6 +501,111 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         }
     }
 
+    async fn committed_model_routing_handoffs_awaiting_decision(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<crate::meerkat_machine_types::CommittedModelRoutingHandoff>, RuntimeDriverError>
+    {
+        // No reconfigure host means this runtime has no durable session
+        // surface at all: nothing can have committed a handoff, and nothing
+        // could realize one. That is genuinely "nothing owed", not a failure —
+        // and treating it as a failure tears down the runtime loop on every
+        // lap for every host that never installs one.
+        let Ok(host) = self.llm_reconfigure_host() else {
+            return Ok(Vec::new());
+        };
+        let history = host
+            .load_live_session_model_routing_control_history(session_id)
+            .await?;
+        Ok(history
+            .awaiting_decision()
+            .map(
+                |record| crate::meerkat_machine_types::CommittedModelRoutingHandoff {
+                    request_id: *record.request_id(),
+                    originating_run_id: record.originating_run_id().clone(),
+                    intent: record.intent().clone(),
+                },
+            )
+            .collect())
+    }
+
+    async fn reconcile_and_list_committed_model_routing_handoffs(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<crate::meerkat_machine_types::CommittedModelRoutingHandoff>, RuntimeDriverError>
+    {
+        let Ok(host) = self.llm_reconfigure_host() else {
+            return Ok(Vec::new());
+        };
+        let history = host
+            .load_live_session_model_routing_control_history(session_id)
+            .await?;
+        // The overwhelmingly common answer is "nothing at all". Deriving both
+        // facts from this one already-loaded log keeps that case to a single
+        // read per lap.
+        let settled: Vec<_> = history.settled_terminals().cloned().collect();
+        if !settled.is_empty() {
+            self.reconcile_committed_model_routing_terminals_inner(session_id, &settled)
+                .await
+                .map_err(|error| RuntimeDriverError::Internal(error.to_string()))?;
+        }
+        Ok(history
+            .awaiting_decision()
+            .map(
+                |record| crate::meerkat_machine_types::CommittedModelRoutingHandoff {
+                    request_id: *record.request_id(),
+                    originating_run_id: record.originating_run_id().clone(),
+                    intent: record.intent().clone(),
+                },
+            )
+            .collect())
+    }
+
+    async fn reconcile_committed_model_routing_terminals(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), RuntimeDriverError> {
+        let Ok(host) = self.llm_reconfigure_host() else {
+            return Ok(());
+        };
+        let history = host
+            .load_live_session_model_routing_control_history(session_id)
+            .await?;
+        let settled: Vec<_> = history.settled_terminals().cloned().collect();
+        if settled.is_empty() {
+            return Ok(());
+        }
+        self.reconcile_committed_model_routing_terminals_inner(session_id, &settled)
+            .await
+            .map_err(|error| RuntimeDriverError::Internal(error.to_string()))
+    }
+
+    async fn realize_committed_model_routing_handoff_under_turn_finalization_boundary(
+        &self,
+        session_id: &SessionId,
+        handoff: crate::meerkat_machine_types::CommittedModelRoutingHandoff,
+    ) -> Result<crate::meerkat_machine_types::ModelRoutingHandoffRealization, RuntimeDriverError>
+    {
+        match self
+            .execute_meerkat_machine_command(
+                None,
+                MeerkatMachineCommand::RealizeCommittedModelRoutingHandoff {
+                    session_id: session_id.clone(),
+                    handoff: Box::new(handoff),
+                },
+            )
+            .await
+            .map_err(MeerkatMachine::driver_error_from_command_error)?
+        {
+            MeerkatMachineCommandResult::ModelRoutingHandoffRealization(realization) => {
+                Ok(*realization)
+            }
+            other => Err(RuntimeDriverError::Internal(format!(
+                "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::realize_committed_model_routing_handoff_under_turn_finalization_boundary: {other:?}"
+            ))),
+        }
+    }
+
     async fn admit_model_routing_assistant_turn(
         &self,
         session_id: &SessionId,
@@ -1729,8 +1834,9 @@ impl MeerkatMachine {
         &self,
         lease: super::MachineSessionArchiveLease,
     ) -> Result<RetireReport, RuntimeControlPlaneError> {
-        self.realize_retire_with_archive_lease(lease, None, None, None)
+        self.realize_retire_with_archive_lease(lease, None, None, None, &[])
             .await
+            .map(|(report, _)| report)
     }
 
     /// Deadline-aware archive sibling. The absolute caller deadline is
@@ -1740,8 +1846,9 @@ impl MeerkatMachine {
         lease: super::MachineSessionArchiveLease,
         deadline: meerkat_core::time_compat::Instant,
     ) -> Result<RetireReport, RuntimeControlPlaneError> {
-        self.realize_retire_with_archive_lease(lease, None, Some(deadline), None)
+        self.realize_retire_with_archive_lease(lease, None, Some(deadline), None, &[])
             .await
+            .map(|(report, _)| report)
     }
 
     pub async fn retire_session_with_archive_lease_and_post_commit_hook_before(
@@ -1750,8 +1857,48 @@ impl MeerkatMachine {
         post_commit_hook: Arc<dyn super::MachineSessionArchivePostCommitHook>,
         deadline: meerkat_core::time_compat::Instant,
     ) -> Result<RetireReport, RuntimeControlPlaneError> {
-        self.realize_retire_with_archive_lease(lease, None, Some(deadline), Some(post_commit_hook))
-            .await
+        self.realize_retire_with_archive_lease(
+            lease,
+            None,
+            Some(deadline),
+            Some(post_commit_hook),
+            &[],
+        )
+        .await
+        .map(|(report, _)| report)
+    }
+
+    /// Retire under an archive lease and, in the same commit, terminalize
+    /// every committed model-routing handoff the durable log still owes.
+    ///
+    /// This is the single seam the session-archive chokepoint uses. Generated
+    /// authority runs strictly after the durable runtime terminal commits, so
+    /// a retire that fails leaves every owed handoff exactly as actionable as
+    /// it was. The returned identities are the ones generated authority moved
+    /// to the archived terminal; the caller owes one durable archive record
+    /// per identity and must write nothing for the rest.
+    pub async fn retire_session_with_archive_lease_terminalizing_model_routing_handoffs_before(
+        &self,
+        lease: super::MachineSessionArchiveLease,
+        publication_handle: Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>>,
+        post_commit_hook: Option<Arc<dyn super::MachineSessionArchivePostCommitHook>>,
+        archive_handoffs: &[crate::meerkat_machine_types::CommittedModelRoutingHandoff],
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<
+        (
+            RetireReport,
+            Vec<meerkat_core::image_generation::SwitchTurnRequestId>,
+        ),
+        RuntimeControlPlaneError,
+    > {
+        self.realize_retire_with_archive_lease(
+            lease,
+            publication_handle,
+            Some(deadline),
+            post_commit_hook,
+            archive_handoffs,
+        )
+        .await
     }
 
     /// Archive sibling combining an owned stored-session publisher with a
@@ -1772,8 +1919,10 @@ impl MeerkatMachine {
             Some(publication_handle),
             Some(deadline),
             Some(post_commit_hook),
+            &[],
         )
         .await
+        .map(|(report, _)| report)
     }
 
     /// Observe whether an archive lease owns a committed runless terminal
@@ -1894,8 +2043,9 @@ impl MeerkatMachine {
         lease: super::MachineSessionArchiveLease,
         publication_handle: Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
     ) -> Result<RetireReport, RuntimeControlPlaneError> {
-        self.realize_retire_with_archive_lease(lease, Some(publication_handle), None, None)
+        self.realize_retire_with_archive_lease(lease, Some(publication_handle), None, None, &[])
             .await
+            .map(|(report, _)| report)
     }
 
     /// Deadline-aware archive-only sibling for a provably stored-only
@@ -1911,8 +2061,10 @@ impl MeerkatMachine {
             Some(publication_handle),
             Some(deadline),
             None,
+            &[],
         )
         .await
+        .map(|(report, _)| report)
     }
 
     /// Retire while consuming the caller's single absolute acknowledgement
@@ -2069,8 +2221,9 @@ impl MeerkatMachine {
             _mutation_guard: mutation_guard,
         };
         let result = self
-            .realize_retire_with_archive_lease(lease, None, deadline, None)
-            .await;
+            .realize_retire_with_archive_lease(lease, None, deadline, None, &[])
+            .await
+            .map(|(report, _)| report);
         drop(direct_member_slot_guard);
         result.map_err(super::DirectMemberRetireError::Runtime)
     }
@@ -2083,7 +2236,14 @@ impl MeerkatMachine {
         >,
         deadline: Option<meerkat_core::time_compat::Instant>,
         post_commit_hook: Option<Arc<dyn super::MachineSessionArchivePostCommitHook>>,
-    ) -> Result<RetireReport, RuntimeControlPlaneError> {
+        archive_handoffs: &[crate::meerkat_machine_types::CommittedModelRoutingHandoff],
+    ) -> Result<
+        (
+            RetireReport,
+            Vec<meerkat_core::image_generation::SwitchTurnRequestId>,
+        ),
+        RuntimeControlPlaneError,
+    > {
         let super::MachineSessionArchiveLease {
             session_id,
             runtime_id,
@@ -2217,6 +2377,20 @@ impl MeerkatMachine {
         if let Some(reason) = commit_error {
             return Err(RuntimeControlPlaneError::Internal(reason));
         }
+
+        // The durable runtime terminal is committed. Only now may generated
+        // authority terminalize an unresolved committed handoff: running it
+        // earlier would leave a still-live session holding a half-terminal
+        // request if any later archive step failed. The registration is still
+        // present here (it is removed below), so generated authority is
+        // reachable for exactly this window.
+        let archived_model_routing_handoffs = if archive_handoffs.is_empty() {
+            Vec::new()
+        } else {
+            self.archive_unresolved_model_routing_handoffs_inner(&session_id, archive_handoffs)
+                .await?
+        };
+
         if let Some(hook) = post_commit_hook {
             hook.after_runtime_retire_commit().await?;
         }
@@ -2281,7 +2455,7 @@ impl MeerkatMachine {
             .await
             .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
         }
-        Ok(report)
+        Ok((report, archived_model_routing_handoffs))
     }
 }
 

@@ -1411,6 +1411,8 @@ struct SessionHandle {
     /// Exact incarnation identity for this registry entry.  Logical-session
     /// recovery creates a new witness even when it reuses the same SessionId.
     actor_witness: LiveSessionActorWitness,
+    #[cfg(not(target_arch = "wasm32"))]
+    task_handle: tokio::task::JoinHandle<()>,
     command_tx: mpsc::Sender<SessionCommand>,
     state_tx: watch::Sender<SessionState>,
     state_rx: watch::Receiver<SessionState>,
@@ -2491,6 +2493,12 @@ pub struct EphemeralSessionService<B: SessionAgentBuilder> {
     /// Notified when a new session handle is stored. Used by CLI --stdin
     /// to avoid polling for the session to appear.
     session_registered: tokio::sync::Notify,
+    #[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
+    fail_next_durable_sync: std::sync::atomic::AtomicBool,
+    #[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
+    fail_next_discard: std::sync::atomic::AtomicBool,
+    #[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
+    fatalized_actor_task_terminations: std::sync::atomic::AtomicUsize,
 }
 
 impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
@@ -2722,7 +2730,31 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             builder,
             staged_registry: Arc::new(StagedSessionRegistry::bounded(max_sessions)),
             session_registered: tokio::sync::Notify::new(),
+            #[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
+            fail_next_durable_sync: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
+            fail_next_discard: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
+            fatalized_actor_task_terminations: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    #[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
+    pub(crate) fn fail_next_durable_sync(&self) {
+        self.fail_next_durable_sync
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
+    pub(crate) fn fail_next_discard(&self) {
+        self.fail_next_discard
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
+    pub(crate) fn fatalized_actor_task_terminations(&self) -> usize {
+        self.fatalized_actor_task_terminations
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     async fn turn_finalization_gate_for_session(&self, id: &SessionId) -> Arc<Mutex<()>> {
@@ -3530,6 +3562,15 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
     /// caller already encodes this (`Ok(()) | Err(NotFound) => Ok(())`); this
     /// makes the contract itself idempotent.
     pub async fn discard_live_session(&self, id: &SessionId) -> Result<(), SessionError> {
+        #[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
+        if self
+            .fail_next_discard
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(SessionError::Agent(AgentError::InternalError(
+                "synthetic live-session discard failure".to_string(),
+            )));
+        }
         let (handle, projection) = {
             let mut sessions = self.sessions.write().await;
             let Some(handle) = sessions.get(id) else {
@@ -3546,6 +3587,40 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         };
         self.shutdown_removed_live_session_handle(id, handle, projection);
         Ok(())
+    }
+
+    /// Revoke, unregister, and terminate a live actor after durable authority
+    /// advanced but the ordinary generated shutdown transition itself failed.
+    ///
+    /// This is a fatal convergence fallback, not a successful lifecycle
+    /// transition. Revocation prevents the detached actor from publishing or
+    /// being addressed again; a later access must materialize from durable
+    /// authority.
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    pub(crate) async fn fatalize_live_session_after_durable_convergence_failure(
+        &self,
+        id: &SessionId,
+    ) {
+        let handle = self.sessions.write().await.swap_remove(id);
+        let Some(handle) = handle else {
+            return;
+        };
+        handle.actor_witness.revoke();
+        self.staged_registry.forget(id);
+        handle.archive_snapshot_gate.close_for_snapshot();
+        handle.task_handle.abort();
+        if let Err(error) = handle.task_handle.await
+            && !error.is_cancelled()
+        {
+            tracing::error!(
+                %error,
+                %id,
+                "fatalized session actor task terminated unexpectedly"
+            );
+        }
+        #[cfg(test)]
+        self.fatalized_actor_task_terminations
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Drop only the actor incarnation named by `witness`.
@@ -4339,6 +4414,15 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         id: &SessionId,
         session: meerkat_core::Session,
     ) -> Result<(), SessionError> {
+        #[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
+        if self
+            .fail_next_durable_sync
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(SessionError::Agent(AgentError::InternalError(
+                "synthetic durable-session sync failure".to_string(),
+            )));
+        }
         if session.id() != id {
             return Err(SessionError::Agent(
                 meerkat_core::error::AgentError::InternalError(format!(
@@ -4347,13 +4431,16 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
                 )),
             ));
         }
-        let sessions = self.sessions.read().await;
-        let handle = sessions
-            .get(id)
-            .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
+        let command_tx = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(id)
+                .ok_or_else(|| SessionError::NotFound { id: id.clone() })?
+                .command_tx
+                .clone()
+        };
         let (reply_tx, reply_rx) = oneshot::channel();
-        handle
-            .command_tx
+        command_tx
             .send(SessionCommand::SyncSessionFromDurableSnapshot {
                 session: Box::new(session),
                 reply_tx,
@@ -5158,7 +5245,7 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
 
         // Spawn the session task using the platform-appropriate task API.
         #[cfg(not(target_arch = "wasm32"))]
-        tokio::spawn(session_task(
+        let task_handle = tokio::spawn(session_task(
             agent,
             session_id.clone(),
             agent_event_tx,
@@ -5209,6 +5296,8 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         // Store the handle
         let handle = SessionHandle {
             actor_witness: actor_witness.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            task_handle,
             command_tx: command_tx.clone(),
             state_tx: state_tx_handle,
             state_rx,
