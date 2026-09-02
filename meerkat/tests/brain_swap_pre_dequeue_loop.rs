@@ -12,9 +12,8 @@
 //!
 //! This file proves the other half, which no positive test can: what happens
 //! when a committed request CANNOT be proven. It builds a real runtime-backed
-//! service over a real realm, runs a real turn to obtain a real committed
-//! boundary receipt, writes a committed `Requested` record bound to a run that
-//! never committed anything, and then submits the next input through the
+//! service over a real realm, materializes a session carrying a committed
+//! `Requested` record bound to a run that never committed anything, and then submits the next input through the
 //! ordinary admission path. Nothing here calls the realization method.
 //!
 //! # Why the seeding is out of band, and what that costs
@@ -41,7 +40,9 @@
 
 use std::sync::Arc;
 
-use meerkat::surface::{build_runtime_backed_service, default_persistent_executor};
+use meerkat::surface::{
+    build_runtime_backed_service_with_default_reconfigure_host, default_persistent_executor,
+};
 use meerkat::{
     AgentFactory, Config, CreateSessionRequest, FactoryAgentBuilder, PersistentSessionService,
 };
@@ -53,7 +54,6 @@ use meerkat_core::image_generation::{
 };
 use meerkat_core::lifecycle::RunId;
 use meerkat_core::lifecycle::run_primitive::ModelId;
-use meerkat_core::service::SessionService;
 use meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord;
 use meerkat_runtime::completion::CompletionOutcome;
 use meerkat_runtime::{Input, MeerkatMachine, PromptInput};
@@ -79,8 +79,13 @@ async fn build_service(
     builder.default_llm_client = Some(Arc::new(TestClient::for_provider(
         meerkat_core::Provider::OpenAI,
     )));
-    let (service, adapter) = build_runtime_backed_service(builder, 4, persistence);
-    (Arc::new(service), adapter)
+    let (service, adapter) = build_runtime_backed_service_with_default_reconfigure_host(
+        builder,
+        4,
+        persistence,
+        root.join("config_state.json"),
+    );
+    (service, adapter)
 }
 
 fn create_request() -> CreateSessionRequest {
@@ -134,50 +139,31 @@ async fn uncommitted_origin_blocks_the_next_input(backend: meerkat_store::RealmB
     let temp = tempfile::tempdir().expect("tempdir");
     let (service, adapter) = build_service(temp.path(), backend).await;
 
-    let created = service
-        .create_session(create_request())
-        .await
-        .expect("create session");
-    let session_id = created.session_id.clone();
-    let service_for_executor = Arc::clone(&service);
-    let adapter_for_executor = Arc::clone(&adapter);
-    adapter
-        .ensure_session_with_executor(
-            session_id.clone(),
-            default_persistent_executor(
-                service_for_executor,
-                adapter_for_executor,
-                session_id.clone(),
-            ),
-        )
-        .await
-        .expect("attach executor");
-
-    // One ordinary turn proves the loop is healthy before the handoff exists.
-    let first = run_prompt(&adapter, &session_id, "first").await;
-    assert!(
-        matches!(first, CompletionOutcome::Completed(_)),
-        "the baseline turn must complete: {first:?}"
-    );
-
-    // Seed a committed request bound to a run that never committed anything.
-    let orphan_run = RunId::new();
-    service
-        .append_live_model_routing_control_record_under_runtime_turn_boundary(
-            &session_id,
+    let mut session = meerkat::Session::new();
+    let session_id = session.id().clone();
+    session
+        .append_model_routing_control_record(
             SessionModelRoutingControlRecord::request(
                 SwitchTurnRequestId::new(uuid::Uuid::from_bytes([42u8; 16])),
-                orphan_run,
+                RunId::new(),
                 until_changed_model_intent("gpt-5.5"),
             )
             .expect("representable durable request"),
         )
-        .await
-        .expect("append committed request");
-    service
-        .persist_live_session_now_under_runtime_turn_boundary(&session_id)
-        .await
-        .expect("persist committed request");
+        .expect("seed committed request");
+    let service_for_executor = Arc::clone(&service);
+    let adapter_for_executor = Arc::clone(&adapter);
+    Box::pin(meerkat::surface::materialize_session(
+        &service,
+        &adapter,
+        session,
+        create_request(),
+        move |session_id| {
+            default_persistent_executor(service_for_executor, adapter_for_executor, session_id)
+        },
+    ))
+    .await
+    .expect("materialize session with committed unprovable request");
 
     // The next input must NOT be served: the loop's pre-dequeue pass observes a
     // committed request it cannot prove, and fails closed.

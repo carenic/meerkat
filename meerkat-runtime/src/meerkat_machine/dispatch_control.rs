@@ -2474,7 +2474,7 @@ impl MeerkatMachine {
         host: &dyn SessionLlmReconfigureHost,
         record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
     ) -> Result<(), RuntimeControlPlaneError> {
-        host.commit_live_session_model_routing_control_record(session_id, record)
+        host.commit_session_model_routing_control_record_durable_first(session_id, record)
             .await
             .map_err(|error| RuntimeControlPlaneError::StoreError(error.to_string()))
     }

@@ -367,7 +367,7 @@ pub trait SessionLlmReconfigureHost: Send + Sync {
     /// disk.
     ///
     /// Caller must hold the turn-finalization boundary.
-    async fn commit_live_session_model_routing_control_record(
+    async fn commit_session_model_routing_control_record_durable_first(
         &self,
         _session_id: &SessionId,
         _record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,

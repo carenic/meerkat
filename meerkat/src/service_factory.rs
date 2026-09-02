@@ -461,23 +461,6 @@ impl SessionAgent for FactoryAgent {
         self.agent.dispatch_external_tool_call(call).await
     }
 
-    fn append_model_routing_control_record(
-        &mut self,
-        record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
-    ) -> Result<
-        meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
-        meerkat_core::error::AgentError,
-    > {
-        self.agent
-            .session_mut()
-            .append_model_routing_control_record(record)
-            .map_err(|error| {
-                meerkat_core::error::AgentError::InternalError(format!(
-                    "failed to record model-routing handoff resolution: {error}"
-                ))
-            })
-    }
-
     async fn dispatch_external_tool_call_with_timeout_policy(
         &mut self,
         call: meerkat_core::ToolCall,

@@ -130,8 +130,19 @@ async fn discarding_the_live_actor_must_not_hide_a_committed_request() {
     let temp = tempfile::tempdir().expect("tempdir");
     let (service, adapter) = build_service(temp.path()).await;
 
-    let session = Session::new();
+    let mut session = Session::new();
     let session_id = session.id().clone();
+    let request_id = SwitchTurnRequestId::new(uuid::Uuid::from_bytes([7u8; 16]));
+    session
+        .append_model_routing_control_record(
+            SessionModelRoutingControlRecord::request(
+                request_id,
+                RunId::new(),
+                until_changed_model_intent("gpt-5.5"),
+            )
+            .expect("representable durable request"),
+        )
+        .expect("seed committed request");
     let service_for_executor = Arc::clone(&service);
     let adapter_for_executor = Arc::clone(&adapter);
     Box::pin(meerkat::surface::materialize_session(
@@ -145,24 +156,6 @@ async fn discarding_the_live_actor_must_not_hide_a_committed_request() {
     ))
     .await
     .expect("materialize session");
-
-    let request_id = SwitchTurnRequestId::new(uuid::Uuid::from_bytes([7u8; 16]));
-    service
-        .append_live_model_routing_control_record_under_runtime_turn_boundary(
-            &session_id,
-            SessionModelRoutingControlRecord::request(
-                request_id,
-                RunId::new(),
-                until_changed_model_intent("gpt-5.5"),
-            )
-            .expect("representable durable request"),
-        )
-        .await
-        .expect("append committed request");
-    service
-        .persist_live_session_now_under_runtime_turn_boundary(&session_id)
-        .await
-        .expect("persist committed request");
 
     // Drop the live actor: the durable row is now the only carrier, which is
     // precisely the state the pre-dequeue seam meets between turns.
@@ -181,133 +174,6 @@ async fn discarding_the_live_actor_must_not_hide_a_committed_request() {
         "the committed request must survive losing the live actor: {history:?}"
     );
     assert_eq!(history.records()[0].request_id(), &request_id);
-}
-
-/// Two independent defences against a live-only terminal, proved against the
-/// REAL persistent service rather than a scripted double.
-///
-/// If a terminal reaches the live session but not the durable log, every later
-/// read would report the request settled while the log still owes it — the
-/// request silently stops being owed. Two things prevent that, and this test
-/// exercises both against the same shadow:
-///
-/// 1. The decision seam reads COMMITTED authority, so a live-only terminal is
-///    never observable to a realization decision in the first place.
-/// 2. The compensation still discards the live actor, so the shadow is gone
-///    from live state too rather than lingering.
-///
-/// Running it here also answers the deadlock question directly. The seam calls
-/// discard while holding the turn-finalization boundary, so `discard` must be
-/// the `_under_runtime_turn_boundary` variant, exactly like `append` and
-/// `persist`. If it re-acquired a lock the caller already holds, this test
-/// would hang rather than fail — so a passing run is the evidence.
-#[tokio::test]
-async fn an_uncommitted_terminal_never_settles_the_request_and_is_discarded() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let (service, adapter) = build_service(temp.path()).await;
-
-    let session = Session::new();
-    let session_id = session.id().clone();
-    let service_for_executor = Arc::clone(&service);
-    let adapter_for_executor = Arc::clone(&adapter);
-    Box::pin(meerkat::surface::materialize_session(
-        &service,
-        &adapter,
-        session,
-        create_request(),
-        move |session_id| {
-            default_persistent_executor(service_for_executor, adapter_for_executor, session_id)
-        },
-    ))
-    .await
-    .expect("materialize session");
-
-    // A committed, durable request: this is what the log owes.
-    let request_id = SwitchTurnRequestId::new(uuid::Uuid::from_bytes([9u8; 16]));
-    let origin_run = RunId::new();
-    let intent = until_changed_model_intent("gpt-5.5");
-    service
-        .append_live_model_routing_control_record_under_runtime_turn_boundary(
-            &session_id,
-            SessionModelRoutingControlRecord::request(
-                request_id,
-                origin_run.clone(),
-                intent.clone(),
-            )
-            .expect("representable durable request"),
-        )
-        .await
-        .expect("append committed request");
-    service
-        .persist_live_session_now_under_runtime_turn_boundary(&session_id)
-        .await
-        .expect("persist committed request");
-
-    // Now append a terminal WITHOUT persisting it — the exact state a failed
-    // persist leaves behind.
-    service
-        .append_live_model_routing_control_record_under_runtime_turn_boundary(
-            &session_id,
-            SessionModelRoutingControlRecord::ModelRoutingIntentDenied {
-                request_id,
-                originating_run_id: origin_run,
-                intent,
-                reason: meerkat_core::image_generation::SwitchTurnDenialReason::CapabilityPolicy,
-            },
-        )
-        .await
-        .expect("append uncommitted terminal");
-
-    let live = service
-        .export_live_session(&session_id)
-        .await
-        .expect("read the live actor body directly");
-    assert_eq!(
-        live.model_routing_control().records().len(),
-        2,
-        "the live actor really does hold the uncommitted terminal — without this the \
-         rest of the test would be vacuous"
-    );
-
-    // ...and yet the seam every realization decision reads returns COMMITTED
-    // authority, so that shadow is not observable to the decision. This is the
-    // property that keeps the request owed until the terminal is truly on disk.
-    let shadowed = service
-        .live_model_routing_control_history(&session_id)
-        .await
-        .expect("read the decision log");
-    assert_eq!(
-        shadowed.records().len(),
-        1,
-        "an uncommitted live terminal must not shadow committed authority: {shadowed:?}"
-    );
-    assert_eq!(
-        shadowed.records()[0].disposition(),
-        meerkat_core::session::model_routing_control::ModelRoutingIntentRecordDisposition::Requested,
-        "the request must still read as owed while its terminal is only live"
-    );
-
-    // The compensation. This must not deadlock under the boundary the seam
-    // already holds.
-    service
-        .discard_live_under_runtime_turn_boundary(&session_id)
-        .await
-        .expect("discarding the live actor must be callable under the held boundary");
-
-    let recovered = service
-        .live_model_routing_control_history(&session_id)
-        .await
-        .expect("committed authority must be readable after the discard");
-    assert_eq!(
-        recovered.records().len(),
-        1,
-        "the uncommitted terminal must be gone: {recovered:?}"
-    );
-    assert_eq!(
-        recovered.records()[0].disposition(),
-        meerkat_core::session::model_routing_control::ModelRoutingIntentRecordDisposition::Requested,
-        "the request must read as still owed so the next lap retries it"
-    );
 }
 
 // ---------------------------------------------------------------------------

@@ -16,11 +16,12 @@
 //!   factory (correctly) advertise no reachable models, so a test that used
 //!   one would be proving a tool production would never have offered;
 //! * the provider layer is a fake `ProviderRuntime` registered in an otherwise
-//!   empty `ProviderRuntimeRegistry`. It resolves an inline test secret and
-//!   returns a scripted client, so resolution is real and the network is not;
-//! * models A (`gpt-5.4`) and B (`gpt-5.5`) share one OpenAI auth binding, so
-//!   the switch exercises the model-only/account-affinity route the tool
-//!   promises rather than a provider change;
+//!   empty `ProviderRuntimeRegistry`. It resolves non-secret managed binding
+//!   identities to static test leases and returns a scripted client, so route
+//!   resolution is real and the network is not;
+//! * the cross-provider route uses Anthropic A (`claude-sonnet-4-6`) and
+//!   OpenAI B (`gpt-5.5`) on distinct bindings that share one credential
+//!   account identity;
 //! * the turns are submitted through `accept_input_with_completion`, so the
 //!   real runtime loop — including its pre-dequeue realization pass — is what
 //!   moves the identity. Nothing here calls the realization method directly.
@@ -32,7 +33,6 @@
 //! authorities, and the handoff must cross both.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 
 use async_trait::async_trait;
@@ -60,7 +60,6 @@ use meerkat_runtime::{
 };
 use meerkat_tools::builtin::brain_swap::BRAIN_SWAP_TOOL_NAME;
 
-use crate::session_runtime::llm_reconfigure::SessionRuntimeLlmReconfigureService;
 use crate::{
     AgentFactory, FactoryAgentBuilder, PersistenceBundle, PersistentSessionService, SessionStore,
 };
@@ -98,14 +97,6 @@ impl RouteSpec {
             vec![self.provider_a, self.provider_b]
         }
     }
-
-    fn binding_for(self, provider: Provider) -> &'static str {
-        if provider == self.provider_a {
-            self.binding_a
-        } else {
-            self.binding_b
-        }
-    }
 }
 
 const SAME_PROVIDER_ROUTE: RouteSpec = RouteSpec {
@@ -120,7 +111,7 @@ const SAME_PROVIDER_ROUTE: RouteSpec = RouteSpec {
 /// A=Anthropic, B=OpenAI. Both are catalog text models on separate configured
 /// bindings, so realization must cross the provider seam.
 const CROSS_PROVIDER_ROUTE: RouteSpec = RouteSpec {
-    model_a: "claude-sonnet-4-5",
+    model_a: "claude-sonnet-4-6",
     provider_a: Provider::Anthropic,
     binding_a: "default_anthropic",
     model_b: MODEL_B,
@@ -138,10 +129,16 @@ const SECOND_NEXT_TURN_TEXT: &str = "answered the second queued turn";
 
 /// Scripted client for the deferred (cross-run) brain swap.
 ///
-/// It records `request.model` for EVERY call, which is the only observation
-/// that can distinguish "the log says B" from "B actually served the turn".
+/// It records the provider runtime and `request.model` for every call, which
+/// distinguishes "the log says B" from "B actually served the turn".
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderCall {
+    provider: Provider,
+    model: String,
+}
+
 struct DeferredBrainSwapClient {
-    requested_models: Arc<StdMutex<Vec<String>>>,
+    requested_calls: Arc<StdMutex<Vec<ProviderCall>>>,
     /// The provider this exact client was built for. Cross-provider routes
     /// build one client per provider, and usage must be attributed to the one
     /// that actually served the call.
@@ -152,10 +149,13 @@ struct DeferredBrainSwapClient {
 impl DeferredBrainSwapClient {
     fn record(&self, model: &str) -> usize {
         let mut recorded = self
-            .requested_models
+            .requested_calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        recorded.push(model.to_string());
+        recorded.push(ProviderCall {
+            provider: self.provider,
+            model: model.to_string(),
+        });
         recorded.len() - 1
     }
 }
@@ -256,12 +256,13 @@ impl LlmClient for DeferredBrainSwapClient {
     }
 }
 
-/// Credential-free OpenAI provider runtime.
+/// Credential-free fake provider runtime.
 ///
 /// `resolve_binding` performs the real validated-binding → resolved-connection
-/// step with an inline test secret, so the session resolves a registry-backed
-/// provider identity — which is exactly what makes `brain_swap` available at
-/// all. `build_client` hands back the scripted client instead of an HTTP one.
+/// step using a static non-secret test lease, so the session resolves a
+/// registry-backed provider identity — which is exactly what makes
+/// `brain_swap` available at all. `build_client` hands back the scripted client
+/// instead of an HTTP one.
 struct DeferredBrainSwapProviderRuntime {
     provider: Provider,
     client: Arc<dyn LlmClient>,
@@ -346,206 +347,6 @@ impl ProviderRuntime for DeferredBrainSwapProviderRuntime {
     }
 }
 
-/// A passthrough over the REAL persistent session service whose terminal
-/// persist can be made to fail on demand.
-///
-/// This exists so the persist-then-discard contract is proved against the
-/// actual service — including its real locking — rather than only against a
-/// scripted double. If `discard_live_under_runtime_turn_boundary` re-entered a
-/// lock the pre-dequeue seam already holds, this decorator would deadlock
-/// instead of returning, and the test would hang rather than pass.
-struct CountingReconfigureService {
-    inner: Arc<PersistentSessionService<FactoryAgentBuilder>>,
-    /// Fails the persist that carries a durable terminal record.
-    terminal_persist_fails: Arc<std::sync::atomic::AtomicBool>,
-    /// Counts discards so the compensation is observable.
-    discards: Arc<AtomicUsize>,
-}
-
-#[async_trait]
-impl SessionRuntimeLlmReconfigureService for CountingReconfigureService {
-    async fn acquire_runtime_turn_finalization_guard(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<
-        Box<dyn meerkat_core::lifecycle::CoreExecutorTurnFinalizationGuard>,
-        meerkat_core::service::SessionError,
-    > {
-        SessionRuntimeLlmReconfigureService::acquire_runtime_turn_finalization_guard(
-            self.inner.as_ref(),
-            session_id,
-        )
-        .await
-    }
-
-    async fn live_llm_identity(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<SessionLlmIdentity, meerkat_core::service::SessionError> {
-        SessionRuntimeLlmReconfigureService::live_llm_identity(self.inner.as_ref(), session_id)
-            .await
-    }
-
-    async fn live_session_has_instruction_activations(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<bool, meerkat_core::service::SessionError> {
-        SessionRuntimeLlmReconfigureService::live_session_has_instruction_activations(
-            self.inner.as_ref(),
-            session_id,
-        )
-        .await
-    }
-
-    async fn live_realm_id(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Option<RealmId>, meerkat_core::service::SessionError> {
-        SessionRuntimeLlmReconfigureService::live_realm_id(self.inner.as_ref(), session_id).await
-    }
-
-    async fn live_tool_visibility_state(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Option<meerkat_core::SessionToolVisibilityState>, meerkat_core::service::SessionError>
-    {
-        SessionRuntimeLlmReconfigureService::live_tool_visibility_state(
-            self.inner.as_ref(),
-            session_id,
-        )
-        .await
-    }
-
-    async fn live_web_search_override(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<meerkat_core::ToolCategoryOverride, meerkat_core::service::SessionError> {
-        SessionRuntimeLlmReconfigureService::live_web_search_override(
-            self.inner.as_ref(),
-            session_id,
-        )
-        .await
-    }
-
-    async fn live_tool_scope_snapshot(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<Option<meerkat_core::ToolScopeSnapshot>, meerkat_core::service::SessionError> {
-        SessionRuntimeLlmReconfigureService::live_tool_scope_snapshot(
-            self.inner.as_ref(),
-            session_id,
-        )
-        .await
-    }
-
-    async fn apply_live_llm_identity_under_runtime_turn_boundary(
-        &self,
-        session_id: &SessionId,
-        client: Arc<dyn meerkat_core::AgentLlmClient>,
-        identity: SessionLlmIdentity,
-        request_policy: meerkat_core::SessionLlmRequestPolicy,
-    ) -> Result<(), meerkat_core::service::SessionError> {
-        SessionRuntimeLlmReconfigureService::apply_live_llm_identity_under_runtime_turn_boundary(
-            self.inner.as_ref(),
-            session_id,
-            client,
-            identity,
-            request_policy,
-        )
-        .await
-    }
-
-    async fn apply_live_tool_visibility_state_under_runtime_turn_boundary(
-        &self,
-        session_id: &SessionId,
-        state: Option<meerkat_core::SessionToolVisibilityState>,
-    ) -> Result<(), meerkat_core::service::SessionError> {
-        SessionRuntimeLlmReconfigureService::apply_live_tool_visibility_state_under_runtime_turn_boundary(
-            self.inner.as_ref(),
-            session_id,
-            state,
-        )
-        .await
-    }
-
-    async fn persist_live_under_runtime_turn_boundary(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<(), meerkat_core::service::SessionError> {
-        if self
-            .terminal_persist_fails
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(meerkat_core::service::SessionError::Store(
-                "injected terminal persist failure".into(),
-            ));
-        }
-        SessionRuntimeLlmReconfigureService::persist_live_under_runtime_turn_boundary(
-            self.inner.as_ref(),
-            session_id,
-        )
-        .await
-    }
-
-    async fn discard_live_under_runtime_turn_boundary(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<(), meerkat_core::service::SessionError> {
-        self.discards.fetch_add(1, Ordering::SeqCst);
-        SessionRuntimeLlmReconfigureService::discard_live_under_runtime_turn_boundary(
-            self.inner.as_ref(),
-            session_id,
-        )
-        .await
-    }
-
-    async fn commit_live_model_routing_control_record_under_runtime_turn_boundary(
-        self: Arc<Self>,
-        session_id: &SessionId,
-        record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
-    ) -> Result<(), meerkat_core::service::SessionError> {
-        if self
-            .terminal_persist_fails
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            // Model the durable commit failing. The real seam's compensation
-            // discards the live actor, so a caller that sees this error must
-            // never find a live-only terminal behind it. Reproduce that fate
-            // here without touching live state at all: refusing before any
-            // append is strictly stronger than appending and compensating.
-            let _ = record;
-            SessionRuntimeLlmReconfigureService::discard_live_under_runtime_turn_boundary(
-                self.inner.as_ref(),
-                session_id,
-            )
-            .await?;
-            return Err(meerkat_core::service::SessionError::Store(
-                "injected terminal commit failure".into(),
-            ));
-        }
-        SessionRuntimeLlmReconfigureService::commit_live_model_routing_control_record_under_runtime_turn_boundary(
-            Arc::clone(&self.inner),
-            session_id,
-            record,
-        )
-        .await
-    }
-
-    async fn live_model_routing_control_history(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<
-        meerkat_core::session::model_routing_control::SessionModelRoutingControlHistory,
-        meerkat_core::service::SessionError,
-    > {
-        SessionRuntimeLlmReconfigureService::live_model_routing_control_history(
-            self.inner.as_ref(),
-            session_id,
-        )
-        .await
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -557,26 +358,52 @@ enum PersistenceProfile {
     HeadCanonical,
 }
 
-/// One inline OpenAI key, minted as the realm's default binding.
-///
-/// Both A and B resolve through this single binding, so a switch that
-/// silently rebound credentials or accounts shows up as a changed
-/// `auth_binding` on the resulting identity.
-fn ab_test_config(route: RouteSpec) -> Config {
+fn ab_test_config(route: RouteSpec, availability: &ModelAvailability) -> Config {
     let mut config = Config::default();
-    let keys: Vec<(&str, &str)> = route
-        .providers()
-        .into_iter()
-        .map(|provider| match provider {
-            Provider::OpenAI => ("openai", "unused-test-key"),
-            Provider::Anthropic => ("anthropic", "unused-test-key"),
-            other => unreachable!("unsupported test provider {other:?}"),
-        })
-        .collect();
-    config.realm.insert(
-        TEST_REALM.to_string(),
-        RealmConfigSection::from_inline_api_keys(&keys),
-    );
+    let account =
+        meerkat_core::CredentialAccountId::parse("shared_test_account").expect("valid account");
+    let mut section = RealmConfigSection::default();
+    for provider in route.providers().into_iter().filter(|provider| {
+        *provider == route.provider_b || availability.is_available(route.model_a)
+    }) {
+        let binding = if provider == route.provider_a {
+            route.binding_a
+        } else {
+            route.binding_b
+        };
+        section.backend.insert(
+            binding.to_string(),
+            meerkat_core::BackendProfileConfig {
+                provider: provider.as_str().to_string(),
+                backend_kind: "copilot".to_string(),
+                base_url: None,
+                options: serde_json::Value::Null,
+                server: None,
+            },
+        );
+        section.auth.insert(
+            binding.to_string(),
+            meerkat_core::AuthProfileConfig {
+                provider: provider.as_str().to_string(),
+                auth_method: "github_copilot_oauth".to_string(),
+                source: meerkat_core::CredentialSourceSpec::ManagedStore,
+                constraints: Default::default(),
+                metadata_defaults: Default::default(),
+            },
+        );
+        section.binding.insert(
+            binding.to_string(),
+            meerkat_core::ProviderBindingConfig {
+                backend_profile: binding.to_string(),
+                auth_profile: binding.to_string(),
+                credential_account: Some(account.clone()),
+                default_model: None,
+                policy: Default::default(),
+                provider_default: false,
+            },
+        );
+    }
+    config.realm.insert(TEST_REALM.to_string(), section);
     config
 }
 
@@ -593,7 +420,7 @@ fn expected_auth_binding() -> AuthBindingRef {
     expected_auth_binding_named(TEST_BINDING)
 }
 
-fn create_request_for(route: RouteSpec) -> CreateSessionRequest {
+fn create_request_for(route: RouteSpec, fresh: bool) -> CreateSessionRequest {
     CreateSessionRequest {
         injected_context: Vec::new(),
         model: route.model_a.to_string(),
@@ -604,16 +431,13 @@ fn create_request_for(route: RouteSpec) -> CreateSessionRequest {
         initial_turn: InitialTurnPolicy::Defer,
         deferred_prompt_policy: DeferredPromptPolicy::Discard,
         build: Some(SessionBuildOptions {
-            provider: Some(route.provider_a),
+            provider: fresh.then_some(route.provider_a),
             realm_id: Some(RealmId::parse(TEST_REALM).expect("valid test realm")),
+            auth_binding: fresh.then(|| expected_auth_binding_named(route.binding_a)),
             ..Default::default()
         }),
         labels: None,
     }
-}
-
-fn create_request() -> CreateSessionRequest {
-    create_request_for(SAME_PROVIDER_ROUTE)
 }
 
 struct AbHarness {
@@ -629,7 +453,7 @@ struct AbEnvironment {
     profile: PersistenceProfile,
     route: RouteSpec,
     temp: tempfile::TempDir,
-    requested_models: Arc<StdMutex<Vec<String>>>,
+    requested_calls: Arc<StdMutex<Vec<ProviderCall>>>,
     availability: Arc<ModelAvailability>,
     client_build_models: Arc<StdMutex<Vec<String>>>,
 }
@@ -637,7 +461,17 @@ struct AbEnvironment {
 impl AbHarness {
     fn requested_models(&self) -> Vec<String> {
         self.environment
-            .requested_models
+            .requested_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|call| call.model.clone())
+            .collect()
+    }
+
+    fn requested_calls(&self) -> Vec<ProviderCall> {
+        self.environment
+            .requested_calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -776,7 +610,7 @@ async fn build_harness_for(profile: PersistenceProfile, route: RouteSpec) -> AbH
         profile,
         route,
         temp: tempfile::tempdir().expect("brain-swap A/B tempdir"),
-        requested_models: Arc::new(StdMutex::new(Vec::new())),
+        requested_calls: Arc::new(StdMutex::new(Vec::new())),
         availability: Arc::new(ModelAvailability::default()),
         client_build_models: Arc::new(StdMutex::new(Vec::new())),
     });
@@ -792,12 +626,14 @@ async fn attach_harness(
         .without_provider_auth_persistence()
         .builtins(true);
     // One runtime per provider the route can be served by. The call script is
-    // shared through `requested_models`, so a cross-provider swap still reads
+    // shared through `requested_calls`, so a cross-provider swap still reads
     // as one ordered sequence of provider calls.
     let mut registry = ProviderRuntimeRegistry::empty();
-    for provider in route.providers() {
+    for provider in route.providers().into_iter().filter(|provider| {
+        *provider == route.provider_b || environment.availability.is_available(route.model_a)
+    }) {
         let scripted: Arc<dyn LlmClient> = Arc::new(DeferredBrainSwapClient {
-            requested_models: Arc::clone(&environment.requested_models),
+            requested_calls: Arc::clone(&environment.requested_calls),
             provider,
             route,
         });
@@ -810,7 +646,15 @@ async fn attach_harness(
     }
     factory.provider_registry = Arc::new(registry);
 
-    let builder = FactoryAgentBuilder::new(factory, ab_test_config(route));
+    let config = ab_test_config(route, environment.availability.as_ref());
+    if environment.availability.is_available(route.model_a) {
+        meerkat_core::resolve_explicit_auth_binding_target(
+            &config,
+            &expected_auth_binding_named(route.binding_a),
+        )
+        .expect("A's configured binding must resolve in the A/B harness");
+    }
+    let builder = FactoryAgentBuilder::new(factory, config);
     assert!(
         builder.default_llm_client.is_none(),
         "the A->B proof must resolve every client through the provider registry"
@@ -860,6 +704,7 @@ async fn attach_harness(
             environment.temp.path().join("config_state.json"),
         );
 
+    let fresh = resume_session_id.is_none();
     let session = match resume_session_id {
         Some(session_id) => service
             .load_authoritative_session(&session_id)
@@ -874,7 +719,7 @@ async fn attach_harness(
         &service,
         &adapter,
         session,
-        create_request_for(route),
+        create_request_for(route, fresh),
         {
             let service = Arc::clone(&service);
             let adapter = Arc::clone(&adapter);
@@ -907,10 +752,6 @@ struct CommittedHandoffProof {
 async fn commit_brain_swap_request(harness: &AbHarness) -> CommittedHandoffProof {
     let route = harness.environment.route;
     let auth_binding = harness.live_identity().await.auth_binding;
-    assert_eq!(
-        auth_binding.as_ref(),
-        Some(&expected_auth_binding_named(route.binding_a))
-    );
 
     let authoring = harness.run_prompt("please switch after this turn").await;
     assert!(
@@ -1154,16 +995,10 @@ fn assert_exact_realized_terminal(
             assert_eq!(originating_run_id, &proof.origin_run);
             assert_eq!(applied_identity.model, proof.route.model_b);
             assert_eq!(applied_identity.provider, proof.route.provider_b);
-            // Same-provider routes keep their pinned binding. Cross-provider
-            // routes currently record an unset binding and let ordinary
-            // resolution pick it at build time — see the note in
-            // `brain_swap_crosses_the_provider_seam`.
-            let expected_binding = if proof.route.provider_a == proof.route.provider_b {
+            assert_eq!(
+                applied_identity.auth_binding,
                 Some(expected_auth_binding_named(proof.route.binding_b))
-            } else {
-                None
-            };
-            assert_eq!(applied_identity.auth_binding, expected_binding);
+            );
         }
         other => panic!("expected a durable Realized terminal, got {other:?}"),
     }
@@ -1178,8 +1013,9 @@ fn assert_exact_realized_terminal(
 /// different client. The durable `Realized` record must say so, and the next
 /// provider call must actually land on OpenAI.
 ///
-/// No live credentials: both providers are scripted runtimes with inline test
-/// secrets, and there is no provider-specific branch in production code.
+/// No live credentials: both providers are scripted runtimes with non-secret
+/// managed binding identities and static test leases, and there is no
+/// provider-specific branch in production code.
 async fn brain_swap_crosses_the_provider_seam(profile: PersistenceProfile) {
     let route = CROSS_PROVIDER_ROUTE;
     let harness = build_harness_for(profile, route).await;
@@ -1191,7 +1027,7 @@ async fn brain_swap_crosses_the_provider_seam(profile: PersistenceProfile) {
     assert_eq!(
         before.auth_binding,
         Some(expected_auth_binding_named(route.binding_a)),
-        "A must be served by its own configured binding"
+        "the authoring route must use A's configured non-secret binding identity"
     );
 
     let proof = commit_brain_swap_request(&harness).await;
@@ -1211,6 +1047,24 @@ async fn brain_swap_crosses_the_provider_seam(profile: PersistenceProfile) {
         ],
         "both authoring calls stay on A and the next call is B"
     );
+    assert_eq!(
+        harness.requested_calls(),
+        vec![
+            ProviderCall {
+                provider: route.provider_a,
+                model: route.model_a.to_string(),
+            },
+            ProviderCall {
+                provider: route.provider_a,
+                model: route.model_a.to_string(),
+            },
+            ProviderCall {
+                provider: route.provider_b,
+                model: route.model_b.to_string(),
+            },
+        ],
+        "the first post-handoff call must be served by B's provider runtime"
+    );
 
     let after = harness.durable_identity().await;
     assert_eq!(after.model, route.model_b);
@@ -1224,21 +1078,10 @@ async fn brain_swap_crosses_the_provider_seam(profile: PersistenceProfile) {
         after.auth_binding, proof.auth_binding,
         "a cross-provider swap must not keep A's binding"
     );
-    // MEASURED, and narrower than one might expect: the applied identity does
-    // not PIN B's binding, it leaves it unset. `preserve_credential_account_
-    // affinity` only fills a binding when the current credential identity is an
-    // Account; for ordinary API-key bindings it declines, and the model-only
-    // resolver returns `auth_binding: None`. The build path then resolves the
-    // provider's configured binding, which is why B really does serve the next
-    // call and the restart below succeeds — but the durable record does not
-    // name the credential route it landed on.
-    //
-    // Asserting the truth here rather than the wish: pinning the resolved
-    // binding would change shared provider-switch credential semantics, which
-    // is a release decision, not a test fix.
     assert_eq!(
-        after.auth_binding, None,
-        "cross-provider model-only switches currently leave the binding to ordinary resolution"
+        after.auth_binding,
+        Some(expected_auth_binding_named(route.binding_b)),
+        "the realized identity must durably name B's non-secret binding identity"
     );
     assert_exact_realized_terminal(&harness.durable_routing_records().await, &proof);
 
@@ -1279,6 +1122,14 @@ async fn brain_swap_crosses_the_provider_seam(profile: PersistenceProfile) {
             route.model_b.to_string(),
         ],
         "the restarted turn must also be served by B"
+    );
+    assert_eq!(
+        harness.requested_calls().last(),
+        Some(&ProviderCall {
+            provider: route.provider_b,
+            model: route.model_b.to_string(),
+        }),
+        "the restarted call must also be served by B's provider runtime"
     );
     assert_eq!(
         harness.live_identity().await.provider,

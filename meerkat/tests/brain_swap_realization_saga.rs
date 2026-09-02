@@ -31,8 +31,7 @@ use meerkat_core::image_generation::{
 use meerkat_core::lifecycle::RunId;
 use meerkat_core::lifecycle::run_primitive::ModelId;
 use meerkat_core::session::model_routing_control::{
-    ModelRoutingControlAppendOutcome, SessionModelRoutingControlHistory,
-    SessionModelRoutingControlRecord,
+    SessionModelRoutingControlHistory, SessionModelRoutingControlRecord,
 };
 use meerkat_core::types::SessionId;
 use meerkat_core::{Provider, SessionLlmIdentity, SessionToolVisibilityState};
@@ -92,7 +91,7 @@ enum HostCall {
     Hydrate,
     Resolve,
     ApplyIdentity(String),
-    AppendRecord(&'static str),
+    PrepareRecord(&'static str),
     Persist,
     Discard,
 }
@@ -106,11 +105,7 @@ struct ScriptedReconfigureHost {
     preflight_fails: Mutex<Option<String>>,
     append_fails: Mutex<Option<String>>,
     persist_fails: Mutex<Option<String>>,
-    /// Fails only the persist that FOLLOWS a durable terminal append — the
-    /// exact window in which the live session holds a settled record that is
-    /// not yet durable.
-    persist_fails_after_terminal_append: Mutex<Option<String>>,
-    terminal_appended: Mutex<bool>,
+    terminal_commit_fails: Mutex<Option<String>>,
     discard_fails: Mutex<Option<String>>,
 }
 
@@ -151,8 +146,7 @@ impl ScriptedReconfigureHost {
             preflight_fails: Mutex::new(None),
             append_fails: Mutex::new(None),
             persist_fails: Mutex::new(None),
-            persist_fails_after_terminal_append: Mutex::new(None),
-            terminal_appended: Mutex::new(false),
+            terminal_commit_fails: Mutex::new(None),
             discard_fails: Mutex::new(None),
         }
     }
@@ -193,9 +187,9 @@ impl ScriptedReconfigureHost {
     /// The identity-swap persist is deliberately NOT failable here: it has its
     /// own compensation, and failing it never reaches the terminal append, so
     /// it cannot exercise the shadow this suite is about.
-    fn fail_persist_after_terminal_append(&self, reason: &str) {
+    fn fail_terminal_commit(&self, reason: &str) {
         *self
-            .persist_fails_after_terminal_append
+            .terminal_commit_fails
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason.to_string());
     }
@@ -343,18 +337,7 @@ impl SessionLlmReconfigureHost for ScriptedReconfigureHost {
         {
             return Err(RuntimeDriverError::Internal(reason));
         }
-        if *self
-            .terminal_appended
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            && let Some(reason) = self
-                .persist_fails_after_terminal_append
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-        {
-            return Err(RuntimeDriverError::Internal(reason));
-        }
+
         // A successful persist is what makes the live log durable.
         let live = self.history();
         *self
@@ -370,28 +353,30 @@ impl SessionLlmReconfigureHost for ScriptedReconfigureHost {
     /// PERSISTED log — because that is the whole point of the discard: an
     /// appended-but-unpersisted terminal must not survive as live state that
     /// reports a request settled when nothing on disk owes it.
-    async fn commit_live_session_model_routing_control_record(
+    async fn commit_session_model_routing_control_record_durable_first(
         &self,
-        session_id: &SessionId,
+        _session_id: &SessionId,
         record: SessionModelRoutingControlRecord,
     ) -> Result<(), RuntimeDriverError> {
-        // Mirrors the persistent service: append, persist, and compensate by
-        // discarding the live projection if either step fails — as ONE
-        // operation, so a caller can never observe a live-only terminal.
-        let appended = self.append_live_record(record).await;
-        let outcome = match appended {
-            Ok(_) => self.persist_live_session(session_id).await,
-            Err(error) => Err(error),
-        };
-        let Err(error) = outcome else {
-            return Ok(());
-        };
-        match self.discard_live_session(session_id).await {
-            Ok(()) => Err(error),
-            Err(discard_error) => Err(RuntimeDriverError::Internal(format!(
-                "{error}; and failed to discard the live session afterwards: {discard_error}"
-            ))),
+        let candidate = self.prepare_detached_record(record).await?;
+        self.record(HostCall::Persist);
+        if let Some(reason) = self
+            .terminal_commit_fails
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return Err(RuntimeDriverError::Internal(reason));
         }
+        *self
+            .persisted_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = candidate.clone();
+        *self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = candidate;
+        Ok(())
     }
 
     async fn discard_live_session(
@@ -428,17 +413,10 @@ impl SessionLlmReconfigureHost for ScriptedReconfigureHost {
 }
 
 impl ScriptedReconfigureHost {
-    /// The live half of the commit, kept as an inherent helper.
-    ///
-    /// The production host has no append-only seam any more: appending without
-    /// committing is exactly the shape that could strand a terminal in live
-    /// state, so it is not offered. This double still needs the two halves
-    /// separately in order to model a failure BETWEEN them, which is what the
-    /// compensation is for.
-    async fn append_live_record(
+    async fn prepare_detached_record(
         &self,
         record: SessionModelRoutingControlRecord,
-    ) -> Result<ModelRoutingControlAppendOutcome, RuntimeDriverError> {
+    ) -> Result<SessionModelRoutingControlHistory, RuntimeDriverError> {
         let label = match &record {
             SessionModelRoutingControlRecord::ModelRoutingIntentRequested { .. } => "requested",
             SessionModelRoutingControlRecord::ModelRoutingIntentRealized { .. } => "realized",
@@ -446,13 +424,7 @@ impl ScriptedReconfigureHost {
             SessionModelRoutingControlRecord::ModelRoutingIntentAbandoned { .. } => "abandoned",
             _ => "unknown",
         };
-        self.record(HostCall::AppendRecord(label));
-        if matches!(label, "realized" | "denied" | "abandoned") {
-            *self
-                .terminal_appended
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-        }
+        self.record(HostCall::PrepareRecord(label));
         if let Some(reason) = self
             .append_fails
             .lock()
@@ -461,13 +433,15 @@ impl ScriptedReconfigureHost {
         {
             return Err(RuntimeDriverError::Internal(reason));
         }
-        let mut history = self
-            .history
+        let mut candidate = self
+            .persisted_history
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        history
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        candidate
             .append(record)
-            .map_err(|error| RuntimeDriverError::Internal(error.to_string()))
+            .map_err(|error| RuntimeDriverError::Internal(error.to_string()))?;
+        Ok(candidate)
     }
 }
 
@@ -597,15 +571,15 @@ async fn a_committed_request_with_a_committed_origin_boundary_realizes_and_recor
     let calls = fixture.host.calls();
     let append_index = calls
         .iter()
-        .position(|call| matches!(call, HostCall::AppendRecord("realized")))
-        .expect("the Realized record must be appended");
+        .position(|call| matches!(call, HostCall::PrepareRecord("realized")))
+        .expect("the detached Realized candidate must be prepared");
     let persist_index = calls
         .iter()
         .rposition(|call| matches!(call, HostCall::Persist))
         .expect("the Realized record must be persisted");
     assert!(
         append_index < persist_index,
-        "the durable Realized record must be persisted after it is appended: {calls:?}"
+        "the durable Realized record must be persisted after its candidate is prepared: {calls:?}"
     );
 
     let history = fixture.host.history();
@@ -806,7 +780,7 @@ async fn an_exact_replay_after_realization_converges_already_exact() {
     );
 }
 
-/// Existing host seams can fail the terminal append after the reconfigure
+/// The durable-first host seam can fail candidate preparation after the reconfigure
 /// transaction has already persisted B. The retry must observe the exact live
 /// target and finish the record/generated terminal without applying B again.
 #[tokio::test]
@@ -817,7 +791,9 @@ async fn retry_after_b_persist_before_realized_append_does_not_rotate_twice() {
         Some(run),
     )
     .await;
-    fixture.host.fail_append("crash before Realized append");
+    fixture
+        .host
+        .fail_append("crash before Realized candidate preparation");
     let handoff = fixture
         .adapter
         .committed_model_routing_handoffs_awaiting_decision(&fixture.session_id)
@@ -834,7 +810,7 @@ async fn retry_after_b_persist_before_realized_append_does_not_rotate_twice() {
             handoff.clone(),
         )
         .await
-        .expect_err("the injected terminal-append crash must surface");
+        .expect_err("the injected terminal-candidate crash must surface");
     assert_eq!(
         fixture.host.identity_applications(),
         vec![MODEL_B.to_string()],
@@ -879,10 +855,8 @@ async fn retry_after_b_persist_before_realized_append_does_not_rotate_twice() {
 ///
 /// If persisting the durable `Realized` record fails, two things must hold.
 /// The generated terminal must NOT be marked — otherwise the machine would
-/// claim a routing change with nothing on disk to support it. And the LIVE
-/// session must not keep the appended-but-unpersisted terminal either, because
-/// the next pre-dequeue lap reads the live session: a settled live record over
-/// a still-pending durable log is a request that silently stops being owed.
+/// claim a routing change with nothing on disk to support it. The detached
+/// candidate must also remain invisible to the committed history reader.
 ///
 /// The retry deliberately re-reads pending authority rather than reusing the
 /// handoff captured before the failure. Reusing it would prove only that a
@@ -896,7 +870,7 @@ async fn a_persistence_failure_leaves_the_generated_terminal_unmarked() {
         Some(run),
     )
     .await;
-    fixture.host.fail_persist_after_terminal_append("disk full");
+    fixture.host.fail_terminal_commit("disk full");
     let pending = fixture
         .adapter
         .committed_model_routing_handoffs_awaiting_decision(&fixture.session_id)
@@ -913,18 +887,11 @@ async fn a_persistence_failure_leaves_the_generated_terminal_unmarked() {
         .await
         .expect_err("a persistence failure must surface");
 
-    assert!(
-        fixture.host.calls().contains(&HostCall::Discard),
-        "a failed terminal persist must discard the live session rather than leave a settled \
-         record that was never committed: {:?}",
-        fixture.host.calls()
-    );
-
     // Recovering: persistence works again. The retry re-reads pending
     // authority, which must still owe this exact request.
     *fixture
         .host
-        .persist_fails_after_terminal_append
+        .terminal_commit_fails
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     let still_pending = fixture
@@ -949,50 +916,6 @@ async fn a_persistence_failure_leaves_the_generated_terminal_unmarked() {
     assert!(
         matches!(retry, ModelRoutingHandoffRealization::Realized { .. }),
         "the retry must complete the request, got {retry:?}"
-    );
-}
-
-/// When the discard ITSELF fails, the live actor is known-poisoned: it holds a
-/// terminal that was never committed and cannot be reloaded. The failure must
-/// name both causes so the caller tears down rather than continuing.
-#[tokio::test]
-async fn a_failed_discard_after_a_failed_persist_surfaces_both_causes() {
-    let run = RunId::new();
-    let fixture = fixture_with(
-        committed_request_history(request_id(11), &run, MODEL_B),
-        Some(run),
-    )
-    .await;
-    fixture.host.fail_persist_after_terminal_append("disk full");
-    *fixture
-        .host
-        .discard_fails
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-        Some("actor slot is wedged".to_string());
-
-    let pending = fixture
-        .adapter
-        .committed_model_routing_handoffs_awaiting_decision(&fixture.session_id)
-        .await
-        .expect("read committed log");
-
-    let error = fixture
-        .adapter
-        .realize_committed_model_routing_handoff_under_turn_finalization_boundary(
-            &fixture.session_id,
-            pending[0].clone(),
-        )
-        .await
-        .expect_err("a persistence failure whose discard also fails must surface");
-    let rendered = error.to_string();
-    assert!(
-        rendered.contains("disk full"),
-        "the original persistence failure must survive: {rendered}"
-    );
-    assert!(
-        rendered.contains("actor slot is wedged"),
-        "the discard failure must be reported too, not swallowed: {rendered}"
     );
 }
 
@@ -1062,7 +985,7 @@ async fn claim_only(fixture: &Fixture, request: SwitchTurnRequestId, run: &RunId
     // stays Requested — exactly the state a crash mid-realization produces.
     fixture
         .host
-        .fail_persist_after_terminal_append("simulated crash before the durable terminal");
+        .fail_terminal_commit("simulated crash before the durable terminal");
     let _ = fixture
         .adapter
         .realize_committed_model_routing_handoff_under_turn_finalization_boundary(
@@ -1072,7 +995,7 @@ async fn claim_only(fixture: &Fixture, request: SwitchTurnRequestId, run: &RunId
         .await;
     *fixture
         .host
-        .persist_fails_after_terminal_append
+        .terminal_commit_fails
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }

@@ -288,7 +288,7 @@ pub trait SessionRuntimeLlmReconfigureService: Send + Sync {
     /// task it owns. Cancelling the caller must not be able to tear the pair in
     /// half, and an implementation cannot offer that if the only handle it has
     /// is borrowed from the caller's frame.
-    async fn commit_live_model_routing_control_record_under_runtime_turn_boundary(
+    async fn commit_model_routing_control_record_durable_first(
         self: Arc<Self>,
         session_id: &SessionId,
         record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
@@ -493,12 +493,12 @@ impl SessionRuntimeLlmReconfigureService for PersistentSessionService<FactoryAge
         }
     }
 
-    async fn commit_live_model_routing_control_record_under_runtime_turn_boundary(
+    async fn commit_model_routing_control_record_durable_first(
         self: Arc<Self>,
         session_id: &SessionId,
         record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
     ) -> Result<(), SessionError> {
-        PersistentSessionService::<FactoryAgentBuilder>::commit_live_model_routing_control_record_under_runtime_turn_boundary(
+        PersistentSessionService::<FactoryAgentBuilder>::commit_model_routing_control_record_durable_first(
             self, session_id, record,
         )
         .await
@@ -654,7 +654,7 @@ impl SessionRuntimeLlmReconfigureService for EphemeralSessionService<FactoryAgen
     // handoff can never exist for them and this can never legitimately be
     // reached. Refusing keeps that impossibility loud instead of recording a
     // resolution into state that is about to disappear.
-    async fn commit_live_model_routing_control_record_under_runtime_turn_boundary(
+    async fn commit_model_routing_control_record_durable_first(
         self: Arc<Self>,
         _session_id: &SessionId,
         _record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
@@ -1157,15 +1157,13 @@ impl SessionLlmReconfigureHost for SessionRuntimeLlmReconfigureHost {
             .map_err(session_error_to_runtime_driver)
     }
 
-    async fn commit_live_session_model_routing_control_record(
+    async fn commit_session_model_routing_control_record_durable_first(
         &self,
         session_id: &SessionId,
         record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
     ) -> Result<(), RuntimeDriverError> {
         Arc::clone(&self.service)
-            .commit_live_model_routing_control_record_under_runtime_turn_boundary(
-                session_id, record,
-            )
+            .commit_model_routing_control_record_durable_first(session_id, record)
             .await
             .map_err(session_error_to_runtime_driver)
     }
@@ -1289,7 +1287,7 @@ mod tests {
             unreachable!("realm selection does not read the handoff log")
         }
 
-        async fn commit_live_model_routing_control_record_under_runtime_turn_boundary(
+        async fn commit_model_routing_control_record_durable_first(
             self: Arc<Self>,
             _session_id: &SessionId,
             _record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
