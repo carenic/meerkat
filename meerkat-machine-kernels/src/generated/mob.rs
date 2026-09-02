@@ -6389,6 +6389,7 @@ pub enum Phase {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct State {
     pub phase: Phase,
+    pub definition_epoch: u64,
     pub destroy_admitted: bool,
     pub live_runtime_ids: std::collections::BTreeSet<AgentRuntimeId>,
     pub externally_addressable_runtime_ids: std::collections::BTreeSet<AgentRuntimeId>,
@@ -6741,6 +6742,11 @@ impl Default for State {
 pub mod inputs {
     #[allow(unused_imports)]
     use super::*;
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AdvanceDefinitionEpoch {
+        pub expected_epoch: u64,
+        pub next_epoch: u64,
+    }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RunFlow {
         pub run_id: RunId,
@@ -8010,6 +8016,7 @@ pub mod inputs {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Input {
+    AdvanceDefinitionEpoch(inputs::AdvanceDefinitionEpoch),
     RunFlow(inputs::RunFlow),
     CreateRunSeed(inputs::CreateRunSeed),
     CreateFrameSeed(inputs::CreateFrameSeed),
@@ -8219,6 +8226,7 @@ pub enum Input {
 impl Input {
     pub fn kind(&self) -> InputKind {
         match self {
+            Self::AdvanceDefinitionEpoch(_) => InputKind::AdvanceDefinitionEpoch,
             Self::RunFlow(_) => InputKind::RunFlow,
             Self::CreateRunSeed(_) => InputKind::CreateRunSeed,
             Self::CreateFrameSeed(_) => InputKind::CreateFrameSeed,
@@ -8499,6 +8507,7 @@ impl Input {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum InputKind {
+    AdvanceDefinitionEpoch,
     RunFlow,
     CreateRunSeed,
     CreateFrameSeed,
@@ -9365,6 +9374,11 @@ pub mod effects {
     #[allow(unused_imports)]
     use super::*;
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct DefinitionEpochAdvanced {
+        pub previous_epoch: u64,
+        pub epoch: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RequestRuntimeBinding {
         pub agent_identity: AgentIdentity,
         pub agent_runtime_id: AgentRuntimeId,
@@ -10183,6 +10197,7 @@ pub mod effects {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Effect {
+    DefinitionEpochAdvanced(effects::DefinitionEpochAdvanced),
     RequestRuntimeBinding(effects::RequestRuntimeBinding),
     SpawnProfileAuthorized(effects::SpawnProfileAuthorized),
     RequestRuntimeIngress(effects::RequestRuntimeIngress),
@@ -10331,6 +10346,7 @@ pub enum Effect {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EffectKind {
+    DefinitionEpochAdvanced,
     RequestRuntimeBinding,
     SpawnProfileAuthorized,
     RequestRuntimeIngress,
@@ -11347,6 +11363,7 @@ pub enum TransitionId {
     BindOwnerBridgeSessionRunning,
     RecoverOwnerBridgeSessionRunning,
     RecoverOwnerBridgeSessionAlreadyCurrent,
+    AdvanceDefinitionEpochRunning,
     StopRunning,
     ResumeStopped,
     CompleteRunning,
@@ -11959,6 +11976,7 @@ pub mod helpers {
 pub fn initial_state() -> State {
     State {
         phase: Phase::Running,
+        definition_epoch: 1,
         destroy_admitted: false,
         live_runtime_ids: Default::default(),
         externally_addressable_runtime_ids: Default::default(),

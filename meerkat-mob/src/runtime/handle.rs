@@ -1871,7 +1871,11 @@ impl std::error::Error for MobSpawnManyFailure {
 
 fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFailureObservationKind {
     match error {
-        MobError::MobNotFound(_) => mob_dsl::MobSpawnManyFailureObservationKind::Internal,
+        MobError::MobNotFound(_)
+        | MobError::MobDefinitionProjectionMismatch { .. }
+        | MobError::MobDefinitionAuthorityChanged { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::Internal
+        }
         MobError::ProfileNotFound(_) => {
             mob_dsl::MobSpawnManyFailureObservationKind::ProfileNotFound
         }

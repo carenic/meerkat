@@ -12,6 +12,7 @@ macro_rules! mob_catalog_machine_dsl {
 
         state {
             lifecycle_phase: MobPhase,
+            definition_epoch: u64,
             destroy_admitted: bool,
             live_runtime_ids: Set<AgentRuntimeId>,
             externally_addressable_runtime_ids: Set<AgentRuntimeId>,
@@ -491,6 +492,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         init(Running) {
+            definition_epoch = 1,
             destroy_admitted = false,
             live_runtime_ids = EmptySet,
             externally_addressable_runtime_ids = EmptySet,
@@ -772,6 +774,10 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         input MobMachineInput {
+            AdvanceDefinitionEpoch {
+                expected_epoch: u64,
+                next_epoch: u64,
+            },
             RunFlow {
                 run_id: RunId,
                 step_ids: Set<StepId>,
@@ -1700,6 +1706,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         effect MobMachineEffect {
+            DefinitionEpochAdvanced { previous_epoch: u64, epoch: u64 },
             RequestRuntimeBinding { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Option<Generation>, session_id: SessionId },
             SpawnProfileAuthorized { agent_identity: AgentIdentity, profile_name: String, model: String, profile_material_digest: String, tool_config_digest: String, skills_digest: String, provider_params_digest: Option<String>, output_schema_digest: Option<String>, external_addressable: bool, resolved_spec_digest: Option<String> },
             RequestRuntimeIngress { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Option<Generation>, session_id: SessionId, work_id: WorkId, origin: Enum<WorkOrigin> },
@@ -2564,6 +2571,7 @@ macro_rules! mob_catalog_machine_dsl {
             }}}}}}
         }
 
+        disposition DefinitionEpochAdvanced => local seam SurfaceResultAlignment,
         disposition RequestRuntimeBinding => routed [MeerkatMachine] seam NoOwnerRealization,
         disposition SpawnProfileAuthorized => local seam NoOwnerRealization,
         disposition RequestRuntimeIngress => routed [MeerkatMachine] seam NoOwnerRealization,
@@ -12550,6 +12558,27 @@ macro_rules! mob_catalog_machine_dsl {
         // =====================================================================
         // Phase-changing transitions
         // =====================================================================
+
+        transition AdvanceDefinitionEpochRunning {
+            on input AdvanceDefinitionEpoch { expected_epoch, next_epoch }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "lifecycle_origin_open" { self.placed_completion_lifecycle_quiescing == false }
+            guard "no_active_runs" { self.active_run_count == 0 }
+            guard "no_pending_spawns" { self.pending_spawn_count == 0 }
+            guard "definition_epoch_cas" { self.definition_epoch == expected_epoch }
+            guard "definition_epoch_successor" {
+                next_epoch > expected_epoch
+                && next_epoch == expected_epoch + 1
+            }
+            update {
+                self.definition_epoch = next_epoch;
+            }
+            to Running
+            emit DefinitionEpochAdvanced {
+                previous_epoch: expected_epoch,
+                epoch: next_epoch
+            }
+        }
 
         transition StopRunning {
             on input Stop

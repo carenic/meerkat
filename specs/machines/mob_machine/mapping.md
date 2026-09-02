@@ -2238,6 +2238,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RecoverOwnerBridgeSessionAlreadyCurrent`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `AdvanceDefinitionEpochRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `StopRunning`
   - anchors: (unclaimed)
   - scenarios: `retire-recover-destroy`
@@ -3857,6 +3860,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - scenarios: `coordination-board-records-and-overlap`
 
 ### Effects
+- `DefinitionEpochAdvanced`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `RequestRuntimeBinding`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
