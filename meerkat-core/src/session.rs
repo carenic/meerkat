@@ -839,7 +839,7 @@ pub struct Session {
     /// baseline stays owned by generated machine state. Records let a run
     /// request a permanent model change that a later, different owner realizes
     /// once this run has durably committed.
-    model_routing_control: model_routing_control::SessionModelRoutingControlHistory,
+    model_routing_control: Box<model_routing_control::SessionModelRoutingControlHistory>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1159,11 +1159,12 @@ impl<'de> Deserialize<'de> for Session {
             ));
         }
         let history_caches = Box::<SessionHistoryCaches>::default();
-        let model_routing_control =
+        let model_routing_control = Box::new(
             model_routing_control::SessionModelRoutingControlHistory::from_records(
                 serde_repr.model_routing_control,
             )
-            .map_err(<D::Error as serde::de::Error>::custom)?;
+            .map_err(<D::Error as serde::de::Error>::custom)?,
+        );
         let mut session = Session {
             version,
             id: serde_repr.id,
@@ -1579,7 +1580,7 @@ impl Session {
             realtime_transcript,
             history_caches,
             usage,
-            model_routing_control,
+            model_routing_control: Box::new(model_routing_control),
         };
         if let Some(projection) = head_canonical_metadata {
             session
@@ -3422,7 +3423,9 @@ impl Session {
             history_caches: Box::default(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: Usage::default(),
-            model_routing_control: model_routing_control::SessionModelRoutingControlHistory::new(),
+            model_routing_control: Box::new(
+                model_routing_control::SessionModelRoutingControlHistory::new(),
+            ),
         }
     }
 
@@ -5910,7 +5913,7 @@ impl Session {
         // The committed handoff log is durable-head truth, exactly like usage:
         // recovery adopts the head's records rather than retaining a local tail
         // that the durable head never acknowledged.
-        self.model_routing_control =
+        *self.model_routing_control =
             model_routing_control::SessionModelRoutingControlHistory::from_records(
                 head_model_routing_control.to_vec(),
             )
@@ -6688,7 +6691,9 @@ impl Session {
             // owed handoff belongs to the originating session's runtime, so it
             // must not be inherited: otherwise parent and fork could each
             // realize the same committed intent.
-            model_routing_control: model_routing_control::SessionModelRoutingControlHistory::new(),
+            model_routing_control: Box::new(
+                model_routing_control::SessionModelRoutingControlHistory::new(),
+            ),
         }
     }
 
@@ -6865,7 +6870,9 @@ impl Session {
             usage: self.usage.clone(),
             // See `fork_at`: a new identity inherits no handoff log at all,
             // owed or settled.
-            model_routing_control: model_routing_control::SessionModelRoutingControlHistory::new(),
+            model_routing_control: Box::new(
+                model_routing_control::SessionModelRoutingControlHistory::new(),
+            ),
         }
     }
 }

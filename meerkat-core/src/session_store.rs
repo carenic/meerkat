@@ -9345,7 +9345,7 @@ mod tests {
 
             let mut owed = plain;
             owed.model_routing_control
-                .append(owed_handoff("claude-opus-5"))
+                .append(owed_handoff("model-b"))
                 .expect("request appends");
             let owed_token = session_head_cas_token(&owed).expect("token derives");
 
@@ -9378,11 +9378,11 @@ mod tests {
 
             let mut opus = base.clone();
             opus.model_routing_control
-                .append(request("claude-opus-5"))
+                .append(request("model-b"))
                 .expect("request appends");
             let mut gpt = base;
             gpt.model_routing_control
-                .append(request("gpt-5.5"))
+                .append(request("model-a"))
                 .expect("request appends");
 
             assert_ne!(
@@ -9400,7 +9400,7 @@ mod tests {
             // carrier, and it must stay pinned.
             let mut session = base_session();
             session
-                .append_model_routing_control_record(owed_handoff("claude-opus-5"))
+                .append_model_routing_control_record(owed_handoff("model-b"))
                 .expect("request appends");
             let head = head_canonical_head(&session);
             let stored_token = session_head_cas_token(&head).expect("stored token derives");
@@ -9432,7 +9432,7 @@ mod tests {
         fn a_head_transition_must_extend_the_committed_handoff_log() {
             let mut committed_session = base_session();
             committed_session
-                .append_model_routing_control_record(owed_handoff("claude-opus-5"))
+                .append_model_routing_control_record(owed_handoff("model-b"))
                 .expect("request appends");
             let stored = head_canonical_head(&committed_session);
 
@@ -9453,7 +9453,7 @@ mod tests {
             // Extending is legal.
             let mut extended_session = committed_session.clone();
             extended_session
-                .append_model_routing_control_record(owed_handoff("gpt-5.5"))
+                .append_model_routing_control_record(owed_handoff("model-a"))
                 .expect("second request appends");
             let extended = head_canonical_head(&extended_session);
             validate_model_routing_control_durable_transition(

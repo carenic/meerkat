@@ -17,7 +17,8 @@
 
 use meerkat_machine_schema::catalog::dsl::meerkat_machine::{
     MeerkatMachineAuthority, MeerkatMachineInput, MeerkatMachineMutator, MeerkatMachineSignal,
-    RoutingHandoffPhase, SessionId,
+    ModelRoutingHandoffRecord, ModelRoutingHandoffRecordError, RoutingAppliedModel,
+    RoutingDenialReason, RoutingHandoffPhase, SessionId,
 };
 
 const REQUEST: &str = "req-1";
@@ -42,6 +43,34 @@ fn registered_authority() -> MeerkatMachineAuthority {
     authority
 }
 
+/// Propose a record in `phase` for `run`/`target`, carrying no outcome fact.
+///
+/// Only the three outcome-free phases are constructible this way, which is the
+/// point: `Realized` and `Denied` cannot exist without the fact that produced
+/// them, so they have their own constructors.
+/// A shorthand for the constructors' `Result` in tests that pass valid input.
+///
+/// Kept as an explicit expect rather than an `unwrap` so a future change that
+/// tightens validation names the record it refused.
+fn valid(
+    record: Result<ModelRoutingHandoffRecord, ModelRoutingHandoffRecordError>,
+) -> ModelRoutingHandoffRecord {
+    record.expect("test builds a valid handoff record")
+}
+
+fn pending_record(
+    phase: RoutingHandoffPhase,
+    run: &str,
+    target: &str,
+) -> ModelRoutingHandoffRecord {
+    match phase {
+        RoutingHandoffPhase::Imported => valid(ModelRoutingHandoffRecord::imported(run, target)),
+        RoutingHandoffPhase::Claimed => valid(ModelRoutingHandoffRecord::claimed(run, target)),
+        RoutingHandoffPhase::Archived => valid(ModelRoutingHandoffRecord::archived(run, target)),
+        other => unreachable!("{other:?} is not an outcome-free phase"),
+    }
+}
+
 fn import(
     authority: &mut MeerkatMachineAuthority,
     request_id: &str,
@@ -52,12 +81,32 @@ fn import(
         authority,
         MeerkatMachineInput::ImportCommittedModelRoutingHandoff {
             request_id: request_id.to_string(),
-            originating_run_id: run.to_string(),
-            target_model: target.to_string(),
+            record: pending_record(RoutingHandoffPhase::Imported, run, target),
         },
     )
     .map(|_| ())
     .map_err(|error| format!("{error:?}"))
+}
+
+/// The record generated authority currently holds, as the shell would read it.
+///
+/// Every non-import transition names the state it observed, so tests read it
+/// the same way production does. A request that is absent yields the
+/// `Imported` record for its identity, which is deliberately WRONG for a
+/// missing key — that keeps "claiming an unimported request" a real refusal
+/// rather than an accident of the harness.
+fn observed(
+    authority: &MeerkatMachineAuthority,
+    request_id: &str,
+    run: &str,
+    target: &str,
+) -> ModelRoutingHandoffRecord {
+    authority
+        .state()
+        .model_routing_handoff
+        .get(request_id)
+        .cloned()
+        .unwrap_or_else(|| valid(ModelRoutingHandoffRecord::imported(run, target)))
 }
 
 fn claim(
@@ -66,12 +115,13 @@ fn claim(
     run: &str,
     target: &str,
 ) -> Result<(), String> {
+    let observed = observed(authority, request_id, run, target);
     MeerkatMachineMutator::apply(
         authority,
         MeerkatMachineInput::ClaimModelRoutingHandoff {
             request_id: request_id.to_string(),
-            originating_run_id: run.to_string(),
-            target_model: target.to_string(),
+            observed,
+            record: pending_record(RoutingHandoffPhase::Claimed, run, target),
         },
     )
     .map(|_| ())
@@ -85,13 +135,32 @@ fn realize(
     target: &str,
     applied: &str,
 ) -> Result<(), String> {
+    let observed = observed(authority, request_id, run, target);
     MeerkatMachineMutator::apply(
         authority,
         MeerkatMachineInput::RealizeModelRoutingHandoff {
             request_id: request_id.to_string(),
-            originating_run_id: run.to_string(),
-            target_model: target.to_string(),
-            applied_model: applied.to_string(),
+            observed,
+            record: valid(ModelRoutingHandoffRecord::realized(run, target, applied)),
+        },
+    )
+    .map(|_| ())
+    .map_err(|error| format!("{error:?}"))
+}
+
+fn archive(
+    authority: &mut MeerkatMachineAuthority,
+    request_id: &str,
+    run: &str,
+    target: &str,
+) -> Result<(), String> {
+    let observed = observed(authority, request_id, run, target);
+    MeerkatMachineMutator::apply(
+        authority,
+        MeerkatMachineInput::ArchiveUnresolvedModelRoutingHandoff {
+            request_id: request_id.to_string(),
+            observed,
+            record: valid(ModelRoutingHandoffRecord::archived(run, target)),
         },
     )
     .map(|_| ())
@@ -101,9 +170,9 @@ fn realize(
 fn phase(authority: &MeerkatMachineAuthority, request_id: &str) -> Option<RoutingHandoffPhase> {
     authority
         .state()
-        .model_routing_handoff_phase
+        .model_routing_handoff
         .get(request_id)
-        .copied()
+        .map(ModelRoutingHandoffRecord::phase)
 }
 
 #[test]
@@ -127,9 +196,10 @@ fn import_then_claim_then_realize_walks_the_lifecycle() {
     assert_eq!(
         authority
             .state()
-            .model_routing_handoff_applied_model
+            .model_routing_handoff
             .get(REQUEST)
-            .map(String::as_str),
+            .and_then(ModelRoutingHandoffRecord::applied_model)
+            .map(RoutingAppliedModel::as_str),
         Some(TARGET),
         "the resolved identity that was actually installed must be recorded"
     );
@@ -210,9 +280,9 @@ fn the_same_request_id_with_a_different_target_is_refused() {
     assert_eq!(
         authority
             .state()
-            .model_routing_handoff_target
+            .model_routing_handoff
             .get(REQUEST)
-            .map(String::as_str),
+            .map(ModelRoutingHandoffRecord::target_model),
         Some(TARGET),
         "the refused import must not have mutated the committed target"
     );
@@ -229,9 +299,9 @@ fn the_same_request_id_from_a_different_run_is_refused() {
     assert_eq!(
         authority
             .state()
-            .model_routing_handoff_run
+            .model_routing_handoff
             .get(REQUEST)
-            .map(String::as_str),
+            .map(ModelRoutingHandoffRecord::originating_run),
         Some(RUN)
     );
 }
@@ -266,13 +336,8 @@ fn realizing_an_unclaimed_request_is_refused() {
 fn archiving_a_pending_handoff_requires_retired_and_is_idempotent() {
     let mut authority = registered_authority();
     import(&mut authority, REQUEST, RUN, TARGET).expect("import");
-    MeerkatMachineMutator::apply(
-        &mut authority,
-        MeerkatMachineInput::ArchiveUnresolvedModelRoutingHandoff {
-            request_id: REQUEST.to_string(),
-        },
-    )
-    .expect_err("an active session cannot mint an archived handoff");
+    archive(&mut authority, REQUEST, RUN, TARGET)
+        .expect_err("an active session cannot mint an archived handoff");
     assert_eq!(
         phase(&authority, REQUEST),
         Some(RoutingHandoffPhase::Imported)
@@ -285,13 +350,7 @@ fn archiving_a_pending_handoff_requires_retired_and_is_idempotent() {
     )
     .expect("session retires before handoff archive");
     for _ in 0..2 {
-        MeerkatMachineMutator::apply(
-            &mut authority,
-            MeerkatMachineInput::ArchiveUnresolvedModelRoutingHandoff {
-                request_id: REQUEST.to_string(),
-            },
-        )
-        .expect("archive converges");
+        archive(&mut authority, REQUEST, RUN, TARGET).expect("archive converges");
     }
     assert_eq!(
         phase(&authority, REQUEST),
@@ -307,13 +366,8 @@ fn archiving_a_realized_handoff_is_refused() {
     import(&mut authority, REQUEST, RUN, TARGET).expect("import");
     claim(&mut authority, REQUEST, RUN, TARGET).expect("claim");
     realize(&mut authority, REQUEST, RUN, TARGET, TARGET).expect("realize");
-    MeerkatMachineMutator::apply(
-        &mut authority,
-        MeerkatMachineInput::ArchiveUnresolvedModelRoutingHandoff {
-            request_id: REQUEST.to_string(),
-        },
-    )
-    .expect_err("a realized handoff is not unresolved");
+    archive(&mut authority, REQUEST, RUN, TARGET)
+        .expect_err("a realized handoff is not unresolved");
     assert_eq!(
         phase(&authority, REQUEST),
         Some(RoutingHandoffPhase::Realized)
@@ -329,4 +383,423 @@ fn an_unregistered_machine_refuses_to_import() {
         .expect("machine initializes");
     import(&mut authority, REQUEST, RUN, TARGET)
         .expect_err("an unregistered session cannot own a handoff");
+}
+
+// ---------------------------------------------------------------------------
+// Malformed replay.
+//
+// The shell proposes a whole record, so every arm — including the arms that do
+// nothing — has to constrain the proposal. Two different mechanisms do that
+// now, and both are pinned here:
+//
+//   * shapes that are meaningless are UNREPRESENTABLE — `ModelRoutingHandoffRecord`
+//     has private fields and five phase-specific constructors, so there is no
+//     way to build a `Realized` record with no installed identity or a
+//     `Claimed` record carrying a denial. Those cases are exercised against the
+//     decoder below, because deserialization is the only remaining way such a
+//     value could enter the process.
+//
+//   * shapes that are well-formed but WRONG — a valid `Realized` record handed
+//     to the import arm, or a valid `Denied` record naming a different run —
+//     are refused by machine guards. Those are exercised here, and each test
+//     re-reads state afterwards so a silently absorbed mutation fails too.
+// ---------------------------------------------------------------------------
+
+fn apply_raw(
+    authority: &mut MeerkatMachineAuthority,
+    input: MeerkatMachineInput,
+) -> Result<(), String> {
+    MeerkatMachineMutator::apply(authority, input)
+        .map(|_| ())
+        .map_err(|error| format!("{error:?}"))
+}
+
+/// Re-import is the hot path, so it is the easiest arm to smuggle a terminal
+/// through: the record already exists and binds correctly.
+#[test]
+fn re_import_proposing_a_terminal_phase_is_refused() {
+    let mut authority = registered_authority();
+    import(&mut authority, REQUEST, RUN, TARGET).expect("import");
+    apply_raw(
+        &mut authority,
+        MeerkatMachineInput::ImportCommittedModelRoutingHandoff {
+            request_id: REQUEST.to_string(),
+            record: valid(ModelRoutingHandoffRecord::realized(RUN, TARGET, TARGET)),
+        },
+    )
+    .expect_err("an import may not propose a realized terminal");
+    apply_raw(
+        &mut authority,
+        MeerkatMachineInput::ImportCommittedModelRoutingHandoff {
+            request_id: REQUEST.to_string(),
+            record: valid(ModelRoutingHandoffRecord::denied(
+                RUN,
+                TARGET,
+                RoutingDenialReason::CapabilityPolicy,
+            )),
+        },
+    )
+    .expect_err("an import may not propose a denied terminal");
+    assert_eq!(
+        phase(&authority, REQUEST),
+        Some(RoutingHandoffPhase::Imported),
+        "a refused re-import must leave the lifecycle where it was"
+    );
+}
+
+/// Re-claiming an already-claimed or already-realized request converges, but
+/// only for a claim-shaped proposal.
+#[test]
+fn re_claim_proposing_a_terminal_phase_is_refused() {
+    let mut authority = registered_authority();
+    import(&mut authority, REQUEST, RUN, TARGET).expect("import");
+    claim(&mut authority, REQUEST, RUN, TARGET).expect("claim");
+    apply_raw(
+        &mut authority,
+        MeerkatMachineInput::ClaimModelRoutingHandoff {
+            request_id: REQUEST.to_string(),
+            observed: valid(ModelRoutingHandoffRecord::claimed(RUN, TARGET)),
+            record: valid(ModelRoutingHandoffRecord::denied(
+                RUN,
+                TARGET,
+                RoutingDenialReason::CapabilityPolicy,
+            )),
+        },
+    )
+    .expect_err("a claim may not propose a denial");
+    assert_eq!(
+        phase(&authority, REQUEST),
+        Some(RoutingHandoffPhase::Claimed)
+    );
+
+    realize(&mut authority, REQUEST, RUN, TARGET, TARGET).expect("realize");
+    apply_raw(
+        &mut authority,
+        MeerkatMachineInput::ClaimModelRoutingHandoff {
+            request_id: REQUEST.to_string(),
+            observed: valid(ModelRoutingHandoffRecord::realized(RUN, TARGET, TARGET)),
+            record: valid(ModelRoutingHandoffRecord::realized(RUN, TARGET, TARGET)),
+        },
+    )
+    .expect_err("converging on a realized request must still be claim-shaped");
+    assert_eq!(
+        phase(&authority, REQUEST),
+        Some(RoutingHandoffPhase::Realized)
+    );
+}
+
+/// A realization replay must still be a realization: same applied identity, and
+/// bound to the same run and target.
+#[test]
+fn realization_replay_with_a_different_identity_is_refused() {
+    let mut authority = registered_authority();
+    import(&mut authority, REQUEST, RUN, TARGET).expect("import");
+    claim(&mut authority, REQUEST, RUN, TARGET).expect("claim");
+    realize(&mut authority, REQUEST, RUN, TARGET, TARGET).expect("realize");
+
+    realize(&mut authority, REQUEST, RUN, TARGET, "model-z")
+        .expect_err("a different applied identity is not the same realization");
+    realize(&mut authority, REQUEST, "run-2", TARGET, TARGET)
+        .expect_err("a realization from a different originating run is a conflict");
+    realize(&mut authority, REQUEST, RUN, "model-z", TARGET)
+        .expect_err("a realization naming a different target is a conflict");
+
+    assert_eq!(
+        authority
+            .state()
+            .model_routing_handoff
+            .get(REQUEST)
+            .and_then(ModelRoutingHandoffRecord::applied_model)
+            .map(RoutingAppliedModel::as_str),
+        Some(TARGET),
+        "no refused replay may rewrite the installed identity"
+    );
+}
+
+/// The denial replay arm previously compared only the reason, so a proposal
+/// naming a different run or target could still report success.
+#[test]
+fn denial_replay_bound_to_a_different_request_is_refused() {
+    let mut authority = registered_authority();
+    import(&mut authority, REQUEST, RUN, TARGET).expect("import");
+    apply_raw(
+        &mut authority,
+        MeerkatMachineInput::DenyModelRoutingHandoff {
+            request_id: REQUEST.to_string(),
+            observed: valid(ModelRoutingHandoffRecord::imported(RUN, TARGET)),
+            record: valid(ModelRoutingHandoffRecord::denied(
+                RUN,
+                TARGET,
+                RoutingDenialReason::CapabilityPolicy,
+            )),
+        },
+    )
+    .expect("deny");
+    assert_eq!(
+        phase(&authority, REQUEST),
+        Some(RoutingHandoffPhase::Denied)
+    );
+
+    // A replay whose proposal names a different run. `observed` is the exact
+    // stored record, so the ONLY thing wrong is the proposal's binding — which
+    // is precisely the hole the old reason-only comparison left open.
+    apply_raw(
+        &mut authority,
+        MeerkatMachineInput::DenyModelRoutingHandoff {
+            request_id: REQUEST.to_string(),
+            observed: valid(ModelRoutingHandoffRecord::denied(
+                RUN,
+                TARGET,
+                RoutingDenialReason::CapabilityPolicy,
+            )),
+            record: valid(ModelRoutingHandoffRecord::denied(
+                "run-2",
+                TARGET,
+                RoutingDenialReason::CapabilityPolicy,
+            )),
+        },
+    )
+    .expect_err("a denial replay from a different run must be refused");
+    apply_raw(
+        &mut authority,
+        MeerkatMachineInput::DenyModelRoutingHandoff {
+            request_id: REQUEST.to_string(),
+            observed: valid(ModelRoutingHandoffRecord::denied(
+                RUN,
+                TARGET,
+                RoutingDenialReason::CapabilityPolicy,
+            )),
+            record: valid(ModelRoutingHandoffRecord::denied(
+                RUN,
+                "model-z",
+                RoutingDenialReason::CapabilityPolicy,
+            )),
+        },
+    )
+    .expect_err("a denial replay naming a different target must be refused");
+
+    let state = authority.state();
+    let stored = state
+        .model_routing_handoff
+        .get(REQUEST)
+        .expect("record survives");
+    assert_eq!(stored.originating_run(), RUN);
+    assert_eq!(stored.target_model(), TARGET);
+    assert_eq!(
+        stored.denial_reason(),
+        Some(RoutingDenialReason::CapabilityPolicy)
+    );
+}
+
+/// The archive replay arm previously checked only the stored phase, so any
+/// proposal at all could converge once a request was archived.
+#[test]
+fn archive_replay_bound_to_a_different_request_is_refused() {
+    let mut authority = registered_authority();
+    import(&mut authority, REQUEST, RUN, TARGET).expect("import");
+    apply_raw(
+        &mut authority,
+        MeerkatMachineInput::Retire {
+            session_id: SessionId("session-1".to_string()),
+        },
+    )
+    .expect("session retires");
+    apply_raw(
+        &mut authority,
+        MeerkatMachineInput::ArchiveUnresolvedModelRoutingHandoff {
+            request_id: REQUEST.to_string(),
+            observed: valid(ModelRoutingHandoffRecord::imported(RUN, TARGET)),
+            record: valid(ModelRoutingHandoffRecord::archived(RUN, TARGET)),
+        },
+    )
+    .expect("archive");
+
+    // Both replays name the exact stored record as `observed`, so the only
+    // defect is the proposal's binding — the hole the old stored-phase-only
+    // comparison left open.
+    apply_raw(
+        &mut authority,
+        MeerkatMachineInput::ArchiveUnresolvedModelRoutingHandoff {
+            request_id: REQUEST.to_string(),
+            observed: valid(ModelRoutingHandoffRecord::archived(RUN, TARGET)),
+            record: valid(ModelRoutingHandoffRecord::archived("run-2", TARGET)),
+        },
+    )
+    .expect_err("an archive replay from a different run must be refused");
+    apply_raw(
+        &mut authority,
+        MeerkatMachineInput::ArchiveUnresolvedModelRoutingHandoff {
+            request_id: REQUEST.to_string(),
+            observed: valid(ModelRoutingHandoffRecord::archived(RUN, TARGET)),
+            record: valid(ModelRoutingHandoffRecord::archived(RUN, "model-z")),
+        },
+    )
+    .expect_err("an archive replay naming a different target must be refused");
+
+    let state = authority.state();
+    let stored = state
+        .model_routing_handoff
+        .get(REQUEST)
+        .expect("record survives");
+    assert_eq!(stored.phase(), RoutingHandoffPhase::Archived);
+    assert_eq!(stored.originating_run(), RUN);
+    assert_eq!(stored.target_model(), TARGET);
+    assert_eq!(stored.applied_model(), None);
+}
+
+// ---------------------------------------------------------------------------
+// Recovery decode.
+//
+// Machine state is serialized, so deserialization is a real ingress: a
+// hand-edited, corrupted, or older-format state document can present a record
+// that no constructor would ever produce. These decode directly from raw JSON
+// rather than round-tripping a value, because a round-trip can only ever
+// produce shapes the type already allows.
+// ---------------------------------------------------------------------------
+
+fn decode(json: &str) -> Result<ModelRoutingHandoffRecord, String> {
+    serde_json::from_str::<ModelRoutingHandoffRecord>(json).map_err(|error| error.to_string())
+}
+
+#[test]
+fn a_well_formed_record_decodes() {
+    let record = decode(
+        r#"{"phase":"Realized","originating_run":"run-1","target_model":"model-b","applied_model":"model-b"}"#,
+    )
+    .expect("a realized record naming its installed identity is valid");
+    assert_eq!(record.phase(), RoutingHandoffPhase::Realized);
+    assert_eq!(record.originating_run(), "run-1");
+    assert_eq!(record.target_model(), "model-b");
+    assert_eq!(
+        record.applied_model().map(RoutingAppliedModel::as_str),
+        Some("model-b")
+    );
+    assert_eq!(record.denial_reason(), None);
+}
+
+#[test]
+fn a_realized_record_without_an_installed_identity_is_refused() {
+    decode(r#"{"phase":"Realized","originating_run":"run-1","target_model":"model-b"}"#)
+        .expect_err("a realization that names no installed identity is not a realization");
+}
+
+#[test]
+fn a_denied_record_without_a_reason_is_refused() {
+    decode(r#"{"phase":"Denied","originating_run":"run-1","target_model":"model-b"}"#)
+        .expect_err("a denial that names no reason is not a denial");
+}
+
+#[test]
+fn a_pending_record_carrying_an_outcome_is_refused() {
+    decode(
+        r#"{"phase":"Imported","originating_run":"run-1","target_model":"model-b","applied_model":"model-b"}"#,
+    )
+    .expect_err("an imported request has installed nothing");
+    decode(
+        r#"{"phase":"Claimed","originating_run":"run-1","target_model":"model-b","denial_reason":"CapabilityPolicy"}"#,
+    )
+    .expect_err("a claimed request has refused nothing");
+    decode(
+        r#"{"phase":"Archived","originating_run":"run-1","target_model":"model-b","applied_model":"model-b"}"#,
+    )
+    .expect_err("an archived request has installed nothing");
+}
+
+#[test]
+fn a_record_carrying_both_outcomes_is_refused() {
+    decode(
+        r#"{"phase":"Realized","originating_run":"run-1","target_model":"model-b","applied_model":"model-b","denial_reason":"CapabilityPolicy"}"#,
+    )
+    .expect_err("a request cannot be both installed and refused");
+    decode(
+        r#"{"phase":"Denied","originating_run":"run-1","target_model":"model-b","applied_model":"model-b","denial_reason":"CapabilityPolicy"}"#,
+    )
+    .expect_err("a refused request installed nothing");
+}
+
+/// A record that binds to no run or no target can never be matched to a
+/// committed request, so it is refused at the boundary rather than admitted as
+/// an inert row that quietly accumulates.
+#[test]
+fn a_record_without_an_identity_is_refused() {
+    decode(r#"{"phase":"Imported","originating_run":"","target_model":"model-b"}"#)
+        .expect_err("a record with no originating run binds to nothing");
+    decode(r#"{"phase":"Imported","originating_run":"run-1","target_model":""}"#)
+        .expect_err("a record with no target model binds to nothing");
+}
+
+#[test]
+fn unknown_and_missing_fields_are_refused() {
+    decode(
+        r#"{"phase":"Imported","originating_run":"run-1","target_model":"model-b","surprise":true}"#,
+    )
+    .expect_err("an unknown field means the document was written by something else");
+    decode(r#"{"originating_run":"run-1","target_model":"model-b"}"#)
+        .expect_err("a record with no phase is not a record");
+}
+
+/// The constructors enforce the same identity invariants as the decoder.
+///
+/// Without this they could mint values that fail their own round-trip: safe
+/// in memory, refused the moment machine state is recovered. Every phase is
+/// covered because the empty-identity check lives in one shared place and a
+/// future constructor could bypass it.
+#[test]
+fn constructors_refuse_a_record_that_binds_to_nothing() {
+    assert_eq!(
+        ModelRoutingHandoffRecord::imported("", TARGET),
+        Err(ModelRoutingHandoffRecordError::MissingOriginatingRun)
+    );
+    assert_eq!(
+        ModelRoutingHandoffRecord::imported(RUN, ""),
+        Err(ModelRoutingHandoffRecordError::MissingTargetModel)
+    );
+    assert_eq!(
+        ModelRoutingHandoffRecord::claimed("", TARGET),
+        Err(ModelRoutingHandoffRecordError::MissingOriginatingRun)
+    );
+    assert_eq!(
+        ModelRoutingHandoffRecord::archived(RUN, ""),
+        Err(ModelRoutingHandoffRecordError::MissingTargetModel)
+    );
+    assert_eq!(
+        ModelRoutingHandoffRecord::denied("", TARGET, RoutingDenialReason::CapabilityPolicy),
+        Err(ModelRoutingHandoffRecordError::MissingOriginatingRun)
+    );
+    assert_eq!(
+        ModelRoutingHandoffRecord::realized("", TARGET, TARGET),
+        Err(ModelRoutingHandoffRecordError::MissingOriginatingRun)
+    );
+}
+
+/// A realization that names no installed identity is not a realization — the
+/// decoder already says so, and now the constructor does too.
+#[test]
+fn realized_refuses_an_empty_applied_identity() {
+    assert_eq!(
+        ModelRoutingHandoffRecord::realized(RUN, TARGET, ""),
+        Err(ModelRoutingHandoffRecordError::MissingAppliedModel)
+    );
+}
+
+/// Everything a constructor accepts must survive its own round-trip. This is
+/// the property the two suites above jointly guarantee, asserted directly.
+#[test]
+fn every_constructed_record_round_trips_through_the_decoder() {
+    let records = [
+        valid(ModelRoutingHandoffRecord::imported(RUN, TARGET)),
+        valid(ModelRoutingHandoffRecord::claimed(RUN, TARGET)),
+        valid(ModelRoutingHandoffRecord::archived(RUN, TARGET)),
+        valid(ModelRoutingHandoffRecord::realized(RUN, TARGET, TARGET)),
+        valid(ModelRoutingHandoffRecord::denied(
+            RUN,
+            TARGET,
+            RoutingDenialReason::CapabilityPolicy,
+        )),
+    ];
+    for record in records {
+        let encoded = serde_json::to_string(&record).expect("record serializes");
+        let decoded = decode(&encoded).expect("a constructed record must decode");
+        assert_eq!(decoded, record, "round-trip must preserve the record");
+    }
 }

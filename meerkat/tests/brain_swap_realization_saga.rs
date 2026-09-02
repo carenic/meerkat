@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use meerkat_core::image_generation::{
-    SwitchTurnDuration, SwitchTurnIntent, SwitchTurnOrigin, SwitchTurnReasonTextDisposition,
-    SwitchTurnRequestId,
+    SwitchTurnDenialReason, SwitchTurnDuration, SwitchTurnIntent, SwitchTurnOrigin,
+    SwitchTurnReasonTextDisposition, SwitchTurnRequestId,
 };
 use meerkat_core::lifecycle::RunId;
 use meerkat_core::lifecycle::run_primitive::ModelId;
@@ -94,15 +94,24 @@ enum HostCall {
     ApplyIdentity(String),
     AppendRecord(&'static str),
     Persist,
+    Discard,
 }
 
 struct ScriptedReconfigureHost {
     calls: Mutex<Vec<HostCall>>,
     history: Mutex<SessionModelRoutingControlHistory>,
+    /// The last durably persisted log. A discard reverts `history` to this.
+    persisted_history: Mutex<SessionModelRoutingControlHistory>,
     current_identity: Mutex<SessionLlmIdentity>,
     preflight_fails: Mutex<Option<String>>,
     append_fails: Mutex<Option<String>>,
     persist_fails: Mutex<Option<String>>,
+    /// Fails only the persist that FOLLOWS a durable terminal append — the
+    /// exact window in which the live session holds a settled record that is
+    /// not yet durable.
+    persist_fails_after_terminal_append: Mutex<Option<String>>,
+    terminal_appended: Mutex<bool>,
+    discard_fails: Mutex<Option<String>>,
 }
 
 fn identity(model: &str) -> SessionLlmIdentity {
@@ -136,11 +145,15 @@ impl ScriptedReconfigureHost {
     fn new(history: SessionModelRoutingControlHistory) -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
-            history: Mutex::new(history),
+            history: Mutex::new(history.clone()),
+            persisted_history: Mutex::new(history),
             current_identity: Mutex::new(identity(MODEL_A)),
             preflight_fails: Mutex::new(None),
             append_fails: Mutex::new(None),
             persist_fails: Mutex::new(None),
+            persist_fails_after_terminal_append: Mutex::new(None),
+            terminal_appended: Mutex::new(false),
+            discard_fails: Mutex::new(None),
         }
     }
 
@@ -175,11 +188,53 @@ impl ScriptedReconfigureHost {
             .clone()
     }
 
-    fn fail_persist(&self, reason: &str) {
+    /// Fail only the persist that carries a durable terminal record.
+    ///
+    /// The identity-swap persist is deliberately NOT failable here: it has its
+    /// own compensation, and failing it never reaches the terminal append, so
+    /// it cannot exercise the shadow this suite is about.
+    fn fail_persist_after_terminal_append(&self, reason: &str) {
         *self
-            .persist_fails
+            .persist_fails_after_terminal_append
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason.to_string());
+    }
+
+    /// Land a durable record without the machine observing it — the crash
+    /// window where a terminal commits and the process dies before generated
+    /// authority records it. Persisted state is advanced too, so a discard
+    /// cannot roll it back.
+    fn push_record(&self, record: SessionModelRoutingControlRecord) {
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        history.append(record).expect("append durable terminal");
+        *self
+            .persisted_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = history.clone();
+    }
+
+    /// Land a record the log's own coherence rules would refuse, by rebuilding
+    /// the history from raw records.
+    ///
+    /// Needed to stage a terminal bound to a DIFFERENT originating run: the
+    /// append path refuses that as a conflicting intent, so a mismatch could
+    /// otherwise never reach reconciliation and the refusal under test would
+    /// be unreachable rather than proven.
+    fn push_record_unchecked(&self, record: SessionModelRoutingControlRecord) {
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut records = history.records().to_vec();
+        records.push(record);
+        *history = SessionModelRoutingControlHistory::from_records_unchecked_for_tests(records);
+        *self
+            .persisted_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = history.clone();
     }
 
     fn fail_append(&self, reason: &str) {
@@ -288,13 +343,79 @@ impl SessionLlmReconfigureHost for ScriptedReconfigureHost {
         {
             return Err(RuntimeDriverError::Internal(reason));
         }
+        if *self
+            .terminal_appended
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            && let Some(reason) = self
+                .persist_fails_after_terminal_append
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        {
+            return Err(RuntimeDriverError::Internal(reason));
+        }
+        // A successful persist is what makes the live log durable.
+        let live = self.history();
+        *self
+            .persisted_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = live;
         Ok(())
+    }
+
+    /// Drop the live session and reload from committed authority.
+    ///
+    /// The double models this honestly — the live log reverts to the last
+    /// PERSISTED log — because that is the whole point of the discard: an
+    /// appended-but-unpersisted terminal must not survive as live state that
+    /// reports a request settled when nothing on disk owes it.
+    async fn commit_live_session_model_routing_control_record(
+        &self,
+        session_id: &SessionId,
+        record: SessionModelRoutingControlRecord,
+    ) -> Result<(), RuntimeDriverError> {
+        // Mirrors the persistent service: append, persist, and compensate by
+        // discarding the live projection if either step fails — as ONE
+        // operation, so a caller can never observe a live-only terminal.
+        let appended = self.append_live_record(record).await;
+        let outcome = match appended {
+            Ok(_) => self.persist_live_session(session_id).await,
+            Err(error) => Err(error),
+        };
+        let Err(error) = outcome else {
+            return Ok(());
+        };
+        match self.discard_live_session(session_id).await {
+            Ok(()) => Err(error),
+            Err(discard_error) => Err(RuntimeDriverError::Internal(format!(
+                "{error}; and failed to discard the live session afterwards: {discard_error}"
+            ))),
+        }
     }
 
     async fn discard_live_session(
         &self,
         _session_id: &SessionId,
     ) -> Result<(), RuntimeDriverError> {
+        self.record(HostCall::Discard);
+        if let Some(reason) = self
+            .discard_fails
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return Err(RuntimeDriverError::Internal(reason));
+        }
+        let persisted = self
+            .persisted_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        *self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = persisted;
         Ok(())
     }
 
@@ -304,10 +425,18 @@ impl SessionLlmReconfigureHost for ScriptedReconfigureHost {
     ) -> Result<SessionModelRoutingControlHistory, RuntimeDriverError> {
         Ok(self.history())
     }
+}
 
-    async fn append_live_session_model_routing_control_record(
+impl ScriptedReconfigureHost {
+    /// The live half of the commit, kept as an inherent helper.
+    ///
+    /// The production host has no append-only seam any more: appending without
+    /// committing is exactly the shape that could strand a terminal in live
+    /// state, so it is not offered. This double still needs the two halves
+    /// separately in order to model a failure BETWEEN them, which is what the
+    /// compensation is for.
+    async fn append_live_record(
         &self,
-        _session_id: &SessionId,
         record: SessionModelRoutingControlRecord,
     ) -> Result<ModelRoutingControlAppendOutcome, RuntimeDriverError> {
         let label = match &record {
@@ -318,6 +447,12 @@ impl SessionLlmReconfigureHost for ScriptedReconfigureHost {
             _ => "unknown",
         };
         self.record(HostCall::AppendRecord(label));
+        if matches!(label, "realized" | "denied" | "abandoned") {
+            *self
+                .terminal_appended
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        }
         if let Some(reason) = self
             .append_fails
             .lock()
@@ -740,10 +875,19 @@ async fn retry_after_b_persist_before_realized_append_does_not_rotate_twice() {
     );
 }
 
-/// The ordering proof. If persisting the durable `Realized` record fails, the
-/// generated terminal must NOT be marked — otherwise the machine would claim a
-/// routing change with nothing on disk to support it, and the next pass would
-/// see a settled request that never settled.
+/// The ordering proof, and the anti-shadow proof.
+///
+/// If persisting the durable `Realized` record fails, two things must hold.
+/// The generated terminal must NOT be marked — otherwise the machine would
+/// claim a routing change with nothing on disk to support it. And the LIVE
+/// session must not keep the appended-but-unpersisted terminal either, because
+/// the next pre-dequeue lap reads the live session: a settled live record over
+/// a still-pending durable log is a request that silently stops being owed.
+///
+/// The retry deliberately re-reads pending authority rather than reusing the
+/// handoff captured before the failure. Reusing it would prove only that a
+/// retained value still works; re-reading proves the request is genuinely
+/// still owed by the log the runtime actually consults.
 #[tokio::test]
 async fn a_persistence_failure_leaves_the_generated_terminal_unmarked() {
     let run = RunId::new();
@@ -752,7 +896,7 @@ async fn a_persistence_failure_leaves_the_generated_terminal_unmarked() {
         Some(run),
     )
     .await;
-    fixture.host.fail_persist("disk full");
+    fixture.host.fail_persist_after_terminal_append("disk full");
     let pending = fixture
         .adapter
         .committed_model_routing_handoffs_awaiting_decision(&fixture.session_id)
@@ -764,29 +908,91 @@ async fn a_persistence_failure_leaves_the_generated_terminal_unmarked() {
         .adapter
         .realize_committed_model_routing_handoff_under_turn_finalization_boundary(
             &fixture.session_id,
-            handoff.clone(),
+            handoff,
         )
         .await
         .expect_err("a persistence failure must surface");
 
-    // Recovering: persistence works again, and the retry must still be able to
-    // finish the request rather than finding it wedged.
+    assert!(
+        fixture.host.calls().contains(&HostCall::Discard),
+        "a failed terminal persist must discard the live session rather than leave a settled \
+         record that was never committed: {:?}",
+        fixture.host.calls()
+    );
+
+    // Recovering: persistence works again. The retry re-reads pending
+    // authority, which must still owe this exact request.
     *fixture
         .host
-        .persist_fails
+        .persist_fails_after_terminal_append
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    let still_pending = fixture
+        .adapter
+        .committed_model_routing_handoffs_awaiting_decision(&fixture.session_id)
+        .await
+        .expect("re-read committed log after the failure");
+    assert_eq!(
+        still_pending.len(),
+        1,
+        "the request must still be owed after a failed persist, not hidden by live state"
+    );
+
     let retry = fixture
         .adapter
         .realize_committed_model_routing_handoff_under_turn_finalization_boundary(
             &fixture.session_id,
-            handoff,
+            still_pending[0].clone(),
         )
         .await
         .expect("retry after a transient persistence failure");
     assert!(
         matches!(retry, ModelRoutingHandoffRealization::Realized { .. }),
         "the retry must complete the request, got {retry:?}"
+    );
+}
+
+/// When the discard ITSELF fails, the live actor is known-poisoned: it holds a
+/// terminal that was never committed and cannot be reloaded. The failure must
+/// name both causes so the caller tears down rather than continuing.
+#[tokio::test]
+async fn a_failed_discard_after_a_failed_persist_surfaces_both_causes() {
+    let run = RunId::new();
+    let fixture = fixture_with(
+        committed_request_history(request_id(11), &run, MODEL_B),
+        Some(run),
+    )
+    .await;
+    fixture.host.fail_persist_after_terminal_append("disk full");
+    *fixture
+        .host
+        .discard_fails
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some("actor slot is wedged".to_string());
+
+    let pending = fixture
+        .adapter
+        .committed_model_routing_handoffs_awaiting_decision(&fixture.session_id)
+        .await
+        .expect("read committed log");
+
+    let error = fixture
+        .adapter
+        .realize_committed_model_routing_handoff_under_turn_finalization_boundary(
+            &fixture.session_id,
+            pending[0].clone(),
+        )
+        .await
+        .expect_err("a persistence failure whose discard also fails must surface");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("disk full"),
+        "the original persistence failure must survive: {rendered}"
+    );
+    assert!(
+        rendered.contains("actor slot is wedged"),
+        "the discard failure must be reported too, not swallowed: {rendered}"
     );
 }
 
@@ -822,4 +1028,163 @@ async fn a_settled_log_owes_no_decision_after_restart() {
         fixture.host.identity_applications().is_empty(),
         "a settled log must trigger no rebinding"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Crash-window reconciliation.
+//
+// The realization chain commits its DURABLE terminal before marking the
+// generated one. A crash between those two steps leaves a request that is
+// settled on disk and still Imported/Claimed in the machine — and because it
+// owes nothing durably, the awaiting-decision seam never looks at it again.
+// Without reconciliation it stays half-finished for the life of the runtime.
+//
+// Reconciliation reads the EXACT durable terminal and drives only the matching
+// generated transition. It resolves no model and re-decides no denial.
+// ---------------------------------------------------------------------------
+
+/// Drive generated state to `Claimed` the way the realization chain does,
+/// leaving the durable log untouched, so a terminal can then be committed
+/// behind the machine's back.
+async fn claim_only(fixture: &Fixture, request: SwitchTurnRequestId, run: &RunId, target: &str) {
+    let pending = fixture
+        .adapter
+        .committed_model_routing_handoffs_awaiting_decision(&fixture.session_id)
+        .await
+        .expect("read committed log");
+    let handoff = pending
+        .into_iter()
+        .find(|candidate| candidate.request_id == request)
+        .expect("the request must be owed before it can be claimed");
+    assert_eq!(handoff.originating_run_id, *run);
+    assert_eq!(handoff.intent.target_model.to_string(), target);
+    // Failing the commit leaves generated state Claimed while the durable log
+    // stays Requested — exactly the state a crash mid-realization produces.
+    fixture
+        .host
+        .fail_persist_after_terminal_append("simulated crash before the durable terminal");
+    let _ = fixture
+        .adapter
+        .realize_committed_model_routing_handoff_under_turn_finalization_boundary(
+            &fixture.session_id,
+            handoff,
+        )
+        .await;
+    *fixture
+        .host
+        .persist_fails_after_terminal_append
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+#[tokio::test]
+async fn a_durable_realized_terminal_reconciles_generated_claimed() {
+    let run = RunId::new();
+    let request = request_id(12);
+    let fixture = fixture_with(
+        committed_request_history(request, &run, MODEL_B),
+        Some(run.clone()),
+    )
+    .await;
+    claim_only(&fixture, request, &run, MODEL_B).await;
+
+    // The durable terminal lands without the machine seeing it.
+    fixture.host.push_record(
+        SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
+            request_id: request,
+            originating_run_id: run.clone(),
+            intent: until_changed_model_intent(MODEL_B),
+            applied_identity: Box::new(identity(MODEL_B)),
+        },
+    );
+
+    let before = fixture.host.identity_applications().len();
+    fixture
+        .adapter
+        .reconcile_committed_model_routing_terminals(&fixture.session_id)
+        .await
+        .expect("reconciliation must accept an exact durable terminal");
+    assert_eq!(
+        fixture.host.identity_applications().len(),
+        before,
+        "reconciliation records a decision that already happened; it must rebind nothing"
+    );
+
+    // Proof the machine actually reached its terminal: a fresh claim of the
+    // same request is now refused as already settled rather than admitted.
+    assert!(
+        fixture
+            .adapter
+            .committed_model_routing_handoffs_awaiting_decision(&fixture.session_id)
+            .await
+            .expect("read committed log")
+            .is_empty(),
+        "a reconciled request owes nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_durable_denied_terminal_reconciles_generated_claimed() {
+    let run = RunId::new();
+    let request = request_id(13);
+    let fixture = fixture_with(
+        committed_request_history(request, &run, MODEL_B),
+        Some(run.clone()),
+    )
+    .await;
+    claim_only(&fixture, request, &run, MODEL_B).await;
+
+    fixture
+        .host
+        .push_record(SessionModelRoutingControlRecord::ModelRoutingIntentDenied {
+            request_id: request,
+            originating_run_id: run.clone(),
+            intent: until_changed_model_intent(MODEL_B),
+            reason: SwitchTurnDenialReason::CapabilityPolicy,
+        });
+
+    let before = fixture.host.identity_applications().len();
+    fixture
+        .adapter
+        .reconcile_committed_model_routing_terminals(&fixture.session_id)
+        .await
+        .expect("reconciliation must accept an exact durable denial");
+    assert_eq!(
+        fixture.host.identity_applications().len(),
+        before,
+        "a denial reconciliation must not rebind identity"
+    );
+}
+
+/// A durable terminal whose run or target disagrees with what the machine
+/// claimed is an inconsistency between two authorities. Reconciliation must
+/// refuse it rather than overwrite generated state from a record that belongs
+/// to a different request.
+#[tokio::test]
+async fn a_mismatched_durable_terminal_is_refused_by_reconciliation() {
+    let run = RunId::new();
+    let request = request_id(14);
+    let fixture = fixture_with(
+        committed_request_history(request, &run, MODEL_B),
+        Some(run.clone()),
+    )
+    .await;
+    claim_only(&fixture, request, &run, MODEL_B).await;
+
+    // Same request id, different originating run: the machine claimed this
+    // request for `run`, and this terminal says another run settled it.
+    fixture.host.push_record_unchecked(
+        SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
+            request_id: request,
+            originating_run_id: RunId::new(),
+            intent: until_changed_model_intent(MODEL_B),
+            applied_identity: Box::new(identity(MODEL_B)),
+        },
+    );
+
+    fixture
+        .adapter
+        .reconcile_committed_model_routing_terminals(&fixture.session_id)
+        .await
+        .expect_err("a terminal bound to a different run must be refused, not absorbed");
 }

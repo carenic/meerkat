@@ -60,9 +60,7 @@ use meerkat_runtime::{
 };
 use meerkat_tools::builtin::brain_swap::BRAIN_SWAP_TOOL_NAME;
 
-use crate::session_runtime::llm_reconfigure::{
-    SessionRuntimeLlmReconfigureHostBlueprint, SessionRuntimeLlmReconfigureService,
-};
+use crate::session_runtime::llm_reconfigure::SessionRuntimeLlmReconfigureService;
 use crate::{
     AgentFactory, FactoryAgentBuilder, PersistenceBundle, PersistentSessionService, SessionStore,
 };
@@ -73,6 +71,63 @@ const MODEL_A: &str = "gpt-5.4";
 const MODEL_B: &str = "gpt-5.5";
 const TEST_REALM: &str = "default";
 const TEST_BINDING: &str = "default_openai";
+
+/// The A and B routes a harness runs against.
+///
+/// Parameterizing this is what lets the SAME proof run same-provider and
+/// cross-provider. A cross-provider swap is the interesting case for release:
+/// it must re-resolve the provider, the credential binding, and the client, not
+/// just swap a model string on an already-built route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RouteSpec {
+    model_a: &'static str,
+    provider_a: Provider,
+    binding_a: &'static str,
+    model_b: &'static str,
+    provider_b: Provider,
+    binding_b: &'static str,
+}
+
+impl RouteSpec {
+    /// Every distinct provider this route can be served by, so the harness
+    /// registers exactly the runtimes the route needs.
+    fn providers(self) -> Vec<Provider> {
+        if self.provider_a == self.provider_b {
+            vec![self.provider_a]
+        } else {
+            vec![self.provider_a, self.provider_b]
+        }
+    }
+
+    fn binding_for(self, provider: Provider) -> &'static str {
+        if provider == self.provider_a {
+            self.binding_a
+        } else {
+            self.binding_b
+        }
+    }
+}
+
+const SAME_PROVIDER_ROUTE: RouteSpec = RouteSpec {
+    model_a: MODEL_A,
+    provider_a: Provider::OpenAI,
+    binding_a: TEST_BINDING,
+    model_b: MODEL_B,
+    provider_b: Provider::OpenAI,
+    binding_b: TEST_BINDING,
+};
+
+/// A=Anthropic, B=OpenAI. Both are catalog text models on separate configured
+/// bindings, so realization must cross the provider seam.
+const CROSS_PROVIDER_ROUTE: RouteSpec = RouteSpec {
+    model_a: "claude-sonnet-4-5",
+    provider_a: Provider::Anthropic,
+    binding_a: "default_anthropic",
+    model_b: MODEL_B,
+    provider_b: Provider::OpenAI,
+    binding_b: TEST_BINDING,
+};
+
 const AUTHORING_TEXT: &str = "staged the swap";
 const NEXT_TURN_TEXT: &str = "answered after the swap";
 const SECOND_NEXT_TURN_TEXT: &str = "answered the second queued turn";
@@ -87,6 +142,11 @@ const SECOND_NEXT_TURN_TEXT: &str = "answered the second queued turn";
 /// that can distinguish "the log says B" from "B actually served the turn".
 struct DeferredBrainSwapClient {
     requested_models: Arc<StdMutex<Vec<String>>>,
+    /// The provider this exact client was built for. Cross-provider routes
+    /// build one client per provider, and usage must be attributed to the one
+    /// that actually served the call.
+    provider: Provider,
+    route: RouteSpec,
 }
 
 impl DeferredBrainSwapClient {
@@ -100,10 +160,10 @@ impl DeferredBrainSwapClient {
     }
 }
 
-fn usage_event(model: &str) -> LlmEvent {
+fn usage_event(provider: Provider, model: &str) -> LlmEvent {
     LlmEvent::UsageUpdate {
         usage: meerkat_core::TurnUsage::host_declared(
-            Provider::OpenAI,
+            provider,
             model,
             meerkat_core::Usage::default(),
         ),
@@ -138,10 +198,10 @@ impl LlmClient for DeferredBrainSwapClient {
                 Ok(LlmEvent::ToolCallComplete {
                     id: "toolu_brain_swap".to_string(),
                     name: BRAIN_SWAP_TOOL_NAME.to_string(),
-                    args: serde_json::json!({ "target_model": MODEL_B }),
+                    args: serde_json::json!({ "target_model": self.route.model_b }),
                     meta: None,
                 }),
-                Ok(usage_event(MODEL_A)),
+                Ok(usage_event(self.provider, self.route.model_a)),
                 Ok(done_event(StopReason::ToolUse)),
             ],
             // Call 1: the authoring turn reads its own tool result and
@@ -151,7 +211,7 @@ impl LlmClient for DeferredBrainSwapClient {
                     delta: AUTHORING_TEXT.to_string(),
                     meta: None,
                 }),
-                Ok(usage_event(MODEL_A)),
+                Ok(usage_event(self.provider, self.route.model_a)),
                 Ok(done_event(StopReason::EndTurn)),
             ],
             // Call 2: the next turn. Usage echoes whatever model the runtime
@@ -162,7 +222,7 @@ impl LlmClient for DeferredBrainSwapClient {
                     delta: NEXT_TURN_TEXT.to_string(),
                     meta: None,
                 }),
-                Ok(usage_event(&request.model)),
+                Ok(usage_event(self.provider, &request.model)),
                 Ok(done_event(StopReason::EndTurn)),
             ],
             // Call 3 is used by the concurrent-admission proof. Distinct text
@@ -173,7 +233,7 @@ impl LlmClient for DeferredBrainSwapClient {
                     delta: SECOND_NEXT_TURN_TEXT.to_string(),
                     meta: None,
                 }),
-                Ok(usage_event(&request.model)),
+                Ok(usage_event(self.provider, &request.model)),
                 Ok(done_event(StopReason::EndTurn)),
             ],
             // Anything past the script is a real finding, not noise to absorb.
@@ -188,7 +248,7 @@ impl LlmClient for DeferredBrainSwapClient {
     }
 
     fn provider(&self) -> Provider {
-        Provider::OpenAI
+        self.provider
     }
 
     async fn health_check(&self) -> Result<(), LlmError> {
@@ -203,6 +263,7 @@ impl LlmClient for DeferredBrainSwapClient {
 /// provider identity — which is exactly what makes `brain_swap` available at
 /// all. `build_client` hands back the scripted client instead of an HTTP one.
 struct DeferredBrainSwapProviderRuntime {
+    provider: Provider,
     client: Arc<dyn LlmClient>,
     availability: Arc<ModelAvailability>,
     client_build_models: Arc<StdMutex<Vec<String>>>,
@@ -238,7 +299,7 @@ impl ModelAvailability {
 #[async_trait]
 impl ProviderRuntime for DeferredBrainSwapProviderRuntime {
     fn provider_id(&self) -> Provider {
-        Provider::OpenAI
+        self.provider
     }
 
     async fn resolve_binding(
@@ -247,7 +308,7 @@ impl ProviderRuntime for DeferredBrainSwapProviderRuntime {
         _env: &ResolverEnvironment,
     ) -> Result<ResolvedConnection, ProviderAuthError> {
         Ok(ResolvedConnection {
-            provider: Provider::OpenAI,
+            provider: self.provider,
             backend: binding.backend(),
             backend_profile: Arc::clone(binding.backend_profile()),
             credential_identity: binding.credential_identity().clone(),
@@ -255,7 +316,7 @@ impl ProviderRuntime for DeferredBrainSwapProviderRuntime {
                 "unused-test-key".to_string(),
                 meerkat_core::AuthMetadata::default(),
                 None,
-                "brain-swap-ab-test:openai".to_string(),
+                format!("brain-swap-ab-test:{:?}", self.provider),
             )),
         })
     }
@@ -285,9 +346,20 @@ impl ProviderRuntime for DeferredBrainSwapProviderRuntime {
     }
 }
 
+/// A passthrough over the REAL persistent session service whose terminal
+/// persist can be made to fail on demand.
+///
+/// This exists so the persist-then-discard contract is proved against the
+/// actual service — including its real locking — rather than only against a
+/// scripted double. If `discard_live_under_runtime_turn_boundary` re-entered a
+/// lock the pre-dequeue seam already holds, this decorator would deadlock
+/// instead of returning, and the test would hang rather than pass.
 struct CountingReconfigureService {
     inner: Arc<PersistentSessionService<FactoryAgentBuilder>>,
-    identity_applications: Arc<AtomicUsize>,
+    /// Fails the persist that carries a durable terminal record.
+    terminal_persist_fails: Arc<std::sync::atomic::AtomicBool>,
+    /// Counts discards so the compensation is observable.
+    discards: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -373,7 +445,6 @@ impl SessionRuntimeLlmReconfigureService for CountingReconfigureService {
         identity: SessionLlmIdentity,
         request_policy: meerkat_core::SessionLlmRequestPolicy,
     ) -> Result<(), meerkat_core::service::SessionError> {
-        self.identity_applications.fetch_add(1, Ordering::SeqCst);
         SessionRuntimeLlmReconfigureService::apply_live_llm_identity_under_runtime_turn_boundary(
             self.inner.as_ref(),
             session_id,
@@ -401,6 +472,14 @@ impl SessionRuntimeLlmReconfigureService for CountingReconfigureService {
         &self,
         session_id: &SessionId,
     ) -> Result<(), meerkat_core::service::SessionError> {
+        if self
+            .terminal_persist_fails
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(meerkat_core::service::SessionError::Store(
+                "injected terminal persist failure".into(),
+            ));
+        }
         SessionRuntimeLlmReconfigureService::persist_live_under_runtime_turn_boundary(
             self.inner.as_ref(),
             session_id,
@@ -412,9 +491,42 @@ impl SessionRuntimeLlmReconfigureService for CountingReconfigureService {
         &self,
         session_id: &SessionId,
     ) -> Result<(), meerkat_core::service::SessionError> {
+        self.discards.fetch_add(1, Ordering::SeqCst);
         SessionRuntimeLlmReconfigureService::discard_live_under_runtime_turn_boundary(
             self.inner.as_ref(),
             session_id,
+        )
+        .await
+    }
+
+    async fn commit_live_model_routing_control_record_under_runtime_turn_boundary(
+        self: Arc<Self>,
+        session_id: &SessionId,
+        record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
+    ) -> Result<(), meerkat_core::service::SessionError> {
+        if self
+            .terminal_persist_fails
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // Model the durable commit failing. The real seam's compensation
+            // discards the live actor, so a caller that sees this error must
+            // never find a live-only terminal behind it. Reproduce that fate
+            // here without touching live state at all: refusing before any
+            // append is strictly stronger than appending and compensating.
+            let _ = record;
+            SessionRuntimeLlmReconfigureService::discard_live_under_runtime_turn_boundary(
+                self.inner.as_ref(),
+                session_id,
+            )
+            .await?;
+            return Err(meerkat_core::service::SessionError::Store(
+                "injected terminal commit failure".into(),
+            ));
+        }
+        SessionRuntimeLlmReconfigureService::commit_live_model_routing_control_record_under_runtime_turn_boundary(
+            Arc::clone(&self.inner),
+            session_id,
+            record,
         )
         .await
     }
@@ -429,22 +541,6 @@ impl SessionRuntimeLlmReconfigureService for CountingReconfigureService {
         SessionRuntimeLlmReconfigureService::live_model_routing_control_history(
             self.inner.as_ref(),
             session_id,
-        )
-        .await
-    }
-
-    async fn append_live_model_routing_control_record_under_runtime_turn_boundary(
-        &self,
-        session_id: &SessionId,
-        record: SessionModelRoutingControlRecord,
-    ) -> Result<
-        meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
-        meerkat_core::service::SessionError,
-    > {
-        SessionRuntimeLlmReconfigureService::append_live_model_routing_control_record_under_runtime_turn_boundary(
-            self.inner.as_ref(),
-            session_id,
-            record,
         )
         .await
     }
@@ -466,28 +562,41 @@ enum PersistenceProfile {
 /// Both A and B resolve through this single binding, so a switch that
 /// silently rebound credentials or accounts shows up as a changed
 /// `auth_binding` on the resulting identity.
-fn ab_test_config() -> Config {
+fn ab_test_config(route: RouteSpec) -> Config {
     let mut config = Config::default();
+    let keys: Vec<(&str, &str)> = route
+        .providers()
+        .into_iter()
+        .map(|provider| match provider {
+            Provider::OpenAI => ("openai", "unused-test-key"),
+            Provider::Anthropic => ("anthropic", "unused-test-key"),
+            other => unreachable!("unsupported test provider {other:?}"),
+        })
+        .collect();
     config.realm.insert(
         TEST_REALM.to_string(),
-        RealmConfigSection::from_inline_api_keys(&[("openai", "unused-test-key")]),
+        RealmConfigSection::from_inline_api_keys(&keys),
     );
     config
 }
 
-fn expected_auth_binding() -> AuthBindingRef {
+fn expected_auth_binding_named(binding: &str) -> AuthBindingRef {
     AuthBindingRef {
         realm: RealmId::parse(TEST_REALM).expect("valid test realm"),
-        binding: BindingId::parse(TEST_BINDING).expect("valid test binding"),
+        binding: BindingId::parse(binding).expect("valid test binding"),
         profile: None,
         origin: meerkat_core::BindingOrigin::Configured,
     }
 }
 
-fn create_request() -> CreateSessionRequest {
+fn expected_auth_binding() -> AuthBindingRef {
+    expected_auth_binding_named(TEST_BINDING)
+}
+
+fn create_request_for(route: RouteSpec) -> CreateSessionRequest {
     CreateSessionRequest {
         injected_context: Vec::new(),
-        model: MODEL_A.to_string(),
+        model: route.model_a.to_string(),
         prompt: meerkat_core::ContentInput::Text(String::new()),
         system_prompt: crate::SystemPromptOverride::Set("runtime-loop brain swap A->B".to_string()),
         max_tokens: None,
@@ -495,12 +604,16 @@ fn create_request() -> CreateSessionRequest {
         initial_turn: InitialTurnPolicy::Defer,
         deferred_prompt_policy: DeferredPromptPolicy::Discard,
         build: Some(SessionBuildOptions {
-            provider: Some(Provider::OpenAI),
+            provider: Some(route.provider_a),
             realm_id: Some(RealmId::parse(TEST_REALM).expect("valid test realm")),
             ..Default::default()
         }),
         labels: None,
     }
+}
+
+fn create_request() -> CreateSessionRequest {
+    create_request_for(SAME_PROVIDER_ROUTE)
 }
 
 struct AbHarness {
@@ -510,11 +623,11 @@ struct AbHarness {
     session_id: SessionId,
     runtime_id: LogicalRuntimeId,
     environment: Arc<AbEnvironment>,
-    identity_applications: Arc<AtomicUsize>,
 }
 
 struct AbEnvironment {
     profile: PersistenceProfile,
+    route: RouteSpec,
     temp: tempfile::TempDir,
     requested_models: Arc<StdMutex<Vec<String>>>,
     availability: Arc<ModelAvailability>,
@@ -552,8 +665,21 @@ impl AbHarness {
             .clone()
     }
 
-    fn identity_application_count(&self) -> usize {
-        self.identity_applications.load(Ordering::SeqCst)
+    /// How many committed realizations the durable log actually carries.
+    ///
+    /// This replaces an earlier decorator that counted calls into a wrapped
+    /// reconfigure service. The harness now builds through the production
+    /// composition, which installs the canonical host — so there is no seam to
+    /// decorate, and there should not be: a second host would be exactly the
+    /// shadow this feature must not have. The durable count is the stronger
+    /// fact anyway, because a second rotation would have to leave a second
+    /// committed terminal behind to be real.
+    async fn realized_terminal_count(&self) -> usize {
+        self.durable_routing_records()
+            .await
+            .iter()
+            .filter(|record| record.disposition() == ModelRoutingIntentRecordDisposition::Realized)
+            .count()
     }
 
     async fn accept_prompt(&self, prompt: &str) -> (InputId, meerkat_runtime::CompletionHandle) {
@@ -642,8 +768,13 @@ impl AbHarness {
 }
 
 async fn build_harness(profile: PersistenceProfile) -> AbHarness {
+    build_harness_for(profile, SAME_PROVIDER_ROUTE).await
+}
+
+async fn build_harness_for(profile: PersistenceProfile, route: RouteSpec) -> AbHarness {
     let environment = Arc::new(AbEnvironment {
         profile,
+        route,
         temp: tempfile::tempdir().expect("brain-swap A/B tempdir"),
         requested_models: Arc::new(StdMutex::new(Vec::new())),
         availability: Arc::new(ModelAvailability::default()),
@@ -656,22 +787,30 @@ async fn attach_harness(
     environment: Arc<AbEnvironment>,
     resume_session_id: Option<SessionId>,
 ) -> AbHarness {
-    let scripted: Arc<dyn LlmClient> = Arc::new(DeferredBrainSwapClient {
-        requested_models: Arc::clone(&environment.requested_models),
-    });
-
+    let route = environment.route;
     let mut factory = AgentFactory::new(environment.temp.path().join("factory-sessions"))
         .without_provider_auth_persistence()
         .builtins(true);
-    factory.provider_registry = Arc::new(ProviderRuntimeRegistry::empty().with_runtime(Arc::new(
-        DeferredBrainSwapProviderRuntime {
+    // One runtime per provider the route can be served by. The call script is
+    // shared through `requested_models`, so a cross-provider swap still reads
+    // as one ordered sequence of provider calls.
+    let mut registry = ProviderRuntimeRegistry::empty();
+    for provider in route.providers() {
+        let scripted: Arc<dyn LlmClient> = Arc::new(DeferredBrainSwapClient {
+            requested_models: Arc::clone(&environment.requested_models),
+            provider,
+            route,
+        });
+        registry = registry.with_runtime(Arc::new(DeferredBrainSwapProviderRuntime {
+            provider,
             client: scripted,
             availability: Arc::clone(&environment.availability),
             client_build_models: Arc::clone(&environment.client_build_models),
-        },
-    )));
+        }));
+    }
+    factory.provider_registry = Arc::new(registry);
 
-    let builder = FactoryAgentBuilder::new(factory, ab_test_config());
+    let builder = FactoryAgentBuilder::new(factory, ab_test_config(route));
     assert!(
         builder.default_llm_client.is_none(),
         "the A->B proof must resolve every client through the provider registry"
@@ -708,27 +847,18 @@ async fn attach_harness(
         Arc::new(meerkat_store::MemoryBlobStore::new()),
     );
 
-    // The blueprint's client slot stays empty on purpose. A populated slot
-    // would short-circuit the reconfigure host and resolve target B without
-    // ever consulting the provider registry, which is precisely the evidence
-    // this test exists to produce. It is installed after the service exists
-    // because the host needs that concrete service.
-    let blueprint = SessionRuntimeLlmReconfigureHostBlueprint::new(
-        &builder,
-        environment.temp.path().join("config_state.json"),
-        Arc::new(StdRwLock::new(None)),
-    );
-
-    let (service, adapter) = crate::surface::build_runtime_backed_service(builder, 4, persistence);
-    let service = Arc::new(service);
-    let identity_applications = Arc::new(AtomicUsize::new(0));
-    blueprint.install(
-        &adapter,
-        Arc::new(CountingReconfigureService {
-            inner: Arc::clone(&service),
-            identity_applications: Arc::clone(&identity_applications),
-        }) as Arc<dyn SessionRuntimeLlmReconfigureService>,
-    );
+    // Built through the PRODUCTION composition, not a hand-wired blueprint.
+    // The canonical reconfigure host is installed by the same code path every
+    // product surface uses, so this test proves the shipped wiring realizes a
+    // handoff — a harness that installed its own host would prove only that
+    // the harness works.
+    let (service, adapter) =
+        crate::surface::build_runtime_backed_service_with_default_reconfigure_host(
+            builder,
+            4,
+            persistence,
+            environment.temp.path().join("config_state.json"),
+        );
 
     let session = match resume_session_id {
         Some(session_id) => service
@@ -744,7 +874,7 @@ async fn attach_harness(
         &service,
         &adapter,
         session,
-        create_request(),
+        create_request_for(route),
         {
             let service = Arc::clone(&service);
             let adapter = Arc::clone(&adapter);
@@ -764,7 +894,6 @@ async fn attach_harness(
         session_id,
         runtime_id,
         environment,
-        identity_applications,
     }
 }
 
@@ -772,11 +901,16 @@ struct CommittedHandoffProof {
     request_id: SwitchTurnRequestId,
     origin_run: RunId,
     auth_binding: Option<AuthBindingRef>,
+    route: RouteSpec,
 }
 
 async fn commit_brain_swap_request(harness: &AbHarness) -> CommittedHandoffProof {
+    let route = harness.environment.route;
     let auth_binding = harness.live_identity().await.auth_binding;
-    assert_eq!(auth_binding.as_ref(), Some(&expected_auth_binding()));
+    assert_eq!(
+        auth_binding.as_ref(),
+        Some(&expected_auth_binding_named(route.binding_a))
+    );
 
     let authoring = harness.run_prompt("please switch after this turn").await;
     assert!(
@@ -785,10 +919,10 @@ async fn commit_brain_swap_request(harness: &AbHarness) -> CommittedHandoffProof
     );
     assert_eq!(
         harness.requested_models(),
-        vec![MODEL_A.to_string(), MODEL_A.to_string()]
+        vec![route.model_a.to_string(), route.model_a.to_string()]
     );
-    assert_eq!(harness.live_identity().await.model, MODEL_A);
-    assert_eq!(harness.durable_identity().await.model, MODEL_A);
+    assert_eq!(harness.live_identity().await.model, route.model_a);
+    assert_eq!(harness.durable_identity().await.model, route.model_a);
 
     let records = harness.durable_routing_records().await;
     assert_eq!(records.len(), 1);
@@ -798,7 +932,7 @@ async fn commit_brain_swap_request(harness: &AbHarness) -> CommittedHandoffProof
             originating_run_id,
             intent,
         } => {
-            assert_eq!(intent.target_model.as_str(), MODEL_B);
+            assert_eq!(intent.target_model.as_str(), route.model_b);
             (*request_id, originating_run_id.clone())
         }
         other => panic!("expected one committed Requested record, got {other:?}"),
@@ -811,6 +945,7 @@ async fn commit_brain_swap_request(harness: &AbHarness) -> CommittedHandoffProof
         request_id,
         origin_run,
         auth_binding,
+        route,
     }
 }
 
@@ -1017,11 +1152,149 @@ fn assert_exact_realized_terminal(
         } => {
             assert_eq!(request_id, &proof.request_id);
             assert_eq!(originating_run_id, &proof.origin_run);
-            assert_eq!(applied_identity.model, MODEL_B);
-            assert_eq!(applied_identity.auth_binding, proof.auth_binding);
+            assert_eq!(applied_identity.model, proof.route.model_b);
+            assert_eq!(applied_identity.provider, proof.route.provider_b);
+            // Same-provider routes keep their pinned binding. Cross-provider
+            // routes currently record an unset binding and let ordinary
+            // resolution pick it at build time — see the note in
+            // `brain_swap_crosses_the_provider_seam`.
+            let expected_binding = if proof.route.provider_a == proof.route.provider_b {
+                Some(expected_auth_binding_named(proof.route.binding_b))
+            } else {
+                None
+            };
+            assert_eq!(applied_identity.auth_binding, expected_binding);
         }
         other => panic!("expected a durable Realized terminal, got {other:?}"),
     }
+}
+
+/// The cross-provider proof: A=Anthropic, B=OpenAI, on separate configured
+/// bindings.
+///
+/// A same-provider swap can pass while realization only rewrites a model
+/// string on an already-built route. This one cannot: realizing B has to
+/// re-resolve the provider, pick the OTHER credential binding, and build a
+/// different client. The durable `Realized` record must say so, and the next
+/// provider call must actually land on OpenAI.
+///
+/// No live credentials: both providers are scripted runtimes with inline test
+/// secrets, and there is no provider-specific branch in production code.
+async fn brain_swap_crosses_the_provider_seam(profile: PersistenceProfile) {
+    let route = CROSS_PROVIDER_ROUTE;
+    let harness = build_harness_for(profile, route).await;
+
+    // The session really does start on Anthropic's route.
+    let before = harness.live_identity().await;
+    assert_eq!(before.model, route.model_a);
+    assert_eq!(before.provider, route.provider_a);
+    assert_eq!(
+        before.auth_binding,
+        Some(expected_auth_binding_named(route.binding_a)),
+        "A must be served by its own configured binding"
+    );
+
+    let proof = commit_brain_swap_request(&harness).await;
+    let next = harness
+        .run_prompt("continue after the cross-provider swap")
+        .await;
+    assert!(
+        matches!(next, CompletionOutcome::Completed(ref run) if run.text == NEXT_TURN_TEXT),
+        "the next turn must complete after pre-dequeue realizes B: {next:?}"
+    );
+    assert_eq!(
+        harness.requested_models(),
+        vec![
+            route.model_a.to_string(),
+            route.model_a.to_string(),
+            route.model_b.to_string(),
+        ],
+        "both authoring calls stay on A and the next call is B"
+    );
+
+    let after = harness.durable_identity().await;
+    assert_eq!(after.model, route.model_b);
+    assert_eq!(
+        after.provider, route.provider_b,
+        "durable routing must have crossed the provider seam"
+    );
+    // The one thing a cross-provider swap must never do is keep serving on the
+    // credential it left behind.
+    assert_ne!(
+        after.auth_binding, proof.auth_binding,
+        "a cross-provider swap must not keep A's binding"
+    );
+    // MEASURED, and narrower than one might expect: the applied identity does
+    // not PIN B's binding, it leaves it unset. `preserve_credential_account_
+    // affinity` only fills a binding when the current credential identity is an
+    // Account; for ordinary API-key bindings it declines, and the model-only
+    // resolver returns `auth_binding: None`. The build path then resolves the
+    // provider's configured binding, which is why B really does serve the next
+    // call and the restart below succeeds — but the durable record does not
+    // name the credential route it landed on.
+    //
+    // Asserting the truth here rather than the wish: pinning the resolved
+    // binding would change shared provider-switch credential semantics, which
+    // is a release decision, not a test fix.
+    assert_eq!(
+        after.auth_binding, None,
+        "cross-provider model-only switches currently leave the binding to ordinary resolution"
+    );
+    assert_exact_realized_terminal(&harness.durable_routing_records().await, &proof);
+
+    // Cold restart with A's runtime gone. The durable Realized identity must
+    // stand on its own: nothing may fall back to the provider the session was
+    // created on.
+    harness.set_available(route.model_a, false);
+    harness.clear_client_build_models();
+    let harness = harness.cold_restart().await;
+
+    assert_eq!(
+        harness.durable_identity().await.model,
+        route.model_b,
+        "a committed cross-provider realization must survive an ordinary restart"
+    );
+    assert!(
+        !harness
+            .client_build_models()
+            .iter()
+            .any(|model| model == route.model_a),
+        "cold materialization must not try to rebuild the abandoned A route: {:?}",
+        harness.client_build_models()
+    );
+
+    let resumed = harness
+        .run_prompt("continue after the cross-provider restart")
+        .await;
+    assert!(
+        matches!(resumed, CompletionOutcome::Completed(ref run) if run.text == SECOND_NEXT_TURN_TEXT),
+        "the restarted session must answer on B with A unavailable: {resumed:?}"
+    );
+    assert_eq!(
+        harness.requested_models(),
+        vec![
+            route.model_a.to_string(),
+            route.model_a.to_string(),
+            route.model_b.to_string(),
+            route.model_b.to_string(),
+        ],
+        "the restarted turn must also be served by B"
+    );
+    assert_eq!(
+        harness.live_identity().await.provider,
+        route.provider_b,
+        "the restarted live session must be bound to B's provider"
+    );
+}
+
+#[tokio::test]
+async fn whole_blob_brain_swap_crosses_the_provider_seam() {
+    brain_swap_crosses_the_provider_seam(PersistenceProfile::WholeBlob).await;
+}
+
+#[tokio::test]
+async fn head_canonical_brain_swap_crosses_the_provider_seam() {
+    brain_swap_crosses_the_provider_seam(PersistenceProfile::HeadCanonical).await;
 }
 
 async fn cold_restart_realizes_with_a_unavailable(profile: PersistenceProfile) {
@@ -1049,7 +1322,7 @@ async fn cold_restart_realizes_with_a_unavailable(profile: PersistenceProfile) {
         MODEL_A,
         "bootstrap must not mark the request realized or rewrite durable identity"
     );
-    assert_eq!(harness.identity_application_count(), 0);
+    assert_eq!(harness.realized_terminal_count().await, 0);
     let waiting = harness.durable_routing_records().await;
     assert_eq!(waiting.len(), 1);
     assert_eq!(
@@ -1071,7 +1344,7 @@ async fn cold_restart_realizes_with_a_unavailable(profile: PersistenceProfile) {
         ]
     );
     assert_eq!(
-        harness.identity_application_count(),
+        harness.realized_terminal_count().await,
         1,
         "the cold successor must apply B exactly once"
     );
@@ -1133,9 +1406,9 @@ async fn unavailable_b_holds_the_real_next_input(profile: PersistenceProfile) {
         "a retriable target-unavailable hold must leave Requested waiting"
     );
     assert_eq!(
-        harness.identity_application_count(),
+        harness.realized_terminal_count().await,
         0,
-        "target preflight must fail before the live identity host is invoked"
+        "target preflight must fail before any realization is committed"
     );
 }
 
@@ -1193,9 +1466,9 @@ async fn concurrent_next_admissions_realize_once_in_order(profile: PersistencePr
         "both queued calls must run on B in admission order"
     );
     assert_eq!(
-        harness.identity_application_count(),
+        harness.realized_terminal_count().await,
         1,
-        "one pending request must invoke the reconfigure host exactly once"
+        "one pending request must commit exactly one realization"
     );
 
     let first_state = harness

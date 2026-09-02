@@ -94,7 +94,7 @@ fn brain_swap_available_models_for_resolved_identity(
     current: &SessionLlmIdentity,
     proven_identities: &[SessionLlmIdentity],
 ) -> Vec<String> {
-    let mut models = BTreeSet::new();
+    let mut models = std::collections::BTreeSet::new();
     for (provider, _) in registry.provider_defaults() {
         for entry in registry
             .entries_for_provider(provider)
@@ -113,11 +113,25 @@ fn brain_swap_available_models_for_resolved_identity(
             // Compare everything EXCEPT the model: the proof we need is that
             // this provider/server/params/credential route works, and the model
             // id is the one thing the switch is allowed to change.
+            //
+            // An unset target binding is not a mismatch. `None` means "resolve
+            // the credential the ordinary way for this provider", which is
+            // exactly what the proven identity already did — the proven route
+            // IS that resolution's result. Requiring a literal `Some` match
+            // here would exclude every cross-provider target whose credential
+            // identity is not an account (the ordinary API-key case), because
+            // account affinity is the only thing that fills the binding in
+            // early, and it deliberately declines when there is no account to
+            // preserve. That would silently make `brain_swap` same-provider-only
+            // for most configurations.
             if !proven_identities.iter().any(|proven| {
                 proven.provider == target.provider
                     && proven.self_hosted_server_id == target.self_hosted_server_id
                     && proven.provider_params == target.provider_params
-                    && proven.auth_binding == target.auth_binding
+                    && match &target.auth_binding {
+                        Some(binding) => proven.auth_binding.as_ref() == Some(binding),
+                        None => true,
+                    }
             }) {
                 continue;
             }
@@ -5609,10 +5623,20 @@ impl AgentFactory {
         // pre-dequeue seam lives in the runtime loop, and a standalone or
         // ephemeral build has no such loop and no durable boundary. Advertising
         // the tool there would durably record requests nothing would act on.
-        let brain_swap_realization_host_ready = matches!(
-            build_config.runtime_build_mode,
-            RuntimeBuildMode::SessionOwned(_)
-        ) && !brain_swap_models.is_empty();
+        //
+        // Session-ownership alone is not enough, though. Realization also needs
+        // an installed session-LLM reconfigure host, because that is what reads
+        // the committed log and rebinds identity. A runtime-backed surface that
+        // constructs its service through the hostless builder and never
+        // installs one would otherwise ship sessions that accept `brain_swap`,
+        // commit the request, and silently never act on it. So the runtime
+        // itself is asked.
+        let brain_swap_realization_host_ready = match &build_config.runtime_build_mode {
+            RuntimeBuildMode::SessionOwned(bindings) => bindings
+                .model_routing()
+                .committed_handoff_realization_ready(),
+            _ => false,
+        } && !brain_swap_models.is_empty();
         let brain_swap_staging = brain_swap_realization_host_ready.then(|| {
             Arc::new(
                 meerkat_core::session::model_routing_handoff_staging::ModelRoutingHandoffStagingSlot::new(),

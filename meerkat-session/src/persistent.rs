@@ -5751,6 +5751,109 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// persists as one caller-ordered pair, so a persistence failure is
     /// attributable to the caller's transaction rather than hidden inside this
     /// mutation.
+    /// Append one model-routing terminal and durably commit it as ONE
+    /// operation that CANNOT be torn in half by cancelling the caller.
+    ///
+    /// The append mutates live state and the commit puts it on disk. Awaiting
+    /// that pair in the caller's own future is unsafe: dropping the future
+    /// between the two steps leaves a live session reporting a resolution that
+    /// durable authority never received, and for WholeBlob the next ordinary
+    /// boundary would then write the live body back over the durable log.
+    ///
+    /// So the pair does not run in the caller's future at all. It runs in a
+    /// task that OWNS the work and the session's recovery guard, and the
+    /// caller merely observes the outcome. Dropping the caller drops the
+    /// observation, never the transaction.
+    ///
+    /// The retained guard is what keeps a next admission from racing the
+    /// abandoned commit: every live/durable mutation of this session takes the
+    /// same gate before it can persist (`live_persist_mutation_guard`), and
+    /// turn admission takes it too (`reserve_runtime_turn_admission`). The
+    /// commit therefore still holds the serialization authority it was given,
+    /// even once nobody is waiting for it.
+    ///
+    /// Cancellation fates, both safe and both convergent:
+    /// * the commit lands — durable carries the exact terminal, live agrees;
+    /// * the commit fails — the live session is discarded, so the resolution
+    ///   is gone from live too, and the request is still owed.
+    ///
+    /// There is no fate in which live has settled a request that disk has not.
+    pub async fn commit_live_model_routing_control_record_under_runtime_turn_boundary(
+        self: Arc<Self>,
+        id: &SessionId,
+        record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
+    ) -> Result<(), SessionError> {
+        let recovery_guard = self.recovery_gate_for_session(id).await.lock_owned().await;
+        let _ = self.discard_stale_live_session_if_needed(id).await?;
+        if let Some(session) = self.load_authoritative_session_base(id).await? {
+            self.reject_if_archived_session(id, &session)
+                .await
+                .map_err(crate::control_error_into_session_error)?;
+        }
+
+        let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+        let owner = Arc::clone(&self);
+        let session_id = id.clone();
+        tokio::spawn(async move {
+            // Held for the whole transaction, including after the caller is
+            // gone. Dropping it earlier would let the next admission observe a
+            // half-applied commit.
+            let _recovery_guard = recovery_guard;
+            let outcome = owner
+                .append_and_persist_model_routing_control_record(&session_id, record)
+                .await;
+            let _ = outcome_tx.send(outcome);
+        });
+
+        match outcome_rx.await {
+            Ok(outcome) => outcome,
+            // The task owns the transaction; it cannot vanish without sending
+            // unless the runtime itself is shutting down under it.
+            Err(_) => Err(SessionError::Agent(AgentError::InternalError(format!(
+                "model-routing resolution commit for session {id} ended without reporting an outcome"
+            )))),
+        }
+    }
+
+    /// The transaction itself, guard already owned by the caller task.
+    ///
+    /// A persistence failure discards the live session, so the append it just
+    /// made cannot survive as live-only truth.
+    async fn append_and_persist_model_routing_control_record(
+        &self,
+        id: &SessionId,
+        record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
+    ) -> Result<(), SessionError> {
+        self.inner
+            .append_session_model_routing_control_record(id, record)
+            .await?;
+        if let Err(error) = self.persist_full_session(id).await {
+            match self.discard_live_session_unfenced(id).await {
+                Ok(()) | Err(SessionError::NotFound { .. }) => {}
+                Err(discard_error) => {
+                    tracing::warn!(
+                        session_id = %id,
+                        error = %discard_error,
+                        "failed to discard live session after model-routing resolution \
+                         persistence failure"
+                    );
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Append one handoff resolution to the live session WITHOUT persisting it.
+    ///
+    /// No production path calls this. The trait/driver seam that used to expose
+    /// it was deleted precisely so that no production caller can leave a
+    /// terminal in live state that disk never received — realization goes
+    /// through the commit seam above, which cannot be torn in half.
+    ///
+    /// It remains as a low-level service capability because constructing the
+    /// exact "appended but never committed" state is the only way to TEST that
+    /// such a shadow cannot settle a request.
     pub async fn append_live_model_routing_control_record_under_runtime_turn_boundary(
         &self,
         id: &SessionId,
@@ -8690,8 +8793,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
 
     /// Prepare an actor-owned boundary with bounded typed control candidates.
     ///
-    /// WholeBlob rejects these candidates because that profile persists its
-    /// inline state through the ordinary normalized snapshot path.
+    /// WholeBlob rejects the deferred-state candidate because that profile
+    /// persists its inline state through the ordinary normalized snapshot
+    /// path.
     async fn prepare_runtime_boundary_with_control_overrides(
         &self,
         id: &SessionId,
@@ -12797,12 +12901,10 @@ mod tests {
     async fn instruction_activation_head_commit_failure_discards_the_mutated_actor() {
         let tempdir = tempfile::tempdir().expect("runtime store tempdir");
         let database_path = tempdir.path().join("runtime.sqlite3");
-        let runtime_store = Arc::new(FailingHeadCanonicalCommitRuntimeStore {
-            inner: meerkat_runtime::SqliteRuntimeStore::new_head_canonical(&database_path)
+        let runtime_store = Arc::new(FailingHeadCanonicalCommitRuntimeStore::new(
+            meerkat_runtime::SqliteRuntimeStore::new_head_canonical(&database_path)
                 .expect("head-canonical runtime store"),
-            fail_commits: AtomicBool::new(false),
-            fail_lifecycle_commits: AtomicBool::new(false),
-        });
+        ));
         let store: Arc<dyn SessionStore> = Arc::new(
             meerkat_store::SqliteSessionStore::open(&database_path)
                 .expect("co-located head-canonical session store"),
@@ -14794,6 +14896,41 @@ mod tests {
         inner: meerkat_runtime::SqliteRuntimeStore,
         fail_commits: AtomicBool,
         fail_lifecycle_commits: AtomicBool,
+        /// Deterministic suspension point INSIDE the durable session-boundary
+        /// commit, mirroring the WholeBlob gate. A paused commit has already
+        /// taken every step before it — notably the live append — so a test can
+        /// abort the caller exactly in the append-done/commit-not-yet window.
+        pause_session_boundary_commit: AtomicBool,
+        entered_session_boundary_commit: tokio::sync::Notify,
+        release_session_boundary_commit: tokio::sync::Notify,
+    }
+
+    impl FailingHeadCanonicalCommitRuntimeStore {
+        fn new(inner: meerkat_runtime::SqliteRuntimeStore) -> Self {
+            Self {
+                inner,
+                fail_commits: AtomicBool::new(false),
+                fail_lifecycle_commits: AtomicBool::new(false),
+                pause_session_boundary_commit: AtomicBool::new(false),
+                entered_session_boundary_commit: tokio::sync::Notify::new(),
+                release_session_boundary_commit: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn set_pause_session_boundary_commit(&self, pause: bool) {
+            self.pause_session_boundary_commit
+                .store(pause, Ordering::Release);
+        }
+
+        async fn await_session_boundary_commit_entered(&self) {
+            self.entered_session_boundary_commit.notified().await;
+        }
+
+        fn release_session_boundary_commit(&self) {
+            self.pause_session_boundary_commit
+                .store(false, Ordering::Release);
+            self.release_session_boundary_commit.notify_waiters();
+        }
     }
 
     #[async_trait::async_trait]
@@ -14816,6 +14953,13 @@ mod tests {
             meerkat_runtime::store::PreparedRuntimeSessionCommitResult,
             meerkat_runtime::store::RuntimeStoreError,
         > {
+            if self.pause_session_boundary_commit.load(Ordering::Acquire) {
+                let released = self.release_session_boundary_commit.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                self.entered_session_boundary_commit.notify_waiters();
+                released.await;
+            }
             if self.fail_commits.load(Ordering::Acquire) {
                 return Err(meerkat_runtime::store::RuntimeStoreError::WriteFailed(
                     "synthetic head-canonical boundary commit failure".to_string(),
@@ -15158,6 +15302,13 @@ mod tests {
         pause_machine_lifecycle_commit: AtomicBool,
         entered_machine_lifecycle_commit: tokio::sync::Notify,
         release_machine_lifecycle_commit: tokio::sync::Notify,
+        /// Deterministic suspension point INSIDE the durable session-boundary
+        /// commit. A paused commit has already taken every step before it —
+        /// notably the live append — so a test can abort the caller exactly in
+        /// the append-done/commit-not-yet window.
+        pause_session_boundary_commit: AtomicBool,
+        entered_session_boundary_commit: tokio::sync::Notify,
+        release_session_boundary_commit: tokio::sync::Notify,
     }
 
     impl GatedSnapshotRuntimeStore {
@@ -15180,11 +15331,29 @@ mod tests {
                 pause_machine_lifecycle_commit: AtomicBool::new(false),
                 entered_machine_lifecycle_commit: tokio::sync::Notify::new(),
                 release_machine_lifecycle_commit: tokio::sync::Notify::new(),
+                pause_session_boundary_commit: AtomicBool::new(false),
+                entered_session_boundary_commit: tokio::sync::Notify::new(),
+                release_session_boundary_commit: tokio::sync::Notify::new(),
             }
         }
 
         fn set_fail_snapshot_commits(&self, fail: bool) {
             self.fail_snapshot_commits.store(fail, Ordering::Release);
+        }
+
+        fn set_pause_session_boundary_commit(&self, pause: bool) {
+            self.pause_session_boundary_commit
+                .store(pause, Ordering::Release);
+        }
+
+        async fn await_session_boundary_commit_entered(&self) {
+            self.entered_session_boundary_commit.notified().await;
+        }
+
+        fn release_session_boundary_commit(&self) {
+            self.pause_session_boundary_commit
+                .store(false, Ordering::Release);
+            self.release_session_boundary_commit.notify_waiters();
         }
 
         fn set_fail_snapshot_loads(&self, fail: bool) {
@@ -15530,6 +15699,13 @@ mod tests {
                 .snapshot_commit_count
                 .fetch_add(1, Ordering::AcqRel)
                 .saturating_add(1);
+            if self.pause_session_boundary_commit.load(Ordering::Acquire) {
+                let released = self.release_session_boundary_commit.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                self.entered_session_boundary_commit.notify_waiters();
+                released.await;
+            }
             if self.fail_snapshot_commits.load(Ordering::Acquire) {
                 return Err(meerkat_runtime::store::RuntimeStoreError::WriteFailed(
                     "synthetic runtime snapshot commit failure".to_string(),
@@ -16294,6 +16470,26 @@ mod tests {
         ) -> Result<(), meerkat_core::error::AgentError> {
             let _ = state;
             Ok(())
+        }
+
+        fn append_model_routing_control_record(
+            &mut self,
+            record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
+        ) -> Result<
+            meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
+            meerkat_core::error::AgentError,
+        > {
+            let mut session = match self.session.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            session
+                .append_model_routing_control_record(record)
+                .map_err(|error| {
+                    meerkat_core::error::AgentError::InternalError(format!(
+                        "failed to record model-routing handoff resolution: {error}"
+                    ))
+                })
         }
 
         fn session_id(&self) -> SessionId {
@@ -26003,14 +26199,10 @@ mod tests {
                     let storage_dir =
                         tempfile::tempdir_in(".").expect("head-canonical archive test directory");
                     let database_path = storage_dir.path().join("runtime.sqlite3");
-                    let runtime_store = Arc::new(FailingHeadCanonicalCommitRuntimeStore {
-                        inner: meerkat_runtime::SqliteRuntimeStore::new_head_canonical(
-                            &database_path,
-                        )
-                        .expect("head-canonical runtime store"),
-                        fail_commits: AtomicBool::new(false),
-                        fail_lifecycle_commits: AtomicBool::new(false),
-                    });
+                    let runtime_store = Arc::new(FailingHeadCanonicalCommitRuntimeStore::new(
+                        meerkat_runtime::SqliteRuntimeStore::new_head_canonical(&database_path)
+                            .expect("head-canonical runtime store"),
+                    ));
                     let session_store: Arc<dyn SessionStore> = Arc::new(
                         meerkat_store::SqliteSessionStore::open(&database_path)
                             .expect("co-located head-canonical session store"),
@@ -26205,6 +26397,516 @@ mod tests {
             2,
             "the archive terminal extends the request exactly once"
         );
+    }
+
+    /// Which durable store the cancellation-safety tests run against. The
+    /// transaction is profile-agnostic — it appends live and then commits
+    /// through `persist_full_session`, which branches per profile — so both
+    /// branches must be proven, not just the one that is easier to gate.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TerminalCommitProfile {
+        WholeBlob,
+        HeadCanonical,
+    }
+
+    impl TerminalCommitProfile {
+        const ALL: [Self; 2] = [Self::WholeBlob, Self::HeadCanonical];
+    }
+
+    /// The deterministic pause point, whichever store is underneath.
+    enum TerminalCommitGate {
+        WholeBlob(Arc<GatedSnapshotRuntimeStore>),
+        HeadCanonical(Arc<FailingHeadCanonicalCommitRuntimeStore>),
+    }
+
+    impl TerminalCommitGate {
+        fn pause(&self) {
+            match self {
+                Self::WholeBlob(store) => store.set_pause_session_boundary_commit(true),
+                Self::HeadCanonical(store) => store.set_pause_session_boundary_commit(true),
+            }
+        }
+
+        async fn entered(&self) {
+            match self {
+                Self::WholeBlob(store) => store.await_session_boundary_commit_entered().await,
+                Self::HeadCanonical(store) => store.await_session_boundary_commit_entered().await,
+            }
+        }
+
+        fn release(&self) {
+            match self {
+                Self::WholeBlob(store) => store.release_session_boundary_commit(),
+                Self::HeadCanonical(store) => store.release_session_boundary_commit(),
+            }
+        }
+
+        fn fail_commits(&self, fail: bool) {
+            match self {
+                Self::WholeBlob(store) => store.set_fail_snapshot_commits(fail),
+                Self::HeadCanonical(store) => store.fail_commits.store(fail, Ordering::Release),
+            }
+        }
+    }
+
+    /// A real `PersistentSessionService` whose durable session-boundary commit
+    /// can be stopped at an exact point, so a test can drop the caller's future
+    /// inside the append-done / commit-not-yet window instead of hoping to hit
+    /// it.
+    struct CancellableTerminalCommitFixture {
+        service: Arc<PersistentSessionService<DummyBuilder>>,
+        gate: TerminalCommitGate,
+        runtime_store: Arc<dyn RuntimeStore>,
+        session_id: SessionId,
+        handoff: meerkat_runtime::CommittedModelRoutingHandoff,
+        _storage_dir: Option<tempfile::TempDir>,
+    }
+
+    impl CancellableTerminalCommitFixture {
+        async fn new(profile: TerminalCommitProfile) -> Self {
+            let (session_store, runtime_store, gate, storage_dir): (
+                Arc<dyn SessionStore>,
+                Arc<dyn RuntimeStore>,
+                TerminalCommitGate,
+                Option<tempfile::TempDir>,
+            ) = match profile {
+                TerminalCommitProfile::WholeBlob => {
+                    let store = Arc::new(GatedSnapshotRuntimeStore::new());
+                    (
+                        Arc::new(MemoryStore::new()),
+                        Arc::clone(&store) as Arc<dyn RuntimeStore>,
+                        TerminalCommitGate::WholeBlob(store),
+                        None,
+                    )
+                }
+                TerminalCommitProfile::HeadCanonical => {
+                    let storage_dir = tempfile::tempdir_in(".")
+                        .expect("head-canonical cancellation test directory");
+                    let database_path = storage_dir.path().join("runtime.sqlite3");
+                    let store = Arc::new(FailingHeadCanonicalCommitRuntimeStore::new(
+                        meerkat_runtime::SqliteRuntimeStore::new_head_canonical(&database_path)
+                            .expect("head-canonical runtime store"),
+                    ));
+                    let session_store: Arc<dyn SessionStore> = Arc::new(
+                        meerkat_store::SqliteSessionStore::open(&database_path)
+                            .expect("co-located head-canonical session store"),
+                    );
+                    (
+                        session_store,
+                        Arc::clone(&store) as Arc<dyn RuntimeStore>,
+                        TerminalCommitGate::HeadCanonical(store),
+                        Some(storage_dir),
+                    )
+                }
+            };
+            let blob_store = memory_blob_store();
+            let service = Arc::new(PersistentSessionService::new(
+                DummyBuilder,
+                4,
+                session_store,
+                Arc::clone(&runtime_store),
+                Arc::clone(&blob_store),
+            ));
+            let (session, handoff) = session_with_requested_archive_handoff();
+            let created = service
+                .create_session(resume_request(session))
+                .await
+                .expect("resume a session that already owes a routing request");
+            let session_id = created.session_id;
+            service
+                .persist_live_session_now(&session_id)
+                .await
+                .expect("commit the owed request durably before the test begins");
+            Self {
+                service,
+                gate,
+                runtime_store,
+                session_id,
+                handoff,
+                _storage_dir: storage_dir,
+            }
+        }
+
+        fn realized_record(&self) -> SessionModelRoutingControlRecord {
+            SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
+                request_id: self.handoff.request_id,
+                originating_run_id: self.handoff.originating_run_id.clone(),
+                intent: self.handoff.intent.clone(),
+                applied_identity: Box::new(meerkat_core::SessionLlmIdentity {
+                    model: "claude-opus-5".to_string(),
+                    provider: meerkat_core::Provider::Anthropic,
+                    self_hosted_server_id: None,
+                    provider_params: None,
+                    auth_binding: None,
+                }),
+            }
+        }
+
+        fn commit(
+            &self,
+        ) -> impl std::future::Future<Output = Result<(), SessionError>> + Send + use<> {
+            let service = Arc::clone(&self.service);
+            let session_id = self.session_id.clone();
+            let record = self.realized_record();
+            async move {
+                service
+                    .commit_live_model_routing_control_record_under_runtime_turn_boundary(
+                        &session_id,
+                        record,
+                    )
+                    .await
+            }
+        }
+
+        async fn durable_body(&self) -> Session {
+            self.service
+                .load_committed_runtime_session_for_body(
+                    &self.session_id,
+                    "cancellation-safety durable read",
+                )
+                .await
+                .expect("read committed body")
+                .expect("committed body remains present")
+        }
+
+        /// The store-issued authority token for the last COMMITTED boundary.
+        ///
+        /// Used instead of a body read while a commit is mid-flight. For
+        /// HeadCanonical the incremental head advances during boundary
+        /// preparation, so a durable tail exists before the boundary lands and
+        /// any authority-bound body read conflicts against it. The authority
+        /// token has no such ambiguity: it moves if and only if the boundary
+        /// committed.
+        async fn durable_authority_token(&self) -> Option<String> {
+            self.runtime_store
+                .load_session_boundary_authority(
+                    &PersistentSessionService::<DummyBuilder>::runtime_id_for_session(
+                        &self.session_id,
+                    ),
+                )
+                .await
+                .expect("read committed session authority")
+                .map(|authority| {
+                    PreparedRuntimeBoundaryIdentity::from_runtime_authority(
+                        &authority,
+                        &self.session_id,
+                    )
+                    .expect("committed authority identifies this session")
+                    .authority_token
+                })
+        }
+
+        /// A body read that tolerates an in-flight durable tail, for polling.
+        async fn try_durable_disposition(&self) -> Option<ModelRoutingIntentRecordDisposition> {
+            self.service
+                .load_committed_runtime_session_for_body(
+                    &self.session_id,
+                    "cancellation-safety durable poll",
+                )
+                .await
+                .ok()
+                .flatten()
+                .and_then(|session| {
+                    session
+                        .model_routing_control()
+                        .disposition_of(&self.handoff.request_id)
+                })
+        }
+
+        /// What the next pre-dequeue would read: committed authority.
+        async fn durable_disposition(&self) -> Option<ModelRoutingIntentRecordDisposition> {
+            self.durable_body()
+                .await
+                .model_routing_control()
+                .disposition_of(&self.handoff.request_id)
+        }
+
+        async fn live_disposition(&self) -> Option<ModelRoutingIntentRecordDisposition> {
+            match self
+                .service
+                .export_session_with_labels(&self.session_id)
+                .await
+            {
+                Ok(session) => session
+                    .model_routing_control()
+                    .disposition_of(&self.handoff.request_id),
+                Err(SessionError::NotFound { .. }) => None,
+                Err(error) => unreachable!("read live body: {error}"),
+            }
+        }
+
+        /// The invariant the whole seam exists to hold: a resolution visible in
+        /// live state must also be on disk. A live-only terminal would let the
+        /// request stop being owed with nothing durable behind it.
+        async fn assert_no_live_only_terminal(&self, at: &str) {
+            if self.live_disposition().await == Some(ModelRoutingIntentRecordDisposition::Realized)
+            {
+                assert_eq!(
+                    self.durable_disposition().await,
+                    Some(ModelRoutingIntentRecordDisposition::Realized),
+                    "{at}: live reported a realized handoff that durable authority never received"
+                );
+            }
+        }
+
+        async fn await_durable_realized(&self, why: &str) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while self.try_durable_disposition().await
+                != Some(ModelRoutingIntentRecordDisposition::Realized)
+            {
+                assert!(std::time::Instant::now() < deadline, "{why}");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    /// Dropping the caller BEFORE the transaction can even start leaves the
+    /// request owed. Nothing is half-applied, and the debt is still visible to
+    /// the next pre-dequeue.
+    #[tokio::test]
+    async fn model_routing_terminal_commit_cancelled_before_it_starts_leaves_the_request_owed() {
+        for profile in TerminalCommitProfile::ALL {
+            let fixture = CancellableTerminalCommitFixture::new(profile).await;
+
+            // Hold the gate the commit must take first, so the future is
+            // guaranteed to be suspended before it has done anything at all.
+            let blocked_gate = fixture
+                .service
+                .recovery_gate_for_session(&fixture.session_id)
+                .await
+                .lock_owned()
+                .await;
+
+            let mut commit = Box::pin(fixture.commit());
+            tokio::select! {
+                biased;
+                _ = &mut commit => {
+                    unreachable!("{profile:?}: the commit cannot progress while its gate is held")
+                }
+                () = std::future::ready(()) => {}
+            }
+            drop(commit);
+            drop(blocked_gate);
+            tokio::task::yield_now().await;
+
+            assert_eq!(
+                fixture.durable_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Requested),
+                "{profile:?}: a commit cancelled before it started must leave the request owed"
+            );
+            fixture
+                .assert_no_live_only_terminal("cancelled before start")
+                .await;
+        }
+    }
+
+    /// Dropping the caller AFTER the live append but BEFORE the durable commit
+    /// is the window that an in-caller `append().await; persist().await` pair
+    /// cannot survive: it would strand a resolution in live state that disk
+    /// never received. The transaction is owned by its own task, so the caller
+    /// going away only cancels the observation.
+    #[tokio::test]
+    async fn model_routing_terminal_commit_survives_cancellation_between_append_and_persist() {
+        for profile in TerminalCommitProfile::ALL {
+            let fixture = CancellableTerminalCommitFixture::new(profile).await;
+            let authority_before = fixture.durable_authority_token().await;
+            fixture.gate.pause();
+
+            let mut commit = Box::pin(fixture.commit());
+            tokio::select! {
+                outcome = &mut commit => unreachable!(
+                    "{profile:?}: the commit cannot finish while its store is paused: {outcome:?}"
+                ),
+                () = fixture.gate.entered() => {}
+            }
+
+            // Prove the test is actually sitting in the dangerous window: the
+            // append has landed in live state and the durable boundary has not
+            // moved.
+            assert_eq!(
+                fixture.live_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized),
+                "{profile:?}: the paused commit should already have appended to live state"
+            );
+            assert_eq!(
+                fixture.durable_authority_token().await,
+                authority_before,
+                "{profile:?}: the paused commit must not have reached durable authority yet"
+            );
+
+            // The caller goes away exactly here.
+            drop(commit);
+            fixture.gate.release();
+
+            fixture
+                .await_durable_realized(&format!(
+                    "{profile:?}: the abandoned transaction never committed; cancelling the \
+                     caller tore it in half"
+                ))
+                .await;
+            assert_ne!(
+                fixture.durable_authority_token().await,
+                authority_before,
+                "{profile:?}: the durable boundary must have advanced"
+            );
+            assert_eq!(
+                fixture.durable_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized),
+                "{profile:?}: committed authority must carry the exact terminal"
+            );
+            assert_eq!(
+                fixture.live_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized),
+                "{profile:?}: live and durable must agree once the transaction completes"
+            );
+            fixture
+                .assert_no_live_only_terminal("after abandoned commit completed")
+                .await;
+        }
+    }
+
+    /// Dropping the caller AFTER the durable commit lands is the other half of
+    /// the window. Nobody ever observes the outcome, but the next pre-dequeue
+    /// must still read the exact terminal — not a debt it would try to realize
+    /// a second time.
+    #[tokio::test]
+    async fn model_routing_terminal_commit_cancelled_after_durable_commit_still_reads_terminal() {
+        for profile in TerminalCommitProfile::ALL {
+            let fixture = CancellableTerminalCommitFixture::new(profile).await;
+            fixture.gate.pause();
+
+            let mut commit = Box::pin(fixture.commit());
+            tokio::select! {
+                outcome = &mut commit => unreachable!(
+                    "{profile:?}: the commit cannot finish while its store is paused: {outcome:?}"
+                ),
+                () = fixture.gate.entered() => {}
+            }
+            fixture.gate.release();
+
+            // Wait for durable evidence WITHOUT polling the caller again, so the
+            // caller provably never observed the outcome it is about to lose.
+            fixture
+                .await_durable_realized(&format!(
+                    "{profile:?}: the released commit never reached durable authority"
+                ))
+                .await;
+            drop(commit);
+            tokio::task::yield_now().await;
+
+            assert_eq!(
+                fixture.durable_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized),
+                "{profile:?}: the next pre-dequeue must read the exact terminal, not a debt"
+            );
+            assert_eq!(
+                fixture.live_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized),
+            );
+
+            // Converges instead of rotating a second time: the log carries
+            // exactly one request and one terminal for it.
+            let body = fixture.durable_body().await;
+            assert_eq!(
+                body.model_routing_control().records().len(),
+                2,
+                "{profile:?}: an unobserved commit must not be applied twice"
+            );
+            assert!(
+                body.model_routing_control()
+                    .awaiting_decision()
+                    .next()
+                    .is_none(),
+                "{profile:?}: the realized request must no longer be owed"
+            );
+        }
+    }
+
+    /// A durable commit that FAILS must leave the request owed, and must not
+    /// leave the terminal stranded in live state. The compensation discards the
+    /// live actor — teardown, per the persistence-failure contract — so the
+    /// request is still owed to committed authority and the next read comes
+    /// from disk rather than from a session that believes it settled.
+    #[tokio::test]
+    async fn model_routing_terminal_commit_failure_leaves_the_request_owed_in_both_profiles() {
+        for profile in TerminalCommitProfile::ALL {
+            let fixture = CancellableTerminalCommitFixture::new(profile).await;
+            fixture.gate.fail_commits(true);
+
+            let error = fixture
+                .commit()
+                .await
+                .expect_err("a failing durable commit must surface as an error");
+            fixture.gate.fail_commits(false);
+
+            assert_eq!(
+                fixture.durable_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Requested),
+                "{profile:?}: a failed commit must leave the request owed ({error})"
+            );
+            assert_ne!(
+                fixture.live_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized),
+                "{profile:?}: a failed commit must not strand the terminal in live state"
+            );
+            fixture
+                .assert_no_live_only_terminal("after a failed commit")
+                .await;
+            assert_eq!(
+                fixture
+                    .durable_body()
+                    .await
+                    .model_routing_control()
+                    .records()
+                    .len(),
+                1,
+                "{profile:?}: a failed commit must not leave a partial terminal on disk"
+            );
+        }
+    }
+
+    /// Once the terminal is durable, an ordinary later persistence of the live
+    /// session must not be able to roll it back. This is the regression the
+    /// whole ordering exists to prevent: live is the thing that gets written,
+    /// so if live could lag durable, the next boundary would erase the handoff.
+    #[tokio::test]
+    async fn a_committed_model_routing_terminal_cannot_be_regressed_by_a_later_persist() {
+        for profile in TerminalCommitProfile::ALL {
+            let fixture = CancellableTerminalCommitFixture::new(profile).await;
+            fixture
+                .commit()
+                .await
+                .unwrap_or_else(|error| unreachable!("{profile:?}: commit terminal: {error}"));
+            assert_eq!(
+                fixture.durable_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized)
+            );
+
+            // An ordinary full-session persistence, exactly like the one the
+            // next turn boundary performs.
+            fixture
+                .service
+                .persist_live_session_now(&fixture.session_id)
+                .await
+                .unwrap_or_else(|error| unreachable!("{profile:?}: ordinary persist: {error}"));
+
+            assert_eq!(
+                fixture.durable_disposition().await,
+                Some(ModelRoutingIntentRecordDisposition::Realized),
+                "{profile:?}: an ordinary persist regressed a committed handoff terminal"
+            );
+            assert_eq!(
+                fixture
+                    .durable_body()
+                    .await
+                    .model_routing_control()
+                    .records()
+                    .len(),
+                2,
+                "{profile:?}: an ordinary persist must not duplicate or drop handoff records"
+            );
+            let _ = &fixture.runtime_store;
+        }
     }
 
     #[tokio::test]

@@ -231,6 +231,43 @@ pub trait SessionServiceRuntimeExt: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Reconcile crash-window terminals and report what is still owed, from a
+    /// SINGLE read of the committed log.
+    ///
+    /// The pre-dequeue seam runs on every lap for every session, so reading the
+    /// durable log twice — once to reconcile, once to list pending — doubles a
+    /// per-lap cost that is almost always answered "nothing to do". One read
+    /// serves both, and it is the same read, so the two answers cannot disagree
+    /// with each other.
+    async fn reconcile_and_list_committed_model_routing_handoffs(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Vec<crate::meerkat_machine_types::CommittedModelRoutingHandoff>, RuntimeDriverError>
+    {
+        Ok(Vec::new())
+    }
+
+    /// Bring generated authority into agreement with durable terminals that
+    /// were committed before the machine recorded them.
+    ///
+    /// The realization chain persists its durable terminal BEFORE marking the
+    /// generated one, so a crash between those two steps leaves a request that
+    /// is settled on disk and still `Imported`/`Claimed` in the machine. That
+    /// request is invisible to the awaiting-decision seam — it owes nothing —
+    /// so nothing would ever finish it.
+    ///
+    /// This drives ONLY the matching generated terminal from the exact durable
+    /// record. It re-applies no identity and re-decides no denial: the durable
+    /// record is the fact, and this is the machine catching up to it.
+    ///
+    /// The default reconciles nothing, matching the read default above.
+    async fn reconcile_committed_model_routing_terminals(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<(), RuntimeDriverError> {
+        Ok(())
+    }
+
     /// Realize one committed handoff while the caller already holds this
     /// session's turn-finalization boundary.
     ///
@@ -313,6 +350,97 @@ pub trait SessionServiceRuntimeExt: Send + Sync {
         Err(RuntimeDriverError::Internal(
             "image operation restore is not supported by this runtime adapter".into(),
         ))
+    }
+}
+
+/// Build the shared pre-dequeue realization handle for one runtime-backed
+/// session.
+///
+/// This is the single implementation every runtime-backed surface returns.
+/// Duplicating it per surface would let one skin quietly ship a session where a
+/// committed handoff is never realized, and that failure is invisible: the
+/// session simply keeps answering on the old model as if nothing was ever
+/// requested.
+///
+/// It lives here, beside `MeerkatMachine`, rather than in the facade because it
+/// needs only the machine and the session id — the machine already owns the
+/// generated lifecycle, the boundary receipts, and the reconfigure host that
+/// reads and writes the durable log. Keeping it here is also what lets the mob
+/// provisioner return the same handle: mob depends on the runtime, but not on
+/// the facade's `session-store` feature. The facade re-exports this function,
+/// so `meerkat::surface::persistent_runtime_pre_dequeue_handle` remains the
+/// name every surface calls.
+#[must_use]
+pub fn persistent_runtime_pre_dequeue_handle(
+    adapter: std::sync::Arc<crate::MeerkatMachine>,
+    session_id: SessionId,
+) -> std::sync::Arc<dyn meerkat_core::lifecycle::CoreExecutorPreDequeueHandle> {
+    std::sync::Arc::new(RuntimeModelRoutingHandoffPreDequeueHandle {
+        adapter,
+        session_id,
+    })
+}
+
+struct RuntimeModelRoutingHandoffPreDequeueHandle {
+    adapter: std::sync::Arc<crate::MeerkatMachine>,
+    session_id: SessionId,
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+impl meerkat_core::lifecycle::CoreExecutorPreDequeueHandle
+    for RuntimeModelRoutingHandoffPreDequeueHandle
+{
+    async fn realize_committed_handoffs_under_turn_finalization_boundary(
+        &self,
+    ) -> Result<
+        meerkat_core::lifecycle::CorePreDequeueOutcome,
+        meerkat_core::lifecycle::CoreExecutorError,
+    > {
+        use meerkat_core::lifecycle::{CoreExecutorError, CorePreDequeueOutcome};
+
+        // One read of the committed log answers both questions: which terminals
+        // the machine has not caught up to, and what is still owed. A settled
+        // request never appears in the pending list, so reconciliation cannot
+        // be gated on there being pending work.
+        let pending = self
+            .adapter
+            .reconcile_and_list_committed_model_routing_handoffs(&self.session_id)
+            .await
+            .map_err(|error| CoreExecutorError::control_failed_runtime(error.to_string()))?;
+        if pending.is_empty() {
+            return Ok(CorePreDequeueOutcome::NothingPending);
+        }
+        let mut realized_any = false;
+        for handoff in pending {
+            let request_id = handoff.request_id;
+            match self
+                .adapter
+                .realize_committed_model_routing_handoff_under_turn_finalization_boundary(
+                    &self.session_id,
+                    handoff,
+                )
+                .await
+                .map_err(|error| {
+                    // A failed realization must not let the pending input
+                    // proceed under an identity the session was told to leave.
+                    CoreExecutorError::control_failed_runtime(error.to_string())
+                })? {
+                crate::ModelRoutingHandoffRealization::Realized { .. }
+                | crate::ModelRoutingHandoffRealization::Denied { .. } => realized_any = true,
+                crate::ModelRoutingHandoffRealization::AlreadyExact => {}
+                crate::ModelRoutingHandoffRealization::Held { reason } => {
+                    return Err(CoreExecutorError::control_failed_runtime(format!(
+                        "committed model-routing handoff {request_id:?} is held: {reason}"
+                    )));
+                }
+            }
+        }
+        Ok(if realized_any {
+            CorePreDequeueOutcome::Realized
+        } else {
+            CorePreDequeueOutcome::NothingPending
+        })
     }
 }
 

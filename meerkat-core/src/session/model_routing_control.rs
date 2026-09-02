@@ -98,7 +98,7 @@
 //!   state, not durable document state, and lands with the generated
 //!   model-routing lifecycle in Phase 1.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -114,7 +114,7 @@ use crate::lifecycle::identifiers::RunId;
 /// and the full typed intent. Terminal variants repeat the intent rather than
 /// referencing it, so a record is self-describing when read in isolation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "record", rename_all = "snake_case")]
+#[serde(tag = "record", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum SessionModelRoutingControlRecord {
     /// A run committed a request for a later routing change.
@@ -174,8 +174,8 @@ impl SessionModelRoutingControlRecord {
         originating_run_id: RunId,
         intent: SwitchTurnIntent,
     ) -> Result<Self, ModelRoutingControlAppendError> {
-        if !intent_is_durable_handoff(&intent) {
-            return Err(ModelRoutingControlAppendError::UnsupportedIntent { request_id });
+        if let Some(refusal) = durable_handoff_intent_refusal(request_id, &intent) {
+            return Err(refusal);
         }
         Ok(Self::ModelRoutingIntentRequested {
             request_id,
@@ -245,10 +245,35 @@ impl SessionModelRoutingControlRecord {
 /// Only the until-changed, model-origin switch is: a finite scoped override
 /// belongs to the run that requested it and must never outlive it, and a
 /// user/system-policy origin has a live control surface of its own.
+///
+/// This answers SHAPE only. A record additionally needs a target that actually
+/// names something — see [`durable_handoff_intent_refusal`], which is what the
+/// commit paths call.
 #[must_use]
 pub fn intent_is_durable_handoff(intent: &SwitchTurnIntent) -> bool {
     matches!(intent.duration, SwitchTurnDuration::UntilChanged)
         && matches!(intent.origin, SwitchTurnOrigin::Model { .. })
+}
+
+/// The reason an intent cannot be committed as a durable handoff, if any.
+///
+/// One function so the append path and the decode path cannot disagree about
+/// what "committable" means. An empty target is refused here rather than left
+/// to a later layer: a request naming no model is a request nothing can ever
+/// realize, and the generated record constructors already refuse it — so
+/// admitting one durably would mint state that can never be carried into
+/// machine authority.
+fn durable_handoff_intent_refusal(
+    request_id: SwitchTurnRequestId,
+    intent: &SwitchTurnIntent,
+) -> Option<ModelRoutingControlAppendError> {
+    if !intent_is_durable_handoff(intent) {
+        return Some(ModelRoutingControlAppendError::UnsupportedIntent { request_id });
+    }
+    if intent.target_model.as_str().is_empty() {
+        return Some(ModelRoutingControlAppendError::EmptyTargetModel { request_id });
+    }
+    None
 }
 
 /// The literal disposition of the newest record for one request identity.
@@ -321,6 +346,13 @@ pub enum ModelRoutingControlAppendError {
     /// The intent cannot be expressed as a durable cross-run handoff.
     #[error("model-routing intent {request_id:?} is not an until-changed model-origin switch")]
     UnsupportedIntent { request_id: SwitchTurnRequestId },
+    /// The intent names no target model.
+    ///
+    /// A request that names nothing can never be realized, and the generated
+    /// record constructors refuse it, so committing one would create durable
+    /// state that machine authority can never accept.
+    #[error("model-routing intent {request_id:?} names no target model")]
+    EmptyTargetModel { request_id: SwitchTurnRequestId },
     /// A persisted log carried the same record twice.
     ///
     /// Silently collapsing it would make decode disagree with the bytes, so an
@@ -431,15 +463,51 @@ impl SessionModelRoutingControlHistory {
     pub fn awaiting_decision(
         &self,
     ) -> impl Iterator<Item = &SessionModelRoutingControlRecord> + '_ {
-        let settled: BTreeSet<&SwitchTurnRequestId> = self
-            .records
-            .iter()
-            .filter(|record| record.disposition().is_terminal())
-            .map(SessionModelRoutingControlRecord::request_id)
-            .collect();
-        self.records.iter().filter(move |record| {
-            record.disposition().is_awaiting_decision() && !settled.contains(record.request_id())
+        self.records.iter().filter(|record| {
+            record.disposition().is_awaiting_decision()
+                && self
+                    .latest_record_for(record.request_id())
+                    .is_some_and(|latest| latest.disposition().is_awaiting_decision())
         })
+    }
+
+    /// Every committed request whose newest record is a terminal.
+    ///
+    /// The mirror of [`Self::awaiting_decision`], and it exists for the crash
+    /// window that seam cannot see: a terminal that persisted before generated
+    /// authority recorded it leaves a request that owes no work durably, yet is
+    /// still `Imported`/`Claimed` in the machine. Such a request is invisible
+    /// to `awaiting_decision` — it is settled — so without this it would stay
+    /// half-finished in generated state for the life of the runtime.
+    ///
+    /// Yields the newest record per request, so the caller reads the exact
+    /// terminal facts (run, intent, installed identity or refusal reason)
+    /// rather than inferring them.
+    pub fn settled_terminals(
+        &self,
+    ) -> impl Iterator<Item = &SessionModelRoutingControlRecord> + '_ {
+        self.records.iter().filter(|record| {
+            record.disposition().is_terminal()
+                && self
+                    .latest_record_for(record.request_id())
+                    .is_some_and(|latest| std::ptr::eq(latest, *record))
+        })
+    }
+
+    /// Build a history WITHOUT revalidating the sequence.
+    ///
+    /// Test-support only, and deliberately named for it. Some refusals can only
+    /// be proved against a log the ordinary paths would never produce — a
+    /// terminal bound to a different originating run, say, which `append`
+    /// refuses as a conflicting intent. Without a way to stage that, the
+    /// downstream refusal under test would be unreachable and its test would
+    /// pass for the wrong reason.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn from_records_unchecked_for_tests(
+        records: Vec<SessionModelRoutingControlRecord>,
+    ) -> Self {
+        Self { records }
     }
 
     /// Append one record, enforcing the log's well-formedness rules.
@@ -464,8 +532,8 @@ fn classify_record_transition(
     record: &SessionModelRoutingControlRecord,
 ) -> Result<ModelRoutingControlAppendOutcome, ModelRoutingControlAppendError> {
     let request_id = *record.request_id();
-    if !intent_is_durable_handoff(record.intent()) {
-        return Err(ModelRoutingControlAppendError::UnsupportedIntent { request_id });
+    if let Some(refusal) = durable_handoff_intent_refusal(request_id, record.intent()) {
+        return Err(refusal);
     }
     let Some(previous) = previous else {
         if record.disposition().is_terminal() {

@@ -4022,6 +4022,184 @@ pub enum RoutingDenialReason {
     RealtimeTransportConflict,
 }
 
+/// Crate-local mirror of the catalog's applied-model newtype.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct RoutingAppliedModel(pub String);
+
+impl<T: Into<String>> From<T> for RoutingAppliedModel {
+    fn from(value: T) -> Self {
+        Self(value.into())
+    }
+}
+
+impl RoutingAppliedModel {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Crate-local mirror of the catalog's committed-handoff record.
+///
+/// One record per request id carries every fact a handoff decision needs, so a
+/// partially-written handoff — a phase without its run, an outcome without its
+/// phase — cannot be represented. Fields are private and there is no `Default`
+/// for the same reason as the catalog type: only five exact shapes are
+/// meaningful, and a public field struct would let a caller build the rest.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ModelRoutingHandoffRecord {
+    phase: RoutingHandoffPhase,
+    originating_run: String,
+    target_model: String,
+    applied_model: Option<RoutingAppliedModel>,
+    denial_reason: Option<RoutingDenialReason>,
+}
+
+/// Crate-local mirror of the catalog's construction error.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ModelRoutingHandoffRecordError {
+    /// A record with no originating run binds to no committed request.
+    #[error("model-routing handoff record has no originating run")]
+    MissingOriginatingRun,
+    /// A record with no target model names no routing change.
+    #[error("model-routing handoff record has no target model")]
+    MissingTargetModel,
+    /// A realization must name the identity it actually installed.
+    #[error("realized model-routing handoff record has no applied model")]
+    MissingAppliedModel,
+}
+
+impl ModelRoutingHandoffRecord {
+    fn checked_identity(
+        originating_run: String,
+        target_model: String,
+    ) -> Result<(String, String), ModelRoutingHandoffRecordError> {
+        if originating_run.is_empty() {
+            return Err(ModelRoutingHandoffRecordError::MissingOriginatingRun);
+        }
+        if target_model.is_empty() {
+            return Err(ModelRoutingHandoffRecordError::MissingTargetModel);
+        }
+        Ok((originating_run, target_model))
+    }
+
+    /// A committed request observed and bound to its originating run.
+    pub fn imported(
+        originating_run: impl Into<String>,
+        target_model: impl Into<String>,
+    ) -> Result<Self, ModelRoutingHandoffRecordError> {
+        Self::pending(
+            RoutingHandoffPhase::Imported,
+            originating_run.into(),
+            target_model.into(),
+        )
+    }
+
+    /// A request this runtime has taken ownership of.
+    pub fn claimed(
+        originating_run: impl Into<String>,
+        target_model: impl Into<String>,
+    ) -> Result<Self, ModelRoutingHandoffRecordError> {
+        Self::pending(
+            RoutingHandoffPhase::Claimed,
+            originating_run.into(),
+            target_model.into(),
+        )
+    }
+
+    /// A request whose routing change was applied, naming what was installed.
+    pub fn realized(
+        originating_run: impl Into<String>,
+        target_model: impl Into<String>,
+        applied_model: impl Into<String>,
+    ) -> Result<Self, ModelRoutingHandoffRecordError> {
+        let (originating_run, target_model) =
+            Self::checked_identity(originating_run.into(), target_model.into())?;
+        let applied_model = applied_model.into();
+        if applied_model.is_empty() {
+            return Err(ModelRoutingHandoffRecordError::MissingAppliedModel);
+        }
+        Ok(Self {
+            phase: RoutingHandoffPhase::Realized,
+            originating_run,
+            target_model,
+            applied_model: Some(RoutingAppliedModel(applied_model)),
+            denial_reason: None,
+        })
+    }
+
+    /// A request refused at its decision point.
+    pub fn denied(
+        originating_run: impl Into<String>,
+        target_model: impl Into<String>,
+        denial_reason: RoutingDenialReason,
+    ) -> Result<Self, ModelRoutingHandoffRecordError> {
+        let (originating_run, target_model) =
+            Self::checked_identity(originating_run.into(), target_model.into())?;
+        Ok(Self {
+            phase: RoutingHandoffPhase::Denied,
+            originating_run,
+            target_model,
+            applied_model: None,
+            denial_reason: Some(denial_reason),
+        })
+    }
+
+    /// A request the session's lifecycle terminality resolved.
+    pub fn archived(
+        originating_run: impl Into<String>,
+        target_model: impl Into<String>,
+    ) -> Result<Self, ModelRoutingHandoffRecordError> {
+        Self::pending(
+            RoutingHandoffPhase::Archived,
+            originating_run.into(),
+            target_model.into(),
+        )
+    }
+
+    fn pending(
+        phase: RoutingHandoffPhase,
+        originating_run: String,
+        target_model: String,
+    ) -> Result<Self, ModelRoutingHandoffRecordError> {
+        let (originating_run, target_model) =
+            Self::checked_identity(originating_run, target_model)?;
+        Ok(Self {
+            phase,
+            originating_run,
+            target_model,
+            applied_model: None,
+            denial_reason: None,
+        })
+    }
+
+    #[must_use]
+    pub fn phase(&self) -> RoutingHandoffPhase {
+        self.phase
+    }
+
+    #[must_use]
+    pub fn originating_run(&self) -> &str {
+        &self.originating_run
+    }
+
+    #[must_use]
+    pub fn target_model(&self) -> &str {
+        &self.target_model
+    }
+
+    #[must_use]
+    pub fn applied_model(&self) -> Option<&RoutingAppliedModel> {
+        self.applied_model.as_ref()
+    }
+
+    #[must_use]
+    pub fn denial_reason(&self) -> Option<RoutingDenialReason> {
+        self.denial_reason
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum RoutingSwitchApprovalReason {
     #[default]

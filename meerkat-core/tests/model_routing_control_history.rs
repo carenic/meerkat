@@ -116,6 +116,108 @@ fn every_record_variant_round_trips_through_json() {
 }
 
 #[test]
+fn a_record_with_an_unknown_field_is_rejected() {
+    let mut encoded = serde_json::to_value(requested(&new_request_id(), &RunId::new(), "model-a"))
+        .expect("record serializes");
+    encoded
+        .as_object_mut()
+        .expect("record is an object")
+        .insert("future_semantic_fact".to_string(), json_true());
+
+    let error = serde_json::from_value::<SessionModelRoutingControlRecord>(encoded)
+        .expect_err("unknown durable record fields must fail closed");
+    assert!(
+        error.to_string().contains("unknown field"),
+        "strict decode must name the unknown field: {error}"
+    );
+}
+
+/// A request naming no model can never be realized.
+///
+/// The generated record constructors already refuse an empty target, so
+/// admitting one durably would mint committed state that machine authority can
+/// never accept — a request permanently owed and permanently unrealizable.
+#[test]
+fn a_request_with_an_empty_target_model_is_typed_refused() {
+    let request_id = new_request_id();
+    let error = SessionModelRoutingControlRecord::request(request_id, RunId::new(), intent(""))
+        .expect_err("an empty target names no routing change");
+    assert!(
+        matches!(
+            error,
+            ModelRoutingControlAppendError::EmptyTargetModel { request_id: refused }
+                if refused == request_id
+        ),
+        "the refusal must name the empty target and the request it belongs to: {error:?}"
+    );
+}
+
+/// The constructor is not the only ingress: a persisted document is decoded
+/// straight into a history. Both paths must agree, or a log could carry a
+/// record the live path would have refused.
+#[test]
+fn a_persisted_envelope_with_an_empty_target_model_is_refused() {
+    let request_id = new_request_id();
+    let run = RunId::new();
+    let mut encoded =
+        serde_json::to_value(requested(&request_id, &run, "model-a")).expect("record serializes");
+    encoded
+        .as_object_mut()
+        .expect("record is an object")
+        .get_mut("intent")
+        .expect("record carries its intent")
+        .as_object_mut()
+        .expect("intent is an object")
+        .insert("target_model".to_string(), serde_json::json!(""));
+
+    let record = serde_json::from_value::<SessionModelRoutingControlRecord>(encoded)
+        .expect("the record shape itself is still well formed");
+    let error = SessionModelRoutingControlHistory::from_records(vec![record])
+        .expect_err("a persisted empty target must not decode into a usable history");
+    assert!(
+        matches!(
+            error,
+            ModelRoutingControlAppendError::EmptyTargetModel { request_id: refused }
+                if refused == request_id
+        ),
+        "materializing a persisted log must refuse the empty target: {error:?}"
+    );
+}
+
+/// The mirror of `awaiting_decision`, and the input to crash-window
+/// reconciliation: only the newest record per request, and only when it is
+/// terminal.
+#[test]
+fn settled_terminals_reports_only_the_newest_terminal_per_request() {
+    let settled_id = new_request_id();
+    let pending_id = new_request_id();
+    let run = RunId::new();
+    let history = SessionModelRoutingControlHistory::from_records(vec![
+        requested(&settled_id, &run, "model-b"),
+        requested(&pending_id, &run, "model-c"),
+        realized(&settled_id, &run, "model-b"),
+    ])
+    .expect("a coherent log materializes");
+
+    let settled: Vec<_> = history.settled_terminals().collect();
+    assert_eq!(settled.len(), 1, "only one request has terminalized");
+    assert_eq!(settled[0].request_id(), &settled_id);
+    assert_eq!(
+        settled[0].disposition(),
+        ModelRoutingIntentRecordDisposition::Realized,
+        "the newest record is the one reconciliation must read"
+    );
+
+    let awaiting: Vec<_> = history.awaiting_decision().collect();
+    assert_eq!(awaiting.len(), 1, "the other request is still owed");
+    assert_eq!(
+        awaiting[0].request_id(),
+        &pending_id,
+        "a settled request must never appear as still owed"
+    );
+}
+
+#[test]
 fn record_tag_names_the_model_routing_domain() {
     let request_id = new_request_id();
     let run = RunId::new();
@@ -551,6 +653,12 @@ fn session_envelope_round_trips_a_populated_handoff_log() {
     assert!(
         encoded.get("model_routing_control").is_some(),
         "a populated handoff log must be persisted in the envelope"
+    );
+    assert_eq!(
+        encoded["model_routing_control"],
+        serde_json::to_value(session.model_routing_control().records())
+            .expect("record sequence serializes"),
+        "the in-memory Box must not add a wrapper to the durable record sequence"
     );
 
     let decoded: Session = serde_json::from_value(encoded).expect("session deserializes");

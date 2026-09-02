@@ -3287,13 +3287,22 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
         SessionError,
     > {
-        let sessions = self.sessions.read().await;
-        let handle = sessions
-            .get(id)
-            .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
+        // Resolve the actor's command channel and release the registry lock
+        // BEFORE awaiting. The send and the reply are round trips through the
+        // session task; holding a read guard across them keeps the whole
+        // registry blocked for the duration, and any writer waiting on it (a
+        // create, a discard) would in turn block every other reader — a stall
+        // whose cause is nowhere near the code that caused it.
+        let command_tx = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(id)
+                .ok_or_else(|| SessionError::NotFound { id: id.clone() })?
+                .command_tx
+                .clone()
+        };
         let (reply_tx, reply_rx) = oneshot::channel();
-        handle
-            .command_tx
+        command_tx
             .send(SessionCommand::AppendModelRoutingControlRecord {
                 record: Box::new(record),
                 reply_tx,

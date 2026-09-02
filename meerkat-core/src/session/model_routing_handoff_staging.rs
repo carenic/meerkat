@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn staged_intent_is_a_representable_durable_handoff() {
         let slot = ModelRoutingHandoffStagingSlot::new();
-        slot.stage(request_id(1), ModelId::new("gpt-5.5"))
+        slot.stage(request_id(1), ModelId::new("model-a"))
             .expect("first stage");
         let staged = slot.peek().expect("slot readable").expect("staged intent");
         assert!(intent_is_durable_handoff(staged.intent()));
@@ -269,10 +269,10 @@ mod tests {
     fn restating_the_same_target_reuses_the_minted_request() {
         let slot = ModelRoutingHandoffStagingSlot::new();
         let first = slot
-            .stage(request_id(2), ModelId::new("gpt-5.5"))
+            .stage(request_id(2), ModelId::new("model-a"))
             .expect("first stage");
         let second = slot
-            .stage(request_id(3), ModelId::new("gpt-5.5"))
+            .stage(request_id(3), ModelId::new("model-a"))
             .expect("duplicate stage");
         assert!(first.is_newly_staged());
         assert!(!second.is_newly_staged());
@@ -283,26 +283,26 @@ mod tests {
     #[test]
     fn a_second_distinct_target_conflicts_instead_of_overwriting() {
         let slot = ModelRoutingHandoffStagingSlot::new();
-        slot.stage(request_id(4), ModelId::new("gpt-5.5"))
+        slot.stage(request_id(4), ModelId::new("model-a"))
             .expect("first stage");
         let error = slot
-            .stage(request_id(5), ModelId::new("claude-opus-5"))
+            .stage(request_id(5), ModelId::new("model-b"))
             .expect_err("conflicting target");
         assert_eq!(
             error,
             ModelRoutingHandoffStageError::ConflictingTarget {
-                staged_target: ModelId::new("gpt-5.5"),
-                requested_target: ModelId::new("claude-opus-5"),
+                staged_target: ModelId::new("model-a"),
+                requested_target: ModelId::new("model-b"),
             }
         );
         let staged = slot.peek().expect("slot readable").expect("staged intent");
-        assert_eq!(staged.target_model(), &ModelId::new("gpt-5.5"));
+        assert_eq!(staged.target_model(), &ModelId::new("model-a"));
     }
 
     #[test]
     fn taking_the_slot_leaves_nothing_to_promote_twice() {
         let slot = ModelRoutingHandoffStagingSlot::new();
-        slot.stage(request_id(6), ModelId::new("gpt-5.5"))
+        slot.stage(request_id(6), ModelId::new("model-a"))
             .expect("stage");
         assert!(slot.take().expect("first take").is_some());
         assert!(slot.take().expect("second take").is_none());
@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn clearing_discards_uncommitted_intent() {
         let slot = ModelRoutingHandoffStagingSlot::new();
-        slot.stage(request_id(7), ModelId::new("gpt-5.5"))
+        slot.stage(request_id(7), ModelId::new("model-a"))
             .expect("stage");
         slot.clear();
         assert!(slot.peek().expect("slot readable").is_none());
@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn committed_request_binds_the_run_supplied_at_promotion() {
         let slot = ModelRoutingHandoffStagingSlot::new();
-        slot.stage(request_id(8), ModelId::new("gpt-5.5"))
+        slot.stage(request_id(8), ModelId::new("model-a"))
             .expect("stage");
         let staged = slot.take().expect("take").expect("staged intent");
         let run_id = RunId::new();
@@ -329,6 +329,6 @@ mod tests {
             .expect("representable request");
         assert_eq!(record.request_id(), &request_id(8));
         assert_eq!(record.originating_run_id(), &run_id);
-        assert_eq!(record.intent().target_model, ModelId::new("gpt-5.5"));
+        assert_eq!(record.intent().target_model, ModelId::new("model-a"));
     }
 }

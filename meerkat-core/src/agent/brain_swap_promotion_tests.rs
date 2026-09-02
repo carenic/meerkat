@@ -197,6 +197,32 @@ impl AgentSessionStore for NoopStore {
     }
 }
 
+/// A store whose every write fails, and that counts the attempts.
+struct FailingStore {
+    attempts: Arc<std::sync::Mutex<usize>>,
+}
+
+impl FailingStore {
+    fn new(attempts: Arc<std::sync::Mutex<usize>>) -> Self {
+        Self { attempts }
+    }
+}
+
+#[async_trait]
+impl AgentSessionStore for FailingStore {
+    async fn save(&self, _session: &meerkat_core::Session) -> Result<(), AgentError> {
+        *self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        Err(AgentError::StoreError("disk is on fire".to_string()))
+    }
+
+    async fn load(&self, _id: &str) -> Result<Option<meerkat_core::Session>, AgentError> {
+        Ok(None)
+    }
+}
+
 fn test_session() -> meerkat_core::Session {
     let mut session = meerkat_core::Session::new();
     session
@@ -229,9 +255,25 @@ async fn build_agent(
     calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
     dispatcher: Arc<StagingToolDispatcher>,
 ) -> DynAgent {
+    build_agent_with_store(
+        scenario,
+        staging,
+        calls,
+        dispatcher,
+        Arc::new(NoopStore) as Arc<dyn AgentSessionStore>,
+    )
+    .await
+}
+
+async fn build_agent_with_store(
+    scenario: Scenario,
+    staging: Arc<ModelRoutingHandoffStagingSlot>,
+    calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    dispatcher: Arc<StagingToolDispatcher>,
+    store: Arc<dyn AgentSessionStore>,
+) -> DynAgent {
     let client: Arc<dyn AgentLlmClient> = Arc::new(RecordingClient::new(scenario, calls));
     let tools: Arc<dyn AgentToolDispatcher> = dispatcher;
-    let store: Arc<dyn AgentSessionStore> = Arc::new(NoopStore);
     AgentBuilder::new()
         .resume_session(test_session())
         .with_turn_state_handle(Arc::new(
@@ -475,4 +517,97 @@ async fn an_agent_without_a_staging_slot_commits_nothing() {
         .await
         .expect("run completes");
     assert!(agent.session().model_routing_control().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Promotion durability.
+//
+// A run that promotes a staged handoff has told the model its permanent switch
+// was accepted. If the save that carries that request then fails quietly, the
+// run still reports success and nothing on disk owes the switch — the next
+// session answers on the old identity with no record that anything was asked.
+// So promotion upgrades the ordinary best-effort save into a required one.
+// ---------------------------------------------------------------------------
+
+/// A promoting run whose store write fails must FAIL, not report success.
+#[tokio::test]
+async fn a_promoting_run_fails_when_the_session_cannot_be_persisted() {
+    let staging = Arc::new(ModelRoutingHandoffStagingSlot::new());
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dispatcher = Arc::new(StagingToolDispatcher::new(Arc::clone(&staging), "model-b"));
+    let attempts = Arc::new(std::sync::Mutex::new(0usize));
+    let mut agent = build_agent_with_store(
+        Scenario::ToolThenText,
+        Arc::clone(&staging),
+        Arc::clone(&calls),
+        Arc::clone(&dispatcher),
+        Arc::new(FailingStore::new(Arc::clone(&attempts))) as Arc<dyn AgentSessionStore>,
+    )
+    .await;
+
+    let error = agent
+        .run(meerkat_core::ContentInput::Text("go".to_string()))
+        .await
+        .expect_err("a promoting run must not report success it cannot back with a durable write");
+    assert!(
+        matches!(&error, AgentError::StoreError(message) if message == "disk is on fire"),
+        "the store's own typed error must surface unchanged, not restated: {error:?}"
+    );
+    assert!(
+        *attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            > 0,
+        "the run must have attempted the write it is failing over"
+    );
+
+    // The request is still on the in-memory session: nothing rolls it back,
+    // because the caller's recovery is to retry the save, not to pretend the
+    // model was never told.
+    assert_eq!(
+        requested_records(&agent).len(),
+        1,
+        "the promoted request stays on the live session for the caller to retry"
+    );
+}
+
+/// The ordinary path is unchanged: a run that stages nothing keeps the
+/// historical best-effort behaviour even when the store is failing.
+#[tokio::test]
+async fn a_run_without_a_staged_handoff_still_tolerates_a_failing_store() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let attempts = Arc::new(std::sync::Mutex::new(0usize));
+    let client: Arc<dyn AgentLlmClient> =
+        Arc::new(RecordingClient::new(Scenario::TextOnly, Arc::clone(&calls)));
+    // A dispatcher whose staging slot is never reached, so the run ends with
+    // nothing staged.
+    let tools: Arc<dyn AgentToolDispatcher> = Arc::new(StagingToolDispatcher::new(
+        Arc::new(ModelRoutingHandoffStagingSlot::new()),
+        "model-b",
+    ));
+    let store: Arc<dyn AgentSessionStore> = Arc::new(FailingStore::new(Arc::clone(&attempts)));
+    let mut agent: DynAgent = AgentBuilder::new()
+        .resume_session(test_session())
+        .with_turn_state_handle(Arc::new(
+            crate::agent::test_turn_state_handle::TestTurnStateHandle::new(),
+        ))
+        .with_model_routing_handoff_staging(Arc::new(ModelRoutingHandoffStagingSlot::new()))
+        .build_standalone(client, tools, store)
+        .await;
+
+    agent
+        .run(meerkat_core::ContentInput::Text("go".to_string()))
+        .await
+        .expect("a run that promoted nothing keeps the historical best-effort save");
+    assert!(
+        *attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            > 0,
+        "the best-effort write must still have been attempted"
+    );
+    assert!(
+        agent.session().model_routing_control().is_empty(),
+        "nothing was staged, so nothing may be committed"
+    );
 }

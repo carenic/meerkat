@@ -529,6 +529,57 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
             .collect())
     }
 
+    async fn reconcile_and_list_committed_model_routing_handoffs(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<crate::meerkat_machine_types::CommittedModelRoutingHandoff>, RuntimeDriverError>
+    {
+        let Ok(host) = self.llm_reconfigure_host() else {
+            return Ok(Vec::new());
+        };
+        let history = host
+            .load_live_session_model_routing_control_history(session_id)
+            .await?;
+        // The overwhelmingly common answer is "nothing at all". Deriving both
+        // facts from this one already-loaded log keeps that case to a single
+        // read per lap.
+        let settled: Vec<_> = history.settled_terminals().cloned().collect();
+        if !settled.is_empty() {
+            self.reconcile_committed_model_routing_terminals_inner(session_id, &settled)
+                .await
+                .map_err(|error| RuntimeDriverError::Internal(error.to_string()))?;
+        }
+        Ok(history
+            .awaiting_decision()
+            .map(
+                |record| crate::meerkat_machine_types::CommittedModelRoutingHandoff {
+                    request_id: *record.request_id(),
+                    originating_run_id: record.originating_run_id().clone(),
+                    intent: record.intent().clone(),
+                },
+            )
+            .collect())
+    }
+
+    async fn reconcile_committed_model_routing_terminals(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), RuntimeDriverError> {
+        let Ok(host) = self.llm_reconfigure_host() else {
+            return Ok(());
+        };
+        let history = host
+            .load_live_session_model_routing_control_history(session_id)
+            .await?;
+        let settled: Vec<_> = history.settled_terminals().cloned().collect();
+        if settled.is_empty() {
+            return Ok(());
+        }
+        self.reconcile_committed_model_routing_terminals_inner(session_id, &settled)
+            .await
+            .map_err(|error| RuntimeDriverError::Internal(error.to_string()))
+    }
+
     async fn realize_committed_model_routing_handoff_under_turn_finalization_boundary(
         &self,
         session_id: &SessionId,

@@ -95,7 +95,9 @@ pub(crate) use runtime_backed::materialize_session_actor_unattached_with_reserve
 pub use runtime_backed::{
     AttachedActorPublicationRefreshFn, PersistentRuntimeExecutor, RuntimeBackedInitialTurn,
     SurfaceRuntimeMaterializeError, build_runtime_backed_service,
-    build_runtime_backed_service_with_capacities, default_persistent_executor,
+    build_runtime_backed_service_with_capacities,
+    build_runtime_backed_service_with_capacities_and_default_reconfigure_host,
+    build_runtime_backed_service_with_default_reconfigure_host, default_persistent_executor,
     default_persistent_executor_with_workgraph_service, install_prepared_runtime_interrupt_handle,
     install_prepared_runtime_interrupt_handle_for_actor_slot,
     materialize_attached_session_actor_only,

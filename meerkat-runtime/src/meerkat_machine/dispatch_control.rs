@@ -1913,6 +1913,158 @@ impl MeerkatMachine {
     /// by pre-checking it: the machine decides. Finding a realized or denied
     /// generated request in this exact durable-Requested batch is an
     /// inconsistency, not a reason to silently omit its durable terminal.
+    /// Read the record generated authority currently holds for `request_key`.
+    ///
+    /// Every handoff transition names the state it observed as well as the
+    /// state it proposes, so the machine can refuse a proposal built from a
+    /// stale read. This is the shell's half of that contract: it reports what
+    /// it actually saw, and never invents a record when none is present.
+    async fn observed_model_routing_handoff(
+        &self,
+        session_id: &SessionId,
+        request_key: &str,
+    ) -> Result<crate::meerkat_machine::dsl::ModelRoutingHandoffRecord, RuntimeControlPlaneError>
+    {
+        self.session_dsl_state(session_id)
+            .await?
+            .model_routing_handoff
+            .get(request_key)
+            .cloned()
+            .ok_or_else(|| {
+                RuntimeControlPlaneError::Internal(format!(
+                    "model-routing handoff {request_key} is absent from generated state where it was just observed"
+                ))
+            })
+    }
+
+    /// Drive generated authority to the terminal a durable record already
+    /// carries, for requests the machine only knows as pending.
+    ///
+    /// Every arm reads the durable record for its facts. Nothing here resolves
+    /// a model, rebinds an identity, or re-decides a denial: the decision
+    /// already happened and is on disk. This is bookkeeping catching up, and it
+    /// is deliberately the ONLY place where a generated terminal is minted
+    /// without a live decision behind it.
+    ///
+    /// A durable record whose run or target disagrees with the generated
+    /// record for the same request id is an inconsistency, not a state to
+    /// interpret — the machine's guards refuse it, and that refusal surfaces.
+    pub(super) async fn reconcile_committed_model_routing_terminals_inner(
+        &self,
+        session_id: &SessionId,
+        settled: &[meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord],
+    ) -> Result<(), RuntimeControlPlaneError> {
+        use meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord as DurableRecord;
+
+        for durable in settled {
+            let request_key = switch_request_key(*durable.request_id());
+            let Some(observed) = self
+                .session_dsl_state(session_id)
+                .await?
+                .model_routing_handoff
+                .get(&request_key)
+                .cloned()
+            else {
+                // The machine never imported this request. A settled request
+                // needs no generated presence, so there is nothing to catch up
+                // — importing one now would manufacture lifecycle state for a
+                // decision that is already over.
+                continue;
+            };
+            if !matches!(
+                observed.phase(),
+                crate::meerkat_machine::dsl::RoutingHandoffPhase::Imported
+                    | crate::meerkat_machine::dsl::RoutingHandoffPhase::Claimed
+            ) {
+                // Already terminal in the machine. Consistency between the two
+                // terminals is enforced where they are produced; nothing to do.
+                continue;
+            }
+
+            let run_key = durable.originating_run_id().to_string();
+            let target_model = durable.intent().target_model.to_string();
+            let _mutation_guard = self
+                .lock_current_control_durability_ready_session_mutation_gate(session_id)
+                .await?;
+            // A claim is required before either terminal, so an `Imported`
+            // record is advanced first. The claim carries the durable record's
+            // own run and target, so a disagreement is refused here rather than
+            // being carried into the terminal.
+            let observed =
+                if observed.phase() == crate::meerkat_machine::dsl::RoutingHandoffPhase::Imported {
+                    self.apply_session_dsl_input(
+                    session_id,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::ClaimModelRoutingHandoff {
+                        request_id: request_key.clone(),
+                        observed,
+                        record: crate::meerkat_machine::dsl::ModelRoutingHandoffRecord::claimed(
+                            run_key.clone(),
+                            target_model.clone(),
+                        )
+                        .map_err(handoff_record_error)?,
+                    },
+                    "ClaimModelRoutingHandoff",
+                )
+                .await
+                .map_err(RuntimeControlPlaneError::Internal)?;
+                    self.observed_model_routing_handoff(session_id, &request_key)
+                        .await?
+                } else {
+                    observed
+                };
+
+            match durable {
+                DurableRecord::ModelRoutingIntentRealized {
+                    applied_identity, ..
+                } => {
+                    self.apply_session_dsl_input(
+                        session_id,
+                        crate::meerkat_machine::dsl::MeerkatMachineInput::RealizeModelRoutingHandoff {
+                            request_id: request_key,
+                            observed,
+                            record:
+                                crate::meerkat_machine::dsl::ModelRoutingHandoffRecord::realized(
+                                    run_key,
+                                    target_model,
+                                    applied_identity.model.clone(),
+                                )
+                                .map_err(handoff_record_error)?,
+                        },
+                        "RealizeModelRoutingHandoff",
+                    )
+                    .await
+                    .map_err(RuntimeControlPlaneError::Internal)?;
+                }
+                DurableRecord::ModelRoutingIntentDenied { reason, .. } => {
+                    self.apply_session_dsl_input(
+                        session_id,
+                        crate::meerkat_machine::dsl::MeerkatMachineInput::DenyModelRoutingHandoff {
+                            request_id: request_key,
+                            observed,
+                            record: crate::meerkat_machine::dsl::ModelRoutingHandoffRecord::denied(
+                                run_key,
+                                target_model,
+                                routing_denial_from_switch(reason),
+                            )
+                            .map_err(handoff_record_error)?,
+                        },
+                        "DenyModelRoutingHandoff",
+                    )
+                    .await
+                    .map_err(RuntimeControlPlaneError::Internal)?;
+                }
+                // Abandonment is minted only by the archive chokepoint, which
+                // drives the generated terminal in the same step while the
+                // session is Retired. There is no live window to reconcile,
+                // and the archive transition is illegal from a live phase.
+                DurableRecord::ModelRoutingIntentAbandoned { .. }
+                | DurableRecord::ModelRoutingIntentRequested { .. } => {}
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn archive_unresolved_model_routing_handoffs_inner(
         &self,
         session_id: &SessionId,
@@ -1922,22 +2074,46 @@ impl MeerkatMachine {
         let mut archived = Vec::with_capacity(handoffs.len());
         for handoff in handoffs {
             let request_key = switch_request_key(handoff.request_id);
-            self.apply_session_dsl_input(
-                session_id,
-                crate::meerkat_machine::dsl::MeerkatMachineInput::ImportCommittedModelRoutingHandoff {
-                    request_id: request_key.clone(),
-                    originating_run_id: handoff.originating_run_id.to_string(),
-                    target_model: handoff.intent.target_model.to_string(),
-                },
-                "ImportCommittedModelRoutingHandoff",
-            )
-            .await
-            .map_err(RuntimeControlPlaneError::Internal)?;
+            let run_key = handoff.originating_run_id.to_string();
+            let target = handoff.intent.target_model.to_string();
+            if !self
+                .session_dsl_state(session_id)
+                .await?
+                .model_routing_handoff
+                .contains_key(&request_key)
+            {
+                self.apply_session_dsl_input(
+                    session_id,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::ImportCommittedModelRoutingHandoff {
+                        request_id: request_key.clone(),
+                        record: crate::meerkat_machine::dsl::ModelRoutingHandoffRecord::imported(
+                            run_key.clone(),
+                            target.clone(),
+                        )
+                        .map_err(handoff_record_error)?,
+                    },
+                    "ImportCommittedModelRoutingHandoff",
+                )
+                .await
+                .map_err(RuntimeControlPlaneError::Internal)?;
+            }
+            // The archive arm names the state it observed as well as the state
+            // it proposes. Import above either created the record or it was
+            // already present, so this read is that exact observation.
+            let observed = self
+                .observed_model_routing_handoff(session_id, &request_key)
+                .await?;
             match self
                 .apply_session_dsl_input(
                     session_id,
                     crate::meerkat_machine::dsl::MeerkatMachineInput::ArchiveUnresolvedModelRoutingHandoff {
                         request_id: request_key.clone(),
+                        observed,
+                        record: crate::meerkat_machine::dsl::ModelRoutingHandoffRecord::archived(
+                            run_key,
+                            target,
+                        )
+                        .map_err(handoff_record_error)?,
                     },
                     "ArchiveUnresolvedModelRoutingHandoff",
                 )
@@ -1946,7 +2122,11 @@ impl MeerkatMachine {
                 Ok(_) => archived.push(handoff.request_id),
                 Err(reason) => {
                     let state = self.session_dsl_state(session_id).await?;
-                    match state.model_routing_handoff_phase.get(&request_key) {
+                    match state
+                        .model_routing_handoff
+                        .get(&request_key)
+                        .map(|record| record.phase())
+                    {
                         Some(
                             crate::meerkat_machine::dsl::RoutingHandoffPhase::Realized
                             | crate::meerkat_machine::dsl::RoutingHandoffPhase::Denied,
@@ -2010,34 +2190,92 @@ impl MeerkatMachine {
             let _mutation_guard = self
                 .lock_current_control_durability_ready_session_mutation_gate(session_id)
                 .await?;
-            self.apply_session_dsl_input(
-                session_id,
-                crate::meerkat_machine::dsl::MeerkatMachineInput::ImportCommittedModelRoutingHandoff {
-                    request_id: request_key.clone(),
-                    originating_run_id: run_key.clone(),
-                    target_model: target_model.to_string(),
-                },
-                "ImportCommittedModelRoutingHandoff",
-            )
-            .await
-            .map_err(RuntimeControlPlaneError::Internal)?;
+            // Import brings a committed fact the machine has not seen. If a
+            // record is already present this lap has nothing to import — and
+            // must not pretend otherwise: a request that has already advanced
+            // to Claimed or Realized is NOT an `Imported` record, so proposing
+            // one would be a false statement about observed state rather than
+            // a convergence.
+            if !self
+                .session_dsl_state(session_id)
+                .await?
+                .model_routing_handoff
+                .contains_key(&request_key)
+            {
+                self.apply_session_dsl_input(
+                    session_id,
+                    crate::meerkat_machine::dsl::MeerkatMachineInput::ImportCommittedModelRoutingHandoff {
+                        request_id: request_key.clone(),
+                        record: crate::meerkat_machine::dsl::ModelRoutingHandoffRecord::imported(
+                            run_key.clone(),
+                            target_model.to_string(),
+                        )
+                        .map_err(handoff_record_error)?,
+                    },
+                    "ImportCommittedModelRoutingHandoff",
+                )
+                .await
+                .map_err(RuntimeControlPlaneError::Internal)?;
+            }
+            let observed = self
+                .observed_model_routing_handoff(session_id, &request_key)
+                .await?;
+            // A generated `Realized` is convergence ONLY if the durable log
+            // agrees, exactly.
+            //
+            // Exactness is a statement about the committed record, so it is
+            // read rather than inferred from phase: the durable terminal must
+            // name the same request, the same originating run, the same target,
+            // and the identity the machine says was installed. Anything less —
+            // including a durable log that still owes this request — means the
+            // two authorities disagree about a routing change, and the durable
+            // one is what a restart reads. That fails closed instead of being
+            // interpreted as "already done".
+            if observed.phase() == crate::meerkat_machine::dsl::RoutingHandoffPhase::Realized {
+                let durable_matches = self
+                    .llm_reconfigure_host()
+                    .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?
+                    .load_live_session_model_routing_control_history(session_id)
+                    .await
+                    .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?
+                    .latest_record_for(&handoff.request_id)
+                    .is_some_and(|durable| {
+                        matches!(
+                            durable,
+                            meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord::ModelRoutingIntentRealized {
+                                applied_identity, ..
+                            } if applied_identity.model.as_str()
+                                == observed.applied_model().map_or("", |model| model.as_str())
+                        ) && durable.originating_run_id() == &handoff.originating_run_id
+                            && durable.intent().target_model == handoff.intent.target_model
+                    });
+                if durable_matches {
+                    return Ok(ModelRoutingHandoffRealization::AlreadyExact);
+                }
+                return Err(RuntimeControlPlaneError::Internal(format!(
+                    "generated authority reports model-routing handoff {:?} realized, but the \
+                     durable log carries no exactly matching realized record; refusing to \
+                     proceed on contradictory authorities",
+                    handoff.request_id
+                )));
+            }
             self.apply_session_dsl_input(
                 session_id,
                 crate::meerkat_machine::dsl::MeerkatMachineInput::ClaimModelRoutingHandoff {
                     request_id: request_key.clone(),
-                    originating_run_id: run_key.clone(),
-                    target_model: target_model.to_string(),
+                    // The claim names the state it observed, so generated
+                    // authority refuses a proposal built from a stale read.
+                    observed,
+                    record: crate::meerkat_machine::dsl::ModelRoutingHandoffRecord::claimed(
+                        run_key.clone(),
+                        target_model.to_string(),
+                    )
+                    .map_err(handoff_record_error)?,
                 },
                 "ClaimModelRoutingHandoff",
             )
             .await
             .map_err(RuntimeControlPlaneError::Internal)?;
-            let state = self.session_dsl_state(session_id).await?;
-            if state.model_routing_handoff_phase.get(&request_key)
-                == Some(&crate::meerkat_machine::dsl::RoutingHandoffPhase::Realized)
-            {
-                return Ok(ModelRoutingHandoffRealization::AlreadyExact);
-            }
         }
 
         let host = self
@@ -2119,6 +2357,13 @@ impl MeerkatMachine {
             }
         };
 
+        // The claimed record generated authority is holding right now. Both
+        // terminal arms below must name it, so it is read once here — after the
+        // switch chain and before either durable append.
+        let observed = self
+            .observed_model_routing_handoff(session_id, &request_key)
+            .await?;
+
         match switch_result {
             meerkat_core::image_generation::SwitchTurnControlResult::Applied { .. } => {
                 let applied_identity = self
@@ -2144,9 +2389,13 @@ impl MeerkatMachine {
                     session_id,
                     crate::meerkat_machine::dsl::MeerkatMachineInput::RealizeModelRoutingHandoff {
                         request_id: request_key,
-                        originating_run_id: run_key,
-                        target_model: target_model.to_string(),
-                        applied_model: applied_identity.model.clone(),
+                        record: crate::meerkat_machine::dsl::ModelRoutingHandoffRecord::realized(
+                            run_key,
+                            target_model.to_string(),
+                            applied_identity.model.clone(),
+                        )
+                        .map_err(handoff_record_error)?,
+                        observed,
                     },
                     "RealizeModelRoutingHandoff",
                 )
@@ -2176,7 +2425,13 @@ impl MeerkatMachine {
                     session_id,
                     crate::meerkat_machine::dsl::MeerkatMachineInput::DenyModelRoutingHandoff {
                         request_id: request_key,
-                        reason: routing_denial_from_switch(&reason),
+                        record: crate::meerkat_machine::dsl::ModelRoutingHandoffRecord::denied(
+                            run_key,
+                            target_model.to_string(),
+                            routing_denial_from_switch(&reason),
+                        )
+                        .map_err(handoff_record_error)?,
+                        observed,
                     },
                     "DenyModelRoutingHandoff",
                 )
@@ -2204,16 +2459,22 @@ impl MeerkatMachine {
     /// An exactly-equal record already present is accepted: a crash between
     /// the persist and the generated terminal is expected, and the retry must
     /// converge rather than refuse.
+    /// Durably commit one model-routing terminal record.
+    ///
+    /// Delegated to the host as ONE operation rather than an append followed by
+    /// a persist. Split across two calls, a failure between them leaves the
+    /// live session reporting a resolution the durable log never received: the
+    /// next pre-dequeue lap reads live, sees nothing owed, and admits the input
+    /// under the identity the handoff was committed to replace. The host owns
+    /// both steps and the compensation, so live state never claims a
+    /// resolution that is not on disk.
     async fn record_and_persist_model_routing_handoff_resolution(
         &self,
         session_id: &SessionId,
         host: &dyn SessionLlmReconfigureHost,
         record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
     ) -> Result<(), RuntimeControlPlaneError> {
-        host.append_live_session_model_routing_control_record(session_id, record)
-            .await
-            .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
-        host.persist_live_session(session_id)
+        host.commit_live_session_model_routing_control_record(session_id, record)
             .await
             .map_err(|error| RuntimeControlPlaneError::StoreError(error.to_string()))
     }
@@ -2238,6 +2499,20 @@ impl MeerkatMachine {
             .transpose()
             .map_err(RuntimeControlPlaneError::Internal)
     }
+}
+
+/// Map a record-construction refusal onto the control-plane error type.
+///
+/// The constructors enforce the same identity invariants the decoder does, so
+/// a refusal here means the shell tried to build a record that could never
+/// survive its own round-trip. That is an internal contradiction, not a
+/// caller-visible condition.
+fn handoff_record_error(
+    error: crate::meerkat_machine::dsl::ModelRoutingHandoffRecordError,
+) -> RuntimeControlPlaneError {
+    RuntimeControlPlaneError::Internal(format!(
+        "failed to build a model-routing handoff record: {error}"
+    ))
 }
 
 fn switch_request_key(id: meerkat_core::image_generation::SwitchTurnRequestId) -> String {
@@ -2865,9 +3140,10 @@ mod tests {
             );
             assert_eq!(
                 state
-                    .model_routing_handoff_phase
-                    .get(&switch_request_key(request_id)),
-                Some(&crate::meerkat_machine::dsl::RoutingHandoffPhase::Archived)
+                    .model_routing_handoff
+                    .get(&switch_request_key(request_id))
+                    .map(|record| record.phase()),
+                Some(crate::meerkat_machine::dsl::RoutingHandoffPhase::Archived)
             );
         }
     }

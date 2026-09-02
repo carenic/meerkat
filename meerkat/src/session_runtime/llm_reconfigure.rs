@@ -276,15 +276,23 @@ pub trait SessionRuntimeLlmReconfigureService: Send + Sync {
         SessionError,
     >;
 
-    /// Append one resolution to that log, leaving persistence to the caller.
-    async fn append_live_model_routing_control_record_under_runtime_turn_boundary(
-        &self,
+    /// Append one resolution to that log and durably commit it as ONE guarded
+    /// operation.
+    ///
+    /// Deliberately not `append` + `persist`: those interleave, and a failure
+    /// between them leaves the live session reporting a resolution the durable
+    /// log never received. Implementations must leave nothing settled in live
+    /// state that is not on disk.
+    ///
+    /// Takes `Arc<Self>` so an implementation can move the transaction into a
+    /// task it owns. Cancelling the caller must not be able to tear the pair in
+    /// half, and an implementation cannot offer that if the only handle it has
+    /// is borrowed from the caller's frame.
+    async fn commit_live_model_routing_control_record_under_runtime_turn_boundary(
+        self: Arc<Self>,
         session_id: &SessionId,
         record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
-    ) -> Result<
-        meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
-        SessionError,
-    >;
+    ) -> Result<(), SessionError>;
 }
 
 async fn preferred_hot_swap_realm(
@@ -428,6 +436,25 @@ impl SessionRuntimeLlmReconfigureService for PersistentSessionService<FactoryAge
             .await
     }
 
+    /// Read the committed handoff log, preferring the live actor and falling
+    /// back to committed authority when no actor is materialized.
+    ///
+    /// `export_live_session` reports `SessionError::NotFound` for BOTH "this
+    /// session does not exist" and "this session has no live actor right now"
+    /// (its `NoLive` / `DurableAuthoritative` arms). Between turns — which is
+    /// exactly when the pre-dequeue seam runs — having no live actor is an
+    /// ordinary shape: the session may be staged, mid-materialization, or
+    /// simply idle with its actor discarded.
+    ///
+    /// Treating that as a read failure stops the runtime loop; treating it as
+    /// an empty log would be worse, because it would silently drop a committed
+    /// handoff. So absence of a LIVE actor falls through to the COMMITTED
+    /// authority, which is where committed records actually live. Only a
+    /// session with no durable body at all yields an empty log, and such a
+    /// session has by construction committed nothing.
+    ///
+    /// The classification matches the structured `NotFound` variant, never
+    /// message text, and every other error propagates unchanged.
     async fn live_model_routing_control_history(
         &self,
         session_id: &SessionId,
@@ -435,22 +462,43 @@ impl SessionRuntimeLlmReconfigureService for PersistentSessionService<FactoryAge
         meerkat_core::session::model_routing_control::SessionModelRoutingControlHistory,
         SessionError,
     > {
-        Ok(self
-            .export_live_session(session_id)
+        // COMMITTED authority first, live only as a fallback.
+        //
+        // Every caller of this read is a pre-dequeue or realization decision,
+        // and those must be made against what is actually on disk. Preferring
+        // the live projection would let a terminal that exists live but never
+        // committed answer "this request is settled" — and the request would
+        // stop being owed with nothing durable behind it. Reading committed
+        // authority makes a live-only terminal unobservable to the decision,
+        // which is what keeps the debt visible until the commit truly lands.
+        //
+        // Safe precisely here: this runs between turns, under the held
+        // turn-finalization boundary, so no run is mid-flight and committed
+        // authority is complete rather than trailing a live session.
+        //
+        // The live fallback covers the session that has no durable row yet
+        // (created, never persisted): committed authority reports nothing, and
+        // the live actor is then the only carrier there is.
+        let committed = self
+            .observe_authoritative_session_body(session_id)
             .await?
-            .model_routing_control()
-            .clone())
+            .map(|session| session.model_routing_control().clone());
+        if let Some(committed) = committed {
+            return Ok(committed);
+        }
+        match self.export_live_session(session_id).await {
+            Ok(session) => Ok(session.model_routing_control().clone()),
+            Err(SessionError::NotFound { .. }) => Ok(Default::default()),
+            Err(error) => Err(error),
+        }
     }
 
-    async fn append_live_model_routing_control_record_under_runtime_turn_boundary(
-        &self,
+    async fn commit_live_model_routing_control_record_under_runtime_turn_boundary(
+        self: Arc<Self>,
         session_id: &SessionId,
         record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
-    ) -> Result<
-        meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
-        SessionError,
-    > {
-        PersistentSessionService::<FactoryAgentBuilder>::append_live_model_routing_control_record_under_runtime_turn_boundary(
+    ) -> Result<(), SessionError> {
+        PersistentSessionService::<FactoryAgentBuilder>::commit_live_model_routing_control_record_under_runtime_turn_boundary(
             self, session_id, record,
         )
         .await
@@ -583,6 +631,11 @@ impl SessionRuntimeLlmReconfigureService for EphemeralSessionService<FactoryAgen
         self.discard_live_session(session_id).await
     }
 
+    /// Ephemeral sessions have no durable boundary, so no committed cross-run
+    /// handoff can exist for them. A structurally absent session therefore owes
+    /// nothing, and reporting that as an empty log cannot lose a committed
+    /// record — there is no durable carrier one could have been written to.
+    /// Every other error still propagates.
     async fn live_model_routing_control_history(
         &self,
         session_id: &SessionId,
@@ -590,27 +643,24 @@ impl SessionRuntimeLlmReconfigureService for EphemeralSessionService<FactoryAgen
         meerkat_core::session::model_routing_control::SessionModelRoutingControlHistory,
         SessionError,
     > {
-        Ok(self
-            .export_session(session_id)
-            .await?
-            .model_routing_control()
-            .clone())
+        match self.export_session(session_id).await {
+            Ok(session) => Ok(session.model_routing_control().clone()),
+            Err(SessionError::NotFound { .. }) => Ok(Default::default()),
+            Err(error) => Err(error),
+        }
     }
 
     // Ephemeral sessions have no durable boundary, so a committed cross-run
     // handoff can never exist for them and this can never legitimately be
     // reached. Refusing keeps that impossibility loud instead of recording a
     // resolution into state that is about to disappear.
-    async fn append_live_model_routing_control_record_under_runtime_turn_boundary(
-        &self,
+    async fn commit_live_model_routing_control_record_under_runtime_turn_boundary(
+        self: Arc<Self>,
         _session_id: &SessionId,
         _record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
-    ) -> Result<
-        meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
-        SessionError,
-    > {
+    ) -> Result<(), SessionError> {
         Err(SessionError::Agent(AgentError::ConfigError(
-            "ephemeral sessions cannot record durable model-routing handoff resolutions"
+            "ephemeral sessions cannot durably commit model-routing handoff resolutions"
                 .to_string(),
         )))
     }
@@ -1107,6 +1157,19 @@ impl SessionLlmReconfigureHost for SessionRuntimeLlmReconfigureHost {
             .map_err(session_error_to_runtime_driver)
     }
 
+    async fn commit_live_session_model_routing_control_record(
+        &self,
+        session_id: &SessionId,
+        record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
+    ) -> Result<(), RuntimeDriverError> {
+        Arc::clone(&self.service)
+            .commit_live_model_routing_control_record_under_runtime_turn_boundary(
+                session_id, record,
+            )
+            .await
+            .map_err(session_error_to_runtime_driver)
+    }
+
     async fn load_live_session_model_routing_control_history(
         &self,
         session_id: &SessionId,
@@ -1116,22 +1179,6 @@ impl SessionLlmReconfigureHost for SessionRuntimeLlmReconfigureHost {
     > {
         self.service
             .live_model_routing_control_history(session_id)
-            .await
-            .map_err(session_error_to_runtime_driver)
-    }
-
-    async fn append_live_session_model_routing_control_record(
-        &self,
-        session_id: &SessionId,
-        record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
-    ) -> Result<
-        meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
-        RuntimeDriverError,
-    > {
-        self.service
-            .append_live_model_routing_control_record_under_runtime_turn_boundary(
-                session_id, record,
-            )
             .await
             .map_err(session_error_to_runtime_driver)
     }
@@ -1242,15 +1289,12 @@ mod tests {
             unreachable!("realm selection does not read the handoff log")
         }
 
-        async fn append_live_model_routing_control_record_under_runtime_turn_boundary(
-            &self,
+        async fn commit_live_model_routing_control_record_under_runtime_turn_boundary(
+            self: Arc<Self>,
             _session_id: &SessionId,
             _record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
-        ) -> Result<
-            meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
-            SessionError,
-        > {
-            unreachable!("realm selection does not record handoff resolutions")
+        ) -> Result<(), SessionError> {
+            unreachable!("realm selection does not commit handoff resolutions")
         }
     }
 

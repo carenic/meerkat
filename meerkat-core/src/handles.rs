@@ -90,6 +90,22 @@ pub enum DrainExitReason {
 /// owns the canonical baseline model and capability surface before tools or
 /// visibility projections observe those facts.
 pub trait ModelRoutingHandle: Send + Sync {
+    /// Whether this runtime can actually realize a committed cross-run
+    /// routing handoff.
+    ///
+    /// Being session-owned is necessary but not sufficient: realization also
+    /// needs an installed session-LLM reconfigure host, because that is what
+    /// reads the committed log and rebinds identity. A build that advertises
+    /// `brain_swap` without one produces sessions that accept the call, commit
+    /// the request, and never act on it — a failure nothing at that surface
+    /// can observe.
+    ///
+    /// Defaults to `false` so a handle that has not positively declared the
+    /// capability cannot cause the tool to be advertised.
+    fn committed_handoff_realization_ready(&self) -> bool {
+        false
+    }
+
     /// Set the session's canonical model-routing baseline.
     fn set_baseline(
         &self,

@@ -856,10 +856,12 @@ pub(crate) async fn run_mob_host(args: MobHostArgs, scope: &RuntimeScope) -> any
         factory,
         config.clone(),
         persistence,
+        meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
+            .root
+            .join("config_state.json"),
         default_schedule_tools,
         None,
     );
-    let service = Arc::new(service);
     let capability_source_runtime: Arc<dyn ForkedParticipantSourceRuntime> = service.clone();
 
     // 6. Live plane (DEC-P2-8, served since 6b): four facade roles over the

@@ -632,9 +632,13 @@ impl AppState {
             Some(workgraph_service.namespace_grant().clone()),
         );
         let (session_service, runtime_adapter) =
-            meerkat::surface::build_runtime_backed_service(builder, max_sessions, persistence);
+            meerkat::surface::build_runtime_backed_service_with_default_reconfigure_host(
+                builder,
+                max_sessions,
+                persistence,
+                realm_paths.root.join("config_state.json"),
+            );
         let auth_lease = runtime_adapter.generated_auth_lease_handle();
-        let session_service = Arc::new(session_service);
         #[cfg(feature = "mob")]
         let mob_session_service = session_service.clone();
 

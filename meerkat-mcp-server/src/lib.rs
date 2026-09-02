@@ -1442,8 +1442,12 @@ impl MeerkatMcpState {
             Some(workgraph_service.namespace_grant().clone()),
         );
         let (service, runtime_adapter) =
-            meerkat::surface::build_runtime_backed_service(builder, max_sessions, persistence);
-        let service = Arc::new(service);
+            meerkat::surface::build_runtime_backed_service_with_default_reconfigure_host(
+                builder,
+                max_sessions,
+                persistence,
+                realm_paths.root.join("config_state.json"),
+            );
         #[cfg(feature = "mob")]
         let mob_state = {
             let persistent_mob_root = realm_paths.root.clone();
@@ -1643,12 +1647,13 @@ impl MeerkatMcpState {
         let blob_store: Arc<dyn meerkat_core::BlobStore> = Arc::new(
             meerkat_store::FsBlobStore::new(realm_paths.root.join("blobs")),
         );
-        let (service, runtime_adapter) = meerkat::surface::build_runtime_backed_service(
-            builder,
-            max_sessions,
-            PersistenceBundle::new(store, runtime_store, blob_store),
-        );
-        let service = Arc::new(service);
+        let (service, runtime_adapter) =
+            meerkat::surface::build_runtime_backed_service_with_default_reconfigure_host(
+                builder,
+                max_sessions,
+                PersistenceBundle::new(store, runtime_store, blob_store),
+                realm_paths.root.join("config_state.json"),
+            );
 
         let state = Self {
             service,

@@ -52,6 +52,17 @@ pub type AttachedActorPublicationRefreshFn = Arc<
         + Sync,
 >;
 
+/// Build a runtime-backed service WITHOUT a session-LLM reconfigure host.
+///
+/// Explicit-host owners only. The caller takes responsibility for installing a
+/// host before any agent is built; a surface that installs none ships sessions
+/// that can accept a `brain_swap` call and never realize it. Product surfaces
+/// should call
+/// [`build_runtime_backed_service_with_default_reconfigure_host`] instead.
+///
+/// RPC deliberately stays on this path because it installs its own host with
+/// late-bound default-client, config, and staged-registry wiring; routing it
+/// through the wrapper would install a second, shadowing host.
 #[cfg(feature = "session-store")]
 pub fn build_runtime_backed_service(
     builder: FactoryAgentBuilder,
@@ -67,6 +78,87 @@ pub fn build_runtime_backed_service(
         DEFAULT_RUNTIME_BACKED_ARCHIVED_HISTORY_CAPACITY,
         persistence,
     )
+}
+
+/// Build a runtime-backed service that already has the canonical session-LLM
+/// reconfigure host installed.
+///
+/// This is the composition every product surface should use. The low-level
+/// [`build_runtime_backed_service`] leaves the reconfigure host UNSET, and an
+/// unset host is not a missing convenience — it is a session that advertises
+/// `brain_swap` to the model, accepts the call, commits the request, and then
+/// can never realize it, because the pre-dequeue seam has no host to read the
+/// committed log through. Nothing about that failure is visible at the surface
+/// that shipped it.
+///
+/// Installing here also fixes the ordering hazard: the host must exist before
+/// any agent is built, since the first turn can stage a handoff. The blueprint
+/// is captured before the builder is moved into the service, then installed
+/// against the concrete service the moment it exists.
+#[cfg(feature = "session-store")]
+pub fn build_runtime_backed_service_with_default_reconfigure_host(
+    builder: FactoryAgentBuilder,
+    max_sessions: usize,
+    persistence: crate::PersistenceBundle,
+    config_state_path: std::path::PathBuf,
+) -> (
+    Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    Arc<MeerkatMachine>,
+) {
+    build_runtime_backed_service_with_capacities_and_default_reconfigure_host(
+        builder,
+        max_sessions,
+        DEFAULT_RUNTIME_BACKED_ARCHIVED_HISTORY_CAPACITY,
+        persistence,
+        config_state_path,
+    )
+}
+
+/// Capacity-explicit sibling of
+/// [`build_runtime_backed_service_with_default_reconfigure_host`].
+#[cfg(feature = "session-store")]
+pub fn build_runtime_backed_service_with_capacities_and_default_reconfigure_host(
+    builder: FactoryAgentBuilder,
+    active_session_capacity: usize,
+    archived_history_capacity: usize,
+    persistence: crate::PersistenceBundle,
+    config_state_path: std::path::PathBuf,
+) -> (
+    Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    Arc<MeerkatMachine>,
+) {
+    // Captured BEFORE the builder moves into the service: the blueprint needs
+    // the builder's factory, config store, and late-bound client/realm slots.
+    //
+    // The default-client slot is seeded from the builder's own configured
+    // default rather than forced empty. A host that injected a default client
+    // means it for every client this runtime builds, and reconfigure is not an
+    // exception — silently ignoring it here would give hosted surfaces
+    // different reconfigure semantics from the explicit-host path, which is
+    // exactly the kind of surface-conditional behaviour this wrapper exists to
+    // remove. When no default is configured the slot stays empty and target
+    // resolution goes through the provider registry as usual.
+    let blueprint =
+        crate::session_runtime::llm_reconfigure::SessionRuntimeLlmReconfigureHostBlueprint::new(
+            &builder,
+            config_state_path,
+            Arc::new(std::sync::RwLock::new(builder.default_llm_client.clone())),
+        );
+    let (service, adapter) = build_runtime_backed_service_with_capacities(
+        builder,
+        active_session_capacity,
+        archived_history_capacity,
+        persistence,
+    );
+    let service = Arc::new(service);
+    blueprint.install(
+        &adapter,
+        Arc::clone(&service)
+            as Arc<
+                dyn crate::session_runtime::llm_reconfigure::SessionRuntimeLlmReconfigureService,
+            >,
+    );
+    (service, adapter)
 }
 
 #[cfg(feature = "session-store")]
@@ -1361,80 +1453,13 @@ pub fn persistent_runtime_post_stop_cleanup_handle_for_actor_slot<
 /// Build the shared pre-dequeue realization handle for one runtime-backed
 /// session.
 ///
-/// This is the single implementation every runtime-backed surface returns.
-/// Duplicating it per surface would let one skin quietly ship a session where a
-/// committed handoff is never realized, and that failure is invisible: the
-/// session simply keeps answering on the old model as if nothing was ever
-/// requested.
-///
-/// It needs only the `MeerkatMachine` and the session id, because the machine
-/// already owns the generated lifecycle, the boundary receipts, and the
-/// reconfigure host that reads and writes the durable log.
-pub fn persistent_runtime_pre_dequeue_handle(
-    adapter: Arc<meerkat_runtime::MeerkatMachine>,
-    session_id: SessionId,
-) -> Arc<dyn meerkat_core::lifecycle::CoreExecutorPreDequeueHandle> {
-    Arc::new(RuntimeModelRoutingHandoffPreDequeueHandle {
-        adapter,
-        session_id,
-    })
-}
-
-struct RuntimeModelRoutingHandoffPreDequeueHandle {
-    adapter: Arc<meerkat_runtime::MeerkatMachine>,
-    session_id: SessionId,
-}
-
-#[async_trait::async_trait]
-impl meerkat_core::lifecycle::CoreExecutorPreDequeueHandle
-    for RuntimeModelRoutingHandoffPreDequeueHandle
-{
-    async fn realize_committed_handoffs_under_turn_finalization_boundary(
-        &self,
-    ) -> Result<meerkat_core::lifecycle::CorePreDequeueOutcome, CoreExecutorError> {
-        use meerkat_core::lifecycle::CorePreDequeueOutcome;
-        use meerkat_runtime::{ModelRoutingHandoffRealization, SessionServiceRuntimeExt};
-
-        let pending = self
-            .adapter
-            .committed_model_routing_handoffs_awaiting_decision(&self.session_id)
-            .await
-            .map_err(|error| CoreExecutorError::control_failed_runtime(error.to_string()))?;
-        if pending.is_empty() {
-            return Ok(CorePreDequeueOutcome::NothingPending);
-        }
-        let mut realized_any = false;
-        for handoff in pending {
-            let request_id = handoff.request_id;
-            match self
-                .adapter
-                .realize_committed_model_routing_handoff_under_turn_finalization_boundary(
-                    &self.session_id,
-                    handoff,
-                )
-                .await
-                .map_err(|error| {
-                    // A failed realization must not let the pending input
-                    // proceed under an identity the session was told to leave.
-                    CoreExecutorError::control_failed_runtime(error.to_string())
-                })? {
-                ModelRoutingHandoffRealization::Realized { .. }
-                | ModelRoutingHandoffRealization::Denied { .. } => realized_any = true,
-                ModelRoutingHandoffRealization::AlreadyExact => {}
-                ModelRoutingHandoffRealization::Held { reason } => {
-                    return Err(CoreExecutorError::control_failed_runtime(format!(
-                        "committed model-routing handoff {request_id:?} is held: {reason}"
-                    )));
-                }
-            }
-        }
-        Ok(if realized_any {
-            CorePreDequeueOutcome::Realized
-        } else {
-            CorePreDequeueOutcome::NothingPending
-        })
-    }
-}
+/// Re-exported from `meerkat_runtime`, which owns the single implementation.
+/// It lives there because the handle needs only the `MeerkatMachine` and the
+/// session id, and because the mob provisioner must return the SAME handle
+/// while depending on the runtime rather than on this crate's `session-store`
+/// feature. Keeping this name here preserves the one helper every surface
+/// calls.
+pub use meerkat_runtime::persistent_runtime_pre_dequeue_handle;
 
 /// Build the stable outer mutation boundary shared by runtime-loop, direct,
 /// and non-turn session writers for one SessionId.

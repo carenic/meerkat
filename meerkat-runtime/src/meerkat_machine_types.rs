@@ -357,20 +357,23 @@ pub trait SessionLlmReconfigureHost: Send + Sync {
         ))
     }
 
-    /// Append one record to the committed handoff log and leave it staged on
-    /// the live session for the caller's subsequent persist.
+    /// Append one record to the committed handoff log AND durably commit it as
+    /// one operation.
+    ///
+    /// Separate from the append/persist pair because those interleave: a
+    /// failure between them leaves the live session reporting a resolution the
+    /// durable log never received, and that request silently stops being owed.
+    /// Implementations must leave nothing settled in live state that is not on
+    /// disk.
     ///
     /// Caller must hold the turn-finalization boundary.
-    async fn append_live_session_model_routing_control_record(
+    async fn commit_live_session_model_routing_control_record(
         &self,
         _session_id: &SessionId,
         _record: meerkat_core::session::model_routing_control::SessionModelRoutingControlRecord,
-    ) -> Result<
-        meerkat_core::session::model_routing_control::ModelRoutingControlAppendOutcome,
-        RuntimeDriverError,
-    > {
+    ) -> Result<(), RuntimeDriverError> {
         Err(RuntimeDriverError::Internal(
-            "session llm reconfigure host cannot record model-routing handoff resolutions"
+            "session llm reconfigure host cannot durably commit model-routing handoff resolutions"
                 .to_string(),
         ))
     }

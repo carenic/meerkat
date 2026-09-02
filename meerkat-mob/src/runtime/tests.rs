@@ -47282,6 +47282,23 @@ fn test_session_llm_capabilities() -> meerkat_runtime::SessionLlmCapabilitySurfa
 
 #[async_trait]
 impl meerkat_runtime::SessionLlmReconfigureHost for RecordingSessionLlmReconfigureHost {
+    /// This double carries no committed handoff log, and says so explicitly.
+    ///
+    /// The trait default refuses on purpose, so that a real host which forgets
+    /// this seam holds instead of silently reporting "nothing was requested".
+    /// A test double owes nothing by construction, so it declares the empty
+    /// log rather than inheriting a refusal that would fail every
+    /// pre-dequeue lap.
+    async fn load_live_session_model_routing_control_history(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<
+        meerkat_core::session::model_routing_control::SessionModelRoutingControlHistory,
+        meerkat_runtime::RuntimeDriverError,
+    > {
+        Ok(Default::default())
+    }
+
     async fn acquire_turn_finalization_boundary(
         &self,
         _session_id: &SessionId,

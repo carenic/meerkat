@@ -38,6 +38,13 @@ fn capability_surface_from_profile(profile: &ModelProfile) -> mm_dsl::SessionLlm
 pub struct RuntimeModelRoutingHandle {
     dsl: Arc<HandleDslAuthority>,
     visibility_owner: Option<Arc<crate::meerkat_machine::MachineToolVisibilityOwner>>,
+    /// Live answer to "can this runtime realize a committed handoff?".
+    ///
+    /// Held as a shared flag rather than a captured boolean because the
+    /// reconfigure host is installed on the adapter AFTER the service is
+    /// constructed. A snapshot taken at handle construction would report the
+    /// pre-install answer forever.
+    reconfigure_host_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 struct RuntimeStickyModelFallbackMachineCommit {
@@ -60,7 +67,19 @@ impl RuntimeModelRoutingHandle {
         Self {
             dsl,
             visibility_owner: None,
+            reconfigure_host_ready: None,
         }
+    }
+
+    /// Bind the shared flag the owning machine flips when a session-LLM
+    /// reconfigure host is installed.
+    #[must_use]
+    pub(crate) fn with_reconfigure_host_readiness(
+        mut self,
+        ready: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.reconfigure_host_ready = Some(ready);
+        self
     }
 
     /// Construct the session-owned handle with the canonical visibility
@@ -72,6 +91,7 @@ impl RuntimeModelRoutingHandle {
         Self {
             dsl,
             visibility_owner: Some(visibility_owner),
+            reconfigure_host_ready: None,
         }
     }
 
@@ -188,6 +208,12 @@ impl RuntimeModelRoutingHandle {
 }
 
 impl ModelRoutingHandle for RuntimeModelRoutingHandle {
+    fn committed_handoff_realization_ready(&self) -> bool {
+        self.reconfigure_host_ready
+            .as_ref()
+            .is_some_and(|ready| ready.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     fn set_baseline(
         &self,
         baseline_model: ModelId,

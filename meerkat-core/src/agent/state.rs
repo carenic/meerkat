@@ -610,6 +610,22 @@ struct CallingLlmToolBatch {
     accumulated_session_effects: Vec<crate::ops::SessionEffect>,
     callback_pending: Vec<(String, String, Value)>,
 }
+
+/// Whether a session save may fail quietly.
+///
+/// The historical intra-loop checkpoint is best-effort on purpose: the later
+/// runtime boundary owns durable truth, so a missed write costs nothing a
+/// caller could observe. That reasoning stops holding the moment a run commits
+/// a cross-run request into the session it is saving — see
+/// [`Agent::commit_model_routing_handoff_and_save_session`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionSaveDurability {
+    /// A failed store write is logged and the run continues.
+    BestEffort,
+    /// A failed store write fails the run.
+    Required,
+}
+
 impl<C, T, S> Agent<C, T, S>
 where
     C: AgentLlmClient + ?Sized + 'static,
@@ -630,6 +646,15 @@ where
     /// produces no claim; an uncertain or unacknowledged physical successor
     /// terminates before a result can be returned.
     async fn save_session_best_effort(&mut self, run_id: &RunId) -> Result<(), AgentError> {
+        self.save_session_with_durability(run_id, SessionSaveDurability::BestEffort)
+            .await
+    }
+
+    async fn save_session_with_durability(
+        &mut self,
+        run_id: &RunId,
+        durability: SessionSaveDurability,
+    ) -> Result<(), AgentError> {
         self.sync_control_state_to_session().map_err(|error| {
             AgentError::InternalError(format!(
                 "failed to sync agent control state before session checkpoint: {error}"
@@ -691,7 +716,15 @@ where
         }
         self.latest_run_checkpoint_receipt = None;
         if let Err(e) = self.store.save(&self.session).await {
-            tracing::warn!("Failed to save session: {}", e);
+            match durability {
+                SessionSaveDurability::BestEffort => {
+                    tracing::warn!("Failed to save session: {}", e);
+                }
+                // Returned as-is: the store already produced a typed
+                // `AgentError`, and restating it as a formatted string would
+                // erase the variant a caller matches on.
+                SessionSaveDurability::Required => return Err(e),
+            }
         }
         Ok(())
     }
@@ -723,9 +756,9 @@ where
     async fn promote_staged_model_routing_handoff(
         &mut self,
         run_id: &RunId,
-    ) -> Result<(), AgentError> {
+    ) -> Result<bool, AgentError> {
         let Some(staging) = self.model_routing_handoff_staging.clone() else {
-            return Ok(());
+            return Ok(false);
         };
         let staged = staging.take().map_err(|error| {
             AgentError::InternalError(format!(
@@ -733,7 +766,7 @@ where
             ))
         })?;
         let Some(staged) = staged else {
-            return Ok(());
+            return Ok(false);
         };
         let record = staged
             .into_committed_request(run_id.clone())
@@ -749,7 +782,7 @@ where
                     "failed to commit staged model-routing handoff: {error}"
                 ))
             })?;
-        Ok(())
+        Ok(true)
     }
 
     /// Promote (if anything is staged) and then take the ordinary final
@@ -758,12 +791,27 @@ where
     /// The ordering is the contract: the request must be part of the same
     /// session state the checkpoint persists, never a follow-up write that a
     /// crash could separate from the transcript that authorized it.
+    ///
+    /// Promotion also changes what a failed save MEANS. Ordinarily a failed
+    /// store write is best-effort: the transcript is recoverable and the run's
+    /// answer is still true. But once this run has promoted a request, a run
+    /// that reports success is telling the model its permanent switch was
+    /// accepted — while nothing on disk owes it. The next session would answer
+    /// on the old identity with no record that anything was ever asked. So a
+    /// promoting run requires the save, and fails if it cannot have it.
+    ///
+    /// Nothing staged means nothing changed, so the ordinary best-effort
+    /// behaviour is preserved exactly.
     async fn commit_model_routing_handoff_and_save_session(
         &mut self,
         run_id: &RunId,
     ) -> Result<(), AgentError> {
-        self.promote_staged_model_routing_handoff(run_id).await?;
-        self.save_session_best_effort(run_id).await
+        let durability = if self.promote_staged_model_routing_handoff(run_id).await? {
+            SessionSaveDurability::Required
+        } else {
+            SessionSaveDurability::BestEffort
+        };
+        self.save_session_with_durability(run_id, durability).await
     }
 
     fn publish_pending_sticky_model_fallback(&mut self) -> Result<(), AgentError> {

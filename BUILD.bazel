@@ -632,6 +632,7 @@ test_suite(
         "//meerkat:agent_builder_policy_canary_test",
         "//meerkat:agent_factory_auth_binding_test",
         "//meerkat:atif_reexport_test",
+        "//meerkat:brain_swap_history_read_classification_test",
         "//meerkat:brain_swap_pre_dequeue_loop_test",
         "//meerkat:brain_swap_realization_saga_test",
         "//meerkat:brain_swap_surface_parity_test",

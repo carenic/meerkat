@@ -1061,7 +1061,7 @@ pub use runtime_event::{
     RuntimeProjectionEvent, RuntimeStateChangeEvent, RuntimeTopologyEvent,
 };
 pub use runtime_state::{RuntimeState, RuntimeStateTransitionError};
-pub use service_ext::SessionServiceRuntimeExt;
+pub use service_ext::{SessionServiceRuntimeExt, persistent_runtime_pre_dequeue_handle};
 #[cfg(feature = "sqlite-store")]
 pub use store::SqliteRuntimeStore;
 pub use store::{

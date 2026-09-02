@@ -77,11 +77,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `model_routing_image_plan_denials`: `Map<String, RoutingImagePlanDenialReason>`
 - `model_routing_approval_phases`: `Map<String, RoutingApprovalPhase>`
 - `model_routing_approval_parent_kind`: `Map<String, RoutingApprovalParentKind>`
-- `model_routing_handoff_phase`: `Map<String, RoutingHandoffPhase>`
-- `model_routing_handoff_run`: `Map<String, String>`
-- `model_routing_handoff_target`: `Map<String, String>`
-- `model_routing_handoff_applied_model`: `Map<String, String>`
-- `model_routing_handoff_denials`: `Map<String, RoutingDenialReason>`
+- `model_routing_handoff`: `Map<String, ModelRoutingHandoffRecord>`
 - `registration_phase`: `RegistrationPhase`
 - `unregister_runtime_loop_drain_pending`: `Bool`
 - `unregister_comms_drain_exit_pending`: `Bool`
@@ -452,10 +448,10 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `PublishEvent`(kind: RuntimeEventKind)
 - `RuntimeState`(runtime_id: String)
 - `AdmitModelRoutingAssistantTurn`
-- `ImportCommittedModelRoutingHandoff`(request_id: String, originating_run_id: String, target_model: String)
-- `ClaimModelRoutingHandoff`(request_id: String, originating_run_id: String, target_model: String)
-- `RealizeModelRoutingHandoff`(request_id: String, originating_run_id: String, target_model: String, applied_model: String)
-- `DenyModelRoutingHandoff`(request_id: String, reason: RoutingDenialReason)
+- `ImportCommittedModelRoutingHandoff`(request_id: String, record: ModelRoutingHandoffRecord)
+- `ClaimModelRoutingHandoff`(request_id: String, observed: ModelRoutingHandoffRecord, record: ModelRoutingHandoffRecord)
+- `RealizeModelRoutingHandoff`(request_id: String, observed: ModelRoutingHandoffRecord, record: ModelRoutingHandoffRecord)
+- `DenyModelRoutingHandoff`(request_id: String, observed: ModelRoutingHandoffRecord, record: ModelRoutingHandoffRecord)
 - `BeginImageOperation`(operation_id: String, target_model: String, target_realtime_capable: Bool, requires_approval: Bool, approval_available: Bool, approval_denied: Bool, approval_reason: Option<RoutingImageApprovalReason>, realtime_detach_allowed: Bool, requires_scoped_override: Bool)
 - `DenyImageOperationPlan`(operation_id: String, reason: RoutingImagePlanDenialReason, terminal_payload: String)
 - `ActivateImageOperationOverride`(operation_id: String, target_model: String, target_realtime_capable: Bool)
@@ -531,7 +527,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RequestFiniteSwitchTurn`(request_id: String, target_model: String, turns: u64, target_realtime_capable: Bool, requires_approval: Bool, approval_available: Bool, approval_denied: Bool, approval_reason: Option<RoutingSwitchApprovalReason>, realtime_detach_allowed: Bool)
 - `RequestUntilChangedSwitchTurn`(request_id: String, target_model: String, target_realtime_capable: Bool, requires_approval: Bool, approval_available: Bool, approval_denied: Bool, approval_reason: Option<RoutingSwitchApprovalReason>, realtime_detach_allowed: Bool)
 - `CompleteUntilChangedSwitchTurnReconfigure`(request_id: String)
-- `ArchiveUnresolvedModelRoutingHandoff`(request_id: String)
+- `ArchiveUnresolvedModelRoutingHandoff`(request_id: String, observed: ModelRoutingHandoffRecord, record: ModelRoutingHandoffRecord)
 - `ResolveLiveBoundaryContextReceipt`(run_id: RunId, input_id: String)
 - `CommitTerminalBoundarySequence`(run_id: RunId, boundary_sequence: u64)
 - `LiveBoundaryUnavailable`(input_id: String)
@@ -1042,6 +1038,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `op_lifecycle_action_status_valid`(action: OpLifecycleActionKind, status: OperationStatus) -> `Bool`
 - `operation_status_terminal`(status: OperationStatus) -> `Bool`
 - `llm_failure_kind_recoverable`(kind: LlmRetryFailureKind) -> `Bool`
+- `handoff_record_binds_same_request`(existing: ModelRoutingHandoffRecord, proposed: ModelRoutingHandoffRecord) -> `Bool`
+- `handoff_record_outcome_free`(record: ModelRoutingHandoffRecord) -> `Bool`
 - `operation_source_valid`(source: Option<OperationSource>) -> `Bool`
 - `op_lifecycle_transition_rejection_idempotent`(action: OpLifecycleActionKind, status: OperationStatus) -> `Bool`
 - `wait_operation_token_witness_valid`(operation_ids: Set<String>, operation_id_tokens: Set<OperationId>, operation_token_by_id: Map<String, OperationId>, operation_id_by_token: Map<OperationId, String>) -> `Bool`
@@ -2608,256 +2606,290 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ImportCommittedModelRoutingHandoffFirstIdle`
 - From: `Idle`
-- On: `ImportCommittedModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- On: `ImportCommittedModelRoutingHandoff`(request_id, record)
 - Guards:
   - `session_registered`
   - `not_yet_imported`
+  - `proposed_is_fresh_import`
 - To: `Idle`
 
 ### `ImportCommittedModelRoutingHandoffFirstAttached`
 - From: `Attached`
-- On: `ImportCommittedModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- On: `ImportCommittedModelRoutingHandoff`(request_id, record)
 - Guards:
   - `session_registered`
   - `not_yet_imported`
+  - `proposed_is_fresh_import`
 - To: `Attached`
 
 ### `ImportCommittedModelRoutingHandoffFirstRunning`
 - From: `Running`
-- On: `ImportCommittedModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- On: `ImportCommittedModelRoutingHandoff`(request_id, record)
 - Guards:
   - `session_registered`
   - `not_yet_imported`
+  - `proposed_is_fresh_import`
 - To: `Running`
 
 ### `ImportCommittedModelRoutingHandoffFirstRetired`
 - From: `Retired`
-- On: `ImportCommittedModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- On: `ImportCommittedModelRoutingHandoff`(request_id, record)
 - Guards:
   - `session_registered`
   - `not_yet_imported`
+  - `proposed_is_fresh_import`
 - To: `Retired`
 
 ### `ImportCommittedModelRoutingHandoffAlreadyExactIdle`
 - From: `Idle`
-- On: `ImportCommittedModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- On: `ImportCommittedModelRoutingHandoff`(request_id, record)
 - Guards:
   - `session_registered`
   - `already_imported_exactly`
+  - `proposed_is_import_shaped`
 - To: `Idle`
 
 ### `ImportCommittedModelRoutingHandoffAlreadyExactAttached`
 - From: `Attached`
-- On: `ImportCommittedModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- On: `ImportCommittedModelRoutingHandoff`(request_id, record)
 - Guards:
   - `session_registered`
   - `already_imported_exactly`
+  - `proposed_is_import_shaped`
 - To: `Attached`
 
 ### `ImportCommittedModelRoutingHandoffAlreadyExactRunning`
 - From: `Running`
-- On: `ImportCommittedModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- On: `ImportCommittedModelRoutingHandoff`(request_id, record)
 - Guards:
   - `session_registered`
   - `already_imported_exactly`
+  - `proposed_is_import_shaped`
 - To: `Running`
 
 ### `ImportCommittedModelRoutingHandoffAlreadyExactRetired`
 - From: `Retired`
-- On: `ImportCommittedModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- On: `ImportCommittedModelRoutingHandoff`(request_id, record)
 - Guards:
   - `session_registered`
   - `already_imported_exactly`
+  - `proposed_is_import_shaped`
 - To: `Retired`
 
 ### `ClaimModelRoutingHandoffImportedIdle`
 - From: `Idle`
-- On: `ClaimModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- On: `ClaimModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
-  - `imported_exactly`
+  - `observed_is_stored`
+  - `observed_is_imported`
+  - `proposed_is_claim`
 - To: `Idle`
 
 ### `ClaimModelRoutingHandoffImportedAttached`
 - From: `Attached`
-- On: `ClaimModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- On: `ClaimModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
-  - `imported_exactly`
+  - `observed_is_stored`
+  - `observed_is_imported`
+  - `proposed_is_claim`
 - To: `Attached`
 
 ### `ClaimModelRoutingHandoffImportedRunning`
 - From: `Running`
-- On: `ClaimModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- On: `ClaimModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
-  - `imported_exactly`
+  - `observed_is_stored`
+  - `observed_is_imported`
+  - `proposed_is_claim`
 - To: `Running`
 
 ### `ClaimModelRoutingHandoffAlreadyClaimedIdle`
 - From: `Idle`
-- On: `ClaimModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- On: `ClaimModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `already_claimed_exactly`
+  - `proposed_is_claim_shaped`
 - To: `Idle`
 
 ### `ClaimModelRoutingHandoffAlreadyClaimedAttached`
 - From: `Attached`
-- On: `ClaimModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- On: `ClaimModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `already_claimed_exactly`
+  - `proposed_is_claim_shaped`
 - To: `Attached`
 
 ### `ClaimModelRoutingHandoffAlreadyClaimedRunning`
 - From: `Running`
-- On: `ClaimModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- On: `ClaimModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `already_claimed_exactly`
+  - `proposed_is_claim_shaped`
 - To: `Running`
 
 ### `ClaimModelRoutingHandoffAlreadyRealizedIdle`
 - From: `Idle`
-- On: `ClaimModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- On: `ClaimModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `already_realized_exactly`
+  - `proposed_is_claim_shaped`
 - To: `Idle`
 
 ### `ClaimModelRoutingHandoffAlreadyRealizedAttached`
 - From: `Attached`
-- On: `ClaimModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- On: `ClaimModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `already_realized_exactly`
+  - `proposed_is_claim_shaped`
 - To: `Attached`
 
 ### `ClaimModelRoutingHandoffAlreadyRealizedRunning`
 - From: `Running`
-- On: `ClaimModelRoutingHandoff`(request_id, originating_run_id, target_model)
+- On: `ClaimModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `already_realized_exactly`
+  - `proposed_is_claim_shaped`
 - To: `Running`
 
 ### `RealizeModelRoutingHandoffClaimedIdle`
 - From: `Idle`
-- On: `RealizeModelRoutingHandoff`(request_id, originating_run_id, target_model, applied_model)
+- On: `RealizeModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `claimed_exactly`
+  - `proposed_is_realization`
 - Emits: `ModelRoutingStatusChanged`
 - To: `Idle`
 
 ### `RealizeModelRoutingHandoffClaimedAttached`
 - From: `Attached`
-- On: `RealizeModelRoutingHandoff`(request_id, originating_run_id, target_model, applied_model)
+- On: `RealizeModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `claimed_exactly`
+  - `proposed_is_realization`
 - Emits: `ModelRoutingStatusChanged`
 - To: `Attached`
 
 ### `RealizeModelRoutingHandoffClaimedRunning`
 - From: `Running`
-- On: `RealizeModelRoutingHandoff`(request_id, originating_run_id, target_model, applied_model)
+- On: `RealizeModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `claimed_exactly`
+  - `proposed_is_realization`
 - Emits: `ModelRoutingStatusChanged`
 - To: `Running`
 
 ### `RealizeModelRoutingHandoffAlreadyRealizedIdle`
 - From: `Idle`
-- On: `RealizeModelRoutingHandoff`(request_id, originating_run_id, target_model, applied_model)
+- On: `RealizeModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `already_realized_with_same_identity`
+  - `proposed_is_realization_shaped`
 - To: `Idle`
 
 ### `RealizeModelRoutingHandoffAlreadyRealizedAttached`
 - From: `Attached`
-- On: `RealizeModelRoutingHandoff`(request_id, originating_run_id, target_model, applied_model)
+- On: `RealizeModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `already_realized_with_same_identity`
+  - `proposed_is_realization_shaped`
 - To: `Attached`
 
 ### `RealizeModelRoutingHandoffAlreadyRealizedRunning`
 - From: `Running`
-- On: `RealizeModelRoutingHandoff`(request_id, originating_run_id, target_model, applied_model)
+- On: `RealizeModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `already_realized_with_same_identity`
+  - `proposed_is_realization_shaped`
 - To: `Running`
 
 ### `DenyModelRoutingHandoffPendingIdle`
 - From: `Idle`
-- On: `DenyModelRoutingHandoff`(request_id, reason)
+- On: `DenyModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `pending`
+  - `proposed_is_denial`
 - Emits: `ModelRoutingStatusChanged`
 - To: `Idle`
 
 ### `DenyModelRoutingHandoffPendingAttached`
 - From: `Attached`
-- On: `DenyModelRoutingHandoff`(request_id, reason)
+- On: `DenyModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `pending`
+  - `proposed_is_denial`
 - Emits: `ModelRoutingStatusChanged`
 - To: `Attached`
 
 ### `DenyModelRoutingHandoffPendingRunning`
 - From: `Running`
-- On: `DenyModelRoutingHandoff`(request_id, reason)
+- On: `DenyModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `pending`
+  - `proposed_is_denial`
 - Emits: `ModelRoutingStatusChanged`
 - To: `Running`
 
 ### `DenyModelRoutingHandoffAlreadyDeniedIdle`
 - From: `Idle`
-- On: `DenyModelRoutingHandoff`(request_id, reason)
+- On: `DenyModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `already_denied_for_same_reason`
+  - `proposed_is_denial_shaped`
 - To: `Idle`
 
 ### `DenyModelRoutingHandoffAlreadyDeniedAttached`
 - From: `Attached`
-- On: `DenyModelRoutingHandoff`(request_id, reason)
+- On: `DenyModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `already_denied_for_same_reason`
+  - `proposed_is_denial_shaped`
 - To: `Attached`
 
 ### `DenyModelRoutingHandoffAlreadyDeniedRunning`
 - From: `Running`
-- On: `DenyModelRoutingHandoff`(request_id, reason)
+- On: `DenyModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `already_denied_for_same_reason`
+  - `proposed_is_denial_shaped`
 - To: `Running`
 
 ### `ArchiveUnresolvedModelRoutingHandoffPendingRetired`
 - From: `Retired`
-- On: `ArchiveUnresolvedModelRoutingHandoff`(request_id)
+- On: `ArchiveUnresolvedModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `pending`
+  - `proposed_is_archive`
 - To: `Retired`
 
 ### `ArchiveUnresolvedModelRoutingHandoffAlreadyArchivedRetired`
 - From: `Retired`
-- On: `ArchiveUnresolvedModelRoutingHandoff`(request_id)
+- On: `ArchiveUnresolvedModelRoutingHandoff`(request_id, observed, record)
 - Guards:
   - `session_registered`
   - `already_archived`
+  - `proposed_is_archive_shaped`
 - To: `Retired`
 
 ### `AdmitPendingFiniteSwitchTurnIdle`

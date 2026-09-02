@@ -71,37 +71,34 @@ fn every_runtime_backed_surface_exposes_the_pre_dequeue_hook() {
 }
 
 #[test]
-fn every_runtime_backed_surface_uses_the_shared_facade_helper() {
+fn every_runtime_backed_surface_uses_the_shared_runtime_helper() {
     for (relative, surface) in RUNTIME_BACKED_EXECUTOR_SOURCES {
         let source = read(relative);
         assert!(
             source.contains(SHARED_HELPER),
-            "{surface} ({relative}) must build its pre-dequeue handle from the shared facade \
+            "{surface} ({relative}) must build its pre-dequeue handle from the shared runtime \
              helper `{SHARED_HELPER}`, not a surface-local implementation"
         );
     }
 }
 
-/// The facade owns exactly one implementation of the handle.
+/// The runtime owns exactly one implementation of the handle.
 ///
 /// If a second `impl CoreExecutorPreDequeueHandle` appears anywhere, the
 /// cross-run transaction has acquired a second owner.
 #[test]
 fn the_pre_dequeue_handle_has_exactly_one_production_implementation() {
-    let facade = read("meerkat/src/surface/runtime_backed.rs");
-    let implementations = facade
+    let runtime = read("meerkat-runtime/src/service_ext.rs");
+    let implementations = runtime
         .matches("impl meerkat_core::lifecycle::CoreExecutorPreDequeueHandle")
         .count()
-        + facade.matches("impl CoreExecutorPreDequeueHandle").count();
+        + runtime.matches("impl CoreExecutorPreDequeueHandle").count();
     assert_eq!(
         implementations, 1,
-        "the facade must carry exactly one pre-dequeue handle implementation"
+        "the runtime must carry exactly one pre-dequeue handle implementation"
     );
 
-    for (relative, surface) in RUNTIME_BACKED_EXECUTOR_SOURCES
-        .iter()
-        .filter(|(relative, _)| *relative != "meerkat/src/surface/runtime_backed.rs")
-    {
+    for (relative, surface) in RUNTIME_BACKED_EXECUTOR_SOURCES {
         let source = read(relative);
         assert!(
             !source.contains("impl CoreExecutorPreDequeueHandle")
@@ -109,6 +106,85 @@ fn the_pre_dequeue_handle_has_exactly_one_production_implementation() {
             "{surface} ({relative}) must not implement the pre-dequeue handle itself"
         );
     }
+}
+
+/// Every production construction of a runtime-backed session service.
+///
+/// The pre-dequeue hook is only half the contract. A surface can expose the
+/// hook correctly and still ship sessions that never realize a handoff, simply
+/// by building its service through the HOSTLESS builder and never installing a
+/// reconfigure host. That failure is invisible at the surface: nothing it does
+/// is wrong, it just never does the thing.
+///
+/// So this enumerates the construction sites themselves. A new one, or an
+/// existing one quietly moved back onto the hostless builder, fails here.
+const RUNTIME_BACKED_CONSTRUCTION_SITES: &[(&str, &str, &str)] = &[
+    (
+        "meerkat-cli/src/main.rs",
+        "cli",
+        "build_runtime_backed_service_with_default_reconfigure_host",
+    ),
+    (
+        "meerkat-rest/src/lib.rs",
+        "rest",
+        "build_runtime_backed_service_with_default_reconfigure_host",
+    ),
+    (
+        "meerkat-mcp-server/src/lib.rs",
+        "mcp-server",
+        "build_runtime_backed_service_with_default_reconfigure_host",
+    ),
+    // RPC deliberately uses the low-level builder because it installs its own
+    // host with late-bound client/config/staged-registry wiring. Routing it
+    // through the hosted wrapper would install a SECOND, shadowing host.
+    (
+        "meerkat-rpc/src/session_runtime.rs",
+        "rpc",
+        "build_runtime_backed_service_with_capacities",
+    ),
+];
+
+#[test]
+fn every_production_service_construction_installs_or_owns_a_reconfigure_host() {
+    for (relative, surface, expected) in RUNTIME_BACKED_CONSTRUCTION_SITES {
+        let source = read(relative);
+        assert!(
+            source.contains(expected),
+            "{surface} ({relative}) must construct its runtime-backed service via `{expected}`"
+        );
+    }
+
+    // The CLI is the surface with the most construction paths, and its resume
+    // path historically used a different one. Pin that no CLI path falls back
+    // to the hostless facade constructor.
+    let cli = read("meerkat-cli/src/main.rs");
+    assert!(
+        !cli.contains("build_persistent_service_with_runtime_adapter"),
+        "the CLI must not construct a session service through the hostless facade builder; \
+         resume would advertise brain_swap with no host to realize it"
+    );
+
+    // RPC owns its host explicitly. If that install ever disappears, RPC is on
+    // the hostless builder with nothing installing a host at all.
+    let rpc = read("meerkat-rpc/src/session_runtime.rs");
+    assert!(
+        rpc.contains("set_session_llm_reconfigure_host"),
+        "rpc uses the low-level builder, so it must install its own reconfigure host"
+    );
+}
+
+/// Readiness must be a fact about the runtime, not about the build mode.
+///
+/// Being session-owned says a runtime loop exists; it says nothing about
+/// whether a reconfigure host was installed. The factory has to ask.
+#[test]
+fn the_registration_gate_consults_actual_host_availability() {
+    let factory = read("meerkat/src/factory.rs");
+    assert!(
+        factory.contains("committed_handoff_realization_ready()"),
+        "the brain_swap registration gate must ask the runtime whether it can realize a \
+         committed handoff, not infer it from RuntimeBuildMode alone"
+    );
 }
 
 /// Standalone and WASM surfaces neither realize handoffs nor advertise the tool
