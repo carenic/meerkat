@@ -564,6 +564,227 @@ them.
   `audience: Default::default()`; `AgentFactory` gains the `mcp_apps` builder
   flag (default off).
 
+- Measured public API changes against 0.8.52 that the entries above do not
+  already declare, as reported by cargo-semver-checks 0.51.0 and grouped by
+  crate and kind of change. Most are generated machine-authority types;
+  exact-pin the crate family and rebuild against 0.9.0.
+- `meerkat`: no longer `UnwindSafe` or `RefUnwindSafe`:
+  `ContinuationHostBindings`.
+- `meerkat`: a new public field on an exhaustively constructible struct (struct
+  literals need it): `AgentBuildConfig` gains `prepared_controller`.
+- `meerkat`: new variants on exhaustive enums (exhaustive matches need arms for
+  them): `BuildAgentError` gains `PreparedController`; `LiveOpenError` gains
+  `ExecutionProfileAdmission`; `PersistenceError` gains `RealmGoverned`.
+- `meerkat`: `LiveOrchestrator::live_refresh_open_config_for_channel` is
+  removed; the channel refresh path uses
+  `LiveOrchestrator::live_refresh_config_for_channel`, which takes 4 parameters
+  instead of 3 (new `llm_identity: SessionLlmIdentity`, the identity the
+  channel is bound to).
+- `meerkat-auth-core`: no longer `UnwindSafe` or `RefUnwindSafe`:
+  `AutoTokenStore` and `KeyringTokenStore`.
+- `meerkat-auth-core`: new variants on an exhaustive enum (exhaustive matches
+  need arms for them): `ConnectorLoginError` gains `ClientConfig` and
+  `ClientSecretUnavailable`.
+- `meerkat-authorization`: `GrantRefusal::Duplicate` is inserted after
+  `Denied`, so the implicit discriminants of `ControllerInUse` and
+  `Unavailable` shift (`GrantRefusal::*`).
+- `meerkat-contracts`: `WireAuthErrorReason` inserts `CredentialAccessDenied`,
+  `CredentialInteractionRequired`, `CredentialAccessPending` and
+  `CredentialStoreUnavailable` ahead of `Infrastructure`, so its implicit
+  discriminant shifts (`WireAuthErrorReason::*`).
+- `meerkat-contracts`: a new public field on an exhaustively constructible
+  struct (struct literals need it): `WireConnectorAuthTarget` gains
+  `client_auth_profile`.
+- `meerkat-contracts`: new fields on enum struct variants (literals and
+  patterns without `..` need them): `PortableMcpDecl::Http` gains `access`;
+  `PortableMcpDecl::Stdio` gains `access`.
+- `meerkat-contracts`: new variants on an exhaustive enum (exhaustive matches
+  need arms for them): `ErrorCode` gains `ApprovalStoreUnavailable`,
+  `ApprovalConflict` and `ApprovalCommitUnknown`.
+- `meerkat-core`: enums whose implicit discriminants change because variants
+  were inserted ahead of existing ones: the generated machine-authority enum
+  `ApprovalLifecycleInput::*`, `PersistedAuthMode::*` (`ConnectorClientSecret`,
+  `McpAttachmentIdentityKey` and `McpServiceSecret` now precede
+  `ExternalTokens`, `ExternalAuthorizer` and `Command`) and
+  `TokenLifecycleMarkerError::*` (`NotACredentialKey` is now first).
+- `meerkat-core`: `DslRejectionKind` gains a tuple variant,
+  `ControllerReadinessRefused(ControllerReadinessFailure)`, so its variants no
+  longer have defined discriminants: numeric casts such as
+  `DslRejectionKind::GuardRejected as isize` no longer compile.
+- `meerkat-core`: new public fields on exhaustively constructible structs
+  (struct literals need them): `Config` gains `governance`; `ExternalToolDelta`
+  gains `restore`; `RealmConfigSection` gains `connector_client`;
+  `SessionBuildOptions` gains `prepared_controller`; `SessionBuildState` gains
+  `mcp_attachment_intent_revision`; `ToolResult` gains `host_metadata`.
+- `meerkat-core`: new fields on enum struct variants (literals and patterns
+  without `..` need them): `ApprovalLifecycleInput::RestoreApproval` gains
+  `consent`, `authenticated` and `consumed`; `SystemNoticeBlock::RuntimeNotice`
+  gains `content`; `ToolConfigChangeStatus::ExternalToolDelta` gains `restore`.
+- `meerkat-core`: new variants on exhaustive enums (exhaustive matches need
+  arms for them): `ApprovalLifecycleInput` gains `CreateConsentApproval`,
+  `ReconcileApproval`, `DecideConsent`, `ConsumeConsentForEntry`,
+  `WithdrawConsent` and `SettleUnlinkedConsent`;
+  `ApprovalLifecycleRejectionReason` gains `NotConsent`; `ConfigError` gains
+  `GovernanceAdministration`; `DslRejectionKind` gains
+  `ControllerReadinessRefused`; `ExternalToolSurfaceEffect` gains
+  `StageRecorded`; `ExternalToolSurfaceInput` gains `Release`; `McpConfigError`
+  gains `AttachmentRefused`; `McpRealmPersistError` gains `NotAdmitted` and
+  `OutcomeUnknown`; `PersistedAuthMode` gains `ConnectorClientSecret` and
+  `McpAttachmentIdentityKey`; `SessionError` gains `WithSettlementFailures`;
+  `TokenLifecycleMarkerError` gains `NotACredentialKey`.
+- `meerkat-core`: the generated
+  `ApprovalLifecycleMachineAuthority::restore_approval` takes 9 parameters
+  instead of 6 (new `consent`, `authenticated` and `consumed` bool parameters).
+- `meerkat-machine-kernels`: generated machine-authority enums whose variants
+  were added or reordered, so their implicit discriminants change
+  (`EffectKind::*`, `InputKind::*` and `TransitionId::*`); match them by
+  variant name, not by numeric cast or position.
+- `meerkat-machine-kernels`: new public fields on exhaustively constructible
+  structs (struct literals need them): `RestoreApproval` gains `consent`,
+  `authenticated` and `consumed`; `State` gains `approval_consent`,
+  `approval_consent_authenticated`, `approval_consent_consumed`,
+  `approval_consent_review`, `review_consent_approval`,
+  `scoped_context_binding`, `scoped_context_scope`,
+  `scoped_context_generation`, `scoped_context_required`,
+  `input_context_targets`, `run_context_binding` and `surface_active_lineage`.
+- `meerkat-machine-kernels`: new variants on exhaustive enums (exhaustive
+  matches need arms for them): `ApprovalLifecycleRejectionReason` gains
+  `NotConsent`; `Effect` gains `SurfaceStageRecorded`; `EffectKind` gains
+  `SurfaceStageRecorded`; `Input` gains `BindScopedContext`,
+  `RetireScopedContext`, `RequireScopedContext`, `BindInputContextTarget`,
+  `SurfaceRelease`, `CreateConsentApproval`, `ReconcileApproval`,
+  `DecideConsent`, `ConsumeConsentForEntry`, `WithdrawConsent` and
+  `SettleUnlinkedConsent`; `InputKind` gains `CreateConsentApproval`,
+  `ReconcileApproval`, `DecideConsent`, `ConsumeConsentForEntry`,
+  `WithdrawConsent`, `SettleUnlinkedConsent`, `BindScopedContext`,
+  `RetireScopedContext`, `RequireScopedContext`, `BindInputContextTarget` and
+  `SurfaceRelease`; `TransitionId` gains `BindScopedContextIdle`,
+  `BindScopedContextAttached`, `RequireScopedContextIdle`,
+  `RequireScopedContextAttached`, `RequireScopedContextRunning`,
+  `RequireScopedContextRetired`, `RequireScopedContextStopped`,
+  `RetireScopedContextIdle`, `RetireScopedContextAttached`,
+  `RetireScopedContextRunning`, `RetireScopedContextRetired`,
+  `RetireScopedContextStopped`, `BindInputContextTargetIdle`,
+  `BindInputContextTargetAttached`, `BindInputContextTargetRunning`,
+  `BindInputContextTargetRetired`, `BindInputContextTargetStopped`,
+  `SurfaceReleaseIdle`, `SurfaceReleaseAttached`, `SurfaceReleaseRunning`,
+  `SurfaceReleaseStopped`, `SurfaceReleaseRetired`,
+  `CreateConsentRejectedEmptyAllowedDecisions`,
+  `CreateConsentRejectedAlreadyExists`, `CreateConsentPending`,
+  `ReconcileRejectedMissing`, `ReconcileRejectedLinked`,
+  `ReconcileRejectedInvalidRecord`, `ReconcileAppliedPending`,
+  `ReconcileAppliedExpired`, `ReconcileAppliedCancelled`,
+  `ReconcileAppliedApproved`, `ReconcileAppliedDenied`,
+  `DecideRejectedAuthenticationRequired`, `DecideConsentRejectedMissing`,
+  `DecideConsentRejectedMismatch`, `DecideConsentRejectedExpired`,
+  `DecideConsentRejectedAlreadyDecided`,
+  `DecideConsentRejectedAuthenticationRequired`,
+  `DecideConsentRejectedNotAllowed`, `DecideConsentApprove`,
+  `DecideConsentDeny`, `ConsumeConsentRejectedMissing`,
+  `ConsumeConsentRejectedAlreadyConsumed`, `ConsumeConsentRejectedMismatch`,
+  `ConsumeConsentRejectedNotSatisfied`, `ConsumeConsentForEntry`,
+  `WithdrawConsentRejectedMissing`, `WithdrawConsentRejectedMismatch`,
+  `WithdrawConsentPending`, `WithdrawConsentSettled`,
+  `SettleUnlinkedRejectedMissing`, `SettleUnlinkedRejectedNotConsent`,
+  `SettleUnlinkedRejectedLinked`, `SettleUnlinkedRejectedConsumed`,
+  `SettleUnlinkedRejectedExpired`, `SettleUnlinkedRejectedSettled`,
+  `SettleUnlinkedPending`, `SettleUnlinkedApproved`,
+  `RecordReviewVerdictRejectedConsentLinked`,
+  `RecordReviewUnavailableRejectedConsentLinked`,
+  `RetireReviewRejectedConsentLinked`, `ConsumeReviewRejectedConsentLinked` and
+  `ReleaseReviewRejectedConsentLinked`.
+- `meerkat-machine-schema`: generated machine-authority enums whose variants
+  were added or reordered, so their implicit discriminants change
+  (`ApprovalLifecycleInput::*`, `ApprovalLifecycleInputVariant::*`,
+  `MeerkatMachineEffect::*`, `MeerkatMachineEffectVariant::*`,
+  `MeerkatMachineInput::*` and `MeerkatMachineInputVariant::*`) and so does the
+  `PartialOrd` order of `ApprovalLifecycleInputVariant::*`,
+  `MeerkatMachineEffectVariant::*` and `MeerkatMachineInputVariant::*`; match
+  them by variant name, not by numeric cast or position.
+- `meerkat-machine-schema`: new public fields on exhaustively constructible
+  structs (struct literals need them): `ApprovalLifecycleMachineState` gains
+  `approval_consent`, `approval_consent_authenticated`,
+  `approval_consent_consumed`, `approval_consent_review` and
+  `review_consent_approval`; `MeerkatMachineState` gains
+  `scoped_context_binding`, `scoped_context_scope`,
+  `scoped_context_generation`, `scoped_context_required`,
+  `input_context_targets`, `run_context_binding` and `surface_active_lineage`;
+  `SessionPersistenceVersionAuthorityMachineState` gains
+  `stored_input_state_migration_v5`.
+- `meerkat-machine-schema`: new fields on an enum struct variant (literals and
+  patterns without `..` need them): `ApprovalLifecycleInput::RestoreApproval`
+  gains `consent`, `authenticated` and `consumed`.
+- `meerkat-machine-schema`: new variants on exhaustive enums (exhaustive
+  matches need arms for them): `ApprovalLifecycleInput` gains
+  `CreateConsentApproval`, `ReconcileApproval`, `DecideConsent`,
+  `ConsumeConsentForEntry`, `WithdrawConsent` and `SettleUnlinkedConsent`;
+  `ApprovalLifecycleInputVariant` gains `CreateConsentApproval`,
+  `ReconcileApproval`, `DecideConsent`, `ConsumeConsentForEntry`,
+  `WithdrawConsent` and `SettleUnlinkedConsent`;
+  `ApprovalLifecycleRejectionReason` gains `NotConsent`; `MeerkatMachineEffect`
+  gains `SurfaceStageRecorded`; `MeerkatMachineEffectVariant` gains
+  `SurfaceStageRecorded`; `MeerkatMachineInput` gains `BindScopedContext`,
+  `RetireScopedContext`, `RequireScopedContext`, `BindInputContextTarget` and
+  `SurfaceRelease`; `MeerkatMachineInputVariant` gains `BindScopedContext`,
+  `RetireScopedContext`, `RequireScopedContext`, `BindInputContextTarget` and
+  `SurfaceRelease`.
+- `meerkat-mcp`: a new variant on an exhaustive enum (exhaustive matches need
+  an arm for it): `McpError` gains `AttachmentRefused`.
+- `meerkat-mob`: no longer `UnwindSafe` or `RefUnwindSafe`:
+  `SqliteForkedParticipantStore`, `SqliteMobIdentityStatusStore`,
+  `SqliteMobRunStore`, `SqliteMobRuntimeMetadataStore`, `SqliteMobSpecStore`
+  and `SqliteRealmProfileStore`.
+- `meerkat-mob`: new public fields on exhaustively constructible structs
+  (struct literals need them): `HostMemberSubstrate` gains
+  `member_runtime_registration_hook`; `TurnOutcomeRow` gains
+  `reserved_bounded_result_spec`.
+- `meerkat-mob`: new variants on exhaustive enums (exhaustive matches need arms
+  for them): `MaterializeDecompileError` gains `McpAccessInvalid`; `MobError`
+  gains `MemberInputRefused`, `GovernedInputUnbound`, `HeldSpawnUnsupported`,
+  `HeldSpawnAborted`, `HeldSpawnExpired` and `HeldProvisionUnsupported`.
+- `meerkat-rest`: a new variant on an exhaustive enum (exhaustive matches need
+  an arm for it): `ApiError` gains `ResultDisclosureRefused`.
+- `meerkat-rpc`: new public fields on an exhaustively constructible struct
+  (struct literals need them): `GovernedJsonlSetup` gains `session_binder`,
+  `connector_authority` and `operation_review`.
+- `meerkat-rpc`: a new variant on an exhaustive enum (exhaustive matches need
+  an arm for it): `GovernedJsonlError` gains `Composition`.
+- `meerkat-runtime`: generated machine-authority enums whose variants were
+  added or reordered, so their implicit discriminants change
+  (`MeerkatMachineEffect::*`, `MeerkatMachineEffectVariant::*`,
+  `MeerkatMachineInput::*` and `MeerkatMachineInputVariant::*`) and so does the
+  `PartialOrd` order of `MeerkatMachineEffectVariant::*` and
+  `MeerkatMachineInputVariant::*`; match them by variant name, not by numeric
+  cast or position.
+- `meerkat-runtime`: new public fields on exhaustively constructible structs
+  (struct literals need them): `MeerkatMachineState` gains
+  `scoped_context_binding`, `scoped_context_scope`,
+  `scoped_context_generation`, `scoped_context_required`,
+  `input_context_targets`, `run_context_binding` and `surface_active_lineage`;
+  `NativeGrantWorkConfiguration` gains `retained_resume` and
+  `require_scoped_destination`.
+- `meerkat-runtime`: new variants on exhaustive enums (exhaustive matches need
+  arms for them): `CompletionWaitError` gains `DisclosureRefused`;
+  `MeerkatMachineEffect` gains `SurfaceStageRecorded`;
+  `MeerkatMachineEffectVariant` gains `SurfaceStageRecorded`;
+  `MeerkatMachineInput` gains `BindScopedContext`, `RetireScopedContext`,
+  `RequireScopedContext`, `BindInputContextTarget` and `SurfaceRelease`;
+  `MeerkatMachineInputVariant` gains `BindScopedContext`,
+  `RetireScopedContext`, `RequireScopedContext`, `BindInputContextTarget` and
+  `SurfaceRelease`.
+- `meerkat-sqlite`: no longer `UnwindSafe` or `RefUnwindSafe`:
+  `SqliteChangeWatch`.
+- `meerkat-sqlite`: a new variant on an exhaustive enum (exhaustive matches
+  need an arm for it): `SqliteStoreError` gains `CurrentCatalogUnavailable`.
+- `meerkat-store`: no longer `UnwindSafe` or `RefUnwindSafe`:
+  `FileApprovalStore`.
+- `meerkat-store`: new public fields on exhaustively constructible structs
+  (struct literals need them): `ExternalRealmManifest` gains `governance`;
+  `RealmManifest` gains `governance`.
+- `meerkat-store`: new variants on an exhaustive enum (exhaustive matches need
+  arms for them): `StoreError` gains `RealmNotMaterialized` and
+  `InvalidRealmGovernance`.
+
 ### Added
 
 - Delivery scope correctness for host-persisted mob deliveries (#1477). A
