@@ -26770,7 +26770,7 @@
   },
   "info": {
     "title": "Meerkat REST API",
-    "version": "0.8.52"
+    "version": "0.9.0"
   },
   "openapi": "3.1.0",
   "paths": {
