@@ -2471,6 +2471,11 @@ them.
   reviewed operation on such a server. A source that states no account
   still states none through the custody.
 
+- The MCP credential source of `rkat run` and `rkat resume` states the
+  account the native MCP OAuth owner selected for a server
+  (`oauth_account`). It stated none, so in a governed realm the stock policy
+  refused each reviewed operation on such a server.
+
 - A governed realm whose selected controller is an explicitly authless
   self-hosted server (`auth_method = "none"`) now admits its first input.
   The controller's model selection carries the credential requirement its

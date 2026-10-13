@@ -10569,6 +10569,15 @@ impl meerkat_mcp::McpAuthResolver for CliMcpHostAuthResolver {
             })?;
         self.authority.require_stored_bearer_token(target).await
     }
+
+    fn selected_account(
+        &self,
+        target: &meerkat::McpServerIdentity,
+    ) -> meerkat_core::OperationAccount {
+        // The native authority's own selection: the CLI selects none of its
+        // own, and a target without a Known selection states none.
+        meerkat_mcp::McpAuthResolver::selected_account(&self.authority, target)
+    }
 }
 
 /// The CLI's host role for one MCP OAuth attempt: bind the loopback
@@ -21914,6 +21923,50 @@ mod tests {
             Some("host-bearer".to_owned())
         );
         assert_eq!(*host.reads.lock().unwrap(), ["remote"]);
+    }
+
+    /// The CLI's MCP credential source states the account the native MCP
+    /// OAuth owner selected for a server (`oauth_account`), alone and through
+    /// the loader's realm service-secret custody, and states none for a
+    /// server without a Known selection.
+    #[cfg(all(feature = "mcp", feature = "local-authorization"))]
+    #[tokio::test]
+    async fn the_cli_mcp_credential_source_states_its_owners_selected_account() {
+        use meerkat_core::OperationAccount;
+        use meerkat_mcp::McpAuthResolver as _;
+        let state = tempfile::tempdir().unwrap();
+        let scope = test_scope(state.path().to_path_buf(), "team");
+        let auth = in_memory_mcp_auth_persistence();
+        let token_store = auth.token_store();
+        let service = cli_mcp_host_auth_service(&scope, auth);
+        let cli = Arc::new(CliMcpHostAuthResolver {
+            authority: service
+                .mcp_oauth_authority()
+                .expect("the native MCP OAuth owner"),
+            service,
+            mode: CliMcpAuthMode::Stored,
+        });
+        let target = |account: Option<&str>| {
+            let mut server = meerkat_core::McpServerConfig::streamable_http(
+                "mail",
+                "https://mcp.example:8443/mcp",
+                HashMap::new(),
+            );
+            if let McpTransportConfig::Http(http) = &mut server.transport {
+                http.oauth_account = account.map(str::to_owned);
+            }
+            meerkat::McpServerIdentity::from_config(&server).expect("the server's OAuth target")
+        };
+        let (selected, unselected) = (target(Some("subject-7")), target(None));
+        let known = OperationAccount::selected("https://mcp.example:8443", "subject-7");
+        assert_eq!(cli.selected_account(&selected), known);
+
+        let loader = with_cli_realm_service_secrets(&scope, token_store, cli);
+        assert_eq!(loader.selected_account(&selected), known);
+        assert_eq!(
+            loader.selected_account(&unselected),
+            OperationAccount::Unavailable
+        );
     }
 
     /// One session with `servers`, created through the CLI's runtime-backed
