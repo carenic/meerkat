@@ -388,6 +388,17 @@ pub async fn handle_create(
     params: Option<&RawValue>,
     state: &Arc<MobMcpState>,
 ) -> RpcResponse {
+    handle_create_with_member_external_tools(id, params, state, None).await
+}
+
+/// [`handle_create`] whose members build with `member_external_tools` (the
+/// creating connection's callback tools) in place of the state-wide source.
+pub(crate) async fn handle_create_with_member_external_tools(
+    id: Option<RpcId>,
+    params: Option<&RawValue>,
+    state: &Arc<MobMcpState>,
+    member_external_tools: Option<meerkat_mob::ExternalToolsProvider>,
+) -> RpcResponse {
     let params: MobCreateParams = match parse_params(params) {
         Ok(p) => p,
         Err(resp) => return resp.with_id(id),
@@ -398,7 +409,14 @@ pub async fn handle_create(
         Err(error) => return invalid_params(id, format!("invalid mob definition: {error}")),
     };
 
-    let result = state.mob_create_definition(definition).await;
+    let result = match member_external_tools {
+        Some(member_external_tools) => {
+            state
+                .mob_create_definition_with_member_external_tools(definition, member_external_tools)
+                .await
+        }
+        None => state.mob_create_definition(definition).await,
+    };
 
     match result {
         Ok(mob_id) => RpcResponse::success(

@@ -2277,8 +2277,7 @@ them.
 - `meerkat-rpc`: a mob member's callback tools are those registered on the
   connection that created its mob, before or after the member's spawn;
   `rkat-rpc` mob members had none since callback routes became
-  per-connection in 0.8.51. A mob without a live route is claimed by the
-  connection that spawns into it.
+  per-connection in 0.8.51.
 - `meerkat-mcp`: shutdown reports what each MCP server close observed
   instead of discarding it. `McpRouter::shutdown_with_report` returns an
   `McpRouterShutdownReport` with one `McpServerCloseRecord` per close the
@@ -2893,6 +2892,13 @@ them.
 - In a governed realm, sessions a schedule materializes are not bound to an
   agent yet, so every configured MCP server of such a session is unavailable
   (refused, never admitted without a grant).
+- `meerkat-rpc`: a mob's members reach callback tools only through the
+  connection whose `mob/create` created that mob. A mob restored after a
+  restart, or created other than by `mob/create`, has no callback route,
+  so its members get the process-default callback tools (none in
+  `rkat-rpc`), as before this release; members of a mob whose creating
+  connection is gone keep that connection's route, and their callbacks
+  fail as unavailable. Re-create the mob to bind it to a live connection.
 
 ### Testing
 
