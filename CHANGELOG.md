@@ -2565,6 +2565,21 @@ them.
   cases. Stored notice bodies and typed payloads are not rewritten; retained
   deferred-catalog blocks use the updated summary when projected into model
   context.
+- `meerkat-sandbox`: two setup defects of the Linux confinement backend,
+  which refused every confined launch with `BackendUnavailable`. Setup bound
+  each mount from a descriptor opened in the host mount namespace, which the
+  kernel never accepts as a bind source in the new namespace, so the
+  capability probe failed on every host. Setup now opens each source again
+  by its canonical name in the new namespace, before the staging tmpfs
+  covers `/tmp`, and binds it only while it is still the object pinned at
+  compile time (same device and inode, and for the three baseline devices
+  the same device number). A bind remount now also keeps `noexec` when the
+  host mount has it, as on the `noexec` `/dev` of Ubuntu 24.04, because a
+  remount in the unprivileged namespace may not clear it. A probe child
+  whose setup step fails now exits with 64 plus that step's number, for
+  diagnosis; the refusal stays `BackendUnavailable`. Linux positive
+  confinement acceptance stays open until the
+  `make test-mcp-confinement-positive` lane passes on an eligible host.
 
 ### Changed
 
