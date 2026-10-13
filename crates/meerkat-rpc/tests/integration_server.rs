@@ -177,7 +177,8 @@ fn spawn_test_server() -> (
         )
         .expect("construct runtime authority"),
         meerkat_rpc::router::NotificationSink::noop(),
-    );
+    )
+    .expect("compose the RPC session runtime");
     let config_store: Arc<dyn meerkat_core::ConfigStore> = Arc::new(MemoryConfigStore::new(
         Config::default(),
         meerkat_models::canonical(),
@@ -228,7 +229,8 @@ fn spawn_test_server_with_client(
         )
         .expect("construct runtime authority"),
         meerkat_rpc::router::NotificationSink::noop(),
-    );
+    )
+    .expect("compose the RPC session runtime");
     let config_store: Arc<dyn meerkat_core::ConfigStore> = Arc::new(MemoryConfigStore::new(
         Config::default(),
         meerkat_models::canonical(),
@@ -1627,7 +1629,8 @@ mod tcp_callback_ownership {
                 )
                 .expect("construct runtime authority"),
                 meerkat_rpc::router::NotificationSink::noop(),
-            );
+            )
+            .expect("compose the RPC session runtime");
             let config: Arc<dyn ConfigStore> = Arc::new(MemoryConfigStore::new(
                 Config::default(),
                 meerkat_models::canonical(),

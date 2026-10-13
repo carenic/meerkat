@@ -202,6 +202,11 @@ pub enum LiveOpenError {
     /// S5: admission rejected without a generated reason.
     #[error("live open authority rejected admission without a reason")]
     AdmissionRejectedNoReason,
+    /// S5: the execution profile selected for the channel was not admitted,
+    /// so the host never published the channel. The payload says whether
+    /// abandoning the open admission failed too.
+    #[error("live execution profile admission failed: {0}")]
+    ExecutionProfileAdmission(#[source] LiveExecutionProfileAdmissionError),
     /// S6: admission accepted but the generated host handoff was absent.
     #[error("live open admission was accepted without a generated host handoff")]
     MissingHostHandoff,
@@ -266,6 +271,24 @@ pub enum LiveOpenError {
     /// additions fail loud, never silently degrade).
     #[error("unsupported live transport")]
     UnsupportedTransport,
+}
+
+/// Why an open's independently selected execution profile was not admitted
+/// ([`LiveOpenError::ExecutionProfileAdmission`]), and whether the generated
+/// open admission it rode on was then abandoned.
+#[cfg(all(feature = "live", not(target_arch = "wasm32")))]
+#[derive(Debug, thiserror::Error)]
+pub enum LiveExecutionProfileAdmissionError {
+    /// The selection was refused and the open admission was abandoned.
+    #[error(transparent)]
+    Refused(meerkat_runtime::RuntimeDriverError),
+    /// The selection was refused and abandoning the open admission failed,
+    /// so its generated binding may remain.
+    #[error("{refusal}; abandoning the open admission failed: {abandonment}")]
+    AbandonmentFailed {
+        refusal: meerkat_runtime::RuntimeDriverError,
+        abandonment: meerkat_runtime::RuntimeDriverError,
+    },
 }
 
 /// Typed failure vocabulary of the extracted live channel verbs

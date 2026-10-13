@@ -1990,7 +1990,7 @@ pub async fn handle_destroy(
 
 /// Handle `mob/snapshot` — return a point-in-time aggregate of mob status +
 /// member list in a single atomic call. Replaces the "subscribe to events
-/// and run your own projection" pattern that mobkit and other consumers had
+/// and run your own projection" pattern that meta and other consumers had
 /// to fall back to when they just wanted to render current state.
 pub async fn handle_snapshot(
     id: Option<RpcId>,
@@ -2071,7 +2071,7 @@ pub async fn handle_rotate_supervisor(
 // mob/submit_work, mob/cancel_work, mob/cancel_all_work (Finding C4)
 // ---------------------------------------------------------------------------
 //
-// Exposes the work lane (previously Rust-only) through JSON-RPC so mobkit
+// Exposes the work lane (previously Rust-only) through JSON-RPC so meta
 // and other non-Rust consumers can submit / cancel work.
 
 pub use meerkat_contracts::{

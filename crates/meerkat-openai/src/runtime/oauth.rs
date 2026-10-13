@@ -22,7 +22,7 @@ use meerkat_auth_core::auth_oauth::{
 };
 use meerkat_auth_core::auth_store::{
     PersistedAuthMode, PersistedTokens, ProviderAuthPersistence, RefreshCoordinator, RefreshError,
-    RefreshFn, TokenKey, TokenStore,
+    RefreshFn, TokenKey, TokenStore, TokenStoreAccess,
 };
 use meerkat_auth_core::oauth_flow::{
     OAuthProviderDeclaration, OAuthProviderIdentity, oauth_provider_declaration,
@@ -197,9 +197,9 @@ impl OpenAiOAuthRuntime {
             let preparation = preparation_for_refresh.clone();
             Box::pin(async move {
                 let current = token_store
-                    .load(&key)
+                    .load_for(&key, TokenStoreAccess::Unattended)
                     .await
-                    .map_err(|e| RefreshError::Refresh(e.to_string()))?
+                    .map_err(RefreshError::from_token_store)?
                     .ok_or_else(|| {
                         RefreshError::Refresh(
                             "persisted tokens disappeared before OAuth refresh".into(),
@@ -620,9 +620,11 @@ mod tests {
                 Reply::InvalidGrant => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"invalid_grant"}))).into_response(),
             }
         }
+        const REFUSED_REREAD: &str = "failure-path reread needs credential interaction";
         struct FaultStore {
             inner: EphemeralTokenStore,
             fail_next_save: Arc<AtomicBool>,
+            refuse_next_load: Arc<AtomicBool>,
         }
         #[async_trait::async_trait]
         impl TokenStore for FaultStore {
@@ -630,6 +632,14 @@ mod tests {
                 &self,
                 key: &TokenKey,
             ) -> Result<Option<PersistedTokens>, meerkat_core::auth::TokenStoreError> {
+                if self.refuse_next_load.swap(false, Ordering::SeqCst) {
+                    return Err(meerkat_core::auth::TokenStoreError::refused(
+                        self.backend_name(),
+                        TokenStoreAccess::Unattended,
+                        meerkat_core::auth::TokenStoreRefusal::InteractionRequired,
+                        REFUSED_REREAD,
+                    ));
+                }
                 self.inner.load(key).await
             }
             async fn save(
@@ -668,6 +678,7 @@ mod tests {
             lease: LeaseKey,
             original: PersistedTokens,
             fail_next_save: Arc<AtomicBool>,
+            refuse_next_load: Arc<AtomicBool>,
             persistence: ProviderAuthPersistence,
             endpoint_url: String,
         }
@@ -739,11 +750,13 @@ mod tests {
                 let key = TokenKey::from_credential_identity(binding.credential_identity());
                 let lease = LeaseKey::from_credential_identity(binding.credential_identity());
                 let fail_next_save = Arc::new(AtomicBool::new(false));
+                let refuse_next_load = Arc::new(AtomicBool::new(false));
                 let persistence = persistence.unwrap_or_else(|| {
                     ProviderAuthPersistence::new(
                         Arc::new(FaultStore {
                             inner: EphemeralTokenStore::new(),
                             fail_next_save: fail_next_save.clone(),
+                            refuse_next_load: refuse_next_load.clone(),
                         }),
                         Arc::new(InMemoryCoordinator::new()),
                     )
@@ -817,6 +830,7 @@ mod tests {
                     lease,
                     original,
                     fail_next_save,
+                    refuse_next_load,
                     persistence,
                     endpoint_url: format!("http://{address}/token"),
                 };
@@ -1033,6 +1047,39 @@ mod tests {
                 assert_eq!(
                     fixture.store.load(&fixture.key).await.unwrap(),
                     Some(fixture.original.clone())
+                );
+            }
+            // A refused failure-path reread cannot verify the durable
+            // predecessor, so neither verdict is applied to it. The refresh
+            // this transaction began still closes transiently, the refusal
+            // keeps its type and the stored bytes stay exact.
+            for reply in [Reply::Transient, Reply::InvalidGrant] {
+                let mut fixture = Fixture::start(reply).await;
+                // Every read before the exchange has happened.
+                fixture.refuse_next_load.store(true, Ordering::SeqCst);
+                let result = fixture.finish().await;
+                // Immediately after the return, before any retry.
+                let phase = fixture.auth.snapshot(&fixture.lease).phase;
+                fixture.assert_one_original_exchange();
+                assert_eq!(
+                    phase,
+                    Some(AuthLeasePhase::Expiring),
+                    "the refused reread must close the begun refresh transiently"
+                );
+                assert!(
+                    matches!(
+                        &result,
+                        Err(OpenAiOAuthError::Refresh(RefreshError::CredentialAccess {
+                            refusal: meerkat_core::auth::TokenStoreRefusal::InteractionRequired,
+                            detail,
+                        })) if detail == REFUSED_REREAD
+                    ),
+                    "the refused reread keeps its typed store cause: {result:?}"
+                );
+                assert_eq!(
+                    fixture.store.load(&fixture.key).await.unwrap(),
+                    Some(fixture.original.clone()),
+                    "the unverified predecessor stays exact"
                 );
             }
         }

@@ -400,7 +400,8 @@ mod orchestrator_e2e {
         let builder = FactoryAgentBuilder::new(factory, Config::default());
         let staged_sessions = Arc::new(StagedSessionRegistry::new());
         let (service, runtime_adapter) =
-            build_runtime_backed_service_with_capacities(builder, 4, 16, persistence);
+            build_runtime_backed_service_with_capacities(builder, 4, 16, persistence)
+                .expect("compose the runtime-backed service");
         let service = Arc::new(service);
         let staged_capacity_admissions: StagedCapacityAdmissions =
             Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));

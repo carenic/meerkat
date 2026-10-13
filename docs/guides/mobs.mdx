@@ -161,13 +161,13 @@ is:
 wiring error: profile '<name>' has tools.comms=false; mob meerkats require comms=true. The default is false, so a profile that omits the key counts as false: set `comms = true` under `[profiles.<name>.tools]`. To keep a member from messaging peers, keep comms on and use `read_only = true` or a per-spawn `tool_access_policy` deny list.
 ```
 
-It surfaces in two shapes. On the worker plane (`mob/spawn` and MobKit's
-`mobkit/ensure_member`) it is JSON-RPC error `-32602` with that text as the
-message, prefixed `ensure_member failed: ` on MobKit, and the failed spawn
-leaves no roster entry behind. On MobKit's identity-first plane the identity
+It surfaces in two shapes. On the worker plane (`mob/spawn` and Meta's
+`meta/ensure_member`) it is JSON-RPC error `-32602` with that text as the
+message, prefixed `ensure_member failed: ` on Meta, and the failed spawn
+leaves no roster entry behind. On Meta's identity-first plane the identity
 record stays and reconciles to outcome `broken`, with the same text as that
 identity's `error` in the bootstrap status
-(`mobkit/status_identity_bootstrap`, Python `identity_bootstrap_status()`).
+(`meta/status_identity_bootstrap`, Python `identity_bootstrap_status()`).
 To keep a member from messaging peers, leave `comms = true` and add
 `read_only = true` (below) or deny `send_message` through a per-spawn
 `tool_access_policy` deny list; disabling comms is never the tool.
@@ -307,7 +307,7 @@ mob or the member's role. The mob comms and WorkGraph operating skills are
 preloaded separately and survive any prompt override, so a role prompt does not
 have to repeat them.
 
-Identity-first hosts (MobKit) have two more knobs that reach the prompt
+Identity-first hosts (Meta) have two more knobs that reach the prompt
 without editing the definition: `DurableAgentSpec.additional_instructions`,
 appended after the skills text and baked once at materialization, and an
 `AgentCustomizer` whose `draft.system_prompt` replaces the assembled prompt.

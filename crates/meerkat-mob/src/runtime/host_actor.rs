@@ -686,6 +686,14 @@ pub struct TurnOutcomeRow {
     pub outcome: WireFlowTurnOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bounded_result: Option<super::bridge_protocol::BridgeBoundedTurnResult>,
+    /// The reserved turn's exact bound when this terminal records no
+    /// bounded result: the result was withheld from this reader, or the
+    /// terminal is not a completed result. It is the reserved request's
+    /// identity, never a result, and is taken from the reservation when the
+    /// terminal is recorded. An exact retry of the same bounded request
+    /// replays this terminal; a differing request still diverges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_bounded_result_spec: Option<super::bridge_protocol::BridgeBoundedResultSpec>,
 }
 
 /// Compact durable proof that the controller consumed one exact terminal.
@@ -4954,12 +4962,17 @@ async fn reserve_turn_outcome_pending_with_mode(
                         && terminal.fence_token == row.fence_token
                         && terminal.input_id == row.input_id
                         && match (&row.bounded_result_spec, &terminal.bounded_result) {
-                            (None, None) => true,
+                            (None, None) => terminal.reserved_bounded_result_spec.is_none(),
                             (Some(spec), Some(result)) => {
                                 result.result.label == spec.label
                                     && result.max_text_bytes == spec.max_text_bytes
                             }
-                            _ => false,
+                            // No result was recorded for the reserved bound:
+                            // replay only the exact same reserved request.
+                            (Some(spec), None) => {
+                                terminal.reserved_bounded_result_spec.as_ref() == Some(spec)
+                            }
+                            (None, Some(_)) => false,
                         }
                 })
             });
@@ -5240,6 +5253,20 @@ pub async fn record_turn_outcome_journal(
             detail: format!("no durable host binding row for bound mob '{mob_id}'"),
         });
     };
+    let mut recorded = row.clone();
+    if recorded.bounded_result.is_none() {
+        recorded.reserved_bounded_result_spec = expected
+            .turn_outcome_pending
+            .get(&identity)
+            .and_then(|pending| {
+                pending.iter().find(|existing| {
+                    existing.input_id == row.input_id
+                        && existing.generation == row.generation
+                        && existing.fence_token == row.fence_token
+                })
+            })
+            .and_then(|existing| existing.bounded_result_spec.clone());
+    }
     let mut next = expected.clone();
     if let Some(pending) = next.turn_outcome_pending.get_mut(&identity) {
         pending.retain(|existing| {
@@ -5257,7 +5284,7 @@ pub async fn record_turn_outcome_journal(
             && existing.generation == row.generation
             && existing.fence_token == row.fence_token)
     });
-    rows.push(row.clone());
+    rows.push(recorded);
     let write_outcome = persistence
         .compare_and_put_turn_outcomes(&mob_id, &expected, &next, &witness)
         .await;
@@ -7140,6 +7167,7 @@ impl MobHostActor {
             terminal_seq: request.record.terminal_seq,
             outcome: request.record.outcome.clone(),
             bounded_result: request.record.bounded_result.clone(),
+            reserved_bounded_result_spec: None,
         };
         if row.generation != request.expected_member.generation
             || row.fence_token != request.expected_member.fence_token
@@ -12762,6 +12790,7 @@ mod tests {
                         terminal_seq: 41,
                         outcome: WireFlowTurnOutcome::RunCompleted,
                         bounded_result: None,
+                        reserved_bounded_result_spec: None,
                     }],
                 )]),
                 turn_outcome_acknowledged: BTreeMap::new(),
@@ -12924,6 +12953,7 @@ mod tests {
                 required_env_keys: vec![missing_key.clone()],
                 connect_timeout_secs: None,
                 tool_names: Default::default(),
+                access: None,
             },
         );
         let records = boot_preparation_records(spec);
@@ -12984,6 +13014,7 @@ mod tests {
                 required_env_keys: vec![missing_key],
                 connect_timeout_secs: Some(u64::MAX),
                 tool_names: Default::default(),
+                access: None,
             },
         );
         let records = boot_preparation_records(spec);

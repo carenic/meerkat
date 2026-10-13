@@ -60,8 +60,8 @@ Ordinary collaboration should use `send_message` or `reply_to_peer`.
 | Display name | `name`; may collide, never resolved into a route |
 | Mob member name | `MemberCommsName` = `{mob_id}/{role}/{member}` (`role` = profile name, `member` = `AgentIdentity`); this is what peers see in `peers` output and in projected peer messages |
 | Component rule | Each component starts with an ASCII letter or `_` and contains only ASCII alphanumerics, `-`, or `_` |
-| MobKit identity-first members | Identities with other characters appear as `mk--` encoded segments (`domain:payments` becomes `mk--domain_cpayments`); decoded only at MobKit console and RPC projections |
-| Mob rename | Changing `definition.id` re-mints every member name and moves members into a new `mob.<id>` realm with fresh sessions; live trust and directory entries follow. Old names survive only in identity-keyed host-realm state such as MobKit agent memory, not in the transcript |
+| Meta identity-first members | Identities with other characters appear as `mk--` encoded segments (`domain:payments` becomes `mk--domain_cpayments`); decoded only at Meta console and RPC projections |
+| Mob rename | Changing `definition.id` re-mints every member name and moves members into a new `mob.<id>` realm with fresh sessions; live trust and directory entries follow. Old names survive only in identity-keyed host-realm state such as Meta agent memory, not in the transcript |
 
 ## Request And Response Across Turns
 
@@ -75,7 +75,7 @@ Ordinary collaboration should use `send_message` or `reply_to_peer`.
 There is no agent-facing await-reply primitive and `send_request` has no
 timeout. Same-call sequencing is `delegate` (bounded helper result returned to
 the calling turn); host-side sequencing is send-then-wait-for-turn-completion
-(MobKit `send_and_wait`, `dispatch_and_wait`) or a mob flow with fan-out and
+(Meta `send_and_wait`, `dispatch_and_wait`) or a mob flow with fan-out and
 fan-in steps.
 
 ## Host-side comms and ingress surfaces

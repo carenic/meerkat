@@ -75,7 +75,7 @@ pub enum RuntimeBootstrapError {
     #[error("`--realm` and `--isolated` cannot be used together")]
     ConflictingSelection,
     #[error(
-        "invalid explicit realm id: {0}; a realm id is the realm's directory name under the realms root: 1 to 64 ASCII letters, digits, '-' or '_', starting with a letter or digit (a MobKit gateway's meerkat-level realm is `mobkit` under its state directory; `mob.<name>` from session metadata is a mob scope, not a store realm)"
+        "invalid explicit realm id: {0}; a realm id is the realm's directory name under the realms root: 1 to 64 ASCII letters, digits, '-' or '_', starting with a letter or digit (a Meta gateway's meerkat-level realm is `mobkit` under its state directory; `mob.<name>` from session metadata is a mob scope, not a store realm)"
     )]
     InvalidRealmId(String),
     /// The same realm id is materialized under both candidate state roots.
@@ -484,7 +484,7 @@ pub fn fnv1a64_hex(input: &str) -> String {
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     #[test]
-    fn invalid_realm_id_error_names_the_accepted_form_and_the_mobkit_realm() {
+    fn invalid_realm_id_error_names_the_accepted_form_and_the_meta_realm() {
         let error = validate_explicit_realm_id("mob.example").expect_err("dots are not allowed");
         let text = error.to_string();
         assert!(text.contains("mob.example"), "{text}");

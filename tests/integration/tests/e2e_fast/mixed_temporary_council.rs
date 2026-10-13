@@ -244,6 +244,10 @@ async fn mixed_local_and_host_temporary_council_completes_and_releases_everythin
         "host durable record carries the temporary capability association"
     );
 
+    // Release the test's handle before the council's own cleanup destroys the
+    // temporary mob (the 0.9 observer drain refuses a destroy while a MobHandle
+    // observes the database).
+    drop(temporary);
     local_gate.open();
     let outcome = running
         .await

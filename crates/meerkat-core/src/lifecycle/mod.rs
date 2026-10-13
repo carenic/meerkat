@@ -27,7 +27,8 @@ pub use boundary_delivery::{
 pub use core_executor::{
     CommittedSessionBoundaryAuthority, CoreApplyFailureCause, CoreApplyFailureCauseKind,
     CoreBoundaryStageError, CoreBoundaryStageOutput, CoreControlFailureCause,
-    CoreControlFailureCauseKind, CoreExecutor, CoreExecutorBoundaryHandle, CoreExecutorError,
+    CoreControlFailureCauseKind, CoreExecutor, CoreExecutorActorIdentity,
+    CoreExecutorActorIncarnation, CoreExecutorBoundaryHandle, CoreExecutorError,
     CoreExecutorInterruptHandle, CoreExecutorPostStopCleanupHandle, CoreExecutorPreDequeueHandle,
     CoreExecutorPublicationHandle, CoreExecutorTeardownReason, CoreExecutorTranscriptNoticeHandle,
     CoreExecutorTurnFinalizationBoundaryHandle, CoreExecutorTurnFinalizationGuard,

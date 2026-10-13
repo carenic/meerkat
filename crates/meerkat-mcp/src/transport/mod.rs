@@ -2,8 +2,90 @@ pub(crate) mod protected;
 pub(crate) mod sse;
 pub(crate) mod streamable_http;
 
+use meerkat_auth_core::http_egress::{
+    HttpEgressError, HttpEgressProfile, HttpEgressUnavailable, egress_refusal_in,
+};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+
+/// The host egress profile of one connection attempt, applied by its
+/// transport client at every request, with the attempt's first egress
+/// outcome recorded so the attempt fails typed rather than as transport text.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct EgressGuard {
+    profile: HttpEgressProfile,
+    recorded: Arc<OnceLock<HttpEgressError>>,
+}
+
+impl EgressGuard {
+    pub(crate) fn new(profile: HttpEgressProfile) -> Self {
+        Self {
+            profile,
+            recorded: Arc::default(),
+        }
+    }
+
+    /// The first egress refusal or unavailability this attempt met.
+    pub(crate) fn recorded(&self) -> Option<HttpEgressError> {
+        self.recorded.get().copied()
+    }
+
+    /// Record this attempt's egress outcome; the first one is kept.
+    pub(crate) fn record_outcome(&self, error: HttpEgressError) -> HttpEgressError {
+        let _ = self.recorded.set(error);
+        error
+    }
+
+    /// Admit one request URI, recording a refusal. Nothing is sent when
+    /// this fails.
+    pub(crate) fn admit(&self, uri: &str) -> Result<(), HttpEgressError> {
+        self.profile
+            .admit(uri)
+            .map_err(|error| self.record_outcome(error))
+    }
+
+    /// Record a request this profile did not admit: here (connection
+    /// diagnostics) and, for a tool call, on the request's own disposition,
+    /// which alone types that call's outcome. Nothing was sent for it.
+    pub(crate) fn refuse(
+        &self,
+        dispatch: Option<&streamable_http::RequestDispatch>,
+        error: HttpEgressError,
+    ) -> HttpEgressError {
+        self.record_outcome(error);
+        if let Some(dispatch) = dispatch {
+            dispatch.record(streamable_http::RequestDisposition::RefusedEgress(error));
+        }
+        error
+    }
+
+    /// The required ordinary client; `None` keeps the caller's existing
+    /// trusted-host client.
+    pub(crate) fn ordinary_client(
+        &self,
+    ) -> Option<Result<&reqwest::Client, HttpEgressUnavailable>> {
+        self.profile.ordinary_client()
+    }
+
+    /// The required protected-call client; `None` keeps the existing one.
+    pub(crate) fn protected_client(
+        &self,
+    ) -> Option<Result<&reqwest::Client, HttpEgressUnavailable>> {
+        self.profile.protected_client()
+    }
+
+    /// The egress refusal a failed send carries (the clients' own resolver
+    /// refused the destination, so nothing was connected), recorded.
+    pub(crate) fn observe_send_error(
+        &self,
+        error: &reqwest::Error,
+    ) -> Option<meerkat_auth_core::http_egress::HttpEgressRefusal> {
+        let refusal = egress_refusal_in(error)?;
+        self.record_outcome(HttpEgressError::Refused(refusal));
+        Some(refusal)
+    }
+}
 
 pub(crate) fn headers_from_map(headers: &HashMap<String, String>) -> Result<HeaderMap, String> {
     let mut header_map = HeaderMap::new();

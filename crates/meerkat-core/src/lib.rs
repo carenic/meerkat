@@ -26,11 +26,16 @@ pub mod tokio {
     }
 }
 
+pub mod administration_entry;
 pub mod agent;
 pub mod llm_client;
+pub mod tool_surface;
+pub use administration_entry::{
+    AdministrationEntry, AdministrationEntryRefusal, EnteredAdministration,
+};
 pub use llm_client::{
-    ControllerFactsUnavailable, ControllerModelClient, ControllerModelFacts,
-    ControllerModelSelection, LlmRequestAuthorization,
+    ControllerCredentialRequirement, ControllerFactsUnavailable, ControllerModelClient,
+    ControllerModelFacts, ControllerModelSelection, ControllerRouteKey, LlmRequestAuthorization,
 };
 pub mod approval;
 pub mod artifact;
@@ -61,6 +66,7 @@ pub mod event_tap;
 pub mod exact_operation;
 pub mod gateway;
 pub mod generated;
+pub mod governance_config;
 pub mod handles;
 pub mod hooks;
 pub mod image_content;
@@ -69,13 +75,18 @@ pub mod interaction;
 pub mod lifecycle;
 pub mod live_adapter;
 pub mod live_execution;
+pub mod mcp_attachment;
+pub mod mcp_attachment_control;
 pub mod mcp_config;
+pub mod mcp_observation;
+pub mod mcp_session_intent;
 pub mod memory;
 pub mod model_defaults;
 pub mod model_fallback;
 pub mod model_profile;
 pub mod model_registry;
 pub mod oauth_identity;
+pub mod operation_account;
 pub mod ops;
 pub mod ops_lifecycle;
 pub mod panic_payload;
@@ -122,6 +133,7 @@ pub mod structured_output;
 pub mod surface_metadata;
 pub mod time_compat;
 pub mod tool_application;
+pub mod tool_bundle;
 pub mod tool_catalog;
 pub mod tool_consequence_policy;
 pub mod tool_execution;
@@ -138,29 +150,31 @@ mod wasm_task;
 pub mod web_search;
 
 // Re-export main types at crate root
-pub use agent::ReviewedEntryTicket;
 pub use agent::{
     Agent, AgentBuildPolicyError, AgentBuilder, AgentControlStateError, AgentExecutionSnapshot,
     AgentLlmClient, AgentLlmClientDecorator, AgentLlmFallbackSkippedTarget, AgentLlmFallbackSwitch,
-    AgentLlmRequestAttempt, AgentRunner, AgentSessionStore, AgentToolDispatcher, BindOutcome,
-    CancelAfterBoundaryCommand, CancelAfterBoundarySender, CommsCapabilityError, CommsRuntime,
-    CurrentTurnContent, CurrentTurnImageRef, DefaultSystemPromptPolicy, DispatcherCapabilities,
-    ExternalToolUpdate, FilteredToolDispatcher, LiveBridgeNoncommittingRunPermit,
-    LiveBridgePreparedOperation, LiveBridgeToolDispatchAdmission, LlmStreamResult,
-    ObservedCommsSender, RequestAttemptAuthority, SnapshotProjectionError,
-    StickyModelFallbackActivationProof, ToolDispatchContext, dispatch_tool_execution_plan_fenced,
-    resolve_tool_execution_plan_fenced, select_tool_catalog_mode,
-    should_compose_tool_catalog_control_plane,
+    AgentLlmRequestAttempt, AgentOwnedRelease, AgentRunner, AgentSessionStore, AgentToolDispatcher,
+    BindOutcome, CancelAfterBoundaryCommand, CancelAfterBoundarySender, CommsCapabilityError,
+    CommsRuntime, CurrentTurnContent, CurrentTurnImageRef, DefaultSystemPromptPolicy,
+    DispatcherCapabilities, ExternalToolUpdate, FilteredToolDispatcher,
+    LiveBridgeNoncommittingRunPermit, LiveBridgePreparedOperation, LiveBridgeToolDispatchAdmission,
+    LlmStreamResult, ObservedCommsSender, RequestAttemptAuthority, SnapshotProjectionError,
+    StickyModelFallbackActivationProof, ToolDispatchContext, dispatch_retained_consent_attempt,
+    dispatch_tool_execution_plan_fenced, resolve_tool_execution_plan_fenced,
+    select_tool_catalog_mode, should_compose_tool_catalog_control_plane,
 };
+pub use agent::{GovernedDispatchOperation, ReviewedEntryTicket};
 pub use approval::review::{
     OperationReviewRefusal, ReviewUnavailableKind, ReviewUnsatisfiedKind, ReviewedEntryCustody,
 };
 pub use approval::{
-    ApprovalActionKind, ApprovalDecision, ApprovalDecisionRecord, ApprovalError, ApprovalId,
-    ApprovalListFilter, ApprovalMemberRef, ApprovalMobRef, ApprovalOwnerRef, ApprovalPrincipalId,
-    ApprovalProposedAction, ApprovalRecord, ApprovalRequest, ApprovalResourceId,
-    ApprovalResourceKind, ApprovalResourceRef, ApprovalRisk, ApprovalService, ApprovalStatus,
-    ApprovalStore, ApprovalStoreError, InMemoryApprovalStore,
+    ApprovalActionKind, ApprovalAssurance, ApprovalConsentApprover, ApprovalConsentCustody,
+    ApprovalConsentDelivery, ApprovalConsentDeliveryState, ApprovalConsentOrigin,
+    ApprovalConsentRecord, ApprovalConsentScope, ApprovalConsentTransition, ApprovalDecision,
+    ApprovalDecisionRecord, ApprovalError, ApprovalId, ApprovalListFilter, ApprovalMemberRef,
+    ApprovalMobRef, ApprovalOwnerRef, ApprovalPrincipalId, ApprovalProposedAction, ApprovalRecord,
+    ApprovalRequest, ApprovalResourceId, ApprovalResourceKind, ApprovalResourceRef, ApprovalRisk,
+    ApprovalService, ApprovalStatus, ApprovalStore, ApprovalStoreError, InMemoryApprovalStore,
 };
 pub use artifact::{
     ArtifactContentHandle, ArtifactError, ArtifactHandle, ArtifactId, ArtifactListFilter,
@@ -174,13 +188,14 @@ pub use auth::{
     authorize_then_materialize_auth_binding, can_observe_visibility, metadata_grants_no_visibility,
 };
 pub use authorization::{
-    AuthorizationOperation, ModelAuthorizationFacts, ModelAuthorizationUse,
-    OperationAuthorizationError, OperationAuthorizationFacts, OperationRefusalKind,
-    OperationRefused, OperationReviewTier, OwnerQualifiedTarget, PreparedAuthorizationBinding,
-    PreparedOperationAuthorization, PublicationAuthorizationFacts, PublicationMode,
-    PublicationRecipient, SourceAuthorizationFacts, SourceAuthorizationTarget,
-    SourceAuthorizationUse, ToolAuthorizationFacts, ToolAuthorizationTarget, WorkAuthorization,
-    WorkAuthorizationContext,
+    AuthorizationOperation, MandatoryHookCause, MandatoryHookProviderTool,
+    MandatoryHookWithheldEffect, MandatoryHookWithholding, MandatoryHookWithholdingRecord,
+    ModelAuthorizationFacts, ModelAuthorizationUse, OperationAuthorizationError,
+    OperationAuthorizationFacts, OperationRefusalKind, OperationRefused, OperationReviewTier,
+    OwnerQualifiedTarget, PreparedAuthorizationBinding, PreparedOperationAuthorization,
+    PublicationAuthorizationFacts, PublicationMode, PublicationRecipient, SourceAuthorizationFacts,
+    SourceAuthorizationTarget, SourceAuthorizationUse, ToolAuthorizationFacts,
+    ToolAuthorizationTarget, WorkAuthorization, WorkAuthorizationContext,
 };
 pub use blob::{
     BlobAddressAttestation, BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError,
@@ -221,6 +236,7 @@ pub use config::{
 #[cfg(not(target_arch = "wasm32"))]
 pub use config_runtime::{
     ConfigEnvelope, ConfigEnvelopePolicy, ConfigRuntime, ConfigRuntimeError, ConfigSnapshot,
+    EnteredConfigWriteError,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use config_store::{
@@ -268,6 +284,10 @@ pub use exact_operation::{
     ValidatedResultProjectionSpec,
 };
 pub use gateway::{DynamicToolComposite, ToolGateway, ToolGatewayBuilder};
+pub use governance_config::{
+    GovernanceConfig, StockConsentAssurance, StockReviewConfig, StockReviewRule, StockReviewTarget,
+    StockReviewTier, StockReviewerSelection,
+};
 pub use handles::{
     AuthLeasePhase, CommsDrainHandle, DrainExitReason, DrainMode, DslRejectionKind,
     DslTransitionError, ExternalToolSurfaceHandle, McpServerLifecycleHandle, PeerCommsHandle,
@@ -282,11 +302,13 @@ pub use handles::{
 pub use hooks::{
     HookCapability, HookDecision, HookDenial, HookEngine, HookEngineError, HookExecutionMode,
     HookExecutionReport, HookFailureReason, HookId, HookInteractionCompleted, HookInvocation,
-    HookLaunchRefusal, HookLlmRequest, HookLlmResponse, HookObservation, HookOutcome,
+    HookLaunchRefusal, HookLlmRequest, HookLlmResponse, HookMandatoryGate, HookMandatoryTopology,
+    HookModelOperation, HookModelOperationScope, HookObservation, HookOutcome,
     HookPeerEgressCommitted, HookPeerEgressKind, HookPeerIngressCommitted, HookPoint,
     HookReasonCode, HookRuntimeInputAccepted, HookRuntimeInputDeduplicated, HookRuntimeInputKind,
     HookRuntimeInputRejected, HookRuntimeInputRejection, HookRuntimeState, HookToolCall,
-    HookToolResult, PostCommitHookDispatcher,
+    HookToolResult, HookTopologyError, HookWithheldModelOperation, PostCommitHookDispatcher,
+    validate_hook_activation, validate_hook_entry_scope,
 };
 pub use image_content::{
     MissingBlobBehavior, RealtimeOpenProjectionAdmission, RealtimeOpenProjectionAdmissionError,
@@ -347,11 +369,23 @@ pub use live_execution::{
     RepresentedLiveUserRow,
 };
 pub use mcp_config::{
-    EffectiveMcpServersError, McpConfig, McpConfigError, McpScope, McpServerConfig,
-    McpServerDefinitionConflict, McpServerSource, McpServerWithScope, McpServerWithSource,
+    EffectiveMcpServersError, McpAccountDeclaration, McpConfig, McpConfigError,
+    McpConnectorApproval, McpScope, McpSecretEnvDeclarationError, McpServerAccess,
+    McpServerAccessError, McpServerConfig, McpServerDefinitionConflict, McpServerSource,
+    McpServerWithScope, McpServerWithSource,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use mcp_config::{McpRealmPersistError, McpRealmPersistTarget};
+pub use mcp_observation::{
+    McpConnectorIdentity, McpObservationInstallation, McpObservationSlot, McpOperationObservation,
+    McpOperationObserver,
+};
+pub use mcp_session_intent::{
+    MCP_ATTACHMENT_REVISION_BASE, McpAttachmentDescriptorIdentity, McpAttachmentIntentDisposition,
+    McpAttachmentIntentError, McpAttachmentIntentMutation, McpAttachmentIntentRecorded,
+    McpAttachmentRestoreWireOutcome, McpAttachmentTarget, McpAttachmentTargetBinding,
+    McpConnectorAccountRef, McpSessionAttachmentIntent,
+};
 pub use memory::{
     CompactionCommitCoordinationError, CompactionCommitCoordinator, CompactionHandoffRefusal,
     CompactionProjectionId, CompactionProjectionIntent, CompactionProjectionPersistence,
@@ -369,6 +403,9 @@ pub use model_registry::{
     UnsupportedModelCapabilityEvidence, UnsupportedModelCapabilityReason,
 };
 pub use oauth_identity::OAuthProviderIdentity;
+pub use operation_account::{
+    InvalidQualifiedAccount, MAX_QUALIFIED_ACCOUNT_PART_BYTES, OperationAccount, QualifiedAccount,
+};
 pub use ops::{
     AsyncOpRef, ConcurrencyLimits, ContextStrategy, DeclaredToolRestriction, ForkBranch,
     ForkBudgetPolicy, OpEvent, OperationId, OperationPolicy, OperationResult, OperationSpec,
@@ -541,6 +578,7 @@ pub use tool_application::{
     ToolApplicationIngress, ToolApplicationObservation, ToolApplicationObservationReader,
     ToolApplicationOperation, ToolApplicationRequest, ToolApplicationSettlement,
 };
+pub use tool_bundle::RegisteredToolBundleDispatcher;
 pub use tool_catalog::{
     ToolCallability, ToolCatalogCapabilities, ToolCatalogDeferredEligibility, ToolCatalogEntry,
     ToolCatalogLoadRejectedReason, ToolCatalogLoadResolution, ToolCatalogMode, ToolPlaneClass,
@@ -560,14 +598,14 @@ pub use tool_consequence_policy::{
     ToolConsequencePolicySnapshot, ToolConsequenceRequest, ToolConsequenceVerdict,
 };
 pub use tool_execution::{
-    CoreDispatchDeadline, DeadlineChainError, DeadlineChainExtensionError,
+    CatalogOperation, CoreDispatchDeadline, DeadlineChainError, DeadlineChainExtensionError,
     DetachedToolExecutionPolicy, EphemeralToolBindingFingerprint, IdempotencyScope,
     ResolvedExecutionKind, ResolvedToolExecutionPlan, RestartClass, RunnerIdentity,
     StreamingToolExecutionPolicy, ToolCredentialContextRef, ToolDeadlineChain,
     ToolDeadlineContributor, ToolDeadlineOwner, ToolDeadlineSource, ToolExecutionApplicability,
     ToolExecutionContract, ToolExecutionContractError, ToolExecutionDeclarationError,
     ToolExecutionMode, ToolExecutionOwnerWitness, ToolExecutionResolutionContext,
-    ToolExecutionResolutionError, ToolOutputPolicy, ToolProgressPolicy,
+    ToolExecutionResolutionError, ToolOperationTarget, ToolOutputPolicy, ToolProgressPolicy,
     ephemeral_tool_catalog_binding_fingerprint,
 };
 pub use tool_execution_policy::{
@@ -582,6 +620,10 @@ pub use tool_scope::{
     ExternalToolSurfaceStagedOp, GeneratedToolVisibilityOwner, LocalToolVisibilityOwner,
     ToolFilter, ToolScope, ToolScopeApplyError, ToolScopeHandle, ToolScopeRevision,
     ToolScopeSnapshot, ToolScopeStageError, ToolVisibilityOwner,
+};
+pub use tool_surface::{
+    PreparedCatalogEntry, PreparedToolCatalog, PreparedToolSurface, ToolSurfaceGate,
+    ToolSurfaceGateSlot, ToolSurfaceRefusal, ToolSurfaceSelection,
 };
 pub use transcript_replay::{
     ReplayApplication, ReplayAssistantBlockIndex, ReplayCapability, ReplayDisposition,
@@ -610,14 +652,15 @@ pub use types::{
     RunResult, SUPPORTED_VIDEO_MEDIA_TYPES, SecurityMode, ServerToolKind, SessionId, StopReason,
     SystemMessage, SystemMessageIdentity, SystemNoticeBlock, SystemNoticeDirection,
     SystemNoticeKind, SystemNoticeMessage, SystemNoticePeer, SystemNoticeRecord, SystemPromptKey,
-    SystemPromptVersion, SystemPromptVersionIdentity, ToolAudience, ToolCall, ToolCallIter,
-    ToolCallView, ToolDef, ToolIdentity, ToolName, ToolNameSet, ToolProvenance, ToolResult,
-    ToolSourceId, ToolSourceKind, TranscriptMessageIdentity, TranscriptSource, TranscriptUserRole,
-    TurnUsage, TurnUsageAccountingMissing, Usage, UserMessage, VideoData,
-    assistant_blocks_have_visible_or_actionable_output, has_images, has_non_text_content,
-    has_video, is_supported_video_media_type, materialize_latest_system_prompt_versions,
-    superseded_system_prompt_offsets, validate_inline_video_blocks,
-    validate_system_prompt_version_order,
+    SystemPromptVersion, SystemPromptVersionIdentity, TOOL_ARTIFACT_REF_PART_MAX_BYTES,
+    ToolArtifactRef, ToolArtifactRefError, ToolArtifactRefPart, ToolArtifactRefusal, ToolAudience,
+    ToolCall, ToolCallIter, ToolCallView, ToolDef, ToolIdentity, ToolName, ToolNameSet,
+    ToolProvenance, ToolResult, ToolSourceId, ToolSourceKind, TranscriptMessageIdentity,
+    TranscriptSource, TranscriptUserRole, TurnUsage, TurnUsageAccountingMissing, Usage,
+    UserMessage, VideoData, assistant_blocks_have_visible_or_actionable_output, has_images,
+    has_non_text_content, has_video, is_supported_video_media_type,
+    materialize_latest_system_prompt_versions, superseded_system_prompt_offsets,
+    validate_inline_video_blocks, validate_system_prompt_version_order,
 };
 pub use web_search::*;
 
@@ -625,8 +668,8 @@ pub use web_search::*;
 pub use auth::{
     AnthropicAuthMetadata, AnthropicRouteHints, AuthConstraints, AuthError, AuthErrorKind,
     AuthErrorSummary, AuthLease, AuthMetadata, AuthMetadataDefaults, AuthRefreshReason,
-    AuthRouteHints, AuthStatus, AuthStatusPhase, GoogleAuthMetadata, GoogleRouteHints,
-    HttpAuthorizationContent, HttpAuthorizationReceipt, HttpAuthorizationRequest,
+    AuthRouteHints, AuthStatus, AuthStatusPhase, CredentialObservation, GoogleAuthMetadata,
+    GoogleRouteHints, HttpAuthorizationContent, HttpAuthorizationReceipt, HttpAuthorizationRequest,
     HttpAuthorizationResponse, HttpAuthorizationResponseAction, HttpAuthorizer, OpenAiAuthMetadata,
     OpenAiRouteHints, ProviderAuthMetadata, PublishedAuthStatus, RefreshFailureObservation,
     ResolvedAuthEnvelope, ResolvedAuthKind, TokenLifecycleClearError,
@@ -641,26 +684,36 @@ pub use auth::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use auth::{
-    AuthLoginLifecycleGuard, AuthStatusRehydrateError, acquire_auth_login_lifecycle_guard,
+    AuthLoginLifecycleGuard, AuthLoginLifecycleRetention, AuthStatusRehydrateError,
+    CredentialStatusRead, acquire_auth_login_lifecycle_guard,
+    acquire_auth_login_lifecycle_guard_for_unattended,
     clear_tokens_and_publish_lifecycle_released_coordinated,
     clear_tokens_and_publish_lifecycle_released_coordinated_for_identity,
     clear_tokens_and_publish_lifecycle_released_coordinated_for_mode,
-    rehydrate_durable_predecessor_for_mutation,
-    rehydrate_durable_predecessor_for_mutation_for_identity, rehydrate_marked_tokens_for_status,
+    observe_marked_tokens_for_status_for_identity, rehydrate_durable_predecessor_for_mutation,
+    rehydrate_durable_predecessor_for_mutation_for_identity,
+    rehydrate_durable_predecessor_for_mutation_with_access,
+    rehydrate_loaded_marked_tokens_with_guard, rehydrate_marked_tokens_for_status,
     rehydrate_marked_tokens_for_status_for_identity,
     rehydrate_marked_tokens_for_status_for_identity_with_guard,
-    rehydrate_marked_tokens_for_status_with_guard, try_acquire_auth_login_lifecycle_guard,
+    rehydrate_marked_tokens_for_status_with_guard, retain_auth_login_lifecycle_exclusion,
+    try_acquire_auth_login_lifecycle_guard,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use auth::{
+    BoundedLifecyclePublicationError, publish_token_lifecycle_acquired_for_identity_within,
 };
 pub use connection::{
     AuthBindingRef, AuthCredentialIdentity, AuthProfile, AuthProfileConfig, BackendProfile,
     BackendProfileConfig, BindingId, BindingOrigin, BindingPolicy, ConnectionTargetError,
-    CredentialAccountBindingCandidates, CredentialAccountId, CredentialAccountRef,
-    CredentialSourceSpec, ExternalResolverId, IdentityError, MemberCommsName, MemberCommsNameError,
-    MobMemberBinding, PeerRole, ProfileId, ProviderBinding, ProviderBindingConfig,
-    ProviderBindingError, RealmConfigSection, RealmConnectionSet, RealmId,
-    ResolvedConnectionTarget, mob_realm_id, resolve_auth_binding_candidates_for_provider,
-    resolve_auth_binding_or_default_for_provider, resolve_credential_account_binding_for_provider,
-    resolve_explicit_auth_binding_target, resolve_realm_binding_target_for_provider,
+    ConnectorClientAuthMethod, ConnectorClientConfig, CredentialAccountBindingCandidates,
+    CredentialAccountId, CredentialAccountRef, CredentialSourceSpec, ExternalResolverId,
+    IdentityError, MemberCommsName, MemberCommsNameError, MobMemberBinding, PeerRole, ProfileId,
+    ProviderBinding, ProviderBindingConfig, ProviderBindingError, RealmConfigSection,
+    RealmConnectionSet, RealmId, ResolvedConnectionTarget, mob_realm_id,
+    resolve_auth_binding_candidates_for_provider, resolve_auth_binding_or_default_for_provider,
+    resolve_credential_account_binding_for_provider, resolve_explicit_auth_binding_target,
+    resolve_realm_binding_target_for_provider,
 };
 pub use self_hosted_binding::{
     SelfHostedBindingCandidate, SelfHostedBindingServer, SelfHostedConnectionError,

@@ -450,6 +450,27 @@ fn estimate_transcript_pressure(
                             tokens += block_tokens;
                             content_bytes += block_bytes;
                         }
+                        // A runtime notice's typed content is estimated as
+                        // other notice content is, its other fields as text.
+                        crate::types::SystemNoticeBlock::RuntimeNotice {
+                            category,
+                            detail,
+                            payload,
+                            content,
+                        } if !content.is_empty() => {
+                            let (block_tokens, block_bytes) = estimate_content_blocks(content);
+                            let fields = serde_json::to_string(
+                                &crate::types::SystemNoticeBlock::RuntimeNotice {
+                                    category: category.clone(),
+                                    detail: detail.clone(),
+                                    payload: payload.clone(),
+                                    content: Vec::new(),
+                                },
+                            )
+                            .map_err(|e| CompactionError::EstimationFailed(e.to_string()))?;
+                            tokens += block_tokens + fields.len() as u64 / 4;
+                            content_bytes += block_bytes + fields.len() as u64;
+                        }
                         other => {
                             let json = serde_json::to_string(other)
                                 .map_err(|e| CompactionError::EstimationFailed(e.to_string()))?;
@@ -1697,6 +1718,36 @@ mod tests {
 
         // One inline image => IMAGE_TOKEN_ESTIMATE, not ~1M tokens from base64.
         assert_eq!(estimate_tokens(&messages).unwrap(), IMAGE_TOKEN_ESTIMATE);
+    }
+
+    #[test]
+    fn estimate_tokens_uses_image_heuristic_for_runtime_notice_content() {
+        use crate::types::{ImageData, SystemNoticeBlock, SystemNoticeKind, SystemNoticeMessage};
+        let notice = |content: Vec<ContentBlock>| {
+            Message::SystemNotice(SystemNoticeMessage::with_block(
+                SystemNoticeKind::Generic,
+                None,
+                SystemNoticeBlock::RuntimeNotice {
+                    category: "consent_attempt".to_string(),
+                    detail: None,
+                    payload: None,
+                    content,
+                },
+            ))
+        };
+        let fields = estimate_tokens(&[notice(Vec::new())]).unwrap();
+        // One large inline image: the fixed image heuristic plus the same
+        // field estimate, never ~1M tokens of base64.
+        let with_image = notice(vec![ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: ImageData::Inline {
+                data: "A".repeat(4_000_000),
+            },
+        }]);
+        assert_eq!(
+            estimate_tokens(&[with_image]).unwrap(),
+            IMAGE_TOKEN_ESTIMATE + fields
+        );
     }
 
     #[test]

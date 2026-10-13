@@ -152,12 +152,13 @@ mod tests {
     /// Facade features that exist in the manifest but are deliberately not
     /// part of the documented shipping inventory: test-only support and the
     /// deprecated private GPT Live path plus its non-shipping harness.
-    const NON_SHIPPING_FACADE_FEATURES: [&str; 5] = [
+    const NON_SHIPPING_FACADE_FEATURES: [&str; 6] = [
         "experimental-gpt-live",
         "experimental-gpt-live-gate0-harness",
         "integration-real-tests",
         "test-mcp-oauth-fixtures",
         "test-realtime-fixtures",
+        "test-support",
     ];
 
     #[test]

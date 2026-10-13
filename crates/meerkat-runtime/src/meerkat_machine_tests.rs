@@ -1492,9 +1492,17 @@ fn named_type_id(name: &str) -> NamedTypeId {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn oauth_target() -> meerkat_core::AuthCredentialIdentity {
+    oauth_target_with_binding("default_openai")
+}
+
+/// A credential identity on its own lease key. The login lifecycle lock is
+/// process-wide per lease key, so a test that asserts an exact release must
+/// not share its key with the tests running beside it.
+#[cfg(not(target_arch = "wasm32"))]
+fn oauth_target_with_binding(binding: &str) -> meerkat_core::AuthCredentialIdentity {
     meerkat_core::AuthCredentialIdentity::from_auth_binding(&meerkat_core::AuthBindingRef {
         realm: meerkat_core::RealmId::parse("dev").expect("valid realm"),
-        binding: meerkat_core::BindingId::parse("default_openai").expect("valid binding"),
+        binding: meerkat_core::BindingId::parse(binding).expect("valid binding"),
         profile: None,
         origin: meerkat_core::connection::BindingOrigin::Configured,
     })
@@ -1962,7 +1970,7 @@ fn oauth_device_expiry_clears_runtime_lifecycle_membership() {
 #[test]
 fn oauth_lifecycle_shares_auth_machine_release_authority() {
     let machine = MeerkatMachine::ephemeral();
-    let target = oauth_target();
+    let target = oauth_target_with_binding("shared_release_openai");
     let redirect_uri = "http://127.0.0.1/callback";
     let state = machine
         .oauth_flow_authority()
@@ -2009,7 +2017,7 @@ fn oauth_lifecycle_release_stays_paired_after_runtime_auth_handle_install() {
     machine
         .set_auth_lease_handle(external_auth)
         .expect("initial runtime authority installation");
-    let target = oauth_target();
+    let target = oauth_target_with_binding("paired_release_openai");
     let redirect_uri = "http://127.0.0.1/callback";
     let state = machine
         .oauth_flow_authority()
@@ -3469,6 +3477,351 @@ async fn teardown_required_runtime_loop_exit_unregisters_after_exact_cleanup() {
     .expect("teardown-required handoff must drive canonical unregister");
     assert_eq!(stop_calls.load(Ordering::SeqCst), 1);
     assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+}
+
+/// A [`CoreExecutor`] whose post-stop cleanup reports that it started and then
+/// waits for its release, so a test can hold an unregister after the runtime
+/// loop has exited and handed the executor off.
+struct HeldTeardownCleanupExecutor {
+    cleanup_started: Arc<Notify>,
+    release_cleanup: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl CoreExecutor for HeldTeardownCleanupExecutor {
+    async fn apply(
+        &mut self,
+        _run_id: RunId,
+        _primitive: RunPrimitive,
+    ) -> Result<CoreApplyOutput, CoreExecutorError> {
+        Err(CoreExecutorError::apply_failed_runtime_turn(
+            "held cleanup fixture does not apply turns",
+        ))
+    }
+
+    async fn cancel_after_boundary(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+
+    async fn stop_runtime_executor(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+
+    async fn cleanup_after_runtime_stop_terminalized(&mut self) -> Result<(), CoreExecutorError> {
+        self.cleanup_started.notify_one();
+        self.release_cleanup.notified().await;
+        Ok(())
+    }
+}
+
+/// A persistent machine over an in-memory store that owns execution custody,
+/// with one session attached through a [`HeldTeardownCleanupExecutor`].
+struct HeldTeardownSession {
+    store: Arc<dyn crate::store::RuntimeStore>,
+    machine: Arc<MeerkatMachine>,
+    session_id: SessionId,
+    registration: RuntimeSessionRegistrationWitness,
+    cleanup_started: Arc<Notify>,
+    release_cleanup: Arc<Notify>,
+}
+
+async fn held_teardown_session() -> HeldTeardownSession {
+    let store: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let machine = Arc::new(
+        MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store())
+            .expect("persistent machine"),
+    );
+    let session_id = SessionId::new();
+    let cleanup_started = Arc::new(Notify::new());
+    let release_cleanup = Arc::new(Notify::new());
+    machine
+        .register_session_with_executor(
+            session_id.clone(),
+            Box::new(HeldTeardownCleanupExecutor {
+                cleanup_started: Arc::clone(&cleanup_started),
+                release_cleanup: Arc::clone(&release_cleanup),
+            }),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+    let registration = machine
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("the registered session exposes its exact registration");
+    // The watcher waits for the unregister it joins under its caller grace;
+    // keep that wait open for the whole test.
+    machine.test_set_unregister_caller_wait_grace(Duration::from_secs(3600));
+    HeldTeardownSession {
+        store,
+        machine,
+        session_id,
+        registration,
+        cleanup_started,
+        release_cleanup,
+    }
+}
+
+/// A runtime-loop teardown watcher holds the machine only for its kickoff:
+/// while it waits for the owned unregister it joined, it retains neither the
+/// machine nor the session driver it observed. A shutdown owner that awaits
+/// the same terminal result and then drops its own handle therefore finds the
+/// store's execution custody free for an immediate reopen.
+///
+/// The unregister is held in its executor cleanup until the test has seen the
+/// watcher dispatch its wait, and the current-thread runtime runs the watcher
+/// to its first suspension before this test resumes, so no scheduling decides
+/// what is observed. Every wait is bounded, and the unregister is released and
+/// joined before anything observed is judged.
+#[tokio::test]
+async fn teardown_watcher_waits_for_its_unregister_without_the_machine() {
+    let HeldTeardownSession {
+        store,
+        machine,
+        session_id,
+        registration,
+        cleanup_started,
+        release_cleanup,
+    } = held_teardown_session().await;
+    let handles = Arc::strong_count(&machine);
+    let watcher_wait = machine.test_witness_next_unregister_wait();
+
+    // The shutdown owner starts the exact unregister and follows its result.
+    let mut shutdown = match machine
+        .observe_unregister_session_registration_if_current(&registration)
+        .await
+        .expect("exact unregister admission")
+    {
+        RuntimeSessionUnregisterAdmission::Pending(observer) => observer,
+        other => panic!("the held cleanup keeps the unregister pending, got {other:?}"),
+    };
+    let watcher_dispatched = tokio::time::timeout(Duration::from_secs(5), watcher_wait).await;
+    let cleanup_reached =
+        tokio::time::timeout(Duration::from_secs(5), cleanup_started.notified()).await;
+    let handles_while_waiting = Arc::strong_count(&machine);
+
+    // Release and join the unregister before judging what was observed.
+    release_cleanup.notify_one();
+    let joined = tokio::time::timeout(Duration::from_secs(5), shutdown.wait_for_result()).await;
+    let registered_after = machine.contains_session(&session_id).await;
+    drop(machine);
+    let reopened = store
+        .execution_custody()
+        .expect("the in-memory store owns execution custody")
+        .try_acquire_governed();
+
+    assert_eq!(
+        watcher_dispatched
+            .expect("the loop's watcher joins the owned unregister in time")
+            .expect("the watcher's wait is reported"),
+        crate::UnregisterTeardownWaitWitness::CallerGrace
+    );
+    cleanup_reached.expect("the unregister reaches its held executor cleanup");
+    assert_eq!(
+        handles_while_waiting, handles,
+        "the watcher waits for the unregister without retaining the machine"
+    );
+    joined
+        .expect("the released unregister completes")
+        .expect("the owned unregister succeeds");
+    assert!(
+        !registered_after,
+        "the joined unregister removed the session"
+    );
+    reopened.expect("the store reopens with governed custody right after the shutdown");
+}
+
+/// An unregister publishes its result only after a runtime-loop watcher
+/// kickoff already in flight on its slot has dropped the machine it holds, so
+/// a shutdown owner woken by that result can drop its own handle and reopen
+/// the store with governed custody at once.
+///
+/// The watcher is parked inside its kickoff, after it took the machine and
+/// before it releases it, while the unregister is held in its executor
+/// cleanup. Once the unregister completes, its publication either waits for
+/// the parked kickoff or has already happened; in the second case the owner
+/// drops its handle and reopens while the kickoff still holds the machine,
+/// and finds the custody busy. Every wait is bounded, and the kickoff is
+/// released and the unregister joined before anything observed is judged.
+#[tokio::test]
+async fn unregister_publication_waits_for_the_watcher_kickoff_to_release_the_machine() {
+    let HeldTeardownSession {
+        store,
+        machine,
+        session_id,
+        registration,
+        cleanup_started,
+        release_cleanup,
+    } = held_teardown_session().await;
+    let slot = {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions.get(&session_id).expect("attached session entry");
+        Arc::clone(
+            entry
+                .runtime_loop_teardown
+                .as_ref()
+                .expect("the attached loop owns its teardown slot"),
+        )
+    };
+    let (kickoff_parked, release_kickoff) = slot.test_hold_next_watcher_kickoff();
+    let mut publication_waits = slot.test_witness_publication_waits_for_kickoff();
+
+    // The shutdown owner starts the exact unregister and follows its result.
+    let mut shutdown = match machine
+        .observe_unregister_session_registration_if_current(&registration)
+        .await
+        .expect("exact unregister admission")
+    {
+        RuntimeSessionUnregisterAdmission::Pending(observer) => observer,
+        other => panic!("the held cleanup keeps the unregister pending, got {other:?}"),
+    };
+    // The loop exits under the unregister, whose cleanup is held, so the
+    // watcher parks inside its kickoff before the unregister can complete.
+    let parked = tokio::time::timeout(Duration::from_secs(5), kickoff_parked).await;
+    let cleanup_reached =
+        tokio::time::timeout(Duration::from_secs(5), cleanup_started.notified()).await;
+    release_cleanup.notify_one();
+    let published_while_held = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            biased;
+            waits = &mut publication_waits => waits.map(|()| false),
+            _ = shutdown.wait_for_result() => Ok(true),
+        }
+    })
+    .await;
+    let result_while_held = shutdown.try_result();
+    // An owner that already holds its result drops its handle and reopens at
+    // once, while the kickoff is still parked.
+    let mut machine = Some(machine);
+    let reopened_while_held = matches!(published_while_held, Ok(Ok(true))).then(|| {
+        drop(machine.take());
+        store
+            .execution_custody()
+            .expect("the in-memory store owns execution custody")
+            .try_acquire_governed()
+    });
+
+    // Release the kickoff and join the unregister before judging.
+    let _ = release_kickoff.send(());
+    let joined = tokio::time::timeout(Duration::from_secs(5), shutdown.wait_for_result()).await;
+    drop(machine);
+    let reopened = match reopened_while_held {
+        Some(reopened) => reopened,
+        None => store
+            .execution_custody()
+            .expect("the in-memory store owns execution custody")
+            .try_acquire_governed(),
+    };
+
+    parked
+        .expect("the watcher reaches its kickoff in time")
+        .expect("the watcher parks before it releases the machine");
+    cleanup_reached.expect("the unregister reaches its held executor cleanup");
+    joined
+        .expect("the unregister completes once the kickoff is released")
+        .expect("the owned unregister succeeds");
+    reopened.expect("the store reopens with governed custody right after the shutdown");
+    assert!(
+        !published_while_held
+            .expect("the unregister publishes or waits in time")
+            .expect("the publication's wait is reported"),
+        "the result is not published while the watcher kickoff holds the machine"
+    );
+    assert!(
+        result_while_held
+            .expect("the result channel stays open")
+            .is_none(),
+        "nothing is published while the watcher kickoff holds the machine"
+    );
+}
+
+/// A runtime-loop watcher that wakes only after a successful unregister of its
+/// slot has acknowledged its result does not take the machine at all, so the
+/// shutdown owner that already holds that result can drop its handle and
+/// reopen the store with governed custody at once.
+///
+/// The watcher is parked right after its wake, before its kickoff, until the
+/// unregister has published. The test then lets it go and waits for whichever
+/// comes first: its kickoff being refused, or its kickoff parking while it
+/// holds the machine, in which case the reopen finds the custody busy. Every
+/// wait is bounded, and a parked kickoff is released and the unregister
+/// joined before anything observed is judged.
+#[tokio::test]
+async fn a_watcher_waking_after_its_successful_unregister_does_not_take_the_machine() {
+    let HeldTeardownSession {
+        store,
+        machine,
+        session_id,
+        registration,
+        cleanup_started,
+        release_cleanup,
+    } = held_teardown_session().await;
+    let slot = {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions.get(&session_id).expect("attached session entry");
+        Arc::clone(
+            entry
+                .runtime_loop_teardown
+                .as_ref()
+                .expect("the attached loop owns its teardown slot"),
+        )
+    };
+    let (watcher_woke, release_watcher) = slot.test_hold_watcher_wake();
+    let (mut kickoff_parked, release_kickoff) = slot.test_hold_next_watcher_kickoff();
+    let mut kickoff_refused = slot.test_witness_watcher_kickoff_refused();
+
+    // The shutdown owner starts the exact unregister and follows its result.
+    let mut shutdown = match machine
+        .observe_unregister_session_registration_if_current(&registration)
+        .await
+        .expect("exact unregister admission")
+    {
+        RuntimeSessionUnregisterAdmission::Pending(observer) => observer,
+        other => panic!("the held cleanup keeps the unregister pending, got {other:?}"),
+    };
+    let woke = tokio::time::timeout(Duration::from_secs(5), watcher_woke).await;
+    let cleanup_reached =
+        tokio::time::timeout(Duration::from_secs(5), cleanup_started.notified()).await;
+    release_cleanup.notify_one();
+    let published = tokio::time::timeout(Duration::from_secs(5), shutdown.wait_for_result()).await;
+
+    // Only now does the watcher reach its kickoff.
+    let _ = release_watcher.send(());
+    let took_machine = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            biased;
+            refused = &mut kickoff_refused => refused.map(|()| false),
+            parked = &mut kickoff_parked => parked.map(|()| true),
+        }
+    })
+    .await;
+    // The owner already holds its result: it drops its handle and reopens.
+    drop(machine);
+    let reopened = store
+        .execution_custody()
+        .expect("the in-memory store owns execution custody")
+        .try_acquire_governed();
+
+    // Release a parked kickoff and join the unregister before judging.
+    drop(release_kickoff);
+    let joined = tokio::time::timeout(Duration::from_secs(5), shutdown.wait_for_result()).await;
+
+    woke.expect("the loop exits under the unregister in time")
+        .expect("its watcher parks before its kickoff");
+    cleanup_reached.expect("the unregister reaches its held executor cleanup");
+    published
+        .expect("the unregister publishes while its watcher has not started")
+        .expect("the owned unregister succeeds");
+    joined
+        .expect("the published unregister stays joinable")
+        .expect("the owned unregister succeeds");
+    reopened.expect("the store reopens with governed custody right after the shutdown");
+    assert!(
+        !took_machine
+            .expect("the watcher's kickoff resolves in time")
+            .expect("its outcome is reported"),
+        "a watcher waking after its successful unregister takes no machine"
+    );
 }
 
 /// #1248: the execution-start bound hands a never-started executor off with
@@ -8091,6 +8444,1198 @@ async fn concurrent_unregister_callers_join_original_drain_result() {
         !adapter.contains_session(&session_id).await,
         "original unregister should remove the entry after the real drain finishes"
     );
+}
+
+/// Executor for the quiescent-close tests. Each apply records the input ids
+/// it ran, announces its start and, when gated, waits for a release. Its
+/// interrupt handle records every hard cancel an unregister saga delivers
+/// and releases a parked apply, as a well-behaved executor unwinds on a hard
+/// cancel.
+struct QuiescentCloseExecutor {
+    apply_started: Arc<Notify>,
+    apply_release: Option<Arc<Notify>>,
+    contributions: Arc<std::sync::Mutex<Vec<Vec<InputId>>>>,
+    hard_cancels: Arc<AtomicUsize>,
+}
+
+impl QuiescentCloseExecutor {
+    fn ungated(
+        contributions: &Arc<std::sync::Mutex<Vec<Vec<InputId>>>>,
+        hard_cancels: &Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            apply_started: Arc::new(Notify::new()),
+            apply_release: None,
+            contributions: Arc::clone(contributions),
+            hard_cancels: Arc::clone(hard_cancels),
+        }
+    }
+}
+
+struct QuiescentCloseInterruptHandle {
+    apply_release: Option<Arc<Notify>>,
+    hard_cancels: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl CoreExecutorInterruptHandle for QuiescentCloseInterruptHandle {
+    async fn hard_cancel_run_if_current(
+        &self,
+        _expected_run_id: &RunId,
+        _reason: String,
+    ) -> Result<bool, CoreExecutorError> {
+        self.hard_cancels.fetch_add(1, Ordering::SeqCst);
+        if let Some(release) = self.apply_release.as_ref() {
+            release.notify_one();
+        }
+        Ok(true)
+    }
+}
+
+#[async_trait::async_trait]
+impl CoreExecutor for QuiescentCloseExecutor {
+    fn interrupt_handle(&self) -> Option<Arc<dyn CoreExecutorInterruptHandle>> {
+        Some(Arc::new(QuiescentCloseInterruptHandle {
+            apply_release: self.apply_release.clone(),
+            hard_cancels: Arc::clone(&self.hard_cancels),
+        }))
+    }
+
+    async fn apply(
+        &mut self,
+        run_id: RunId,
+        primitive: RunPrimitive,
+    ) -> Result<CoreApplyOutput, CoreExecutorError> {
+        self.contributions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(primitive.contributing_input_ids().to_vec());
+        self.apply_started.notify_one();
+        if let Some(release) = self.apply_release.as_ref() {
+            release.notified().await;
+        }
+        Ok(CoreApplyOutput::with_untyped_snapshot(
+            RunBoundaryReceiptDraft {
+                run_id,
+                boundary: RunApplyBoundary::RunStart,
+                contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                conversation_digest: None,
+                message_count: 0,
+            },
+            None,
+            None,
+        ))
+    }
+
+    async fn cancel_after_boundary(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+
+    async fn stop_runtime_executor(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+}
+
+fn recorded_contributions(
+    contributions: &Arc<std::sync::Mutex<Vec<Vec<InputId>>>>,
+) -> Vec<Vec<InputId>> {
+    contributions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Retry a quiescent close while the registration settles the work it has
+/// just finished, and return the first answer that is not `Busy`.
+async fn quiescent_close_once_settled(
+    machine: &MeerkatMachine,
+    registration: &RuntimeSessionRegistrationWitness,
+) -> RuntimeSessionQuiescentClose {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let answer = machine
+                .unregister_session_registration_until_terminal_if_quiescent(registration)
+                .await
+                .expect("the quiescent close answers typed");
+            if answer != RuntimeSessionQuiescentClose::Busy {
+                break answer;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a settled registration must stop answering busy")
+}
+
+async fn await_successful_completion(
+    completion: Option<crate::completion::CompletionHandle>,
+    context: &str,
+) {
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        completion
+            .expect("an admitted input carries its completion")
+            .wait(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{context}: the input settles"))
+    .unwrap_or_else(|error| panic!("{context}: the completion resolves: {error}"));
+    assert!(
+        matches!(
+            outcome,
+            CompletionOutcome::Completed(_) | CompletionOutcome::CompletedWithoutResult
+        ),
+        "{context}: the input completes successfully: {outcome:?}"
+    );
+}
+
+async fn await_input_consumed(
+    machine: &MeerkatMachine,
+    session_id: &SessionId,
+    input_id: &InputId,
+) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state = <MeerkatMachine as SessionServiceRuntimeExt>::input_state(
+                machine, session_id, input_id,
+            )
+            .await
+            .expect("input state lookup")
+            .expect("the input is retained");
+            if state.seed.terminal_outcome
+                == Some(crate::input_state::InputTerminalOutcome::Consumed)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the retained input runs to completion");
+}
+
+/// A read of `session_has_active_inputs` followed by an unregister is not a
+/// quiescence fence: input admitted between the two starts a run that the
+/// unregister hard-cancels. The quiescent close checks under the
+/// registration's own mutation gate instead, so input admitted after an
+/// earlier idle read makes it answer `Busy`, and the run is never
+/// interrupted.
+#[tokio::test]
+async fn quiescent_close_never_interrupts_input_admitted_after_an_idle_read() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    let apply_started = Arc::new(Notify::new());
+    let apply_release = Arc::new(Notify::new());
+    let contributions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hard_cancels = Arc::new(AtomicUsize::new(0));
+    adapter
+        .register_session_with_executor(
+            session_id.clone(),
+            Box::new(QuiescentCloseExecutor {
+                apply_started: Arc::clone(&apply_started),
+                apply_release: Some(Arc::clone(&apply_release)),
+                contributions: Arc::clone(&contributions),
+                hard_cancels: Arc::clone(&hard_cancels),
+            }),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+    let registration = adapter
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("a registered runtime exposes its exact registration");
+
+    // The prior read: the registration is idle.
+    assert!(
+        !adapter.session_has_active_inputs(&session_id).await,
+        "the registration starts idle"
+    );
+
+    // Genuine input admission scheduled after that read and before the
+    // close. It starts a run that parks inside apply.
+    let admitted = make_prompt("admitted after the idle read");
+    let admitted_id = admitted.id().clone();
+    let (outcome, completion) = adapter
+        .accept_input_with_completion(&session_id, admitted)
+        .await
+        .expect("input is admitted after the idle read");
+    assert!(outcome.is_accepted());
+    tokio::time::timeout(Duration::from_secs(5), apply_started.notified())
+        .await
+        .expect("the admitted input starts a run");
+
+    let answer = tokio::time::timeout(
+        Duration::from_secs(5),
+        adapter.unregister_session_registration_until_terminal_if_quiescent(&registration),
+    )
+    .await
+    .expect("the quiescent close answers without waiting for the run")
+    .expect("the quiescent close answers typed");
+    assert_eq!(
+        hard_cancels.load(Ordering::SeqCst),
+        0,
+        "the close hard-cancelled the run of input admitted after the idle read"
+    );
+    assert_eq!(answer, RuntimeSessionQuiescentClose::Busy);
+    assert_eq!(
+        adapter
+            .current_session_registration_witness(&session_id)
+            .await
+            .as_ref(),
+        Some(&registration),
+        "busy keeps the exact registration current"
+    );
+    assert_ne!(
+        adapter
+            .session_dsl_state(&session_id)
+            .await
+            .expect("session DSL state")
+            .registration_phase,
+        mm_dsl::RegistrationPhase::Draining,
+        "busy opens no drain window"
+    );
+
+    apply_release.notify_one();
+    await_successful_completion(completion, "the admitted input").await;
+
+    // Settled now: the same exact registration closes, still without a
+    // hard cancel.
+    assert_eq!(
+        quiescent_close_once_settled(&adapter, &registration).await,
+        RuntimeSessionQuiescentClose::Closed
+    );
+    assert_eq!(hard_cancels.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        recorded_contributions(&contributions),
+        vec![vec![admitted_id]]
+    );
+    assert!(!adapter.contains_session(&session_id).await);
+}
+
+/// `Busy` is a typed local answer that leaves the running owner alone: a
+/// queued input keeps the registration serving, nothing is staged or
+/// abandoned, ingress stays open and the queued input later runs to
+/// completion.
+#[tokio::test]
+async fn quiescent_close_busy_leaves_the_owner_serving_its_queued_input() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    let contributions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hard_cancels = Arc::new(AtomicUsize::new(0));
+    adapter
+        .register_session_with_executor(
+            session_id.clone(),
+            Box::new(QuiescentCloseExecutor::ungated(
+                &contributions,
+                &hard_cancels,
+            )),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+    let registration = adapter
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("a registered runtime exposes its exact registration");
+
+    let queued = make_prompt("queued real work");
+    let queued_id = queued.id().clone();
+    let queued_outcome = adapter
+        .accept_input_without_wake(&session_id, queued)
+        .await
+        .expect("queued input is admitted");
+    assert!(queued_outcome.is_accepted());
+
+    assert_eq!(
+        adapter
+            .unregister_session_registration_until_terminal_if_quiescent(&registration)
+            .await
+            .expect("the quiescent close answers typed"),
+        RuntimeSessionQuiescentClose::Busy,
+        "a retained queued input is real work: the close answers busy"
+    );
+    assert_eq!(hard_cancels.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        adapter
+            .current_session_registration_witness(&session_id)
+            .await
+            .as_ref(),
+        Some(&registration),
+        "busy keeps the exact registration current"
+    );
+    assert_ne!(
+        adapter
+            .session_dsl_state(&session_id)
+            .await
+            .expect("session DSL state")
+            .registration_phase,
+        mm_dsl::RegistrationPhase::Draining,
+        "busy opens no drain window"
+    );
+    let queued_state = <MeerkatMachine as SessionServiceRuntimeExt>::input_state(
+        &adapter,
+        &session_id,
+        &queued_id,
+    )
+    .await
+    .expect("queued input state lookup")
+    .expect("the queued input is retained");
+    assert_eq!(
+        queued_state.seed.terminal_outcome, None,
+        "busy neither discards nor abandons retained queued work"
+    );
+
+    // The owner keeps serving: ingress stays open and wakes the loop, which
+    // runs the retained queued input as well.
+    let (outcome, completion) = adapter
+        .accept_input_with_completion(&session_id, make_prompt("admitted after busy"))
+        .await
+        .expect("ingress stays open after a busy close");
+    assert!(outcome.is_accepted());
+    await_successful_completion(completion, "the input admitted after busy").await;
+    await_input_consumed(&adapter, &session_id, &queued_id).await;
+
+    assert_eq!(
+        quiescent_close_once_settled(&adapter, &registration).await,
+        RuntimeSessionQuiescentClose::Closed
+    );
+    assert_eq!(hard_cancels.load(Ordering::SeqCst), 0);
+    assert!(
+        recorded_contributions(&contributions)
+            .iter()
+            .flatten()
+            .any(|input_id| input_id == &queued_id),
+        "the retained queued input ran"
+    );
+}
+
+/// Wait until an ingress spawned after `before` was read is waiting for the
+/// mutation gate this test holds. While it waits, the ingress owns two
+/// references to the gate: the one it read from the registry and the one its
+/// lock acquisition consumed.
+async fn await_ingress_waiting_on_gate<T>(gate: &Arc<T>, before: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while Arc::strong_count(gate) < before + 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the ingress reaches the shared mutation gate");
+}
+
+/// Gate race, first order: a quiescent close that wins the shared mutation
+/// gate commits its drain window before ingress queued behind it is
+/// admitted. That ingress is refused, and nothing runs or is interrupted.
+#[tokio::test]
+async fn quiescent_close_that_wins_the_mutation_gate_refuses_ingress_queued_behind_it() {
+    use std::future::Future as _;
+
+    let machine = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    let contributions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hard_cancels = Arc::new(AtomicUsize::new(0));
+    machine
+        .register_session_with_executor(
+            session_id.clone(),
+            Box::new(QuiescentCloseExecutor::ungated(
+                &contributions,
+                &hard_cancels,
+            )),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+    let registration = machine
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("a registered runtime exposes its exact registration");
+    let mutation_gate = {
+        let sessions = machine.sessions.read().await;
+        Arc::clone(
+            &sessions
+                .get(&session_id)
+                .expect("registered session entry")
+                .mutation_gate,
+        )
+    };
+    let held_gate = Arc::clone(&mutation_gate).lock_owned().await;
+
+    let close = machine.unregister_session_registration_until_terminal_if_quiescent(&registration);
+    tokio::pin!(close);
+    let first_poll =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(close.as_mut().poll(cx))).await;
+    assert!(
+        first_poll.is_pending(),
+        "the close waits for the shared mutation gate"
+    );
+    {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions
+            .get(&session_id)
+            .expect("the waiting close retains the registration");
+        assert!(
+            entry.unregister_coordinator.is_none(),
+            "the close publishes no owner before it wins the gate"
+        );
+    }
+
+    // Ingress queues on the same gate, behind the waiting close.
+    let before_ingress = Arc::strong_count(&mutation_gate);
+    let ingress = {
+        let machine = Arc::clone(&machine);
+        let session_id = session_id.clone();
+        tokio::spawn(async move {
+            machine
+                .accept_input_with_completion(&session_id, make_prompt("queued behind the close"))
+                .await
+        })
+    };
+    await_ingress_waiting_on_gate(&mutation_gate, before_ingress).await;
+    drop(held_gate);
+
+    let closed = tokio::time::timeout(Duration::from_secs(5), close)
+        .await
+        .expect("the close that won the gate converges")
+        .expect("the close answers typed");
+    assert_eq!(closed, RuntimeSessionQuiescentClose::Closed);
+    let refused = tokio::time::timeout(Duration::from_secs(5), ingress)
+        .await
+        .expect("ingress behind the close resolves")
+        .expect("ingress task does not panic");
+    assert!(
+        matches!(
+            refused,
+            Err(RuntimeDriverError::NotReady { .. } | RuntimeDriverError::Destroyed)
+        ),
+        "ingress queued behind a committed drain window must be refused, got {:?}",
+        refused.map(|(outcome, _)| outcome)
+    );
+    assert_eq!(hard_cancels.load(Ordering::SeqCst), 0);
+    assert!(
+        recorded_contributions(&contributions).is_empty(),
+        "no run started behind the close"
+    );
+    assert!(!machine.contains_session(&session_id).await);
+}
+
+/// Gate race, second order: ingress that wins the shared mutation gate
+/// admits its input first; a quiescent close queued behind it decides under
+/// that same gate afterwards, answers `Busy`, mutates nothing, and the
+/// admitted run is never interrupted.
+#[tokio::test]
+async fn quiescent_close_queued_behind_ingress_that_won_the_mutation_gate_answers_busy() {
+    use std::future::Future as _;
+
+    let machine = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    let apply_release = Arc::new(Notify::new());
+    let contributions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hard_cancels = Arc::new(AtomicUsize::new(0));
+    machine
+        .register_session_with_executor(
+            session_id.clone(),
+            Box::new(QuiescentCloseExecutor {
+                apply_started: Arc::new(Notify::new()),
+                apply_release: Some(Arc::clone(&apply_release)),
+                contributions: Arc::clone(&contributions),
+                hard_cancels: Arc::clone(&hard_cancels),
+            }),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+    let registration = machine
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("a registered runtime exposes its exact registration");
+    let mutation_gate = {
+        let sessions = machine.sessions.read().await;
+        Arc::clone(
+            &sessions
+                .get(&session_id)
+                .expect("registered session entry")
+                .mutation_gate,
+        )
+    };
+    let held_gate = Arc::clone(&mutation_gate).lock_owned().await;
+
+    // Ingress reaches the gate first and waits behind this test.
+    let before_ingress = Arc::strong_count(&mutation_gate);
+    let won = make_prompt("wins the gate");
+    let won_id = won.id().clone();
+    let ingress = {
+        let machine = Arc::clone(&machine);
+        let session_id = session_id.clone();
+        tokio::spawn(async move { machine.accept_input_with_completion(&session_id, won).await })
+    };
+    await_ingress_waiting_on_gate(&mutation_gate, before_ingress).await;
+
+    // The close then queues behind that ingress.
+    let close = machine.unregister_session_registration_until_terminal_if_quiescent(&registration);
+    tokio::pin!(close);
+    let first_poll =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(close.as_mut().poll(cx))).await;
+    assert!(
+        first_poll.is_pending(),
+        "the close waits behind the ingress for the shared mutation gate"
+    );
+    drop(held_gate);
+
+    let (outcome, completion) = tokio::time::timeout(Duration::from_secs(5), ingress)
+        .await
+        .expect("ingress that won the gate resolves")
+        .expect("ingress task does not panic")
+        .expect("ingress that won the gate is admitted");
+    assert!(outcome.is_accepted());
+    let answer = tokio::time::timeout(Duration::from_secs(5), close)
+        .await
+        .expect("the close answers")
+        .expect("the close answers typed");
+    assert_eq!(
+        hard_cancels.load(Ordering::SeqCst),
+        0,
+        "the close interrupted the run of input admitted before it won the gate"
+    );
+    assert_eq!(
+        answer,
+        RuntimeSessionQuiescentClose::Busy,
+        "the close must decide under the gate, after the ingress that won it"
+    );
+    assert_eq!(
+        machine
+            .current_session_registration_witness(&session_id)
+            .await
+            .as_ref(),
+        Some(&registration),
+        "busy keeps the exact registration current"
+    );
+    {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions
+            .get(&session_id)
+            .expect("busy retains the registration");
+        assert!(
+            entry.unregister_coordinator.is_none(),
+            "busy installs no unregister owner"
+        );
+    }
+    assert_ne!(
+        machine
+            .session_dsl_state(&session_id)
+            .await
+            .expect("session DSL state")
+            .registration_phase,
+        mm_dsl::RegistrationPhase::Draining,
+        "busy opens no drain window"
+    );
+
+    apply_release.notify_one();
+    await_successful_completion(completion, "the input that won the gate").await;
+    assert_eq!(
+        quiescent_close_once_settled(&machine, &registration).await,
+        RuntimeSessionQuiescentClose::Closed
+    );
+    assert_eq!(hard_cancels.load(Ordering::SeqCst), 0);
+    assert_eq!(recorded_contributions(&contributions), vec![vec![won_id]]);
+}
+
+/// The quiescent close's own prefix is owned by the canonical unregister
+/// coordinator before it mutates anything. A caller cancelled while that
+/// prefix's persistence is held leaves the close owned: it still converges,
+/// and the same SessionId registers again afterwards.
+#[tokio::test]
+async fn quiescent_close_cancelled_during_prefix_persistence_keeps_its_owned_teardown() {
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let store = Arc::new(RuntimeCommitAtomicityStore::pass_through(Arc::clone(
+        &inner,
+    )));
+    let machine = Arc::new(
+        MeerkatMachine::persistent(
+            store.clone() as Arc<dyn crate::store::RuntimeStore>,
+            memory_blob_store(),
+        )
+        .expect("persistent machine"),
+    );
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("idle registration");
+    let registration = machine
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("a registered runtime exposes its exact registration");
+
+    let prefix_committed = Arc::new(Notify::new());
+    let release_prefix = Arc::new(Notify::new());
+    store.arm_block_commit_machine_lifecycle_after_commit(
+        Arc::clone(&prefix_committed),
+        Arc::clone(&release_prefix),
+    );
+    let close = {
+        let machine = Arc::clone(&machine);
+        let registration = registration.clone();
+        tokio::spawn(async move {
+            machine
+                .unregister_session_registration_until_terminal_if_quiescent(&registration)
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), prefix_committed.notified())
+        .await
+        .expect("the quiescent close commits its prefix");
+    assert_eq!(
+        machine
+            .session_dsl_state(&session_id)
+            .await
+            .expect("session DSL state")
+            .registration_phase,
+        mm_dsl::RegistrationPhase::Draining,
+        "the prefix is committed"
+    );
+    {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions
+            .get(&session_id)
+            .expect("the closing registration is retained");
+        assert!(
+            entry.unregister_coordinator.is_some(),
+            "the prefix committed before an owned unregister coordinator existed"
+        );
+    }
+
+    // Cancel the caller while its prefix persistence is held.
+    close.abort();
+    assert!(
+        close
+            .await
+            .expect_err("the caller is cancelled")
+            .is_cancelled()
+    );
+    release_prefix.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !machine.contains_session(&session_id).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Draining was left with no owner after the caller was cancelled");
+    let durable =
+        crate::store::load_machine_lifecycle(inner.as_ref(), &runtime_id_for_session(&session_id))
+            .await
+            .expect("load the post-close lifecycle")
+            .expect("the post-close lifecycle remains durable");
+    assert!(
+        durable.unregister_progress().is_none(),
+        "the owned teardown finished the durable drain its cancelled caller began"
+    );
+    assert_eq!(
+        machine
+            .unregister_session_registration_until_terminal_if_quiescent(&registration)
+            .await
+            .expect("the quiescent close answers typed"),
+        RuntimeSessionQuiescentClose::NotCurrent
+    );
+
+    // Convergence: the same SessionId registers again and closes again.
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("the same SessionId registers again after the owned close");
+    let fresh = machine
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("the fresh registration exposes its witness");
+    assert_ne!(fresh, registration);
+    assert_eq!(
+        machine
+            .unregister_session_registration_until_terminal_if_quiescent(&fresh)
+            .await
+            .expect("the quiescent close answers typed"),
+        RuntimeSessionQuiescentClose::Closed
+    );
+}
+
+/// A persistent idle registration whose quiescent close is parked inside its
+/// prefix persistence: the store has committed `BeginUnregisterSession` and
+/// holds the acknowledgement until `release_prefix` is notified.
+struct HeldQuiescentClosePrefix {
+    machine: Arc<MeerkatMachine>,
+    session_id: SessionId,
+    registration: RuntimeSessionRegistrationWitness,
+    close: tokio::task::JoinHandle<Result<RuntimeSessionQuiescentClose, RuntimeDriverError>>,
+    release_prefix: Arc<Notify>,
+}
+
+async fn hold_quiescent_close_prefix() -> HeldQuiescentClosePrefix {
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let store = Arc::new(RuntimeCommitAtomicityStore::pass_through(Arc::clone(
+        &inner,
+    )));
+    let machine = Arc::new(
+        MeerkatMachine::persistent(
+            store.clone() as Arc<dyn crate::store::RuntimeStore>,
+            memory_blob_store(),
+        )
+        .expect("persistent machine"),
+    );
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("idle registration");
+    let registration = machine
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("a registered runtime exposes its exact registration");
+    let prefix_committed = Arc::new(Notify::new());
+    let release_prefix = Arc::new(Notify::new());
+    store.arm_block_commit_machine_lifecycle_after_commit(
+        Arc::clone(&prefix_committed),
+        Arc::clone(&release_prefix),
+    );
+    let close = {
+        let machine = Arc::clone(&machine);
+        let registration = registration.clone();
+        tokio::spawn(async move {
+            machine
+                .unregister_session_registration_until_terminal_if_quiescent(&registration)
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), prefix_committed.notified())
+        .await
+        .expect("the quiescent close commits its prefix");
+    HeldQuiescentClosePrefix {
+        machine,
+        session_id,
+        registration,
+        close,
+        release_prefix,
+    }
+}
+
+impl HeldQuiescentClosePrefix {
+    /// Release the held prefix persistence and require the close to finish.
+    async fn release_and_close(self) -> (Arc<MeerkatMachine>, SessionId) {
+        self.release_prefix.notify_one();
+        let closed = tokio::time::timeout(Duration::from_secs(5), self.close)
+            .await
+            .expect("the held close converges once its prefix is released")
+            .expect("close task does not panic")
+            .expect("the close answers typed");
+        assert_eq!(closed, RuntimeSessionQuiescentClose::Closed);
+        assert!(!self.machine.contains_session(&self.session_id).await);
+        (self.machine, self.session_id)
+    }
+}
+
+/// The registration transaction covers a quiescent close's check and its
+/// coordinator installation only. While the close's prefix persistence is
+/// held, a same-ID registration therefore observes the installed
+/// coordinator and refuses typed at once, instead of waiting for that
+/// persistence; once the close finishes, the SessionId registers again.
+#[tokio::test]
+async fn quiescent_close_held_prefix_refuses_same_id_registration_without_waiting() {
+    let held = hold_quiescent_close_prefix().await;
+
+    let refused = tokio::time::timeout(
+        Duration::from_secs(2),
+        held.machine.execute_meerkat_machine_command(
+            None,
+            MeerkatMachineCommand::RegisterSession {
+                session_id: held.session_id.clone(),
+            },
+        ),
+    )
+    .await
+    .expect("same-ID registration waited for the held prefix persistence");
+    assert!(
+        matches!(
+            refused,
+            Err(MeerkatMachineCommandError::Driver(
+                RuntimeDriverError::NotReady { .. }
+            ))
+        ),
+        "same-ID registration must observe the installed coordinator: {refused:?}"
+    );
+
+    let (machine, session_id) = held.release_and_close().await;
+    machine
+        .register_session(session_id)
+        .await
+        .expect("the SessionId registers again after the close");
+}
+
+/// While a quiescent close's prefix persistence is held, a duplicate close
+/// of the same exact registration answers `AlreadyClosing` from the
+/// installed coordinator at once, instead of queueing behind that
+/// persistence on either gate.
+#[tokio::test]
+async fn quiescent_close_held_prefix_answers_a_duplicate_close_without_waiting() {
+    let held = hold_quiescent_close_prefix().await;
+
+    let duplicate = tokio::time::timeout(
+        Duration::from_secs(2),
+        held.machine
+            .unregister_session_registration_until_terminal_if_quiescent(&held.registration),
+    )
+    .await
+    .expect("a duplicate close waited for the held prefix persistence")
+    .expect("the duplicate close answers typed");
+    assert_eq!(duplicate, RuntimeSessionQuiescentClose::AlreadyClosing);
+
+    held.release_and_close().await;
+}
+
+/// Two quiescent closes of one registration both pass the read-only
+/// coordinator check before either installs one, then queue on the
+/// registration transaction. The first installs the coordinator, releases
+/// the transaction and parks inside its prefix persistence with the mutation
+/// gate held. The second, next on the transaction, must answer
+/// `AlreadyClosing` there instead of waiting on that gate while it holds the
+/// transaction, so a same-ID registration also gets its typed refusal
+/// before the persistence is released.
+#[tokio::test]
+async fn quiescent_close_queued_behind_another_close_on_the_transaction_answers_without_waiting() {
+    use std::future::Future as _;
+
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let store = Arc::new(RuntimeCommitAtomicityStore::pass_through(Arc::clone(
+        &inner,
+    )));
+    let machine = Arc::new(
+        MeerkatMachine::persistent(
+            store.clone() as Arc<dyn crate::store::RuntimeStore>,
+            memory_blob_store(),
+        )
+        .expect("persistent machine"),
+    );
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("idle registration");
+    let registration = machine
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("a registered runtime exposes its exact registration");
+    let prefix_committed = Arc::new(Notify::new());
+    let release_prefix = Arc::new(Notify::new());
+    store.arm_block_commit_machine_lifecycle_after_commit(
+        Arc::clone(&prefix_committed),
+        Arc::clone(&release_prefix),
+    );
+
+    // Both closes pass the read-only check, then queue on the held
+    // registration transaction: A first, then B.
+    let held_transaction = machine
+        .lock_session_registration_transaction(&session_id)
+        .await;
+    let close_a =
+        machine.unregister_session_registration_until_terminal_if_quiescent(&registration);
+    let close_b =
+        machine.unregister_session_registration_until_terminal_if_quiescent(&registration);
+    tokio::pin!(close_a);
+    tokio::pin!(close_b);
+    let first_a =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(close_a.as_mut().poll(cx))).await;
+    assert!(
+        first_a.is_pending(),
+        "close A waits for the held registration transaction"
+    );
+    let first_b =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(close_b.as_mut().poll(cx))).await;
+    assert!(first_b.is_pending(), "close B queues behind close A");
+    drop(held_transaction);
+
+    // A takes the transaction, installs its coordinator, releases the
+    // transaction, and its owned worker parks inside the prefix persistence.
+    tokio::select! {
+        () = prefix_committed.notified() => {}
+        answer = close_a.as_mut() => {
+            panic!("close A answered before its prefix persistence was held: {answer:?}")
+        }
+        () = tokio::time::sleep(Duration::from_secs(5)) => {
+            panic!("close A never reached its prefix persistence")
+        }
+    }
+
+    let answer_b = tokio::time::timeout(Duration::from_secs(2), close_b.as_mut())
+        .await
+        .expect("close B waited on close A's held mutation gate while holding the transaction")
+        .expect("close B answers typed");
+    assert_eq!(answer_b, RuntimeSessionQuiescentClose::AlreadyClosing);
+    let refused = tokio::time::timeout(
+        Duration::from_secs(2),
+        machine.execute_meerkat_machine_command(
+            None,
+            MeerkatMachineCommand::RegisterSession {
+                session_id: session_id.clone(),
+            },
+        ),
+    )
+    .await
+    .expect("same-ID registration waited on the registration transaction");
+    assert!(
+        matches!(
+            refused,
+            Err(MeerkatMachineCommandError::Driver(
+                RuntimeDriverError::NotReady { .. }
+            ))
+        ),
+        "same-ID registration must observe the installed coordinator: {refused:?}"
+    );
+
+    release_prefix.notify_one();
+    let answer_a = tokio::time::timeout(Duration::from_secs(5), close_a.as_mut())
+        .await
+        .expect("close A converges once its prefix is released")
+        .expect("close A answers typed");
+    assert_eq!(answer_a, RuntimeSessionQuiescentClose::Closed);
+    assert!(!machine.contains_session(&session_id).await);
+    machine
+        .register_session(session_id)
+        .await
+        .expect("the SessionId registers again after the close");
+}
+
+/// A failed first persistence of the quiescent close's own prefix fails
+/// typed and leaves a Draining registration that lost its owner. That
+/// ownerless drain is not answered as already closing: the same operation
+/// retries it through the canonical teardown, which fails closed on the
+/// poisoned shell exactly as an ordinary unregister retry does, and cold
+/// recovery of the durable state converges.
+#[tokio::test]
+async fn quiescent_close_prefix_persistence_failure_leaves_a_recoverable_drain() {
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let store = Arc::new(RuntimeCommitAtomicityStore::pass_through(Arc::clone(
+        &inner,
+    )));
+    let machine = Arc::new(
+        MeerkatMachine::persistent(
+            store.clone() as Arc<dyn crate::store::RuntimeStore>,
+            memory_blob_store(),
+        )
+        .expect("persistent machine"),
+    );
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("idle registration");
+    let registration = machine
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("a registered runtime exposes its exact registration");
+
+    let calls_before = store.commit_machine_lifecycle_calls();
+    // The quiescent close's own prefix is its first lifecycle write.
+    store.fail_commit_machine_lifecycle_on_call(calls_before + 1);
+    let error = machine
+        .unregister_session_registration_until_terminal_if_quiescent(&registration)
+        .await
+        .expect_err("the first prefix write fails");
+    assert!(
+        matches!(&error, RuntimeDriverError::RecoveryRepairBlocked { .. }),
+        "unexpected prefix-persist failure: {error}"
+    );
+    {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions
+            .get(&session_id)
+            .expect("a failed close retains the registration");
+        assert!(
+            entry.unregister_coordinator.is_none(),
+            "the failed owned close released its coordinator"
+        );
+    }
+    assert_eq!(
+        machine
+            .session_dsl_state(&session_id)
+            .await
+            .expect("session DSL state")
+            .registration_phase,
+        mm_dsl::RegistrationPhase::Draining,
+        "the live prefix is retained for recovery"
+    );
+
+    let retry = machine
+        .unregister_session_registration_until_terminal_if_quiescent(&registration)
+        .await;
+    assert!(
+        matches!(
+            &retry,
+            Err(RuntimeDriverError::RecoveryRepairBlocked { .. })
+        ),
+        "an ownerless drain must be retried through the canonical teardown, not answered as closing: {retry:?}"
+    );
+
+    drop(machine);
+    let recovered = Arc::new(
+        MeerkatMachine::persistent(
+            store.clone() as Arc<dyn crate::store::RuntimeStore>,
+            memory_blob_store(),
+        )
+        .expect("persistent machine"),
+    );
+    recovered
+        .register_session(session_id.clone())
+        .await
+        .expect("cold registration recovers the durable state");
+    let fresh = recovered
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("the recovered registration exposes its witness");
+    assert_eq!(
+        recovered
+            .unregister_session_registration_until_terminal_if_quiescent(&fresh)
+            .await
+            .expect("the quiescent close answers typed"),
+        RuntimeSessionQuiescentClose::Closed
+    );
+    assert!(!recovered.contains_session(&session_id).await);
+}
+
+/// A settled exact-owner close, then a same-SessionId resume. A retained
+/// queued input first makes the close answer `Busy` and then settles; the
+/// close that follows archives and discards nothing. The resumed executor
+/// runs exactly the fresh input, never an input settled before the close.
+#[tokio::test]
+async fn quiescent_close_of_a_settled_owner_resumes_the_same_session_without_replay() {
+    let store = Arc::new(crate::store::InMemoryRuntimeStore::new()) as Arc<dyn RuntimeStore>;
+    let adapter = Arc::new(
+        MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store())
+            .expect("persistent machine"),
+    );
+    let session_id = SessionId::new();
+    let first_contributions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let first_hard_cancels = Arc::new(AtomicUsize::new(0));
+    adapter
+        .register_session_with_executor(
+            session_id.clone(),
+            Box::new(QuiescentCloseExecutor::ungated(
+                &first_contributions,
+                &first_hard_cancels,
+            )),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+    let registration = adapter
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("a registered runtime exposes its exact registration");
+
+    let settled = make_prompt("settled before the close");
+    let settled_id = settled.id().clone();
+    let (outcome, completion) = adapter
+        .accept_input_with_completion(&session_id, settled)
+        .await
+        .expect("input is admitted");
+    assert!(outcome.is_accepted());
+    await_successful_completion(completion, "the first input").await;
+
+    // Retained queued work makes the close busy; it then settles.
+    let queued = make_prompt("queued before the close");
+    let queued_id = queued.id().clone();
+    assert!(
+        adapter
+            .accept_input_without_wake(&session_id, queued)
+            .await
+            .expect("queued input is admitted")
+            .is_accepted()
+    );
+    assert_eq!(
+        adapter
+            .unregister_session_registration_until_terminal_if_quiescent(&registration)
+            .await
+            .expect("the quiescent close answers typed"),
+        RuntimeSessionQuiescentClose::Busy,
+        "a retained queued input is real work: the close answers busy"
+    );
+    let waking = make_prompt("wakes the queued input");
+    let waking_id = waking.id().clone();
+    let (outcome, completion) = adapter
+        .accept_input_with_completion(&session_id, waking)
+        .await
+        .expect("ingress stays open after busy");
+    assert!(outcome.is_accepted());
+    await_successful_completion(completion, "the waking input").await;
+    await_input_consumed(&adapter, &session_id, &queued_id).await;
+
+    assert_eq!(
+        quiescent_close_once_settled(&adapter, &registration).await,
+        RuntimeSessionQuiescentClose::Closed
+    );
+    assert!(!adapter.contains_session(&session_id).await);
+    let mut ran_before_close: Vec<InputId> = recorded_contributions(&first_contributions)
+        .into_iter()
+        .flatten()
+        .collect();
+    ran_before_close.sort_by_key(ToString::to_string);
+    let mut expected_before_close = vec![settled_id.clone(), queued_id.clone(), waking_id.clone()];
+    expected_before_close.sort_by_key(ToString::to_string);
+    assert_eq!(
+        ran_before_close, expected_before_close,
+        "each input ran exactly once before the close"
+    );
+    for input_id in [&settled_id, &queued_id, &waking_id] {
+        let state = <MeerkatMachine as SessionServiceRuntimeExt>::input_state(
+            &adapter,
+            &session_id,
+            input_id,
+        )
+        .await
+        .expect("durable input lookup after the close")
+        .expect("the settled input stays in durable history");
+        assert_eq!(
+            state.seed.terminal_outcome,
+            Some(crate::input_state::InputTerminalOutcome::Consumed)
+        );
+    }
+
+    // Same-SessionId resume on the same store.
+    let resumed_contributions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let resumed_hard_cancels = Arc::new(AtomicUsize::new(0));
+    adapter
+        .register_session_with_executor(
+            session_id.clone(),
+            Box::new(QuiescentCloseExecutor::ungated(
+                &resumed_contributions,
+                &resumed_hard_cancels,
+            )),
+        )
+        .await
+        .expect("the same SessionId resumes after a quiescent close");
+    let resumed = adapter
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("the resumed runtime exposes its exact registration");
+    assert_ne!(
+        resumed, registration,
+        "the resume is a new exact registration"
+    );
+    assert!(
+        !adapter.session_has_active_inputs(&session_id).await,
+        "no settled input is recovered as active work"
+    );
+
+    // The resumed owner serves exactly the fresh input.
+    let fresh = make_prompt("after the resume");
+    let fresh_id = fresh.id().clone();
+    let (outcome, completion) = adapter
+        .accept_input_with_completion(&session_id, fresh)
+        .await
+        .expect("the resumed owner admits new input");
+    assert!(outcome.is_accepted());
+    await_successful_completion(completion, "the fresh input after the resume").await;
+    assert_eq!(
+        recorded_contributions(&resumed_contributions),
+        vec![vec![fresh_id]],
+        "the resumed executor ran exactly the fresh input, no settled input"
+    );
+    assert_eq!(resumed_hard_cancels.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -15594,6 +17139,374 @@ async fn a_cancel_point_abandons_the_queued_input_and_spares_later_input() {
     );
 }
 
+/// The retirement cleanup that actually abandons a retired session's
+/// pending input tells the runless-terminal hint once, after that
+/// abandonment committed and its guards were released, and the abandoned
+/// terminal is readable. A mob stop request (a run-start hold) and entering
+/// retirement while the held runtime loop still owns the drain abandon
+/// nothing and tell nothing; a cleanup with nothing left to abandon tells
+/// nothing.
+#[tokio::test]
+async fn retirement_cleanup_tells_the_runless_terminal_hint_only_when_it_abandons() {
+    let machine = Arc::new(MeerkatMachine::ephemeral());
+    let (session_id, applies, _applied) = counting_executor_session(&machine).await;
+    let runtime_id = runtime_id_for_session(&session_id);
+    let tells = RunlessTerminalTells::install(&machine, &session_id).await;
+
+    machine
+        .hold_run_starts(&session_id, crate::RunStartHoldReason::MobStop)
+        .await
+        .expect("hold run starts");
+    let mut parks = machine.run_start_held_parks();
+    let input = make_prompt("pending at retirement");
+    let input_id = input.id().clone();
+    let (outcome, _completion) = machine
+        .accept_input_with_completion(&session_id, input)
+        .await
+        .expect("admit while held");
+    assert!(outcome.is_accepted(), "{outcome:?}");
+    tokio::time::timeout(Duration::from_secs(30), parks.wait_for(|parks| *parks >= 1))
+        .await
+        .expect("the runtime loop parks on the hold")
+        .expect("park signal");
+    assert_eq!(tells.total(), 0, "a stop request tells nothing");
+
+    crate::traits::RuntimeControlPlane::retire(machine.as_ref(), &runtime_id)
+        .await
+        .expect("retire while the held loop owns the drain");
+    assert_eq!(
+        tells.total(),
+        0,
+        "entering retirement abandons nothing and tells nothing"
+    );
+
+    let abandoned = tokio::time::timeout(
+        Duration::from_secs(30),
+        machine.abandon_retired_pending_inputs(&session_id, "retired cleanup"),
+    )
+    .await
+    .expect("the cleanup finishes")
+    .expect("retirement cleanup");
+    assert_eq!(abandoned, 1, "the pending input is abandoned");
+    // This session's held runtime loop takes M right after the cleanup
+    // releases it, so the gate cannot tell who holds it at the tell; the
+    // loop-free controls (queued cancel point, loop-less stop, unregister)
+    // pin the after-the-gate order.
+    assert_eq!(
+        tells.total(),
+        1,
+        "the cleanup that abandoned the input tells the host once"
+    );
+    let stored = machine
+        .input_state(&session_id, &input_id)
+        .await
+        .expect("read the abandoned input")
+        .expect("the abandoned input is retained");
+    assert_eq!(
+        stored.seed.terminal_outcome,
+        Some(crate::input_state::InputTerminalOutcome::Abandoned {
+            reason: crate::input_state::InputAbandonReason::Retired,
+        }),
+        "the abandoned terminal is readable"
+    );
+
+    let nothing = machine
+        .abandon_retired_pending_inputs(&session_id, "nothing left")
+        .await
+        .expect("retirement cleanup");
+    assert_eq!(nothing, 0);
+    assert_eq!(
+        tells.total(),
+        1,
+        "a cleanup that abandons nothing tells nothing"
+    );
+    assert_eq!(applies.load(Ordering::SeqCst), 0, "nothing ran");
+}
+
+/// A queued cancel point tells the inputs it abandoned once, after the
+/// driver lock and the session mutation gate it committed under were
+/// released; a cancel point that finds nothing queued tells nothing.
+#[tokio::test]
+async fn a_queued_cancel_point_tells_once_after_releasing_its_guards() {
+    let machine = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+    // No executor serves the session, so admitted inputs stay queued.
+    for text in ["queued first", "queued second"] {
+        let outcome = machine
+            .accept_input(&session_id, make_prompt(text))
+            .await
+            .expect("admit");
+        assert!(outcome.is_accepted(), "{outcome:?}");
+    }
+    let tells = RunlessTerminalTells::install(&machine, &session_id).await;
+
+    let cancel_point = machine
+        .abandon_queued_inputs_at_cancel_point(&session_id, "cancel point under test")
+        .await
+        .expect("cancel point")
+        .expect("registered session");
+    assert_eq!(cancel_point.queued_inputs.len(), 2);
+    tells.assert_told_once_after_the_gate("a queued cancel point");
+
+    let nothing = machine
+        .abandon_queued_inputs_at_cancel_point(&session_id, "nothing left to cancel")
+        .await
+        .expect("cancel point")
+        .expect("registered session");
+    assert!(nothing.queued_inputs.is_empty());
+    assert_eq!(
+        tells.total(),
+        1,
+        "a cancel point that abandons nothing tells nothing"
+    );
+}
+
+/// A runtime stop without a runtime loop tells the inputs its detached stop
+/// transaction terminalized once, after the session mutation gate was
+/// released.
+#[tokio::test]
+async fn a_loopless_runtime_stop_tells_its_terminalized_inputs_once_after_m() {
+    let machine = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+    let input = make_prompt("queued at the stop");
+    let input_id = input.id().clone();
+    assert!(
+        machine
+            .accept_input(&session_id, input)
+            .await
+            .expect("admit")
+            .is_accepted()
+    );
+    let tells = RunlessTerminalTells::install(&machine, &session_id).await;
+
+    machine
+        .stop_runtime_executor(&session_id, "operator stop")
+        .await
+        .expect("stop the loop-less runtime");
+    tells.wait_told().await;
+    tells.assert_told_once_after_the_gate("a loop-less runtime stop");
+    let stored = machine
+        .input_state(&session_id, &input_id)
+        .await
+        .expect("read the stopped input")
+        .expect("the stopped input is retained");
+    assert!(
+        stored.seed.terminal_outcome.is_some(),
+        "the stopped input's terminal is readable: {:?}",
+        stored.seed.terminal_outcome
+    );
+}
+
+/// An unregister without a live executor tells the inputs its stop
+/// terminalization abandoned once, after the session mutation gate was
+/// released; an unregister with nothing queued tells nothing.
+#[tokio::test]
+async fn an_unregister_without_a_live_executor_tells_its_terminalized_inputs_once_after_m() {
+    let machine = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+    assert!(
+        machine
+            .accept_input(&session_id, make_prompt("queued at the unregister"))
+            .await
+            .expect("admit")
+            .is_accepted()
+    );
+    let tells = RunlessTerminalTells::install(&machine, &session_id).await;
+    machine
+        .unregister_session(&session_id)
+        .await
+        .expect("unregister");
+    tells.wait_told().await;
+    tells.assert_told_once_after_the_gate("an unregister without a live executor");
+
+    let quiet = SessionId::new();
+    machine
+        .register_session(quiet.clone())
+        .await
+        .expect("register a session with nothing queued");
+    let quiet_tells = RunlessTerminalTells::install(&machine, &quiet).await;
+    machine
+        .unregister_session(&quiet)
+        .await
+        .expect("unregister the quiet session");
+    assert_eq!(
+        quiet_tells.total(),
+        0,
+        "an unregister with nothing queued tells nothing"
+    );
+}
+
+/// A queued cancel point whose caller is cancelled while its first SQLite
+/// write is entered still tells that write once SQLite commits it: the
+/// detached abandonment owns M and the announcement through the durable
+/// write, so dropping the caller cannot lose the notification of a write
+/// that commits after it. It is told once, after M was released, and the
+/// committed abandonment is the store's row.
+#[cfg(feature = "sqlite-store")]
+#[tokio::test]
+async fn a_cancelled_queued_cancel_point_tells_its_entered_sqlite_write_once_committed() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let sqlite = Arc::new(
+        crate::store::SqliteRuntimeStore::new(dir.path().join("runtime.sqlite3"))
+            .expect("SQLite runtime store"),
+    );
+    let store = Arc::clone(&sqlite) as Arc<dyn RuntimeStore>;
+    let machine = Arc::new(
+        MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store())
+            .expect("persistent machine"),
+    );
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+    // No executor serves the session, so the admitted input stays queued.
+    let input = make_prompt("queued, its abandonment write is entered");
+    let input_id = input.id().clone();
+    assert!(
+        machine
+            .accept_input(&session_id, input)
+            .await
+            .expect("admit")
+            .is_accepted()
+    );
+    let tells = RunlessTerminalTells::install(&machine, &session_id).await;
+
+    let entered = Arc::new(Notify::new());
+    let (release, release_rx) = std::sync::mpsc::channel();
+    sqlite.pause_machine_lifecycle_commit_of_input_for_test(
+        input_id.clone(),
+        Arc::clone(&entered),
+        release_rx,
+    );
+    let caller = tokio::spawn({
+        let machine = Arc::clone(&machine);
+        let session_id = session_id.clone();
+        async move {
+            machine
+                .abandon_queued_inputs_at_cancel_point(&session_id, "cancelled cancel point")
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .expect("the cancel point enters its first SQLite write");
+    caller.abort();
+    assert!(
+        matches!(caller.await, Err(error) if error.is_cancelled()),
+        "the caller is cancelled while its first write is entered"
+    );
+    assert_eq!(
+        tells.total(),
+        0,
+        "nothing is told before the entered write commits"
+    );
+    release
+        .send(())
+        .expect("the entered SQLite write waits for its release");
+
+    tells.wait_told().await;
+    tells.assert_told_once_after_the_gate("a cancelled queued cancel point");
+    let stored = store
+        .load_input_state(&runtime_id_for_session(&session_id), &input_id)
+        .await
+        .expect("read the abandoned input's row")
+        .expect("the abandoned input's row is stored");
+    assert_eq!(
+        stored.seed.terminal_outcome,
+        Some(crate::input_state::InputTerminalOutcome::Abandoned {
+            reason: crate::input_state::InputAbandonReason::Cancelled,
+        }),
+        "SQLite committed the write the cancelled caller entered"
+    );
+}
+
+/// A queued cancel point whose first queued input's abandonment commits and
+/// whose archival then fails, with no abandoned prefix before it, keeps that
+/// failure (the durability refusal) as its error and still tells once,
+/// after M: a conservative re-observation after a possibly committed
+/// transition, not proof of a committed terminal. The abandonment is the
+/// store's row.
+#[tokio::test]
+async fn a_queued_cancel_point_whose_first_archival_fails_keeps_the_error_and_tells_once() {
+    let store = Arc::new(crate::store::InMemoryRuntimeStore::new()) as Arc<dyn RuntimeStore>;
+    let machine = Arc::new(
+        MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store())
+            .expect("persistent machine"),
+    );
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+    // No executor serves the session, so the admitted input stays queued.
+    let input = make_prompt("queued first, its archival fails");
+    let input_id = input.id().clone();
+    assert!(
+        machine
+            .accept_input(&session_id, input)
+            .await
+            .expect("admit")
+            .is_accepted()
+    );
+    let tells = RunlessTerminalTells::install(&machine, &session_id).await;
+    {
+        let driver = {
+            let sessions = machine.sessions.read().await;
+            Arc::clone(&sessions.get(&session_id).expect("session").driver)
+        };
+        let mut guard = driver.lock().await;
+        let DriverEntry::Persistent(persistent) = &mut *guard else {
+            panic!("a persistent machine drives its sessions persistently");
+        };
+        persistent.force_queued_abandon_archive_failure_for_test = true;
+    }
+
+    let error = machine
+        .abandon_queued_inputs_at_cancel_point(&session_id, "cancel point whose archival fails")
+        .await
+        .expect_err("the failed archival is the cancel point's error");
+    assert!(
+        matches!(
+            &error,
+            RuntimeDriverError::RecoveryRepairBlocked { reason, .. }
+                if reason.contains("abandon_queued_input_archive")
+                    && reason.contains("forced terminal-input archive failure")
+        ),
+        "the archival's durability refusal is the error: {error:?}"
+    );
+    assert_eq!(
+        tells.total(),
+        1,
+        "the possibly committed abandonment is re-observed once although its archival failed"
+    );
+    tells.assert_told_once_after_the_gate("a queued cancel point whose first archival failed");
+    let stored = store
+        .load_input_state(&runtime_id_for_session(&session_id), &input_id)
+        .await
+        .expect("read the abandoned input's row")
+        .expect("the abandoned input's row is stored");
+    assert_eq!(
+        stored.seed.terminal_outcome,
+        Some(crate::input_state::InputTerminalOutcome::Abandoned {
+            reason: crate::input_state::InputAbandonReason::Cancelled,
+        }),
+        "the abandonment committed before its archival failed"
+    );
+}
+
 /// #1471: a boundary cancel taken after the runtime loop started a run but
 /// before the executor entered it (here: blocked at the top of `apply`) is not
 /// lost. The executor receives a cooperative cancel bound to that exact run
@@ -19965,9 +21878,10 @@ mod stop_under_gate_deadlock_class {
         }
     }
 
-    struct BlockingPostStopCleanupExecutor {
-        entered: Arc<Notify>,
-        release: Arc<Notify>,
+    /// Its post-stop cleanup notifies `entered`, then waits for `release`.
+    pub(super) struct BlockingPostStopCleanupExecutor {
+        pub(super) entered: Arc<Notify>,
+        pub(super) release: Arc<Notify>,
     }
 
     #[async_trait::async_trait]
@@ -20290,14 +22204,23 @@ mod stop_under_gate_deadlock_class {
             .await
             .expect("machine-managed cleanup stages Draining after first watcher sample");
 
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            machine.join_unregister_if_observed_runtime_loop_became_draining(
-                &session_id,
-                &observed_epoch,
-                &observed_teardown_slot,
-            ),
-        )
+        // The recheck hands the joined unregister back as a wait, which the
+        // watcher finishes holding the machine only weakly.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            machine
+                .join_unregister_if_observed_runtime_loop_became_draining(
+                    &session_id,
+                    &observed_epoch,
+                    &observed_teardown_slot,
+                )
+                .await?
+                .finish(
+                    &Arc::downgrade(&machine),
+                    &session_id,
+                    &observed_teardown_slot,
+                )
+                .await
+        })
         .await
         .expect("post-stop recheck must converge")
         .expect("post-stop recheck must join canonical unregister");
@@ -20992,6 +22915,407 @@ async fn wait_for_queued_boundary_cancel(calls: &AtomicUsize) {
     })
     .await
     .expect("the exact queued boundary-cancel effect should be applied");
+}
+
+/// #1471: an exact-run boundary cancel records the request in the run's
+/// machine-owned turn state under the same exact-run compare, so the agent
+/// that claims a run staged before it reached the executor sees the cancel
+/// at its first boundary even though no session-side receiver existed when
+/// the Stop was dispatched. A cancel for another run records nothing.
+#[tokio::test]
+async fn exact_run_boundary_cancel_records_the_request_in_the_run_turn_state() {
+    let mut race = install_boundary_cancel_callback_race(
+        Arc::new(
+            MeerkatMachine::persistent(
+                Arc::new(crate::store::InMemoryRuntimeStore::new()),
+                memory_blob_store(),
+            )
+            .expect("persistent machine"),
+        ),
+        SessionId::new(),
+        false,
+    )
+    .await;
+    let run_id = race
+        .adapter
+        .meerkat_machine_archive_snapshot(&race.session_id)
+        .await
+        .and_then(|snapshot| snapshot.control.current_run_id)
+        .expect("blocked executor should expose its exact current run");
+
+    assert!(
+        !race
+            .adapter
+            .cancel_after_boundary_run_if_current(&race.session_id, &RunId::new())
+            .await
+            .expect("a stale exact cancellation converges without dispatch"),
+        "a stale exact-run witness must not reach the current run"
+    );
+    assert!(
+        !race
+            .adapter
+            .session_dsl_state(&race.session_id)
+            .await
+            .expect("running session should retain DSL authority")
+            .cancel_after_boundary,
+        "another run's cancel records nothing in this run's turn state"
+    );
+
+    let exact_adapter = Arc::clone(&race.adapter);
+    let exact_session = race.session_id.clone();
+    let exact = tokio::spawn(async move {
+        exact_adapter
+            .cancel_after_boundary_run_if_current(&exact_session, &run_id)
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        race.callback_entered
+            .take()
+            .expect("race should expose its callback-entered receiver"),
+    )
+    .await
+    .expect("the exact cancellation reaches the live boundary handle")
+    .expect("boundary handle should retain the callback-entered signal");
+    race.callback_release
+        .take()
+        .expect("race should expose its callback release")
+        .send(())
+        .expect("live callback should still be waiting");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), exact)
+            .await
+            .expect("the exact cancellation completes")
+            .expect("exact cancellation task should not panic")
+            .expect("exact current-run cancellation should succeed"),
+        "the exact run is current"
+    );
+    assert!(
+        race.adapter
+            .session_dsl_state(&race.session_id)
+            .await
+            .expect("running session should retain DSL authority")
+            .cancel_after_boundary,
+        "the exact run's cancel is recorded in its machine-owned turn state"
+    );
+
+    race.first_apply_release
+        .take()
+        .expect("race should expose its first-apply release")
+        .send(())
+        .expect("first apply should still be blocked");
+}
+
+/// #1471: an exact-run boundary cancel for a current run whose turn already
+/// ended (terminal, not yet acknowledged) reports the run as ended
+/// (`Ok(false)`, which a mob Stop classifies `RunEndedBeforeCancel`), never a
+/// phantom cancel: it records nothing, leaves no dispatch outstanding and
+/// does not reach the live boundary handle.
+#[tokio::test]
+async fn exact_run_boundary_cancel_of_an_ended_turn_reports_it_ended() {
+    let mut race = install_boundary_cancel_callback_race(
+        Arc::new(
+            MeerkatMachine::persistent(
+                Arc::new(crate::store::InMemoryRuntimeStore::new()),
+                memory_blob_store(),
+            )
+            .expect("persistent machine"),
+        ),
+        SessionId::new(),
+        false,
+    )
+    .await;
+    let run_id = race
+        .adapter
+        .meerkat_machine_archive_snapshot(&race.session_id)
+        .await
+        .and_then(|snapshot| snapshot.control.current_run_id)
+        .expect("blocked executor should expose its exact current run");
+    for (input, context) in [
+        (
+            mm_dsl::MeerkatMachineInput::CancelNow {
+                run_id: mm_dsl::RunId::from_domain(&run_id),
+            },
+            "CancelNow(ended-turn fixture)",
+        ),
+        (
+            mm_dsl::MeerkatMachineInput::CancellationObserved {
+                run_id: mm_dsl::RunId::from_domain(&run_id),
+            },
+            "CancellationObserved(ended-turn fixture)",
+        ),
+    ] {
+        race.adapter
+            .apply_session_dsl_input(&race.session_id, input, context)
+            .await
+            .expect("the fixture ends the current run's turn");
+    }
+    let ended = race
+        .adapter
+        .session_dsl_state(&race.session_id)
+        .await
+        .expect("running session should retain DSL authority");
+    assert_eq!(ended.turn_phase, mm_dsl::TurnPhase::Cancelled);
+    assert_eq!(
+        ended.current_run_id,
+        Some(mm_dsl::RunId::from_domain(&run_id)),
+        "the ended run is still the machine's current run"
+    );
+
+    assert!(
+        !race
+            .adapter
+            .cancel_after_boundary_run_if_current(&race.session_id, &run_id)
+            .await
+            .expect("an ended turn's cancel converges"),
+        "a cancel for a run whose turn already ended reports it ended"
+    );
+    let after = race
+        .adapter
+        .session_dsl_state(&race.session_id)
+        .await
+        .expect("running session should retain DSL authority");
+    assert!(!after.cancel_after_boundary, "nothing is recorded");
+    assert!(
+        !after.boundary_cancel_dispatch_pending,
+        "no boundary-cancel dispatch is left outstanding"
+    );
+    assert_eq!(
+        race.handle_calls.load(Ordering::SeqCst),
+        0,
+        "the live boundary handle is not called"
+    );
+
+    race.first_apply_release
+        .take()
+        .expect("race should expose its first-apply release")
+        .send(())
+        .expect("first apply should still be blocked");
+}
+
+async fn persistent_boundary_cancel_race(
+    fail_first_callback: bool,
+) -> (BoundaryCancelCallbackRaceHarness, RunId) {
+    let race = install_boundary_cancel_callback_race(
+        Arc::new(
+            MeerkatMachine::persistent(
+                Arc::new(crate::store::InMemoryRuntimeStore::new()),
+                memory_blob_store(),
+            )
+            .expect("persistent machine"),
+        ),
+        SessionId::new(),
+        fail_first_callback,
+    )
+    .await;
+    let run_id = race
+        .adapter
+        .meerkat_machine_archive_snapshot(&race.session_id)
+        .await
+        .and_then(|snapshot| snapshot.control.current_run_id)
+        .expect("blocked executor should expose its exact current run");
+    (race, run_id)
+}
+
+async fn release_boundary_cancel_callback(race: &mut BoundaryCancelCallbackRaceHarness) {
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        race.callback_entered
+            .take()
+            .expect("race should expose its callback-entered receiver"),
+    )
+    .await
+    .expect("the cancel reaches the live boundary handle")
+    .expect("boundary handle should retain the callback-entered signal");
+    race.callback_release
+        .take()
+        .expect("race should expose its callback release")
+        .send(())
+        .expect("live callback should still be waiting");
+}
+
+/// #1471: the supported raw Retired recovery shape with the exact current run
+/// records the run's cancel in the same generated transition that admits its
+/// dispatch, as the Running shape does.
+#[tokio::test]
+async fn exact_run_boundary_cancel_records_the_request_for_a_retired_current_run() {
+    let (mut race, run_id) = persistent_boundary_cancel_race(false).await;
+    {
+        let sessions = race.adapter.sessions.read().await;
+        let entry = sessions
+            .get(&race.session_id)
+            .expect("the attachment is registered");
+        let mut state = entry
+            .dsl_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state()
+            .clone();
+        // Legacy or partially persisted Retired+current-run recovery shape.
+        state.lifecycle_phase = mm_dsl::MeerkatPhase::Retired;
+        state.pre_run_phase = Some(mm_dsl::PreRunPhase::Retired);
+        *entry
+            .dsl_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            crate::meerkat_machine::recover_projected_authority(
+                state,
+                "retired current-run recovery shape must recover",
+            );
+    }
+
+    let exact_adapter = Arc::clone(&race.adapter);
+    let exact_session = race.session_id.clone();
+    let exact_run = run_id.clone();
+    let exact = tokio::spawn(async move {
+        exact_adapter
+            .cancel_after_boundary_run_if_current(&exact_session, &exact_run)
+            .await
+    });
+    release_boundary_cancel_callback(&mut race).await;
+    let result = tokio::time::timeout(Duration::from_secs(1), exact)
+        .await
+        .expect("the exact cancellation completes")
+        .expect("exact cancellation task should not panic");
+    assert!(
+        matches!(result, Ok(true)),
+        "the retired current run's cancel is accepted: {result:?}"
+    );
+    let state = race
+        .adapter
+        .session_dsl_state(&race.session_id)
+        .await
+        .expect("retired session should retain DSL authority");
+    assert_eq!(state.lifecycle_phase, mm_dsl::MeerkatPhase::Retired);
+    assert!(
+        state.cancel_after_boundary,
+        "the retired current run's cancel is recorded in its turn state"
+    );
+
+    race.first_apply_release
+        .take()
+        .expect("race should expose its first-apply release")
+        .send(())
+        .expect("first apply should still be blocked");
+}
+
+/// An exact-run cancel that finds an ambient boundary-cancel dispatch still
+/// outstanding (and possibly undelivered) joins it and records the run's
+/// cancel itself; the ambient request alone records nothing.
+#[tokio::test]
+async fn exact_run_boundary_cancel_joining_a_pending_dispatch_records_the_request() {
+    let (mut race, run_id) = persistent_boundary_cancel_race(false).await;
+    let ambient_adapter = Arc::clone(&race.adapter);
+    let ambient_session = race.session_id.clone();
+    let ambient = tokio::spawn(async move {
+        ambient_adapter
+            .cancel_after_boundary(&ambient_session)
+            .await
+    });
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        race.callback_entered
+            .take()
+            .expect("race should expose its callback-entered receiver"),
+    )
+    .await
+    .expect("the ambient cancel reaches the live boundary handle")
+    .expect("boundary handle should retain the callback-entered signal");
+    let pending = race
+        .adapter
+        .session_dsl_state(&race.session_id)
+        .await
+        .expect("running session should retain DSL authority");
+    assert!(pending.boundary_cancel_dispatch_pending);
+    assert!(
+        !pending.cancel_after_boundary,
+        "an ambient cancel records no run's turn cancel"
+    );
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            race.adapter
+                .cancel_after_boundary_run_if_current(&race.session_id, &run_id),
+        )
+        .await
+        .expect("joining a pending dispatch does not wait for it")
+        .expect("the exact cancel joins the pending dispatch"),
+        "the exact run is current"
+    );
+    assert!(
+        race.adapter
+            .session_dsl_state(&race.session_id)
+            .await
+            .expect("running session should retain DSL authority")
+            .cancel_after_boundary,
+        "the joining exact cancel records the run's turn cancel"
+    );
+
+    race.callback_release
+        .take()
+        .expect("race should expose its callback release")
+        .send(())
+        .expect("live callback should still be waiting");
+    tokio::time::timeout(Duration::from_secs(1), ambient)
+        .await
+        .expect("the ambient cancel completes")
+        .expect("ambient cancellation task should not panic")
+        .expect("the ambient cancel succeeds");
+    race.first_apply_release
+        .take()
+        .expect("race should expose its first-apply release")
+        .send(())
+        .expect("first apply should still be blocked");
+}
+
+/// A live-delivery failure after the exact-run cancel was accepted withdraws
+/// only the dispatch: the run's recorded cancel stays, and the typed result
+/// says the outcome is owned by that recorded cancel rather than claiming the
+/// run ended before it.
+#[tokio::test]
+async fn exact_run_boundary_cancel_delivery_failure_keeps_the_recorded_cancel() {
+    let (mut race, run_id) = persistent_boundary_cancel_race(true).await;
+    let exact_adapter = Arc::clone(&race.adapter);
+    let exact_session = race.session_id.clone();
+    let exact_run = run_id.clone();
+    let exact = tokio::spawn(async move {
+        exact_adapter
+            .cancel_after_boundary_run_if_current(&exact_session, &exact_run)
+            .await
+    });
+    release_boundary_cancel_callback(&mut race).await;
+    let result = tokio::time::timeout(Duration::from_secs(1), exact)
+        .await
+        .expect("the exact cancellation completes")
+        .expect("exact cancellation task should not panic");
+    assert!(
+        matches!(
+            &result,
+            Err(RuntimeDriverError::InterruptDispatchOutcomeUnknown { run_id: failed, .. })
+                if failed == &run_id
+        ),
+        "a failed delivery of an accepted cancel is outcome-unknown for that run: {result:?}"
+    );
+    let state = race
+        .adapter
+        .session_dsl_state(&race.session_id)
+        .await
+        .expect("running session should retain DSL authority");
+    assert!(
+        state.cancel_after_boundary,
+        "the dispatch compensation never erases the accepted cancel"
+    );
+    assert!(
+        !state.boundary_cancel_dispatch_pending,
+        "the failed dispatch is withdrawn"
+    );
+
+    race.first_apply_release
+        .take()
+        .expect("race should expose its first-apply release")
+        .send(())
+        .expect("first apply should still be blocked");
 }
 
 /// Retirement may open the unregister drain after admitting an input but
@@ -23304,6 +25628,8 @@ async fn assert_faulted_boundary_terminalizes_exact_input() {
     let rig = InterruptYieldingTestRig::new(true, result).await;
     rig.start_busy_turn().await;
     let probe = rig.probe.clone().expect("live boundary probe installed");
+    let (hint, runless_terminal_tells, _told) = counting_runless_terminal_hint();
+    rig.adapter.set_runless_input_terminal_hint(hint);
 
     let (peer_input, peer_id) = interrupt_yielding_peer_input(
         "failed exact boundary must not fall back",
@@ -23336,6 +25662,11 @@ async fn assert_faulted_boundary_terminalizes_exact_input() {
         }
         other => panic!("faulted boundary should terminalize exact input, got {other:?}"),
     }
+    assert_eq!(
+        runless_terminal_tells.load(Ordering::SeqCst),
+        1,
+        "the failed admission's abandoned input is told to the host once"
+    );
     probe.wait_for_prepare_calls(1).await;
 
     let during_busy = rig
@@ -31342,9 +33673,14 @@ async fn prepare_live_run_for_authority_test(
         machine_authorize_runtime_loop_batch(&entry).expect("accepted input should authorize batch")
     };
     assert_eq!(batch.input_ids(), std::slice::from_ref(&input_id));
-    let outcome = prepare_runtime_loop_batch_start(&driver, run_id.clone(), batch)
-        .await
-        .expect("run prepare should stage the accepted input");
+    let outcome = prepare_runtime_loop_batch_start(
+        &driver,
+        run_id.clone(),
+        batch,
+        crate::meerkat_machine::RunlessTerminalAnnouncement::default(),
+    )
+    .await
+    .expect("run prepare should stage the accepted input");
     // A refusal is a typed `Ok` outcome now, so the fixture must assert it
     // actually staged: silently proceeding with nothing staged would make the
     // expect message above a lie for every test built on this fixture.
@@ -31739,9 +34075,14 @@ async fn staged_batch_commit_driver(
             .expect("accepted inputs should authorize batch")
     };
     assert_eq!(batch.input_ids(), staged_ids.as_slice());
-    let outcome = prepare_runtime_loop_batch_start(&driver, run_id.clone(), batch)
-        .await
-        .expect("batch prepare should stage both inputs");
+    let outcome = prepare_runtime_loop_batch_start(
+        &driver,
+        run_id.clone(),
+        batch,
+        crate::meerkat_machine::RunlessTerminalAnnouncement::default(),
+    )
+    .await
+    .expect("batch prepare should stage both inputs");
     assert!(
         matches!(
             outcome,
@@ -34545,6 +36886,13 @@ struct RecordingPostCommitHookEngine {
 
 #[async_trait::async_trait]
 impl meerkat_core::HookEngine for RecordingPostCommitHookEngine {
+    fn mandatory_topology(
+        &self,
+        _overrides: Option<&meerkat_core::HookRunOverrides>,
+    ) -> Result<meerkat_core::HookMandatoryTopology, meerkat_core::HookEngineError> {
+        Ok(meerkat_core::HookMandatoryTopology::none())
+    }
+
     async fn execute(
         &self,
         invocation: meerkat_core::HookInvocation,
@@ -35279,6 +37627,7 @@ fn callback_tool_provenance(source_id: &str) -> meerkat_core::ToolProvenance {
     meerkat_core::ToolProvenance {
         kind: meerkat_core::ToolSourceKind::Callback,
         source_id: source_id.to_string().into(),
+        artifact: None,
     }
 }
 
@@ -35644,6 +37993,7 @@ async fn request_deferred_tools_rejects_public_authority_mismatched_with_visible
                     last_seen_provenance: Some(meerkat_core::ToolProvenance {
                         kind: meerkat_core::ToolSourceKind::Callback,
                         source_id: "forged".into(),
+                        artifact: None,
                     }),
                 },
             )],
@@ -37554,6 +39904,7 @@ fn request_deferred_tools_accepts_provenance_only_dsl_authority_witness() {
         last_seen_provenance: Some(meerkat_core::ToolProvenance {
             kind: meerkat_core::ToolSourceKind::Callback,
             source_id: "test".into(),
+            artifact: None,
         }),
     });
     let witnesses: BTreeMap<meerkat_core::ToolName, mm_dsl::ToolVisibilityWitness> =
@@ -38984,6 +41335,531 @@ async fn recovered_predecessor_inputs_are_silently_abandoned_before_attachment_s
         .unregister_executor_attachment_if_current(&witness)
         .await
         .expect("clean replacement attachment");
+}
+
+/// Counts a machine's runless-terminal tells, apart by whether the session's
+/// mutation gate was free when told. Install it before the step that takes
+/// the announcement: an announcement tells the hint that was installed when
+/// it was taken.
+struct RunlessTerminalTells {
+    gate: Arc<tokio::sync::Mutex<()>>,
+    with_gate_free: Arc<AtomicUsize>,
+    under_gate: Arc<AtomicUsize>,
+    told: Arc<Notify>,
+}
+
+impl RunlessTerminalTells {
+    async fn install(machine: &MeerkatMachine, session_id: &SessionId) -> Self {
+        let gate = machine
+            .session_mutation_gate(session_id)
+            .await
+            .expect("session mutation gate");
+        let with_gate_free = Arc::new(AtomicUsize::new(0));
+        let under_gate = Arc::new(AtomicUsize::new(0));
+        let told = Arc::new(Notify::new());
+        machine.set_runless_input_terminal_hint(Arc::new({
+            let gate = Arc::clone(&gate);
+            let with_gate_free = Arc::clone(&with_gate_free);
+            let under_gate = Arc::clone(&under_gate);
+            let told = Arc::clone(&told);
+            move || {
+                if gate.try_lock().is_ok() {
+                    with_gate_free.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    under_gate.fetch_add(1, Ordering::SeqCst);
+                }
+                told.notify_one();
+            }
+        }));
+        Self {
+            gate,
+            with_gate_free,
+            under_gate,
+            told,
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.with_gate_free.load(Ordering::SeqCst) + self.under_gate.load(Ordering::SeqCst)
+    }
+
+    /// Whether some owner holds the session's mutation gate right now.
+    fn gate_is_held(&self) -> bool {
+        self.gate.try_lock().is_err()
+    }
+
+    async fn wait_told(&self) {
+        tokio::time::timeout(Duration::from_secs(10), self.told.notified())
+            .await
+            .expect("the owed runless terminal must be told");
+    }
+
+    fn assert_told_once_after_the_gate(&self, what: &str) {
+        assert_eq!(
+            self.under_gate.load(Ordering::SeqCst),
+            0,
+            "{what}: told while M was held"
+        );
+        assert_eq!(
+            self.with_gate_free.load(Ordering::SeqCst),
+            1,
+            "{what}: told once after M was released"
+        );
+    }
+
+    /// Whether, once `what`'s teardown is held in its post-stop cleanup, M
+    /// is free and the owed terminal has been told exactly once, after M. A
+    /// miss is returned, not panicked on, so that the caller can release the
+    /// cleanup and join the teardown before it fails.
+    async fn observe_told_once_while_cleanup_is_held(
+        &self,
+        cleanup_entered: &Notify,
+        what: &str,
+    ) -> Result<(), String> {
+        if tokio::time::timeout(Duration::from_secs(5), cleanup_entered.notified())
+            .await
+            .is_err()
+        {
+            return Err(format!(
+                "{what}: the teardown reaches its post-stop cleanup"
+            ));
+        }
+        if self.gate_is_held() {
+            return Err(format!(
+                "{what}: M is free while the post-stop cleanup is held"
+            ));
+        }
+        if tokio::time::timeout(Duration::from_secs(5), self.told.notified())
+            .await
+            .is_err()
+        {
+            return Err(format!(
+                "{what}: told while the teardown's post-stop cleanup is held"
+            ));
+        }
+        let under_gate = self.under_gate.load(Ordering::SeqCst);
+        let with_gate_free = self.with_gate_free.load(Ordering::SeqCst);
+        if under_gate != 0 || with_gate_free != 1 {
+            return Err(format!(
+                "{what}: told once after M while the post-stop cleanup is held, \
+                 not {with_gate_free} after M and {under_gate} under M"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// An executor whose post-stop cleanup holds its teardown until released,
+/// with the cleanup's `entered` and `release` signals.
+fn cleanup_holding_executor() -> (Box<dyn CoreExecutor>, Arc<Notify>, Arc<Notify>) {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let executor: Box<dyn CoreExecutor> = Box::new(
+        stop_under_gate_deadlock_class::BlockingPostStopCleanupExecutor {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        },
+    );
+    (executor, entered, release)
+}
+
+/// A session with one queued input and a pending replacement attachment,
+/// built with `executor`, that inherits it as a predecessor's. The tells are
+/// installed before the attachment takes its announcement.
+async fn predecessor_input_with_pending_attachment(
+    label: &str,
+    executor: Box<dyn CoreExecutor>,
+) -> (
+    Arc<MeerkatMachine>,
+    SessionId,
+    InputId,
+    RunlessTerminalTells,
+    PendingRuntimeExecutorAttachment,
+) {
+    let machine = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register predecessor fixture");
+    let tells = RunlessTerminalTells::install(&machine, &session_id).await;
+    let (accepted, _waiter) = machine
+        .accept_input_with_completion(&session_id, make_prompt(label))
+        .await
+        .expect("queue predecessor input");
+    let AcceptOutcome::Accepted { input_id, .. } = accepted else {
+        panic!("expected a fresh predecessor input, got {accepted:?}");
+    };
+    let pending = match machine
+        .ensure_session_with_executor_factory(session_id.clone(), move |_| executor)
+        .await
+        .expect("prepare replacement attachment")
+    {
+        EnsureRuntimeExecutorAttachment::Pending(pending) => pending,
+        EnsureRuntimeExecutorAttachment::Existing(witness) => {
+            panic!("replacement fixture unexpectedly found {witness:?}")
+        }
+    };
+    (machine, session_id, input_id, tells, pending)
+}
+
+#[tokio::test]
+async fn recovered_predecessor_abandonment_is_told_once_its_lease_releases_m() {
+    let (machine, session_id, input_id, tells, mut pending) =
+        predecessor_input_with_pending_attachment(
+            "recovered predecessor told after M",
+            Box::new(ColdTerminalRecoveryExecutor),
+        )
+        .await;
+    let mut publication = pending
+        .try_commit_with_retained_publication_lease_under_runtime_turn_finalization_boundary()
+        .await
+        .expect("retain replacement publication boundary");
+    assert_eq!(
+        publication
+            .abandon_recovered_predecessor_inputs()
+            .await
+            .expect("silently abandon predecessor request"),
+        1
+    );
+    assert_eq!(
+        tells.total(),
+        0,
+        "nothing is told while the lease retains M"
+    );
+    let witness = publication
+        .commit_with(|_| Ok(()))
+        .await
+        .expect("publish replacement after predecessor abandonment");
+    tells.assert_told_once_after_the_gate("recovered predecessor abandonment");
+    let stored = machine
+        .input_state(&session_id, &input_id)
+        .await
+        .expect("read abandoned predecessor input")
+        .expect("predecessor input remains inspectable");
+    assert_eq!(
+        stored.seed.phase,
+        crate::input_state::InputLifecycleState::Abandoned
+    );
+    machine
+        .unregister_executor_attachment_if_current(&witness)
+        .await
+        .expect("clean replacement attachment");
+}
+
+#[tokio::test]
+async fn a_replacing_commit_tells_its_predecessor_terminals_once_after_releasing_m() {
+    let (machine, session_id, input_id, tells, pending) =
+        predecessor_input_with_pending_attachment(
+            "replaced predecessor told after M",
+            Box::new(ColdTerminalRecoveryExecutor),
+        )
+        .await;
+    let witness = pending
+        .commit_replacing_predecessor()
+        .await
+        .expect("commit the replacement attachment");
+    tells.assert_told_once_after_the_gate("predecessor replacement");
+    let stored = machine
+        .input_state(&session_id, &input_id)
+        .await
+        .expect("read replaced predecessor input")
+        .expect("predecessor input remains inspectable");
+    assert!(matches!(
+        stored.seed.terminal_outcome,
+        Some(crate::input_state::InputTerminalOutcome::Abandoned {
+            reason: crate::input_state::InputAbandonReason::Cancelled,
+        })
+    ));
+    machine
+        .unregister_executor_attachment_if_current(&witness)
+        .await
+        .expect("clean replacement attachment");
+}
+
+/// A pending replacement whose publication was rejected after it abandoned
+/// its predecessor's input, so it owes that terminal under its retained M.
+async fn rejected_replacement_owing_its_predecessor_terminal(
+    label: &str,
+    executor: Box<dyn CoreExecutor>,
+) -> (
+    Arc<MeerkatMachine>,
+    RunlessTerminalTells,
+    PendingRuntimeExecutorAttachment,
+) {
+    let (machine, _session_id, _input_id, tells, mut pending) =
+        predecessor_input_with_pending_attachment(label, executor).await;
+    let rejected = pending
+        .try_commit_with_under_runtime_turn_finalization_boundary(true, |_| {
+            Err(RuntimeDriverError::Internal(
+                "synthetic replacement publication rejection".to_string(),
+            ))
+        })
+        .await;
+    assert!(rejected.is_err(), "the rejected replacement must not serve");
+    assert_eq!(
+        tells.total(),
+        0,
+        "nothing is told while the pending attachment retains M"
+    );
+    (machine, tells, pending)
+}
+
+/// The detached cleanup that M moves into reads the session table before it
+/// releases M; holding the table's write side keeps it there.
+#[tokio::test]
+async fn a_dropped_pending_attachment_tells_after_its_detached_abort_releases_m() {
+    let (machine, tells, pending) = rejected_replacement_owing_its_predecessor_terminal(
+        "dropped pending owes",
+        Box::new(ColdTerminalRecoveryExecutor),
+    )
+    .await;
+    let held_cleanup = machine.sessions.write().await;
+    drop(pending);
+    assert!(tells.gate_is_held(), "the detached abort owns M");
+    assert_eq!(
+        tells.total(),
+        0,
+        "nothing is told while the detached abort holds M"
+    );
+    drop(held_cleanup);
+    tells.wait_told().await;
+    tells.assert_told_once_after_the_gate("dropped pending attachment");
+}
+
+#[tokio::test]
+async fn a_cancelled_pending_abort_tells_after_its_detached_abort_releases_m() {
+    let (machine, tells, pending) = rejected_replacement_owing_its_predecessor_terminal(
+        "cancelled abort owes",
+        Box::new(ColdTerminalRecoveryExecutor),
+    )
+    .await;
+    let held_cleanup = machine.sessions.write().await;
+    let mut abort = Box::pin(pending.abort());
+    let parked =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(abort.as_mut().poll(cx).is_pending()))
+            .await;
+    assert!(parked, "the abort awaits its detached saga");
+    drop(abort);
+    assert!(tells.gate_is_held(), "the detached abort owns M");
+    assert_eq!(
+        tells.total(),
+        0,
+        "a cancelled caller tells nothing while the detached abort holds M"
+    );
+    drop(held_cleanup);
+    tells.wait_told().await;
+    tells.assert_told_once_after_the_gate("cancelled pending abort");
+}
+
+/// A retained publication lease that owes its recovered predecessor's
+/// abandoned input under M.
+async fn publication_lease_owing_its_recovered_predecessor(
+    label: &str,
+    executor: Box<dyn CoreExecutor>,
+) -> (
+    Arc<MeerkatMachine>,
+    RunlessTerminalTells,
+    CommittedRuntimeExecutorAttachmentPublicationLease,
+) {
+    let (machine, _session_id, _input_id, tells, mut pending) =
+        predecessor_input_with_pending_attachment(label, executor).await;
+    let mut publication = pending
+        .try_commit_with_retained_publication_lease_under_runtime_turn_finalization_boundary()
+        .await
+        .expect("retain the replacement's publication boundary");
+    assert_eq!(
+        publication
+            .abandon_recovered_predecessor_inputs()
+            .await
+            .expect("abandon the predecessor's input"),
+        1
+    );
+    assert_eq!(
+        tells.total(),
+        0,
+        "nothing is told while the lease retains M"
+    );
+    (machine, tells, publication)
+}
+
+#[tokio::test]
+async fn a_lease_begin_abort_tells_after_its_detached_retirement_releases_m() {
+    let (machine, tells, publication) = publication_lease_owing_its_recovered_predecessor(
+        "begin_abort owes",
+        Box::new(ColdTerminalRecoveryExecutor),
+    )
+    .await;
+    let held_cleanup = machine.sessions.write().await;
+    let retirement = publication
+        .begin_abort()
+        .expect("hand the lease's M to its retirement");
+    assert!(tells.gate_is_held(), "the detached retirement owns M");
+    assert_eq!(
+        tells.total(),
+        0,
+        "nothing is told while the detached retirement holds M"
+    );
+    drop(held_cleanup);
+    retirement
+        .wait()
+        .await
+        .expect("retire the lease's attachment");
+    tells.wait_told().await;
+    tells.assert_told_once_after_the_gate("lease begin_abort");
+}
+
+#[tokio::test]
+async fn a_dropped_publication_lease_tells_after_its_detached_retirement_releases_m() {
+    let (machine, tells, publication) = publication_lease_owing_its_recovered_predecessor(
+        "dropped lease owes",
+        Box::new(ColdTerminalRecoveryExecutor),
+    )
+    .await;
+    let held_cleanup = machine.sessions.write().await;
+    drop(publication);
+    assert!(tells.gate_is_held(), "the detached retirement owns M");
+    assert_eq!(
+        tells.total(),
+        0,
+        "nothing is told while the detached retirement holds M"
+    );
+    drop(held_cleanup);
+    tells.wait_told().await;
+    tells.assert_told_once_after_the_gate("dropped publication lease");
+}
+
+/// The detached abort tells once it has released M, not after the teardown
+/// it then awaits: held in post-stop cleanup, that teardown does not delay
+/// the tell, and its end tells nothing more.
+#[tokio::test]
+async fn a_pending_abort_tells_while_its_teardown_cleanup_is_held() {
+    let (executor, cleanup_entered, cleanup_release) = cleanup_holding_executor();
+    let (_machine, tells, pending) = rejected_replacement_owing_its_predecessor_terminal(
+        "abort tells before its cleanup ends",
+        executor,
+    )
+    .await;
+    let abort = pending
+        .abort_under_runtime_turn_finalization_boundary_with_completion()
+        .expect("hand the pending attachment's M to its abort");
+    let held = tells
+        .observe_told_once_while_cleanup_is_held(&cleanup_entered, "pending abort")
+        .await;
+    // Release and join before failing, so no teardown stays held.
+    cleanup_release.notify_one();
+    let ended = tokio::time::timeout(Duration::from_secs(5), abort.wait()).await;
+    if let Err(miss) = held {
+        panic!("{miss}");
+    }
+    ended
+        .expect("the abort ends once its cleanup is released")
+        .expect("abort the pending attachment");
+    assert_eq!(
+        tells.total(),
+        1,
+        "pending abort: nothing more is told once its cleanup ends"
+    );
+}
+
+#[tokio::test]
+async fn a_lease_retirement_tells_while_its_teardown_cleanup_is_held() {
+    let (executor, cleanup_entered, cleanup_release) = cleanup_holding_executor();
+    let (_machine, tells, publication) = publication_lease_owing_its_recovered_predecessor(
+        "retirement tells before its cleanup ends",
+        executor,
+    )
+    .await;
+    let retirement = publication
+        .begin_abort()
+        .expect("hand the lease's M to its retirement");
+    let held = tells
+        .observe_told_once_while_cleanup_is_held(&cleanup_entered, "lease begin_abort")
+        .await;
+    // Release and join before failing, so no teardown stays held.
+    cleanup_release.notify_one();
+    let ended = tokio::time::timeout(Duration::from_secs(5), retirement.wait()).await;
+    if let Err(miss) = held {
+        panic!("{miss}");
+    }
+    ended
+        .expect("the retirement ends once its cleanup is released")
+        .expect("retire the lease's attachment");
+    assert_eq!(
+        tells.total(),
+        1,
+        "lease begin_abort: nothing more is told once its cleanup ends"
+    );
+}
+
+/// A progress input that coalesces with the queued one before it.
+fn coalescing_progress_input(label: &str) -> Input {
+    let mut input = make_progress_input(label);
+    if let Input::Peer(peer) = &mut input {
+        peer.header.durability = crate::input::InputDurability::Durable;
+        peer.header.supersession_key =
+            Some(crate::identifiers::SupersessionKey::new("same-window"));
+    }
+    input
+}
+
+#[tokio::test]
+async fn a_coalescing_admission_tells_after_its_boundary_work_releases_m() {
+    let machine = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+    let tells = RunlessTerminalTells::install(&machine, &session_id).await;
+    assert!(
+        <MeerkatMachine as SessionServiceRuntimeExt>::accept_input(
+            &machine,
+            &session_id,
+            coalescing_progress_input("first"),
+        )
+        .await
+        .expect("queue the first progress input")
+        .is_accepted()
+    );
+    // The first admission's boundary work owns M until it is done.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while tells.gate_is_held() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the first admission's boundary work releases M");
+    assert_eq!(tells.total(), 0, "the first admission displaces nothing");
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    *machine
+        .test_accepted_boundary_work_hold
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((entered_tx, release_rx));
+    assert!(
+        <MeerkatMachine as SessionServiceRuntimeExt>::accept_input(
+            &machine,
+            &session_id,
+            coalescing_progress_input("second"),
+        )
+        .await
+        .expect("coalesce the queued progress input")
+        .is_accepted()
+    );
+    entered_rx
+        .await
+        .expect("the second admission's boundary work holds M");
+    assert!(tells.gate_is_held(), "the boundary work owns M");
+    assert_eq!(
+        tells.total(),
+        0,
+        "nothing is told while the boundary work holds M"
+    );
+    release_tx.send(()).expect("release the boundary work");
+    tells.wait_told().await;
+    tells.assert_told_once_after_the_gate("coalescing admission");
 }
 
 #[tokio::test]
@@ -40503,7 +43379,7 @@ async fn stale_unserved_teardown_slot_cannot_unregister_same_epoch_attachment() 
     // changing the registration epoch.  The watcher carries a real slot
     // identity, but it is no longer the entry's exact current slot.
     let stale_slot = crate::runtime_loop::RuntimeLoopTeardownSlot::pending();
-    machine
+    let observed = machine
         .observe_runtime_loop_teardown(
             &session_id,
             stale_slot,
@@ -40511,6 +43387,13 @@ async fn stale_unserved_teardown_slot_cannot_unregister_same_epoch_attachment() 
         )
         .await
         .expect("stale unserved watcher must be an idempotent no-op");
+    assert!(
+        matches!(
+            observed,
+            super::session_management::RuntimeLoopTeardownWait::Settled
+        ),
+        "a stale watcher joins nothing it would still wait for"
+    );
 
     let still_current = machine
         .current_executor_attachment_witness(&session_id)
@@ -43722,6 +46605,7 @@ fn runtime_modeled_tool_visibility_witness_inner_from_json(
                     Some(meerkat_core::ToolProvenance {
                         kind,
                         source_id: source_id.to_string().into(),
+                        artifact: None,
                     })
                 });
             runtime_modeled_tool_visibility_witness_inner_from_domain(
@@ -44242,6 +47126,7 @@ fn runtime_parity_witnesses()
             last_seen_provenance: Some(meerkat_core::ToolProvenance {
                 kind: meerkat_core::ToolSourceKind::Callback,
                 source_id: "runtime-parity".into(),
+                artifact: None,
             }),
         },
     )]
@@ -44843,6 +47728,7 @@ async fn prepare_runtime_loop_batch_start_unwinds_run_state_when_staging_rejects
         &driver,
         RunId::new(),
         crate::meerkat_machine::driver::test_authorized_runtime_loop_batch(vec![InputId::new()]),
+        crate::meerkat_machine::RunlessTerminalAnnouncement::default(),
     )
     .await
     .expect("staging refusal is a typed outcome, not a loop failure");
@@ -44954,6 +47840,7 @@ async fn drive_stage_refusal_to_terminal(driver: &SharedDriver, input_id: &Input
                 input_id.clone(),
                 InputId::new(),
             ]),
+            crate::meerkat_machine::RunlessTerminalAnnouncement::default(),
         )
         .await
         .expect("staging refusal remains a typed non-fatal outcome");
@@ -44969,6 +47856,178 @@ async fn drive_stage_refusal_to_terminal(driver: &SharedDriver, input_id: &Input
         }
     }
     panic!("generated staging-attempt cap did not terminalize the input");
+}
+
+/// A runless-terminal hint that counts its tells and wakes one waiter per
+/// tell.
+fn counting_runless_terminal_hint() -> (RunlessInputTerminalHint, Arc<AtomicUsize>, Arc<Notify>) {
+    let tells = Arc::new(AtomicUsize::new(0));
+    let told = Arc::new(Notify::new());
+    let hint: RunlessInputTerminalHint = Arc::new({
+        let tells = Arc::clone(&tells);
+        let told = Arc::clone(&told);
+        move || {
+            tells.fetch_add(1, Ordering::SeqCst);
+            told.notify_one();
+        }
+    });
+    (hint, tells, told)
+}
+
+fn runless_terminal_announcement_telling(
+    hint: &RunlessInputTerminalHint,
+) -> RunlessTerminalAnnouncement {
+    RunlessTerminalAnnouncement {
+        hint: Some(Arc::clone(hint)),
+        owed: false,
+    }
+}
+
+async fn accept_stage_refusal_input(driver: &SharedDriver, text: &str) -> InputId {
+    let (input, input_id) = interrupt_yielding_peer_input(text, None);
+    assert!(
+        driver
+            .lock()
+            .await
+            .as_driver_mut()
+            .accept_input(input)
+            .await
+            .expect("input admission")
+            .is_accepted()
+    );
+    input_id
+}
+
+/// One refused stage of `input_id`'s batch; the inputs it terminalized.
+async fn refuse_stage_once(
+    driver: &SharedDriver,
+    input_id: &InputId,
+    runless_terminal: RunlessTerminalAnnouncement,
+) -> Vec<InputId> {
+    let outcome = prepare_runtime_loop_batch_start(
+        driver,
+        RunId::new(),
+        crate::meerkat_machine::driver::test_authorized_runtime_loop_batch(vec![
+            input_id.clone(),
+            InputId::new(),
+        ]),
+        runless_terminal,
+    )
+    .await
+    .expect("staging refusal remains a typed non-fatal outcome");
+    let crate::meerkat_machine::driver::RuntimeLoopBatchStart::StageRefused {
+        abandoned_input_ids,
+        ..
+    } = outcome
+    else {
+        panic!("an unstageable test batch must be refused");
+    };
+    abandoned_input_ids
+}
+
+#[tokio::test]
+async fn a_stage_refusal_tells_the_host_only_when_it_terminalizes_at_the_retry_cap() {
+    let (hint, tells, _told) = counting_runless_terminal_hint();
+    let driver = stage_refusal_terminal_driver("stage-refusal-runless-terminal-tell");
+    let input_id = accept_stage_refusal_input(&driver, "refused input told at the cap").await;
+    for _ in 0..8 {
+        let abandoned = refuse_stage_once(
+            &driver,
+            &input_id,
+            runless_terminal_announcement_telling(&hint),
+        )
+        .await;
+        if abandoned.is_empty() {
+            assert_eq!(
+                tells.load(Ordering::SeqCst),
+                0,
+                "a refusal that requeues the input tells the host nothing"
+            );
+            continue;
+        }
+        assert_eq!(abandoned, vec![input_id.clone()]);
+        assert_eq!(
+            tells.load(Ordering::SeqCst),
+            1,
+            "the refusal that terminalizes the input tells the host once"
+        );
+        return;
+    }
+    panic!("generated staging-attempt cap did not terminalize the input");
+}
+
+#[tokio::test]
+async fn a_stage_refusal_handoff_tells_the_host_after_its_caller_is_gone() {
+    // The generated retry cap, counted on a twin of the same shape.
+    let twin = stage_refusal_terminal_driver("stage-refusal-runless-terminal-twin");
+    let twin_input_id = accept_stage_refusal_input(&twin, "twin refused input").await;
+    let mut refusals_to_cap = 0_usize;
+    loop {
+        refusals_to_cap += 1;
+        assert!(
+            refusals_to_cap <= 8,
+            "generated staging-attempt cap did not terminalize the input"
+        );
+        if !refuse_stage_once(
+            &twin,
+            &twin_input_id,
+            RunlessTerminalAnnouncement::default(),
+        )
+        .await
+        .is_empty()
+        {
+            break;
+        }
+    }
+
+    let (hint, tells, told) = counting_runless_terminal_hint();
+    let driver = stage_refusal_terminal_driver("stage-refusal-runless-terminal-dropped-caller");
+    let input_id =
+        accept_stage_refusal_input(&driver, "refused input told without its caller").await;
+    for _ in 1..refusals_to_cap {
+        assert!(
+            refuse_stage_once(
+                &driver,
+                &input_id,
+                runless_terminal_announcement_telling(&hint)
+            )
+            .await
+            .is_empty()
+        );
+    }
+    assert_eq!(tells.load(Ordering::SeqCst), 0);
+
+    // The refusal that terminalizes the input loses its caller while its
+    // retained handoff is still pending.
+    let mut start = Box::pin(prepare_runtime_loop_batch_start(
+        &driver,
+        RunId::new(),
+        crate::meerkat_machine::driver::test_authorized_runtime_loop_batch(vec![
+            input_id.clone(),
+            InputId::new(),
+        ]),
+        runless_terminal_announcement_telling(&hint),
+    ));
+    let parked =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(start.as_mut().poll(cx).is_pending()))
+            .await;
+    assert!(parked, "the refusal must park on its retained handoff");
+    drop(start);
+
+    tokio::time::timeout(Duration::from_secs(5), told.notified())
+        .await
+        .expect("the retained handoff must tell the host without its caller");
+    assert_eq!(tells.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        driver
+            .lock()
+            .await
+            .as_driver()
+            .stored_input_state(&input_id)
+            .map(|stored| stored.seed.phase),
+        Some(crate::input_state::InputLifecycleState::Abandoned),
+        "the handoff committed the terminal it told"
+    );
 }
 
 #[tokio::test]
@@ -45027,6 +48086,7 @@ async fn stage_refusal_completion_keeps_prior_run_attribution_without_claiming_i
             crate::meerkat_machine::driver::test_authorized_runtime_loop_batch(vec![
                 input_id.clone()
             ]),
+            crate::meerkat_machine::RunlessTerminalAnnouncement::default(),
         )
         .await
         .unwrap(),
@@ -45203,6 +48263,7 @@ async fn failed_stage_refusal_commit_publishes_none_of_the_terminal_bundle() {
                 input_id.clone(),
                 InputId::new(),
             ]),
+            crate::meerkat_machine::RunlessTerminalAnnouncement::default(),
         )
         .await
         .expect("pre-terminal refusal remains retryable");
@@ -45223,6 +48284,7 @@ async fn failed_stage_refusal_commit_publishes_none_of_the_terminal_bundle() {
             input_id.clone(),
             InputId::new(),
         ]),
+        crate::meerkat_machine::RunlessTerminalAnnouncement::default(),
     )
     .await
     .expect_err("failed atomic commit must not report a terminal delivery");
@@ -46060,6 +49122,9 @@ fn summarize_runtime_parity_driver_error(error: &RuntimeDriverError) -> String {
         RuntimeDriverError::HostingUnavailable { session_id } => {
             format!("hosting_unavailable:{session_id}")
         }
+        RuntimeDriverError::ConsentOwnerLossUnsettled { session_id } => {
+            format!("consent_owner_loss_unsettled:{session_id}")
+        }
         RuntimeDriverError::HostingClaimInvariantViolated {
             runtime_id,
             input_id,
@@ -46075,6 +49140,9 @@ fn summarize_runtime_parity_driver_error(error: &RuntimeDriverError) -> String {
         }
         RuntimeDriverError::InputTerminalWithoutReceipt { input_id, terminal } => {
             format!("input_terminal_without_receipt:{input_id}:{terminal:?}")
+        }
+        RuntimeDriverError::ScopedResultWithheld { input_id } => {
+            format!("scoped_result_withheld:{input_id}")
         }
         RuntimeDriverError::RecoveryBackoff { reason } => {
             format!("recovery_backoff:{reason}")
@@ -46132,6 +49200,9 @@ fn summarize_runtime_parity_control_error(error: &RuntimeControlPlaneError) -> S
         RuntimeControlPlaneError::StoreError(reason) => format!("store_error:{reason}"),
         RuntimeControlPlaneError::RetirementInProgress { runtime_id, stage } => {
             format!("retirement_in_progress:{runtime_id}:{stage}")
+        }
+        RuntimeControlPlaneError::ConsentOwnerLossUnsettled { session_id } => {
+            format!("consent_owner_loss_unsettled:{session_id}")
         }
         RuntimeControlPlaneError::Internal(reason) => format!("internal:{reason}"),
     }
@@ -51726,6 +54797,616 @@ async fn a_session_lock_unavailable_after_startup_is_refused_not_hosted_unclaime
     );
 }
 
+/// Consent owner loss (3): a registration attaches its hosting claim and,
+/// once the installed issuing consent owner settled the lineage's owner
+/// loss, completes that settlement, once, as it publishes. The proof reaches
+/// the registration even when an earlier grant (a cold attach, as the
+/// session service makes before the runtime registers) began the lineage. A
+/// lineage whose settlement an earlier attachment completed owes nothing
+/// again, and a storeless machine never owes one.
+#[cfg(feature = "sqlite-store")]
+#[tokio::test]
+async fn a_registration_takes_its_claim_lineage_owner_loss_proof_once() {
+    use crate::session_hosting::{HostingAcquisition, HostingPaths};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn RuntimeStore> = Arc::new(
+        crate::store::SqliteRuntimeStore::new(dir.path().join("runtime.sqlite3"))
+            .unwrap()
+            .with_hosting_paths(HostingPaths {
+                hosting_lock_dir: dir.path().join("hosting"),
+                cold_delivery_lock: dir.path().join("delivery").join("cold-delivery.lock"),
+                database: None,
+            }),
+    );
+    let machine = MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store()).unwrap();
+    let settlement = Arc::new(RecordingOwnerLossSettlement::default());
+    machine
+        .install_consent_owner_loss_settlement(settlement.clone())
+        .expect("installed before any registration");
+
+    let session_id = SessionId::new();
+    let cold_attach = machine
+        .grant_session_hosting(&session_id)
+        .expect("the first grant begins the lineage");
+    assert_eq!(cold_attach.acquisition(), HostingAcquisition::AcquiredFresh);
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("registers under the lineage");
+    let proof = machine
+        .session_owner_loss_proof(&session_id)
+        .await
+        .expect("the registration took the lineage's proof");
+    assert_eq!(proof.session_id(), &session_id);
+    assert_eq!(proof.acquisition(), HostingAcquisition::AcquiredFresh);
+    assert_eq!(
+        Some(proof.domain()),
+        store.hosting_capability().domain_ref().as_ref()
+    );
+    assert_eq!(
+        settlement.settled.lock().unwrap().clone(),
+        vec![proof.clone()],
+        "the issuing consent owner settled that proof"
+    );
+    assert!(
+        matches!(
+            cold_attach.reserve_owner_loss(),
+            crate::session_hosting::OwnerLossAttachment::Settled
+        ),
+        "the lineage's settlement completed once"
+    );
+
+    let taken = SessionId::new();
+    let holder = machine
+        .grant_session_hosting(&taken)
+        .expect("the first grant begins the lineage");
+    let crate::session_hosting::OwnerLossAttachment::Reserved(earlier) =
+        holder.reserve_owner_loss()
+    else {
+        panic!("the lineage owes its settlement");
+    };
+    let _settled_earlier = earlier.complete();
+    machine
+        .register_session(taken.clone())
+        .await
+        .expect("registers under the lineage");
+    assert!(
+        machine.session_owner_loss_proof(&taken).await.is_none(),
+        "a lineage whose proof was taken proves nothing again"
+    );
+
+    let storeless = MeerkatMachine::ephemeral();
+    storeless
+        .install_consent_owner_loss_settlement(settlement.clone())
+        .expect("installed before any registration");
+    let unclaimed = SessionId::new();
+    storeless
+        .register_session(unclaimed.clone())
+        .await
+        .expect("a storeless registration");
+    assert!(
+        storeless
+            .session_owner_loss_proof(&unclaimed)
+            .await
+            .is_none(),
+        "an unclaimed registration proves no owner loss"
+    );
+}
+
+/// A runtime store with cross-process hosting claims under `dir`.
+#[cfg(feature = "sqlite-store")]
+fn os_lock_runtime_store(dir: &std::path::Path) -> Arc<dyn RuntimeStore> {
+    Arc::new(
+        crate::store::SqliteRuntimeStore::new(dir.join("runtime.sqlite3"))
+            .unwrap()
+            .with_hosting_paths(crate::session_hosting::HostingPaths {
+                hosting_lock_dir: dir.join("hosting"),
+                cold_delivery_lock: dir.join("delivery").join("cold-delivery.lock"),
+                database: None,
+            }),
+    )
+}
+
+/// Consent owner loss (3): only the winning publication of a registration
+/// takes its claim lineage's owner-loss proof. An archive candidate prepared
+/// under the lineage and then abandoned leaves the proof with the lineage,
+/// and the registration that publishes next takes it.
+#[cfg(feature = "sqlite-store")]
+#[tokio::test]
+async fn an_abandoned_registration_preparation_leaves_the_owner_loss_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let machine =
+        MeerkatMachine::persistent(os_lock_runtime_store(dir.path()), memory_blob_store()).unwrap();
+    machine
+        .install_consent_owner_loss_settlement(Arc::new(RecordingOwnerLossSettlement::default()))
+        .expect("installed before any registration");
+    let session_id = SessionId::new();
+    let cold_attach = machine
+        .grant_session_hosting(&session_id)
+        .expect("the first grant begins the lineage");
+    let prepared = machine
+        .prepare_archive_session_registration(session_id.clone(), false, None)
+        .await
+        .expect("a candidate prepared under the lineage");
+    drop(prepared);
+
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("registers under the lineage");
+    assert!(
+        machine
+            .session_owner_loss_proof(&session_id)
+            .await
+            .is_some(),
+        "the publishing registration takes the proof the abandoned preparation left"
+    );
+    drop(cold_attach);
+}
+
+/// Consent owner loss (3): a prepared archive candidate whose publication an
+/// ordinary registration won is discarded without the proof: the winning
+/// registration, which joined the same lineage, takes it.
+#[cfg(feature = "sqlite-store")]
+#[tokio::test]
+async fn the_winning_registration_takes_the_owner_loss_proof_from_a_losing_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let machine =
+        MeerkatMachine::persistent(os_lock_runtime_store(dir.path()), memory_blob_store()).unwrap();
+    machine
+        .install_consent_owner_loss_settlement(Arc::new(RecordingOwnerLossSettlement::default()))
+        .expect("installed before any registration");
+    let session_id = SessionId::new();
+    let cold_attach = machine
+        .grant_session_hosting(&session_id)
+        .expect("the first grant begins the lineage");
+    let prepared = machine
+        .prepare_archive_session_registration(session_id.clone(), false, None)
+        .await
+        .expect("a candidate prepared under the lineage");
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("the ordinary registration publishes first");
+    let outcome = machine
+        .commit_prepared_archive_session_registration_under_transaction(prepared)
+        .await
+        .expect("the losing candidate is discarded");
+    assert!(
+        matches!(
+            outcome,
+            super::session_management::RegisterSessionInnerOutcome::Existing
+        ),
+        "the candidate lost its publication"
+    );
+    assert!(
+        machine
+            .session_owner_loss_proof(&session_id)
+            .await
+            .is_some(),
+        "the winning registration took the lineage's proof"
+    );
+    drop(cold_attach);
+}
+
+/// The issuing consent owner's settlement, recorded: the proof of every
+/// live reservation it was asked to settle under, and a switch to leave the
+/// next settlement incomplete.
+#[derive(Default)]
+struct RecordingOwnerLossSettlement {
+    settled: std::sync::Mutex<Vec<crate::session_hosting::HostingOwnerLossProof>>,
+    incomplete_next: std::sync::atomic::AtomicBool,
+}
+
+impl meerkat_core::approval::ConsentOwnerLossSettlement for RecordingOwnerLossSettlement {
+    fn settle(
+        &self,
+        reservation: &crate::session_hosting::OwnerLossReservation,
+    ) -> Result<(), meerkat_core::ApprovalError> {
+        self.settled
+            .lock()
+            .unwrap()
+            .push(reservation.proof().clone());
+        if self
+            .incomplete_next
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(meerkat_core::ApprovalError::StoreUnavailable(
+                "settlement left a row unsettled".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn register_command(session_id: &SessionId) -> MeerkatMachineCommand {
+    MeerkatMachineCommand::RegisterSession {
+        session_id: session_id.clone(),
+    }
+}
+
+fn refused_unsettled(error: &MeerkatMachineCommandError, session_id: &SessionId) -> bool {
+    matches!(
+        error,
+        MeerkatMachineCommandError::Driver(RuntimeDriverError::ConsentOwnerLossUnsettled {
+            session_id: refused,
+        }) if refused == session_id
+    )
+}
+
+/// Consent owner loss (3): the issuing consent owner installed on the
+/// runtime settles a registration's owner-loss proof before the registration
+/// publishes. An incomplete settlement refuses the registration typed and
+/// retryably, with nothing published, and returns the proof to the same
+/// lineage; the retry settles that proof and publishes. The completed
+/// settlement is never owed again.
+#[cfg(feature = "sqlite-store")]
+#[tokio::test]
+async fn a_registration_settles_its_owner_loss_before_it_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let settlement = Arc::new(RecordingOwnerLossSettlement::default());
+    let machine =
+        MeerkatMachine::persistent(os_lock_runtime_store(dir.path()), memory_blob_store()).unwrap();
+    machine
+        .install_consent_owner_loss_settlement(settlement.clone())
+        .expect("installed before any registration");
+    let session_id = SessionId::new();
+    let lineage = machine
+        .grant_session_hosting(&session_id)
+        .expect("the first grant begins the lineage");
+
+    settlement
+        .incomplete_next
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let refused = machine
+        .execute_meerkat_machine_command(None, register_command(&session_id))
+        .await
+        .expect_err("an incomplete settlement refuses the registration");
+    assert!(refused_unsettled(&refused, &session_id), "{refused:?}");
+    assert!(
+        !machine.contains_session(&session_id).await,
+        "nothing was published"
+    );
+
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("the retry settles and publishes");
+    let settled = settlement.settled.lock().unwrap().clone();
+    assert_eq!(settled.len(), 2, "the returned proof was settled again");
+    assert_eq!(settled[0], settled[1], "the same lineage's proof");
+    assert_eq!(settled[1].session_id(), &session_id);
+    assert_eq!(
+        machine.session_owner_loss_proof(&session_id).await,
+        Some(settled[1].clone())
+    );
+    assert!(
+        matches!(
+            lineage.reserve_owner_loss(),
+            crate::session_hosting::OwnerLossAttachment::Settled
+        ),
+        "a completed settlement is never owed again"
+    );
+}
+
+/// Consent owner loss (3): the public registration reports an incomplete
+/// settlement as the typed, session-bearing control-plane refusal, and the
+/// machine maps that refusal to the same driver refusal and back, so a
+/// caller keeps its retryable classification.
+#[cfg(feature = "sqlite-store")]
+#[tokio::test]
+async fn register_session_reports_an_unsettled_owner_loss_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let machine =
+        MeerkatMachine::persistent(os_lock_runtime_store(dir.path()), memory_blob_store()).unwrap();
+    let settlement = Arc::new(RecordingOwnerLossSettlement::default());
+    machine
+        .install_consent_owner_loss_settlement(settlement.clone())
+        .expect("installed before any registration");
+    settlement
+        .incomplete_next
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let session_id = SessionId::new();
+
+    let refused = machine
+        .register_session(session_id.clone())
+        .await
+        .expect_err("an incomplete settlement refuses the registration");
+    assert!(
+        matches!(
+            &refused,
+            RuntimeControlPlaneError::ConsentOwnerLossUnsettled { session_id: refused_id }
+                if refused_id == &session_id
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        matches!(
+            MeerkatMachine::driver_error_from_control_plane_error(refused),
+            RuntimeDriverError::ConsentOwnerLossUnsettled { session_id: back }
+                if back == session_id
+        ),
+        "the driver refusal round-trips"
+    );
+    assert!(!machine.contains_session(&session_id).await);
+}
+
+/// Consent owner loss (3): while another attachment of the lineage holds
+/// its owner-loss proof, the settlement is in progress, never complete: a
+/// registration joining that lineage is refused retryably without settling
+/// anything. Once the other attachment lets the proof go, the registration
+/// settles it and publishes.
+#[cfg(feature = "sqlite-store")]
+#[tokio::test]
+async fn a_joined_registration_is_refused_while_its_lineage_settlement_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let settlement = Arc::new(RecordingOwnerLossSettlement::default());
+    let machine =
+        MeerkatMachine::persistent(os_lock_runtime_store(dir.path()), memory_blob_store()).unwrap();
+    machine
+        .install_consent_owner_loss_settlement(settlement.clone())
+        .expect("installed before any registration");
+    let session_id = SessionId::new();
+    let lineage = machine
+        .grant_session_hosting(&session_id)
+        .expect("the first grant begins the lineage");
+    let crate::session_hosting::OwnerLossAttachment::Reserved(held) = lineage.reserve_owner_loss()
+    else {
+        panic!("the lineage owes its settlement");
+    };
+
+    let refused = machine
+        .execute_meerkat_machine_command(None, register_command(&session_id))
+        .await
+        .expect_err("a settlement in progress refuses the joined registration");
+    assert!(refused_unsettled(&refused, &session_id), "{refused:?}");
+    assert!(
+        settlement.settled.lock().unwrap().is_empty(),
+        "nothing is settled while another attachment holds the proof"
+    );
+
+    drop(held);
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("registers once the proof is returned");
+    assert_eq!(settlement.settled.lock().unwrap().len(), 1);
+    assert!(
+        machine
+            .session_owner_loss_proof(&session_id)
+            .await
+            .is_some()
+    );
+    drop(lineage);
+}
+
+/// Consent owner loss (3): a runtime composed without an issuing consent
+/// owner settles nothing, so it never records a settlement as complete: its
+/// registration publishes without a settled proof, the lineage keeps owing
+/// its settlement, and an owner installed after a session registered is
+/// refused.
+#[cfg(feature = "sqlite-store")]
+#[tokio::test]
+async fn a_registration_without_a_settlement_owner_never_completes_its_owner_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let machine =
+        MeerkatMachine::persistent(os_lock_runtime_store(dir.path()), memory_blob_store()).unwrap();
+    assert!(!machine.has_consent_owner_loss_settlement());
+    let session_id = SessionId::new();
+    let lineage = machine
+        .grant_session_hosting(&session_id)
+        .expect("the first grant begins the lineage");
+
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("registers without a consent owner");
+    assert!(
+        machine
+            .session_owner_loss_proof(&session_id)
+            .await
+            .is_none(),
+        "no settlement is recorded"
+    );
+    assert!(
+        matches!(
+            lineage.reserve_owner_loss(),
+            crate::session_hosting::OwnerLossAttachment::Reserved(_)
+        ),
+        "the lineage still owes its settlement"
+    );
+    assert_eq!(
+        machine.install_consent_owner_loss_settlement(Arc::new(
+            RecordingOwnerLossSettlement::default()
+        )),
+        Err(crate::ConsentOwnerLossInstallRefused::SessionsRegistered),
+        "a consent owner is installed before any registration, never after"
+    );
+    assert!(!machine.has_consent_owner_loss_settlement());
+}
+
+/// Attach a no-op executor to `session_id` through the exact executor
+/// attachment path, committing a fresh attachment.
+async fn attach_noop_executor(
+    machine: &Arc<MeerkatMachine>,
+    session_id: &SessionId,
+) -> Result<EnsureRuntimeExecutorAttachment, RuntimeDriverError> {
+    machine
+        .ensure_session_with_executor_factory(session_id.clone(), |_| {
+            Box::new(RuntimeParityNoopExecutor) as Box<dyn CoreExecutor>
+        })
+        .await
+}
+
+fn owner_loss_unsettled(error: &RuntimeDriverError, session_id: &SessionId) -> bool {
+    matches!(
+        error,
+        RuntimeDriverError::ConsentOwnerLossUnsettled { session_id: refused }
+            if refused == session_id
+    )
+}
+
+/// Consent owner loss (3): reusing a registration (its live attachment, or
+/// a new executor claim on it) first finishes the settlement its claim
+/// lineage still owes. This registration published before the issuing
+/// consent owner existed, so its required settlement is missing: while
+/// another attachment of the lineage holds the proof, and while the
+/// settlement fails, the reuse is not success and nothing is recorded as
+/// settled. Once the settlement completes, the reuse succeeds and the
+/// lineage owes nothing again.
+#[cfg(feature = "sqlite-store")]
+#[tokio::test]
+async fn reusing_a_registration_waits_for_its_required_settlement() {
+    let dir = tempfile::tempdir().unwrap();
+    let machine = Arc::new(
+        MeerkatMachine::persistent(os_lock_runtime_store(dir.path()), memory_blob_store()).unwrap(),
+    );
+    let session_id = SessionId::new();
+    let lineage = machine
+        .grant_session_hosting(&session_id)
+        .expect("the first grant begins the lineage");
+    match attach_noop_executor(&machine, &session_id)
+        .await
+        .expect("attaches without a consent owner")
+    {
+        EnsureRuntimeExecutorAttachment::Pending(pending) => {
+            pending.commit().await.expect("commits the attachment");
+        }
+        EnsureRuntimeExecutorAttachment::Existing(witness) => {
+            panic!("a fresh session unexpectedly found {witness:?}")
+        }
+    }
+    // The issuing consent owner arrives only now (a composition that missed
+    // installing it before registering): the published registration's
+    // lineage still owes its settlement.
+    let settlement = Arc::new(RecordingOwnerLossSettlement::default());
+    assert!(
+        machine
+            .consent_owner_loss_settlement
+            .set(settlement.clone())
+            .is_ok()
+    );
+
+    let crate::session_hosting::OwnerLossAttachment::Reserved(held) = lineage.reserve_owner_loss()
+    else {
+        panic!("the lineage owes its settlement");
+    };
+    let in_flight = attach_noop_executor(&machine, &session_id)
+        .await
+        .expect_err("a settlement in flight is not success");
+    assert!(
+        owner_loss_unsettled(&in_flight, &session_id),
+        "{in_flight:?}"
+    );
+    assert!(settlement.settled.lock().unwrap().is_empty());
+    drop(held);
+
+    settlement
+        .incomplete_next
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let failed = attach_noop_executor(&machine, &session_id)
+        .await
+        .expect_err("a failed settlement is not success");
+    assert!(owner_loss_unsettled(&failed, &session_id), "{failed:?}");
+    assert!(
+        machine
+            .session_owner_loss_proof(&session_id)
+            .await
+            .is_none(),
+        "nothing is recorded as settled"
+    );
+
+    assert!(
+        matches!(
+            attach_noop_executor(&machine, &session_id)
+                .await
+                .expect("the reuse succeeds once the settlement completes"),
+            EnsureRuntimeExecutorAttachment::Existing(_)
+        ),
+        "the live attachment is reused"
+    );
+    let settled = settlement.settled.lock().unwrap().clone();
+    assert_eq!(settled.len(), 2, "the failed and the completed settlement");
+    assert_eq!(
+        machine.session_owner_loss_proof(&session_id).await,
+        Some(settled[1].clone())
+    );
+    assert!(
+        matches!(
+            lineage.reserve_owner_loss(),
+            crate::session_hosting::OwnerLossAttachment::Settled
+        ),
+        "a completed settlement is never owed again"
+    );
+    assert!(
+        matches!(
+            attach_noop_executor(&machine, &session_id)
+                .await
+                .expect("reused again"),
+            EnsureRuntimeExecutorAttachment::Existing(_)
+        ),
+        "a reuse after the completed settlement settles nothing again"
+    );
+    assert_eq!(settlement.settled.lock().unwrap().len(), 2);
+}
+
+/// Consent owner loss (3): a fresh executor attachment publishes its
+/// registration only after the installed issuing consent owner settled the
+/// owner loss its claim lineage owes: an incomplete settlement publishes
+/// nothing, and the retry settles the same proof and publishes.
+#[cfg(feature = "sqlite-store")]
+#[tokio::test]
+async fn a_fresh_executor_attachment_publishes_only_after_its_settlement() {
+    let dir = tempfile::tempdir().unwrap();
+    let machine = Arc::new(
+        MeerkatMachine::persistent(os_lock_runtime_store(dir.path()), memory_blob_store()).unwrap(),
+    );
+    let settlement = Arc::new(RecordingOwnerLossSettlement::default());
+    machine
+        .install_consent_owner_loss_settlement(settlement.clone())
+        .expect("installed before any registration");
+    let session_id = SessionId::new();
+    let lineage = machine
+        .grant_session_hosting(&session_id)
+        .expect("the first grant begins the lineage");
+
+    settlement
+        .incomplete_next
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let refused = attach_noop_executor(&machine, &session_id)
+        .await
+        .expect_err("an incomplete settlement publishes nothing");
+    assert!(owner_loss_unsettled(&refused, &session_id), "{refused:?}");
+    assert!(!machine.contains_session(&session_id).await);
+
+    match attach_noop_executor(&machine, &session_id)
+        .await
+        .expect("the retry settles and publishes")
+    {
+        EnsureRuntimeExecutorAttachment::Pending(pending) => {
+            pending.commit().await.expect("commits the attachment");
+        }
+        EnsureRuntimeExecutorAttachment::Existing(witness) => {
+            panic!("an unpublished session unexpectedly found {witness:?}")
+        }
+    }
+    let settled = settlement.settled.lock().unwrap().clone();
+    assert_eq!(settled.len(), 2);
+    assert_eq!(settled[0], settled[1], "the same lineage's proof");
+    assert_eq!(
+        machine.session_owner_loss_proof(&session_id).await,
+        Some(settled[1].clone())
+    );
+    assert!(
+        matches!(
+            lineage.reserve_owner_loss(),
+            crate::session_hosting::OwnerLossAttachment::Settled
+        ),
+        "the publication completed the lineage's settlement"
+    );
+}
+
 /// #1813 (ADR's R6 objection): hosting claims are owner-scoped. Two
 /// MeerkatMachines may share one store for distinct runtimes, and each is a
 /// distinct runtime owner. A session one hosts is refused to the other
@@ -51815,4 +55496,118 @@ async fn a_second_local_machine_over_one_store_is_refused_the_session() {
         .await
         .expect("free once the first owner's lineage is gone");
     assert_eq!(other.session_serving(&session_id), SessionServing::HeldHere);
+}
+
+/// A registration's MCP observation slot reaches its runtime bindings, and a
+/// real unregister retires it: its installation ends and nothing installs
+/// into it again. A later registration of the same session owns a fresh slot.
+#[tokio::test]
+async fn unregister_retires_the_registrations_mcp_observation_slot() {
+    struct Fixed;
+    #[async_trait::async_trait]
+    impl meerkat_core::McpOperationObserver for Fixed {
+        async fn observe_operation(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> meerkat_core::McpOperationObservation {
+            meerkat_core::McpOperationObservation::Absent
+        }
+    }
+    let machine = MeerkatMachine::ephemeral();
+    let session_id = SessionId::new();
+    let bindings = machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings");
+    let slot = bindings
+        .mcp_observation_slot()
+        .cloned()
+        .expect("canonical bindings carry the registration's slot");
+    {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions.get(&session_id).expect("registered");
+        assert!(
+            entry.mcp_observation.same_slot(&slot),
+            "the registration's own slot"
+        );
+    }
+    let installed = slot.install(Arc::new(Fixed)).expect("live registration");
+    assert!(slot.is_current(installed));
+
+    machine
+        .unregister_session(&session_id)
+        .await
+        .expect("unregister");
+    assert!(
+        !slot.is_current(installed),
+        "unregister ends the installation"
+    );
+    assert!(slot.current().is_none());
+    assert!(
+        slot.install(Arc::new(Fixed)).is_none(),
+        "nothing installs into an ended registration"
+    );
+
+    let rebound = machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings after re-registration");
+    let fresh = rebound.mcp_observation_slot().expect("fresh slot");
+    assert!(
+        !fresh.same_slot(&slot),
+        "a new registration owns a fresh slot"
+    );
+    machine
+        .unregister_session(&session_id)
+        .await
+        .expect("cleanup");
+}
+
+/// A runtime owner's identity holds none of the owner and names every handle
+/// of exactly that owner: the machine it was taken from, and a clone of it
+/// after that original handle is dropped; never a separately constructed
+/// machine.
+#[tokio::test]
+async fn a_runtime_owner_identity_names_every_handle_of_its_owner_and_holds_none() {
+    let machine = MeerkatMachine::persistent(
+        Arc::new(crate::store::InMemoryRuntimeStore::new()),
+        memory_blob_store(),
+    )
+    .expect("machine");
+    let other = MeerkatMachine::persistent(
+        Arc::new(crate::store::InMemoryRuntimeStore::new()),
+        memory_blob_store(),
+    )
+    .expect("another machine");
+    let held = Arc::strong_count(&machine.shared);
+    let identity = machine.runtime_owner();
+    assert_eq!(
+        Arc::strong_count(&machine.shared),
+        held,
+        "the identity holds none of the owner"
+    );
+    assert!(identity.is_owner_of(&machine));
+    assert!(
+        !identity.is_owner_of(&other),
+        "a separately constructed machine is another owner"
+    );
+    let handle = machine.clone();
+    drop(machine);
+    assert!(
+        identity.is_owner_of(&handle),
+        "a clone names the owner after the original handle dropped"
+    );
+    assert!(identity.clone().is_owner_of(&handle));
+    assert!(!identity.is_owner_of(&other));
+    drop(handle);
+    let later = MeerkatMachine::persistent(
+        Arc::new(crate::store::InMemoryRuntimeStore::new()),
+        memory_blob_store(),
+    )
+    .expect("a later machine");
+    assert!(
+        !identity.is_owner_of(&later),
+        "once every handle of its owner is gone the identity names no new machine"
+    );
 }

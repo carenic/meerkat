@@ -5593,6 +5593,7 @@ impl AgentToolDispatcher for DeferredCatalogProbe {
                     meerkat_core::types::ToolProvenance {
                         kind: self.source.clone(),
                         source_id: "probe".into(),
+                        artifact: None,
                     },
                 ),
             ))

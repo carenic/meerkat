@@ -51,9 +51,63 @@ struct ToolPolicyOwner {
     /// is explicit R1. Changed only under the owner publication.
     write_tier: Mutex<meerkat_core::authorization::OperationReviewTier>,
     calls: AtomicUsize,
+    /// The owner's review material for reviewed operations, changed only
+    /// under the owner publication.
+    review_material: Mutex<ReviewMaterial>,
+    review_context_calls: AtomicUsize,
+}
+
+/// What the fixture owner holds as review material.
+#[derive(Clone)]
+enum ReviewMaterial {
+    /// The owner states it has none for this operation.
+    NotApplicable,
+    /// The selected action account and the current mandate.
+    Held { account: String, mandate: String },
+    /// The owner requires material it cannot currently read.
+    RequiredButMissing,
+    /// The owner deliberately refuses to supply it.
+    Denied,
 }
 
 impl LocalWorkPolicy for ToolPolicyOwner {
+    fn review_context(
+        &self,
+        association: &InputAuthorityAssociation,
+        binding: &PreparedAuthorizationBinding,
+        _now_ms: u64,
+    ) -> Result<
+        meerkat_core::authorization::ReviewOperationContextResolution,
+        meerkat_core::OperationAuthorizationError,
+    > {
+        use meerkat_core::authorization::{
+            ReviewOperationContext, ReviewOperationContextResolution,
+        };
+        self.review_context_calls.fetch_add(1, Ordering::SeqCst);
+        if association != self.admitted.as_ref()
+            || binding.facts().execution_scope != self.native_scope
+        {
+            return Err(denied().into());
+        }
+        match self
+            .review_material
+            .lock()
+            .expect("review material")
+            .clone()
+        {
+            ReviewMaterial::NotApplicable => Ok(ReviewOperationContextResolution::NotApplicable),
+            ReviewMaterial::Held { account, mandate } => {
+                ReviewOperationContext::new(Some(account), Some(mandate))
+                    .map(ReviewOperationContextResolution::Material)
+                    .map_err(|_| meerkat_core::OperationAuthorizationError::Unavailable)
+            }
+            ReviewMaterial::RequiredButMissing => {
+                Err(meerkat_core::OperationAuthorizationError::Unavailable)
+            }
+            ReviewMaterial::Denied => Err(denied().into()),
+        }
+    }
+
     fn evaluate(
         &self,
         association: &InputAuthorityAssociation,
@@ -154,6 +208,8 @@ impl ToolWork {
             revoked_tool: Mutex::new(None),
             write_tier: Mutex::new(meerkat_core::authorization::OperationReviewTier::R1),
             calls: AtomicUsize::new(0),
+            review_material: Mutex::new(ReviewMaterial::NotApplicable),
+            review_context_calls: AtomicUsize::new(0),
         });
         let publication = LocalAuthorizationPublication::new();
         let authorization = Arc::new(LocalWorkAuthorization::new(
@@ -188,6 +244,21 @@ impl ToolWork {
         drop(publication);
     }
 
+    /// Change the owner's review material under the publication, keeping
+    /// every permission and tier.
+    fn set_review_material(&self, material: ReviewMaterial) {
+        let publication = self
+            .publication
+            .begin_owner_change()
+            .expect("owner publication");
+        *self.owner.review_material.lock().expect("review material") = material;
+        drop(publication);
+    }
+
+    fn review_context_calls(&self) -> usize {
+        self.owner.review_context_calls.load(Ordering::SeqCst)
+    }
+
     /// Publish an owner change that keeps every permission and tier: the
     /// reviewed context is no longer the one the reviewer saw.
     fn republish(&self) {
@@ -206,6 +277,36 @@ impl ToolWork {
             .expect("owner publication");
         *self.owner.revoked_tool.lock().expect("revoked tool") = Some(name.to_string());
         drop(publication);
+    }
+}
+
+/// A custom work owner that forwards preparation but never implements the
+/// review-context read, so it inherits the fail-closed default.
+struct InheritingWork(Arc<dyn meerkat_core::authorization::WorkAuthorization>);
+
+impl meerkat_core::authorization::WorkAuthorization for InheritingWork {
+    fn controller_model_selection(&self) -> Option<meerkat_core::ControllerModelSelection> {
+        self.0.controller_model_selection()
+    }
+
+    fn prepare(
+        &self,
+        binding: &PreparedAuthorizationBinding,
+    ) -> Result<
+        Arc<dyn meerkat_core::authorization::PreparedOperationAuthorization>,
+        meerkat_core::OperationAuthorizationError,
+    > {
+        self.0.prepare(binding)
+    }
+}
+
+impl ToolWork {
+    /// The same native owner behind a custom wrapper without the read.
+    fn inheriting_context(&self) -> WorkAuthorizationContext {
+        WorkAuthorizationContext::new(
+            Arc::new(InheritingWork(Arc::clone(self.context.authorization()))),
+            self.owner.native_scope.clone(),
+        )
     }
 }
 
@@ -809,4 +910,5 @@ async fn fixture_controller_checks_current_work_before_recording_model_input() {
     assert!(client.0.lock().expect("model requests").is_empty());
 }
 
+mod human_consent;
 mod operation_review;

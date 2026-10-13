@@ -20,7 +20,7 @@ impl MobHandle {
     /// Restrict this handle to direct read-only runtime observations.
     pub fn read_handle(&self) -> MobReadHandle {
         MobReadHandle {
-            handle: self.clone(),
+            handle: self.non_owning(),
         }
     }
 }

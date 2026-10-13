@@ -112,6 +112,10 @@ pub struct OpenAiClient {
     /// DynamicAuthorizer envelope (host-managed OAuth refresh, etc.).
     authorizer: Option<std::sync::Arc<dyn meerkat_core::HttpAuthorizer>>,
     supports_image_input: bool,
+    /// The GitHub Copilot Responses route re-identifies output items between
+    /// their done events and the terminal response; see
+    /// [`Self::with_copilot_responses_item_identity`].
+    copilot_responses_item_identity: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -736,6 +740,7 @@ impl OpenAiClient {
             extra_headers: Vec::new(),
             authorizer: None,
             supports_image_input: true,
+            copilot_responses_item_identity: false,
         }
     }
 
@@ -754,6 +759,23 @@ impl OpenAiClient {
     /// uses `/responses` under `https://chatgpt.com/backend-api/codex`.
     pub fn with_responses_path(mut self, path: impl Into<String>) -> Self {
         self.responses_path = path.into().trim_start_matches('/').to_string();
+        self
+    }
+
+    /// For the GitHub Copilot Responses route only. Copilot re-identifies a
+    /// message or reasoning item on every event of its lifecycle (added,
+    /// deltas, done, terminal) while its wire `output_index` stays. Events of
+    /// an added item's lifecycle are recorded under its canonical (first
+    /// added) id; a completed message or reasoning item the terminal output
+    /// lacks by id is aliased to the one terminal item that is the same item
+    /// (see `responses_output::copilot_item_aliases`), keeping the terminal
+    /// identity (and, for reasoning, its ciphertext); and the streamed ids of
+    /// each completed lifecycle are reconciled with that terminal identity.
+    /// Conflicting items at one `output_index` and reused or repeated ids are
+    /// protocol errors, and coverage stays strict afterwards. Function calls
+    /// keep their `call_id` identity. Other routes are unchanged.
+    pub fn with_copilot_responses_item_identity(mut self) -> Self {
+        self.copilot_responses_item_identity = true;
         self
     }
 
@@ -1538,7 +1560,7 @@ impl OpenAiClient {
     }
 
     fn system_notice_responses_content(notice: &SystemNoticeMessage) -> Value {
-        let rendered = notice.model_projection_text();
+        let rendered = notice.model_projection_lead_text();
         let mut parts = Vec::new();
         if !rendered.trim().is_empty() {
             parts.push(serde_json::json!({
@@ -1550,10 +1572,23 @@ impl OpenAiClient {
         for block in &notice.blocks {
             match block {
                 SystemNoticeBlock::Comms { content, .. }
-                | SystemNoticeBlock::ExternalEvent { content, .. } => {
-                    for content_block in content {
-                        if !matches!(content_block, ContentBlock::Text { .. }) {
-                            parts.push(Self::content_block_to_responses_part(content_block));
+                | SystemNoticeBlock::ExternalEvent { content, .. }
+                | SystemNoticeBlock::RuntimeNotice { content, .. } => {
+                    if block.content_follows_notice_text() {
+                        // Runtime notice content and comms response blocks
+                        // follow the notice text in their own order, each
+                        // block lowered once.
+                        parts.extend(content.iter().map(Self::content_block_to_responses_part));
+                    } else {
+                        // The content's text is part of the notice text;
+                        // only its media follows it.
+                        for content_block in content {
+                            if matches!(
+                                content_block,
+                                ContentBlock::Image { .. } | ContentBlock::Video { .. }
+                            ) {
+                                parts.push(Self::content_block_to_responses_part(content_block));
+                            }
                         }
                     }
                 }
@@ -2503,6 +2538,7 @@ impl OpenAiClient {
             };
 
             let endpoint = self.responses_endpoint();
+            let copilot_item_identity = self.copilot_responses_item_identity;
             let mut diagnostics = Vec::new();
             let response = self
                 .responses_response_with_fallback(
@@ -2519,6 +2555,13 @@ impl OpenAiClient {
             let mut streamed_text_items: HashSet<String> = HashSet::new();
             let mut assistant_items: HashMap<String, Value> = HashMap::new();
             let mut completed_items: std::collections::BTreeMap<ResponsesOutputIndex, Value> = std::collections::BTreeMap::new();
+            // Copilot only: the item kind and canonical (first added) id of
+            // each message/reasoning item lifecycle, by its wire output_index.
+            let mut copilot_slots: HashMap<u64, (String, String)> = HashMap::new();
+            // Copilot only: each slot's first added item, and the slot each
+            // canonical id belongs to, so lifecycles stay one to one.
+            let mut copilot_slot_items: HashMap<u64, Value> = HashMap::new();
+            let mut copilot_canonical_slots: HashMap<String, u64> = HashMap::new();
             let mut streamed_tool_ids: HashSet<String> = HashSet::with_capacity(4);
             let mut response_item_tool_calls: HashMap<String, (String, String)> =
                 HashMap::with_capacity(4);
@@ -2609,6 +2652,45 @@ impl OpenAiClient {
                                     continue;
                                 }
                                 let final_blocks = match response_obj.get("output") {
+                                    Some(Value::Array(output)) if !output.is_empty() && copilot_item_identity => {
+                                        // Copilot re-identifies completed messages in the
+                                        // terminal response: alias each proven same message
+                                        // to its terminal id in both coverage inputs, then
+                                        // check coverage strictly.
+                                        let aliases = crate::responses_output::copilot_item_aliases(output, completed_items.values())?;
+                                        let completed: Vec<Value> = completed_items
+                                            .values()
+                                            .map(|item| aliases.apply(item))
+                                            .collect();
+                                        crate::responses_output::validate_completed_coverage(output, completed.iter())?;
+                                        // Reconcile the streamed ids of each completed
+                                        // lifecycle (its canonical id and its completed
+                                        // id) with that item's terminal identity.
+                                        for (index, item) in &completed_items {
+                                            let (Some(kind), Some(done_id)) = (
+                                                item.get("type").and_then(Value::as_str),
+                                                item.get("id").and_then(Value::as_str),
+                                            ) else {
+                                                continue;
+                                            };
+                                            let streamed = match kind {
+                                                "message" => &mut streamed_text_items,
+                                                "reasoning" => &mut streamed_reasoning_ids,
+                                                _ => continue,
+                                            };
+                                            let terminal_id = aliases.terminal_id(kind, done_id).to_owned();
+                                            let canonical = copilot_slots
+                                                .get(&index.0)
+                                                .filter(|(slot_kind, _)| slot_kind == kind)
+                                                .map(|(_, canonical)| canonical.as_str());
+                                            for observed in [Some(done_id), canonical].into_iter().flatten() {
+                                                if observed != terminal_id && streamed.remove(observed) {
+                                                    streamed.insert(terminal_id.clone());
+                                                }
+                                            }
+                                        }
+                                        Some(crate::responses_output::lower_items(output, active_response_id.as_deref())?)
+                                    },
                                     Some(Value::Array(output)) if !output.is_empty() => {
                                         crate::responses_output::validate_completed_coverage(output, completed_items.values())?;
                                         Some(crate::responses_output::lower_items(output, active_response_id.as_deref())?)
@@ -2818,6 +2900,40 @@ impl OpenAiClient {
                         else if event.event_type == "response.output_item.added" {
                             if let Some(item) = &event.item {
                                 crate::responses_output::validate_item(item)?;
+                                // Copilot re-identifies an item on every event of
+                                // its lifecycle; its wire output_index stays. The
+                                // first added id is that lifecycle's canonical id.
+                                if copilot_item_identity
+                                    && let Some(index) = event.output_index
+                                    && let Some(kind) = item.get("type").and_then(Value::as_str)
+                                    && crate::responses_output::COPILOT_ALIASED_KINDS.contains(&kind)
+                                    && let Some(id) = item.get("id").and_then(Value::as_str)
+                                {
+                                    // One lifecycle per slot and one slot per canonical
+                                    // id: only an identical retransmission may repeat.
+                                    match copilot_slot_items.get(&index) {
+                                        Some(first) if first != item => {
+                                            Err(LlmError::StreamParseError {
+                                                message: format!(
+                                                    "conflicting Responses output items added at output_index {index}"
+                                                ),
+                                            })?;
+                                        }
+                                        Some(_) => {}
+                                        None => {
+                                            if let Some(other) = copilot_canonical_slots.get(id) {
+                                                Err(LlmError::StreamParseError {
+                                                    message: format!(
+                                                        "Responses output item id '{id}' added at output_index {other} and {index}"
+                                                    ),
+                                                })?;
+                                            }
+                                            copilot_canonical_slots.insert(id.to_owned(), index);
+                                            copilot_slot_items.insert(index, item.clone());
+                                            copilot_slots.insert(index, (kind.to_owned(), id.to_owned()));
+                                        }
+                                    }
+                                }
                                 if item.get("type").and_then(Value::as_str) == Some("message")
                                     && let Some(id) = item.get("id").and_then(Value::as_str)
                                 {
@@ -2840,13 +2956,22 @@ impl OpenAiClient {
                         }
                         else if event.event_type == "response.output_text.delta" {
                             if let Some(delta) = &event.delta {
-                                if let Some(id) = &event.item_id {
+                                // On Copilot, a delta of an added message's lifecycle
+                                // (same wire output_index) carries its canonical id.
+                                let item_id = match (copilot_item_identity, event.output_index) {
+                                    (true, Some(index)) => match copilot_slots.get(&index) {
+                                        Some((kind, canonical)) if kind == "message" => Some(canonical.clone()),
+                                        _ => event.item_id.clone(),
+                                    },
+                                    _ => event.item_id.clone(),
+                                };
+                                if let Some(id) = &item_id {
                                     streamed_text_items.insert(id.clone());
                                 } else {
                                     saw_stream_text_delta = true;
                                 }
                                 saw_terminal_fallback_output = true;
-                                let meta = match event.item_id.as_ref().and_then(|id| assistant_items.get(id)) {
+                                let meta = match item_id.as_ref().and_then(|id| assistant_items.get(id)) {
                                     Some(item) => crate::responses_output::assistant_meta(item, active_response_id.as_deref())?,
                                     None => openai_response_meta(active_response_id.as_deref()),
                                 };
@@ -2924,6 +3049,17 @@ impl OpenAiClient {
                             if let Some(item) = &event.item {
                                 crate::responses_output::validate_item(item)?;
                                 if let Some(index) = event.output_index {
+                                    if copilot_item_identity
+                                        && completed_items
+                                            .get(&ResponsesOutputIndex(index))
+                                            .is_some_and(|previous| previous != item)
+                                    {
+                                        Err(LlmError::StreamParseError {
+                                            message: format!(
+                                                "conflicting Responses output items completed at output_index {index}"
+                                            ),
+                                        })?;
+                                    }
                                     completed_items.insert(ResponsesOutputIndex(index), item.clone());
                                 }
                             }
@@ -3002,7 +3138,16 @@ impl OpenAiClient {
                                     saw_terminal_fallback_output = true;
                                 }
 
-                                streamed_reasoning_ids.insert(reasoning_id.to_string());
+                                // On Copilot, a completion of an added reasoning
+                                // item's lifecycle carries its canonical id.
+                                let streamed_id = match (copilot_item_identity, event.output_index) {
+                                    (true, Some(index)) => match copilot_slots.get(&index) {
+                                        Some((kind, canonical)) if kind == "reasoning" => canonical.clone(),
+                                        _ => reasoning_id.to_string(),
+                                    },
+                                    _ => reasoning_id.to_string(),
+                                };
+                                streamed_reasoning_ids.insert(streamed_id);
                                 if !summary_text.trim().is_empty() || meta.is_some() {
                                     saw_terminal_fallback_output = true;
                                 }
@@ -8980,6 +9125,135 @@ mod tests {
         assert_eq!(content[0]["type"], "input_text");
         assert_eq!(content[1]["type"], "input_image");
         assert_eq!(content[1]["image_url"], "data:image/png;base64,iVBOR...");
+    }
+
+    #[test]
+    fn openai_comms_response_blocks_lower_once() {
+        use meerkat_core::{
+            SystemNoticeDirection, SystemNoticeKind, SystemNoticeMessage, SystemNoticePeer,
+        };
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let mut request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::SystemNotice(SystemNoticeMessage::with_block(
+                SystemNoticeKind::Comms,
+                None,
+                SystemNoticeBlock::Comms {
+                    kind: meerkat_core::types::CommsNoticeKind::ResponseTerminal,
+                    direction: SystemNoticeDirection::Incoming,
+                    peer: Some(SystemNoticePeer {
+                        id: meerkat_core::comms::PeerId::new(),
+                        display_name: Some("operator".to_string()),
+                    }),
+                    sender_taint: None,
+                    request_id: Some("request-7".to_string()),
+                    intent: None,
+                    status: Some("completed".to_string()),
+                    summary: None,
+                    payload: Some(serde_json::json!({"result_marker_q7": true})),
+                    content: vec![
+                        ContentBlock::structured(&serde_json::json!({"block_marker_z9": 2}))
+                            .expect("structured response block"),
+                    ],
+                },
+            ))],
+        );
+        request.messages = client
+            .project_replay_messages(&request.messages)
+            .expect("project comms response");
+
+        let body = client.build_request_body(&request).expect("build request");
+        let rendered = body["input"][0]["content"].to_string();
+        assert_eq!(
+            rendered.matches("result_marker_q7").count(),
+            1,
+            "the response result appears once: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches("block_marker_z9").count(),
+            1,
+            "the response block appears once: {rendered}"
+        );
+    }
+
+    #[test]
+    fn openai_runtime_notice_content_lowers_in_order_once() {
+        use meerkat_core::{SystemNoticeKind, SystemNoticeMessage};
+
+        let client = OpenAiClient::new("test-key".to_string());
+        let mut request = LlmRequest::new(
+            "gpt-5.4",
+            vec![Message::SystemNotice(SystemNoticeMessage::with_block(
+                SystemNoticeKind::Generic,
+                None,
+                SystemNoticeBlock::RuntimeNotice {
+                    category: "consent_attempt".to_string(),
+                    detail: Some("correlated result".to_string()),
+                    payload: Some(serde_json::json!({"payload_marker": "never-projected"})),
+                    content: vec![
+                        ContentBlock::Text {
+                            text: "first".to_string(),
+                        },
+                        ContentBlock::Image {
+                            media_type: "image/png".to_string(),
+                            data: ImageData::Inline {
+                                data: "aW1hZ2Ux".to_string(),
+                            },
+                        },
+                        ContentBlock::Text {
+                            text: "second".to_string(),
+                        },
+                        ContentBlock::Image {
+                            media_type: "image/png".to_string(),
+                            data: ImageData::Inline {
+                                data: "aW1hZ2Uy".to_string(),
+                            },
+                        },
+                        ContentBlock::structured(&serde_json::json!({"rows": 2}))
+                            .expect("structured content"),
+                    ],
+                },
+            ))],
+        );
+        request.messages = client
+            .project_replay_messages(&request.messages)
+            .expect("project runtime notice");
+
+        let body = client.build_request_body(&request).expect("build request");
+        assert!(!body.to_string().contains("never-projected"));
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input[0]["role"], "user");
+        let parts: Vec<(String, String)> = input[0]["content"]
+            .as_array()
+            .expect("content array")
+            .iter()
+            .map(|part| {
+                (
+                    part["type"].as_str().unwrap_or_default().to_owned(),
+                    part["text"]
+                        .as_str()
+                        .or_else(|| part["image_url"].as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                )
+            })
+            .collect();
+        let expected: Vec<(String, String)> = [
+            ("input_text", "correlated result"),
+            ("input_text", "first"),
+            ("input_image", "data:image/png;base64,aW1hZ2Ux"),
+            ("input_text", "second"),
+            ("input_image", "data:image/png;base64,aW1hZ2Uy"),
+            ("input_text", "{\"rows\":2}"),
+        ]
+        .iter()
+        .map(|(kind, value)| ((*kind).to_owned(), (*value).to_owned()))
+        .collect();
+        assert_eq!(
+            parts, expected,
+            "detail first, then the content in order, once"
+        );
     }
 
     #[test]

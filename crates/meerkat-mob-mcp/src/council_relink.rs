@@ -225,15 +225,14 @@ pub async fn relink_detached_councils(
         })
         .map(|record| {
             let state = Arc::clone(state);
-            // Each council delivers on its own task: one convener's busy
-            // session must not hold up the others.
-            tokio::spawn(async move { relink_council(&state, record).await })
-        });
-    futures::future::join_all(tasks)
-        .await
-        .into_iter()
-        .filter_map(Result::ok)
-        .collect()
+            // The councils deliver concurrently: one convener's busy session
+            // must not hold up the others. They run inside this pass's own
+            // task, not on tasks of their own, so a stand-down that aborts
+            // the pass has stopped every delivery once the pass is dropped.
+            async move { relink_council(&state, record).await }
+        })
+        .collect::<Vec<_>>();
+    futures::future::join_all(tasks).await
 }
 
 /// Deliver one detached council's sealed outcome to its convener.

@@ -1,6 +1,8 @@
 //! Cold-process qualification of the existing stock SQLite recovery path.
 //! Each host explicitly issues current grants and authenticates fresh input.
 //! Historical associations and transcripts are audit data, never authority.
+//! Both hosts configure the same mandatory model-request gates: the writer's
+//! withhold one candidate and one response, the reader's permit fresh work.
 use super::*;
 
 const SELECTOR: &str = "e1_policy_control::stock_persistent::process_reopen::stock_sqlite_separate_process_reopen_runs_fresh_governed_model_tool_model_work";
@@ -52,13 +54,23 @@ async fn only_session(store: &Arc<dyn RuntimeStore>) -> SessionId {
 }
 
 async fn write_completed_turn(root: &std::path::Path) {
-    let server = Server::start().await;
+    // The second immediate response answers the PostLlm feedback request.
+    let server =
+        Server::start_with_tool_responses(vec![sibling_response(), final_response()]).await;
     let host = StockCredentialHost {
         client: http_client_with_binding(&server, cold_binding()),
         credential_persistence: file_credentials(root),
     };
     let (session_store, store) = sqlite_stores(root);
-    run_stock_persistent_case_with_host(server, session_store, store, None, false, host).await;
+    run_stock_persistent_case_with_options(
+        server,
+        session_store,
+        store,
+        None,
+        StockPersistentOptions::hooked_writer(),
+        host,
+    )
+    .await;
 }
 
 async fn read_and_run_fresh_turn(root: &std::path::Path, cleanup: &CleanupSlot, server: &Server) {
@@ -79,13 +91,12 @@ async fn read_and_run_fresh_turn(root: &std::path::Path, cleanup: &CleanupSlot, 
     let original_claims = original.state.authority_contributors[0]
         .association()
         .clone();
-    assert_stock_turn_audit(
+    // The writer process's withholdings survive process exit on the row.
+    mandatory_hooks::assert_withheld_stock_turn_audit(
         &stored_audit(original),
         &session_id,
         &original_input_id,
         &original_run_id,
-        DENIED_CALL,
-        PERMITTED_CALL,
     );
     let original_document = store
         .load_committed_whole_blob_snapshot(&runtime)
@@ -169,6 +180,8 @@ async fn read_and_run_fresh_turn(root: &std::path::Path, cleanup: &CleanupSlot, 
         store.clone(),
         Arc::new(meerkat::MemoryBlobStore::new()),
         NativeGrantWorkConfiguration {
+            retained_resume: None,
+            require_scoped_destination: false,
             grants,
             ingress,
             invocation_owner: Arc::new(InvocationOwner),
@@ -176,12 +189,16 @@ async fn read_and_run_fresh_turn(root: &std::path::Path, cleanup: &CleanupSlot, 
                 selection: selected.clone(),
                 endpoint: format!("{}/v1/messages", server.base_url),
             }),
+            configured_mcp_attachment: None,
         },
     )
     .expect("cold host explicitly installs its current native owners");
     let configured_adapter = bundle.runtime_adapter();
     let tools = Arc::new(RecordingTools::default());
-    let mut builder = FactoryAgentBuilder::new(AgentFactory::minimal(), Config::default());
+    // The reader host configures the same mandatory gates; its hook runtime
+    // permits every ordinary operation.
+    let hooks = mandatory_hooks::HookEndpoint::start(mandatory_hooks::Verdicts::AllowAll).await;
+    let mut builder = FactoryAgentBuilder::new(AgentFactory::minimal(), hooks.config());
     builder.default_llm_client = Some(client);
     builder.default_tool_dispatcher = Some(tools.clone());
     let (service, machine) = build_runtime_backed_service_with_default_reconfigure_host(
@@ -189,7 +206,8 @@ async fn read_and_run_fresh_turn(root: &std::path::Path, cleanup: &CleanupSlot, 
         2,
         bundle,
         root.join("unused-cold-host.toml"),
-    );
+    )
+    .expect("compose the runtime-backed service");
     assert!(Arc::ptr_eq(&machine, &configured_adapter));
     assert!(Arc::ptr_eq(&service.runtime_store(), &store));
     *cleanup.lock().unwrap() = Some((machine.clone(), session_id.clone()));
@@ -507,6 +525,10 @@ async fn read_and_run_fresh_turn(root: &std::path::Path, cleanup: &CleanupSlot, 
         frozen_original_messages,
         "a refused old-grant input cannot enter the committed transcript",
     );
+    assert!(
+        hooks.offered().is_empty(),
+        "refused admissions and reconstruction offer the gates nothing"
+    );
 
     assert_ne!(input_id, stale_input_id);
     let (accepted, completion) = machine
@@ -642,6 +664,9 @@ async fn read_and_run_fresh_turn(root: &std::path::Path, cleanup: &CleanupSlot, 
         COLD_DENIED_CALL,
         COLD_PERMITTED_CALL,
     );
+    // Later permitted work: the restarted host's configured gates were offered
+    // every ordinary operation of the fresh run and withheld nothing.
+    mandatory_hooks::assert_permitted_fresh_turn(&hooks, &final_audit, &session_id, &run_id);
     let frozen_final = serde_json::to_value(&final_row).unwrap();
     machine
         .unregister_current_session_registration_until_terminal(&session_id)
@@ -755,6 +780,13 @@ async fn stock_sqlite_separate_process_reopen_runs_fresh_governed_model_tool_mod
     assert_eq!(rows.len(), 1);
     let original_input_id = rows[0].state.input_id.clone();
     let frozen_original = serde_json::to_value(&rows[0]).unwrap();
+    // The exited writer's protected withholdings are on its committed row.
+    mandatory_hooks::assert_withheld_stock_turn_audit(
+        &stored_audit(&rows[0]),
+        &session_id,
+        &original_input_id,
+        rows[0].seed.last_run_id.as_ref().unwrap(),
+    );
     let original_document = store
         .load_committed_whole_blob_snapshot(&runtime)
         .await

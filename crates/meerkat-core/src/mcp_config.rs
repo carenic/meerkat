@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 #[cfg(not(target_arch = "wasm32"))]
 use std::collections::HashSet;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::{File, OpenOptions};
 #[cfg(not(target_arch = "wasm32"))]
@@ -55,6 +55,12 @@ pub struct McpStdioConfig {
     /// Environment variables
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Names of environment variables whose values the realm that defines
+    /// this server keeps in its protected credential store. Only the names
+    /// are configuration: each value is read for this exact definition when
+    /// the server is launched, and never from the host environment.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub secret_env: BTreeSet<String>,
 }
 
 /// HTTP transport configuration (streamable HTTP or legacy SSE)
@@ -111,6 +117,7 @@ impl std::fmt::Debug for McpStdioConfig {
             .field("command", &self.command)
             .field("args", &crate::redact::RedactedList(self.args.len()))
             .field("env", &crate::redact::RedactedValues::of(self.env.keys()))
+            .field("secret_env", &self.secret_env)
             .finish()
     }
 }
@@ -173,9 +180,402 @@ pub struct McpServerConfig {
     /// operation in the map does not create a tool.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tool_names: BTreeMap<String, String>,
+    /// Host access ceiling for this server's operations. Absent, every
+    /// operation the server lists is callable (subject to session tool
+    /// policy). The server's own tool annotations never set or widen it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<McpServerAccess>,
+    /// Trusted connector credential binding of a stdio server installation:
+    /// each listed operation's calls carry the connector credential that
+    /// satisfies it, and the server gets the expected account binding at
+    /// startup. Only host configuration sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector: Option<McpConnectorBinding>,
+    /// The host's declaration of the account this server's operations act
+    /// with, stated to review and consent: `none` declares that they act
+    /// with no selected account. Absent, the account is the connector
+    /// binding's or the OAuth account selection's, and otherwise unavailable:
+    /// a server without either never states that it has none. It conflicts
+    /// with both. Only host configuration sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<McpAccountDeclaration>,
+}
+
+/// A host's declaration of the account an MCP server's operations act with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum McpAccountDeclaration {
+    // The server's operations act with no selected account.
+    #[serde(rename = "none")]
+    NoAccount,
+}
+
+impl McpAccountDeclaration {
+    /// The configured spelling (`none`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoAccount => "none",
+        }
+    }
+}
+
+/// Host access ceiling for one MCP server, enforced by the connection that
+/// calls it.
+///
+/// Only the raw MCP operations in `allowed_operations` may be called. The
+/// router does not offer any other under any name, and the connection
+/// refuses any other before anything is sent.
+/// The ceiling only narrows access. It does not certify that the listed
+/// operations are reads: session read-only policy still requires a trusted
+/// host declaration for the exact destination and operation. Nothing is
+/// inferred from operation names or from the server's annotations.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerAccess {
+    /// The raw MCP operation names that may be called.
+    pub allowed_operations: BTreeSet<String>,
+}
+
+/// A refused [`McpServerAccess`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("MCP server '{server}' has an invalid access policy: {reason}")]
+pub struct McpServerAccessError {
+    pub server: String,
+    pub reason: &'static str,
+}
+
+/// A refused `secret_env` declaration of a stdio MCP server
+/// ([`McpStdioConfig::secret_env`]). It names the server, never a value.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("MCP server '{server}' has an invalid secret_env declaration: {reason}")]
+pub struct McpSecretEnvDeclarationError {
+    pub server: String,
+    pub reason: &'static str,
+}
+
+/// Longest environment variable name `secret_env` may declare, so the
+/// value's storage key stays within file-name limits.
+pub const MCP_SECRET_ENV_NAME_MAX: usize = 128;
+
+impl McpServerAccess {
+    /// A ceiling of exactly `operations`.
+    pub fn allowing(operations: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            allowed_operations: operations.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Whether the raw operation may be called.
+    pub fn permits(&self, raw_operation: &str) -> bool {
+        self.allowed_operations.contains(raw_operation)
+    }
+}
+
+/// Environment variable that carries a connector-bound stdio server's
+/// expected account binding ([`McpConnectorBinding::startup_projection`]).
+pub const MCP_CONNECTOR_BINDING_ENV: &str = "MEERKAT_CONNECTOR_BINDING";
+
+/// Whether `name` is a portable environment variable name of at most
+/// [`MCP_SECRET_ENV_NAME_MAX`] bytes: ASCII letters, digits and underscores,
+/// not starting with a digit.
+pub fn is_env_var_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MCP_SECRET_ENV_NAME_MAX
+        && !bytes.first().is_some_and(u8::is_ascii_digit)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+}
+
+/// The connector credential a trusted MCP server installation's calls need:
+/// the slot, the verified account and stable context the credential must be
+/// bound to, and each raw operation's required scopes and destination.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpConnectorBinding {
+    pub realm_id: String,
+    pub slot_id: String,
+    pub issuer: String,
+    pub client: String,
+    pub resource: String,
+    pub strategy_id: String,
+    /// The provider-verified account subject (the strategy's canonical
+    /// account id) the credential must be bound to.
+    pub account: String,
+    /// Every raw operation the server exposes; an unlisted one is refused.
+    pub operations: BTreeMap<String, McpConnectorOperation>,
+}
+
+/// One raw operation of a connector-bound installation.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpConnectorOperation {
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub required_scopes: BTreeSet<String>,
+    /// `scheme://host[:port]` of the connector API the operation calls.
+    pub destination_origin: String,
+    /// The host's typed declaration that this operation only reads. Absent
+    /// (`false`), the operation is undeclared, never inferred read-only from
+    /// its name, the server's annotations or an access ceiling.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+}
+
+impl McpConnectorBinding {
+    /// The expected binding a connector-bound server receives at startup in
+    /// [`MCP_CONNECTOR_BINDING_ENV`]: per raw operation, the account its
+    /// calls' credential is bound to and the destination origin. No secrets.
+    pub fn startup_projection(&self) -> serde_json::Value {
+        let account = serde_json::json!({
+            "issuer": self.issuer,
+            "strategy_id": self.strategy_id,
+            "subject": self.account,
+        });
+        let operations: serde_json::Map<String, serde_json::Value> = self
+            .operations
+            .iter()
+            .map(|(operation, binding)| {
+                (
+                    operation.clone(),
+                    serde_json::json!({
+                        "account": account,
+                        "destination_origin": binding.destination_origin,
+                    }),
+                )
+            })
+            .collect();
+        serde_json::json!({"version": 1, "operations": operations})
+    }
+}
+
+/// The connector binding a grant approves for one MCP server: an explicit
+/// "no connector", or the canonical identity of the server's full nonsecret
+/// [`McpConnectorBinding`]. The identity covers the credential route (realm
+/// and slot), the verified principal (issuer, strategy, account), the stable
+/// context (client, resource) and every operation's scopes and destination.
+/// It excludes token material, expiry and connection generation, so an
+/// ordinary same-account refresh keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum McpConnectorApproval {
+    /// The server has no connector binding.
+    NoConnector,
+    /// `sha256:<lowercase hex>` of the binding's canonical encoding (see
+    /// [`McpConnectorBinding::approval_identity`]).
+    Connector(String),
+}
+
+impl McpConnectorApproval {
+    /// The approval of `binding`.
+    pub fn of(binding: Option<&McpConnectorBinding>) -> Self {
+        match binding {
+            None => Self::NoConnector,
+            Some(binding) => Self::Connector(binding.approval_identity()),
+        }
+    }
+
+    /// The token a grant records for this approval: `none`, or the
+    /// binding's `sha256:<hex>` identity. Neither contains `/`.
+    pub fn token(&self) -> &str {
+        match self {
+            Self::NoConnector => "none",
+            Self::Connector(identity) => identity,
+        }
+    }
+}
+
+impl McpConnectorBinding {
+    /// `sha256:<lowercase hex>` of the binding's canonical encoding: a
+    /// version tag, then every field in declaration order, each string
+    /// length-prefixed (8-byte little-endian), each map and set prefixed
+    /// with its length and walked in key order. Equal for equal bindings,
+    /// and changed by any field.
+    pub fn approval_identity(&self) -> String {
+        use sha2::{Digest, Sha256};
+        fn put(hasher: &mut Sha256, value: &str) {
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+        let mut hasher = Sha256::new();
+        put(&mut hasher, "mcp-connector-approval/v1");
+        for field in [
+            &self.realm_id,
+            &self.slot_id,
+            &self.issuer,
+            &self.client,
+            &self.resource,
+            &self.strategy_id,
+            &self.account,
+        ] {
+            put(&mut hasher, field);
+        }
+        hasher.update((self.operations.len() as u64).to_le_bytes());
+        for (name, operation) in &self.operations {
+            put(&mut hasher, name);
+            hasher.update((operation.required_scopes.len() as u64).to_le_bytes());
+            for scope in &operation.required_scopes {
+                put(&mut hasher, scope);
+            }
+            put(&mut hasher, &operation.destination_origin);
+            hasher.update([u8::from(operation.read_only)]);
+        }
+        let digest = hasher.finalize();
+        let mut identity = String::with_capacity(7 + digest.len() * 2);
+        identity.push_str("sha256:");
+        for byte in digest {
+            identity.push_str(&format!("{byte:02x}"));
+        }
+        identity
+    }
 }
 
 impl McpServerConfig {
+    /// The connector approval this server's current descriptor requires.
+    pub fn connector_approval(&self) -> McpConnectorApproval {
+        McpConnectorApproval::of(self.connector.as_ref())
+    }
+
+    /// Refuse an access policy that admits nothing or names an empty
+    /// operation, and an account declaration that contradicts the server's
+    /// connector binding or OAuth account selection. Checked before any
+    /// effect when servers are loaded, persisted, staged and connected.
+    pub fn validate_access(&self) -> Result<(), McpServerAccessError> {
+        if self.account == Some(McpAccountDeclaration::NoAccount) {
+            let oauth_selected = matches!(
+                &self.transport,
+                McpTransportConfig::Http(http)
+                    if http.oauth_account.is_some() || http.oauth_account_selection.is_some()
+            );
+            let reason = if self.connector.is_some() {
+                Some("account = \"none\" conflicts with its connector binding")
+            } else if oauth_selected {
+                Some("account = \"none\" conflicts with its OAuth account selection")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                return Err(McpServerAccessError {
+                    server: self.name.clone(),
+                    reason,
+                });
+            }
+        }
+        let Some(access) = &self.access else {
+            return Ok(());
+        };
+        let reason = if access.allowed_operations.is_empty() {
+            Some("allowed_operations must list at least one operation")
+        } else if access.allowed_operations.iter().any(String::is_empty) {
+            Some("operation names must not be empty")
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => Err(McpServerAccessError {
+                server: self.name.clone(),
+                reason,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether this server's access ceiling admits the raw operation
+    /// (always, without one).
+    pub fn permits_operation(&self, raw_operation: &str) -> bool {
+        self.access
+            .as_ref()
+            .is_none_or(|access| access.permits(raw_operation))
+    }
+
+    /// Refuse a `secret_env` declaration that could not be launched
+    /// unambiguously: a name that is not an environment variable name, a
+    /// name that is also a literal `env` entry, or the connector binding's
+    /// variable. Names are compared without ASCII case, as some platforms
+    /// do. Checked before any effect when a server is connected or staged
+    /// and before a secret is stored for it.
+    pub fn validate_secret_env(&self) -> Result<(), McpSecretEnvDeclarationError> {
+        let McpTransportConfig::Stdio(stdio) = &self.transport else {
+            return Ok(());
+        };
+        let reason = stdio.secret_env.iter().find_map(|name| {
+            if !is_env_var_name(name) {
+                Some(
+                    "names must be 1-128 ASCII letters, digits or underscores, not starting with a digit",
+                )
+            } else if name.eq_ignore_ascii_case(MCP_CONNECTOR_BINDING_ENV) {
+                Some("MEERKAT_CONNECTOR_BINDING is set by the connector binding")
+            } else if stdio.env.keys().any(|key| key.eq_ignore_ascii_case(name)) {
+                Some("a secret name must not also be a literal env entry")
+            } else if stdio
+                .secret_env
+                .iter()
+                .any(|other| other != name && other.eq_ignore_ascii_case(name))
+            {
+                Some("secret names must differ beyond ASCII case")
+            } else {
+                None
+            }
+        });
+        match reason {
+            Some(reason) => Err(McpSecretEnvDeclarationError {
+                server: self.name.clone(),
+                reason,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// The canonical non-secret meaning of this stdio server's launch:
+    /// lowercase hex SHA-256 of a version tag, then the server name, the
+    /// command, the ordered arguments, the literal environment (by name),
+    /// the declared secret names and the connector approval
+    /// ([`McpConnectorApproval::token`], which covers the startup binding
+    /// projection), each string length-prefixed (8-byte little-endian) and
+    /// each list prefixed with its length. `None` for an HTTP server.
+    ///
+    /// It is configuration equality only: equal meanings launch the same
+    /// configured command, never proving the executable's bytes, the
+    /// external service or a verified account. Access ceilings, exposed tool
+    /// names and timeouts are not part of it; they are separate checks.
+    pub fn stdio_launch_meaning(&self) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        fn put(hasher: &mut Sha256, value: &str) {
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+        let McpTransportConfig::Stdio(stdio) = &self.transport else {
+            return None;
+        };
+        let mut hasher = Sha256::new();
+        put(&mut hasher, "mcp-stdio-launch-meaning/v1");
+        put(&mut hasher, &self.name);
+        put(&mut hasher, &stdio.command);
+        hasher.update((stdio.args.len() as u64).to_le_bytes());
+        for arg in &stdio.args {
+            put(&mut hasher, arg);
+        }
+        let env: BTreeMap<&str, &str> = stdio
+            .env
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        hasher.update((env.len() as u64).to_le_bytes());
+        for (name, value) in env {
+            put(&mut hasher, name);
+            put(&mut hasher, value);
+        }
+        hasher.update((stdio.secret_env.len() as u64).to_le_bytes());
+        for name in &stdio.secret_env {
+            put(&mut hasher, name);
+        }
+        put(&mut hasher, self.connector_approval().token());
+        let digest = hasher.finalize();
+        let mut meaning = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            meaning.push_str(&format!("{byte:02x}"));
+        }
+        Some(meaning)
+    }
+
     pub fn stdio(
         name: impl Into<String>,
         command: impl Into<String>,
@@ -188,9 +588,13 @@ impl McpServerConfig {
                 command: command.into(),
                 args,
                 env,
+                secret_env: BTreeSet::new(),
             }),
             connect_timeout_secs: None,
             tool_names: BTreeMap::new(),
+            access: None,
+            connector: None,
+            account: None,
         }
     }
 
@@ -210,6 +614,9 @@ impl McpServerConfig {
             }),
             connect_timeout_secs: None,
             tool_names: BTreeMap::new(),
+            access: None,
+            connector: None,
+            account: None,
         }
     }
 
@@ -229,6 +636,9 @@ impl McpServerConfig {
             }),
             connect_timeout_secs: None,
             tool_names: BTreeMap::new(),
+            access: None,
+            connector: None,
+            account: None,
         }
     }
 
@@ -396,6 +806,8 @@ pub enum EffectiveMcpServersError {
     Conflict(#[from] McpServerDefinitionConflict),
     #[error(transparent)]
     RealmEnvReference(#[from] McpRealmServerEnvReference),
+    #[error(transparent)]
+    Access(#[from] McpServerAccessError),
 }
 
 /// The MCP set of a realm-scoped session from its two sources: the realm's
@@ -415,6 +827,12 @@ pub fn compose_effective_mcp_servers(
     file_servers: Vec<McpServerWithScope>,
 ) -> Result<Vec<McpServerWithSource>, EffectiveMcpServersError> {
     reject_realm_server_env_references(realm_servers)?;
+    for server in realm_servers
+        .iter()
+        .chain(file_servers.iter().map(|file| &file.server))
+    {
+        server.validate_access()?;
+    }
     let mut servers: Vec<McpServerWithSource> = realm_servers
         .iter()
         .map(|server| McpServerWithSource {
@@ -539,6 +957,10 @@ impl McpConfigRollback {
 pub enum McpConfigError {
     #[error("IO error: {0}")]
     Io(String),
+    /// The configuration owner refused this write under the config lock;
+    /// nothing was written.
+    #[error("MCP configuration write refused: {0}")]
+    AttachmentRefused(crate::mcp_attachment::McpAttachmentRefusal),
     #[error("Parse error in {path}: {message}")]
     Parse { path: String, message: String },
     #[error("Server '{0}' already exists. Remove it first with: rkat mcp remove {0}")]
@@ -557,6 +979,10 @@ pub enum McpConfigError {
     MissingEnvVar { field: String, var: String },
     #[error("Invalid environment variable reference in {field}: '{value}'")]
     InvalidEnvVarSyntax { field: String, value: String },
+    #[error(transparent)]
+    Access(#[from] McpServerAccessError),
+    #[error(transparent)]
+    SecretEnv(#[from] McpSecretEnvDeclarationError),
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -769,6 +1195,20 @@ impl McpConfig {
         authority: &McpConfigMutationAuthority,
         server: McpServerConfig,
     ) -> Result<McpConfigRollback, McpConfigError> {
+        Self::persist_add_with_rollback_admitted(authority, server, || Ok(())).await
+    }
+
+    /// [`Self::persist_add_with_rollback`] whose `admit` decides the write
+    /// under the cross-process config lock, after the document is read and
+    /// validated and immediately before the revision is reserved and the file
+    /// is written. A refusal writes nothing.
+    pub async fn persist_add_with_rollback_admitted(
+        authority: &McpConfigMutationAuthority,
+        server: McpServerConfig,
+        admit: impl FnOnce() -> Result<(), crate::mcp_attachment::McpAttachmentRefusal>,
+    ) -> Result<McpConfigRollback, McpConfigError> {
+        server.validate_access()?;
+        server.validate_secret_env()?;
         let path = authority.resolved_path()?;
         let lock = acquire_mcp_config_lock(&path).await?;
         let previous = read_existing_bytes(&path).await?;
@@ -780,6 +1220,8 @@ impl McpConfig {
             }
         }
         servers.push(server_table(&server));
+        // The write's owner decides here, holding the config lock.
+        admit().map_err(McpConfigError::AttachmentRefused)?;
         // Reserve and fsync a fresh cross-process revision before mutating the
         // config file. If the process crashes after this point, older rollback
         // tokens fail closed instead of overwriting the uncertain result.
@@ -1010,6 +1452,9 @@ async fn read_mcp_file_raw(path: Option<&Path>) -> Result<McpConfig, McpConfigEr
         path: path.display().to_string(),
         message: e.to_string(),
     })?;
+    for server in &parsed.servers {
+        server.validate_access()?;
+    }
     Ok(parsed)
 }
 
@@ -1126,6 +1571,10 @@ fn server_table(server: &McpServerConfig) -> Table {
             if !stdio.env.is_empty() {
                 table["env"] = toml_edit::value(string_map(&stdio.env));
             }
+            if !stdio.secret_env.is_empty() {
+                let names: Vec<String> = stdio.secret_env.iter().cloned().collect();
+                table["secret_env"] = toml_edit::value(string_array(&names));
+            }
         }
         McpTransportConfig::Http(http) => {
             table["url"] = toml_edit::value(&http.url);
@@ -1156,6 +1605,57 @@ fn server_table(server: &McpServerConfig) -> Table {
     if let Some(timeout) = server.connect_timeout_secs {
         table["connect_timeout_secs"] = toml_edit::value(i64::from(timeout));
     }
+    if let Some(access) = &server.access {
+        let mut policy = toml_edit::InlineTable::new();
+        let operations: Vec<String> = access.allowed_operations.iter().cloned().collect();
+        policy.insert("allowed_operations", string_array(&operations).into());
+        table["access"] = toml_edit::value(policy);
+    }
+    if let Some(connector) = &server.connector {
+        table["connector"] = toml_edit::value(connector_table(connector));
+    }
+    if let Some(account) = server.account {
+        table["account"] = toml_edit::value(account.as_str());
+    }
+    table
+}
+
+/// The persisted form of a connector binding, read back by the same serde
+/// definition.
+#[cfg(not(target_arch = "wasm32"))]
+fn connector_table(connector: &McpConnectorBinding) -> toml_edit::InlineTable {
+    let mut operations = toml_edit::InlineTable::new();
+    for (operation, binding) in &connector.operations {
+        let mut entry = toml_edit::InlineTable::new();
+        if !binding.required_scopes.is_empty() {
+            let scopes: Vec<String> = binding.required_scopes.iter().cloned().collect();
+            entry.insert(
+                "required_scopes",
+                toml_edit::Value::Array(string_array(&scopes)),
+            );
+        }
+        entry.insert(
+            "destination_origin",
+            binding.destination_origin.as_str().into(),
+        );
+        if binding.read_only {
+            entry.insert("read_only", true.into());
+        }
+        operations.insert(operation, toml_edit::Value::InlineTable(entry));
+    }
+    let mut table = toml_edit::InlineTable::new();
+    for (key, value) in [
+        ("realm_id", &connector.realm_id),
+        ("slot_id", &connector.slot_id),
+        ("issuer", &connector.issuer),
+        ("client", &connector.client),
+        ("resource", &connector.resource),
+        ("strategy_id", &connector.strategy_id),
+        ("account", &connector.account),
+    ] {
+        table.insert(key, value.as_str().into());
+    }
+    table.insert("operations", toml_edit::Value::InlineTable(operations));
     table
 }
 
@@ -1278,7 +1778,14 @@ where
                 .map(|arg| expand_env_in_string_with(&arg, "servers[].args", env))
                 .collect::<Result<Vec<_>, _>>()?;
             let env = expand_env_in_map_with(stdio.env, "servers[].env", env)?;
-            McpTransportConfig::Stdio(McpStdioConfig { command, args, env })
+            // Secret names are never expanded: their values are not
+            // configuration.
+            McpTransportConfig::Stdio(McpStdioConfig {
+                command,
+                args,
+                env,
+                secret_env: stdio.secret_env,
+            })
         }
         McpTransportConfig::Http(http) => {
             let url = expand_env_in_string_with(&http.url, "servers[].url", env)?;
@@ -1297,6 +1804,9 @@ where
         transport,
         connect_timeout_secs: server.connect_timeout_secs,
         tool_names: server.tool_names,
+        access: server.access,
+        connector: server.connector,
+        account: server.account,
     })
 }
 
@@ -1423,7 +1933,17 @@ pub enum McpRealmPersistError {
     #[error(transparent)]
     EnvReference(#[from] McpRealmServerEnvReference),
     #[error(transparent)]
+    Access(#[from] McpServerAccessError),
+    #[error(transparent)]
     Config(#[from] crate::config_runtime::ConfigRuntimeError),
+    /// The host's entry check refused an admitted write
+    /// ([`McpRealmPersistTarget::add_entered`]): nothing was written.
+    #[error(transparent)]
+    NotAdmitted(crate::AdministrationEntryRefusal),
+    /// An admitted write began and failed: the realm's own document may or
+    /// may not list the server.
+    #[error("the realm config write's outcome is unknown: {0}")]
+    OutcomeUnknown(crate::config_runtime::ConfigRuntimeError),
 }
 
 /// The selected realm's own config document as the target of a persisted
@@ -1463,13 +1983,55 @@ impl<'a> McpRealmPersistTarget<'a> {
         server: McpServerConfig,
         expected_generation: Option<u64>,
     ) -> Result<crate::config_runtime::ConfigSnapshot, McpRealmPersistError> {
+        let (servers, generation) = self.with_added(server, expected_generation).await?;
+        self.write(&servers, generation).await
+    }
+
+    /// [`Self::add`], admitted by `entry` at the write's entry
+    /// ([`crate::ConfigRuntime::patch_entered`]): after the document's locks
+    /// and the reviewed-generation check, immediately before the document is
+    /// written. A refusal there writes nothing
+    /// ([`McpRealmPersistError::NotAdmitted`]); a failure after it is
+    /// [`McpRealmPersistError::OutcomeUnknown`].
+    pub async fn add_entered(
+        &self,
+        server: McpServerConfig,
+        expected_generation: Option<u64>,
+        entry: &dyn crate::AdministrationEntry,
+    ) -> Result<crate::config_runtime::ConfigSnapshot, McpRealmPersistError> {
+        let (servers, generation) = self.with_added(server, expected_generation).await?;
+        self.runtime
+            .patch_entered(Self::servers_delta(&servers)?, Some(generation), entry)
+            .await
+            .map_err(|error| match error {
+                crate::config_runtime::EnteredConfigWriteError::NotWritten(error) => {
+                    McpRealmPersistError::Config(error)
+                }
+                crate::config_runtime::EnteredConfigWriteError::NotAdmitted(refusal) => {
+                    McpRealmPersistError::NotAdmitted(refusal)
+                }
+                crate::config_runtime::EnteredConfigWriteError::OutcomeUnknown(error) => {
+                    McpRealmPersistError::OutcomeUnknown(error)
+                }
+            })
+    }
+
+    /// The realm's own servers with `server` added, and the generation the
+    /// write is checked against. A server holding an environment reference
+    /// is refused before anything is read.
+    async fn with_added(
+        &self,
+        server: McpServerConfig,
+        expected_generation: Option<u64>,
+    ) -> Result<(Vec<McpServerConfig>, u64), McpRealmPersistError> {
         reject_realm_server_env_references(std::slice::from_ref(&server))?;
+        server.validate_access()?;
         let (mut servers, generation) = self.current(expected_generation).await?;
         if servers.iter().any(|existing| existing.name == server.name) {
             return Err(McpRealmPersistError::ServerExists(server.name));
         }
         servers.push(server);
-        self.write(&servers, generation).await
+        Ok((servers, generation))
     }
 
     /// Remove the server named `server_name` from the realm's own document.
@@ -1513,22 +2075,26 @@ impl<'a> McpRealmPersistTarget<'a> {
         servers: &[McpServerConfig],
         generation: u64,
     ) -> Result<crate::config_runtime::ConfigSnapshot, McpRealmPersistError> {
-        // An emptied list is removed rather than written as `[]`.
+        Ok(self
+            .runtime
+            .patch(Self::servers_delta(servers)?, Some(generation))
+            .await?)
+    }
+
+    /// The patch that makes `servers` the realm's own list. An emptied list
+    /// is removed rather than written as `[]`.
+    fn servers_delta(
+        servers: &[McpServerConfig],
+    ) -> Result<crate::config::ConfigDelta, McpRealmPersistError> {
         let servers = if servers.is_empty() {
             serde_json::Value::Null
         } else {
             serde_json::to_value(servers)
                 .map_err(crate::config_runtime::ConfigRuntimeError::Json)?
         };
-        Ok(self
-            .runtime
-            .patch(
-                crate::config::ConfigDelta(
-                    serde_json::json!({ "tools": { "mcp_servers": servers } }),
-                ),
-                Some(generation),
-            )
-            .await?)
+        Ok(crate::config::ConfigDelta(
+            serde_json::json!({ "tools": { "mcp_servers": servers } }),
+        ))
     }
 }
 
@@ -2031,6 +2597,69 @@ command = "echo"
         );
     }
 
+    /// The write's owner decides only after the config lock is held: while
+    /// another writer holds it, nothing has been decided; a refusal under the
+    /// lock writes nothing; an admitted write lands.
+    #[tokio::test]
+    async fn an_admitted_add_is_decided_under_the_held_config_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let temp = TempDir::new().unwrap();
+        let authority = McpConfigMutationAuthority::project(Some(temp.path().to_path_buf()), None);
+        let path = authority.resolved_path().unwrap();
+        let held = acquire_mcp_config_lock(&path).await.unwrap();
+        let decided = std::sync::Arc::new(AtomicBool::new(false));
+        let write = tokio::spawn({
+            let authority = authority.clone();
+            let decided = std::sync::Arc::clone(&decided);
+            async move {
+                McpConfig::persist_add_with_rollback_admitted(
+                    &authority,
+                    McpServerConfig::stdio("held", "echo", vec![], HashMap::new()),
+                    move || {
+                        decided.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !decided.load(Ordering::SeqCst),
+            "no decision while another writer holds the config lock"
+        );
+        drop(held);
+        let rollback = write.await.unwrap().expect("admitted write");
+        assert!(decided.load(Ordering::SeqCst));
+        assert!(
+            McpConfig::load_from_paths(None, Some(&path))
+                .await
+                .unwrap()
+                .servers
+                .iter()
+                .any(|server| server.name == "held")
+        );
+        rollback.rollback().await.unwrap();
+
+        let refused = McpConfig::persist_add_with_rollback_admitted(
+            &authority,
+            McpServerConfig::stdio("refused", "echo", vec![], HashMap::new()),
+            || Err(crate::mcp_attachment::McpAttachmentRefusal::Denied),
+        )
+        .await;
+        assert!(matches!(
+            refused,
+            Err(McpConfigError::AttachmentRefused(
+                crate::mcp_attachment::McpAttachmentRefusal::Denied
+            ))
+        ));
+        let servers = McpConfig::load_from_paths(None, Some(&path))
+            .await
+            .map(|config| config.servers)
+            .unwrap_or_default();
+        assert!(servers.iter().all(|server| server.name != "refused"));
+    }
+
     #[tokio::test]
     async fn tool_names_round_trip_persistence_without_environment_expansion() {
         let temp = TempDir::new().unwrap();
@@ -2053,6 +2682,50 @@ command = "echo"
             serde_json::from_value::<McpServerConfig>(json).unwrap(),
             expected
         );
+        rollback.rollback().await.unwrap();
+    }
+
+    /// A persisted connector binding survives the reload a fresh process
+    /// does. (Fails-old: the writer omitted it, so the reload lost it.)
+    #[tokio::test]
+    async fn connector_binding_round_trips_persistence() {
+        let temp = TempDir::new().unwrap();
+        let authority = McpConfigMutationAuthority::project(Some(temp.path().to_path_buf()), None);
+        let mut server = McpServerConfig::stdio("services", "services-mcp", vec![], HashMap::new());
+        server.connector = Some(McpConnectorBinding {
+            realm_id: "tenant-a".into(),
+            slot_id: "mail-work".into(),
+            issuer: "https://issuer.example".into(),
+            client: "client".into(),
+            resource: "https://mail.example".into(),
+            strategy_id: "oidc-userinfo-v1".into(),
+            account: "subject-a".into(),
+            operations: BTreeMap::from([
+                (
+                    "gmail_read_text_part".into(),
+                    McpConnectorOperation {
+                        required_scopes: ["mail.readonly".to_owned()].into(),
+                        destination_origin: "https://mail.example".into(),
+                        read_only: false,
+                    },
+                ),
+                (
+                    "gmail_profile".into(),
+                    McpConnectorOperation {
+                        required_scopes: BTreeSet::new(),
+                        destination_origin: "https://mail.example".into(),
+                        read_only: true,
+                    },
+                ),
+            ]),
+        });
+        let expected = server.clone();
+        let rollback = McpConfig::persist_add_with_rollback(&authority, server)
+            .await
+            .unwrap();
+        let path = temp.path().join(".rkat/mcp.toml");
+        let loaded = McpConfig::load_from_paths(None, Some(&path)).await.unwrap();
+        assert_eq!(loaded.servers, vec![expected]);
         rollback.rollback().await.unwrap();
     }
 
@@ -2523,6 +3196,255 @@ command = "remove-cmd"
         .expect("mcp.toml servers keep their expansion");
     }
 
+    /// An access ceiling survives the realm document: written by the
+    /// realm writer, read back by a fresh runtime over the same files (a new
+    /// process), and composed into the realm's MCP set unchanged.
+    #[tokio::test]
+    async fn access_ceiling_survives_the_realm_document() {
+        let dir = TempDir::new().unwrap();
+        let mut server =
+            McpServerConfig::streamable_http("slack", "https://mcp.example/slack", HashMap::new());
+        server.access = Some(McpServerAccess::allowing(["channels_list", "history"]));
+        tokio::fs::write(dir.path().join("config.toml"), "")
+            .await
+            .unwrap();
+        {
+            let runtime = realm_runtime(dir.path());
+            McpRealmPersistTarget::new(&runtime)
+                .add(server.clone(), None)
+                .await
+                .unwrap();
+        }
+        let written = tokio::fs::read_to_string(dir.path().join("config.toml"))
+            .await
+            .unwrap();
+        assert!(written.contains("allowed_operations"), "{written}");
+
+        let fresh = realm_runtime(dir.path());
+        let (servers, _) = McpRealmPersistTarget::new(&fresh).servers().await.unwrap();
+        assert_eq!(servers, vec![server.clone()]);
+        let composed = compose_effective_mcp_servers(&servers, vec![]).unwrap();
+        let composed = &composed[0].server;
+        assert!(composed.permits_operation("history"));
+        assert!(composed.permits_operation("channels_list"));
+        assert!(!composed.permits_operation("post_message"));
+    }
+
+    /// An access policy that admits nothing, or names an empty operation, is
+    /// refused by the realm writer and by composition; an unknown policy key
+    /// is refused when parsed.
+    #[tokio::test]
+    async fn invalid_access_policies_are_refused() {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("config.toml"), "")
+            .await
+            .unwrap();
+        let runtime = realm_runtime(dir.path());
+        let mut empty = McpServerConfig::stdio("empty", "/bin/true", vec![], HashMap::new());
+        empty.access = Some(McpServerAccess::allowing(Vec::<String>::new()));
+        let refused = McpRealmPersistTarget::new(&runtime)
+            .add(empty.clone(), None)
+            .await
+            .expect_err("an empty ceiling");
+        assert!(
+            matches!(refused, McpRealmPersistError::Access(_)),
+            "{refused:?}"
+        );
+        let refused = compose_effective_mcp_servers(&[empty], vec![])
+            .expect_err("composition refuses it too");
+        assert!(
+            matches!(refused, EffectiveMcpServersError::Access(_)),
+            "{refused:?}"
+        );
+
+        let mut blank = McpServerConfig::stdio("blank", "/bin/true", vec![], HashMap::new());
+        blank.access = Some(McpServerAccess::allowing([""]));
+        assert!(blank.validate_access().is_err());
+
+        let unknown: Result<McpConfig, _> = toml::from_str(
+            "[[servers]]\nname = \"s\"\ncommand = \"/bin/true\"\n[servers.access]\nallowed_operations = [\"a\"]\nwrites = true\n",
+        );
+        assert!(unknown.is_err(), "an unknown access key is refused");
+    }
+
+    /// `account = "none"` is the host's declaration that a server acts with no
+    /// selected account. It survives the native `mcp.toml` writer and a
+    /// reload, is omitted when absent, and is refused next to a connector
+    /// binding or an OAuth account selection, which state an account
+    /// themselves.
+    #[tokio::test]
+    async fn an_account_declaration_round_trips_and_conflicts_with_an_account_source() {
+        let parsed: McpConfig = toml::from_str(
+            "[[servers]]\nname = \"s\"\ncommand = \"/bin/true\"\naccount = \"none\"\n",
+        )
+        .unwrap();
+        let declared = &parsed.servers[0];
+        assert_eq!(declared.account, Some(McpAccountDeclaration::NoAccount));
+        assert!(declared.validate_access().is_ok());
+        let encoded = serde_json::to_value(declared).unwrap();
+        assert_eq!(encoded["account"], "none");
+        let undeclared = McpServerConfig::stdio("s", "/bin/true", vec![], HashMap::new());
+        assert!(
+            serde_json::to_value(&undeclared)
+                .unwrap()
+                .get("account")
+                .is_none()
+        );
+        // Saved through the native writer and reloaded, the declaration is
+        // kept exactly; an undeclared server stays undeclared.
+        let temp = TempDir::new().unwrap();
+        let authority = McpConfigMutationAuthority::project(Some(temp.path().to_path_buf()), None);
+        let mut kept = declared.clone();
+        kept.name = "declared".into();
+        let mut plain = undeclared.clone();
+        plain.name = "plain".into();
+        for server in [kept.clone(), plain.clone()] {
+            // The written document is the evidence; nothing is rolled back.
+            let _committed = McpConfig::persist_add_with_rollback(&authority, server)
+                .await
+                .unwrap();
+        }
+        let path = temp.path().join(".rkat/mcp.toml");
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(
+            written.matches("account = \"none\"").count(),
+            1,
+            "{written}"
+        );
+        let loaded = McpConfig::load_from_paths(None, Some(&path)).await.unwrap();
+        assert_eq!(loaded.servers, vec![kept, plain]);
+        let unknown: Result<McpConfig, _> = toml::from_str(
+            "[[servers]]\nname = \"s\"\ncommand = \"/bin/true\"\naccount = \"anyone\"\n",
+        );
+        assert!(unknown.is_err(), "only `none` is a declaration");
+
+        let mut oauth =
+            McpServerConfig::streamable_http("o", "https://mcp.example", HashMap::new());
+        if let McpTransportConfig::Http(http) = &mut oauth.transport {
+            http.oauth_account = Some("subject-7".into());
+        }
+        oauth.account = Some(McpAccountDeclaration::NoAccount);
+        assert!(oauth.validate_access().is_err());
+        let mut discover =
+            McpServerConfig::streamable_http("d", "https://mcp.example", HashMap::new());
+        if let McpTransportConfig::Http(http) = &mut discover.transport {
+            http.oauth_account_selection = Some(McpOAuthAccountSelection::Discover);
+        }
+        discover.account = Some(McpAccountDeclaration::NoAccount);
+        assert!(discover.validate_access().is_err());
+        let mut bound = McpServerConfig::stdio("c", "/bin/true", vec![], HashMap::new());
+        bound.connector = Some(McpConnectorBinding {
+            realm_id: "r".into(),
+            slot_id: "mail".into(),
+            issuer: "https://issuer.example".into(),
+            client: "client".into(),
+            resource: "https://api.example".into(),
+            strategy_id: "oidc-userinfo-v1".into(),
+            account: "subject-7".into(),
+            operations: BTreeMap::new(),
+        });
+        bound.account = Some(McpAccountDeclaration::NoAccount);
+        let refused = bound
+            .validate_access()
+            .expect_err("a binding states its account");
+        assert!(
+            refused.to_string().contains("connector binding"),
+            "{refused}"
+        );
+    }
+
+    /// The `mcp.toml` writer refuses an empty ceiling before it writes, and
+    /// loading a file that holds one is a typed error.
+    #[tokio::test]
+    async fn mcp_toml_refuses_an_empty_access_ceiling() {
+        let temp = TempDir::new().unwrap();
+        let authority = McpConfigMutationAuthority::project(Some(temp.path().to_path_buf()), None);
+        let mut empty = McpServerConfig::stdio("empty", "/bin/true", vec![], HashMap::new());
+        empty.access = Some(McpServerAccess::allowing(Vec::<String>::new()));
+        let refused = McpConfig::persist_add_with_rollback(&authority, empty)
+            .await
+            .expect_err("an empty ceiling is refused");
+        assert!(matches!(refused, McpConfigError::Access(_)), "{refused:?}");
+        let path = authority.resolved_path().unwrap();
+        assert!(!path.exists(), "nothing was written");
+
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(
+            &path,
+            "[[servers]]\nname = \"empty\"\ncommand = \"/bin/true\"\n[servers.access]\nallowed_operations = []\n",
+        )
+        .await
+        .unwrap();
+        let refused = McpConfig::load_from_paths(None, Some(&path))
+            .await
+            .expect_err("loading an empty ceiling is refused");
+        assert!(matches!(refused, McpConfigError::Access(_)), "{refused:?}");
+    }
+
+    /// An `mcp.toml` server keeps its access ceiling through the file writer.
+    #[tokio::test]
+    async fn access_ceiling_survives_the_mcp_toml_writer() {
+        let temp = TempDir::new().unwrap();
+        let authority = McpConfigMutationAuthority::project(Some(temp.path().to_path_buf()), None);
+        let mut server = McpServerConfig::stdio("files", "/bin/true", vec![], HashMap::new());
+        server.access = Some(McpServerAccess::allowing(["read_file", "list_dir"]));
+
+        McpConfig::persist_add_with_rollback(&authority, server.clone())
+            .await
+            .unwrap();
+
+        let path = authority.resolved_path().unwrap();
+        let reloaded = McpConfig::load_from_paths(None, Some(&path)).await.unwrap();
+        assert_eq!(reloaded.servers, vec![server]);
+    }
+
+    /// An `mcp.toml` stdio server keeps its declared secret names through
+    /// the file writer and the reload a fresh process does, and an invalid
+    /// declaration is refused before anything is written. (Fails-old: the
+    /// writer omitted `secret_env`, so the reload declared no secret.)
+    #[tokio::test]
+    async fn secret_env_declaration_survives_the_mcp_toml_writer() {
+        let temp = TempDir::new().unwrap();
+        let authority = McpConfigMutationAuthority::project(Some(temp.path().to_path_buf()), None);
+        let mut server = McpServerConfig::stdio(
+            "search",
+            "/bin/true",
+            vec!["--stdio".into()],
+            HashMap::from([("LOG_LEVEL".into(), "info".into())]),
+        );
+        if let McpTransportConfig::Stdio(stdio) = &mut server.transport {
+            stdio.secret_env = BTreeSet::from(["SEARCH_API_KEY".into(), "SEARCH_TOKEN".into()]);
+        }
+
+        McpConfig::persist_add_with_rollback(&authority, server.clone())
+            .await
+            .unwrap();
+
+        let path = authority.resolved_path().unwrap();
+        let reloaded = McpConfig::load_from_paths(None, Some(&path)).await.unwrap();
+        assert_eq!(reloaded.servers, vec![server]);
+
+        let written = tokio::fs::read(&path).await.unwrap();
+        let mut invalid = McpServerConfig::stdio("invalid", "/bin/true", vec![], HashMap::new());
+        if let McpTransportConfig::Stdio(stdio) = &mut invalid.transport {
+            stdio.secret_env.insert("HAS-DASH".into());
+        }
+        let refused = McpConfig::persist_add_with_rollback(&authority, invalid)
+            .await
+            .expect_err("an invalid declaration is refused");
+        assert!(
+            matches!(refused, McpConfigError::SecretEnv(_)),
+            "{refused:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(&path).await.unwrap(),
+            written,
+            "nothing was written"
+        );
+    }
+
     fn realm_runtime(dir: &Path) -> crate::config_runtime::ConfigRuntime {
         crate::config_runtime::ConfigRuntime::new(
             std::sync::Arc::new(crate::config_store::FileConfigStore::new(
@@ -2623,5 +3545,188 @@ command = "remove-cmd"
             "the emptied list is removed: {written}"
         );
         assert!(written.starts_with(doc), "{written}");
+    }
+
+    /// A host's entry check for the realm writer's admitted form: admits
+    /// while `admin` holds and counts its calls. Its admission holds a probe
+    /// that records, when the writer releases it, whether the realm's own
+    /// document lists the server named `entered`.
+    struct HeldEntry {
+        admin: std::sync::atomic::AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+        document: std::path::PathBuf,
+        listed_at_release: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+    }
+
+    impl HeldEntry {
+        fn new(document: std::path::PathBuf) -> Self {
+            Self {
+                admin: std::sync::atomic::AtomicBool::new(true),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                document,
+                listed_at_release: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            }
+        }
+
+        fn set_admin(&self, admin: bool) {
+            self.admin.store(admin, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn listed_at_release(&self) -> Option<bool> {
+            *self.listed_at_release.lock().unwrap()
+        }
+    }
+
+    struct ReleaseProbe {
+        document: std::path::PathBuf,
+        listed: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+    }
+
+    impl Drop for ReleaseProbe {
+        fn drop(&mut self) {
+            let listed =
+                std::fs::read_to_string(&self.document).is_ok_and(|text| text.contains("entered"));
+            if let Ok(mut slot) = self.listed.lock() {
+                *slot = Some(listed);
+            }
+        }
+    }
+
+    impl crate::AdministrationEntry for HeldEntry {
+        fn enter(&self) -> Result<crate::EnteredAdministration, crate::AdministrationEntryRefusal> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !self.admin.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::AdministrationEntryRefusal::NotAdministrator);
+            }
+            Ok(crate::EnteredAdministration::holding(ReleaseProbe {
+                document: self.document.clone(),
+                listed: std::sync::Arc::clone(&self.listed_at_release),
+            }))
+        }
+    }
+
+    /// The admitted realm write checks the caller only at its entry, after
+    /// the reviewed-generation check, writes nothing when refused there, and
+    /// releases the admission only once the document is written.
+    #[tokio::test]
+    async fn an_admitted_realm_write_is_checked_at_its_entry_and_held_until_it_settles() {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("config.toml"), "")
+            .await
+            .unwrap();
+        let runtime = realm_runtime(dir.path());
+        let target = McpRealmPersistTarget::new(&runtime);
+        let server = McpServerConfig::stdio("entered", "/bin/true", vec![], HashMap::new());
+        let entry = HeldEntry::new(dir.path().join("config.toml"));
+
+        // A stale review is refused before the entry, which never runs.
+        let stale = target
+            .add_entered(server.clone(), Some(7), &entry)
+            .await
+            .expect_err("a stale review");
+        assert!(
+            matches!(
+                stale,
+                McpRealmPersistError::Config(
+                    crate::config_runtime::ConfigRuntimeError::GenerationConflict {
+                        expected: 7,
+                        current: 0
+                    }
+                )
+            ),
+            "{stale:?}"
+        );
+        assert_eq!(entry.calls(), 0);
+
+        // Refused at its entry: nothing is written.
+        entry.set_admin(false);
+        let refused = target
+            .add_entered(server.clone(), Some(0), &entry)
+            .await
+            .expect_err("not admitted");
+        assert!(
+            matches!(
+                refused,
+                McpRealmPersistError::NotAdmitted(
+                    crate::AdministrationEntryRefusal::NotAdministrator
+                )
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(entry.calls(), 1);
+        assert_eq!(target.servers().await.unwrap(), (Vec::new(), 0));
+
+        // Admitted: written, the admission released only after the write.
+        entry.set_admin(true);
+        let snapshot = target
+            .add_entered(server.clone(), Some(0), &entry)
+            .await
+            .expect("admitted");
+        assert_eq!(snapshot.generation, 1);
+        assert_eq!(target.servers().await.unwrap(), (vec![server], 1));
+        assert_eq!(
+            entry.listed_at_release(),
+            Some(true),
+            "the admission is held until the write settles"
+        );
+    }
+
+    /// A caller that loses its administration while its write waits for the
+    /// document's custody is refused at the write's entry, with nothing
+    /// written: a check before the wait would have admitted it.
+    #[tokio::test]
+    async fn a_caller_revoked_while_its_realm_write_waits_is_refused_at_entry() {
+        let dir = TempDir::new().unwrap();
+        tokio::fs::write(dir.path().join("config.toml"), "")
+            .await
+            .unwrap();
+        let runtime = std::sync::Arc::new(realm_runtime(dir.path()));
+        let server = McpServerConfig::stdio("entered", "/bin/true", vec![], HashMap::new());
+        let entry = std::sync::Arc::new(HeldEntry::new(dir.path().join("config.toml")));
+
+        // Another writer holds the document's custody.
+        let held = crate::config_runtime::ConfigWriterLock::try_hold(
+            &dir.path().join("config_state.lock"),
+        )
+        .unwrap()
+        .expect("config writer custody");
+        let write = tokio::spawn({
+            let runtime = std::sync::Arc::clone(&runtime);
+            let entry = std::sync::Arc::clone(&entry);
+            async move {
+                McpRealmPersistTarget::new(&runtime)
+                    .add_entered(server, Some(0), entry.as_ref())
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!write.is_finished(), "the write waits for the custody");
+        assert_eq!(entry.calls(), 0, "nothing is admitted before the custody");
+
+        // The caller loses its administration while the write waits.
+        entry.set_admin(false);
+        drop(held);
+        let refused = write
+            .await
+            .unwrap()
+            .expect_err("refused at the write's entry");
+        assert!(
+            matches!(refused, McpRealmPersistError::NotAdmitted(_)),
+            "{refused:?}"
+        );
+        assert_eq!(entry.calls(), 1);
+        assert_eq!(
+            McpRealmPersistTarget::new(&runtime)
+                .servers()
+                .await
+                .unwrap(),
+            (Vec::new(), 0),
+            "nothing was written"
+        );
+        assert_eq!(entry.listed_at_release(), None, "nothing was entered");
     }
 }

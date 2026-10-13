@@ -577,11 +577,23 @@ impl SessionResumeVerdict {
         let head_revision = authority.head_revision();
         match authority.observation.as_ref() {
             None => SessionResumeLifecycle::NoCurrentDurableAuthority,
+            // Archived on either RuntimeStore projection of the absorbing
+            // terminal, as the session owner reads it: the catalog terminal,
+            // or a retired or destroyed runtime lifecycle. A runtime-backed
+            // archive commits only the lifecycle row; it never rewrites the
+            // session body the catalog terminal is derived from.
             Some(observation)
                 if observation
                     .catalog_entry()
                     .and_then(|entry| entry.lifecycle_terminal())
-                    .is_some_and(meerkat_core::SessionLifecycleTerminal::is_archived) =>
+                    .is_some_and(meerkat_core::SessionLifecycleTerminal::is_archived)
+                    || matches!(
+                        runtime_state,
+                        Some(
+                            meerkat_runtime::RuntimeState::Retired
+                                | meerkat_runtime::RuntimeState::Destroyed
+                        )
+                    ) =>
             {
                 SessionResumeLifecycle::Archived {
                     revivable: matches!(
@@ -1127,6 +1139,63 @@ impl MemberSessionActivity {
     }
 }
 
+/// What a member's session service observed about the controller route of
+/// one exact live actor, from the client that actor actually pinned.
+///
+/// Only the bounded report leaves the service: never the client, and no other
+/// client is constructed, probed or called to make it. The report is an
+/// observation, not permission or proof of future credential currentness:
+/// ordinary admission and use checks stay authoritative. `Unavailable` and
+/// `Unsupported` are typed answers, never a substituted key or a permissive
+/// default; a host that requires the route refuses them itself.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ControllerRouteObservation {
+    /// The route report of the client the actor pinned: observed bounded
+    /// facts, not permission or credential currentness.
+    Reported(meerkat::controller_route::ControllerRouteReport),
+    /// The actor pinned no controller client with coherent route facts for
+    /// its selection (for example a custom builder or client without them).
+    Unavailable,
+    /// The member's session service cannot pin its actors' controllers.
+    Unsupported,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ControllerRouteObservation {
+    /// The report, when one was observed.
+    pub fn report(&self) -> Option<&meerkat::controller_route::ControllerRouteReport> {
+        match self {
+            Self::Reported(report) => Some(report),
+            Self::Unavailable | Self::Unsupported => None,
+        }
+    }
+
+    /// The observation of one exact actor's pin: its client's report, or
+    /// `Unavailable` when the client has no coherent route facts or the
+    /// still-live actor answered that its agent pins no controller client.
+    /// Any other failure (a lost, replaced or retiring actor) stays an error.
+    fn from_pinned(
+        pinned: Result<meerkat_core::ControllerModelClient, SessionError>,
+        actor: &meerkat_session::LiveSessionActorWitness,
+    ) -> Result<Self, SessionError> {
+        match pinned {
+            Ok(client) => Ok(meerkat::controller_route::controller_route_report(&client)
+                .map_or(Self::Unavailable, Self::Reported)),
+            Err(SessionError::Agent(meerkat_core::error::AgentError::OperationRefused {
+                refusal,
+            })) if refusal.kind()
+                == meerkat_core::authorization::OperationRefusalKind::MalformedFacts
+                && actor.is_live() =>
+            {
+                Ok(Self::Unavailable)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
 /// Extension trait for session services used by the mob runtime.
 ///
 /// Builds on `SessionServiceCommsExt` from core so mob orchestration can use
@@ -1136,6 +1205,13 @@ impl MemberSessionActivity {
 pub trait MobSessionService:
     SessionServiceCommsExt + SessionServiceControlExt + SessionServiceHistoryExt
 {
+    /// Wait until every actor removed for `session_id` has exited. An
+    /// ordinary removed-actor exit joins the release of what its agent owned
+    /// (its MCP router's own surface lineages); an aborted or panicked one
+    /// only drops it. Call it with no runtime boundary held.
+    /// Services without actors have nothing to wait for.
+    async fn await_removed_actor_exit(&self, _session_id: &SessionId) {}
+
     /// Record a typed system notice in the live session's durable transcript
     /// without a turn (no model call). The caller holds the runtime
     /// turn-finalization boundary and the actor is idle. Services without
@@ -1604,6 +1680,15 @@ pub trait MobSessionService:
         Ok(None)
     }
 
+    /// The live session's actual visible tool definitions, as its built
+    /// agent owns them. `None` when this service cannot report them.
+    async fn live_visible_tool_defs(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Option<Vec<meerkat_core::ToolDef>>, SessionError> {
+        Ok(None)
+    }
+
     async fn external_tool_surface_snapshot(
         &self,
         _session_id: &SessionId,
@@ -1793,7 +1878,7 @@ pub trait MobSessionService:
 
     /// Load the persisted session METADATA view when available.
     ///
-    /// Metadata-only sibling of [`Self::load_persisted_session`] (mobkit
+    /// Metadata-only sibling of [`Self::load_persisted_session`] (meta
     /// ask-24 clause 3): ownership routing, policy resolution, and presence
     /// probes that only need session-authority metadata facts must not force
     /// a full transcript materialization. Visibility parity with
@@ -2081,6 +2166,43 @@ pub trait MobSessionService:
         )))
     }
 
+    /// The controller route of the exact live actor `actor`, observed from
+    /// the client that actor actually pinned, while the caller already owns
+    /// that session's runtime turn-finalization boundary (B is never
+    /// reacquired here). Only the report leaves (see
+    /// [`ControllerRouteObservation`]). A service that cannot pin its actors'
+    /// controllers keeps this default and reports `Unsupported`; a lost or
+    /// replaced actor is an error.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn controller_route_under_runtime_turn_boundary(
+        &self,
+        actor: &meerkat_session::LiveSessionActorWitness,
+    ) -> Result<ControllerRouteObservation, SessionError> {
+        let _ = actor;
+        Ok(ControllerRouteObservation::Unsupported)
+    }
+
+    /// The controller client the exact live actor `actor` actually
+    /// selected, pinned while the caller already owns that session's runtime
+    /// turn-finalization boundary (B is never reacquired here): a command to
+    /// that actor. A member executor attachment's publication owner calls it
+    /// for [`meerkat_runtime::MeerkatMachine::with_admitted_original`] after
+    /// acquiring this service's own boundary through
+    /// [`Self::acquire_runtime_turn_finalization_guard`], so a service
+    /// implements both or neither. A service without a turn boundary of its
+    /// own keeps this default and refuses with `SessionError::Unsupported`: a
+    /// no-op boundary is never custody. A lost or replaced actor is an error.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn pin_controller_client_under_runtime_turn_boundary(
+        &self,
+        actor: &meerkat_session::LiveSessionActorWitness,
+    ) -> Result<meerkat_core::ControllerModelClient, SessionError> {
+        Err(SessionError::Unsupported(format!(
+            "session service cannot pin the controller of a live actor of session {} under its turn boundary",
+            actor.session_id()
+        )))
+    }
+
     /// Discard only process-local material for one exact actor after the
     /// runtime store lost durable write authority. The caller owns either the
     /// exact degraded-registration coordinator or, after terminal settlement,
@@ -2177,6 +2299,14 @@ impl<B> MobSessionService for meerkat_session::EphemeralSessionService<B>
 where
     B: meerkat_session::SessionAgentBuilder + 'static,
 {
+    async fn await_removed_actor_exit(&self, session_id: &SessionId) {
+        #[cfg(not(target_arch = "wasm32"))]
+        meerkat_session::EphemeralSessionService::<B>::await_removed_actor_exit(self, session_id)
+            .await;
+        #[cfg(target_arch = "wasm32")]
+        let _ = session_id;
+    }
+
     async fn observe_member_status_view(
         &self,
         session_id: &SessionId,
@@ -2611,6 +2741,15 @@ where
         meerkat_session::EphemeralSessionService::<B>::tool_scope_snapshot(self, session_id).await
     }
 
+    async fn live_visible_tool_defs(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<Vec<meerkat_core::ToolDef>>, SessionError> {
+        meerkat_session::EphemeralSessionService::<B>::live_visible_tool_defs(self, session_id)
+            .await
+            .map(Some)
+    }
+
     async fn external_tool_surface_snapshot(
         &self,
         session_id: &SessionId,
@@ -2672,6 +2811,33 @@ where
         witness: &meerkat_session::LiveSessionActorWitness,
     ) -> Result<bool, SessionError> {
         meerkat_session::EphemeralSessionService::<B>::discard_live_session_actor(self, witness)
+            .await
+    }
+
+    /// The exact actor's own pin, a command it answers between turns; the
+    /// ephemeral service holds no outer boundary of its own to reacquire.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn controller_route_under_runtime_turn_boundary(
+        &self,
+        actor: &meerkat_session::LiveSessionActorWitness,
+    ) -> Result<ControllerRouteObservation, SessionError> {
+        ControllerRouteObservation::from_pinned(
+            meerkat_session::EphemeralSessionService::<B>::pin_controller_client_for_actor(
+                self, actor,
+            )
+            .await,
+            actor,
+        )
+    }
+
+    /// The exact actor's own pin under the caller's hold of this service's
+    /// per-session boundary, which the pin never takes.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn pin_controller_client_under_runtime_turn_boundary(
+        &self,
+        actor: &meerkat_session::LiveSessionActorWitness,
+    ) -> Result<meerkat_core::ControllerModelClient, SessionError> {
+        meerkat_session::EphemeralSessionService::<B>::pin_controller_client_for_actor(self, actor)
             .await
     }
 
@@ -2771,6 +2937,14 @@ impl<B> MobSessionService for meerkat_session::PersistentSessionService<B>
 where
     B: meerkat_session::SessionAgentBuilder + 'static,
 {
+    async fn await_removed_actor_exit(&self, session_id: &SessionId) {
+        #[cfg(not(target_arch = "wasm32"))]
+        meerkat_session::PersistentSessionService::<B>::await_removed_actor_exit(self, session_id)
+            .await;
+        #[cfg(target_arch = "wasm32")]
+        let _ = session_id;
+    }
+
     async fn append_system_notice_under_runtime_turn_boundary(
         &self,
         session_id: &SessionId,
@@ -3641,6 +3815,15 @@ where
         meerkat_session::PersistentSessionService::<B>::tool_scope_snapshot(self, session_id).await
     }
 
+    async fn live_visible_tool_defs(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<Vec<meerkat_core::ToolDef>>, SessionError> {
+        meerkat_session::PersistentSessionService::<B>::live_visible_tool_defs(self, session_id)
+            .await
+            .map(Some)
+    }
+
     async fn external_tool_surface_snapshot(
         &self,
         session_id: &SessionId,
@@ -3826,6 +4009,31 @@ where
     ) -> Result<bool, SessionError> {
         meerkat_session::PersistentSessionService::<B>::discard_live_session_actor_under_runtime_turn_boundary(
             self, witness,
+        )
+        .await
+    }
+
+    /// The pin for an owner already holding B, which it never reacquires.
+    async fn controller_route_under_runtime_turn_boundary(
+        &self,
+        actor: &meerkat_session::LiveSessionActorWitness,
+    ) -> Result<ControllerRouteObservation, SessionError> {
+        ControllerRouteObservation::from_pinned(
+            meerkat_session::PersistentSessionService::<B>::pin_controller_client_for_actor_under_runtime_turn_boundary(
+                self, actor,
+            )
+            .await,
+            actor,
+        )
+    }
+
+    /// The pin for an owner already holding B, which it never reacquires.
+    async fn pin_controller_client_under_runtime_turn_boundary(
+        &self,
+        actor: &meerkat_session::LiveSessionActorWitness,
+    ) -> Result<meerkat_core::ControllerModelClient, SessionError> {
+        meerkat_session::PersistentSessionService::<B>::pin_controller_client_for_actor_under_runtime_turn_boundary(
+            self, actor,
         )
         .await
     }

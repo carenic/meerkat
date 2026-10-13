@@ -626,6 +626,9 @@ fn openai_realtime_history_events(seed_messages: &[Message]) -> Result<Vec<Clien
                     content: vec![ContentPart::OutputText { text }],
                 }))
             }
+            // Text-only: notice media (comms, external-event or runtime
+            // notice content) reaches the realtime session only as the
+            // placeholders in the notice's text projection.
             Message::SystemNotice(notice) => Ok(Some(Item::Message {
                 id: None,
                 status: None,
@@ -7397,6 +7400,44 @@ mod tests {
                 "duplicate".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn runtime_notice_media_reaches_realtime_history_as_text_only() {
+        let notice = meerkat_core::SystemNoticeMessage::with_block(
+            meerkat_core::SystemNoticeKind::Generic,
+            None,
+            meerkat_core::SystemNoticeBlock::RuntimeNotice {
+                category: "consent_attempt".to_string(),
+                detail: Some("correlated result".to_string()),
+                payload: None,
+                content: vec![meerkat_core::ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: meerkat_core::ImageData::Inline {
+                        data: "iVBOR...".to_string(),
+                    },
+                }],
+            },
+        );
+        let projection = notice.model_projection_text();
+        assert!(projection.contains("[image: image/png]"));
+        let events = openai_realtime_history_events(&[Message::SystemNotice(notice)])
+            .expect("a notice projects as an in-place history event");
+        assert!(matches!(
+            events.as_slice(),
+            [ClientEvent::ConversationItemCreate { item, .. }]
+                if matches!(
+                    item.as_ref(),
+                    Item::Message {
+                        role: Role::User,
+                        content,
+                        ..
+                    } if matches!(
+                        content.as_slice(),
+                        [ContentPart::InputText { text }] if text == &projection
+                    )
+                )
+        ));
     }
 
     #[test]

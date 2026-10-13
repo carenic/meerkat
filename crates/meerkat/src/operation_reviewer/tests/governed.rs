@@ -195,7 +195,31 @@ impl PreparedOperationAuthorization for Check {
     }
 }
 
+/// The owners' literal material for the reviewed operation.
+const ACTION_ACCOUNT: &str = "fixture-records-account";
+const MANDATE: &str = "Write the weekly fixture record for the requester";
+
 impl WorkAuthorization for TestPolicy {
+    fn review_operation_context(
+        &self,
+        binding: &PreparedAuthorizationBinding,
+    ) -> Result<
+        meerkat_core::authorization::ReviewOperationContextResolution,
+        meerkat_core::OperationAuthorizationError,
+    > {
+        assert!(
+            matches!(&binding.facts().operation,
+                AuthorizationOperation::Tool(tool) if tool.name.as_str() == REVIEWED),
+            "only the reviewed candidate reads owner material"
+        );
+        meerkat_core::authorization::ReviewOperationContext::new(
+            Some(ACTION_ACCOUNT.to_owned()),
+            Some(MANDATE.to_owned()),
+        )
+        .map(meerkat_core::authorization::ReviewOperationContextResolution::Material)
+        .map_err(|_| meerkat_core::OperationAuthorizationError::Unavailable)
+    }
+
     fn prepare(
         &self,
         binding: &PreparedAuthorizationBinding,
@@ -523,6 +547,12 @@ async fn scenario_with_outcome_fault(
         let wire = body.to_string();
         assert!(wire.contains("Test owner context"));
         assert!(wire.contains(REVIEWED));
+        // The actual model request carries the owners' literal account and
+        // mandate as their own fields, apart from the proposed arguments.
+        assert!(wire.contains("owner_selected_action_account"));
+        assert!(wire.contains(ACTION_ACCOUNT));
+        assert!(wire.contains("current_mandate"));
+        assert!(wire.contains(MANDATE));
     }
 }
 

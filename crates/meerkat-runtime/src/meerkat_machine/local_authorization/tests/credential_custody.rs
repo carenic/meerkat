@@ -7,6 +7,14 @@ use meerkat_core::auth::{PersistedTokens, ProviderAuthPersistence, TokenStore};
 use meerkat_core::handles::{CredentialUseDisposition, LeaseKey};
 
 async fn pending() -> (MeerkatMachine, SessionId, Input) {
+    pending_requiring(meerkat_core::ControllerCredentialRequirement::Required).await
+}
+
+/// A pending governed input whose selected controller's resolved connection
+/// reports `requirement`.
+async fn pending_requiring(
+    requirement: meerkat_core::ControllerCredentialRequirement,
+) -> (MeerkatMachine, SessionId, Input) {
     let (configuration, mut prompt, _, _) = mutable_controller_configuration(true);
     let mut candidate = prompt
         .header()
@@ -25,18 +33,21 @@ async fn pending() -> (MeerkatMachine, SessionId, Input) {
             ))
             .unwrap(),
         });
-    candidate.controller_model = Some(ControllerModelSelection::new(
-        meerkat_core::SessionLlmIdentity {
-            model: selection.model().into(),
-            provider: selection.provider(),
-            self_hosted_server_id: selection.self_hosted_server_id().map(str::to_owned),
-            provider_params: None,
-            auth_binding: selection.auth_binding().cloned(),
-        },
-        credential,
-        selection.backend_profile_id().into(),
-        selection.backend_kind().into(),
-    ));
+    candidate.controller_model = Some(
+        ControllerModelSelection::new(
+            meerkat_core::SessionLlmIdentity {
+                model: selection.model().into(),
+                provider: selection.provider(),
+                self_hosted_server_id: selection.self_hosted_server_id().map(str::to_owned),
+                provider_params: None,
+                auth_binding: selection.auth_binding().cloned(),
+            },
+            credential,
+            selection.backend_profile_id().into(),
+            selection.backend_kind().into(),
+        )
+        .with_credential_requirement(requirement),
+    );
     prompt.header_mut().authority_association =
         Some(InputAuthorityAssociation::new(candidate).unwrap());
     pending_controller_input(configuration, prompt).await
@@ -120,6 +131,7 @@ fn assert_release_veto(
     handle: &meerkat_core::handles::GeneratedAuthLeaseHandle,
     key: &LeaseKey,
     expected_context: &'static str,
+    expected_kind: meerkat_core::handles::DslRejectionKind,
 ) {
     assert_eq!(
         handle
@@ -133,12 +145,16 @@ fn assert_release_veto(
     let error = handle
         .release_lease(key)
         .expect_err("native observer must veto before AuthMachine Release");
-    assert_eq!(
-        error.kind,
-        meerkat_core::handles::DslRejectionKind::NoMatchingTransition
-    );
+    assert_eq!(error.kind, expected_kind);
     assert_eq!(error.context, expected_context);
 }
+
+const IN_USE: meerkat_core::handles::DslRejectionKind =
+    meerkat_core::handles::DslRejectionKind::NoMatchingTransition;
+const BUSY: meerkat_core::handles::DslRejectionKind =
+    meerkat_core::handles::DslRejectionKind::ControllerReadinessRefused(
+        ControllerReadinessFailure::Busy,
+    );
 
 #[tokio::test]
 async fn direct_driver_busy_lease_is_typed_readiness_then_same_input_can_enter() {
@@ -179,6 +195,110 @@ async fn absent_credential_is_not_permission_feedback_and_commit_allows_same_inp
     attempt(&machine, &session, prompt).await.unwrap();
 }
 
+/// An explicitly authless controller (its resolved connection holds no
+/// credential material) is admitted with no credential lifecycle, and none
+/// is synthesized for it. The same input with a credential-required
+/// selection and no lease stays refused.
+#[tokio::test]
+async fn an_authless_controller_is_admitted_without_a_credential_lease() {
+    let (machine, session, prompt) =
+        pending_requiring(meerkat_core::ControllerCredentialRequirement::Required).await;
+    let id = prompt.id().clone();
+    assert!(matches!(
+        attempt(&machine, &session, prompt).await,
+        Err(RuntimeDriverError::ControllerReadinessUnavailable {
+            reason: ControllerReadinessFailure::CredentialUnusable {
+                disposition: CredentialUseDisposition::LeaseAbsent
+            }
+        })
+    ));
+    assert_unaccepted(&machine, &session, &id).await;
+
+    let (machine, session, prompt) =
+        pending_requiring(meerkat_core::ControllerCredentialRequirement::Authless).await;
+    let id = prompt.id().clone();
+    let key = LeaseKey::from_credential_identity(&identity(&prompt));
+    assert!(
+        matches!(attempt(&machine, &session, prompt).await.unwrap(), crate::accept::AcceptOutcome::Accepted { input_id, .. } if input_id == id)
+    );
+    let snapshot = machine.generated_auth_lease_handle().snapshot(&key);
+    assert_eq!(snapshot.phase, None, "no lease is synthesized");
+    assert!(!snapshot.credential_present);
+}
+
+/// The selected client reports one selection while it is pinned, then
+/// another: a controller that is no longer the pinned route.
+struct SwitchingClient {
+    model: String,
+    selection: std::sync::Mutex<ControllerModelSelection>,
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl meerkat_core::AgentLlmClient for SwitchingClient {
+    fn controller_model_selection(&self) -> Option<ControllerModelSelection> {
+        Some(self.selection.lock().unwrap().clone())
+    }
+    async fn stream_response(
+        &self,
+        _: &[meerkat_core::Message],
+        _: &[Arc<meerkat_core::ToolDef>],
+        _: u32,
+        _: Option<f32>,
+        _: Option<&meerkat_core::ProviderParamsOverride>,
+    ) -> Result<meerkat_core::LlmStreamResult, meerkat_core::AgentError> {
+        Err(meerkat_core::AgentError::ConfigError(
+            "source-only fixture never calls a model".into(),
+        ))
+    }
+    fn provider(&self) -> meerkat_core::Provider {
+        self.selection.lock().unwrap().provider()
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+/// An authless selection is honored only while the live selected client
+/// still reports it: once the client reports a credential-required route,
+/// the pinned authless claim is refused, not used to skip the lease.
+#[tokio::test]
+async fn an_authless_claim_the_live_client_no_longer_reports_is_refused() {
+    let (machine, session, prompt) =
+        pending_requiring(meerkat_core::ControllerCredentialRequirement::Authless).await;
+    let ingress = prompt.header().ingress_context.as_ref().unwrap().clone();
+    let pinned = ingress.controller_client().unwrap().selection().clone();
+    let client = Arc::new(SwitchingClient {
+        model: pinned.model().to_owned(),
+        selection: std::sync::Mutex::new(pinned.clone()),
+    });
+    let context = NativeIngressContext::from_trusted_ingress(
+        &prompt,
+        ingress.requester().clone(),
+        ingress.ingress_actor().clone(),
+        ingress.realm().clone(),
+        ingress.authentication().clone(),
+    )
+    .unwrap()
+    .with_controller_client(
+        &prompt,
+        ControllerModelClient::new(pinned.clone(), client.clone()),
+    )
+    .unwrap();
+    let prompt = prompt.with_ingress_context(context).unwrap();
+    *client.selection.lock().unwrap() = pinned
+        .clone()
+        .with_credential_requirement(meerkat_core::ControllerCredentialRequirement::Required);
+    let id = prompt.id().clone();
+    assert!(matches!(
+        attempt(&machine, &session, prompt).await,
+        Err(RuntimeDriverError::ControllerReadinessUnavailable {
+            reason: ControllerReadinessFailure::AuthorityChanged
+        })
+    ));
+    assert_unaccepted(&machine, &session, &id).await;
+}
+
 #[tokio::test]
 async fn exported_handle_release_retains_consumed_controller_until_real_run_terminal() {
     let (machine, session, prompt) = pending().await;
@@ -211,7 +331,12 @@ async fn exported_handle_release_retains_consumed_controller_until_real_run_term
             .unwrap();
         assert!(driver.input_is_terminal_by_authority(&id).unwrap());
     }
-    assert_release_veto(&handle, &key, "NativeControllerCredentialRelease::InUse");
+    assert_release_veto(
+        &handle,
+        &key,
+        "NativeControllerCredentialRelease::InUse",
+        IN_USE,
+    );
     assert_eq!(handle.snapshot(&key), before);
     assert_eq!(
         store
@@ -253,7 +378,12 @@ async fn active_controller_refuses_handle_replacement_without_detaching_old_obse
         &old.clone_handle(),
         &machine.generated_auth_lease_handle().clone_handle()
     ));
-    assert_release_veto(&old, &key, "NativeControllerCredentialRelease::InUse");
+    assert_release_veto(
+        &old,
+        &key,
+        "NativeControllerCredentialRelease::InUse",
+        IN_USE,
+    );
     meerkat_core::authorization::PreparedOperationCheck::prepare(
         context.clone(),
         plain_controller_binding(&context, &run),
@@ -276,7 +406,12 @@ async fn replacement_and_previously_exported_handles_both_keep_native_veto() {
     stage_controller_input(&machine, &session, prompt).await;
     for handle in [old, current] {
         let before = handle.snapshot(&key);
-        assert_release_veto(&handle, &key, "NativeControllerCredentialRelease::InUse");
+        assert_release_veto(
+            &handle,
+            &key,
+            "NativeControllerCredentialRelease::InUse",
+            IN_USE,
+        );
         assert_eq!(handle.snapshot(&key), before);
     }
 }
@@ -314,9 +449,119 @@ async fn unrelated_credential_release_is_allowed_and_busy_native_scope_is_not_mu
         .driver
         .clone();
     let held = driver.lock().await;
-    assert_release_veto(&handle, &key, "NativeControllerCredentialRelease::Busy");
+    assert_release_veto(
+        &handle,
+        &key,
+        "NativeControllerCredentialRelease::Busy",
+        BUSY,
+    );
     assert_eq!(handle.snapshot(&key), before);
     drop(held);
+}
+
+/// Wait until `machine`'s session map can be taken exclusively, proving a
+/// refused publication released its native custody before backing off.
+async fn session_map_is_free(machine: &MeerkatMachine) -> bool {
+    for _ in 0..200 {
+        if machine.sessions.try_write().is_ok() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn busy_publication_releases_custody_while_waiting_then_publishes() {
+    let (machine, session, prompt) = pending().await;
+    let (_store, handle) = commit(&machine, &prompt).await;
+    let unrelated =
+        meerkat_core::AuthCredentialIdentity::Account(meerkat_core::CredentialAccountRef {
+            realm: meerkat_core::RealmId::parse("native-test").unwrap(),
+            account: meerkat_core::CredentialAccountId::parse(format!(
+                "busy-{}",
+                uuid::Uuid::new_v4()
+            ))
+            .unwrap(),
+        });
+    let other_key = LeaseKey::from_credential_identity(&unrelated);
+    let tokens = PersistedTokens::api_key("synthetic-busy");
+    let before = handle.snapshot(&other_key);
+    let driver = machine
+        .sessions
+        .read()
+        .await
+        .get(&session)
+        .unwrap()
+        .driver
+        .clone();
+    let held = driver.lock().await;
+    let publication = meerkat_core::publish_token_lifecycle_acquired_for_identity_within(
+        &handle,
+        &unrelated,
+        &tokens,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+    );
+    let contention = async {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            handle.snapshot(&other_key),
+            before,
+            "refused attempts publish nothing"
+        );
+        assert!(
+            session_map_is_free(&machine).await,
+            "custody is released while waiting"
+        );
+        drop(held);
+    };
+    let (published, ()) = tokio::join!(publication, contention);
+    published.expect("publication after the driver is free");
+    assert!(handle.snapshot(&other_key).credential_present);
+}
+
+#[tokio::test]
+async fn busy_publication_rechecks_references_after_fresh_custody() {
+    let (machine, session, prompt) = pending().await;
+    let credential = identity(&prompt);
+    let key = LeaseKey::from_credential_identity(&credential);
+    let (_store, handle) = commit(&machine, &prompt).await;
+    // Busy is decided before references are read; the referencing input is
+    // invisible to a refused attempt and must be found by the fresh one.
+    stage_controller_input(&machine, &session, prompt).await;
+    let before = handle.snapshot(&key);
+    let driver = machine
+        .sessions
+        .read()
+        .await
+        .get(&session)
+        .unwrap()
+        .driver
+        .clone();
+    let held = driver.lock().await;
+    let tokens = PersistedTokens::api_key("synthetic-replacement");
+    let publication = meerkat_core::publish_token_lifecycle_acquired_for_identity_within(
+        &handle,
+        &credential,
+        &tokens,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+    );
+    let contention = async {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            handle.snapshot(&key),
+            before,
+            "refused attempts publish nothing"
+        );
+        drop(held);
+    };
+    let (published, ()) = tokio::join!(publication, contention);
+    let Err(meerkat_core::BoundedLifecyclePublicationError::Refused(error)) = published else {
+        panic!("a fresh attempt must see the reference: {published:?}");
+    };
+    assert_eq!(error.context, "NativeControllerCredentialRelease::InUse");
+    assert_eq!(error.controller_readiness_refusal(), None);
+    assert_eq!(handle.snapshot(&key), before);
 }
 
 #[tokio::test]
@@ -671,10 +916,12 @@ async fn generic_host_pending() -> (
     .unwrap();
     // This host has access to a different valid generated owner. Its policy
     // callbacks must not select that owner for this machine's admission.
-    let host = Arc::new(crate::input_authority::tests::TestIngress::new(
+    let host = Arc::new(crate::input_authority::tests::TestIngress::isolated(
         foreign.clone(),
     ));
-    let machine = machine.with_native_work_authorization_host(host).unwrap();
+    let machine = machine
+        .with_native_work_authorization_host(host.clone())
+        .unwrap();
     let session = SessionId::new();
     machine.register_session(session.clone()).await.unwrap();
     let runtime = machine
@@ -685,7 +932,7 @@ async fn generic_host_pending() -> (
         .unwrap()
         .runtime_id
         .clone();
-    let mut prompt = input("caller");
+    let mut prompt = host.input("caller");
     let original = prompt.header().ingress_context.as_ref().unwrap().clone();
     let mut candidate = prompt
         .header()
@@ -740,7 +987,12 @@ async fn generic_host_cannot_select_foreign_credential_owner() {
         attempt(&machine, &session, prompt).await.unwrap(),
         crate::accept::AcceptOutcome::Accepted { .. }
     ));
-    assert_release_veto(&actual, &key, "NativeControllerCredentialRelease::InUse");
+    assert_release_veto(
+        &actual,
+        &key,
+        "NativeControllerCredentialRelease::InUse",
+        IN_USE,
+    );
     foreign.release_lease(&key).unwrap();
     assert_eq!(
         actual

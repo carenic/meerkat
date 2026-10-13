@@ -523,7 +523,8 @@ impl From<&AgentError> for AgentErrorClass {
             | AgentError::SessionDurableProjectionAuthorityUnknown { .. } => Self::Internal,
             AgentError::BuildError(_)
             | AgentError::SessionIdentityInUse(_)
-            | AgentError::DeclaredToolUnknown(_) => Self::Build,
+            | AgentError::DeclaredToolUnknown(_)
+            | AgentError::ToolArtifactRefused(_) => Self::Build,
             AgentError::AuthReauthRequired { .. } => Self::Auth,
             AgentError::CallbackPending { .. } | AgentError::CallbackBatchPending { .. } => {
                 Self::CallbackPending
@@ -1511,6 +1512,9 @@ pub enum ToolConfigChangeStatus {
         /// Historical setup refusal, separate from the lifecycle phase.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         confinement_refusal: Option<crate::confinement::ConfinementRefusal>,
+        /// Restore outcome of a resumed session's recorded attachment.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore: Option<crate::mcp_session_intent::McpAttachmentRestoreWireOutcome>,
     },
 }
 
@@ -1550,6 +1554,7 @@ impl ToolConfigChangeStatus {
             phase,
             detail,
             confinement_refusal: None,
+            restore: None,
         }
     }
 
@@ -1603,6 +1608,10 @@ pub struct ExternalToolDelta {
     /// accepted by the lifecycle owner. This observation grants no permission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confinement_refusal: Option<crate::confinement::ConfinementRefusal>,
+    /// The restore outcome of a resumed session's recorded attachment, when
+    /// restore did not re-stage it. An observation, never permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<crate::mcp_session_intent::McpAttachmentRestoreWireOutcome>,
 }
 
 impl ExternalToolDelta {
@@ -1664,6 +1673,7 @@ impl ExternalToolDelta {
             tool_count: None,
             detail: None,
             confinement_refusal: None,
+            restore: None,
         }
     }
 
@@ -1689,6 +1699,15 @@ impl ExternalToolDelta {
     }
 
     #[must_use]
+    pub fn with_restore(
+        mut self,
+        restore: Option<crate::mcp_session_intent::McpAttachmentRestoreWireOutcome>,
+    ) -> Self {
+        self.restore = restore;
+        self
+    }
+
+    #[must_use]
     pub fn status_text(&self) -> String {
         ToolConfigChangeStatus::external_tool_delta(self.phase, self.detail.clone()).status_text()
     }
@@ -1699,6 +1718,7 @@ impl ExternalToolDelta {
             phase: self.phase,
             detail: self.detail.clone(),
             confinement_refusal: self.confinement_refusal,
+            restore: self.restore,
         };
         ToolConfigChangedPayload::new(
             self.operation.clone(),
@@ -3645,6 +3665,7 @@ mod tests {
                 category: "flow_step".to_string(),
                 detail: None,
                 payload: None,
+                content: Vec::new(),
             }]);
             assert!(peer_content_ingested_events(&runtime_notice).is_empty());
             assert!(

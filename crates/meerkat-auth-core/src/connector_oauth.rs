@@ -4,7 +4,7 @@
 //! registry. A trusted host strategy verifies provider evidence; the existing
 //! OAuth owner compares that typed observation against the admitted descriptor.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::Duration;
 
@@ -32,6 +32,17 @@ pub struct ConnectorOAuthParameters {
     /// `Unverified`.
     pub expected_account: AccountSelection,
     pub strategy_id: String,
+    /// The host-installed client-auth profile the attempt is bound to, by
+    /// id. `None` keeps the default public-client request forms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_auth_profile: Option<String>,
+    /// The provider protocol the attempt was admitted under, by id, as its
+    /// client-auth profile named it at the start. `None` is the default
+    /// protocol. Completion and refresh use exactly this protocol: a
+    /// profile that names another one, or a missing protocol, is refused,
+    /// never replaced by the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
 }
 
 /// Account selection of one connector browser attempt.
@@ -159,6 +170,10 @@ pub enum ConnectorOAuthRefusal {
     CredentialMismatch,
     #[error("connector OAuth account verification is unavailable")]
     VerificationUnavailable,
+    /// The host egress profile refused a verification endpoint; nothing was
+    /// sent to it. A local refusal, never evidence about the account.
+    #[error("connector OAuth verification endpoint refused by the host egress profile: {0}")]
+    EgressRefused(crate::http_egress::HttpEgressRefusal),
 }
 
 fn valid_atom(value: &str) -> bool {
@@ -190,6 +205,7 @@ impl TryFrom<ConnectorOAuthParameters> for ConnectorOAuthDescriptor {
                 .known()
                 .is_some_and(|account| !valid_atom(account))
             || !valid_atom(&value.strategy_id)
+            || value.protocol.as_deref().is_some_and(|protocol| !valid_atom(protocol))
             // An unverified resource grant may request no scope: the
             // resource need not publish any, and no account evidence scope
             // is requested for it.
@@ -240,6 +256,14 @@ impl ConnectorOAuthDescriptor {
             hash.update(b":");
             hash.update(value.as_bytes());
         }
+        // A selected protocol is part of the key; without one the key is
+        // unchanged.
+        if let Some(protocol) = &self.0.protocol {
+            hash.update(b"protocol:");
+            hash.update(protocol.len().to_string().as_bytes());
+            hash.update(b":");
+            hash.update(protocol.as_bytes());
+        }
         format!("connector:{:x}", hash.finalize())
     }
 
@@ -258,6 +282,21 @@ impl ConnectorOAuthDescriptor {
             hash.update(value.len().to_string().as_bytes());
             hash.update(b":");
             hash.update(value.as_bytes());
+        }
+        // A bound client-auth profile is part of the context; without one
+        // the context is unchanged.
+        if let Some(profile) = &self.0.client_auth_profile {
+            hash.update(b"client-auth:");
+            hash.update(profile.len().to_string().as_bytes());
+            hash.update(b":");
+            hash.update(profile.as_bytes());
+        }
+        // So is a selected protocol.
+        if let Some(protocol) = &self.0.protocol {
+            hash.update(b"protocol:");
+            hash.update(protocol.len().to_string().as_bytes());
+            hash.update(b":");
+            hash.update(protocol.as_bytes());
         }
         ConnectorStableContext(format!("connector-context:{:x}", hash.finalize()))
     }
@@ -476,6 +515,42 @@ pub struct ConnectorCredentialMetadata {
     pub scope_evidence: ScopeEvidence,
     /// When the scopes' original token-endpoint grant was committed.
     pub granted_at_epoch_secs: i64,
+    /// The client-auth profile the credential was minted under, by id. Its
+    /// refresh uses that same installed profile, never another one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_auth_profile: Option<String>,
+    /// The provider protocol the credential was minted under, by id. Its
+    /// refresh uses exactly that protocol, never the default or another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// Non-secret facts the profile's protocol decoded from the response
+    /// that issued the credential (for example a provider app, org or API
+    /// instance). Its pinned facts must hold on every refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_evidence: Option<ConnectorProtocolEvidence>,
+}
+
+/// Non-secret facts a protocol decoded from a provider response, kept with
+/// the credential. `pinned` facts identify the grant (for example the
+/// provider app or organization) and must not change across refreshes;
+/// `facts` may (for example an API instance URL). Values are normalized
+/// strings, never raw provider JSON, and never secrets.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorProtocolEvidence {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pinned: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub facts: BTreeMap<String, String>,
+}
+
+impl ConnectorProtocolEvidence {
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.pinned
+            .get(name)
+            .or_else(|| self.facts.get(name))
+            .map(String::as_str)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -920,6 +995,8 @@ mod tests {
             redirect_uri: "http://127.0.0.1:12345/callback".into(),
             expected_account: "account-a".into(),
             strategy_id: "verified-profile-v1".into(),
+            client_auth_profile: None,
+            protocol: None,
         }
     }
 
@@ -1028,6 +1105,38 @@ mod tests {
             ),
             Err(ConnectorOAuthRefusal::VerificationUnavailable)
         );
+    }
+
+    #[test]
+    fn without_a_client_auth_profile_the_descriptor_bytes_and_context_are_unchanged() {
+        let params = parameters();
+        let serialized = serde_json::to_value(&params).unwrap();
+        assert!(
+            serialized.get("client_auth_profile").is_none(),
+            "{serialized}"
+        );
+        // The pre-profile context formula, reproduced.
+        let mut hash = Sha256::new();
+        for value in [
+            params.issuer.as_str(),
+            &params.client,
+            &params.resource,
+            &params.strategy_id,
+        ] {
+            hash.update(value.len().to_string().as_bytes());
+            hash.update(b":");
+            hash.update(value.as_bytes());
+        }
+        let expected = format!("connector-context:{:x}", hash.finalize());
+        let descriptor: ConnectorOAuthDescriptor = params.clone().try_into().unwrap();
+        assert_eq!(
+            serde_json::to_value(descriptor.stable_context()).unwrap(),
+            serde_json::Value::String(expected)
+        );
+        let mut bound = params;
+        bound.client_auth_profile = Some("desktop@00".into());
+        let bound: ConnectorOAuthDescriptor = bound.try_into().unwrap();
+        assert_ne!(bound.stable_context(), descriptor.stable_context());
     }
 
     #[test]

@@ -2651,6 +2651,7 @@ mod tests {
                 category: "wire_probe".to_string(),
                 detail: Some("typed block".to_string()),
                 payload: Some(serde_json::json!({"preserved": true})),
+                content: Vec::new(),
             }],
         );
         notice.runtime_origin = Some(meerkat_core::types::RuntimeAppendOrigin {

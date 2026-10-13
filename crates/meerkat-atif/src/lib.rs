@@ -2,7 +2,7 @@
 //!
 //! The exporter consumes committed event envelopes. It does not observe a
 //! surface-specific stream and therefore produces the same trajectory for
-//! CLI, REST, RPC, MCP, embedded, and MobKit hosts.
+//! CLI, REST, RPC, MCP, embedded, and Meta hosts.
 
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 

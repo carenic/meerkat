@@ -2103,6 +2103,8 @@ dependencies = [
  "futures",
  "inventory",
  "meerkat-anthropic",
+ "meerkat-authorization",
+ "meerkat-authorization-contracts",
  "meerkat-capabilities",
  "meerkat-client",
  "meerkat-comms",
@@ -2128,6 +2130,7 @@ dependencies = [
  "meerkat-store",
  "meerkat-tools",
  "meerkat-workgraph",
+ "nix 0.29.0",
  "parking_lot",
  "reqwest 0.12.28",
  "serde",
@@ -2135,6 +2138,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio_with_wasm",
+ "toml",
  "tracing",
  "uuid",
 ]
@@ -2193,6 +2197,7 @@ dependencies = [
  "oauth2",
  "parking_lot",
  "reqwest 0.12.28",
+ "security-framework 3.7.0",
  "serde",
  "serde_json",
  "sha2",
@@ -2203,6 +2208,21 @@ dependencies = [
  "urlencoding",
  "uuid",
  "webbrowser",
+]
+
+[[package]]
+name = "meerkat-authorization"
+version = "0.8.52"
+dependencies = [
+ "indexmap",
+ "meerkat-authorization-contracts",
+ "meerkat-core",
+ "meerkat-machine-dsl",
+ "meerkat-machine-schema",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]
@@ -2325,6 +2345,7 @@ dependencies = [
  "fs4 0.13.1",
  "futures",
  "getrandom 0.3.4",
+ "hmac",
  "humantime-serde",
  "indexmap",
  "js-sys",
@@ -2560,6 +2581,7 @@ dependencies = [
  "indexmap",
  "jsonschema",
  "meerkat",
+ "meerkat-authorization-contracts",
  "meerkat-client",
  "meerkat-comms",
  "meerkat-contracts",
@@ -2664,16 +2686,19 @@ version = "0.8.52"
 dependencies = [
  "async-trait",
  "axum",
+ "base64",
  "chrono",
  "clap",
  "futures",
  "meerkat",
  "meerkat-anthropic",
  "meerkat-atif",
+ "meerkat-authorization-contracts",
  "meerkat-client",
  "meerkat-contracts",
  "meerkat-core",
  "meerkat-live",
+ "meerkat-llm-core",
  "meerkat-mob",
  "meerkat-mob-mcp",
  "meerkat-models",
@@ -2700,6 +2725,7 @@ dependencies = [
  "futures",
  "indexmap",
  "meerkat-auth-core",
+ "meerkat-authorization",
  "meerkat-authorization-contracts",
  "meerkat-contracts",
  "meerkat-core",

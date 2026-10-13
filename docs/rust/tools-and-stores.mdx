@@ -136,7 +136,7 @@ facade persistence boundary: one provider returns every required store in a
 
 Mob state is intentionally not a `RealmStoreSet` slot. The separate
 `meerkat-mob` crate owns its mob store to avoid a facade dependency cycle;
-MobKit or another higher-level host composes it alongside the facade provider.
+Meta or another higher-level host composes it alongside the facade provider.
 
 Each required slot declares a `DurabilityClass` and its actual
 `DurabilityResolution`. Startup fails closed when a durable slot resolves to

@@ -7,6 +7,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 
+use meerkat_core::auth::token_store::TokenStoreObservation;
+
 use super::{PersistedTokens, TokenKey, TokenStore, TokenStoreError};
 
 #[derive(Default)]
@@ -42,5 +44,16 @@ impl TokenStore for EphemeralTokenStore {
 
     fn backend_name(&self) -> &'static str {
         "ephemeral"
+    }
+
+    /// An in-memory read never raises operating-system UI: status reads it.
+    async fn observe_status(
+        &self,
+        key: &TokenKey,
+    ) -> Result<TokenStoreObservation, TokenStoreError> {
+        Ok(match self.inner.read().get(key).cloned() {
+            Some(tokens) => TokenStoreObservation::Present(Box::new(tokens)),
+            None => TokenStoreObservation::Missing,
+        })
     }
 }

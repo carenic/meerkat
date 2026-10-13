@@ -21,8 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use meerkat_contracts::wire::supervisor_bridge::{
-    BridgeCapabilities, BridgePeerIdentity, BridgePeerSpec, BridgeRejectionCause,
-    BridgeTurnOutcomeAck, MaterializeLaunchOutcome, WireFlowTurnOutcome,
+    BridgeBoundedResultSpec, BridgeBoundedTurnResult, BridgeCapabilities, BridgePeerIdentity,
+    BridgePeerSpec, BridgeRejectionCause, BridgeTurnOutcomeAck, MaterializeLaunchOutcome,
+    WireFlowFailureDetail, WireFlowTurnOutcome,
 };
 use meerkat_contracts::wire::{PortableMemberSpec, portable_member_spec_digest};
 use meerkat_mob::machines::mob_host_binding_authority::{
@@ -455,6 +456,7 @@ fn outcome_row(
         terminal_seq,
         outcome: WireFlowTurnOutcome::RunCompleted,
         bounded_result: None,
+        reserved_bounded_result_spec: None,
     }
 }
 
@@ -932,6 +934,188 @@ async fn committed_then_error_pending_outcome_and_ack_converge_exactly() {
         .expect("delayed post-ACK delivery replays after cold recovery"),
         TurnOutcomePendingReservationDisposition::TerminalReplay
     );
+}
+
+/// A bounded reservation whose result was withheld records its terminal with
+/// no bounded result. The exact unacknowledged retry of the same input and
+/// bound replays that terminal; a retry with a different bound or no bound
+/// still diverges. A bounded reservation's failure terminal, which also has no
+/// bounded result, replays its exact retry the same way. A released bounded
+/// result replays as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn withheld_bounded_terminal_replays_only_its_exact_reserved_request() {
+    let mut fixture = fixture();
+    bind_fixture(&mut fixture, "mob-withheld-bound").await;
+    let key = member_key("mob-withheld-bound", "worker-1");
+    record_materialized_member(
+        &mut fixture.authority,
+        &fixture.persistence,
+        &key,
+        materialized_row("mob-withheld-bound", "worker-1", 5, 9),
+        None,
+    )
+    .await
+    .expect("member materializes");
+    let spec = BridgeBoundedResultSpec {
+        label: "placed_result".to_string(),
+        max_text_bytes: 4096,
+    };
+    let bounded = |input_id: &str, window_start: u64, spec: Option<BridgeBoundedResultSpec>| {
+        TurnOutcomePendingRow {
+            input_id: input_id.to_string(),
+            generation: 5,
+            fence_token: 9,
+            window_start,
+            bounded_result_spec: spec,
+        }
+    };
+
+    // Withheld: reserved with a bound, recorded with no bounded result.
+    let withheld = bounded("withheld", 41, Some(spec.clone()));
+    assert_eq!(
+        reserve_turn_outcome_pending(
+            &mut fixture.authority,
+            &fixture.persistence,
+            &key,
+            &withheld
+        )
+        .await
+        .expect("bounded reservation"),
+        TurnOutcomePendingReservationDisposition::Reserved { window_start: 41 }
+    );
+    assert_eq!(
+        record_turn_outcome_journal(
+            &mut fixture.authority,
+            &fixture.persistence,
+            &key,
+            &outcome_row("withheld", 5, 9, 77),
+        )
+        .await
+        .expect("withheld terminal records"),
+        TurnOutcomeRecordDisposition::Recorded
+    );
+    let durable = fixture
+        .persistence
+        .load("mob-withheld-bound")
+        .await
+        .expect("binding row loads")
+        .expect("binding remains");
+    let row = durable
+        .turn_outcomes
+        .get("worker-1")
+        .and_then(|rows| rows.iter().find(|row| row.input_id == "withheld"))
+        .expect("withheld terminal row");
+    assert!(row.bounded_result.is_none(), "no result is manufactured");
+    assert_eq!(row.reserved_bounded_result_spec.as_ref(), Some(&spec));
+    assert_eq!(
+        reserve_turn_outcome_pending(
+            &mut fixture.authority,
+            &fixture.persistence,
+            &key,
+            &withheld
+        )
+        .await
+        .expect("the exact retry replays the withheld terminal"),
+        TurnOutcomePendingReservationDisposition::TerminalReplay
+    );
+    for differing in [
+        Some(BridgeBoundedResultSpec {
+            max_text_bytes: 1024,
+            ..spec.clone()
+        }),
+        None,
+    ] {
+        assert!(matches!(
+            reserve_turn_outcome_pending(
+                &mut fixture.authority,
+                &fixture.persistence,
+                &key,
+                &bounded("withheld", 41, differing),
+            )
+            .await,
+            Err(MobHostActorError::StoreDiverged { .. })
+        ));
+    }
+
+    // A failure terminal of a bounded reservation records no bounded result
+    // either. Its exact retry now replays (it previously diverged).
+    let failed = bounded("failed", 43, Some(spec.clone()));
+    reserve_turn_outcome_pending(&mut fixture.authority, &fixture.persistence, &key, &failed)
+        .await
+        .expect("third bounded reservation");
+    record_turn_outcome_journal(
+        &mut fixture.authority,
+        &fixture.persistence,
+        &key,
+        &TurnOutcomeRow {
+            outcome: WireFlowTurnOutcome::RunFailed {
+                detail: WireFlowFailureDetail::complete("failed".to_string()),
+            },
+            ..outcome_row("failed", 5, 9, 79)
+        },
+    )
+    .await
+    .expect("failed terminal records");
+    assert_eq!(
+        reserve_turn_outcome_pending(&mut fixture.authority, &fixture.persistence, &key, &failed)
+            .await
+            .expect("the exact retry replays the failed bounded terminal"),
+        TurnOutcomePendingReservationDisposition::TerminalReplay
+    );
+
+    // Released: the bounded result is recorded and replays as before.
+    let released = bounded("released", 42, Some(spec.clone()));
+    reserve_turn_outcome_pending(
+        &mut fixture.authority,
+        &fixture.persistence,
+        &key,
+        &released,
+    )
+    .await
+    .expect("second bounded reservation");
+    record_turn_outcome_journal(
+        &mut fixture.authority,
+        &fixture.persistence,
+        &key,
+        &TurnOutcomeRow {
+            bounded_result: Some(BridgeBoundedTurnResult {
+                result: meerkat_contracts::MobBoundedHelperResult {
+                    label: spec.label.clone(),
+                    status: meerkat_contracts::MobBoundedHelperResultStatus::Completed,
+                    text: "released".to_string(),
+                },
+                max_text_bytes: spec.max_text_bytes,
+                session_id: "session".to_string(),
+                usage: meerkat_core::Usage::default(),
+                turns: 1,
+                tool_calls: 0,
+            }),
+            ..outcome_row("released", 5, 9, 78)
+        },
+    )
+    .await
+    .expect("released terminal records");
+    assert_eq!(
+        reserve_turn_outcome_pending(
+            &mut fixture.authority,
+            &fixture.persistence,
+            &key,
+            &released
+        )
+        .await
+        .expect("the exact retry replays the released terminal"),
+        TurnOutcomePendingReservationDisposition::TerminalReplay
+    );
+    assert!(matches!(
+        reserve_turn_outcome_pending(
+            &mut fixture.authority,
+            &fixture.persistence,
+            &key,
+            &bounded("released", 42, None),
+        )
+        .await,
+        Err(MobHostActorError::StoreDiverged { .. })
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]

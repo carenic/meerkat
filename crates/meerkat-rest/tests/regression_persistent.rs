@@ -166,6 +166,7 @@ fn build_state(
     let (event_tx, _) = tokio::sync::broadcast::channel(16);
 
     AppState {
+        connector_client_auth_profiles: Vec::new(),
         store_path: store_path.to_path_buf(),
         max_tokens: max_tokens.unwrap_or(config.agent.resolved_max_tokens_per_turn()),
         rest_host: config.rest.host.clone().into(),

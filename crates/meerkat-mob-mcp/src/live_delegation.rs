@@ -1336,14 +1336,16 @@ impl SteerDeliveryChain {
         self.closed
     }
 
-    /// Run `delivery` after the previously chained one (FIFO). The caller
-    /// checks [`Self::is_closed`] under the same lock first.
-    fn push<F>(&mut self, delivery: F)
+    /// Run `delivery` after the previously chained one (FIFO), holding the
+    /// mob state's stand-down until it ends. The caller checks
+    /// [`Self::is_closed`] under the same lock first.
+    fn push<F>(&mut self, hold: crate::state_tasks::StateHold, delivery: F)
     where
         F: std::future::Future<Output = SteerDeliveryOutcome> + Send + 'static,
     {
         let previous = self.last.take();
         self.last = Some(tokio::spawn(async move {
+            let _hold = hold;
             if let Some(previous) = previous {
                 let _ = previous.await;
             }
@@ -1928,6 +1930,7 @@ async fn run_client_context_restart_reconciler<R>(
     }
 }
 
+#[cfg(test)]
 fn try_arm_client_context_restart_reconciler<R>(
     armed: &std::sync::atomic::AtomicBool,
     owner: Arc<R>,
@@ -1957,7 +1960,7 @@ where
 }
 
 /// Compose the one shared live-delegation lifecycle owner used by RPC and
-/// MobKit hosts. The returned typed handle is also the provider binder's
+/// Meta hosts. The returned typed handle is also the provider binder's
 /// erased `ExperimentalLiveBoundChannelActivator`.
 #[must_use]
 pub fn compose_experimental_live_delegation_coordinator(
@@ -2065,13 +2068,64 @@ impl ExperimentalLiveDelegationCoordinator {
     }
 
     fn arm_client_context_restart_reconciler(self: &Arc<Self>) -> bool {
-        try_arm_client_context_restart_reconciler(
-            &self.client_context_restart_reconciler_armed,
-            Arc::clone(self),
-            Arc::clone(&self.client_context_restart_inventory_ready),
-            ClientContextRestartReconcileTiming::SHIPPING,
-        )
-        .is_some()
+        use std::sync::atomic::Ordering;
+        if tokio::runtime::Handle::try_current().is_err()
+            || self
+                .client_context_restart_reconciler_armed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+        // The mob state owns the pass: a stand-down aborts it, and the next
+        // state over the same storage redoes it.
+        let armed = self
+            .mobs
+            .state_tasks
+            .spawn(
+                crate::state_tasks::StateTaskKind::Convergent,
+                "client-context restart reconciler",
+                run_client_context_restart_reconciler(
+                    Arc::downgrade(self),
+                    Arc::clone(&self.client_context_restart_inventory_ready),
+                    ClientContextRestartReconcileTiming::SHIPPING,
+                ),
+            )
+            .is_some();
+        if !armed {
+            self.client_context_restart_reconciler_armed
+                .store(false, Ordering::Release);
+        }
+        armed
+    }
+
+    /// Hold the mob state's stand-down for one piece of detached work this
+    /// coordinator starts, named `work` in a stand-down report. `None`, and
+    /// logged, once the state is sealed: the work is not started then.
+    fn hold_state(&self, work: &'static str) -> Option<crate::state_tasks::StateHold> {
+        let hold = self.mobs.state_tasks.hold(work);
+        if hold.is_none() {
+            tracing::warn!(
+                work,
+                "live delegation work not started: its mob state has stood down"
+            );
+        }
+        hold
+    }
+
+    /// Spawn detached work that holds the mob state's stand-down until it
+    /// ends; nothing is started once the state is sealed.
+    fn spawn_held<F>(&self, work: &'static str, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let Some(hold) = self.hold_state(work) else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _hold = hold;
+            future.await;
+        });
     }
 
     /// Whether Meerkat has supplied the durable-fork execution half of
@@ -2805,6 +2859,10 @@ impl ExperimentalLiveDelegationCoordinator {
         &self,
         evidence: &FinalLiveUserTranscriptCommitEvidence,
     ) -> Result<(), String> {
+        // Held from before the executor starts until its terminal task ends.
+        let hold = self.hold_state("live responses execution").ok_or_else(|| {
+            "live bridge execution refused: its mob state has stood down".to_string()
+        })?;
         let mut prepared = self.responses_prepared.lock().await;
         let matching_ids = prepared
             .iter()
@@ -2912,6 +2970,7 @@ impl ExperimentalLiveDelegationCoordinator {
         let outcome_owners = self.responses_outcome_owners.clone();
         let (start_tx, start_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
+            let _hold = hold;
             let _ = start_rx.await;
             let terminalized = delegated.await_terminal().await;
             let (executor_terminal, executor_output, ordinary_terminal) =
@@ -4106,7 +4165,7 @@ impl ExperimentalLiveDelegationCoordinator {
     /// observation loop that admits delegations never runs the pump inline.
     fn spawn_pump(&self, channel_key: ActiveChannelKey) {
         let coordinator = self.clone();
-        tokio::spawn(async move {
+        self.spawn_held("live delegation schedule pump", async move {
             coordinator.pump_channel_schedule(&channel_key).await;
         });
     }
@@ -4385,7 +4444,7 @@ impl ExperimentalLiveDelegationCoordinator {
         let coordinator = self.clone();
         let key = channel_key.clone();
         let operation_id = operation_id.clone();
-        tokio::spawn(async move {
+        self.spawn_held("live delegation deferred start", async move {
             tokio::time::sleep(delay).await;
             if let Some(schedule) = coordinator.schedules.lock().await.get_mut(&key)
                 && let Some(entry) = schedule.pending.get_mut(&operation_id)
@@ -4652,7 +4711,7 @@ impl ExperimentalLiveDelegationCoordinator {
         explicit_block: bool,
     ) {
         let coordinator = self.clone();
-        tokio::spawn(async move {
+        self.spawn_held("live delegation narration", async move {
             coordinator
                 .narrate(subject, kind, running_ahead, blockers, explicit_block)
                 .await;
@@ -4874,14 +4933,15 @@ impl ExperimentalLiveDelegationCoordinator {
             .await;
         let coordinator = self.clone();
         let task_retained = Arc::clone(&retained);
+        let hold = self.hold_state("live delegation steer delivery");
         // Chain under the lock; the guard is released before any await.
         let chained = {
             let mut chain = retained
                 .steer_delivery_chain
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match run_id {
-                Some(run_id) if !chain.is_closed() => {
+            match (run_id, hold) {
+                (Some(run_id), Some(hold)) if !chain.is_closed() => {
                     let delivery = async move {
                         coordinator
                             .deliver_authorized_continuation(
@@ -4893,13 +4953,13 @@ impl ExperimentalLiveDelegationCoordinator {
                             )
                             .await
                     };
-                    chain.push(delivery);
+                    chain.push(hold, delivery);
                     None
                 }
-                // No run to steer (the worker is not running), or the
-                // worker's terminal already joined its steers: the
-                // continuation stays an ordinary turn, recorded as not
-                // delivered.
+                // No run to steer (the worker is not running), the worker's
+                // terminal already joined its steers, or the mob state has
+                // stood down: the continuation stays an ordinary turn,
+                // recorded as not delivered.
                 _ => Some((authority, continuation)),
             }
         };
@@ -5008,7 +5068,7 @@ impl ExperimentalLiveDelegationCoordinator {
     ) {
         let digest = continuation_digest(&continuation.transcript);
         let runtime = Arc::clone(&self.runtime);
-        tokio::spawn(async move {
+        self.spawn_held("live delegation steer reconciliation", async move {
             let outcome = retained
                 .control
                 .continuation_commit(
@@ -5213,7 +5273,7 @@ impl ExperimentalLiveDelegationCoordinator {
         // The merged reply reaches a reopened channel once it commits; until
         // then the result is still on its way.
         let merges_awaiting_commit = Arc::clone(&self.merges_awaiting_commit);
-        tokio::spawn(async move {
+        self.spawn_held("post-close result merge", async move {
             if let Err(error) = handle.wait().await {
                 tracing::warn!(%error, %operation_id, "post-close voice result merge turn did not complete");
             }
@@ -5357,6 +5417,11 @@ impl ExperimentalLiveDelegationCoordinator {
     ) -> Result<(), LiveDelegationStartFailure> {
         let other = LiveDelegationStartFailure::Failed;
         let session_id = provider_binding.session_id();
+        // Held from before the worker starts until the task that owns its
+        // terminal (or its start cleanup) ends.
+        let hold = self.hold_state("live delegation worker").ok_or_else(|| {
+            other("live delegation not started: its mob state has stood down".to_string())
+        })?;
 
         if reconciliation.disposition() != LiveHandoffReconciliation::Confirmed {
             return Err(other(
@@ -5478,6 +5543,7 @@ impl ExperimentalLiveDelegationCoordinator {
                 let (first_report_tx, first_report_rx) = oneshot::channel();
                 let (cleanup_start_tx, cleanup_start_rx) = oneshot::channel();
                 let cleanup = tokio::spawn(async move {
+                    let _hold = hold;
                     let _ = cleanup_start_rx.await;
                     retire_failed_start_with_retry(
                         runtime,
@@ -5543,6 +5609,7 @@ impl ExperimentalLiveDelegationCoordinator {
             let cleanup_retained = Arc::clone(&retained);
             let (cleanup_start_tx, cleanup_start_rx) = oneshot::channel();
             let cleanup = tokio::spawn(async move {
+                let _hold = hold;
                 let _ = cleanup_start_rx.await;
                 retry_reconciled_cleanup_step("missing-cancellation-start-report", || {
                     cleanup_runtime.resolve_live_delegation_worker_start(
@@ -5592,6 +5659,7 @@ impl ExperimentalLiveDelegationCoordinator {
         let task_cancellation = cancellation.clone();
         let (task_start_tx, task_start_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
+            let _hold = hold;
             let command = await_started_delegation_task_command(task_start_rx).await;
             if matches!(
                 command,
@@ -5807,12 +5875,16 @@ impl ExperimentalLiveDelegationCoordinator {
         if tasks.contains_key(&operation_id) {
             return;
         }
+        let Some(hold) = self.hold_state("live delegation result delivery") else {
+            return;
+        };
         let coordinator = Arc::new(self.clone());
         let task_operation_id = operation_id.clone();
         let task_retained = Arc::clone(&retained);
         let tasks_owner = Arc::clone(&self.result_delivery_tasks);
         let (start_tx, start_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
+            let _hold = hold;
             let _ = start_rx.await;
             let session_id = task_retained.runtime_binding.session_id().clone();
             // A refused release waits for the session machine to commit a
@@ -5929,6 +6001,10 @@ impl ExperimentalLiveDelegationCoordinator {
         if tasks.contains_key(&operation_id) {
             return;
         }
+        // Refused once the mob state is sealed: the recovery stays retained.
+        let Some(hold) = self.hold_state("live delegation result recovery") else {
+            return;
+        };
         let runtime = Arc::clone(&self.runtime);
         let pending = Arc::clone(&self.pending_result_recoveries);
         let tasks_owner = Arc::clone(&self.result_recovery_tasks);
@@ -5939,6 +6015,7 @@ impl ExperimentalLiveDelegationCoordinator {
         let task_cancellation = cancellation.clone();
         let (start_tx, start_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
+            let _hold = hold;
             let _ = start_rx.await;
             let realization = await_result_recovery_attempt_or_shutdown(
                 task_cancellation,
@@ -7382,11 +7459,12 @@ mod tests {
     /// that is ready at once still waits for the earlier one to finish.
     #[tokio::test]
     async fn steer_deliveries_of_one_delegation_run_in_chain_order() {
+        let tasks = crate::state_tasks::StateTasks::new();
         let mut chain = SteerDeliveryChain::default();
         let order = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (release_first, first_gate) = oneshot::channel::<()>();
         let first_order = Arc::clone(&order);
-        chain.push(async move {
+        chain.push(tasks.hold("test steer").expect("hold"), async move {
             let _ = first_gate.await;
             first_order.lock().expect("order").push(1);
             SteerDeliveryOutcome::Delivered {
@@ -7394,7 +7472,7 @@ mod tests {
             }
         });
         let second_order = Arc::clone(&order);
-        chain.push(async move {
+        chain.push(tasks.hold("test steer").expect("hold"), async move {
             second_order.lock().expect("order").push(2);
             SteerDeliveryOutcome::MissedRun
         });
@@ -7419,9 +7497,10 @@ mod tests {
     /// arriving afterwards is not chained (it becomes an ordinary turn).
     #[tokio::test]
     async fn the_terminal_join_waits_for_a_pending_steer_and_closes_the_chain() {
+        let tasks = crate::state_tasks::StateTasks::new();
         let mut chain = SteerDeliveryChain::default();
         let (release, gate) = oneshot::channel::<()>();
-        chain.push(async move {
+        chain.push(tasks.hold("test steer").expect("hold"), async move {
             let _ = gate.await;
             SteerDeliveryOutcome::MissedRun
         });

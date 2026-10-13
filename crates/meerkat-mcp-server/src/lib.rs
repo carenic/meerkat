@@ -21,6 +21,7 @@ use meerkat::{
     MachineSessionArchiveProtocol, OutputSchema, PersistenceBundle, PersistentSessionService,
     ScheduleService, ScheduleToolDispatcher, ToolError, ToolResult,
 };
+use meerkat_contracts::wire::WireConfigWriteRefusal;
 use meerkat_contracts::{RequestLifecycle, SkillsParams};
 use meerkat_core::error::invalid_session_id_message;
 use meerkat_core::service::{
@@ -983,6 +984,18 @@ fn map_config_runtime_error(err: ConfigRuntimeError) -> ToolCallError {
                 "current_generation": current
             })),
         ),
+        // An ordinary write is not governance administration; nothing was
+        // written.
+        ConfigRuntimeError::Config(
+            refused @ meerkat_core::ConfigError::GovernanceAdministration,
+        ) => match serde_json::to_value(WireConfigWriteRefusal::GovernanceAdministrationRequired) {
+            Ok(data) => ToolCallError::new(-32602, refused.to_string(), Some(data)),
+            Err(serialize_error) => ToolCallError::new(
+                -32603,
+                format!("failed to serialize config refusal data: {serialize_error}"),
+                None,
+            ),
+        },
         // The store refused the caller's candidate config (a new or changed
         // realm MCP server with an environment reference, or an invalid
         // written config); document and store failures stay internal.
@@ -1495,7 +1508,7 @@ impl MeerkatMcpState {
                 max_sessions,
                 persistence,
                 realm_paths.root.join("config_state.json"),
-            );
+            )?;
         #[cfg(feature = "mob")]
         let mob_state = {
             let persistent_mob_root = realm_paths.root.clone();
@@ -1716,7 +1729,8 @@ impl MeerkatMcpState {
                 PersistenceBundle::new(store, runtime_store, blob_store)
                     .expect("construct runtime authority"),
                 realm_paths.root.join("config_state.json"),
-            );
+            )
+            .expect("compose the runtime-backed service");
 
         let state = Self {
             service,
@@ -2361,6 +2375,7 @@ fn recoverable_callback_tool_defs(tools: &[McpToolDef]) -> Vec<ToolDef> {
             provenance: Some(meerkat_core::types::ToolProvenance {
                 kind: meerkat_core::types::ToolSourceKind::Builtin,
                 source_id: "mcp-server".into(),
+                artifact: None,
             }),
         })
         .collect()
@@ -3520,8 +3535,24 @@ async fn handle_meerkat_mcp_add(
             "oauth_account and oauth_account_selection are host configuration and cannot be set through meerkat_mcp_add",
         ));
     }
+    // Neither is an account declaration: an agent never states the account
+    // review shows for a server's operations.
+    if input.server_config.account.is_some() {
+        return Err(ToolCallError::invalid_params(
+            "account is host configuration and cannot be set through meerkat_mcp_add",
+        ));
+    }
     let session_id = meerkat::SessionId::parse(&input.session_id)
         .map_err(|error| ToolCallError::invalid_params(invalid_session_id_message(error)))?;
+    // This tool carries no authenticated attachment control: a governed
+    // runtime never attaches a server through it.
+    if state.runtime_adapter.has_native_work_authorization_host() {
+        return Err(ToolCallError::new(
+            -32600,
+            meerkat::surface::McpLiveAddError::GovernedRequiresControl.to_string(),
+            None,
+        ));
+    }
     let router_lease = state.live_mcp_router_lease(&session_id).await?;
     let adapter = router_lease.router();
 
@@ -4241,6 +4272,7 @@ async fn handle_meerkat_run(
                     .then(|| recoverable_callback_tool_defs(&input.tools)),
                 llm_client_override: None,
                 session_comms_runtime_override: None,
+                prepared_controller: None,
                 host_prompt_sections: Default::default(),
                 agent_llm_client_decorator: None,
                 runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
@@ -4683,6 +4715,7 @@ async fn handle_meerkat_resume(
                 .then(|| recoverable_callback_tool_defs(&input.tools)),
             llm_client_override: None,
             session_comms_runtime_override: None,
+            prepared_controller: None,
             host_prompt_sections: Default::default(),
             agent_llm_client_decorator: None,
             runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(runtime_bindings),
@@ -5190,6 +5223,7 @@ impl MpcToolDispatcher {
                     provenance: Some(meerkat_core::types::ToolProvenance {
                         kind: meerkat_core::types::ToolSourceKind::Builtin,
                         source_id: "mcp-server".into(),
+                        artifact: None,
                     }),
                 })
             })
@@ -6378,6 +6412,7 @@ mod tests {
             serde_json::json!({"oauth_account_selection": "unverified"}),
             serde_json::json!({"oauth_account_selection": "discover"}),
             serde_json::json!({"oauth_account": "provider-subject-7"}),
+            serde_json::json!({"account": "none"}),
         ] {
             let mut server_config = serde_json::json!({
                 "name": "selected",
@@ -7964,6 +7999,7 @@ mod tests {
                 provenance: Some(meerkat_core::types::ToolProvenance {
                     kind: meerkat_core::types::ToolSourceKind::Mcp,
                     source_id: "late-server".into(),
+                    artifact: None,
                 }),
             }));
 

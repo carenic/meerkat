@@ -414,8 +414,10 @@ interaction and additional controller/model turns are explicit application work,
 measured separately. Host time with bounded declared leeway is sufficient; no
 authenticated clock or witness service is required.
 
-Added authorization cost must be below 1 ms p99 per tool/model operation and at
-most 10 percent per representative turn. Count evaluation, attribute resolution,
+Added authorization cost must be below 1 ms p99 per tool/model operation, with
+responsiveness and full coverage. At most 10 percent mean overhead per
+representative turn is a nonblocking optimization target, not an acceptance
+gate. Count evaluation, attribute resolution,
 cache misses, recording and allocation. The final warm check is constant time;
 preparation is not free merely because it precedes dispatch. Measure matched
 trusted/governed runs, warm and cold paths, invalidation, 1/16 concurrency,

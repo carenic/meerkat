@@ -55,7 +55,7 @@ source of truth for tool names and availability.
 | `meerkat_skills` | List or inspect available skills |
 | `meerkat_schedule_*` tools | Agent-facing schedule create/get/list/update/pause/resume/delete/occurrences tools |
 | `workgraph_*` tools | Agent-facing WorkGraph create/read/claim/update/link/evidence/close tools |
-| `meerkat_mcp_add` | Stage a live MCP server addition on an active session (refuses `oauth_account` and `oauth_account_selection`) |
+| `meerkat_mcp_add` | Stage a live MCP server addition on an active session (refuses `oauth_account`, `oauth_account_selection` and `account`) |
 | `meerkat_mcp_remove` | Stage a live MCP server removal on an active session |
 | `meerkat_mcp_reload` | Stage a live MCP server reload on an active session |
 | `meerkat_event_stream_open` | Open a session-level agent event stream |
@@ -260,6 +260,37 @@ then run `rkat mcp login <name>` for an explicit browser login, or
 `rkat run "..." --mcp-auth interactive` to allow first-use browser auth during
 an interactive TTY run. Normal runs default to `--mcp-auth stored`.
 </Note>
+
+### The account an operation acts with
+
+A reviewed operation (R2 or R3 under a realm's
+[governance settings](/concepts/configuration#governance-settings)) shows
+the reviewer and the consenting human the account it acts with, as the
+server's owners state it for the exact connection the call runs on:
+
+- a connector binding (`connector`) states its issuer-verified account;
+- `oauth_account = "<subject>"` states that subject at the server's origin;
+  every credential the connection uses must prove it;
+- `account = "none"` is the host's declaration that the server's operations
+  act with no selected account.
+
+Anything else states nothing, and the operation's review material is
+unavailable: its R2 or R3 review is refused locally, never run at R1. That
+includes a stdio server's environment, a static `Authorization` header, an
+`oauth_account_selection` (a discovered subject lives only in the stored
+credential, and an unverified one carries no account) and a server without
+a connector binding. The account is fixed for the connection; a changed
+binding is a new connection, and a plan resolved on the old one is not
+dispatched. `account = "none"` conflicts with `connector`, `oauth_account`
+and `oauth_account_selection`. Only host configuration sets it:
+`meerkat_mcp_add` refuses it, and mob portable profiles cannot carry it.
+
+```toml
+[[servers]]
+name = "calendar"
+command = "calendar-mcp"
+account = "none"
+```
 
 ### Host-driven OAuth
 

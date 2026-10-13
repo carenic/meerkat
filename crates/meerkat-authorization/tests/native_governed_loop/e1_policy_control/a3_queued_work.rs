@@ -465,6 +465,8 @@ async fn exercise_queued(server: &Server, barriers: Arc<QueueBarriers>) {
     let machine = Arc::new(
         MeerkatMachine::ephemeral()
             .with_local_grant_authorization(NativeGrantWorkConfiguration {
+                retained_resume: None,
+                require_scoped_destination: false,
                 grants,
                 ingress,
                 invocation_owner: Arc::new(InvocationOwner),
@@ -472,6 +474,7 @@ async fn exercise_queued(server: &Server, barriers: Arc<QueueBarriers>) {
                     selection: selected.clone(),
                     endpoint: endpoint.clone(),
                 }),
+                configured_mcp_attachment: None,
             })
             .unwrap(),
     );

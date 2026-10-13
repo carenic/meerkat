@@ -543,6 +543,126 @@ rust_test(
 )
 
 rust_test(
+    name = "connector_protocol_google_test",
+    aliases = aliases(
+        package_name = "crates/meerkat-auth-core",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "connector_protocol_google",
+    crate_root = "tests/connector_protocol_google.rs",
+    crate_features = [
+        "azure-ad",
+        "file-lock",
+        "gcp-auth",
+        "keyring",
+        "oauth",
+    ],
+    edition = "2024",
+    rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
+    compile_data = [
+        "Cargo.toml",
+        "tests/fixtures/oauth-browser-pre-connector.json",
+        "tests/fixtures/test_sa_key.pem",
+    ],
+    srcs = [
+        "tests/connector_protocol_google.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.8.52",
+        "CARGO_BIN_NAME": "connector_protocol_google",
+        "CARGO_MANIFEST_DIR": "./crates/meerkat-auth-core",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "medium",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "8388608",
+        "RUST_TEST_THREADS": "1",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "crates/meerkat-auth-core",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//crates/meerkat-auth-core:meerkat_auth_core",
+        "//crates/meerkat-core:meerkat_core",
+        "//crates/meerkat-llm-core:meerkat_llm_core",
+        "//crates/meerkat-runtime:meerkat_runtime_test_support",
+    ] + all_crate_deps(
+        package_name = "crates/meerkat-auth-core",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "connector_protocol_providers_test",
+    aliases = aliases(
+        package_name = "crates/meerkat-auth-core",
+        normal = True,
+        normal_dev = True,
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    crate_name = "connector_protocol_providers",
+    crate_root = "tests/connector_protocol_providers.rs",
+    crate_features = [
+        "azure-ad",
+        "file-lock",
+        "gcp-auth",
+        "keyring",
+        "oauth",
+    ],
+    edition = "2024",
+    rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
+    compile_data = [
+        "Cargo.toml",
+        "tests/fixtures/oauth-browser-pre-connector.json",
+        "tests/fixtures/test_sa_key.pem",
+    ],
+    srcs = [
+        "tests/connector_protocol_providers.rs",
+    ],
+    visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.8.52",
+        "CARGO_BIN_NAME": "connector_protocol_providers",
+        "CARGO_MANIFEST_DIR": "./crates/meerkat-auth-core",
+    },
+    tags = [
+        "fast",
+    ],
+    size = "medium",
+    data = [],
+    env = {
+        "RUST_MIN_STACK": "8388608",
+        "RUST_TEST_THREADS": "1",
+    },
+    proc_macro_deps = all_crate_deps(
+        package_name = "crates/meerkat-auth-core",
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//crates/meerkat-auth-core:meerkat_auth_core",
+        "//crates/meerkat-core:meerkat_core",
+        "//crates/meerkat-llm-core:meerkat_llm_core",
+        "//crates/meerkat-runtime:meerkat_runtime_test_support",
+    ] + all_crate_deps(
+        package_name = "crates/meerkat-auth-core",
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
     name = "google_auth_authorizer_test",
     aliases = aliases(
         package_name = "crates/meerkat-auth-core",
@@ -1100,6 +1220,8 @@ test_suite(
         ":cloud_refresh_readiness_test",
         ":connector_login_owner_test",
         ":connector_oauth_commit_test",
+        ":connector_protocol_google_test",
+        ":connector_protocol_providers_test",
         ":google_auth_authorizer_test",
         ":mcp_oauth_account_use_test",
         ":mcp_oauth_owner_test",

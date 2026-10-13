@@ -4058,7 +4058,7 @@ while true; do sleep 1; done"#,
     reopened_pump
         .call(
             &mut reopened_rpc,
-            "mobkit/jobs/progress",
+            "meta/jobs/progress",
             json!({
                 "authority": old_authority,
                 "cursor": 2,
@@ -4147,7 +4147,7 @@ while true; do sleep 1; done"#,
     let (_code, stale_message) = reopened_pump
         .call_expect_error(
             &mut reopened_rpc,
-            "mobkit/jobs/progress",
+            "meta/jobs/progress",
             json!({
                 "authority": old_authority,
                 "cursor": 4,

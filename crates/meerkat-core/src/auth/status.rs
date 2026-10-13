@@ -92,6 +92,29 @@ impl AuthStatusPhase {
     }
 }
 
+/// What a non-blocking status read could not observe about a stored
+/// credential. A status carries it only when the credential store did not
+/// answer, and then the status phase reflects the live lease alone: it is
+/// never a statement that the credential is absent.
+///
+/// `not_observed`: no operating-system read was attempted. `owner_busy`: the
+/// credential's lifecycle owner was busy, so nothing was read. `pending`: an
+/// owner-held lookup is in flight. `denied` and `interaction_required`:
+/// backend evidence from an earlier lookup. `unavailable`: the store could
+/// not answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CredentialObservation {
+    NotObserved,
+    OwnerBusy,
+    Pending,
+    Denied,
+    InteractionRequired,
+    Unavailable,
+}
+
 /// Status snapshot of a resolved (or unresolved) auth profile.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

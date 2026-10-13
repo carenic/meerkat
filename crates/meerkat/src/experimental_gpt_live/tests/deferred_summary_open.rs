@@ -481,7 +481,8 @@ async fn build_environment_with(
     let mut builder = crate::FactoryAgentBuilder::new(factory, config);
     let held_client = Arc::new(HeldTurnClient::new());
     builder.default_llm_client = Some(held_client.clone());
-    let (service, runtime) = crate::surface::build_runtime_backed_service(builder, 4, persistence);
+    let (service, runtime) = crate::surface::build_runtime_backed_service(builder, 4, persistence)
+        .expect("compose the runtime-backed service");
     let service = Arc::new(service);
 
     let projection = Arc::new(crate::surface::ServiceLiveProjection::new(
@@ -1610,10 +1611,46 @@ async fn canonical_open_with_a_turn_mid_flight_seeds_the_committed_boundary_and_
         .expect("close active channel");
 }
 
+/// The strict adapter's local refusal of `Refresh` on the exact channel: the
+/// projection was built and handed to the host, and the experimental GPT Live
+/// adapter, which has no refresh, refused the command with its own not-ready
+/// detail before any acceptance was minted. This fixture's controlled
+/// sideband never reports the session ready, so the adapter answers from
+/// `Opening`. A snapshot-version or other enqueue failure carries another
+/// detail.
+fn assert_refresh_refused_by_strict_adapter<T: std::fmt::Debug>(
+    refreshed: &Result<T, crate::session_runtime::errors::LiveChannelVerbError>,
+    channel_id: &meerkat_core::LiveChannelId,
+) {
+    match refreshed {
+        Err(crate::session_runtime::errors::LiveChannelVerbError::RequestRejected {
+            channel_id: rejected,
+            expected: meerkat_runtime::meerkat_machine::dsl::LiveChannelRequestPublicKind::Refresh,
+            detail,
+            ..
+        }) => {
+            assert_eq!(
+                rejected,
+                &channel_id.to_string(),
+                "the exact channel's Refresh is refused"
+            );
+            assert_eq!(
+                detail.as_deref(),
+                Some("adapter not ready: current status is Opening"),
+                "the strict adapter's own refusal"
+            );
+        }
+        other => panic!("the strict adapter refuses Refresh locally: {other:?}"),
+    }
+}
+
 /// `live/refresh` and the per-channel refresh projection config propagation
 /// uses, on a channel whose member is mid-turn, never wait for the turn: the config part is
 /// built from the committed boundary and the published tools, and the durable
-/// resync is left to the turn boundary.
+/// resync is left to the turn boundary. The projection carries the strict
+/// channel's bound identity, not the member's text identity, and no replay
+/// seed; the strict adapter's local refusal of `Refresh` is preserved, and the
+/// strict control lane reaches it only with the exact activation receipt.
 #[tokio::test]
 async fn refresh_with_a_turn_mid_flight_does_not_wait_for_the_turn() {
     let _reservation = OPEN_RESERVATION.lock().await;
@@ -1624,10 +1661,8 @@ async fn refresh_with_a_turn_mid_flight_does_not_wait_for_the_turn() {
         .expect("media activation");
     let turn = env.start_held_turn().await;
 
-    // The scripted adapter of this environment never leaves `Opening`, so the
-    // host may refuse to queue the refresh. What this pins is that the refresh
-    // projection is built (no `RefreshConfig`) and handed to the host while the
-    // turn is still held.
+    // The projection is built (no `RefreshConfig`) and handed to the host
+    // while the turn is still held; the strict adapter then refuses it.
     let orchestrator = env.member_host.orchestrator();
     let refreshed = tokio::time::timeout(
         Duration::from_secs(20),
@@ -1639,25 +1674,47 @@ async fn refresh_with_a_turn_mid_flight_does_not_wait_for_the_turn() {
     )
     .await
     .expect("live/refresh never waits on the parked turn");
-    assert!(
-        !matches!(
-            refreshed,
-            Err(crate::session_runtime::errors::LiveChannelVerbError::RefreshConfig(_))
-        ),
-        "the refresh projection is built mid-turn: {refreshed:?}"
+    assert_refresh_refused_by_strict_adapter(&refreshed, opened.channel_id());
+    let binding = env
+        .runtime
+        .live_channel_binding(&env.session_id, opened.channel_id())
+        .await
+        .expect("binding read")
+        .expect("the strict channel is bound");
+    assert_eq!(
+        binding.execution_profile_id(),
+        Some(GPT_LIVE_PUBLIC_CLIENT_CONTEXT_PROFILE_ID),
+        "the strict open admitted its selected profile"
     );
-    // Config propagation builds each channel's refresh with this projection.
+    let text_identity = env
+        .service
+        .live_session_llm_identity(&env.session_id)
+        .await
+        .expect("the member's text identity");
+    assert_ne!(
+        binding.identity(),
+        &text_identity,
+        "the strict channel's realtime identity differs from the text identity"
+    );
+    // The refresh verbs, and config propagation for session-following
+    // channels, build a channel's refresh with this projection.
     let config = tokio::time::timeout(
         Duration::from_secs(20),
         orchestrator.live_refresh_config_for_channel(
             &env.session_id,
             opened.channel_id(),
             meerkat_contracts::RealtimeTurningMode::ProviderManaged,
+            binding.identity().clone(),
         ),
     )
     .await
     .expect("the propagated refresh projection never waits on the parked turn")
     .expect("refresh projection");
+    assert_eq!(&config.llm_identity, binding.identity());
+    assert!(
+        config.seed_messages().is_empty(),
+        "a refresh projection replays no history"
+    );
     let published = env
         .service
         .published_live_visible_tool_defs(&env.session_id)
@@ -1686,6 +1743,45 @@ async fn refresh_with_a_turn_mid_flight_does_not_wait_for_the_turn() {
         .expect("held turn completes once released")
         .expect("turn task")
         .expect("turn commits");
+
+    // The strict control lane: a receipt other than the channel's activation
+    // receipt is refused before any provider IO; the exact receipt reaches
+    // the same local adapter refusal.
+    let custody = env
+        .member_host
+        .validate_experimental_live_channel_custody(opened.channel_id(), opened.pending_receipt())
+        .await
+        .expect("active custody");
+    let activation_receipt = custody
+        .phase()
+        .activation_receipt()
+        .expect("active channel has an activation receipt")
+        .to_string();
+    let wrong_receipt = env
+        .member_host
+        .control_experimental_live_channel(
+            opened.channel_id(),
+            "not-the-activation-receipt",
+            meerkat_contracts::wire::supervisor_bridge::BridgeLiveControlVerb::Refresh,
+        )
+        .await;
+    assert!(
+        matches!(
+            wrong_receipt,
+            Err(crate::session_runtime::errors::LiveChannelVerbError::HostCommit { .. })
+        ),
+        "a wrong activation receipt is refused: {wrong_receipt:?}"
+    );
+    let exact_receipt = env
+        .member_host
+        .control_experimental_live_channel(
+            opened.channel_id(),
+            &activation_receipt,
+            meerkat_contracts::wire::supervisor_bridge::BridgeLiveControlVerb::Refresh,
+        )
+        .await;
+    assert_refresh_refused_by_strict_adapter(&exact_receipt, opened.channel_id());
+
     env.member_host
         .close_experimental_live_pending_channel(
             env.authority.as_ref(),
@@ -1694,6 +1790,160 @@ async fn refresh_with_a_turn_mid_flight_does_not_wait_for_the_turn() {
         )
         .await
         .expect("close active channel");
+}
+
+/// Records, when the provider adapter is opened, whether the channel's
+/// generated binding already names an execution profile.
+struct ProfileProbeFactory {
+    runtime: Arc<meerkat_runtime::MeerkatMachine>,
+    session_id: SessionId,
+    inner: crate::test_fixtures::realtime::ScriptedRealtimeSessionFactory,
+    observed: std::sync::Mutex<Vec<Option<String>>>,
+}
+
+#[async_trait]
+impl meerkat_llm_core::realtime_session::RealtimeSessionFactory for ProfileProbeFactory {
+    fn capabilities(&self) -> meerkat_contracts::RealtimeCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn supports_provider(&self, provider: meerkat_core::Provider) -> bool {
+        self.inner.supports_provider(provider)
+    }
+
+    async fn open_session(
+        &self,
+        open_config: &meerkat_llm_core::realtime_session::RealtimeSessionOpenConfig,
+    ) -> Result<
+        Box<dyn meerkat_llm_core::realtime_session::RealtimeSession>,
+        meerkat_llm_core::LlmError,
+    > {
+        self.inner.open_session(open_config).await
+    }
+
+    async fn attach_external_session(
+        &self,
+        target: &meerkat_llm_core::realtime_session::RealtimeExternalSessionTarget,
+        open_config: &meerkat_llm_core::realtime_session::RealtimeSessionOpenConfig,
+    ) -> Result<
+        Box<dyn meerkat_llm_core::realtime_session::RealtimeSession>,
+        meerkat_llm_core::LlmError,
+    > {
+        self.inner
+            .attach_external_session(target, open_config)
+            .await
+    }
+
+    async fn open_live_adapter(
+        &self,
+        open_config: &meerkat_llm_core::realtime_session::RealtimeSessionOpenConfig,
+    ) -> Result<Arc<dyn meerkat_core::live_adapter::LiveAdapter>, meerkat_llm_core::LlmError> {
+        let profile = match self
+            .runtime
+            .live_active_channel_for_session(&self.session_id)
+            .await
+        {
+            Some(channel_id) => self
+                .runtime
+                .live_channel_binding(&self.session_id, &channel_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|binding| binding.execution_profile_id().map(str::to_string)),
+            None => None,
+        };
+        self.observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(profile);
+        self.inner.open_live_adapter(open_config).await
+    }
+}
+
+/// A channel opened under an independently selected execution profile has
+/// that selection recorded in its generated binding by the time the provider
+/// adapter is opened. The probe samples at adapter creation, which follows
+/// host publication, so it catches a selection admitted after the open
+/// returns, not one admitted between publication and adapter creation; that
+/// the admission precedes publication is the open custody's source order.
+#[tokio::test]
+async fn profile_selected_open_records_the_profile_before_the_adapter_opens() {
+    let _reservation = OPEN_RESERVATION.lock().await;
+    let env = build_environment_without_summary_policy().await;
+    let probe = ProfileProbeFactory {
+        runtime: Arc::clone(&env.runtime),
+        session_id: env.session_id.clone(),
+        inner: crate::test_fixtures::realtime::ScriptedRealtimeSessionFactory::new(),
+        observed: std::sync::Mutex::new(Vec::new()),
+    };
+    let profile = meerkat_runtime::live_execution::LiveExecutionProfileSelection::__test_new(
+        "ordering-probe",
+        meerkat_core::LiveExecutionMode::ClientContext,
+        meerkat_core::LiveExecutionCapabilities {
+            function_bridge: false,
+            client_context: true,
+        },
+    )
+    .expect("test execution profile");
+    let projection_sink = Arc::new(crate::surface::ServiceLiveProjection::new(
+        Arc::clone(&env.service),
+        Arc::clone(&env.runtime),
+    ));
+    let close_feedback: Arc<dyn meerkat_live::LiveChannelCloseFeedback> = projection_sink.clone();
+    let status_feedback: Arc<dyn meerkat_live::LiveChannelStatusFeedback> = projection_sink.clone();
+    let token_authority: Arc<dyn meerkat_live::LiveWsTokenAuthority> = projection_sink;
+    let ws_state = meerkat_live::LiveWsState::new(
+        Arc::clone(&env.live_adapter_host),
+        close_feedback,
+        status_feedback,
+        token_authority,
+    );
+    let orchestrator = env.member_host.orchestrator();
+    let projection = orchestrator
+        .live_open_projection_for_session(
+            &env.session_id,
+            meerkat_contracts::RealtimeTurningMode::ProviderManaged,
+            None,
+        )
+        .await
+        .expect("prepare projection");
+    let opened = orchestrator
+        .open_live_channel_from_projection_with_execution_profile(
+            &env.live_adapter_host,
+            crate::session_runtime::live_orchestration::LiveTransportContext {
+                ws_state: Some(&ws_state),
+                base_url: Some("wss://profile-ordering.test"),
+                webrtc: None,
+            },
+            &probe,
+            &env.session_id,
+            projection,
+            None,
+            &profile,
+        )
+        .await
+        .expect("profile-selected open");
+    assert_eq!(
+        *probe
+            .observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        vec![Some("ordering-probe".to_string())],
+        "the profile is recorded before the provider adapter opens"
+    );
+    let channel_id = meerkat_live::LiveChannelId::new(&opened.channel_id);
+    let binding = env
+        .runtime
+        .live_channel_binding(&env.session_id, &channel_id)
+        .await
+        .expect("binding read")
+        .expect("the opened channel is bound");
+    assert_eq!(binding.execution_profile_id(), Some("ordering-probe"));
+    assert!(!binding.follows_session_identity());
+    orchestrator
+        .close_live_channel(&env.live_adapter_host, &channel_id, Some(&env.session_id))
+        .await
+        .expect("close the probe channel");
 }
 
 /// A summary that is ready within the pre-open bound rides the startup

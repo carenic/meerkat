@@ -852,6 +852,143 @@ impl ReviewedEntryTicket {
     }
 }
 
+/// The governed operation one tool dispatch prepared, owned by a trusted
+/// native owner that must check it again later, after its own waits (for
+/// example a WorkGraph admission fence that commits under its own
+/// reservation). See [`ToolDispatchContext::governed_operation`].
+///
+/// It keeps this dispatch's work context, prepared check and binding-owned
+/// call and plan inside core; it never exposes them for replay. Every
+/// [`Self::run_if_current_within`] checks the exact binding-owned call and
+/// its retained plan against current owners again.
+#[derive(Debug, Clone)]
+pub struct GovernedDispatchOperation {
+    context: ToolDispatchContext,
+    work: crate::WorkAuthorizationContext,
+}
+
+impl GovernedDispatchOperation {
+    /// The current decision for exactly this prepared operation, refreshed
+    /// once from current owners when stale.
+    ///
+    /// # Errors
+    /// A refused, unavailable or no longer current operation (for example
+    /// its run ended).
+    pub(crate) fn current(
+        &self,
+    ) -> Result<crate::authorization::PreparedOperationCheck, crate::ToolError> {
+        let (Some(work), Some(prepared)) = (
+            self.context.work_authorization.as_ref(),
+            self.context.prepared_authorization.as_ref(),
+        ) else {
+            return Err(governed_malformed());
+        };
+        let (call, plan) = prepared
+            .tool_dispatch_parts()
+            .ok_or_else(governed_malformed)?;
+        prepared
+            .current_tool(work, call, Some(plan), self.context.run_id())
+            .map_err(crate::ToolError::from)
+    }
+
+    /// Run `operation` only while this exact prepared operation is
+    /// currently permitted, with `further` conjoined by the work's own
+    /// retained owners (see `WorkAuthorization::run_if_current_within`),
+    /// under those owners' non-waiting exclusion held through `operation`.
+    /// An entry that requires review refuses: no review runs here. The
+    /// prepared check, binding and call never leave core.
+    ///
+    /// # Errors
+    /// A refused, unavailable or no longer current operation; `operation`
+    /// did not run.
+    pub fn run_if_current_within(
+        &self,
+        further: &(dyn std::any::Any + Send + Sync),
+        operation: &mut dyn FnMut(),
+    ) -> Result<(), crate::ToolError> {
+        let check = self.current()?;
+        check
+            .require_unreviewed_entry()
+            .map_err(crate::ToolError::from)?;
+        self.work
+            .authorization()
+            .run_if_current_within(
+                check.binding(),
+                check.validity().as_ref(),
+                further,
+                operation,
+            )
+            .map_err(crate::ToolError::from)
+    }
+
+    /// Issue (or recover) a child grant for `intent` as this dispatch's
+    /// effect, only while this exact prepared operation is currently
+    /// permitted with `further` conjoined, under the work owners' single
+    /// exclusion (see `WorkAuthorization::issue_child_if_current_within`).
+    /// The work owner first validates the typed `further` and `intent`
+    /// (before any review is spent); then THIS dispatch's own review custody
+    /// is entered (R1, or the R2 review this dispatch admitted; R3 needs
+    /// human consent, which is not supported here, and refuses) and held
+    /// through the issuance. The returned box carries the grant owner's
+    /// typed outcome, which callers must keep: an outer `Ok` is no receipt.
+    ///
+    /// # Errors
+    /// A refused, unavailable or no longer current operation, or an entry
+    /// this dispatch cannot make; nothing was issued.
+    pub fn issue_child_if_current_within(
+        &self,
+        further: &(dyn std::any::Any + Send + Sync),
+        intent: &(dyn std::any::Any + Send + Sync),
+    ) -> Result<Box<dyn std::any::Any + Send>, crate::ToolError> {
+        let prepared = self
+            .context
+            .prepared_authorization
+            .as_ref()
+            .ok_or_else(governed_malformed)?;
+        let (call, plan) = prepared
+            .tool_dispatch_parts()
+            .ok_or_else(governed_malformed)?;
+        // Validate the typed inputs before spending this dispatch's review: a
+        // malformed call must leave the entry spendable.
+        self.work
+            .authorization()
+            .validate_child_issuance(further, intent)
+            .map_err(crate::ToolError::from)?;
+        // The single consuming entry of this dispatch's effect: the final
+        // current check and this dispatch's own review custody.
+        let (entering, _custody) = self.context.enter_reviewed_effect_held(call, Some(plan))?;
+        let entered = entering.as_ref().unwrap_or(&self.context);
+        let check = entered
+            .prepared_authorization
+            .as_ref()
+            .ok_or_else(governed_malformed)?;
+        self.work
+            .authorization()
+            .issue_child_if_current_within(
+                check.binding(),
+                check.validity().as_ref(),
+                further,
+                intent,
+                check.review_tier(),
+            )
+            .map_err(crate::ToolError::from)
+    }
+
+    /// The governed work context this operation was prepared in.
+    pub fn work_authorization(&self) -> &crate::WorkAuthorizationContext {
+        // Constructed only from a governed context, which carries one.
+        &self.work
+    }
+}
+
+fn governed_malformed() -> crate::ToolError {
+    crate::ToolError::AuthorizationRefused {
+        refusal: crate::authorization::OperationRefused::new(
+            crate::authorization::OperationRefusalKind::MalformedFacts,
+        ),
+    }
+}
+
 /// Process-local live bridge authority carried to the last actual tool
 /// dispatch boundary. The opaque id participates in equality and diagnostics;
 /// the authority object itself is deliberately never rendered.
@@ -1289,6 +1426,67 @@ impl ToolDispatchContext {
         }
     }
 
+    /// Whether this context carries actual bound work and a prepared
+    /// authorization for exactly `call` and `plan`: the binding-owned call
+    /// and plan a governed dispatch forwards to its dispatcher, matched by
+    /// identity. An ungoverned or default context, whatever runtime identity
+    /// it carries, and any other call or plan are `false`. For an owner that
+    /// admits an effect only under governed work, such as a checked MCP
+    /// route that bypasses its server's access ceiling. The prepared check
+    /// never leaves core, and the effect's own reviewed entry decides it
+    /// again.
+    #[must_use]
+    pub fn is_prepared_for(
+        &self,
+        call: ToolCallView<'_>,
+        plan: &crate::ResolvedToolExecutionPlan,
+    ) -> bool {
+        let (Some(_), Some(prepared)) = (self.work_authorization(), self.prepared_authorization())
+        else {
+            return false;
+        };
+        prepared
+            .tool_dispatch_parts()
+            .is_some_and(|(bound_call, bound_plan)| {
+                std::ptr::eq(call.id, bound_call.id)
+                    && std::ptr::eq(call.name, bound_call.name)
+                    && std::ptr::eq(call.args, bound_call.args)
+                    && std::ptr::eq(plan, bound_plan)
+            })
+    }
+
+    /// The governed operation this dispatch prepared, for a trusted native
+    /// owner that checks it again later (see [`GovernedDispatchOperation`]).
+    /// `call` must be this dispatch's actual borrowed call: it is matched by
+    /// identity against the binding-owned call, and the binding's retained
+    /// plan is used internally (no caller-supplied plan).
+    ///
+    /// # Errors
+    /// An ungoverned or default context, or any other call, refuses.
+    pub fn governed_operation(
+        &self,
+        call: ToolCallView<'_>,
+    ) -> Result<GovernedDispatchOperation, crate::ToolError> {
+        let (Some(work), Some(prepared)) =
+            (self.work_authorization(), self.prepared_authorization())
+        else {
+            return Err(governed_malformed());
+        };
+        let (bound_call, _) = prepared
+            .tool_dispatch_parts()
+            .ok_or_else(governed_malformed)?;
+        if !std::ptr::eq(call.id, bound_call.id)
+            || !std::ptr::eq(call.name, bound_call.name)
+            || !std::ptr::eq(call.args, bound_call.args)
+        {
+            return Err(governed_malformed());
+        }
+        Ok(GovernedDispatchOperation {
+            context: self.clone(),
+            work: work.clone(),
+        })
+    }
+
     /// An owned, single-use entry for a leaf whose effect runs on a worker
     /// (for example a queued blocking task). It re-derives the exact
     /// binding-owned call when entered, so it is `'static` and `Send`, and it
@@ -1345,8 +1543,10 @@ impl ToolDispatchContext {
     }
 
     /// [`Self::enter_reviewed_effect`], also returning custody of the
-    /// entered effect for a leaf that may outlive its dispatch.
-    pub(crate) fn enter_reviewed_effect_held(
+    /// entered effect for a leaf that may outlive its dispatch. Hand the
+    /// custody to the owner that keeps the effect going (for example a send
+    /// task that outlives the caller) and hold it until that effect settles.
+    pub fn enter_reviewed_effect_held(
         &self,
         call: ToolCallView<'_>,
         plan: Option<&crate::ResolvedToolExecutionPlan>,
@@ -1696,6 +1896,15 @@ impl BindOutcome {
     }
 }
 
+/// A resource an agent's construction handed to the agent, released by the
+/// agent's owner when it ends the agent.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait AgentOwnedRelease: Send + Sync {
+    /// Release the resource and await its release. Idempotent.
+    async fn release(&self);
+}
+
 /// Trait for tool dispatchers
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -2014,14 +2223,14 @@ pub fn resolve_tool_execution_plan_fenced<T: AgentToolDispatcher + ?Sized + 'sta
     plan.bind_root_dispatch(Arc::clone(dispatcher), call)
 }
 
-/// Dispatch a plan only through the exact root allocation and exact canonical
-/// call identity used during resolution.
-pub async fn dispatch_tool_execution_plan_fenced<T: AgentToolDispatcher + ?Sized + 'static>(
+/// The plan still names this exact root allocation, the exact canonical call
+/// and the tool's current execution owner.
+fn validate_fenced_root_dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
     call: ToolCallView<'_>,
     context: &ToolDispatchContext,
     plan: &crate::ResolvedToolExecutionPlan,
-) -> Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError> {
+) -> Result<(), crate::error::ToolError> {
     plan.validate_root_dispatch(dispatcher, call)?;
     if let Some(binding) = context.application_binding() {
         binding.validate_execution_plan(call.name, plan)?;
@@ -2038,6 +2247,18 @@ pub async fn dispatch_tool_execution_plan_fenced<T: AgentToolDispatcher + ?Sized
             crate::ToolUnavailableReason::ExecutionOwnerChanged,
         ));
     }
+    Ok(())
+}
+
+/// Dispatch a plan only through the exact root allocation and exact canonical
+/// call identity used during resolution.
+pub async fn dispatch_tool_execution_plan_fenced<T: AgentToolDispatcher + ?Sized + 'static>(
+    dispatcher: &Arc<T>,
+    call: ToolCallView<'_>,
+    context: &ToolDispatchContext,
+    plan: &crate::ResolvedToolExecutionPlan,
+) -> Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError> {
+    validate_fenced_root_dispatch(dispatcher, call, context, plan)?;
     // Retain one binding with the actual resolved call. Its generation is
     // checked here after the dispatch queue, and again by adapters after any
     // further preparation waits, such as application consequence policy.
@@ -2091,6 +2312,79 @@ pub async fn dispatch_tool_execution_plan_fenced<T: AgentToolDispatcher + ?Sized
         None
     };
     let context = governed_context.as_ref().unwrap_or(context);
+    dispatch_admitted_plan(dispatcher, call, context, plan).await
+}
+
+/// Fresh explicit attempt of one retained R3 candidate after an
+/// authenticated human decision (ADR-001 human consent).
+///
+/// The approval owner resolves `approval_id` only for this context's own
+/// admitted work association and run: a reference copied from another work
+/// association or run, or a new call with equal-looking arguments, has no
+/// consent. The RETAINED binding-owned call and plan then go through the same
+/// fenced entry as any dispatch (root and execution-owner validation, entry
+/// staging, the current authorization check), and the effect leaf spends the
+/// decision once immediately before its body. A refusal anywhere settles this
+/// attempt locally with zero entry; a failure before entry leaves the consent
+/// spendable. The decision itself never executes anything.
+pub async fn dispatch_retained_consent_attempt<T: AgentToolDispatcher + ?Sized + 'static>(
+    dispatcher: &Arc<T>,
+    context: &ToolDispatchContext,
+    approval_id: &crate::ApprovalId,
+) -> Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError> {
+    let malformed = || crate::ToolError::AuthorizationRefused {
+        refusal: crate::authorization::OperationRefused::new(
+            crate::authorization::OperationRefusalKind::MalformedFacts,
+        ),
+    };
+    let Some(work) = context.work_authorization() else {
+        return Err(malformed());
+    };
+    let (review_entry, retained) = crate::approval::review::admit_consent_attempt(
+        context.operation_review(),
+        approval_id,
+        work,
+        context.run_id(),
+    )?;
+    let (call, plan) = retained.tool_dispatch_parts().ok_or_else(malformed)?;
+    if dispatcher.review_entry_support(call.name)
+        != crate::approval::review::ReviewEntrySupport::ConsumesAtEntry
+    {
+        return Err(crate::ToolError::ReviewUnavailable {
+            kind: crate::approval::review::ReviewUnavailableKind::UnsupportedEntry,
+        });
+    }
+    validate_fenced_root_dispatch(dispatcher, call, context, plan)?;
+    let governed = context
+        .clone()
+        .with_prepared_authorization(retained.clone())
+        .with_review_entry(review_entry);
+    // The retained plan keeps the original call's resolved deadline: the
+    // attempt runs under the same effective timeout that call had.
+    let Some(timeout) = plan.effective_timeout() else {
+        return dispatch_admitted_plan(dispatcher, call, &governed, plan).await;
+    };
+    let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    match tokio::time::timeout(
+        timeout,
+        dispatch_admitted_plan(dispatcher, call, &governed, plan),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(crate::error::ToolError::timeout(call.name, timeout_ms)),
+    }
+}
+
+/// The common tail of a fenced dispatch whose review admission is settled:
+/// entry staging and the check point, the body, the outcome observation, and
+/// the dispatch-lifetime review guard.
+async fn dispatch_admitted_plan<T: AgentToolDispatcher + ?Sized + 'static>(
+    dispatcher: &Arc<T>,
+    call: ToolCallView<'_>,
+    context: &ToolDispatchContext,
+    plan: &crate::ResolvedToolExecutionPlan,
+) -> Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError> {
     // The guard lives exactly as long as this dispatch. Dropping it here
     // (cancellation, enclosing tool timeout) abandons a retained review and
     // closes every clone a worker or transport may still hold.
@@ -3228,6 +3522,38 @@ impl RunLifecyclePublication {
     }
 }
 
+/// The human consent the current run requested itself, and which of it the
+/// run already attempted. Scheduling and notice suppression only: at most
+/// one in-run attempt per decision per run, and only the run's own requests
+/// are examined. Spend and withdrawal authority stays with the approval
+/// owner. Reset with each work-authorized run scope.
+#[derive(Debug, Default)]
+pub(crate) struct RunConsentAttempts {
+    requested: BTreeSet<crate::ApprovalId>,
+    attempted: BTreeSet<crate::ApprovalId>,
+}
+
+impl RunConsentAttempts {
+    /// The run's own dispatch committed a consent request for one call.
+    pub(crate) fn requested(&mut self, approval_id: &crate::ApprovalId) {
+        self.requested.insert(approval_id.clone());
+    }
+
+    /// The consent this run requested and has not attempted yet.
+    pub(crate) fn unattempted(&self) -> Vec<crate::ApprovalId> {
+        self.requested
+            .difference(&self.attempted)
+            .cloned()
+            .collect()
+    }
+
+    /// Record `approval_id` as attempted in this run; false when the run
+    /// already attempted it.
+    pub(crate) fn first_attempt(&mut self, approval_id: &crate::ApprovalId) -> bool {
+        self.attempted.insert(approval_id.clone())
+    }
+}
+
 /// The main Agent struct
 pub struct Agent<C, T, S>
 where
@@ -3247,6 +3573,9 @@ where
     pub(super) comms_runtime: Option<Arc<dyn CommsRuntime>>,
     pub(super) hook_engine: Option<Arc<dyn HookEngine>>,
     pub(super) hook_run_overrides: HookRunOverrides,
+    /// Mandatory hook topology validated at this run's admission. Same-run
+    /// feedback recovers only failures of its admitted gates.
+    pub(super) admitted_hook_topology: crate::hooks::HookMandatoryTopology,
     pub(super) post_commit_hooks: Arc<crate::hooks::PostCommitHookDispatcher>,
     /// Optional context compaction strategy.
     pub(crate) compactor: Option<Arc<dyn crate::compact::Compactor>>,
@@ -3415,6 +3744,10 @@ where
     pub(crate) active_model_profile: Option<crate::ModelProfileWitness>,
     /// True when the runtime control plane must stamp execution kind metadata.
     pub(crate) runtime_execution_kind_required: bool,
+    /// Resources this agent's construction handed over that must be released
+    /// when the agent's owner ends it (for example its MCP router's own
+    /// lineages of a session registration's surface).
+    pub(crate) owned_releases: Vec<Arc<dyn AgentOwnedRelease>>,
     /// Typed execution intent for the current run, when this turn is owned by
     /// the runtime control plane rather than a direct surface call.
     pub(crate) runtime_execution_kind: Option<crate::lifecycle::RuntimeExecutionKind>,
@@ -3444,6 +3777,10 @@ where
     /// Runtime-backed external tool-surface diagnostic handle, when provided
     /// by the session runtime bindings.
     pub(crate) external_tool_surface_handle: Option<Arc<dyn crate::ExternalToolSurfaceHandle>>,
+    /// This member's live MCP attachment surface: its construction's own
+    /// router, when a governed session-owned construction built one.
+    pub(crate) live_mcp_attachment:
+        Option<Arc<dyn crate::mcp_attachment::LiveMcpAttachmentSurface>>,
     /// Runtime-backed auth lease handle (Phase 1.5-rev).
     pub(crate) auth_lease_handle: Option<crate::handles::GeneratedAuthLeaseHandle>,
     /// Credential authority paired with the currently active LLM route.
@@ -3487,6 +3824,8 @@ where
     /// Trusted host operation review composition, forwarded to every tool
     /// dispatch context. It only enables review; the tier stays authorization's.
     pub(crate) operation_review: Option<Arc<crate::approval::review::BoundOperationReview>>,
+    /// Human consent the current run requested, and its in-run attempts.
+    pub(crate) run_consent_attempts: RunConsentAttempts,
     /// Exact per-operation dispatch authority for a noncommitting live bridge
     /// run. Ordinary turns always leave this absent.
     pub(crate) live_bridge_dispatch_admission: Option<LiveBridgeToolDispatchAdmission>,
@@ -3515,6 +3854,25 @@ where
     T: AgentToolDispatcher + ?Sized,
     S: AgentSessionStore + ?Sized,
 {
+    /// Hand this agent a resource its construction must release when the
+    /// agent's owner ends it.
+    pub fn retain_owned_release(&mut self, release: Arc<dyn AgentOwnedRelease>) {
+        self.owned_releases.push(release);
+    }
+
+    /// Release every resource this agent's construction handed it, awaiting
+    /// each release. The owner ending the agent calls this before it reports
+    /// the agent gone. Limits: the list is taken before the first await, so
+    /// a release cancelled midway drops the rest unreleased; a panicked or
+    /// aborted owner never calls it; and a completed release (for an MCP
+    /// router, its unit-returning shutdown) is not proof that a server
+    /// process exited.
+    pub async fn release_owned_resources(&mut self) {
+        for release in std::mem::take(&mut self.owned_releases) {
+            release.release().await;
+        }
+    }
+
     /// Retain the existing selection owner's actual immutable client for
     /// native setup. This is process resource custody, never admission.
     /// Mutable selectors must pin their selected child, not themselves.
@@ -4818,6 +5176,293 @@ mod tests {
                 .consume("operation-1", &session_id, &revision)
                 .is_err(),
             "a cloned permit must share the one-use consumption bit"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod governed_operation_tests {
+    use super::*;
+    use crate::authorization::{
+        AuthorizationOperation, OperationAuthorizationError, OperationAuthorizationFacts,
+        OperationObservation, OperationObservationError, OperationRefusalKind, OperationRefused,
+        PreparedAuthorizationBinding, PreparedOperationAuthorization, PreparedOperationCheck,
+        ToolAuthorizationFacts, ToolAuthorizationTarget, WorkAuthorization,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Work(Arc<AtomicBool>);
+    struct Prepared(Arc<AtomicBool>);
+    impl WorkAuthorization for Work {
+        fn prepare(
+            &self,
+            _binding: &PreparedAuthorizationBinding,
+        ) -> Result<Arc<dyn PreparedOperationAuthorization>, OperationAuthorizationError> {
+            if self.0.load(Ordering::SeqCst) {
+                return Err(OperationRefused::new(OperationRefusalKind::Denied).into());
+            }
+            Ok(Arc::new(Prepared(Arc::clone(&self.0))))
+        }
+    }
+    impl PreparedOperationAuthorization for Prepared {
+        fn review_tier(&self) -> crate::authorization::OperationReviewTier {
+            crate::authorization::OperationReviewTier::R1
+        }
+
+        fn check_current(
+            &self,
+            _binding: &PreparedAuthorizationBinding,
+        ) -> Result<(), OperationAuthorizationError> {
+            if self.0.load(Ordering::SeqCst) {
+                return Err(OperationRefused::new(OperationRefusalKind::Denied).into());
+            }
+            Ok(())
+        }
+
+        fn observe(
+            &self,
+            _binding: &PreparedAuthorizationBinding,
+            _event: OperationObservation,
+        ) -> Result<(), OperationObservationError> {
+            Ok(())
+        }
+    }
+
+    /// The dispatch's own operation is reachable only with its actual
+    /// borrowed call, and stays checked against current owners.
+    #[test]
+    fn a_governed_operation_requires_the_dispatch_call_and_stays_current() {
+        let revoked = Arc::new(AtomicBool::new(false));
+        let work = crate::WorkAuthorizationContext::new(
+            Arc::new(Work(Arc::clone(&revoked))),
+            crate::OperationExecutionScope::Domain,
+        );
+        let plan = crate::ToolExecutionContract::default()
+            .resolve_default(
+                crate::ToolDeadlineChain::new(vec![crate::ToolDeadlineContributor::finite(
+                    crate::ToolDeadlineOwner::CoreToolDispatch,
+                    std::time::Duration::from_secs(1),
+                )])
+                .unwrap(),
+            )
+            .unwrap();
+        let arguments: Arc<serde_json::value::RawValue> =
+            Arc::from(serde_json::value::RawValue::from_string("{}".to_string()).unwrap());
+        let binding = PreparedAuthorizationBinding::new(OperationAuthorizationFacts {
+            operation_id: crate::OperationId::new(),
+            execution_scope: crate::OperationExecutionScope::Domain,
+            run_id: None,
+            context_revision: None,
+            operation: AuthorizationOperation::Tool(ToolAuthorizationFacts {
+                call_id: Arc::from("setup-call"),
+                name: "setup".into(),
+                arguments,
+                target: ToolAuthorizationTarget::Dispatcher(Arc::new(plan)),
+            }),
+        });
+        let prepared = PreparedOperationCheck::prepare(work.clone(), binding).unwrap();
+        let context = ToolDispatchContext::default()
+            .with_work_authorization(Some(work.clone()))
+            .with_prepared_authorization(prepared.clone());
+        let (call, _) = prepared.tool_dispatch_parts().unwrap();
+
+        assert!(
+            ToolDispatchContext::default()
+                .governed_operation(call)
+                .is_err(),
+            "a default context has no governed operation"
+        );
+        let args = serde_json::value::RawValue::from_string("{}".to_string()).unwrap();
+        let lookalike = ToolCallView {
+            id: "setup-call",
+            name: "setup",
+            args: &args,
+        };
+        assert!(
+            context.governed_operation(lookalike).is_err(),
+            "an equal-looking call is not the dispatch's own call"
+        );
+        let operation = context
+            .governed_operation(call)
+            .expect("the dispatch's own call");
+        assert!(operation.work_authorization().same_context(&work));
+        let current = operation.current().expect("current");
+        assert!(current.binding().same_operation(prepared.binding()));
+        let mut ran = false;
+        assert_eq!(
+            operation.run_if_current_within(&(), &mut || ran = true),
+            Err(crate::ToolError::OperationAuthorizationUnavailable),
+            "a default (foreign) work owner refuses as unavailable"
+        );
+        assert!(!ran, "and the operation never runs");
+        assert_eq!(
+            operation
+                .issue_child_if_current_within(&(), &())
+                .map(|_| ()),
+            Err(crate::ToolError::OperationAuthorizationUnavailable),
+            "a default (foreign) work owner issues no child"
+        );
+
+        revoked.store(true, Ordering::SeqCst);
+        assert!(
+            operation.current().is_err(),
+            "the owned operation is checked against current owners"
+        );
+    }
+
+    /// An R2 work owner whose child issuance accepts only a `u32` intent.
+    struct R2Prepared;
+    impl PreparedOperationAuthorization for R2Prepared {
+        fn review_tier(&self) -> crate::authorization::OperationReviewTier {
+            crate::authorization::OperationReviewTier::R2
+        }
+
+        fn check_current(
+            &self,
+            _binding: &PreparedAuthorizationBinding,
+        ) -> Result<(), OperationAuthorizationError> {
+            Ok(())
+        }
+
+        fn observe(
+            &self,
+            _binding: &PreparedAuthorizationBinding,
+            _event: OperationObservation,
+        ) -> Result<(), OperationObservationError> {
+            Ok(())
+        }
+    }
+    struct R2Work;
+    impl WorkAuthorization for R2Work {
+        fn prepare(
+            &self,
+            _binding: &PreparedAuthorizationBinding,
+        ) -> Result<Arc<dyn PreparedOperationAuthorization>, OperationAuthorizationError> {
+            Ok(Arc::new(R2Prepared))
+        }
+
+        fn validate_child_issuance(
+            &self,
+            _further: &(dyn std::any::Any + Send + Sync),
+            intent: &(dyn std::any::Any + Send + Sync),
+        ) -> Result<(), OperationAuthorizationError> {
+            intent
+                .downcast_ref::<u32>()
+                .map(|_| ())
+                .ok_or_else(|| OperationRefused::new(OperationRefusalKind::Denied).into())
+        }
+
+        fn issue_child_if_current_within(
+            &self,
+            _binding: &PreparedAuthorizationBinding,
+            _prepared: Option<&crate::authorization::OperationValidity>,
+            _further: &(dyn std::any::Any + Send + Sync),
+            intent: &(dyn std::any::Any + Send + Sync),
+            entered_tier: crate::authorization::OperationReviewTier,
+        ) -> Result<Box<dyn std::any::Any + Send>, OperationAuthorizationError> {
+            assert_eq!(entered_tier, crate::authorization::OperationReviewTier::R2);
+            Ok(Box::new(*intent.downcast_ref::<u32>().expect("validated")))
+        }
+
+        /// The fixture work names no action account and no mandate.
+        fn review_operation_context(
+            &self,
+            _binding: &PreparedAuthorizationBinding,
+        ) -> Result<
+            crate::authorization::ReviewOperationContextResolution,
+            OperationAuthorizationError,
+        > {
+            Ok(crate::authorization::ReviewOperationContextResolution::NotApplicable)
+        }
+    }
+    struct AllowAll;
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl crate::approval::review::OperationReviewer for AllowAll {
+        async fn review(
+            &self,
+            _candidate: &crate::approval::review::ReviewCandidate<'_>,
+        ) -> Result<crate::approval::review::ReviewVerdict, crate::approval::review::ReviewerFailure>
+        {
+            Ok(crate::approval::review::ReviewVerdict::Allow)
+        }
+    }
+
+    /// A malformed child intent is refused before the dispatch's admitted R2
+    /// review is spent: the corrected intent then enters once, and a second
+    /// entry finds the review consumed.
+    #[tokio::test]
+    async fn a_malformed_child_intent_leaves_the_admitted_review_spendable() {
+        let work = crate::WorkAuthorizationContext::new(
+            Arc::new(R2Work),
+            crate::OperationExecutionScope::Domain,
+        );
+        let plan = crate::ToolExecutionContract::default()
+            .resolve_default(
+                crate::ToolDeadlineChain::new(vec![crate::ToolDeadlineContributor::finite(
+                    crate::ToolDeadlineOwner::CoreToolDispatch,
+                    std::time::Duration::from_secs(1),
+                )])
+                .unwrap(),
+            )
+            .unwrap();
+        let arguments: Arc<serde_json::value::RawValue> =
+            Arc::from(serde_json::value::RawValue::from_string("{}".to_string()).unwrap());
+        let binding = PreparedAuthorizationBinding::new(OperationAuthorizationFacts {
+            operation_id: crate::OperationId::new(),
+            execution_scope: crate::OperationExecutionScope::Domain,
+            run_id: None,
+            context_revision: None,
+            operation: AuthorizationOperation::Tool(ToolAuthorizationFacts {
+                call_id: Arc::from("setup-call"),
+                name: "setup".into(),
+                arguments,
+                target: ToolAuthorizationTarget::Dispatcher(Arc::new(plan)),
+            }),
+        });
+        let prepared = PreparedOperationCheck::prepare(work.clone(), binding).unwrap();
+        let (call, _) = prepared.tool_dispatch_parts().unwrap();
+        let review = Arc::new(crate::approval::review::BoundOperationReview::new(
+            Arc::new(AllowAll),
+            crate::approval::ApprovalService::new(),
+            std::time::Duration::from_secs(30),
+        ));
+        let entry = crate::approval::review::admit_operation_review(
+            Some(&review),
+            crate::approval::review::ReviewEntrySupport::ConsumesAtEntry,
+            call,
+            &prepared,
+            &work,
+        )
+        .await
+        .expect("the R2 review is admitted");
+        let context = ToolDispatchContext::default()
+            .with_work_authorization(Some(work))
+            .with_prepared_authorization(prepared.clone())
+            .with_review_entry(entry);
+        let operation = context.governed_operation(call).expect("governed");
+
+        assert!(
+            matches!(
+                operation.issue_child_if_current_within(&(), &"not an intent"),
+                Err(crate::ToolError::AuthorizationRefused { .. })
+            ),
+            "a malformed intent is refused"
+        );
+        let issued = operation
+            .issue_child_if_current_within(&(), &7u32)
+            .expect("the review was not spent by the malformed call");
+        assert_eq!(*issued.downcast::<u32>().expect("typed"), 7);
+        assert!(
+            matches!(
+                operation.issue_child_if_current_within(&(), &7u32),
+                Err(crate::ToolError::ReviewUnsatisfied {
+                    kind: crate::approval::review::ReviewUnsatisfiedKind::AlreadyConsumed,
+                    ..
+                })
+            ),
+            "the admitted review is spent once"
         );
     }
 }

@@ -39,6 +39,10 @@ function retryWithKnownAccount(reason: WireAuthErrorReason): boolean {
     case "callback_unavailable":
     case "upstream_failure":
     case "configuration_invalid":
+    case "credential_access_denied":
+    case "credential_interaction_required":
+    case "credential_access_pending":
+    case "credential_store_unavailable":
     case "infrastructure":
       return false;
     default: {

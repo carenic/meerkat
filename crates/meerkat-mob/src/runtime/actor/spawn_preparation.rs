@@ -101,6 +101,8 @@ pub(super) struct SpawnPreparationCarry {
     pub(super) fork_overlay: super::super::ForkOverlayOrigin,
     pub(super) owner_bridge_session_id: Option<SessionId>,
     pub(super) ops_registry: Option<Arc<dyn meerkat_core::ops_lifecycle::OpsLifecycleRegistry>>,
+    /// Held spawn request, handed to the provisioning task.
+    pub(super) held: Option<super::super::held_spawn::HeldSpawnRequest>,
 }
 
 /// The preparation task itself is detached, never aborted: its reads may
@@ -131,6 +133,11 @@ impl SpawnPreparations {
 
     pub(super) fn permits(&self) -> Arc<tokio::sync::Semaphore> {
         Arc::clone(&self.permits)
+    }
+
+    /// Spawn preparations still in flight.
+    pub(super) fn len(&self) -> usize {
+        self.slots.len()
     }
 }
 
@@ -247,26 +254,43 @@ impl MobActor {
             .get(&agent_identity)
             .cloned()
             .unwrap_or_default();
+        #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+        let held_bound = carry.held.as_ref().map(|held| held.bound.clone());
         tokio::spawn(async move {
             // The permit is awaited here, off the actor loop. The semaphore
-            // is never closed, so a failed acquire cannot occur.
-            let permit = permits.acquire_owned().await.ok();
-            #[cfg(test)]
-            if let Some(entered) = test_gate.entered.as_ref() {
-                let _ = entered.send(task_identity.clone());
-            }
-            #[cfg(test)]
-            if let Some(release) = test_gate.release.clone() {
-                let _released = release.acquire_owned().await;
-            }
-            let result = super::super::panic_capture::run_spawn_provision_guarded(
-                panic_log_ledger.as_ref(),
-                &mob_id,
-                "spawn preparation task",
-                &task_identity,
-                preparation,
-            )
-            .await;
+            // is never closed, so a failed acquire cannot occur. A held
+            // setup awaits it only within its bound: the task owns nothing
+            // and the preparation has not started, so a bound that ends
+            // first settles typed without running it.
+            #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+            let acquired = match held_bound.as_ref() {
+                Some(bound) => bound.within(permits.acquire_owned()).await,
+                None => Ok(permits.acquire_owned().await),
+            };
+            #[cfg(not(all(feature = "runtime-adapter", not(target_arch = "wasm32"))))]
+            let acquired: Result<_, MobError> = Ok(permits.acquire_owned().await);
+            let (permit, result) = match acquired {
+                Ok(permit) => {
+                    #[cfg(test)]
+                    if let Some(entered) = test_gate.entered.as_ref() {
+                        let _ = entered.send(task_identity.clone());
+                    }
+                    #[cfg(test)]
+                    if let Some(release) = test_gate.release.clone() {
+                        let _released = release.acquire_owned().await;
+                    }
+                    let result = super::super::panic_capture::run_spawn_provision_guarded(
+                        panic_log_ledger.as_ref(),
+                        &mob_id,
+                        "spawn preparation task",
+                        &task_identity,
+                        preparation,
+                    )
+                    .await;
+                    (permit.ok(), result)
+                }
+                Err(stopped) => (None, Err(stopped)),
+            };
             // A closed channel means the actor is gone; its keyed table (and
             // the custody in it) went with it.
             let _ = command_tx

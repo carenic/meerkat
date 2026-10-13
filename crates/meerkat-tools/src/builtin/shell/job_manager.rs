@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use base64::Engine;
 use meerkat_core::completion_feed::{
     CompletionEnrichment, CompletionEnrichmentData, CompletionEnrichmentProvider,
 };
@@ -18,11 +19,11 @@ use meerkat_core::ops_lifecycle::{
     OpsLifecycleError, OpsLifecycleRegistry,
 };
 use meerkat_core::types::SessionId;
-use meerkat_core::{BlobId, BlobStore, ExecutionPlacement};
+use meerkat_core::{BlobId, BlobPayload, BlobStore, ExecutionPlacement};
 use meerkat_jobs::{
     AttemptClaim, AttemptWriteAuthority, CanonicalArgumentsHash, DetachedJobError,
     DetachedJobService, DetachedJobStore, ExecutionIntentId, InteractionLineageId, JobFailureCode,
-    JobHealthCondition, JobNotification, JobPhase, JobProgress, JobResultRef, JobSpec,
+    JobHealthCondition, JobNotification, JobPhase, JobProgress, JobReceipt, JobResultRef, JobSpec,
     JobSubmissionKey, JobSubscription, JobSubscriptionId, JobTerminalApplication,
     JobTerminalResult, RestartClass, RunnerHandleRef, RunnerIdentity, RunnerSpecificationRef,
     ToolIdentity, WorkerId,
@@ -132,7 +133,7 @@ impl DurableShellJobRuntime {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ShellRunnerSpecification {
     command: String,
     working_dir: String,
@@ -142,7 +143,7 @@ struct ShellRunnerSpecification {
     monitor: Option<MonitorRunnerSpecification>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MonitorRunnerSpecification {
     protocol: MonitorOutputProtocol,
     limits: MonitorProtocolLimits,
@@ -793,7 +794,7 @@ impl JobManager {
             timeout_secs,
             monitor: monitor.clone(),
         };
-        let encoded_spec = serde_json::to_string(&runner_spec).map_err(|error| {
+        let encoded_spec = encode_shell_artifact(&runner_spec).map_err(|error| {
             shell_io(format!("cannot encode shell runner specification: {error}"))
         })?;
         let stable_call = validate_call_identity(tool_call_id)?;
@@ -862,7 +863,14 @@ impl JobManager {
         // re-derives it from the job store on recovery.
         .with_terminal_application(JobTerminalApplication::Producer);
         let service = durable.service();
-        let receipt = service.submit(spec).await.map_err(shell_job_error)?;
+        let receipt = match service.submit(spec.clone()).await {
+            Ok(receipt) => receipt,
+            Err(DetachedJobError::SubmissionConflict) => {
+                resubmit_under_recorded_specification(&durable, &service, spec, &runner_spec)
+                    .await?
+            }
+            Err(error) => return Err(shell_job_error(error)),
+        };
         let public_job_id = JobId::from_string(receipt.job_id.as_str());
         if receipt.deduplicated {
             let existing = service
@@ -2766,7 +2774,7 @@ async fn persist_result(
     durable: &DurableShellJobRuntime,
     result: &ShellResultRecord,
 ) -> Result<JobResultRef, ShellError> {
-    let encoded = serde_json::to_string(result)
+    let encoded = encode_shell_artifact(result)
         .map_err(|error| shell_io(format!("cannot encode shell result: {error}")))?;
     let blob = durable
         .blob_store
@@ -2794,8 +2802,9 @@ async fn hydrate_job(
                 .get(&BlobId::new(result_ref.as_str()))
                 .await
                 .map_err(|error| shell_io(format!("cannot read shell result: {error}")))?;
-            let result: ShellResultRecord = serde_json::from_str(&result_payload.data)
-                .map_err(|error| shell_io(format!("shell result is corrupt: {error}")))?;
+            let result: ShellResultRecord =
+                decode_shell_artifact(&result_payload, SHELL_RESULT_MEDIA_TYPE)
+                    .map_err(|error| shell_io(format!("shell result is corrupt: {error}")))?;
             JobStatus::Completed {
                 exit_code: result.exit_code,
                 stdout: result.stdout,
@@ -2852,9 +2861,87 @@ async fn load_runner_spec(
         .get(&BlobId::new(specification_ref.as_str()))
         .await
         .map_err(|error| shell_io(format!("cannot read shell runner specification: {error}")))?;
-    let spec: ShellRunnerSpecification = serde_json::from_str(&payload.data)
-        .map_err(|error| shell_io(format!("shell runner specification is corrupt: {error}")))?;
+    let spec: ShellRunnerSpecification =
+        decode_shell_artifact(&payload, SHELL_RUNNER_MEDIA_TYPE)
+            .map_err(|error| shell_io(format!("shell runner specification is corrupt: {error}")))?;
     Ok(spec)
+}
+
+/// Encode a shell artifact for the blob contract, whose payload is
+/// base64-encoded bytes: here, the exact JSON bytes of the record.
+fn encode_shell_artifact<T: Serialize>(record: &T) -> Result<String, serde_json::Error> {
+    Ok(base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(record)?))
+}
+
+/// Decode a shell artifact stored under exactly `media_type`.
+///
+/// Shell artifacts written before they were base64 encoded hold the literal
+/// JSON object, and stores that keep payloads verbatim still return it. A JSON
+/// object starts with `{`, which is outside the base64 alphabet, so the first
+/// byte selects the representation. A malformed selected representation is an
+/// error; it is never retried as the other one.
+fn decode_shell_artifact<T: serde::de::DeserializeOwned>(
+    payload: &BlobPayload,
+    media_type: &str,
+) -> Result<T, String> {
+    if payload.media_type != media_type {
+        return Err(format!(
+            "media type {} is not {media_type}",
+            payload.media_type
+        ));
+    }
+    if payload.data.starts_with('{') {
+        return serde_json::from_str(&payload.data).map_err(|error| error.to_string());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.data.as_bytes())
+        .map_err(|error| format!("invalid base64: {error}"))?;
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+}
+
+/// Replay a call whose job was admitted before shell artifacts were base64
+/// encoded.
+///
+/// That job's runner specification reference and canonical arguments hash are
+/// the address of the literal JSON, so the same call now addresses its
+/// specification differently and the store refuses the replay as another
+/// submission. Read the job admitted under the same submission key. When its
+/// recorded specification decodes to this call's specification, submit again
+/// with the recorded reference and hash exactly, and let the store's unchanged
+/// equivalence check decide every other field. An established mismatch keeps
+/// the original refusal; a missing admitted job or a failed read is reported
+/// as such, not as a mismatch.
+async fn resubmit_under_recorded_specification(
+    durable: &DurableShellJobRuntime,
+    service: &DetachedJobService,
+    spec: JobSpec,
+    runner_spec: &ShellRunnerSpecification,
+) -> Result<JobReceipt, ShellError> {
+    let refused = || shell_job_error(DetachedJobError::SubmissionConflict);
+    let Some(admitted) = durable
+        .job_store
+        .get_by_submission_key(&spec.realm_id, &spec.submission_key)
+        .await
+        .map_err(shell_job_error)?
+    else {
+        return Err(shell_io(format!(
+            "detached shell submission {} conflicted with an admitted job that is unavailable",
+            spec.submission_key
+        )));
+    };
+    let Some(recorded_ref) = admitted.spec.runner_specification_ref.clone() else {
+        return Err(refused());
+    };
+    if admitted.spec.canonical_arguments_hash.as_str() != recorded_ref.as_str() {
+        return Err(refused());
+    }
+    if load_runner_spec(durable, &admitted).await? != *runner_spec {
+        return Err(refused());
+    }
+    let mut replay = spec;
+    replay.canonical_arguments_hash = admitted.spec.canonical_arguments_hash;
+    replay.runner_specification_ref = Some(recorded_ref);
+    service.submit(replay).await.map_err(shell_job_error)
 }
 
 /// Preserve the backend's bounded mechanical refusal in the existing durable
@@ -3213,6 +3300,7 @@ impl CompletionEnrichmentProvider for JobManager {
 #[allow(clippy::panic)]
 mod durable_tests {
     use super::*;
+    use meerkat_core::{BlobRef, BlobStoreError};
     use meerkat_jobs::{
         DetachedJobService, InsertJobOutcome, JobOutboxEntry, SqliteDetachedJobStore, StoredJob,
     };
@@ -3536,6 +3624,20 @@ mod durable_tests {
         ShellConfig,
     ) {
         let blob_store: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(temp.path().join("blobs")));
+        durable_fixture_with_stores(temp, session_id, job_store, blob_store, delivery_projector)
+    }
+
+    fn durable_fixture_with_stores(
+        temp: &TempDir,
+        session_id: SessionId,
+        job_store: Arc<dyn DetachedJobStore>,
+        blob_store: Arc<dyn BlobStore>,
+        delivery_projector: Arc<dyn ShellJobDeliveryProjector>,
+    ) -> (
+        DurableShellJobRuntime,
+        Arc<dyn DetachedJobStore>,
+        ShellConfig,
+    ) {
         let runtime = DurableShellJobRuntime::new(
             "test-realm",
             session_id,
@@ -3575,6 +3677,239 @@ mod durable_tests {
         ShellConfig,
     ) {
         durable_fixture_with_projector(temp, session_id, Arc::new(NoopDeliveryProjector))
+    }
+
+    /// The fixture's file store held to the base64 blob contract.
+    ///
+    /// A payload that is not base64 is refused at write, as a gateway's base64
+    /// adapter refuses it, so a shell write of literal JSON fails here exactly
+    /// as it fails in a gateway. Reads return what the file store holds, so
+    /// records planted there keep their stored form.
+    struct StrictBase64BlobStore {
+        inner: FsBlobStore,
+    }
+
+    #[async_trait]
+    impl BlobStore for StrictBase64BlobStore {
+        async fn put_image(&self, media_type: &str, data: &str) -> Result<BlobRef, BlobStoreError> {
+            base64::engine::general_purpose::STANDARD
+                .decode(data.as_bytes())
+                .map_err(|error| {
+                    BlobStoreError::WriteFailed(format!("invalid blob base64: {error}"))
+                })?;
+            self.inner.put_image(media_type, data).await
+        }
+
+        async fn get(&self, blob_id: &BlobId) -> Result<BlobPayload, BlobStoreError> {
+            self.inner.get(blob_id).await
+        }
+
+        async fn delete(&self, blob_id: &BlobId) -> Result<(), BlobStoreError> {
+            self.inner.delete(blob_id).await
+        }
+
+        fn is_persistent(&self) -> bool {
+            true
+        }
+    }
+
+    /// [`durable_fixture`] over [`StrictBase64BlobStore`]. Calling it again
+    /// for the same directory reopens the same job and blob stores.
+    fn strict_durable_fixture(
+        temp: &TempDir,
+        session_id: SessionId,
+    ) -> (
+        DurableShellJobRuntime,
+        Arc<dyn DetachedJobStore>,
+        ShellConfig,
+    ) {
+        let job_store: Arc<dyn DetachedJobStore> = Arc::new(
+            SqliteDetachedJobStore::open(temp.path().join("jobs.db"))
+                .expect("open detached job store"),
+        );
+        let blob_store: Arc<dyn BlobStore> = Arc::new(StrictBase64BlobStore {
+            inner: FsBlobStore::new(temp.path().join("blobs")),
+        });
+        durable_fixture_with_stores(
+            temp,
+            session_id,
+            job_store,
+            blob_store,
+            Arc::new(NoopDeliveryProjector),
+        )
+    }
+
+    /// The stored form of a planted shell artifact.
+    #[derive(Debug, Clone, Copy)]
+    enum PlantedEncoding {
+        /// The literal JSON object that shells wrote before artifacts were
+        /// base64 encoded.
+        LegacyLiteral,
+        /// The base64 of the JSON bytes, as shells write now.
+        Base64,
+    }
+
+    /// Plant a shell artifact straight into the fixture's file store.
+    ///
+    /// The file store keeps either form verbatim, the way an earlier shell or
+    /// this one left it.
+    async fn plant_shell_artifact<T: Serialize>(
+        temp: &TempDir,
+        media_type: &str,
+        record: &T,
+        encoding: PlantedEncoding,
+    ) -> BlobRef {
+        let data = match encoding {
+            PlantedEncoding::LegacyLiteral => {
+                serde_json::to_string(record).expect("encode literal shell artifact")
+            }
+            PlantedEncoding::Base64 => {
+                encode_shell_artifact(record).expect("encode base64 shell artifact")
+            }
+        };
+        FsBlobStore::new(temp.path().join("blobs"))
+            .put_artifact(media_type, &data)
+            .await
+            .expect("plant shell artifact")
+    }
+
+    /// The runner specification a detached shell call of `command` records.
+    async fn shell_call_runner_spec(
+        config: &ShellConfig,
+        command: &str,
+    ) -> ShellRunnerSpecification {
+        let resolved_dir = config
+            .default_working_dir_async()
+            .await
+            .expect("working dir");
+        let placement = config
+            .execution_placement_for_working_dir_async(&resolved_dir)
+            .await
+            .expect("placement");
+        ShellRunnerSpecification {
+            command: command.to_string(),
+            working_dir: resolved_dir.display().to_string(),
+            placement,
+            timeout_secs: 5,
+            monitor: None,
+        }
+    }
+
+    /// The job a detached shell call submits, addressed by `spec_blob`.
+    fn shell_call_job_spec(
+        session_id: &SessionId,
+        tool_call_id: &str,
+        spec_blob: &BlobRef,
+    ) -> JobSpec {
+        JobSpec::new(
+            "test-realm",
+            session_id.clone(),
+            ExecutionIntentId::from_string(format!("shell-call:{tool_call_id}")).expect("intent"),
+            InteractionLineageId::from_string(format!("shell-session:{session_id}"))
+                .expect("lineage"),
+            ToolIdentity::new("shell", "v1").expect("tool"),
+            RunnerIdentity::new("meerkat.shell", "v1").expect("runner"),
+            RestartClass::NonResumable,
+            CanonicalArgumentsHash::new(spec_blob.blob_id.to_string()).expect("hash"),
+            JobSubmissionKey::new(format!("shell:{session_id}:{tool_call_id}"))
+                .expect("submission key"),
+        )
+        .with_runner_specification_ref(
+            RunnerSpecificationRef::new(spec_blob.blob_id.to_string()).expect("runner ref"),
+        )
+    }
+
+    fn shell_artifact_payload(media_type: &str, data: String) -> BlobPayload {
+        BlobPayload {
+            blob_id: BlobId::new("sha256:planted"),
+            media_type: media_type.to_string(),
+            data,
+        }
+    }
+
+    /// The JSON text of a shell artifact this shell wrote, which it stores as
+    /// base64.
+    fn written_shell_artifact_json(payload: &BlobPayload) -> String {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(payload.data.as_bytes())
+            .expect("shell artifacts are written as base64");
+        String::from_utf8(bytes).expect("shell artifact JSON is UTF-8")
+    }
+
+    fn sample_result() -> ShellResultRecord {
+        ShellResultRecord {
+            exit_code: Some(0),
+            stdout: "out {\"x\":1}".to_string(),
+            stderr: "err".to_string(),
+            duration_secs: 0.5,
+        }
+    }
+
+    #[test]
+    fn shell_artifacts_are_base64_of_their_exact_json_and_decode_back() {
+        let record = sample_result();
+        let encoded = encode_shell_artifact(&record).expect("encode");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .expect("the payload is strict base64");
+        assert_eq!(bytes, serde_json::to_vec(&record).expect("json"));
+        let decoded: ShellResultRecord = decode_shell_artifact(
+            &shell_artifact_payload(SHELL_RESULT_MEDIA_TYPE, encoded),
+            SHELL_RESULT_MEDIA_TYPE,
+        )
+        .expect("decode");
+        assert_eq!(
+            serde_json::to_vec(&decoded).expect("json"),
+            serde_json::to_vec(&record).expect("json")
+        );
+    }
+
+    #[test]
+    fn legacy_literal_shell_artifacts_still_decode() {
+        let record = sample_result();
+        let literal = serde_json::to_string(&record).expect("json");
+        let decoded: ShellResultRecord = decode_shell_artifact(
+            &shell_artifact_payload(SHELL_RESULT_MEDIA_TYPE, literal),
+            SHELL_RESULT_MEDIA_TYPE,
+        )
+        .expect("legacy literal decodes");
+        assert_eq!(decoded.stdout, record.stdout);
+        assert_eq!(decoded.exit_code, record.exit_code);
+    }
+
+    #[test]
+    fn shell_artifact_decoding_requires_the_exact_shell_media_type() {
+        let encoded = encode_shell_artifact(&sample_result()).expect("encode");
+        for media_type in [SHELL_RUNNER_MEDIA_TYPE, "application/json", "text/plain"] {
+            let error = decode_shell_artifact::<ShellResultRecord>(
+                &shell_artifact_payload(media_type, encoded.clone()),
+                SHELL_RESULT_MEDIA_TYPE,
+            )
+            .expect_err("another media type is refused");
+            assert!(error.contains("media type"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_selected_shell_artifact_form_is_never_retried_as_the_other() {
+        let decode = |data: String| {
+            decode_shell_artifact::<ShellResultRecord>(
+                &shell_artifact_payload(SHELL_RESULT_MEDIA_TYPE, data),
+                SHELL_RESULT_MEDIA_TYPE,
+            )
+        };
+        // A leading brace selects the literal form; broken JSON is an error,
+        // not a base64 attempt.
+        let error = decode("{\"exit_code\":".to_string()).expect_err("broken literal");
+        assert!(!error.contains("base64"), "{error}");
+        // Anything else must be strict base64; broken base64 is an error,
+        // not a JSON attempt.
+        let error = decode("not base64!".to_string()).expect_err("broken base64");
+        assert!(error.contains("invalid base64"), "{error}");
+        // Valid base64 of something that is not the record is an error too.
+        let error = decode(base64::engine::general_purpose::STANDARD.encode(b"\"not a record\""))
+            .expect_err("base64 of another shape");
+        assert!(!error.contains("invalid base64"), "{error}");
     }
 
     #[test]
@@ -3825,25 +4160,37 @@ mod durable_tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn recovered_monitor_spawn_refusal_is_durable_without_another_retry() {
+        for encoding in [PlantedEncoding::LegacyLiteral, PlantedEncoding::Base64] {
+            recovered_monitor_spawn_refusal_case(encoding).await;
+        }
+    }
+
+    /// One refused monitor recovery over the strict store, whose runner
+    /// specification was recorded in `encoding`.
+    #[cfg(unix)]
+    async fn recovered_monitor_spawn_refusal_case(encoding: PlantedEncoding) {
         use crate::builtin::BuiltinToolError;
         use meerkat_core::confinement::ConfinementRefusal;
 
         for confinement in [true, false] {
             let temp = TempDir::new().expect("tempdir");
             let session = SessionId::new();
-            let (runtime, store, mut config) = durable_fixture(&temp, session.clone());
+            let (runtime, store, mut config) = strict_durable_fixture(&temp, session.clone());
             let service = DetachedJobService::new(store.clone());
             let entry_marker = temp.path().join("recovered-must-not-enter");
+            let spec_blob = plant_shell_artifact(
+                &temp,
+                SHELL_RUNNER_MEDIA_TYPE,
+                &test_monitor_runner_spec("printf entered > recovered-must-not-enter"),
+                encoding,
+            )
+            .await;
             let receipt = service
-                .submit(
-                    test_monitor_job_spec_with_command(
-                        &runtime,
-                        session.clone(),
-                        "recover-refused",
-                        "printf entered > recovered-must-not-enter",
-                    )
-                    .await,
-                )
+                .submit(test_monitor_job_spec_for_blob(
+                    session.clone(),
+                    "recover-refused",
+                    &spec_blob,
+                ))
                 .await
                 .expect("submit");
             let first = service
@@ -3919,7 +4266,7 @@ mod durable_tests {
             drop(service);
             drop(manager);
             drop(store);
-            let (runtime, reopened_store, config) = durable_fixture(&temp, session.clone());
+            let (runtime, reopened_store, config) = strict_durable_fixture(&temp, session.clone());
             let reopened = JobManager::new(config)
                 .bind_canonical_async_ops(session, Arc::new(RuntimeOpsLifecycleRegistry::new()))
                 .with_durable_job_runtime(runtime);
@@ -3978,7 +4325,18 @@ mod durable_tests {
         submission_key: &str,
         command: &str,
     ) -> JobSpec {
-        let runner_spec = ShellRunnerSpecification {
+        let encoded = serde_json::to_string(&test_monitor_runner_spec(command))
+            .expect("encode runner specification");
+        let blob = runtime
+            .blob_store
+            .put_artifact(SHELL_RUNNER_MEDIA_TYPE, &encoded)
+            .await
+            .expect("persist runner specification");
+        test_monitor_job_spec_for_blob(session_id, submission_key, &blob)
+    }
+
+    fn test_monitor_runner_spec(command: &str) -> ShellRunnerSpecification {
+        ShellRunnerSpecification {
             command: command.to_string(),
             working_dir: ".".to_string(),
             placement: ExecutionPlacement::new(
@@ -3994,13 +4352,14 @@ mod durable_tests {
                 limits: MonitorProtocolLimits::default(),
                 delivery: meerkat_jobs::JobDeliveryKind::Record,
             }),
-        };
-        let encoded = serde_json::to_string(&runner_spec).expect("encode runner specification");
-        let blob = runtime
-            .blob_store
-            .put_artifact(SHELL_RUNNER_MEDIA_TYPE, &encoded)
-            .await
-            .expect("persist runner specification");
+        }
+    }
+
+    fn test_monitor_job_spec_for_blob(
+        session_id: SessionId,
+        submission_key: &str,
+        blob: &BlobRef,
+    ) -> JobSpec {
         JobSpec::new(
             "test-realm",
             session_id,
@@ -4522,6 +4881,7 @@ mod durable_tests {
         let entries = std::sync::atomic::AtomicUsize::new(0);
         let refusal = meerkat_core::ToolError::ReviewUnsatisfied {
             kind: meerkat_core::ReviewUnsatisfiedKind::HumanConsentRequired,
+            approval_id: None,
         };
         let refuse: &(dyn Fn() -> Result<(), meerkat_core::ToolError> + Send + Sync) = &|| {
             entries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -4576,7 +4936,9 @@ mod durable_tests {
     async fn completed_shell_result_survives_manager_reconstruction() {
         let temp = TempDir::new().expect("tempdir");
         let session_id = SessionId::new();
-        let (runtime, job_store, config) = durable_fixture(&temp, session_id.clone());
+        // The strict store refuses any shell artifact that is not base64, as
+        // a gateway's base64 adapter does.
+        let (runtime, job_store, config) = strict_durable_fixture(&temp, session_id.clone());
         let registry: Arc<dyn OpsLifecycleRegistry> = Arc::new(RuntimeOpsLifecycleRegistry::new());
         let manager = JobManager::new(config.clone())
             .bind_canonical_async_ops(session_id.clone(), registry)
@@ -4627,6 +4989,131 @@ mod durable_tests {
         assert_eq!(
             job_store
                 .list_for_origin("test-realm", &reopened.owner_bridge_session_id, 10)
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
+    }
+
+    /// A shell job completed before artifacts were base64 encoded keeps its
+    /// literal records. After a reopen its status still reads them, and a
+    /// replay of the same call with the same arguments is the same job with
+    /// no added attempt, while changed arguments under that call stay
+    /// refused.
+    #[tokio::test]
+    async fn completed_legacy_shell_record_survives_reopen_and_its_call_replays_to_the_same_job() {
+        let temp = TempDir::new().expect("tempdir");
+        let session_id = SessionId::new();
+        let tool_call_id = "legacy-completed-call";
+        let command = "printf legacy-shell";
+        let (_, job_store, config) = strict_durable_fixture(&temp, session_id.clone());
+        let runner_spec = shell_call_runner_spec(&config, command).await;
+        let spec_blob = plant_shell_artifact(
+            &temp,
+            SHELL_RUNNER_MEDIA_TYPE,
+            &runner_spec,
+            PlantedEncoding::LegacyLiteral,
+        )
+        .await;
+        let result_blob = plant_shell_artifact(
+            &temp,
+            SHELL_RESULT_MEDIA_TYPE,
+            &ShellResultRecord {
+                exit_code: Some(0),
+                stdout: "legacy-shell".to_string(),
+                stderr: String::new(),
+                duration_secs: 0.5,
+            },
+            PlantedEncoding::LegacyLiteral,
+        )
+        .await;
+        let service = DetachedJobService::new(job_store.clone());
+        let committed = service
+            .submit(shell_call_job_spec(&session_id, tool_call_id, &spec_blob))
+            .await
+            .expect("legacy submission");
+        let claim = service
+            .claim_attempt(
+                &committed.job_id,
+                AttemptClaim::new(
+                    WorkerId::new("legacy-worker").expect("worker"),
+                    1,
+                    60_000,
+                    RunnerHandleRef::new("legacy-handle").expect("handle"),
+                ),
+            )
+            .await
+            .expect("legacy claim");
+        service
+            .complete_attempt(
+                &committed.job_id,
+                AttemptWriteAuthority::from(&claim),
+                2,
+                Some(JobResultRef::new(result_blob.blob_id.to_string()).expect("result ref")),
+            )
+            .await
+            .expect("legacy completion");
+        drop(service);
+        drop(job_store);
+
+        let (runtime, job_store, config) = strict_durable_fixture(&temp, session_id.clone());
+        let service = DetachedJobService::new(job_store.clone());
+        let manager = JobManager::new(config)
+            .bind_canonical_async_ops(
+                session_id.clone(),
+                Arc::new(RuntimeOpsLifecycleRegistry::new()),
+            )
+            .with_durable_job_runtime(runtime);
+        let public_id = JobId::from_string(committed.job_id.as_str());
+        let restored = manager
+            .get_status(&public_id)
+            .await
+            .expect("legacy status")
+            .expect("legacy job");
+        assert!(matches!(
+            restored.status,
+            JobStatus::Completed { ref stdout, .. } if stdout == "legacy-shell"
+        ));
+
+        let replayed = manager
+            .spawn_job_for_call(command, None, 5, tool_call_id)
+            .await
+            .expect("replay of the legacy call");
+        assert_eq!(replayed.to_string(), committed.job_id.as_str());
+        let snapshot = service
+            .get(&committed.job_id)
+            .await
+            .expect("read")
+            .expect("job");
+        assert_eq!(snapshot.attempt_count, 1);
+        assert_eq!(
+            snapshot.current_attempt_id.as_ref(),
+            Some(&claim.attempt_id)
+        );
+        assert!(matches!(
+            snapshot.terminal_result,
+            Some(JobTerminalResult::Succeeded { .. })
+        ));
+
+        let refused = manager
+            .spawn_job_for_call("printf changed-arguments", None, 5, tool_call_id)
+            .await
+            .expect_err("changed arguments under the same call stay refused");
+        assert!(
+            refused.to_string().contains("different specification"),
+            "{refused}"
+        );
+        let after = service
+            .get(&committed.job_id)
+            .await
+            .expect("read")
+            .expect("job");
+        assert_eq!(after.attempt_count, 1);
+        assert_eq!(after.revision, snapshot.revision);
+        assert_eq!(
+            job_store
+                .list_for_origin("test-realm", &session_id, 10)
                 .await
                 .expect("list")
                 .len(),
@@ -4956,7 +5443,7 @@ mod durable_tests {
                 .as_str(),
         );
         let runner_blob = blob_store.get(&runner_blob_id).await.expect("runner blob");
-        assert!(!runner_blob.data.contains(secret));
+        assert!(!written_shell_artifact_json(&runner_blob).contains(secret));
 
         let result_ref = match completed.terminal_result.expect("terminal result") {
             JobTerminalResult::Succeeded {
@@ -4968,8 +5455,9 @@ mod durable_tests {
             .get(&BlobId::new(result_ref.as_str()))
             .await
             .expect("result blob");
-        assert!(!result_blob.data.contains(secret));
-        assert!(result_blob.data.contains("[REDACTED]"));
+        let result_json = written_shell_artifact_json(&result_blob);
+        assert!(!result_json.contains(secret));
+        assert!(result_json.contains("[REDACTED]"));
     }
 
     #[tokio::test]
@@ -5079,9 +5567,18 @@ mod durable_tests {
 
     #[tokio::test]
     async fn checkpoint_monitor_recovery_claims_once_after_loss_and_resumes_from_committed_state() {
+        for encoding in [PlantedEncoding::LegacyLiteral, PlantedEncoding::Base64] {
+            checkpoint_monitor_recovery_case(encoding).await;
+        }
+    }
+
+    /// One recovered checkpoint monitor over the strict store, whose runner
+    /// specification was recorded in `encoding`. Its completion writes a
+    /// result through the strict store, so the result writer is covered too.
+    async fn checkpoint_monitor_recovery_case(encoding: PlantedEncoding) {
         let temp = TempDir::new().expect("tempdir");
         let session_id = SessionId::new();
-        let (runtime, job_store, config) = durable_fixture(&temp, session_id.clone());
+        let (runtime, job_store, config) = strict_durable_fixture(&temp, session_id.clone());
         let service = DetachedJobService::new(job_store);
         let resolved_dir = config
             .default_working_dir_async()
@@ -5112,12 +5609,8 @@ mod durable_tests {
                 delivery: meerkat_jobs::JobDeliveryKind::Record,
             }),
         };
-        let encoded = serde_json::to_string(&runner_spec).expect("encode");
-        let blob = runtime
-            .blob_store
-            .put_artifact(SHELL_RUNNER_MEDIA_TYPE, &encoded)
-            .await
-            .expect("persist runner spec");
+        let blob =
+            plant_shell_artifact(&temp, SHELL_RUNNER_MEDIA_TYPE, &runner_spec, encoding).await;
         let receipt = service
             .submit(
                 JobSpec::new(
@@ -5215,6 +5708,19 @@ mod durable_tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(keys, vec!["observation:v2", "observation:v3"]);
+        // The explicit completion persisted its result through the strict
+        // store; a literal JSON result would have failed the monitor with
+        // `monitor_result_persistence_failed` instead.
+        assert!(
+            matches!(
+                completed.terminal_result,
+                Some(JobTerminalResult::Succeeded {
+                    result_ref: Some(_)
+                })
+            ),
+            "{encoding:?}: {:?}",
+            completed.terminal_result
+        );
     }
 
     #[tokio::test]
@@ -6074,88 +6580,72 @@ mod durable_tests {
         assert_eq!(projector.acknowledge_calls.load(Ordering::SeqCst), 1);
     }
 
+    /// A call whose job was committed before the crash, but never claimed,
+    /// replays after a reopen to that one job and claims it once, whether its
+    /// runner specification was recorded in the legacy literal form or in
+    /// base64.
     #[tokio::test]
     async fn replay_after_submit_before_claim_claims_the_committed_job_once() {
-        let temp = TempDir::new().expect("tempdir");
-        let session_id = SessionId::new();
-        let (runtime, job_store, config) = durable_fixture(&temp, session_id.clone());
-        let resolved_dir = config
-            .default_working_dir_async()
-            .await
-            .expect("working dir");
-        let placement = config
-            .execution_placement_for_working_dir_async(&resolved_dir)
-            .await
-            .expect("placement");
-        let runner_spec = ShellRunnerSpecification {
-            command: "printf recovered-submit".to_string(),
-            working_dir: resolved_dir.display().to_string(),
-            placement,
-            timeout_secs: 5,
-            monitor: None,
-        };
-        let encoded = serde_json::to_string(&runner_spec).expect("encode");
-        let blob = runtime
-            .blob_store
-            .put_artifact(SHELL_RUNNER_MEDIA_TYPE, &encoded)
-            .await
-            .expect("persist runner spec");
-        let tool_call_id = "tool-call-before-receipt";
-        let spec = JobSpec::new(
-            "test-realm",
-            session_id.clone(),
-            ExecutionIntentId::from_string(format!("shell-call:{tool_call_id}")).expect("intent"),
-            InteractionLineageId::from_string(format!("shell-session:{session_id}"))
-                .expect("lineage"),
-            ToolIdentity::new("shell", "v1").expect("tool"),
-            RunnerIdentity::new("meerkat.shell", "v1").expect("runner"),
-            RestartClass::NonResumable,
-            CanonicalArgumentsHash::new(blob.blob_id.to_string()).expect("hash"),
-            JobSubmissionKey::new(format!("shell:{session_id}:{tool_call_id}"))
-                .expect("submission key"),
-        )
-        .with_runner_specification_ref(
-            RunnerSpecificationRef::new(blob.blob_id.to_string()).expect("runner ref"),
-        );
-        let service = DetachedJobService::new(job_store.clone());
-        let committed = service.submit(spec).await.expect("commit before crash");
-        assert_eq!(
-            service
+        for encoding in [PlantedEncoding::LegacyLiteral, PlantedEncoding::Base64] {
+            let temp = TempDir::new().expect("tempdir");
+            let session_id = SessionId::new();
+            let tool_call_id = "tool-call-before-receipt";
+            let (_, job_store, config) = strict_durable_fixture(&temp, session_id.clone());
+            let runner_spec = shell_call_runner_spec(&config, "printf recovered-submit").await;
+            let blob =
+                plant_shell_artifact(&temp, SHELL_RUNNER_MEDIA_TYPE, &runner_spec, encoding).await;
+            let service = DetachedJobService::new(job_store.clone());
+            let committed = service
+                .submit(shell_call_job_spec(&session_id, tool_call_id, &blob))
+                .await
+                .expect("commit before crash");
+            assert_eq!(
+                service
+                    .get(&committed.job_id)
+                    .await
+                    .expect("read")
+                    .expect("job")
+                    .phase,
+                JobPhase::Queued
+            );
+            drop(service);
+            drop(job_store);
+
+            let (runtime, job_store, config) = strict_durable_fixture(&temp, session_id.clone());
+            let service = DetachedJobService::new(job_store.clone());
+            let manager = JobManager::new(config)
+                .bind_canonical_async_ops(
+                    session_id.clone(),
+                    Arc::new(RuntimeOpsLifecycleRegistry::new()),
+                )
+                .with_durable_job_runtime(runtime);
+            let replayed = manager
+                .spawn_job_for_call("printf recovered-submit", None, 5, tool_call_id)
+                .await
+                .unwrap_or_else(|error| panic!("{encoding:?} replay: {error}"));
+            assert_eq!(
+                replayed.to_string(),
+                committed.job_id.as_str(),
+                "{encoding:?}"
+            );
+
+            let snapshot = service
                 .get(&committed.job_id)
                 .await
                 .expect("read")
-                .expect("job")
-                .phase,
-            JobPhase::Queued
-        );
-
-        let manager = JobManager::new(config)
-            .bind_canonical_async_ops(
-                session_id.clone(),
-                Arc::new(RuntimeOpsLifecycleRegistry::new()),
-            )
-            .with_durable_job_runtime(runtime);
-        let replayed = manager
-            .spawn_job_for_call("printf recovered-submit", None, 5, tool_call_id)
-            .await
-            .expect("replay");
-        assert_eq!(replayed.to_string(), committed.job_id.as_str());
-
-        let snapshot = service
-            .get(&committed.job_id)
-            .await
-            .expect("read")
-            .expect("job");
-        assert_ne!(snapshot.phase, JobPhase::Queued);
-        assert_eq!(snapshot.attempt_count, 1);
-        assert_eq!(
-            job_store
-                .list_for_origin("test-realm", &session_id, 10)
-                .await
-                .expect("list")
-                .len(),
-            1
-        );
+                .expect("job");
+            assert_ne!(snapshot.phase, JobPhase::Queued, "{encoding:?}");
+            assert_eq!(snapshot.attempt_count, 1, "{encoding:?}");
+            assert_eq!(
+                job_store
+                    .list_for_origin("test-realm", &session_id, 10)
+                    .await
+                    .expect("list")
+                    .len(),
+                1,
+                "{encoding:?}"
+            );
+        }
     }
 
     #[tokio::test]

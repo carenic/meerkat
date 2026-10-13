@@ -412,6 +412,163 @@ fn executor_represented_subject_and_issuer_are_distinct() {
     );
 }
 
+/// Liveness resolves the exact lineage for the retained leaf's own grantee
+/// and represented subject, which no caller supplies, and returns no grant.
+/// A live lineage is accepted; one that is empty, incomplete, reordered, of
+/// another owner, namespace, generation, revision or root, not yet valid,
+/// expired or revoked is refused.
+#[test]
+fn liveness_uses_the_leafs_own_identity_and_every_other_use_check() {
+    let fixture = Fixture::new();
+    let chain = fixture.three_levels();
+    let live = |references: &[GrantLineageRef]| fixture.authority.require_live_lineage(references);
+    assert_eq!(live(&chain), Ok(()), "the leaf's own executor and subject");
+    assert!(fixture.resolve(&chain).is_ok());
+    assert!(
+        fixture
+            .authority
+            .resolve_lineage(&chain, &who("delegator"), Some(&who("represented-human")))
+            .is_err(),
+        "the lineage is not another executor's use"
+    );
+    assert_eq!(live(&chain[..2]), Ok(()), "a prefix, for its own leaf");
+    assert_eq!(live(&chain[..1]), Ok(()), "the root, for its own grantee");
+
+    assert_eq!(live(&[]), Err(GrantRefusal::Denied), "empty");
+    assert_eq!(live(&chain[1..]), Err(GrantRefusal::Denied), "no root");
+    let mut skipped = chain.clone();
+    skipped.remove(1);
+    assert_eq!(live(&skipped), Err(GrantRefusal::Denied), "a missing link");
+    let mut reordered = chain.clone();
+    reordered.swap(0, 1);
+    assert_eq!(live(&reordered), Err(GrantRefusal::Denied), "reordered");
+    for change in 0..5 {
+        let mut wrong = chain.clone();
+        match change {
+            0 => wrong[0].authority_namespace = id("other-namespace"),
+            1 => wrong[1].authority_generation += 1,
+            2 => wrong[2].authority_generation += 1,
+            3 => wrong[2].issued_revision += 1,
+            _ => wrong[2].root_authority = who("other-root"),
+        }
+        assert_eq!(
+            live(&wrong),
+            Err(GrantRefusal::Denied),
+            "coordinate {change}"
+        );
+    }
+    // Another owner of the same configuration issued the same ids at the
+    // same revisions: only its incarnation differs.
+    let other = Fixture::new();
+    let foreign = other.three_levels();
+    assert_eq!(other.authority.require_live_lineage(&foreign), Ok(()));
+    assert_eq!(live(&foreign), Err(GrantRefusal::Denied), "another owner");
+
+    // The chain is current from 100 until 250.
+    fixture.clock.0.store(99, Ordering::SeqCst);
+    assert_eq!(live(&chain), Err(GrantRefusal::Denied), "not yet valid");
+    fixture.clock.0.store(250, Ordering::SeqCst);
+    assert_eq!(live(&chain), Err(GrantRefusal::Denied), "expired");
+    fixture.clock.0.store(100, Ordering::SeqCst);
+    assert_eq!(live(&chain), Ok(()));
+
+    fixture
+        .authority
+        .revoke(&who("root"), &chain[1], &mut IsolatedGrantTestCustody)
+        .expect("revoke the middle link");
+    assert_eq!(
+        live(&chain),
+        Err(GrantRefusal::Denied),
+        "a revoked ancestor"
+    );
+    assert_eq!(
+        live(&chain[..2]),
+        Err(GrantRefusal::Denied),
+        "a revoked leaf"
+    );
+    assert_eq!(live(&chain[..1]), Ok(()), "the root is not revoked");
+}
+
+/// Liveness is one observation of the owner on its publication: an owner
+/// change completed during the observation leaves it unavailable, never
+/// answered from facts read across that change.
+#[test]
+fn liveness_is_one_owner_observation() {
+    struct PublishingClock(LocalAuthorizationPublication);
+    impl LocalAuthorizationClock for PublishingClock {
+        fn now(&self) -> Result<LocalAuthorizationTime, LocalClockError> {
+            let change = self.0.begin_owner_change().expect("other owner changes");
+            drop(change);
+            Ok(LocalAuthorizationTime {
+                unix_ms: 100,
+                monotonic: Instant::now(),
+            })
+        }
+    }
+
+    let publication = LocalAuthorizationPublication::new();
+    let authority = LocalGrantAuthority::new(
+        LocalGrantConfiguration {
+            root: who("root"),
+            namespace: id("liveness-observation"),
+            generation: 1,
+        },
+        publication.clone(),
+        Arc::new(PublishingClock(publication)),
+    )
+    .expect("configure");
+    let grant = authority
+        .issue_root(
+            &who("root"),
+            id("liveness-grant"),
+            who("executor"),
+            None,
+            ExecutionRestrictions::unrestricted(),
+        )
+        .expect("issue without reading the clock");
+    assert_eq!(
+        authority.require_live_lineage(&[grant]),
+        Err(GrantRefusal::Unavailable)
+    );
+}
+
+/// A lineage's ceiling is its resolution for the retained leaf's own
+/// identity: the same restrictions and expiry as a resolution for that
+/// identity, current on the actual publication until an owner change, and
+/// refused where liveness is. It carries no lineage evidence.
+#[test]
+fn a_lineage_ceiling_is_the_resolution_for_its_own_leaf() {
+    use crate::publication::PublicationError;
+
+    let fixture = Fixture::new();
+    let chain = fixture.three_levels();
+    let ceiling = fixture
+        .authority
+        .resolve_lineage_ceiling(&chain)
+        .expect("a current ceiling");
+    let own = fixture.resolve(&chain).expect("the leaf's own use");
+    assert_eq!(ceiling.restrictions(), own.restrictions());
+    assert_eq!(ceiling.expires_at_ms(), own.expires_at_ms());
+    assert_eq!(ceiling.expires_at_ms(), 250);
+    assert_eq!(ceiling.check_current(), Ok(()));
+
+    fixture
+        .authority
+        .revoke(&who("root"), &chain[1], &mut IsolatedGrantTestCustody)
+        .expect("revoke the middle link");
+    assert_eq!(ceiling.check_current(), Err(PublicationError::Changed));
+    assert!(matches!(
+        fixture.authority.resolve_lineage_ceiling(&chain),
+        Err(GrantRefusal::Denied)
+    ));
+    assert!(
+        fixture
+            .authority
+            .resolve_lineage_ceiling(&chain[..1])
+            .is_ok()
+    );
+}
+
 #[test]
 fn issuance_and_revocation_are_immutable_with_no_id_reuse() {
     let fixture = Fixture::new();

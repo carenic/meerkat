@@ -224,9 +224,14 @@ pub enum ToolError {
 
     /// Owner review policy is not satisfied for this otherwise permitted
     /// operation. An ordinary tool result, never a run or session disposition.
+    ///
+    /// `approval_id` is the approval owner's reference to the consent request
+    /// it actually committed for this candidate, present only then. It is a
+    /// correlation for the host, never a bearer or execution authority.
     #[error("{kind}")]
     ReviewUnsatisfied {
         kind: crate::approval::review::ReviewUnsatisfiedKind,
+        approval_id: Option<crate::approval::ApprovalId>,
     },
 
     /// Required review could not be completed. Distinct from a refusal; the
@@ -477,7 +482,14 @@ impl ToolError {
             })),
             Self::PolicyDenied { denial } => serde_json::to_value(denial).ok(),
             Self::PolicyIndeterminate { failure } => serde_json::to_value(failure).ok(),
-            Self::ReviewUnsatisfied { kind } => Some(serde_json::json!({ "kind": kind })),
+            Self::ReviewUnsatisfied {
+                kind,
+                approval_id: None,
+            } => Some(serde_json::json!({ "kind": kind })),
+            Self::ReviewUnsatisfied {
+                kind,
+                approval_id: Some(approval_id),
+            } => Some(serde_json::json!({ "kind": kind, "approval_id": approval_id })),
             Self::ReviewUnavailable { kind } => Some(serde_json::json!({ "kind": kind })),
             _ => None,
         }
@@ -675,6 +687,12 @@ pub enum AgentError {
     /// it) small.
     #[error(transparent)]
     DeclaredToolUnknown(Box<DeclaredToolUnknown>),
+
+    /// A build's callback tools were refused for their installed-artifact
+    /// references; nothing of the build was published. Boxed to keep
+    /// `AgentError` small.
+    #[error(transparent)]
+    ToolArtifactRefused(Box<crate::types::ToolArtifactRefusal>),
 
     /// MeerkatMachine DSL observed an auth lease in `reauth_required`
     /// state at a CallingLlm boundary; the lease cannot proceed

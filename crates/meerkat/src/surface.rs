@@ -4,6 +4,8 @@
 
 mod embedded;
 mod ephemeral_runtime;
+#[cfg(not(target_arch = "wasm32"))]
+pub use ephemeral_runtime::materialize_ephemeral_runtime_session_with_continuations;
 pub use ephemeral_runtime::{
     EphemeralRuntimeError, ephemeral_runtime_completion_result,
     interrupt_ephemeral_runtime_session, materialize_ephemeral_runtime_session,
@@ -106,12 +108,19 @@ pub use request_execution::{
 };
 #[cfg(all(feature = "session-store", feature = "comms"))]
 pub use runtime_backed::configure_peer_ingress;
+#[cfg(all(
+    feature = "session-store",
+    feature = "mcp",
+    feature = "local-authorization",
+    not(target_arch = "wasm32")
+))]
+pub use runtime_backed::install_default_mcp_auth_resolver_for_realm;
 #[cfg(feature = "session-store")]
 pub(crate) use runtime_backed::materialize_session_actor_unattached_with_reserved_admission_and_actor_slot;
 #[cfg(feature = "session-store")]
 pub use runtime_backed::{
-    AttachedActorPublicationRefreshFn, PersistentRuntimeExecutor, RuntimeBackedInitialTurn,
-    SurfaceRuntimeMaterializeError, build_runtime_backed_service,
+    AttachedActorPublicationRefreshFn, PersistentRuntimeExecutor, RuntimeBackedCompositionError,
+    RuntimeBackedInitialTurn, SurfaceRuntimeMaterializeError, build_runtime_backed_service,
     build_runtime_backed_service_with_capacities,
     build_runtime_backed_service_with_capacities_and_default_reconfigure_host,
     build_runtime_backed_service_with_default_reconfigure_host, default_persistent_executor,
@@ -134,6 +143,8 @@ pub use runtime_backed::{
     persistent_runtime_turn_finalization_boundary_handle,
     run_runtime_backed_initial_turn_with_machine, split_runtime_backed_eager_create_request,
 };
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+pub use runtime_schedule_host::spawn_runtime_backed_schedule_host_with_mobs_and_continuations;
 #[cfg(feature = "session-store")]
 pub use runtime_schedule_host::{
     spawn_runtime_backed_schedule_host, spawn_runtime_backed_schedule_host_with_mobs,
@@ -1275,6 +1286,440 @@ pub async fn persist_mcp_remove_if_requested(
         Err(meerkat_core::mcp_config::McpConfigError::ServerNotFound(_)) => Ok(None),
         Err(err) => Err(err.to_string()),
     }
+}
+
+/// Why a live MCP add was not staged.
+#[derive(Debug, thiserror::Error)]
+pub enum McpLiveAddError {
+    /// The runtime has an installed native work host, and this caller supplied
+    /// no prepared, authenticated attachment control. Governed sessions are
+    /// never attached through an unauthenticated surface.
+    #[error("a governed session's MCP attachment needs an authenticated attachment control")]
+    GovernedRequiresControl,
+    /// The attachment control refused the effect.
+    #[error("MCP attachment refused: {0}")]
+    Refused(meerkat_core::mcp_attachment::McpAttachmentRefusal),
+    /// Writing the server to configuration failed.
+    #[error("{0}")]
+    Persist(String),
+    /// Staging the server failed (after any persisted write was rolled back).
+    #[error("{0}")]
+    Stage(String),
+}
+
+/// One live MCP add, with optional persistence, on the path every surface
+/// shares.
+///
+/// - Ungoverned runtime, no control: the existing add (persist, then stage).
+/// - Governed runtime: requires `control`, prepared by the native owners
+///   before this call. The control's current configuration owner decides
+///   the persisted write under the config lock, immediately before it; the
+///   live add is staged with the control, which travels with that exact
+///   descriptor to the connection's physical entry. A later live refusal
+///   does not undo an authorized persisted write: the outcome reports each
+///   effect separately.
+/// - A control on an ungoverned runtime is refused: it proves nothing there.
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+pub async fn stage_mcp_live_add(
+    adapter: &meerkat_mcp::McpRouterAdapter,
+    governed_runtime: bool,
+    control: Option<std::sync::Arc<dyn meerkat_core::mcp_attachment::McpAttachmentAuthority>>,
+    authority: &meerkat_core::mcp_config::McpConfigMutationAuthority,
+    config: meerkat_core::mcp_config::McpServerConfig,
+    persisted: bool,
+) -> Result<meerkat_core::mcp_attachment::McpAttachmentOutcome, McpLiveAddError> {
+    use meerkat_core::mcp_attachment::{McpAttachmentOutcome, McpAttachmentRefusal};
+    let control = match (governed_runtime, control) {
+        (false, None) => None,
+        (true, Some(control)) => Some(control),
+        (true, None) => return Err(McpLiveAddError::GovernedRequiresControl),
+        (false, Some(_)) => {
+            return Err(McpLiveAddError::Refused(McpAttachmentRefusal::Unavailable));
+        }
+    };
+    if let Some(control) = &control
+        && control.server() != &config
+    {
+        return Err(McpLiveAddError::Refused(McpAttachmentRefusal::Mismatch));
+    }
+    let rollback = if persisted {
+        Some(persist_live_add(control.as_ref(), authority, &config).await?)
+    } else {
+        None
+    };
+    let staged = match control {
+        Some(control) => adapter.stage_add_governed(config, control).await,
+        None => adapter.stage_add(config).await,
+    };
+    if let Err(error) = staged {
+        return Err(live_add_staging_failed(rollback, error).await);
+    }
+    Ok(McpAttachmentOutcome {
+        persisted: rollback.is_some(),
+        staged: true,
+    })
+}
+
+/// The persisted half of a live add. The configuration owner decides under
+/// the config lock, after the write is prepared and immediately before it
+/// (through `control` when the add is governed); an ungoverned add keeps the
+/// existing write.
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+async fn persist_live_add(
+    control: Option<&std::sync::Arc<dyn meerkat_core::mcp_attachment::McpAttachmentAuthority>>,
+    authority: &meerkat_core::mcp_config::McpConfigMutationAuthority,
+    config: &meerkat_core::mcp_config::McpServerConfig,
+) -> Result<meerkat_core::mcp_config::McpConfigRollback, McpLiveAddError> {
+    let scope = authority.scope;
+    let admit = || match control {
+        Some(control) => control.authorize_persist(scope),
+        None => Ok(()),
+    };
+    match meerkat_core::mcp_config::McpConfig::persist_add_with_rollback_admitted(
+        authority,
+        config.clone(),
+        admit,
+    )
+    .await
+    {
+        Ok(rollback) => Ok(rollback),
+        Err(meerkat_core::mcp_config::McpConfigError::AttachmentRefused(refusal)) => {
+            Err(McpLiveAddError::Refused(refusal))
+        }
+        Err(error) => Err(McpLiveAddError::Persist(error.to_string())),
+    }
+}
+
+/// A staging failure after an optional persisted write, which it rolls back.
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+async fn live_add_staging_failed(
+    rollback: Option<meerkat_core::mcp_config::McpConfigRollback>,
+    error: String,
+) -> McpLiveAddError {
+    let rollback_message = match rollback_mcp_persisted_mutation(rollback).await {
+        Ok(()) => String::new(),
+        Err(rollback_err) => format!("; persisted rollback failed: {rollback_err}"),
+    };
+    McpLiveAddError::Stage(format!("{error}{rollback_message}"))
+}
+
+/// One governed live attachment on `adapter`: the persisted write first when
+/// `persist` is given (the control's separate decision; a refused write
+/// stages nothing), then the add staged with `control`, returning the exact
+/// attempt it starts for observation.
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+async fn stage_mcp_live_attachment(
+    adapter: &std::sync::Arc<meerkat_mcp::McpRouterAdapter>,
+    control: std::sync::Arc<dyn meerkat_core::mcp_attachment::McpAttachmentAuthority>,
+    persist: Option<&meerkat_core::mcp_config::McpConfigMutationAuthority>,
+    config: meerkat_core::mcp_config::McpServerConfig,
+) -> Result<
+    (
+        meerkat_core::mcp_attachment::McpAttachmentOutcome,
+        meerkat_core::mcp_attachment::McpAttachmentAttempt,
+    ),
+    McpLiveAddError,
+> {
+    use meerkat_core::mcp_attachment::{McpAttachmentOutcome, McpAttachmentRefusal};
+    if control.server() != &config {
+        return Err(McpLiveAddError::Refused(McpAttachmentRefusal::Mismatch));
+    }
+    let rollback = match persist {
+        Some(authority) => Some(persist_live_add(Some(&control), authority, &config).await?),
+        None => None,
+    };
+    match adapter.stage_add_governed_observed(config, control).await {
+        Ok(attempt) => Ok((
+            McpAttachmentOutcome {
+                persisted: rollback.is_some(),
+                staged: true,
+            },
+            attempt,
+        )),
+        Err(error) => Err(live_add_staging_failed(rollback, error).await),
+    }
+}
+
+/// A member's live MCP attachment surface: its construction's own router.
+/// Each attachment runs [`stage_mcp_live_add`] on it with the attachment's
+/// native prepared control (and, separately, its persist owner), then
+/// applies the staged add now; its actor serializes this with turns.
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+pub(crate) struct AdapterLiveMcpAttachment {
+    adapter: std::sync::Arc<meerkat_mcp::McpRouterAdapter>,
+    governed_runtime: bool,
+}
+
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+impl AdapterLiveMcpAttachment {
+    pub(crate) fn new(
+        adapter: std::sync::Arc<meerkat_mcp::McpRouterAdapter>,
+        governed_runtime: bool,
+    ) -> Self {
+        Self {
+            adapter,
+            governed_runtime,
+        }
+    }
+}
+
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+#[async_trait::async_trait]
+impl meerkat_core::mcp_attachment::LiveMcpAttachmentSurface for AdapterLiveMcpAttachment {
+    async fn attach(
+        &self,
+        attachment: meerkat_core::mcp_attachment::LiveMcpAttachment,
+    ) -> Result<
+        meerkat_core::mcp_attachment::LiveMcpAttachmentReceipt,
+        meerkat_core::mcp_attachment::LiveMcpAttachError,
+    > {
+        use meerkat_core::mcp_attachment::{LiveMcpAttachError, McpAttachmentRefusal};
+        let meerkat_core::mcp_attachment::LiveMcpAttachment {
+            control,
+            server,
+            persist,
+        } = attachment;
+        if !self.governed_runtime {
+            return Err(LiveMcpAttachError::Refused(
+                McpAttachmentRefusal::Unavailable,
+            ));
+        }
+        // A persisted add's write is the control's separate decision and a
+        // refused write stages nothing; a live-only add writes nothing and
+        // its control must cover the exact descriptor. Either way the add is
+        // staged with its control and its exact attempt is returned.
+        let (outcome, attempt) =
+            stage_mcp_live_attachment(&self.adapter, control, persist.as_ref(), server)
+                .await
+                .map_err(|error| match error {
+                    McpLiveAddError::GovernedRequiresControl => {
+                        LiveMcpAttachError::Refused(McpAttachmentRefusal::Unavailable)
+                    }
+                    McpLiveAddError::Refused(refusal) => LiveMcpAttachError::Refused(refusal),
+                    McpLiveAddError::Persist(message) => LiveMcpAttachError::Persist(message),
+                    McpLiveAddError::Stage(message) => LiveMcpAttachError::Stage(message),
+                })?;
+        // The add is staged with its control; applying it now starts its
+        // connection, whose physical entry asks the control again.
+        self.adapter
+            .apply_staged()
+            .await
+            .map_err(LiveMcpAttachError::Stage)?;
+        Ok(meerkat_core::mcp_attachment::LiveMcpAttachmentReceipt { outcome, attempt })
+    }
+}
+
+/// Why a recorded per-session MCP attachment was not re-staged on restore.
+/// Local and typed: nothing is connected for a refused intent.
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpAttachmentRestoreRefusal {
+    /// No current installation carries the recorded server name.
+    Retired,
+    /// The current installation of that name reaches a different target.
+    Rebound,
+    /// The current installation is bound to a different account.
+    AccountChanged,
+    /// The native attachment control refused the re-stage.
+    Native(meerkat_core::mcp_attachment::McpAttachmentRefusal),
+    /// Staging the current descriptor failed.
+    StageFailed(String),
+    /// The record cannot prove the current installation unchanged: its
+    /// credential-bearing parts are unbound or bound under an identity key
+    /// this host no longer has, or it predates the identity format. Nothing
+    /// is staged; the session needs a fresh explicit attachment request.
+    RenewalRequired,
+}
+
+/// What restore did with one recorded attachment intent.
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpAttachmentRestoreDisposition {
+    /// Re-staged from the current installation. A missing or revoked
+    /// credential enters the router's ordinary awaiting-authorization path;
+    /// no earlier connection or permit is reused.
+    Restaged,
+    /// Suppressed by an explicit sign-out: not staged and never connected.
+    Suppressed,
+    /// Refused locally; nothing was staged.
+    Refused(McpAttachmentRestoreRefusal),
+}
+
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+impl McpAttachmentRestoreDisposition {
+    /// The wire outcome to report, or `None` for a re-staged attachment
+    /// (its ordinary apply events report it).
+    #[must_use]
+    pub fn wire_outcome(&self) -> Option<meerkat_core::McpAttachmentRestoreWireOutcome> {
+        use meerkat_core::McpAttachmentRestoreWireOutcome as Wire;
+        match self {
+            Self::Restaged => None,
+            Self::Suppressed => Some(Wire::Suppressed),
+            Self::Refused(McpAttachmentRestoreRefusal::Retired) => Some(Wire::Retired),
+            Self::Refused(McpAttachmentRestoreRefusal::Rebound) => Some(Wire::Rebound),
+            Self::Refused(McpAttachmentRestoreRefusal::AccountChanged) => {
+                Some(Wire::AccountChanged)
+            }
+            Self::Refused(McpAttachmentRestoreRefusal::Native(refusal)) => {
+                Some(Wire::from(refusal.clone()))
+            }
+            Self::Refused(McpAttachmentRestoreRefusal::StageFailed(_)) => Some(Wire::StageFailed),
+            Self::Refused(McpAttachmentRestoreRefusal::RenewalRequired) => {
+                Some(Wire::RenewalRequired)
+            }
+        }
+    }
+}
+
+/// The restore outcome of one recorded attachment intent.
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpAttachmentRestoreOutcome {
+    pub server_name: String,
+    pub disposition: McpAttachmentRestoreDisposition,
+}
+
+/// The identity to record for an accepted attachment request of `config`,
+/// before staging it. When the descriptor has credential-bearing parts (URL
+/// credentials or query, command arguments), `realm`'s protected identity key
+/// is resolved, and created and persisted first if it has none, so the
+/// recorded keyed binding never depends on a key that is not yet durable.
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+pub async fn accepted_mcp_attachment_identity(
+    persistence: &meerkat_core::auth::ProviderAuthPersistence,
+    realm: &meerkat_core::RealmId,
+    config: &meerkat_core::mcp_config::McpServerConfig,
+) -> Result<
+    meerkat_core::McpAttachmentDescriptorIdentity,
+    meerkat_core::auth::McpAttachmentIdentityKeyError,
+> {
+    let unkeyed = meerkat_core::McpAttachmentDescriptorIdentity::of(config, None);
+    if unkeyed.target.is_exact() {
+        return Ok(unkeyed);
+    }
+    let key = meerkat_core::auth::resolve_or_create_mcp_attachment_identity_key(persistence, realm)
+        .await?;
+    Ok(meerkat_core::McpAttachmentDescriptorIdentity::of(
+        config,
+        Some(&key),
+    ))
+}
+
+/// The current installation to re-stage for `intent`, or what restore does
+/// instead, decided before anything is staged.
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+fn restore_refusal(
+    intent: &meerkat_core::McpSessionAttachmentIntent,
+    current_installation: &(
+         dyn Fn(&str) -> Option<meerkat_core::mcp_config::McpServerConfig> + Send + Sync
+     ),
+    identity_key: Option<&meerkat_core::auth::McpAttachmentIdentityKey>,
+) -> Result<meerkat_core::mcp_config::McpServerConfig, McpAttachmentRestoreDisposition> {
+    use meerkat_core::{McpAttachmentDescriptorIdentity, McpAttachmentIntentDisposition};
+    let refused = |refusal| Err(McpAttachmentRestoreDisposition::Refused(refusal));
+    if intent.disposition == McpAttachmentIntentDisposition::SuppressedByLogout {
+        return Err(McpAttachmentRestoreDisposition::Suppressed);
+    }
+    let Some(current) = current_installation(&intent.descriptor.server_name) else {
+        return refused(McpAttachmentRestoreRefusal::Retired);
+    };
+    // A record that cannot prove its target, or whose keyed binding was made
+    // under a key this host no longer has, proves nothing: no replacement key
+    // is created here to bless current config.
+    let key_lost = intent.descriptor.target.binding().is_some_and(|binding| {
+        identity_key.map(meerkat_core::auth::McpAttachmentIdentityKey::id)
+            != Some(binding.key_id.as_str())
+    });
+    if !intent.descriptor.target.is_exact() || key_lost {
+        return refused(McpAttachmentRestoreRefusal::RenewalRequired);
+    }
+    let current_identity = McpAttachmentDescriptorIdentity::of(&current, identity_key);
+    if current_identity.target != intent.descriptor.target {
+        return refused(McpAttachmentRestoreRefusal::Rebound);
+    }
+    if !intent.descriptor.same_account(&current_identity) {
+        return refused(McpAttachmentRestoreRefusal::AccountChanged);
+    }
+    Ok(current)
+}
+
+/// Re-stage a resumed session's recorded MCP attachment intents on its fresh
+/// adapter, through the same live-add path as an original `mcp/add`.
+///
+/// Each intent is matched against the server's CURRENT installation
+/// (`current_installation`): a missing installation is `Retired`, a record
+/// that cannot prove the target (unbound, bound under a key other than
+/// `identity_key`, the realm's loaded identity key, or predecessor)
+/// `RenewalRequired`,
+/// a different target `Rebound`, a different account binding
+/// `AccountChanged`, all refused locally with nothing connected. A matching
+/// one is staged from the current descriptor (never from the record), on a
+/// governed runtime with a fresh native control from `control_for`, never a
+/// saved one. A suppressed intent is not staged. Nothing here replays a
+/// model request or a tool call: staging only makes the server's tools
+/// available at the session's next boundary.
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+pub async fn restore_session_mcp_attachments(
+    adapter: &meerkat_mcp::McpRouterAdapter,
+    governed_runtime: bool,
+    intents: &[meerkat_core::McpSessionAttachmentIntent],
+    current_installation: &(
+         dyn Fn(&str) -> Option<meerkat_core::mcp_config::McpServerConfig> + Send + Sync
+     ),
+    control_for: &(
+         dyn Fn(
+        &meerkat_core::mcp_config::McpServerConfig,
+    )
+        -> Option<std::sync::Arc<dyn meerkat_core::mcp_attachment::McpAttachmentAuthority>>
+             + Send
+             + Sync
+     ),
+    authority: &meerkat_core::mcp_config::McpConfigMutationAuthority,
+    identity_key: Option<&meerkat_core::auth::McpAttachmentIdentityKey>,
+) -> Vec<McpAttachmentRestoreOutcome> {
+    let mut outcomes = Vec::with_capacity(intents.len());
+    for intent in intents {
+        let server_name = intent.descriptor.server_name.clone();
+        let disposition = 'decide: {
+            let current = match restore_refusal(intent, current_installation, identity_key) {
+                Ok(current) => current,
+                Err(disposition) => break 'decide disposition,
+            };
+            let control = if governed_runtime {
+                control_for(&current)
+            } else {
+                None
+            };
+            match stage_mcp_live_add(
+                adapter,
+                governed_runtime,
+                control,
+                authority,
+                current,
+                false,
+            )
+            .await
+            {
+                Ok(_) => McpAttachmentRestoreDisposition::Restaged,
+                Err(McpLiveAddError::Refused(refusal)) => McpAttachmentRestoreDisposition::Refused(
+                    McpAttachmentRestoreRefusal::Native(refusal),
+                ),
+                Err(McpLiveAddError::GovernedRequiresControl) => {
+                    McpAttachmentRestoreDisposition::Refused(McpAttachmentRestoreRefusal::Native(
+                        meerkat_core::mcp_attachment::McpAttachmentRefusal::Unavailable,
+                    ))
+                }
+                Err(error) => McpAttachmentRestoreDisposition::Refused(
+                    McpAttachmentRestoreRefusal::StageFailed(error.to_string()),
+                ),
+            }
+        };
+        outcomes.push(McpAttachmentRestoreOutcome {
+            server_name,
+            disposition,
+        });
+    }
+    outcomes
 }
 
 /// Roll back a persisted MCP config mutation after a coupled live-stage failure.
@@ -2630,6 +3075,10 @@ mod native_admission_projection_tests {
             AuthErrorKind::HostOwnedUnavailable,
             AuthErrorKind::Io,
             AuthErrorKind::Other,
+            AuthErrorKind::CredentialAccessDenied,
+            AuthErrorKind::CredentialInteractionRequired,
+            AuthErrorKind::CredentialAccessPending,
+            AuthErrorKind::CredentialStoreUnavailable,
         ] {
             let error = RuntimeDriverError::ControllerReadinessUnavailable {
                 reason: Ready::CredentialPreparationFailed { kind },
@@ -2666,3 +3115,6 @@ mod native_admission_projection_tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "mcp", not(target_arch = "wasm32")))]
+mod mcp_live_add_tests;

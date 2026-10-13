@@ -64,6 +64,12 @@ pub struct PersistentRuntimeDriver {
     /// checkpoint-restore contract for that arm.
     #[cfg(test)]
     pub(crate) force_input_snapshot_failure_for_test: bool,
+    /// Test-only fault injection: fails the archival that follows the durable
+    /// commit of the next [`Self::abandon_queued_input`], so tests can pin
+    /// what a caller does with an abandonment that may have committed before
+    /// a later step failed.
+    #[cfg(test)]
+    pub(crate) force_queued_abandon_archive_failure_for_test: bool,
     /// Test-only typed pause just before an admission's durable commit: the
     /// driver signals the first half, then waits for the second.
     #[cfg(test)]
@@ -532,12 +538,12 @@ impl PersistentRuntimeDriver {
             .execution_custody()
             .map(|owner| owner.try_acquire_shared().map(Arc::new))
             .transpose();
+        let mut inner =
+            EphemeralRuntimeDriver::new_with_control_and_dsl(runtime_id.clone(), control, dsl);
+        inner.set_durable_replay_authority();
+        inner.set_consent_scope_domain(store.hosting_capability().domain_ref());
         Self {
-            inner: EphemeralRuntimeDriver::new_with_control_and_dsl(
-                runtime_id.clone(),
-                control,
-                dsl,
-            ),
+            inner,
             store,
             blob_store,
             runtime_id,
@@ -546,6 +552,8 @@ impl PersistentRuntimeDriver {
             input_state_write_fence: None,
             #[cfg(test)]
             force_input_snapshot_failure_for_test: false,
+            #[cfg(test)]
+            force_queued_abandon_archive_failure_for_test: false,
             #[cfg(test)]
             admission_commit_gate_for_test: None,
         }
@@ -590,6 +598,8 @@ impl PersistentRuntimeDriver {
         let mut inner =
             EphemeralRuntimeDriver::new_with_control_and_dsl(runtime_id.clone(), control, dsl);
         inner.set_work_durability_health(durability_health.clone());
+        inner.set_durable_replay_authority();
+        inner.set_consent_scope_domain(store.hosting_capability().domain_ref());
         Self {
             inner,
             execution_custody,
@@ -600,6 +610,8 @@ impl PersistentRuntimeDriver {
             input_state_write_fence: None,
             #[cfg(test)]
             force_input_snapshot_failure_for_test: false,
+            #[cfg(test)]
+            force_queued_abandon_archive_failure_for_test: false,
             #[cfg(test)]
             admission_commit_gate_for_test: None,
         }
@@ -704,9 +716,16 @@ impl PersistentRuntimeDriver {
         input: &Input,
         replay_policy: crate::accept::InputReplayPolicy,
     ) -> Result<Option<(InputId, InputStateSeed)>, RuntimeDriverError> {
-        self.inner.authenticate_work(input)?;
+        use crate::input_authority::NativeReplayLookup;
+        // The durable lookup runs before authentication, so the installed host
+        // learns whether this is a first authentication or an exact retained
+        // replay from the store that actually holds idempotency.
         let qualified_key = crate::input_authority::qualified_idempotency_key(input)?;
         let Some(key) = qualified_key.as_ref() else {
+            self.inner.authenticate_work_with_replay(
+                input,
+                Some(NativeReplayLookup::FirstAuthentication),
+            )?;
             return Ok(None);
         };
         let observation = self
@@ -736,6 +755,10 @@ impl PersistentRuntimeDriver {
                 )),
             })?;
         let Some(observation) = observation else {
+            self.inner.authenticate_work_with_replay(
+                input,
+                Some(NativeReplayLookup::FirstAuthentication),
+            )?;
             return Ok(None);
         };
         let (stored, _exact_row_digest) = observation.into_parts();
@@ -749,6 +772,12 @@ impl PersistentRuntimeDriver {
             });
         }
         crate::input_authority::verify_retained_replay(&stored.state, input)?;
+        self.inner.authenticate_work_with_replay(
+            input,
+            Some(NativeReplayLookup::RetainedReplay {
+                existing_id: stored.state.input_id.clone(),
+            }),
+        )?;
         crate::input_state::PromptReplayIdentity::verify_replay(
             &stored.state,
             input,
@@ -1885,9 +1914,13 @@ impl PersistentRuntimeDriver {
         // Production registrations carry no rollback image: mutate once, then
         // either commit the exact one/two-row admission delta or degrade the
         // shared entry to ReloadRequired. Direct/test constructors retain one
-        // compatibility checkpoint.
-        self.inner
-            .authenticate_work_with_credential(&input, custody)?;
+        // compatibility checkpoint. The durable lookup found no holder of this
+        // input's key, so this decisive check is a first authentication.
+        self.inner.authenticate_work_with_credential_replay(
+            &input,
+            custody,
+            Some(crate::input_authority::NativeReplayLookup::FirstAuthentication),
+        )?;
         let checkpoint = self.persistence_rollback_checkpoint();
         let mut outcome = match self
             .inner
@@ -2391,10 +2424,7 @@ impl PersistentRuntimeDriver {
                 format!("tracked input cancel persist failed: {error}"),
             ));
         }
-        if let Err(error) = self
-            .inner
-            .archive_archivable_terminal_inputs_after_durable_commit(std::slice::from_ref(input_id))
-        {
+        if let Err(error) = self.archive_queued_abandonment_after_durable_commit(input_id) {
             return Err(self.post_transition_failure(
                 None,
                 "abandon_queued_input_archive",
@@ -2402,6 +2432,22 @@ impl PersistentRuntimeDriver {
             ));
         }
         Ok(true)
+    }
+
+    /// The archival that follows the durable commit of
+    /// [`Self::abandon_queued_input`].
+    fn archive_queued_abandonment_after_durable_commit(
+        &mut self,
+        input_id: &meerkat_core::lifecycle::InputId,
+    ) -> Result<(), RuntimeDriverError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.force_queued_abandon_archive_failure_for_test) {
+            return Err(RuntimeDriverError::Internal(
+                "forced terminal-input archive failure after the durable commit".to_string(),
+            ));
+        }
+        self.inner
+            .archive_archivable_terminal_inputs_after_durable_commit(std::slice::from_ref(input_id))
     }
 
     /// Recycle the in-memory driver shell while preserving canonical pending
@@ -2465,6 +2511,7 @@ impl PersistentRuntimeDriver {
 
     pub(crate) async fn realize_reset_lifecycle(
         &mut self,
+        runless_terminal: &mut crate::meerkat_machine::RunlessTerminalAnnouncement,
     ) -> Result<crate::traits::ResetReport, RuntimeDriverError> {
         self.require_durability_ready()?;
         let changed_input_ids = self.inner.active_input_ids();
@@ -2493,6 +2540,11 @@ impl PersistentRuntimeDriver {
         };
         self.commit_lifecycle_with_rollback(checkpoint, &changed_input_ids, target_state, "reset")
             .await?;
+        // The abandoned inputs are durably terminal from here, whatever the
+        // archival below does.
+        if report.inputs_abandoned > 0 {
+            runless_terminal.owe();
+        }
         if let Err(error) = self
             .inner
             .archive_archivable_terminal_inputs_after_durable_commit(&changed_input_ids)
@@ -2529,6 +2581,7 @@ impl PersistentRuntimeDriver {
     pub(crate) async fn commit_prepared_destroy_lifecycle(
         &mut self,
         changed_input_ids: Vec<InputId>,
+        runless_terminal: &mut crate::meerkat_machine::RunlessTerminalAnnouncement,
     ) -> Result<(), RuntimeDriverError> {
         self.require_durability_ready()?;
         let target_state = match self.runtime_state_for_persistence() {
@@ -2543,6 +2596,11 @@ impl PersistentRuntimeDriver {
         };
         self.commit_lifecycle_with_rollback(None, &changed_input_ids, target_state, "destroy")
             .await?;
+        // The destroyed inputs are durably terminal from here, whatever the
+        // archival below does.
+        if !changed_input_ids.is_empty() {
+            runless_terminal.owe();
+        }
         if let Err(error) = self
             .inner
             .archive_archivable_terminal_inputs_after_durable_commit(&changed_input_ids)
@@ -3318,6 +3376,31 @@ mod tests {
         );
         assert!(store.hosting_capability().is_cross_process());
         store
+    }
+
+    /// A persistent driver over a store with cross-process hosting claims
+    /// stages consent scope in that store's hosting domain, under every
+    /// constructor; over a store without such claims it stages none.
+    #[cfg(feature = "sqlite-store")]
+    #[test]
+    fn the_consent_scope_domain_is_the_store_hosting_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = cross_process_sqlite_store(dir.path());
+        let blobs: Arc<dyn BlobStore> = Arc::new(meerkat_store::MemoryBlobStore::new());
+        let runtime_id = LogicalRuntimeId::new("consent-scope-domain");
+        let expected = store.hosting_capability().domain_ref();
+        assert!(expected.is_some());
+        let registered = registered_driver(&runtime_id, &store, &blobs);
+        assert_eq!(registered.inner.consent_scope_domain(), expected.as_ref());
+        let plain = PersistentRuntimeDriver::new(runtime_id.clone(), store, blobs.clone());
+        assert_eq!(plain.inner.consent_scope_domain(), expected.as_ref());
+
+        let claimless: Arc<dyn RuntimeStore> = Arc::new(
+            crate::store::SqliteRuntimeStore::new(dir.path().join("claimless.sqlite3")).unwrap(),
+        );
+        assert!(!claimless.hosting_capability().is_cross_process());
+        let unscoped = PersistentRuntimeDriver::new(runtime_id, claimless, blobs);
+        assert_eq!(unscoped.inner.consent_scope_domain(), None);
     }
 
     /// A persistent driver as a registration builds it: with the shared
@@ -4326,6 +4409,108 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|row| row.state.recovery_count == 50)
+        );
+    }
+
+    /// A retry whose original row only the durable store holds: the live
+    /// lookup alone is undecided, and the durable lookup hands the host the
+    /// exact retained replay before it authenticates.
+    #[tokio::test]
+    async fn a_durable_only_retained_replay_reaches_the_host_as_retained() {
+        use crate::input_authority::NativeReplayLookup;
+        let owner = crate::meerkat_machine::MeerkatMachine::ephemeral();
+        let host = Arc::new(crate::input_authority::tests::TestIngress::isolated(
+            owner.generated_auth_lease_handle(),
+        ));
+        let slot = Arc::new(std::sync::OnceLock::new());
+        assert!(
+            slot.set(
+                crate::meerkat_machine::credential_custody::NativeWorkAuthorizationAttachment::new(
+                    host.clone(),
+                    &owner,
+                )
+            )
+            .is_ok()
+        );
+        let runtime_id = LogicalRuntimeId::new("native-test");
+        let mut admitting = EphemeralRuntimeDriver::new(runtime_id.clone());
+        admitting.set_work_authorization_host(Arc::clone(&slot));
+        admitting.set_executor_work_authorization_support(true);
+        let original = host.input("caller-a");
+        let crate::accept::AcceptOutcome::Accepted { state, seed, .. } =
+            admitting.accept_input(original.clone()).await.unwrap()
+        else {
+            panic!("first admission");
+        };
+        let existing_id = state.input_id.clone();
+        let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+        store
+            .persist_input_state(
+                &runtime_id,
+                &crate::input_state::InputStatePersistenceRecord::from_machine_snapshot(
+                    crate::input_state::StoredInputState { state, seed },
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut durable = PersistentRuntimeDriver::new(
+            runtime_id,
+            store,
+            Arc::new(meerkat_store::MemoryBlobStore::new()),
+        );
+        durable.inner.set_work_authorization_host(slot);
+        durable.inner.set_executor_work_authorization_support(true);
+        let mut retry = original;
+        retry.header_mut().id = InputId::new();
+        retry.header_mut().timestamp = Utc::now();
+        retry.header_mut().ingress_context = None;
+        let ingress = host
+            .input("caller-a")
+            .header()
+            .ingress_context
+            .clone()
+            .unwrap();
+        let fresh = crate::input_authority::NativeIngressContext::from_trusted_ingress(
+            &retry,
+            ingress.requester().clone(),
+            ingress.ingress_actor().clone(),
+            ingress.realm().clone(),
+            ingress.authentication().clone(),
+        )
+        .unwrap()
+        .with_controller_client(&retry, ingress.controller_client().unwrap().clone())
+        .unwrap();
+        let retry = retry.with_ingress_context(fresh).unwrap();
+        let retry_id = retry.id().clone();
+
+        durable
+            .inner
+            .authenticate_work(&retry)
+            .expect("the undecided live check is permitted");
+        assert_eq!(
+            host.observed_replay(&retry_id),
+            vec![None],
+            "the live state alone cannot decide a durable-only replay"
+        );
+        let duplicate = durable
+            .durable_idempotency_duplicate(&retry, crate::accept::InputReplayPolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            duplicate.map(|(id, _)| id),
+            Some(existing_id.clone()),
+            "the durable store holds the exact original"
+        );
+        assert_eq!(
+            host.observed_replay(&retry_id),
+            vec![
+                None,
+                Some(NativeReplayLookup::RetainedReplay { existing_id })
+            ],
+            "the host saw exactly the undecided live check, then the durable retained \
+             replay; never a first authentication"
         );
     }
 }

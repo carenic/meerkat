@@ -67,6 +67,8 @@ export type {
   LiveWebrtcOfferDescription,
   LiveWebrtcPeerConnectionLike,
 } from "./live_webrtc.js";
+export { CONSENT_NOTICE_NOTIFICATION, parseConsentNotice } from "./consent.js";
+export type { ConsentNotice, ConsentNoticeListener } from "./consent.js";
 export { EventStream } from "./streaming.js";
 export { EventSubscription } from "./subscription.js";
 export type {
@@ -306,6 +308,7 @@ export {
   HostUnavailableError,
   StaleCursorError,
   StaleFenceError,
+  StaleDeliveryScopeError,
   MULTI_HOST_JSON_RPC_ERROR_CODES,
   meerkatErrorFromJsonRpcCode,
   meerkatErrorFromSemanticCode,
@@ -316,6 +319,7 @@ export type {
   WireScopeDeniedDetail,
   WireStaleCursorDetail,
   WireStaleFenceDetail,
+  WireStaleDeliveryScopeDetail,
 } from "./generated/errors.js";
 
 export type {

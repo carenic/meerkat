@@ -766,6 +766,9 @@ pub enum DslRejectionKind {
     /// Generated authority rejected recovered state before any transition
     /// was attempted. This is not an idempotent transition guard no-op.
     RecoveredStateInvariantRejected,
+    /// Not a DSL rejection: a native controller-custody observer refused
+    /// before the transition was attempted, for this typed readiness cause.
+    ControllerReadinessRefused(crate::authorization::ControllerReadinessFailure),
 }
 
 /// Error surfaced when a DSL transition is rejected.
@@ -817,9 +820,33 @@ impl DslTransitionError {
         }
     }
 
+    /// Construct a native controller-custody refusal carrying its typed cause.
+    pub fn controller_readiness_refused(
+        context: &'static str,
+        cause: crate::authorization::ControllerReadinessFailure,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            context,
+            kind: DslRejectionKind::ControllerReadinessRefused(cause),
+            reason: reason.into(),
+        }
+    }
+
     /// True iff this rejection came from a guard evaluating false.
     pub fn is_guard_rejected(&self) -> bool {
         self.kind == DslRejectionKind::GuardRejected
+    }
+
+    /// The typed controller-readiness cause, when a native custody observer
+    /// refused rather than the generated DSL.
+    pub fn controller_readiness_refusal(
+        &self,
+    ) -> Option<crate::authorization::ControllerReadinessFailure> {
+        match self.kind {
+            DslRejectionKind::ControllerReadinessRefused(cause) => Some(cause),
+            _ => None,
+        }
     }
 }
 
@@ -1522,6 +1549,13 @@ pub enum ExternalToolSurfaceInput {
         epoch: u64,
     },
     Shutdown,
+    /// Release one lineage the caller staged on `surface_id`. Refused unless
+    /// the surface still carries exactly that lineage as staged, pending or
+    /// active.
+    Release {
+        surface_id: String,
+        lineage: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1548,6 +1582,12 @@ pub enum ExternalToolSurfaceEffect {
     RejectSurfaceCall {
         surface_id: String,
         cause: ExternalToolSurfaceFailureCause,
+    },
+    /// A stage input recorded `staged_intent_sequence` for `surface_id`: the
+    /// exact lineage its stager now holds.
+    StageRecorded {
+        surface_id: String,
+        staged_intent_sequence: u64,
     },
 }
 
@@ -2136,6 +2176,12 @@ impl GeneratedAuthLeaseHandle {
 
     pub fn clone_handle(&self) -> Arc<dyn AuthLeaseHandle> {
         Arc::clone(&self.inner)
+    }
+
+    /// Whether `other` is this exact lifecycle owner (a clone of the same
+    /// generated handle), not merely an equal or equivalent one.
+    pub fn same_owner(&self, other: &Self) -> bool {
+        std::ptr::addr_eq(Arc::as_ptr(&self.inner), Arc::as_ptr(&other.inner))
     }
 
     #[cfg_attr(

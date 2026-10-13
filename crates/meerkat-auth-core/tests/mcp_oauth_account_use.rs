@@ -173,6 +173,8 @@ impl McpOAuthAccountStrategy for AccountStrategy {
             scopes: self.profile.scopes.clone(),
             expected_account: self.profile.expected_account.clone().into(),
             strategy_id: self.profile.strategy_id.clone(),
+            client_auth_profile: None,
+            protocol: None,
         }
         .try_into()
     }

@@ -724,19 +724,22 @@ async fn posts_do_not_follow_cross_origin_redirects_for_http_or_legacy_sse() {
     assert_eq!(forwarded.load(Ordering::SeqCst), 0);
 }
 
+/// A legacy SSE client whose stream names `endpoint` in its `endpoint` event,
+/// and which records the URI of every message it is asked to post.
 #[derive(Clone)]
 struct EndpointClient {
-    posts: Arc<AtomicUsize>,
+    endpoint: Arc<str>,
+    posts: Arc<std::sync::Mutex<Vec<String>>>,
 }
 impl SseClient for EndpointClient {
     type Error = io::Error;
     async fn post_message(
         &self,
-        _: http::Uri,
+        uri: http::Uri,
         _: ClientJsonRpcMessage,
         _: Option<String>,
     ) -> Result<(), SseTransportError<Self::Error>> {
-        self.posts.fetch_add(1, Ordering::SeqCst);
+        self.posts.lock().unwrap().push(uri.to_string());
         Ok(())
     }
     async fn get_stream(
@@ -748,10 +751,11 @@ impl SseClient for EndpointClient {
         BoxStream<'static, Result<sse_stream::Sse, sse_stream::Error>>,
         SseTransportError<Self::Error>,
     > {
-        Ok(futures::stream::once(async {
+        let endpoint = self.endpoint.to_string();
+        Ok(futures::stream::once(async move {
             Ok(sse_stream::Sse {
                 event: Some("endpoint".into()),
-                data: Some("http://127.0.0.1:10002/messages".into()),
+                data: Some(endpoint),
                 ..Default::default()
             })
         })
@@ -759,24 +763,397 @@ impl SseClient for EndpointClient {
     }
 }
 
-#[tokio::test]
-async fn protected_legacy_sse_rejects_cross_origin_endpoint_before_post() {
-    let posts = Arc::new(AtomicUsize::new(0));
-    let mut transport = SseClientTransport::start_with_client(
+/// Start a legacy SSE transport configured for `source` whose stream names
+/// `endpoint`, with the record of everything it posts.
+async fn start_with_endpoint(
+    source: &str,
+    endpoint: &str,
+) -> (
+    Result<SseClientTransport<EndpointClient>, SseTransportError<io::Error>>,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let posts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let started = SseClientTransport::start_with_client(
         EndpointClient {
+            endpoint: endpoint.into(),
             posts: posts.clone(),
         },
         SseClientConfig {
-            sse_endpoint: "http://127.0.0.1:10001/events".into(),
+            sse_endpoint: source.into(),
             use_message_endpoint: None,
         },
     )
-    .await
-    .unwrap();
-    assert!(transport.send(message(true)).await.is_err());
-    assert_eq!(posts.load(Ordering::SeqCst), 0);
-    transport.send(message(false)).await.unwrap();
-    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    .await;
+    (started, posts)
+}
+
+/// An `endpoint` event naming another host, port or scheme than the
+/// configured endpoint is refused when the transport starts, so no message,
+/// ordinary or protected, is ever posted there.
+#[tokio::test]
+async fn legacy_sse_refuses_a_message_endpoint_on_another_origin_before_any_post() {
+    let source = "http://127.0.0.1:10001/events";
+    let mut violations = Vec::new();
+    for endpoint in [
+        "http://localhost:10001/messages",
+        "http://127.0.0.1:10002/messages",
+        "https://127.0.0.1:10001/messages",
+    ] {
+        let (started, posts) = start_with_endpoint(source, endpoint).await;
+        let refusal = match started {
+            Ok(mut transport) => {
+                for protected in [false, true] {
+                    let _ = transport.send(message(protected)).await;
+                }
+                None
+            }
+            Err(error) => Some(error.to_string()),
+        };
+        let posted = posts.lock().unwrap().clone();
+        if !posted.is_empty() {
+            violations.push(format!("{endpoint}: posted {posted:?}"));
+        }
+        match refusal {
+            None => violations.push(format!("{endpoint}: accepted as the message endpoint")),
+            Some(refusal)
+                if !refusal.contains("configured origin") || refusal.contains(endpoint) =>
+            {
+                violations.push(format!("{endpoint}: refused as {refusal:?}"));
+            }
+            Some(_) => {}
+        }
+    }
+    assert!(violations.is_empty(), "{violations:#?}");
+}
+
+/// Same-origin endpoints still work, absolute (including an explicit default
+/// port and a differently cased host), relative and query-only: ordinary and
+/// protected messages are posted to the resolved endpoint.
+#[tokio::test]
+async fn legacy_sse_keeps_same_origin_message_endpoints() {
+    for (source, endpoint, resolved) in [
+        (
+            "http://127.0.0.1:10001/events",
+            "http://127.0.0.1:10001/messages?session=absolute",
+            "http://127.0.0.1:10001/messages?session=absolute",
+        ),
+        (
+            "http://mcp.example.test/events",
+            "http://MCP.example.test:80/messages",
+            "http://MCP.example.test:80/messages",
+        ),
+        (
+            "http://127.0.0.1:10001/events",
+            "/messages?session=relative",
+            "http://127.0.0.1:10001/messages?session=relative",
+        ),
+        (
+            "http://127.0.0.1:10001/events",
+            "?session=query",
+            "http://127.0.0.1:10001/events?session=query",
+        ),
+    ] {
+        let (started, posts) = start_with_endpoint(source, endpoint).await;
+        let Ok(mut transport) = started else {
+            panic!("{endpoint} is on the origin of {source}");
+        };
+        for protected in [false, true] {
+            transport.send(message(protected)).await.unwrap();
+        }
+        assert_eq!(*posts.lock().unwrap(), [resolved, resolved], "{endpoint}");
+    }
+}
+
+/// The credential carried by the configured headers in the legacy SSE
+/// connection controls.
+const ORIGIN_MARKER: &str = "configured-origin-credential-marker";
+
+/// What a fixture saw of one request: its method, the authority it was
+/// addressed to (`Host`), its path and query, and whether any header carried
+/// the credential marker.
+#[derive(Clone, Debug)]
+struct SeenRequest {
+    method: String,
+    authority: String,
+    target: String,
+    marker: bool,
+}
+
+/// A minimal legacy SSE MCP server. A GET opens the event stream, which first
+/// names the endpoint built from this server's own authority and then carries
+/// the answer to each POSTed request. Every request, to any path, is recorded.
+struct LegacySseServer {
+    fixture: HttpFixture,
+    authority: String,
+    seen: Arc<std::sync::Mutex<Vec<SeenRequest>>>,
+}
+impl LegacySseServer {
+    async fn start(endpoint: impl FnOnce(&str) -> String) -> Self {
+        use axum::response::IntoResponse;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        let endpoint_event = format!("event: endpoint\ndata: {}\n\n", endpoint(&authority));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (answers, unanswered) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let unanswered = Arc::new(std::sync::Mutex::new(Some(unanswered)));
+        let record = seen.clone();
+        let app = axum::Router::new().fallback(
+            move |method: axum::http::Method,
+                  uri: axum::http::Uri,
+                  headers: axum::http::HeaderMap,
+                  body: axum::body::Bytes| {
+                let record = record.clone();
+                let answers = answers.clone();
+                let unanswered = unanswered.clone();
+                let endpoint_event = endpoint_event.clone();
+                async move {
+                    record.lock().unwrap().push(SeenRequest {
+                        method: method.to_string(),
+                        authority: headers
+                            .get("host")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                        target: uri.to_string(),
+                        marker: headers.values().any(|value| {
+                            value
+                                .to_str()
+                                .is_ok_and(|value| value.contains(ORIGIN_MARKER))
+                        }),
+                    });
+                    if method == axum::http::Method::GET {
+                        let Some(pending) = unanswered.lock().unwrap().take() else {
+                            return axum::http::StatusCode::CONFLICT.into_response();
+                        };
+                        let messages = futures::stream::unfold(pending, |mut pending| async move {
+                            let answer = pending.recv().await?;
+                            Some((format!("event: message\ndata: {answer}\n\n"), pending))
+                        });
+                        let events = futures::stream::once(async move { endpoint_event })
+                            .chain(messages)
+                            .map(Ok::<_, std::convert::Infallible>);
+                        return (
+                            [("content-type", "text/event-stream")],
+                            axum::body::Body::from_stream(events),
+                        )
+                            .into_response();
+                    }
+                    if let Ok(request) = serde_json::from_slice::<Value>(&body)
+                        && let Some(id) = request.get("id")
+                    {
+                        let result = match request["method"].as_str() {
+                            Some("initialize") => json!({
+                                "protocolVersion": request["params"]["protocolVersion"],
+                                "capabilities": {"tools": {}},
+                                "serverInfo": {"name": "legacy-sse-origin", "version": "0.0.0"},
+                            }),
+                            Some("tools/list") => json!({"tools": [{
+                                "name": "probe",
+                                "inputSchema": {"type": "object", "properties": {}},
+                            }]}),
+                            _ => json!({}),
+                        };
+                        let answer = json!({"jsonrpc": "2.0", "id": id, "result": result});
+                        let _ = answers.send(answer.to_string());
+                    }
+                    axum::http::StatusCode::ACCEPTED.into_response()
+                }
+            },
+        );
+        let url = format!("http://{authority}/mcp");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self {
+            fixture: HttpFixture { url, task },
+            authority,
+            seen,
+        }
+    }
+
+    fn url(&self) -> &str {
+        &self.fixture.url
+    }
+
+    fn seen(&self) -> Vec<SeenRequest> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+/// A TCP endpoint that counts the connections reaching it and closes each one
+/// at once, so no HTTP or TLS exchange can complete there.
+struct CountingListener {
+    authority: String,
+    connections: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl Drop for CountingListener {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+impl CountingListener {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let count = connections.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((connection, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                drop(connection);
+            }
+        });
+        Self {
+            authority,
+            connections,
+            task,
+        }
+    }
+}
+
+type Connected = Result<(crate::McpConnection, Vec<Arc<meerkat_core::ToolDef>>), crate::McpError>;
+
+/// Connect, initialize and list tools through the production legacy SSE
+/// connection, with the credential marker in the configured headers.
+async fn connect_legacy_sse(url: &str) -> Connected {
+    let headers = std::collections::HashMap::from([(
+        "authorization".to_string(),
+        format!("Bearer {ORIGIN_MARKER}"),
+    )]);
+    let mut config = meerkat_core::McpServerConfig::sse("origin-probe", url, headers);
+    config.connect_timeout_secs = Some(5);
+    crate::McpConnection::connect_and_enumerate(&config).await
+}
+
+/// Why `connected` is not the expected refusal, if it is not. The refusal is
+/// local connection feedback naming the origin rule, not the endpoint the
+/// server supplied.
+fn origin_refusal_violation(connected: Connected, other: &str) -> Option<String> {
+    let Err(error) = connected else {
+        return Some(format!("an endpoint on {other} was accepted"));
+    };
+    match &error {
+        crate::McpError::ConnectionFailed { reason }
+            if reason.contains("configured origin") && !reason.contains(other) =>
+        {
+            None
+        }
+        _ => Some(format!("unexpected refusal {error:?}")),
+    }
+}
+
+/// The production legacy SSE connection refuses an `endpoint` event naming
+/// another host, port or scheme before initialize: nothing is sent there, and
+/// the configured credential never reaches it. Each case is checked in full
+/// before the violations are reported.
+#[tokio::test]
+async fn legacy_sse_connection_refuses_another_origin_without_reaching_it() {
+    let mut violations = Vec::new();
+
+    // Another host: the configured URL names `localhost`, the endpoint the
+    // same port by address.
+    let source =
+        LegacySseServer::start(|authority| format!("http://{authority}/mcp/messages")).await;
+    let port = source.authority.rsplit_once(':').unwrap().1.to_string();
+    let connected = connect_legacy_sse(&format!("http://localhost:{port}/mcp")).await;
+    let sent: Vec<_> = source
+        .seen()
+        .into_iter()
+        .filter(|seen| seen.method != "GET")
+        .collect();
+    if !sent.is_empty() {
+        violations.push(format!(
+            "another host: reached {}: {sent:?}",
+            source.authority
+        ));
+    }
+    violations.extend(
+        origin_refusal_violation(connected, &source.authority)
+            .map(|violation| format!("another host: {violation}")),
+    );
+
+    // Another port: the endpoint names a second server.
+    let destination =
+        LegacySseServer::start(|authority| format!("http://{authority}/mcp/messages")).await;
+    let other = destination.authority.clone();
+    let source = LegacySseServer::start(move |_| format!("http://{other}/mcp/messages")).await;
+    let connected = connect_legacy_sse(source.url()).await;
+    let reached = destination.seen();
+    if !reached.is_empty() {
+        violations.push(format!(
+            "another port: reached {}: {reached:?}",
+            destination.authority
+        ));
+    }
+    violations.extend(
+        origin_refusal_violation(connected, &destination.authority)
+            .map(|violation| format!("another port: {violation}")),
+    );
+
+    // Another scheme: the endpoint names `https` on a listener that counts
+    // every connection.
+    let listener = CountingListener::start().await;
+    let other = listener.authority.clone();
+    let source = LegacySseServer::start(move |_| format!("https://{other}/mcp/messages")).await;
+    let connected = connect_legacy_sse(source.url()).await;
+    let connections = listener.connections.load(Ordering::SeqCst);
+    if connections != 0 {
+        violations.push(format!(
+            "another scheme: {connections} connection(s) reached {}",
+            listener.authority
+        ));
+    }
+    violations.extend(
+        origin_refusal_violation(connected, &listener.authority)
+            .map(|violation| format!("another scheme: {violation}")),
+    );
+    let sent: Vec<_> = source
+        .seen()
+        .into_iter()
+        .filter(|seen| seen.method != "GET")
+        .collect();
+    if !sent.is_empty() {
+        violations.push(format!("another scheme: the source received {sent:?}"));
+    }
+
+    assert!(violations.is_empty(), "{violations:#?}");
+}
+
+/// The same connection still initializes and lists tools through a
+/// same-origin endpoint, absolute, relative or query-only, and posts there
+/// with the configured headers.
+#[tokio::test]
+async fn legacy_sse_connection_initializes_and_lists_on_same_origin_endpoints() {
+    let cases: [(fn(&str) -> String, &str); 3] = [
+        (
+            |authority: &str| format!("http://{authority}/mcp/messages?session=absolute"),
+            "/mcp/messages?session=absolute",
+        ),
+        (
+            |_: &str| "/mcp/messages?session=relative".to_string(),
+            "/mcp/messages?session=relative",
+        ),
+        (|_: &str| "?session=query".to_string(), "/mcp?session=query"),
+    ];
+    for (endpoint, target) in cases {
+        let server = LegacySseServer::start(endpoint).await;
+        let (_connection, tools) = connect_legacy_sse(server.url()).await.unwrap();
+        let names: Vec<_> = tools.iter().map(|tool| tool.name.to_string()).collect();
+        assert_eq!(names, ["probe"], "{target}");
+        let posts: Vec<_> = server
+            .seen()
+            .into_iter()
+            .filter(|seen| seen.method == "POST")
+            .collect();
+        assert!(!posts.is_empty(), "{target}");
+        assert!(
+            posts.iter().all(|seen| seen.target == target
+                && seen.authority == server.authority
+                && seen.marker),
+            "{target}: {posts:?}"
+        );
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1171,4 +1548,130 @@ async fn redirect_disposition_controls() {
         .await;
     assert!(failed.is_err());
     assert_eq!(dispatch.disposition(), Some(RequestDisposition::Sent));
+}
+
+/// A stdio writer that accepts no bytes until it is opened.
+#[derive(Clone, Default)]
+struct HeldWriter(Arc<std::sync::Mutex<HeldState>>);
+
+#[derive(Default)]
+struct HeldState {
+    open: bool,
+    waker: Option<std::task::Waker>,
+    written: Vec<u8>,
+}
+
+impl HeldWriter {
+    fn open(&self) {
+        let mut state = self.0.lock().unwrap();
+        state.open = true;
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+    }
+
+    fn written(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().written.clone()).unwrap()
+    }
+
+    fn poll_open(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        let mut state = self.0.lock().unwrap();
+        if state.open {
+            std::task::Poll::Ready(())
+        } else {
+            state.waker = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        }
+    }
+}
+
+impl AsyncWrite for HeldWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::task::ready!(self.poll_open(cx));
+        self.0.lock().unwrap().written.extend_from_slice(buf);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        self.poll_open(cx).map(Ok)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+struct Counted(Arc<AtomicUsize>);
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn held_call(dropped: &Arc<AtomicUsize>, id: i64) -> ClientJsonRpcMessage {
+    let mut call = CallToolRequest::new(CallToolRequestParams::new("read"));
+    call.extensions
+        .insert(SendCustody::new(Counted(Arc::clone(dropped))));
+    ClientJsonRpcMessage::request(call.into(), NumberOrString::Number(id))
+}
+
+/// A send whose sender is cancelled while the stdio writer holds its bytes
+/// keeps the request's custody with the writer: it is released only when a
+/// later flush writes those bytes, or when the writer is retired. (Fails-old:
+/// the codec consumed the request with its custody before the write.)
+#[tokio::test]
+async fn a_held_stdio_writer_keeps_send_custody_after_its_sender_is_cancelled() {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let writer = HeldWriter::default();
+    let (read, _peer) = tokio::io::duplex(64);
+    let mut transport =
+        ProtectedStdioTransport::new(read, writer.clone(), ProtectedMetadataState::default());
+
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(100),
+        transport.send(held_call(&dropped, 1)),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the held writer kept the send pending");
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        0,
+        "the cancelled send's custody stays with the held writer"
+    );
+
+    writer.open();
+    transport.send(message(false)).await.unwrap();
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "the flush that wrote the held bytes released their custody"
+    );
+    assert!(writer.written().contains(r#""id":1"#));
+
+    // Retirement releases the custody of bytes that were never flushed.
+    let retired = Arc::new(AtomicUsize::new(0));
+    let held = HeldWriter::default();
+    let (read, _peer) = tokio::io::duplex(64);
+    let mut transport =
+        ProtectedStdioTransport::new(read, held.clone(), ProtectedMetadataState::default());
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(100),
+        transport.send(held_call(&retired, 2)),
+    )
+    .await;
+    assert!(cancelled.is_err());
+    assert_eq!(retired.load(Ordering::SeqCst), 0);
+    transport.close().await.unwrap();
+    assert_eq!(retired.load(Ordering::SeqCst), 1);
 }

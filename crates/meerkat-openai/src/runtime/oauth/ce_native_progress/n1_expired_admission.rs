@@ -394,6 +394,8 @@ async fn exercise_expiry(case: CredentialCase) {
     let machine = Arc::new(
         unconfigured
             .with_local_grant_authorization(NativeGrantWorkConfiguration {
+                retained_resume: None,
+                require_scoped_destination: false,
                 grants,
                 ingress,
                 invocation_owner: Arc::new(InvocationOwner),
@@ -401,6 +403,7 @@ async fn exercise_expiry(case: CredentialCase) {
                     selection: selected.clone(),
                     endpoint: format!("{}/v1/responses", server.base),
                 }),
+                configured_mcp_attachment: None,
             })
             .unwrap(),
     );

@@ -16,7 +16,7 @@ in reverse (a stale mirror looks fine on a quiet week). A doc-touching commit
 that is not mirrored is exactly the defect.
 
 Usage:
-    gh api "repos/lukacf/meerkat-mobkit/compare/<mirrored>...main" > compare.json
+    gh api "repos/lukacf/meerkat-meta/compare/<mirrored>...main" > compare.json
     python3 scripts/check-mobkit-docs-lag.py --compare compare.json
 """
 

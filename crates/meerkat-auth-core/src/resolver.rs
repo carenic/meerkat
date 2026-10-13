@@ -18,7 +18,7 @@ use futures::future::BoxFuture;
 use meerkat_core::auth::{
     CredentialMutationError, CredentialMutationOutcome, PersistedAuthMode, PersistedTokens,
     ProviderAuthPersistence, RefreshCoordinator, RefreshError, RefreshFailureObservation, TokenKey,
-    TokenStore,
+    TokenStore, TokenStoreAccess, TokenStoreError, TokenStoreObservation, TokenStoreRefusal,
 };
 #[cfg(all(not(target_arch = "wasm32"), test))]
 use meerkat_core::auth::{CredentialMutationFn, RefreshFn};
@@ -210,22 +210,33 @@ async fn observe_managed_store_readiness(
                     | CredentialUseDisposition::ReauthRequired,
                 ) => return CredentialReadiness::NeedsReauth,
                 // Never emitted for `UseCredential`; the open rejects it too.
+                // An admission the machine cannot answer is not absence.
                 Ok(CredentialUseDisposition::AlreadyRefreshing) | Err(_) => {
-                    return CredentialReadiness::Missing;
+                    return CredentialReadiness::Unavailable;
                 }
             }
         }
+        // A status observation: it never waits and never starts an
+        // operating-system credential read. Only a store answer can be Ready
+        // or Missing.
         let key = TokenKey::from_credential_identity(binding.credential_identity());
-        match store.load(&key).await {
-            Ok(Some(tokens))
+        match store.observe_status(&key).await {
+            Ok(TokenStoreObservation::Present(tokens))
                 if require_persisted_auth_mode(&tokens, binding).is_ok()
                     && tokens.primary_secret.is_some() =>
             {
                 CredentialReadiness::Ready
             }
-            Ok(_) => CredentialReadiness::Missing,
-            // An unreadable store is not a usable credential.
-            Err(_) => CredentialReadiness::Missing,
+            Ok(TokenStoreObservation::Present(_) | TokenStoreObservation::Missing) => {
+                CredentialReadiness::Missing
+            }
+            // Only the open's admitted lookup can observe this credential.
+            Ok(TokenStoreObservation::NotObserved) => CredentialReadiness::MaterializedAtOpen,
+            Ok(TokenStoreObservation::Denied) => CredentialReadiness::AccessDenied,
+            Ok(TokenStoreObservation::InteractionRequired) => {
+                CredentialReadiness::InteractionRequired
+            }
+            Ok(_) | Err(_) => CredentialReadiness::Unavailable,
         }
     }
     #[cfg(target_arch = "wasm32")]
@@ -495,16 +506,15 @@ impl ManagedStoreOAuthRefreshPreparationSlot {
 
         let returned = refreshed;
         let outcome = coordinator
-            .with_exclusive_mutation(
+            .with_exclusive_mutation_for(
                 key.clone(),
+                TokenStoreAccess::Unattended,
                 Box::new(move || {
                     Box::pin(async move {
                         let current = token_store
-                            .load(&key)
+                            .load_for(&key, TokenStoreAccess::Unattended)
                             .await
-                            .map_err(|error| {
-                                CredentialMutationError::TokenStore(error.to_string())
-                            })?
+                            .map_err(CredentialMutationError::from_token_store)?
                             .ok_or_else(|| {
                                 CredentialMutationError::Operation(
                                     "persisted tokens disappeared before shared refresh adoption"
@@ -587,9 +597,34 @@ impl PreparedManagedStoreOAuthRefresh {
         let Some(auth) = self.env.auth_lease_handle.as_ref() else {
             return RefreshError::Refresh("refresh authority is unavailable".into());
         };
-        let stored = match self.previous.store.load(&self.previous.key).await {
+        let stored = match self
+            .previous
+            .store
+            .load_for(&self.previous.key, TokenStoreAccess::Unattended)
+            .await
+        {
             Ok(stored) => stored,
-            Err(error) => return RefreshError::Refresh(error.to_string()),
+            Err(store_error) => {
+                // The durable predecessor cannot be verified, so the provider's
+                // verdict is not applied to it. The refresh this transaction
+                // began still closes transiently while its captured lifecycle
+                // is current; the store refusal keeps its type.
+                let cause = RefreshError::from_token_store(store_error);
+                if !self.refresh_started
+                    || self.previous.lifecycle_snapshot.as_ref() != Some(&auth.snapshot(&lease_key))
+                {
+                    return cause;
+                }
+                return match mark_managed_store_oauth_refresh_failed(
+                    &self.env,
+                    &self.binding,
+                    self.refresh_started,
+                    RefreshFailureObservation::transient(),
+                ) {
+                    Ok(()) => cause,
+                    Err(lifecycle_error) => with_refresh_closure_failure(cause, &lifecycle_error),
+                };
+            }
         };
         if stored.as_ref() != Some(&self.previous.tokens)
             || self.previous.lifecycle_snapshot.as_ref() != Some(&auth.snapshot(&lease_key))
@@ -608,19 +643,58 @@ impl PreparedManagedStoreOAuthRefresh {
     }
 }
 
+/// A failed refresh closure is reported with its cause. A credential-store
+/// refusal keeps its type.
+#[cfg(not(target_arch = "wasm32"))]
+fn with_refresh_closure_failure(
+    cause: RefreshError,
+    closure_error: &ProviderAuthError,
+) -> RefreshError {
+    match cause {
+        RefreshError::CredentialAccess { refusal, detail } => RefreshError::CredentialAccess {
+            refusal,
+            detail: format!("{detail}; refresh closure failed: {closure_error}"),
+        },
+        other => RefreshError::Refresh(format!("{other}; refresh closure failed: {closure_error}")),
+    }
+}
+
 /// Preserve stale preparation across provider and coalesced-result boundaries.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn refresh_error_from_provider(error: ProviderAuthError) -> RefreshError {
     match error {
         ProviderAuthError::Auth(AuthError::StaleCredential) => RefreshError::StalePreparation,
+        // A credential-store refusal keeps its type: it is not a refresh failure.
+        ProviderAuthError::Auth(ref auth) => match credential_access_refusal(auth) {
+            Some((refusal, detail)) => RefreshError::CredentialAccess { refusal, detail },
+            None => RefreshError::Refresh(error.to_string()),
+        },
         other => RefreshError::Refresh(other.to_string()),
     }
+}
+
+/// The credential-store refusal an auth error reports, if it reports one.
+#[cfg(not(target_arch = "wasm32"))]
+fn credential_access_refusal(error: &AuthError) -> Option<(TokenStoreRefusal, String)> {
+    let refusal = match error {
+        AuthError::CredentialAccessDenied => TokenStoreRefusal::Denied,
+        AuthError::CredentialInteractionRequired => TokenStoreRefusal::InteractionRequired,
+        AuthError::CredentialAccessPending => TokenStoreRefusal::Pending,
+        AuthError::CredentialStoreUnavailable(detail) => {
+            return Some((TokenStoreRefusal::Unavailable, detail.clone()));
+        }
+        _ => return None,
+    };
+    Some((refusal, error.to_string()))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn mutation_error_from_refresh(error: RefreshError) -> CredentialMutationError {
     match error {
         RefreshError::StalePreparation => CredentialMutationError::StalePreparation,
+        RefreshError::CredentialAccess { refusal, detail } => {
+            CredentialMutationError::CredentialAccess { refusal, detail }
+        }
         other => CredentialMutationError::AuthLifecycle(other.to_string()),
     }
 }
@@ -629,6 +703,9 @@ fn mutation_error_from_refresh(error: RefreshError) -> CredentialMutationError {
 fn refresh_error_from_mutation(error: CredentialMutationError) -> RefreshError {
     match error {
         CredentialMutationError::StalePreparation => RefreshError::StalePreparation,
+        CredentialMutationError::CredentialAccess { refusal, detail } => {
+            RefreshError::CredentialAccess { refusal, detail }
+        }
         other => RefreshError::Refresh(other.to_string()),
     }
 }
@@ -769,6 +846,7 @@ fn credential_phase_from_snapshot(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
 async fn restore_marked_token_lifecycle_if_absent(
     auth_lease: &meerkat_core::handles::GeneratedAuthLeaseHandle,
     store: &dyn TokenStore,
@@ -777,6 +855,7 @@ async fn restore_marked_token_lifecycle_if_absent(
     lease_key: &meerkat_core::handles::LeaseKey,
     now: chrono::DateTime<chrono::Utc>,
     guard: Option<&meerkat_core::AuthLoginLifecycleGuard>,
+    loaded: &PersistedTokens,
 ) -> Result<(), ProviderAuthError> {
     let snapshot = auth_lease.snapshot(lease_key);
     if snapshot.phase.is_some()
@@ -787,15 +866,16 @@ async fn restore_marked_token_lifecycle_if_absent(
         return Ok(());
     }
     let restored = if let Some(guard) = guard {
-        meerkat_core::rehydrate_marked_tokens_for_status_for_identity_with_guard(
-            store,
+        // The caller read these tokens under this same guard: restore from
+        // them instead of reading the store (an OS keychain) a second time.
+        meerkat_core::rehydrate_loaded_marked_tokens_with_guard(
+            Some(loaded.clone()),
             auth_lease,
             binding.credential_identity(),
             expected_mode,
             now,
             guard,
         )
-        .await
     } else {
         meerkat_core::rehydrate_marked_tokens_for_status_for_identity(
             store,
@@ -887,6 +967,17 @@ pub async fn load_existing_managed_store_tokens_with_lifecycle(
     .await
 }
 
+/// A token-store error at provider setup or maintenance: a refused or failed
+/// credential access keeps its typed auth kind; any other store error keeps
+/// its text.
+#[cfg(not(target_arch = "wasm32"))]
+fn provider_store_error(error: TokenStoreError) -> ProviderAuthError {
+    match error.credential_access_error() {
+        Some(auth_error) => ProviderAuthError::Auth(auth_error),
+        None => ProviderAuthError::SourceResolutionFailed(error.to_string()),
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 async fn load_managed_store_tokens_for_purpose(
     env: &ResolverEnvironment,
@@ -900,12 +991,19 @@ async fn load_managed_store_tokens_for_purpose(
     let key = TokenKey::from_credential_identity(binding.credential_identity());
     let lease_key =
         meerkat_core::handles::LeaseKey::from_credential_identity(binding.credential_identity());
+    // Unattended: a lease whose exclusion an operating-system credential
+    // operation still physically holds answers pending at once instead of
+    // waiting behind it.
     let lifecycle_guard = if binding
         .auth()
         .persisted_auth_mode()
         .is_some_and(crate::auth_store::persisted_auth_mode_is_oauth_login)
     {
-        Some(meerkat_core::acquire_auth_login_lifecycle_guard(&lease_key).await)
+        Some(
+            meerkat_core::acquire_auth_login_lifecycle_guard_for_unattended(&lease_key)
+                .await
+                .ok_or(ProviderAuthError::Auth(AuthError::CredentialAccessPending))?,
+        )
     } else {
         None
     };
@@ -916,10 +1014,13 @@ async fn load_managed_store_tokens_for_purpose(
             lifecycle_guard.as_ref().ok_or_else(lease_absent_error)?,
         )?;
     }
+    // Provider setup and maintenance: an unattended access. A keychain store
+    // admits at most one owner-held lookup per credential; a refusal stays a
+    // typed credential-access error, never "no credentials".
     let tokens = store
-        .load(&key)
+        .load_for(&key, TokenStoreAccess::Unattended)
         .await
-        .map_err(|e| ProviderAuthError::SourceResolutionFailed(e.to_string()))?
+        .map_err(provider_store_error)?
         .ok_or_else(|| interactive_login_error(binding))?;
     let expected_mode = require_persisted_auth_mode(&tokens, binding)?;
     let is_oauth_login = crate::auth_store::persisted_auth_mode_is_oauth_login(expected_mode);
@@ -941,6 +1042,7 @@ async fn load_managed_store_tokens_for_purpose(
             &lease_key,
             now,
             lifecycle_guard.as_ref(),
+            &tokens,
         )
         .await?;
     }
@@ -1162,8 +1264,10 @@ pub(crate) async fn normalize_interrupted_refresh_under_coordinator(
     tokens: &PersistedTokens,
     guard: &meerkat_core::AuthLoginLifecycleGuard,
 ) -> Result<Option<PersistedTokens>, RefreshError> {
-    let lease =
-        meerkat_core::handles::LeaseKey::from_credential_identity(key.credential_identity());
+    let Some(identity) = key.credential_identity() else {
+        return Err(RefreshError::StalePreparation);
+    };
+    let lease = meerkat_core::handles::LeaseKey::from_credential_identity(identity);
     if guard.lease_key() != &lease {
         return Err(RefreshError::StalePreparation);
     }
@@ -1186,12 +1290,13 @@ pub(crate) async fn normalize_interrupted_refresh_under_coordinator(
         return Err(RefreshError::StalePreparation);
     }
     if snapshot.phase != Some(AuthLeasePhase::Refreshing) {
-        let restored = meerkat_core::rehydrate_durable_predecessor_for_mutation_for_identity(
+        let restored = meerkat_core::rehydrate_durable_predecessor_for_mutation_with_access(
             store,
             auth,
-            key.credential_identity(),
+            identity,
             chrono::Utc::now(),
             guard,
+            TokenStoreAccess::Unattended,
         )
         .await
         .map_err(|error| RefreshError::Refresh(error.to_string()))?;
@@ -1205,9 +1310,9 @@ pub(crate) async fn normalize_interrupted_refresh_under_coordinator(
     let marked = meerkat_core::mark_tokens_lifecycle_published_for_transition(key, tokens, &closed)
         .map_err(|error| RefreshError::Refresh(error.to_string()))?;
     store
-        .save(key, &marked)
+        .save_for(key, &marked, TokenStoreAccess::Unattended)
         .await
-        .map_err(|error| RefreshError::Refresh(error.to_string()))?;
+        .map_err(RefreshError::from_token_store)?;
     Ok(Some(marked))
 }
 
@@ -1279,8 +1384,13 @@ async fn prepare_managed_store_oauth_refresh_for_purpose(
     }
     let lease_key =
         meerkat_core::handles::LeaseKey::from_credential_identity(binding.credential_identity());
-    previous.lifecycle_guard =
-        Some(meerkat_core::acquire_auth_login_lifecycle_guard(&lease_key).await);
+    // Unattended refresh never waits behind an operating-system credential
+    // call that holds the lease.
+    previous.lifecycle_guard = Some(
+        meerkat_core::acquire_auth_login_lifecycle_guard_for_unattended(&lease_key)
+            .await
+            .ok_or(ProviderAuthError::Auth(AuthError::CredentialAccessPending))?,
+    );
 
     if purpose == ManagedStorePurpose::ExistingOwnerMaintenance {
         observe_existing_managed_store_lifecycle_with_guard(
@@ -1295,9 +1405,9 @@ async fn prepare_managed_store_oauth_refresh_for_purpose(
 
     let mut durable_baseline = previous
         .store
-        .load(&previous.key)
+        .load_for(&previous.key, TokenStoreAccess::Unattended)
         .await
-        .map_err(|error| ProviderAuthError::SourceResolutionFailed(error.to_string()))?
+        .map_err(provider_store_error)?
         .ok_or_else(|| {
             ProviderAuthError::SourceResolutionFailed(
                 "persisted tokens disappeared inside OAuth refresh transaction".into(),
@@ -1645,6 +1755,17 @@ impl RefreshCoordinator for ManagedStoreOAuthRefreshFailureCoordinator {
         self.inner.with_exclusive_mutation(key, mutation_fn).await
     }
 
+    async fn with_exclusive_mutation_for(
+        &self,
+        key: TokenKey,
+        access: TokenStoreAccess,
+        mutation_fn: CredentialMutationFn,
+    ) -> Result<CredentialMutationOutcome, CredentialMutationError> {
+        self.inner
+            .with_exclusive_mutation_for(key, access, mutation_fn)
+            .await
+    }
+
     async fn with_refresh(
         &self,
         key: TokenKey,
@@ -1761,9 +1882,9 @@ pub async fn publish_managed_store_tokens_lifecycle_and_save(
             })?;
     let current_tokens = previous
         .store
-        .load(&previous.key)
+        .load_for(&previous.key, TokenStoreAccess::Unattended)
         .await
-        .map_err(|e| ProviderAuthError::SourceResolutionFailed(e.to_string()))?;
+        .map_err(provider_store_error)?;
     let current_snapshot = auth_lease.snapshot(&lease_key);
     if current_tokens.as_ref() != Some(&previous.tokens) {
         // Preserve the existing exactly-published shared result control only
@@ -1812,7 +1933,11 @@ pub async fn publish_managed_store_tokens_lifecycle_and_save(
         refreshed,
         &transition,
     ) {
-        Ok(committed) => match previous.store.save(&previous.key, &committed).await {
+        Ok(committed) => match previous
+            .store
+            .save_for(&previous.key, &committed, TokenStoreAccess::Unattended)
+            .await
+        {
             Ok(()) => return Ok(committed),
             Err(error) => {
                 format!("TokenStore save failed after AuthMachine lifecycle acquire: {error}")
@@ -1847,7 +1972,7 @@ pub async fn publish_managed_store_tokens_lifecycle_and_save(
         .map_err(|error| format!("rollback marker failed: {error}"))?;
         previous
             .store
-            .save(&previous.key, &marked)
+            .save_for(&previous.key, &marked, TokenStoreAccess::Unattended)
             .await
             .map_err(|error| format!("TokenStore rollback save failed: {error}"))?;
         Ok::<(), String>(())
@@ -5101,6 +5226,247 @@ mod tests {
                 .with_provider_auth_persistence(test_provider_auth_persistence(store.clone()))
                 .with_auth_lease_handle(owner.clone());
             (env, binding, store, owner, marked)
+        }
+
+        /// A managed OpenAI OAuth binding in its own realm, published on a
+        /// fresh owner: the lifecycle owner registry is process wide, and
+        /// these tests hold or retain its exclusion.
+        #[cfg(feature = "keyring")]
+        async fn keychain_fixture(
+            realm: &str,
+        ) -> (
+            ResolverEnvironment,
+            ValidatedBinding,
+            GeneratedAuthLeaseHandle,
+            PersistedTokens,
+        ) {
+            let template =
+                simple_secret_binding(CredentialSourceSpec::ManagedStore, "managed_chatgpt_oauth");
+            let binding = ProviderRuntimeCatalog::validate_binding(
+                &AuthBindingRef {
+                    realm: meerkat_core::connection::RealmId::parse(realm).unwrap(),
+                    binding: meerkat_core::connection::BindingId::parse("default").unwrap(),
+                    profile: None,
+                    origin: meerkat_core::connection::BindingOrigin::Configured,
+                },
+                template.backend_profile().as_ref(),
+                template.auth_profile().as_ref(),
+                &BindingPolicy::default(),
+            )
+            .unwrap();
+            let key = TokenKey::from_credential_identity(binding.credential_identity());
+            let lease = LeaseKey::from_credential_identity(binding.credential_identity());
+            let owner = generated_auth_lease_handle_for_test(Arc::new(
+                meerkat_runtime::RuntimeAuthLeaseHandle::new(),
+            ));
+            let publisher = generated_auth_lease_handle_for_test(Arc::new(
+                meerkat_runtime::RuntimeAuthLeaseHandle::new(),
+            ));
+            let tokens = chatgpt_oauth_tokens("keychain-original");
+            let acquired = publisher
+                .acquire_lease(
+                    &lease,
+                    meerkat_core::persisted_token_expires_at_epoch_secs(&tokens),
+                )
+                .unwrap();
+            let marked = meerkat_core::mark_tokens_lifecycle_published_for_transition(
+                &key, &tokens, &acquired,
+            )
+            .unwrap();
+            // What the keychain stores and returns: the JSON round trip.
+            let marked: PersistedTokens =
+                serde_json::from_str(&serde_json::to_string(&marked).unwrap()).unwrap();
+            let env = ResolverEnvironment::testing().with_auth_lease_handle(owner.clone());
+            (env, binding, owner, marked)
+        }
+
+        /// T1: at the public status entry, with the ACTUAL lifecycle guard held
+        /// and an interactive keychain call in flight, status answers at once
+        /// that the owner is busy, and reads nothing.
+        #[cfg(feature = "keyring")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn status_with_the_owner_busy_answers_at_once_without_reading() {
+            use crate::auth_store::keyring::test_keychain::{FakeKeychain, store};
+            let (_env, binding, owner, marked) = keychain_fixture("kc-status").await;
+            let keychain = FakeKeychain::blocked();
+            let keyring: Arc<dyn TokenStore> = Arc::new(store(&keychain, 2));
+            let identity = binding.credential_identity().clone();
+            let lease = LeaseKey::from_credential_identity(&identity);
+            let key = TokenKey::from_credential_identity(&identity);
+            let saving = tokio::spawn({
+                let keyring = Arc::clone(&keyring);
+                let marked = marked.clone();
+                async move {
+                    let _guard = meerkat_core::acquire_auth_login_lifecycle_guard(&lease).await;
+                    keyring
+                        .save_for(&key, &marked, TokenStoreAccess::Interactive)
+                        .await
+                }
+            });
+            keychain.reach_calls(1).await;
+            let read = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                meerkat_core::observe_marked_tokens_for_status_for_identity(
+                    keyring.as_ref(),
+                    &owner,
+                    &identity,
+                    marked.auth_mode,
+                    chrono::Utc::now(),
+                ),
+            )
+            .await
+            .expect("status answers at once")
+            .unwrap();
+            assert_eq!(read, meerkat_core::CredentialStatusRead::OwnerBusy);
+            assert_eq!(keychain.calls(), 1, "status read nothing");
+            keychain.release();
+            saving.await.unwrap().unwrap();
+        }
+
+        /// Public unattended cold control: concurrent cold resolutions of one
+        /// credential make exactly one keychain call, and every other caller
+        /// answers a typed pending at once.
+        #[cfg(feature = "keyring")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn concurrent_cold_resolutions_of_one_credential_make_one_keychain_call() {
+            use crate::auth_store::keyring::test_keychain::{FakeKeychain, store};
+            let (env, binding, _owner, marked) = keychain_fixture("kc-cold").await;
+            let keychain = FakeKeychain::blocked();
+            let key = TokenKey::from_credential_identity(binding.credential_identity());
+            keychain.put(
+                &key.keyring_account(),
+                &serde_json::to_string(&marked).unwrap(),
+            );
+            let keyring: Arc<dyn TokenStore> = Arc::new(store(&keychain, 2));
+            let env = Arc::new(
+                env.with_provider_auth_persistence(test_provider_auth_persistence(keyring)),
+            );
+            let binding = Arc::new(binding);
+            let first = tokio::spawn({
+                let env = Arc::clone(&env);
+                let binding = Arc::clone(&binding);
+                async move {
+                    load_managed_store_tokens_with_lifecycle(&env, &binding)
+                        .await
+                        .map(|loaded| loaded.tokens)
+                }
+            });
+            keychain.reach_calls(1).await;
+            for _ in 0..6 {
+                let outcome = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    load_managed_store_tokens_with_lifecycle(&env, &binding),
+                )
+                .await
+                .expect("a concurrent caller answers at once");
+                assert!(
+                    matches!(
+                        outcome,
+                        Err(ProviderAuthError::Auth(AuthError::CredentialAccessPending))
+                    ),
+                    "got {:?}",
+                    outcome.err()
+                );
+            }
+            assert_eq!(keychain.calls(), 1, "exactly one keychain call");
+            keychain.release();
+            assert_eq!(first.await.unwrap().unwrap(), marked);
+            assert_eq!(keychain.calls(), 1, "the waiting caller made the only call");
+        }
+
+        /// Public unattended cold controls past the single flight: another
+        /// credential's resolution over the process capacity answers a typed
+        /// unavailability with no call, and a recorded denial answers typed
+        /// denied with no call until an explicit credential change re-arms it.
+        #[cfg(feature = "keyring")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn cold_resolutions_over_capacity_or_after_a_denial_make_no_keychain_call() {
+            use crate::auth_store::keyring::KeychainFailure;
+            use crate::auth_store::keyring::test_keychain::{FakeKeychain, store};
+            let (env_a, binding_a, _owner_a, marked_a) = keychain_fixture("kc-cap-a").await;
+            let (env_b, binding_b, _owner_b, marked_b) = keychain_fixture("kc-cap-b").await;
+            let keychain = FakeKeychain::blocked();
+            let key_a = TokenKey::from_credential_identity(binding_a.credential_identity());
+            let key_b = TokenKey::from_credential_identity(binding_b.credential_identity());
+            keychain.put(
+                &key_a.keyring_account(),
+                &serde_json::to_string(&marked_a).unwrap(),
+            );
+            keychain.put(
+                &key_b.keyring_account(),
+                &serde_json::to_string(&marked_b).unwrap(),
+            );
+            // One operating-system call at a time in this process.
+            let keyring: Arc<dyn TokenStore> = Arc::new(store(&keychain, 1));
+            let env_a = Arc::new(env_a.with_provider_auth_persistence(
+                test_provider_auth_persistence(Arc::clone(&keyring)),
+            ));
+            let env_b = env_b.with_provider_auth_persistence(test_provider_auth_persistence(
+                Arc::clone(&keyring),
+            ));
+            let binding_a = Arc::new(binding_a);
+            let first = tokio::spawn({
+                let env_a = Arc::clone(&env_a);
+                let binding_a = Arc::clone(&binding_a);
+                async move {
+                    load_managed_store_tokens_with_lifecycle(&env_a, &binding_a)
+                        .await
+                        .map(|loaded| loaded.tokens)
+                }
+            });
+            keychain.reach_calls(1).await;
+            let over = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                load_managed_store_tokens_with_lifecycle(&env_b, &binding_b),
+            )
+            .await
+            .expect("an over-capacity caller answers at once");
+            assert!(
+                matches!(
+                    over,
+                    Err(ProviderAuthError::Auth(
+                        AuthError::CredentialStoreUnavailable(_)
+                    ))
+                ),
+                "got {:?}",
+                over.err()
+            );
+            assert_eq!(keychain.calls(), 1, "over capacity launches no call");
+            keychain.release();
+            assert_eq!(first.await.unwrap().unwrap(), marked_a);
+
+            keychain.fail_next(KeychainFailure::Denied("the user denied access".into()));
+            let denied = load_managed_store_tokens_with_lifecycle(&env_b, &binding_b).await;
+            assert!(
+                matches!(
+                    denied,
+                    Err(ProviderAuthError::Auth(AuthError::CredentialAccessDenied))
+                ),
+                "got {:?}",
+                denied.err()
+            );
+            assert_eq!(keychain.calls(), 2);
+            let again = load_managed_store_tokens_with_lifecycle(&env_b, &binding_b).await;
+            assert!(
+                matches!(
+                    again,
+                    Err(ProviderAuthError::Auth(AuthError::CredentialAccessDenied))
+                ),
+                "got {:?}",
+                again.err()
+            );
+            assert_eq!(keychain.calls(), 2, "a recorded denial launches no call");
+            // An explicit credential change re-arms the credential.
+            keyring
+                .save_for(&key_b, &marked_b, TokenStoreAccess::Interactive)
+                .await
+                .unwrap();
+            assert_eq!(keychain.calls(), 3);
+            let rearmed = load_managed_store_tokens_with_lifecycle(&env_b, &binding_b)
+                .await
+                .unwrap();
+            assert_eq!(rearmed.tokens, marked_b);
+            assert_eq!(keychain.calls(), 4);
         }
 
         #[tokio::test]

@@ -16,10 +16,10 @@
 use std::sync::{Arc, Weak};
 
 use meerkat::{
-    AddressResolution, ContinuationAddressResolver, ContinuationBody, ContinuationDelivery,
-    ContinuationHandling, ContinuationKey, ContinuationOwner, ContinuationOwnerService,
-    ContinuationProducer, ContinuationResultRef, ContinuationSubmitError, RetainedJobFacts,
-    RetainedJobLookup, RetainedJobRecord, RetainedJobSource,
+    AddressObservation, AddressResolution, ContinuationAddressResolver, ContinuationBody,
+    ContinuationDelivery, ContinuationHandling, ContinuationKey, ContinuationOwner,
+    ContinuationOwnerService, ContinuationProducer, ContinuationResultRef, ContinuationSubmitError,
+    RetainedJobFacts, RetainedJobLookup, RetainedJobRecord, RetainedJobSource,
 };
 use meerkat_core::SessionId;
 use meerkat_core::event::BackgroundJobTerminalStatus;
@@ -189,6 +189,89 @@ impl DetachedCompletionSink {
     }
 }
 
+/// A host's own committed-result owner for exactly these `Host` namespaces
+/// (its committed setup results), composed into the job source a
+/// [`MobMcpState`] binds ([`MobMcpState::with_host_job_source`]).
+#[derive(Clone)]
+pub struct HostJobSource {
+    namespaces: std::collections::BTreeSet<String>,
+    source: Arc<dyn RetainedJobSource>,
+}
+
+impl std::fmt::Debug for HostJobSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostJobSource")
+            .field("namespaces", &self.namespaces)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a [`HostJobSource`] was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum HostJobSourceError {
+    /// No namespace was named: the source would own nothing.
+    #[error("a host job source must own at least one namespace")]
+    NoNamespaces,
+    /// An empty namespace names no host operation.
+    #[error("a host job source namespace must not be empty")]
+    EmptyNamespace,
+}
+
+impl HostJobSource {
+    /// `source` answers for the `Host` producer in exactly `namespaces`.
+    ///
+    /// # Errors
+    /// No namespace, or an empty one.
+    pub fn new(
+        namespaces: impl IntoIterator<Item = impl Into<String>>,
+        source: Arc<dyn RetainedJobSource>,
+    ) -> Result<Self, HostJobSourceError> {
+        let namespaces = namespaces
+            .into_iter()
+            .map(Into::into)
+            .collect::<std::collections::BTreeSet<String>>();
+        if namespaces.is_empty() {
+            return Err(HostJobSourceError::NoNamespaces);
+        }
+        if namespaces.iter().any(String::is_empty) {
+            return Err(HostJobSourceError::EmptyNamespace);
+        }
+        Ok(Self { namespaces, source })
+    }
+
+    fn owns(&self, producer: &ContinuationProducer) -> bool {
+        matches!(producer, ContinuationProducer::Host { namespace } if self.namespaces.contains(namespace))
+    }
+}
+
+/// The job source a state binds: its own fork_off and council owner, and the
+/// host's owner for exactly its declared namespaces. Any other host namespace
+/// is owned by no one here.
+pub(crate) struct ComposedJobSource {
+    pub(crate) native: Arc<MobJobOwner>,
+    pub(crate) host: Option<HostJobSource>,
+}
+
+#[async_trait::async_trait]
+impl RetainedJobSource for ComposedJobSource {
+    async fn retained_job(
+        &self,
+        producer: &ContinuationProducer,
+        job_id: &str,
+    ) -> RetainedJobLookup {
+        match producer {
+            ContinuationProducer::Host { .. } => match &self.host {
+                Some(host) if host.owns(producer) => {
+                    host.source.retained_job(producer, job_id).await
+                }
+                _ => RetainedJobLookup::Absent,
+            },
+            _ => self.native.retained_job(producer, job_id).await,
+        }
+    }
+}
+
 /// The committed owner of this host's fork_off and council jobs: the mob
 /// event streams (`ForkJobTerminal`) and the council custody store.
 pub(crate) struct MobJobOwner {
@@ -329,20 +412,116 @@ impl ContinuationAddressResolver for HostContinuationResolver {
         let AddressResolution::Session(session_id) = &resolution else {
             return Ok(resolution);
         };
-        // A session that no longer reads (archived, deleted, or never
-        // persisted) never serves again.
-        if let Err(meerkat_core::service::SessionError::NotFound { .. }) =
-            state.session_service().read(session_id).await
-        {
-            return Ok(AddressResolution::Retired);
+        // A session that does not read is not served now, and its absence
+        // proves nothing (see `observe_address`): retired only on its own
+        // lifecycle proof, otherwise it waits unserved with its rows owed
+        // until the next wake retries it. A read that fails answers nothing
+        // about the owner: the address is unavailable, and the owner hook is
+        // not asked.
+        match state.session_service().read(session_id).await {
+            Ok(_) => {}
+            Err(meerkat_core::service::SessionError::NotFound { .. }) => {
+                return retired_or_unserved(&state, session_id).await;
+            }
+            Err(error) => {
+                return Err(format!("the owner session could not be read: {error}"));
+            }
         }
         let Some(host) = state.detached_owner_host() else {
             return Ok(resolution);
         };
-        Ok(match host.ensure_owner_live(session_id).await {
-            Ok(()) => resolution,
-            Err(DetachedOwnerError::OwnerGone { .. }) => AddressResolution::Retired,
-            Err(DetachedOwnerError::Failed { .. }) => AddressResolution::NotServed,
+        match host.ensure_owner_live(session_id).await {
+            Ok(()) => Ok(resolution),
+            // The host holds no such session now, which a host also answers
+            // for a session that is only absent for the moment: retired only
+            // on the same proof.
+            Err(DetachedOwnerError::OwnerGone { .. }) => {
+                retired_or_unserved(&state, session_id).await
+            }
+            Err(DetachedOwnerError::Failed { .. }) => Ok(AddressResolution::NotServed),
+        }
+    }
+
+    /// Observed, never served: the member's roster and mob, the host's
+    /// retired mobs, and a session owner's durable lifecycle, with no owner
+    /// hook. Making an owner live is delivery work, so a status read through
+    /// a service that outlived its binding revives nothing.
+    async fn observe_address(
+        &self,
+        address: &LogicalRuntimeId,
+    ) -> Result<AddressObservation, String> {
+        if self.mobs.observe_address(address).await? == AddressObservation::Retired {
+            return Ok(AddressObservation::Retired);
+        }
+        let member = address
+            .member_address()
+            .map_err(|error| error.to_string())?;
+        let Some(state) = self.state.upgrade() else {
+            return Ok(AddressObservation::MayServe);
+        };
+        if let Some(member) = member {
+            // A member of a mob this host does not manage is retired only
+            // once the mob is gone for good.
+            return Ok(
+                if state
+                    .mob_is_retired(&MobId::from(member.mob_id.as_str()))
+                    .await
+                {
+                    AddressObservation::Retired
+                } else {
+                    AddressObservation::MayServe
+                },
+            );
+        }
+        let AddressResolution::Session(session_id) = meerkat::default_address_resolution(address)
+        else {
+            return Ok(AddressObservation::MayServe);
+        };
+        Ok(if session_proven_retired(&state, &session_id).await? {
+            AddressObservation::Retired
+        } else {
+            AddressObservation::MayServe
         })
     }
+}
+
+/// Whether a session owner's own records prove it retired: its durable
+/// lifecycle is archived over a destroyed runtime, which the owner's resume
+/// verdict holds stably not revivable. Mere absence proves nothing: an
+/// ephemeral session whose live actor was discarded reads as absent and is
+/// restored under the same id, an archived session over a live runtime may
+/// be revived, and a session may not be persisted yet. Read only: nothing is
+/// materialized, recovered or served. `Err` when the lifecycle cannot be
+/// observed now.
+async fn session_proven_retired(
+    state: &MobMcpState,
+    session_id: &SessionId,
+) -> Result<bool, String> {
+    let authority = state
+        .session_service()
+        .observe_session_resume_authority(session_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(matches!(
+        authority.lifecycle(),
+        meerkat_mob::SessionResumeLifecycle::Archived {
+            runtime_state: Some(meerkat_runtime::RuntimeState::Destroyed),
+            ..
+        }
+    ))
+}
+
+/// A session owner no session serves now: [`AddressResolution::Retired`] on
+/// its own retirement proof ([`session_proven_retired`]), otherwise
+/// [`AddressResolution::NotServed`], so its rows stay owed and its runtime
+/// blocked for the next wake.
+async fn retired_or_unserved(
+    state: &MobMcpState,
+    session_id: &SessionId,
+) -> Result<AddressResolution, String> {
+    Ok(if session_proven_retired(state, session_id).await? {
+        AddressResolution::Retired
+    } else {
+        AddressResolution::NotServed
+    })
 }

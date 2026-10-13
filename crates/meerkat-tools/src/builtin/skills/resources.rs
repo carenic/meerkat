@@ -75,6 +75,7 @@ impl BuiltinTool for SkillListResourcesTool {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Builtin,
                 source_id: "skills".into(),
+                artifact: None,
             }),
         }
     }
@@ -129,6 +130,7 @@ impl BuiltinTool for SkillReadResourceTool {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Builtin,
                 source_id: "skills".into(),
+                artifact: None,
             }),
         }
     }

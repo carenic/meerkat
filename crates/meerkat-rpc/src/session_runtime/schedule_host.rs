@@ -510,15 +510,94 @@ fn rpc_to_schedule(error: crate::protocol::RpcError) -> ScheduleDomainError {
     ScheduleDomainError::Internal(error.message)
 }
 
+/// What a scheduled mob target hears while the RPC host has no mob state.
+#[cfg(feature = "mob")]
+const MOB_STATE_UNAVAILABLE: &str = "mob state unavailable on RPC host";
+
+/// The RPC host's scheduled mob targets, served by the runtime's current mob
+/// state, resolved once per operation and held only for that operation.
+///
+/// The schedule service keeps this host for its create-time identity probe
+/// for as long as any clone of the service lives, and the session builder's
+/// schedule tools hold such a clone. Holding the mob state itself here would
+/// keep the state alive past shutdown, and with it the session service, the
+/// runtime machine and this runtime. Like the session host, it holds the
+/// runtime weakly and reports a gone runtime as a stopped driver; a live
+/// runtime without a mob state answers as the unavailable host does.
+#[cfg(feature = "mob")]
+struct RpcScheduleMobHost {
+    runtime: Weak<SessionRuntime>,
+}
+
+#[cfg(feature = "mob")]
+impl RpcScheduleMobHost {
+    fn current(&self) -> Result<Box<dyn SurfaceScheduleMobHost>, ScheduleDomainError> {
+        let runtime = self
+            .runtime
+            .upgrade()
+            .ok_or(ScheduleDomainError::DriverStopped)?;
+        Ok(match runtime.mob_state() {
+            Some(state) => Box::new(MobMcpScheduleHost::new(state)),
+            None => Box::new(NoopScheduleMobHost::new(MOB_STATE_UNAVAILABLE)),
+        })
+    }
+}
+
+#[cfg(feature = "mob")]
+#[async_trait]
+impl SurfaceScheduleMobHost for RpcScheduleMobHost {
+    async fn probe_mob_target(
+        &self,
+        binding: &meerkat::MobTargetBinding,
+    ) -> Result<TargetProbeOutcome, ScheduleDomainError> {
+        let host = self.current()?;
+        host.probe_mob_target(binding).await
+    }
+
+    async fn deliver_mob_target(
+        &self,
+        occurrence: &Occurrence,
+        identity: &ScheduleDeliveryIdentity,
+        binding: &meerkat::MobTargetBinding,
+    ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+        let host = self.current()?;
+        host.deliver_mob_target(occurrence, identity, binding).await
+    }
+
+    async fn probe_identity_target(
+        &self,
+        binding: &IdentityTargetBinding,
+    ) -> Result<Option<TargetProbeOutcome>, ScheduleDomainError> {
+        let host = self.current()?;
+        host.probe_identity_target(binding).await
+    }
+
+    async fn resolve_identity_target(
+        &self,
+        binding: &IdentityTargetBinding,
+    ) -> Result<Option<SessionId>, ScheduleDomainError> {
+        let host = self.current()?;
+        host.resolve_identity_target(binding).await
+    }
+
+    async fn deliver_identity_target(
+        &self,
+        occurrence: &Occurrence,
+        identity: &ScheduleDeliveryIdentity,
+        binding: &IdentityTargetBinding,
+    ) -> Result<Option<DeliveryDispatch>, ScheduleDomainError> {
+        let host = self.current()?;
+        host.deliver_identity_target(occurrence, identity, binding)
+            .await
+    }
+}
+
 fn rpc_schedule_mob_host(runtime: &Arc<SessionRuntime>) -> Arc<dyn SurfaceScheduleMobHost> {
     #[cfg(feature = "mob")]
     {
-        if let Some(mob_state) = runtime.mob_state() {
-            return Arc::new(MobMcpScheduleHost::new(mob_state));
-        }
-        Arc::new(NoopScheduleMobHost::new(
-            "mob state unavailable on RPC host",
-        ))
+        Arc::new(RpcScheduleMobHost {
+            runtime: Arc::downgrade(runtime),
+        })
     }
 
     #[cfg(not(feature = "mob"))]
@@ -598,5 +677,61 @@ mod tests {
 
         let build = scheduled_build_config(&materialization_spec()).expect("valid spec");
         assert!(build.system_prompt.is_inherit());
+    }
+
+    /// The schedule service keeps its schedule host's mob host (through the
+    /// create-time identity probe) for as long as anything holds the service,
+    /// and the mob state holds the service through its own session service.
+    /// A runtime that armed its schedule host with a mob state, then shut
+    /// down and was dropped, releases that mob state and its machine (and so
+    /// the machine's execution custody), so the realm can be reopened in the
+    /// same process.
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn shutdown_releases_the_mob_state_its_schedule_host_targets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_, bundle) = meerkat::open_realm_persistence_in(
+            temp.path(),
+            "schedule-mob-host",
+            Some(meerkat_store::RealmBackend::Sqlite),
+            None,
+        )
+        .await
+        .expect("realm persistence");
+        let machine = bundle.runtime_adapter();
+        let config_store: Arc<dyn meerkat_core::ConfigStore> =
+            Arc::new(meerkat_core::MemoryConfigStore::new(
+                meerkat_core::Config::default(),
+                meerkat_models::canonical(),
+            ));
+        let runtime = Arc::new(
+            SessionRuntime::new_with_config_store(
+                meerkat::AgentFactory::new(temp.path().join("sessions")),
+                meerkat_core::Config::default(),
+                Arc::clone(&config_store),
+                1,
+                bundle,
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
+        let mob_state =
+            crate::router::compose_rpc_mob_state(&runtime, &config_store, None).expect("mob state");
+        let released = Arc::downgrade(&mob_state);
+        runtime.set_mob_state(mob_state);
+        runtime
+            .ensure_schedule_host_started()
+            .await
+            .expect("schedule host");
+
+        runtime.try_shutdown().await.expect("shutdown");
+        drop(runtime);
+
+        assert_eq!(released.strong_count(), 0, "the mob state is released");
+        assert_eq!(
+            Arc::strong_count(&machine),
+            1,
+            "only this test still holds the machine"
+        );
     }
 }

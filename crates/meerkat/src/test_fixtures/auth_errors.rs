@@ -5,7 +5,8 @@ use meerkat_contracts::WireAuthErrorReason as R;
 use meerkat_core::ConnectionTargetError;
 use meerkat_core::connection::{ProviderBindingError, WriteOwnerError};
 use meerkat_providers::auth_store::{
-    CredentialMutationError, CredentialSlotRefusal, TokenStoreError,
+    CredentialMutationError, CredentialSlotRefusal, TokenStoreAccess, TokenStoreError,
+    TokenStoreRefusal,
 };
 use meerkat_providers::connector_login::ConnectorLoginError;
 use meerkat_providers::connector_oauth::ConnectorOAuthRefusal;
@@ -49,6 +50,10 @@ pub fn all_reasons() -> Vec<R> {
         R::CallbackUnavailable,
         R::UpstreamFailure,
         R::ConfigurationInvalid,
+        R::CredentialAccessDenied,
+        R::CredentialInteractionRequired,
+        R::CredentialAccessPending,
+        R::CredentialStoreUnavailable,
         R::Infrastructure,
     ];
     for reason in &reasons {
@@ -83,6 +88,10 @@ pub fn all_reasons() -> Vec<R> {
             | R::CallbackUnavailable
             | R::UpstreamFailure
             | R::ConfigurationInvalid
+            | R::CredentialAccessDenied
+            | R::CredentialInteractionRequired
+            | R::CredentialAccessPending
+            | R::CredentialStoreUnavailable
             | R::Infrastructure => {}
         }
     }
@@ -351,6 +360,36 @@ pub fn reason_examples() -> Vec<(HostAuthError, R)> {
                 reason: "token endpoint refused the refresh".into(),
             }),
             R::UpstreamFailure,
+        ),
+        (
+            HostAuthError::Connector(ConnectorLoginError::CredentialAccess {
+                refusal: TokenStoreRefusal::Denied,
+                detail: "the user denied keychain access".into(),
+            }),
+            R::CredentialAccessDenied,
+        ),
+        (
+            HostAuthError::McpOAuth(McpOAuthError::CredentialAccess {
+                refusal: TokenStoreRefusal::InteractionRequired,
+                detail: "user interaction is not allowed".into(),
+            }),
+            R::CredentialInteractionRequired,
+        ),
+        (
+            HostAuthError::CredentialMutation(CredentialMutationError::CredentialAccess {
+                refusal: TokenStoreRefusal::Pending,
+                detail: "a keychain call for this credential is still running".into(),
+            }),
+            R::CredentialAccessPending,
+        ),
+        (
+            HostAuthError::TokenStore(TokenStoreError::refused(
+                "keyring",
+                TokenStoreAccess::Interactive,
+                TokenStoreRefusal::Unavailable,
+                "the keychain is locked",
+            )),
+            R::CredentialStoreUnavailable,
         ),
     ]
 }

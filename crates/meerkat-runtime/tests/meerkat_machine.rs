@@ -6415,3 +6415,251 @@ async fn directed_caller_on_post_completion_failure_observes_teardown_not_the_ru
         "a turn whose effects already ran must not be executed a second time"
     );
 }
+
+/// Count the runless-input-terminal hints `machine` tells its host.
+fn count_runless_input_terminal_hints(machine: &MeerkatMachine) -> Arc<AtomicUsize> {
+    let told = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&told);
+    machine.set_runless_input_terminal_hint(Arc::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+    }));
+    told
+}
+
+/// Response-progress peer input: a second one with the same supersession key
+/// coalesces the first while it is still queued.
+fn response_progress(label: &str) -> Input {
+    Input::Peer(meerkat_runtime::input::PeerInput {
+        directed_interaction_id: None,
+        objective_id: None,
+        system_prompts: Vec::new(),
+        injected_context: Vec::new(),
+        sender_taint: None,
+        header: InputHeader {
+            ingress_context: None,
+            retained_resume: None,
+            authority_association: None,
+            id: InputId::new(),
+            timestamp: Utc::now(),
+            source: InputOrigin::Peer {
+                peer_id: "peer-1".into(),
+                display_identity: None,
+                runtime_id: None,
+            },
+            durability: InputDurability::Durable,
+            visibility: InputVisibility::default(),
+            idempotency_key: None,
+            supersession_key: Some(meerkat_runtime::identifiers::SupersessionKey::new(
+                "same-window",
+            )),
+            correlation_id: None,
+        },
+        convention: Some(meerkat_runtime::input::PeerConvention::ResponseProgress {
+            request_id: format!("request-{label}"),
+            phase: meerkat_runtime::input::ResponseProgressPhase::InProgress,
+        }),
+        content: format!("progress {label}").into(),
+        payload: None,
+        handling_mode: None,
+    })
+}
+
+/// An exact cancellation that abandons a queued input tells the host once,
+/// and the abandoned terminal is readable; cancelling an absent input and an
+/// admission that displaces nothing tell nothing.
+#[tokio::test]
+async fn an_exact_cancellation_of_a_queued_input_tells_the_host_once() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let sid = SessionId::new();
+    adapter
+        .register_session(sid.clone())
+        .await
+        .expect("register session");
+    let told = count_runless_input_terminal_hints(&adapter);
+
+    // No executor serves the session, so the input stays queued.
+    let input = make_prompt("queued until cancelled");
+    let input_id = input.id().clone();
+    assert!(
+        adapter
+            .accept_input(&sid, input)
+            .await
+            .unwrap()
+            .is_accepted()
+    );
+    assert_eq!(
+        told.load(Ordering::SeqCst),
+        0,
+        "an admission that displaces nothing tells nothing"
+    );
+
+    assert!(
+        !adapter
+            .cancel_input_if_present(&sid, &InputId::new(), "nothing to cancel")
+            .await
+            .expect("cancelling an absent input"),
+        "an absent input is not observed"
+    );
+    assert_eq!(
+        told.load(Ordering::SeqCst),
+        0,
+        "an absent input tells nothing"
+    );
+
+    assert!(
+        adapter
+            .cancel_input_if_present(&sid, &input_id, "operator cancelled")
+            .await
+            .expect("cancelling the queued input"),
+        "the queued input is observed"
+    );
+    assert_eq!(
+        told.load(Ordering::SeqCst),
+        1,
+        "the abandoned input tells the host once"
+    );
+    let stored = adapter
+        .input_state(&sid, &input_id)
+        .await
+        .expect("read the cancelled input")
+        .expect("the cancelled input is recorded");
+    assert!(
+        matches!(
+            stored.seed.terminal_outcome,
+            Some(InputTerminalOutcome::Abandoned { .. })
+        ),
+        "the abandoned terminal is readable: {:?}",
+        stored.seed.terminal_outcome
+    );
+}
+
+/// A queued cancel point that abandons queued inputs tells the host once,
+/// after those abandonments committed, and every abandoned terminal is
+/// readable; a cancel point that finds nothing queued tells nothing.
+#[tokio::test]
+async fn a_queued_cancel_point_tells_the_host_once() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let sid = SessionId::new();
+    adapter
+        .register_session(sid.clone())
+        .await
+        .expect("register session");
+    let told = count_runless_input_terminal_hints(&adapter);
+
+    // No executor serves the session, so admitted inputs stay queued.
+    let mut queued = Vec::new();
+    for text in ["queued first", "queued second"] {
+        let input = make_prompt(text);
+        queued.push(input.id().clone());
+        assert!(
+            adapter
+                .accept_input(&sid, input)
+                .await
+                .unwrap()
+                .is_accepted()
+        );
+    }
+    assert_eq!(told.load(Ordering::SeqCst), 0, "admission tells nothing");
+
+    let cancel_point = adapter
+        .abandon_queued_inputs_at_cancel_point(&sid, "operator cancelled the queue")
+        .await
+        .expect("cancel point")
+        .expect("registered session");
+    assert_eq!(cancel_point.queued_inputs, queued);
+    assert_eq!(
+        told.load(Ordering::SeqCst),
+        1,
+        "the committed abandonments tell the host once"
+    );
+    for input_id in &queued {
+        let stored = adapter
+            .input_state(&sid, input_id)
+            .await
+            .expect("read the abandoned input")
+            .expect("the abandoned input is recorded");
+        assert_eq!(
+            stored.seed.terminal_outcome,
+            Some(InputTerminalOutcome::Abandoned {
+                reason: InputAbandonReason::Cancelled,
+            }),
+            "the abandoned terminal is readable"
+        );
+    }
+
+    let nothing = adapter
+        .abandon_queued_inputs_at_cancel_point(&sid, "nothing left to cancel")
+        .await
+        .expect("cancel point")
+        .expect("registered session");
+    assert!(nothing.queued_inputs.is_empty());
+    assert_eq!(
+        told.load(Ordering::SeqCst),
+        1,
+        "a cancel point that abandons nothing tells nothing"
+    );
+}
+
+/// An admission that coalesces a queued input tells the host once, and the
+/// coalesced terminal is readable.
+#[tokio::test]
+async fn a_coalescing_admission_tells_the_host_once() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let sid = SessionId::new();
+    adapter
+        .register_session(sid.clone())
+        .await
+        .expect("register session");
+    let told = count_runless_input_terminal_hints(&adapter);
+
+    let first = response_progress("first");
+    let first_id = first.id().clone();
+    assert!(
+        adapter
+            .accept_input(&sid, first)
+            .await
+            .unwrap()
+            .is_accepted()
+    );
+    assert_eq!(
+        told.load(Ordering::SeqCst),
+        0,
+        "the first admission displaces nothing"
+    );
+
+    let second = response_progress("second");
+    let second_id = second.id().clone();
+    assert!(
+        adapter
+            .accept_input(&sid, second)
+            .await
+            .unwrap()
+            .is_accepted()
+    );
+    // The coalesced terminal is told by the admission's boundary work, once
+    // that work has released the session's mutation gate.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while told.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("coalescing the queued input tells the host");
+    assert_eq!(
+        told.load(Ordering::SeqCst),
+        1,
+        "coalescing the queued input tells the host once"
+    );
+    let stored = adapter
+        .input_state(&sid, &first_id)
+        .await
+        .expect("read the coalesced input")
+        .expect("the coalesced input is recorded");
+    assert_eq!(
+        stored.seed.terminal_outcome,
+        Some(InputTerminalOutcome::Coalesced {
+            aggregate_id: second_id
+        }),
+        "the coalesced terminal is readable"
+    );
+}

@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let factory = AgentFactory::new(temp.path().join("sessions"));
     let builder = FactoryAgentBuilder::new(factory, config.clone());
-    let (service, runtime_adapter) = build_runtime_backed_service(builder, 4, persistence);
+    let (service, runtime_adapter) = build_runtime_backed_service(builder, 4, persistence)?;
     let service = Arc::new(service);
     let result = Box::pin(materialize_session(
         &service,

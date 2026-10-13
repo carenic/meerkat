@@ -240,7 +240,8 @@ async fn a_delivery_held_by_a_pending_callback_batch_applies_once_after_its_resu
     }));
     // The low-level composition arms no owner, so this test holds the
     // handle and observes every pass.
-    let (service, adapter) = build_runtime_backed_service(builder, 4, persistence);
+    let (service, adapter) = build_runtime_backed_service(builder, 4, persistence)
+        .expect("compose the runtime-backed service");
     let service = Arc::new(service);
     let adapter: Arc<MeerkatMachine> = adapter;
     let handle = owner

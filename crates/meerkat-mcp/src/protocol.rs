@@ -20,6 +20,8 @@ pub struct McpProtocol {
     stdio_child: Option<crate::connection::StdioChildCustody>,
     /// Server name for typed call failures.
     server: String,
+    /// The host access policy of the connection this was converted from.
+    access: Option<meerkat_core::McpServerAccess>,
     protected_metadata: crate::transport::protected::ProtectedMetadataState,
     /// The session-expiry owner of the connection this was converted from,
     /// so its calls keep the same request-local disposition and refusal.
@@ -36,6 +38,7 @@ impl McpProtocol {
             service: service.into(),
             stdio_child: None,
             server,
+            access: None,
             protected_metadata: Default::default(),
             session_expiry: Default::default(),
         }
@@ -45,6 +48,7 @@ impl McpProtocol {
         service: crate::client_service::ConnectedClient,
         stdio_child: Option<crate::connection::StdioChildCustody>,
         server: String,
+        access: Option<meerkat_core::McpServerAccess>,
         protected_metadata: crate::transport::protected::ProtectedMetadataState,
         session_expiry: crate::transport::streamable_http::SessionExpiryRecorder,
     ) -> Self {
@@ -52,6 +56,7 @@ impl McpProtocol {
             service,
             stdio_child,
             server,
+            access,
             protected_metadata,
             session_expiry,
         }
@@ -78,13 +83,14 @@ impl McpProtocol {
         let result = crate::connection::call_tool_on(
             &self.service,
             &self.server,
+            crate::connection::CallAdmission::Ceiling(self.access.as_ref()),
             &self.protected_metadata,
             &self.session_expiry,
             None,
             name,
             args,
             None,
-            || Ok(()),
+            || Ok(None),
         )
         .await?;
         convert_tool_result(result, name)
@@ -100,7 +106,9 @@ impl McpProtocol {
     }
 
     pub async fn close(self) -> Result<(), McpError> {
-        crate::connection::close_connected(self.service, self.stdio_child).await
+        crate::connection::close_connected(&self.server, self.service, self.stdio_child)
+            .await
+            .map(drop)
     }
 }
 

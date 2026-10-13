@@ -196,7 +196,8 @@ async fn make_stack_over(
         64,
         persistence,
         NotificationSink::noop(),
-    );
+    )
+    .expect("compose the RPC session runtime");
     runtime.set_default_llm_client(Some(Arc::clone(&client)));
     let config_store: Arc<dyn meerkat_core::ConfigStore> =
         Arc::new(MemoryConfigStore::new(config, meerkat_models::canonical()));
@@ -500,33 +501,33 @@ async fn e2e_fast_detached_fork_off_reaches_the_forker_and_its_next_turn() {
     let _ = mob_state.mob_destroy(&mob_id).await;
 }
 
-/// MobKit's gateway builds its mob state with `MobMcpState::new` over a
+/// Meta's gateway builds its mob state with `MobMcpState::new` over a
 /// session service that forwards the runtime. Outcomes are submitted durably
 /// through a bound delivery inbox: until the host binds one the tools run in
 /// the turn (typed `NoContinuationOwner`), and once it does that shape takes
 /// the detached path, never the blocking one (a forker would otherwise wait
 /// for its child's whole run).
 #[tokio::test(flavor = "multi_thread")]
-async fn e2e_fast_library_host_built_like_mobkit_delivers_detached() {
+async fn e2e_fast_library_host_built_like_meta_delivers_detached() {
     let temp = tempfile::TempDir::new().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let client: Arc<dyn LlmClient> = Arc::new(ForkOffScript {
         requests: Arc::clone(&requests),
     });
     let (_router, stack_state) = make_stack(temp.path(), client).await;
-    let mobkit_shaped = MobMcpState::new(
+    let meta_shaped = MobMcpState::new(
         stack_state.session_service(),
         meerkat_mob::MobControlPrincipal::Owner,
     )
     .expect("construct runtime authority")
     .into_shared();
     assert_eq!(
-        mobkit_shaped.detached_delivery_blocked_because(),
+        meta_shaped.detached_delivery_blocked_because(),
         Some(meerkat_mob_mcp::DetachedDeliveryUnavailable::NoContinuationOwner),
         "a library host that never bound a delivery inbox runs the tools in the turn"
     );
     let bindings = meerkat::ContinuationHostBindings::default();
-    mobkit_shaped
+    meta_shaped
         .bind_continuations(
             meerkat_runtime::RuntimeDeliveryInbox::new(Arc::new(
                 meerkat_runtime::InMemoryRuntimeStore::new(),
@@ -535,7 +536,7 @@ async fn e2e_fast_library_host_built_like_mobkit_delivers_detached() {
         )
         .expect("bind the host's delivery inbox");
     assert_eq!(
-        mobkit_shaped.detached_delivery_blocked_because(),
+        meta_shaped.detached_delivery_blocked_because(),
         None,
         "a bound library host whose session service carries a runtime delivers detached"
     );
@@ -1676,7 +1677,8 @@ async fn e2e_fast_top_level_rpc_convener_is_revived_for_its_council_result() {
         64,
         persistence,
         NotificationSink::noop(),
-    );
+    )
+    .expect("compose the RPC session runtime");
     runtime.set_default_llm_client(Some(Arc::clone(&client)));
     let config_store: Arc<dyn meerkat_core::ConfigStore> =
         Arc::new(MemoryConfigStore::new(config, meerkat_models::canonical()));

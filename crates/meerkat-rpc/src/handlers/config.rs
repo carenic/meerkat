@@ -21,9 +21,9 @@ use meerkat::session_runtime::live_orchestration::{
     LiveHotSwapSkipReason, should_fire_live_propagation,
 };
 use meerkat_contracts::wire::{
-    ConfigWriteResult, WireLiveChannelCloseFailure, WireLiveChannelRefreshFailure,
-    WireLiveCloseFailure, WireLiveConfigPropagationReport, WireLiveHotSwapSkip,
-    WireLiveHotSwapSkipReason, WireLiveRefreshFailure, WireLiveSwapFailure,
+    ConfigWriteResult, WireConfigWriteRefusal, WireLiveChannelCloseFailure,
+    WireLiveChannelRefreshFailure, WireLiveCloseFailure, WireLiveConfigPropagationReport,
+    WireLiveHotSwapSkip, WireLiveHotSwapSkipReason, WireLiveRefreshFailure, WireLiveSwapFailure,
 };
 
 use super::{RpcResponseExt, parse_params};
@@ -143,6 +143,11 @@ fn runtime_error_to_response(id: Option<RpcId>, err: ConfigRuntimeError) -> RpcR
             error::INVALID_PARAMS,
             format!("Generation conflict: expected {expected}, current {current}"),
         ),
+        // An ordinary write is not governance administration; nothing was
+        // written.
+        ConfigRuntimeError::Config(
+            refused @ meerkat_core::ConfigError::GovernanceAdministration,
+        ) => governance_administration_response(id, &refused),
         // The store refused the caller's candidate config: its own new or
         // changed realm MCP server holds an environment reference, or the
         // written config is invalid (for example after a concurrent edit
@@ -156,6 +161,35 @@ fn runtime_error_to_response(id: Option<RpcId>, err: ConfigRuntimeError) -> RpcR
             error::INVALID_PARAMS,
             format!("Invalid config: {error}"),
         ),
+        other => RpcResponse::error(id, error::INTERNAL_ERROR, other.to_string()),
+    }
+}
+
+/// The typed refusal of a config write that would change, remove or restate
+/// the realm's governance section.
+fn governance_administration_response(
+    id: Option<RpcId>,
+    refused: &meerkat_core::ConfigError,
+) -> RpcResponse {
+    match serde_json::to_value(WireConfigWriteRefusal::GovernanceAdministrationRequired) {
+        Ok(data) => {
+            RpcResponse::error_with_data(id, error::INVALID_PARAMS, refused.to_string(), data)
+        }
+        Err(serialize_error) => RpcResponse::error(
+            id,
+            error::INTERNAL_ERROR,
+            format!("failed to serialize config refusal data: {serialize_error}"),
+        ),
+    }
+}
+
+/// A store write's failure on the path without a config runtime: the
+/// governance refusal stays typed, anything else is internal.
+fn store_write_error_response(id: Option<RpcId>, err: meerkat_core::ConfigError) -> RpcResponse {
+    match err {
+        refused @ meerkat_core::ConfigError::GovernanceAdministration => {
+            governance_administration_response(id, &refused)
+        }
         other => RpcResponse::error(id, error::INTERNAL_ERROR, other.to_string()),
     }
 }
@@ -385,7 +419,7 @@ pub async fn handle_set(
                     },
                 )
             }
-            Err(e) => RpcResponse::error(id, error::INTERNAL_ERROR, e.to_string()),
+            Err(e) => store_write_error_response(id, e),
         }
     }
 }
@@ -538,7 +572,7 @@ pub async fn handle_patch(
                     },
                 )
             }
-            Err(e) => RpcResponse::error(id, error::INTERNAL_ERROR, e.to_string()),
+            Err(e) => store_write_error_response(id, e),
         }
     }
 }

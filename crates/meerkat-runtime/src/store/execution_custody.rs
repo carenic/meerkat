@@ -95,6 +95,25 @@ impl RuntimeStoreExecutionCustody {
         }
     }
 
+    /// Whether `claim` binds this owner's own store, whichever owner instance
+    /// took it: the same in-memory owner, or the same canonical SQLite
+    /// database (an alias path resolves to it). A machine never retains such
+    /// a claim as an associated one, which would admit it against itself.
+    pub fn binds_same_store(&self, claim: &RuntimeStoreExecutionClaim) -> bool {
+        match (&self.inner, &claim.owner) {
+            (
+                ExecutionCustodyOwner::Memory(owner),
+                ExecutionClaimOwner::Memory { owner: actual, .. },
+            ) => Arc::ptr_eq(owner, actual),
+            #[cfg(feature = "sqlite-store")]
+            (ExecutionCustodyOwner::Physical(owner), ExecutionClaimOwner::Physical(actual)) => {
+                actual.binds_same_file(owner)
+            }
+            #[cfg(feature = "sqlite-store")]
+            _ => false,
+        }
+    }
+
     /// Attempt one ordinary execution claim without waiting or polling.
     pub fn try_acquire_shared(
         &self,
@@ -108,6 +127,7 @@ impl RuntimeStoreExecutionCustody {
                     .try_acquire(false)
                     .map(|claim| RuntimeStoreExecutionClaim {
                         owner: ExecutionClaimOwner::Physical(claim),
+                        associated: Vec::new(),
                     });
             }
         };
@@ -126,6 +146,7 @@ impl RuntimeStoreExecutionCustody {
                 owner: Arc::clone(inner),
                 governed: false,
             },
+            associated: Vec::new(),
         })
     }
 
@@ -143,6 +164,7 @@ impl RuntimeStoreExecutionCustody {
                     .try_acquire(true)
                     .map(|claim| RuntimeStoreExecutionClaim {
                         owner: ExecutionClaimOwner::Physical(claim),
+                        associated: Vec::new(),
                     });
             }
         };
@@ -158,6 +180,7 @@ impl RuntimeStoreExecutionCustody {
                 owner: Arc::clone(inner),
                 governed: true,
             },
+            associated: Vec::new(),
         })
     }
 }
@@ -174,6 +197,10 @@ fn custody_lock_error<T>(error: TryLockError<T>) -> RuntimeStoreExecutionCustody
 #[derive(Debug)]
 pub struct RuntimeStoreExecutionClaim {
     owner: ExecutionClaimOwner,
+    /// Governed claims on other actual stores that this owner's composition
+    /// is bound to ([`Self::retain_associated`]). They grant nothing here.
+    /// Declared after `owner`, they are released with this claim, after it.
+    associated: Vec<RuntimeStoreExecutionClaim>,
 }
 
 #[derive(Debug)]
@@ -218,10 +245,29 @@ impl RuntimeStoreExecutionClaim {
             ExecutionClaimOwner::Physical(claim) => claim.is_governed(),
         }
     }
+
+    /// Retain `associated`, the governed claim on another actual store that
+    /// this owner's composition is bound to, for exactly this claim's
+    /// lifetime: every holder sharing this claim shares it, and it is
+    /// released only when this claim is, after it. It grants no authority
+    /// over either store; it only keeps that store's other execution owners
+    /// out. Both claims must be governed, before this one is shared.
+    pub(crate) fn retain_associated(
+        &mut self,
+        associated: RuntimeStoreExecutionClaim,
+    ) -> Result<(), RuntimeStoreExecutionCustodyError> {
+        if !self.is_governed() || !associated.is_governed() {
+            return Err(RuntimeStoreExecutionCustodyError::Unavailable);
+        }
+        self.associated.push(associated);
+        Ok(())
+    }
 }
 
 impl Drop for RuntimeStoreExecutionClaim {
     fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-support"))]
+        final_drop_holds::park(self);
         // This lock contains only mechanical counters. Poison remains set, so
         // releasing an old claim cannot make a poisoned backend usable again.
         let (inner, governed) = match &self.owner {
@@ -236,6 +282,53 @@ impl Drop for RuntimeStoreExecutionClaim {
             current.governed = false;
         } else {
             current.shared = current.shared.saturating_sub(1);
+        }
+    }
+}
+
+/// Test holds on the final destruction of one exact claim (by address): the
+/// destructor reports the thread it runs on, then parks, still holding the
+/// custody, until its hold is released or dropped. Other claims pass.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod final_drop_holds {
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::thread::ThreadId;
+
+    use super::RuntimeStoreExecutionClaim;
+
+    type Hold = (usize, Sender<ThreadId>, Receiver<()>);
+
+    static HOLDS: Mutex<Vec<Hold>> = Mutex::new(Vec::new());
+
+    /// Hold the final destruction of `claim`. The first receiver reports the
+    /// thread that parked in it; the destruction completes once the sender is
+    /// used or dropped.
+    pub(crate) fn hold(
+        claim: &Arc<RuntimeStoreExecutionClaim>,
+    ) -> (Receiver<ThreadId>, Sender<()>) {
+        let (parked_tx, parked_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        HOLDS.lock().unwrap_or_else(PoisonError::into_inner).push((
+            Arc::as_ptr(claim).addr(),
+            parked_tx,
+            release_rx,
+        ));
+        (parked_rx, release_tx)
+    }
+
+    pub(super) fn park(claim: &RuntimeStoreExecutionClaim) {
+        let address = std::ptr::from_ref(claim).addr();
+        let hold = {
+            let mut holds = HOLDS.lock().unwrap_or_else(PoisonError::into_inner);
+            holds
+                .iter()
+                .position(|(held, _, _)| *held == address)
+                .map(|index| holds.remove(index))
+        };
+        if let Some((_, parked, release)) = hold {
+            let _ = parked.send(std::thread::current().id());
+            let _ = release.recv();
         }
     }
 }

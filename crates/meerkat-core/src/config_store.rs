@@ -187,6 +187,46 @@ impl EffectiveConfigReader {
         &self,
         head: &crate::connection::RealmId,
     ) -> Result<(Config, Vec<RealmConfigWarning>), ConfigError> {
+        let ChainDocs {
+            docs,
+            raw_docs,
+            warnings,
+        } = self.chain_docs(head).await?;
+        Ok(compose_reporting_chain_warnings(
+            &docs, &raw_docs, head, warnings,
+        )?)
+    }
+
+    /// The realm whose OWN document defines the MCP server `name` in
+    /// `head`'s effective configuration, with that definition: the nearest
+    /// chain member, head first, whose document lists the name. Servers fold
+    /// by name with the child winning, so this is the definition the
+    /// composition yields for the name. The documents and the chain are
+    /// discovered and resolved exactly as [`Self::effective_config`] does.
+    /// `None` when no document on the chain defines the name.
+    pub async fn mcp_server_owner(
+        &self,
+        head: &crate::connection::RealmId,
+        name: &str,
+    ) -> Result<
+        Option<(
+            crate::connection::RealmId,
+            crate::mcp_config::McpServerConfig,
+        )>,
+        ConfigError,
+    > {
+        let ChainDocs { docs, .. } = self.chain_docs(head).await?;
+        Ok(crate::config::mcp_server_definition_owner(
+            &docs, head, name,
+        )?)
+    }
+
+    /// The documents [`Self::effective_config`] composes for `head`: the head
+    /// document, its `parent` edges and the implicit `global` tail.
+    async fn chain_docs(
+        &self,
+        head: &crate::connection::RealmId,
+    ) -> Result<ChainDocs, ConfigError> {
         use crate::connection::{MAX_REALM_CHAIN_DEPTH, RealmId};
         use std::collections::{BTreeMap, BTreeSet};
 
@@ -242,9 +282,11 @@ impl EffectiveConfigReader {
             docs.insert(global, doc);
         }
 
-        Ok(compose_reporting_chain_warnings(
-            &docs, &raw_docs, head, warnings,
-        )?)
+        Ok(ChainDocs {
+            docs,
+            raw_docs,
+            warnings,
+        })
     }
 
     /// Like [`Self::effective_config`], but the HEAD realm's document is supplied
@@ -275,6 +317,45 @@ impl EffectiveConfigReader {
         head: &crate::connection::RealmId,
         head_config: Config,
     ) -> Result<(Config, Vec<RealmConfigWarning>), ConfigError> {
+        let ChainDocs {
+            docs,
+            raw_docs,
+            warnings,
+        } = self.chain_docs_over_head(head, head_config).await?;
+        Ok(compose_reporting_chain_warnings(
+            &docs, &raw_docs, head, warnings,
+        )?)
+    }
+
+    /// [`Self::mcp_server_owner`] with the HEAD realm's own document
+    /// supplied by the caller, as [`Self::effective_config_over_head`]
+    /// composes it; ancestors are fetched from the source.
+    pub async fn mcp_server_owner_over_head(
+        &self,
+        head: &crate::connection::RealmId,
+        head_config: Config,
+        name: &str,
+    ) -> Result<
+        Option<(
+            crate::connection::RealmId,
+            crate::mcp_config::McpServerConfig,
+        )>,
+        ConfigError,
+    > {
+        let ChainDocs { docs, .. } = self.chain_docs_over_head(head, head_config).await?;
+        Ok(crate::config::mcp_server_definition_owner(
+            &docs, head, name,
+        )?)
+    }
+
+    /// The documents [`Self::effective_config_over_head`] composes for
+    /// `head`: the caller's head document, its `parent` edges and the
+    /// implicit `global` tail.
+    async fn chain_docs_over_head(
+        &self,
+        head: &crate::connection::RealmId,
+        head_config: Config,
+    ) -> Result<ChainDocs, ConfigError> {
         use crate::connection::{MAX_REALM_CHAIN_DEPTH, RealmId};
         use std::collections::{BTreeMap, BTreeSet};
 
@@ -347,10 +428,20 @@ impl EffectiveConfigReader {
             docs.insert(global, doc);
         }
 
-        Ok(compose_reporting_chain_warnings(
-            &docs, &raw_docs, head, warnings,
-        )?)
+        Ok(ChainDocs {
+            docs,
+            raw_docs,
+            warnings,
+        })
     }
+}
+
+/// The per-realm documents fetched for one composition, with their raw TOML
+/// (presence) and load warnings.
+struct ChainDocs {
+    docs: std::collections::BTreeMap<crate::connection::RealmId, Config>,
+    raw_docs: std::collections::BTreeMap<crate::connection::RealmId, toml::Value>,
+    warnings: Vec<RealmConfigWarning>,
 }
 
 /// Log composed-document warnings once per realm per process for callers
@@ -411,6 +502,7 @@ impl ConfigStore for MemoryConfigStore {
 
     async fn set(&self, config: Config) -> Result<(), ConfigError> {
         let mut current = self.config.write().await;
+        keep_governance(&current.governance, &config.governance)?;
         config.validate_for_write(self.catalog, &current.tools.mcp_servers)?;
         *current = config;
         Ok(())
@@ -421,6 +513,7 @@ impl ConfigStore for MemoryConfigStore {
         let mut value = serde_json::to_value(&*config).map_err(ConfigError::Json)?;
         merge_patch(&mut value, delta.0);
         let updated: Config = serde_json::from_value(value).map_err(ConfigError::Json)?;
+        keep_governance(&config.governance, &updated.governance)?;
         updated.validate_for_write(self.catalog, &config.tools.mcp_servers)?;
         *config = updated.clone();
         Ok(updated)
@@ -625,12 +718,14 @@ impl ConfigStore for FileConfigStore {
         let content = self.read_content().await?;
         let patched = PersistedConfigDocument::patch_content(&content, delta.0)?;
         // The patch already parsed this content strictly, so this parse
-        // succeeds; the comparison is against the same bytes the patch edits.
-        let persisted_servers = PersistedConfigDocument::parse(&content)
-            .map(|document| document.into_loaded().0.tools.mcp_servers)?;
+        // succeeds; the comparisons are against the same bytes the patch
+        // edits.
+        let persisted =
+            PersistedConfigDocument::parse(&content).map(|document| document.into_loaded().0)?;
+        keep_governance(&persisted.governance, &patched.config.governance)?;
         patched
             .config
-            .validate_for_write(self.catalog, &persisted_servers)?;
+            .validate_for_write(self.catalog, &persisted.tools.mcp_servers)?;
         self.write_content(&patched.content).await?;
         Ok((patched.config, patched.warnings))
     }
@@ -639,6 +734,10 @@ impl ConfigStore for FileConfigStore {
     /// document each one then overrides the parent realm, so callers that
     /// change individual keys of a realm document patch it instead.
     async fn set(&self, config: Config) -> Result<(), ConfigError> {
+        keep_governance(
+            &persisted_governance(&self.read_content().await?)?,
+            &config.governance,
+        )?;
         config.validate_for_write(self.catalog, &self.persisted_mcp_servers_for_write().await)?;
         let content = toml::to_string_pretty(&config).map_err(ConfigError::TomlSerialize)?;
         self.write_content(&content).await
@@ -648,6 +747,47 @@ impl ConfigStore for FileConfigStore {
         let (updated, warnings) = self.patch_with_warnings(delta).await?;
         report_config_load_warnings_once(&self.path, &warnings);
         Ok(updated)
+    }
+}
+
+/// Refuse a write that would not keep `committed`, the document's governance
+/// section, exactly ([`ConfigError::GovernanceAdministration`]): ordinary
+/// config write permission is not governance administration. The section is
+/// administered by the realm's trusted host in the document itself, so a
+/// write can neither change nor remove it (an explicitly empty section
+/// included), and neither state one in a document that states none, which
+/// would shadow every later change of the parent's.
+///
+/// The check runs inside each write; it does not exclude a concurrent edit
+/// of the document by another writer outside the config owner (such as the
+/// trusted host editing the file by hand at the same moment).
+fn keep_governance(
+    committed: &Option<crate::GovernanceConfig>,
+    written: &Option<crate::GovernanceConfig>,
+) -> Result<(), ConfigError> {
+    if committed == written {
+        Ok(())
+    } else {
+        Err(ConfigError::GovernanceAdministration)
+    }
+}
+
+/// The governance section a persisted document states (`None` when it states
+/// none), for a full replace that does not otherwise parse the old
+/// document's sections. The section is found by parsed key identity, so a
+/// quoted or escaped key names the same section. A document that is not
+/// TOML could state one, so no write may replace it.
+fn persisted_governance(content: &str) -> Result<Option<crate::GovernanceConfig>, ConfigError> {
+    let document: toml::Table = content
+        .parse()
+        .map_err(|_| ConfigError::GovernanceAdministration)?;
+    match document.get("governance") {
+        None => Ok(None),
+        Some(section) => section
+            .clone()
+            .try_into()
+            .map(Some)
+            .map_err(|_| ConfigError::GovernanceAdministration),
     }
 }
 
@@ -790,6 +930,94 @@ mod tests {
         assert_eq!(
             eff.models.anthropic, "c-anthropic",
             "absent global ancestor must not clobber the child's own fields"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_server_owner_is_the_nearest_own_document_on_the_composed_chain() {
+        use crate::connection::{RealmConfigSection, RealmId};
+        use crate::mcp_config::McpServerConfig;
+
+        let server = |name: &str, command: &str| {
+            McpServerConfig::stdio(name, command, Vec::new(), std::collections::HashMap::new())
+        };
+        let mut global = Config::default();
+        global
+            .realm
+            .insert("global".to_string(), RealmConfigSection::default());
+        // `twice` is listed twice: the composition makes the later entry
+        // effective.
+        global.tools.mcp_servers = vec![
+            server("search", "global-search"),
+            server("shared", "same"),
+            server("twice", "shadowed"),
+            server("twice", "effective"),
+        ];
+        let mut child = Config::default();
+        child.realm.insert(
+            "child".to_string(),
+            RealmConfigSection {
+                parent: Some(RealmId::global()),
+                ..Default::default()
+            },
+        );
+        // The child repeats `shared` exactly; it still defines it itself.
+        child.tools.mcp_servers = vec![server("shared", "same")];
+        let mut docs = std::collections::BTreeMap::new();
+        docs.insert("child".to_string(), child.clone());
+        docs.insert("global".to_string(), global);
+        let reader = EffectiveConfigReader::new(Arc::new(MapSource { docs }));
+        let child_id = RealmId::parse("child").unwrap();
+
+        assert_eq!(
+            reader.mcp_server_owner(&child_id, "search").await.unwrap(),
+            Some((RealmId::global(), server("search", "global-search"))),
+            "an inherited server is owned by the realm whose document defines it"
+        );
+        assert_eq!(
+            reader
+                .mcp_server_owner(&child_id, "shared")
+                .await
+                .unwrap()
+                .map(|(owner, _)| owner),
+            Some(child_id.clone()),
+            "an identical child definition is the child's own, never its parent's"
+        );
+        assert_eq!(
+            reader.mcp_server_owner(&child_id, "missing").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            reader.mcp_server_owner(&child_id, "twice").await.unwrap(),
+            Some((RealmId::global(), server("twice", "effective"))),
+            "a twice-listed name is owned with its later, effective entry"
+        );
+        // The owner's definition is the one the composition yields.
+        let effective = reader.effective_config(&child_id).await.unwrap();
+        assert!(
+            !effective
+                .tools
+                .mcp_servers
+                .contains(&server("twice", "shadowed"))
+        );
+        for name in ["search", "shared", "twice"] {
+            let (_, defined) = reader
+                .mcp_server_owner(&child_id, name)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(effective.tools.mcp_servers.contains(&defined), "{name}");
+        }
+        // Over a caller-supplied head, the head's own servers come from it.
+        let mut head = child;
+        head.tools.mcp_servers.clear();
+        assert_eq!(
+            reader
+                .mcp_server_owner_over_head(&child_id, head, "shared")
+                .await
+                .unwrap()
+                .map(|(owner, _)| owner),
+            Some(RealmId::global())
         );
     }
 
@@ -1732,22 +1960,25 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["legacy-a", "docs"]);
 
-        // A full replace never depends on parsing the old document, and an
-        // unreadable old document exempts nothing.
-        tokio::fs::write(&path, "[tools\n").await?;
+        // A full replace never depends on parsing the old document's own
+        // sections, and an unreadable old document exempts nothing. (A
+        // document that is not TOML at all is never replaced by an ordinary
+        // write: it could state the governance section.)
+        let unreadable = "[tools]\nmcp_servers = 5\n";
+        tokio::fs::write(&path, unreadable).await?;
         let mut valid: Config = toml::from_str(original)?;
         valid.tools.mcp_servers = vec![serde_json::from_value(serde_json::json!({
             "name": "docs", "command": "docs-tool"
         }))?];
         store.set(valid).await?;
-        tokio::fs::write(&path, "[tools\n").await?;
+        tokio::fs::write(&path, unreadable).await?;
         let mut invalid: Config = toml::from_str(original)?;
         invalid.tools.mcp_servers = vec![serde_json::from_value(referencing("legacy-a"))?];
         assert!(matches!(
             store.set(invalid).await,
             Err(ConfigError::RealmMcpServerEnvReference(_))
         ));
-        assert_eq!(tokio::fs::read_to_string(&path).await?, "[tools\n");
+        assert_eq!(tokio::fs::read_to_string(&path).await?, unreadable);
         Ok(())
     }
 
@@ -1850,5 +2081,223 @@ mod tests {
             "backend profile should survive round trip"
         );
         Ok(())
+    }
+
+    const GOVERNED: &str = "[[governance.review.rules]]\n\
+target = { kind = \"mcp_server\", server = \"mail\" }\n\
+tier = \"r2\"\n";
+
+    fn governed() -> Config {
+        Config::from_persisted_toml(GOVERNED)
+            .expect("governed document")
+            .0
+    }
+
+    /// An ordinary write is not governance administration: neither a full
+    /// replace nor a patch can change or remove the document's governance
+    /// section, and a refused write leaves the document's bytes as they
+    /// were. A write that keeps the section exactly, or never names it,
+    /// succeeds and keeps it.
+    #[tokio::test]
+    async fn an_ordinary_write_never_changes_the_documents_governance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("config.toml");
+        let administered = format!("max_tokens = 4096\n\n{GOVERNED}");
+        tokio::fs::write(&path, &administered).await?;
+        let store = FileConfigStore::new(
+            path.clone(),
+            *crate::model_profile::test_catalog::TEST_CATALOG,
+        );
+        let committed = store.get().await?;
+        assert_eq!(committed.governance, governed().governance);
+
+        let mut changed = committed.clone();
+        let rule = &mut changed.governance.as_mut().expect("stated").review.rules[0];
+        rule.tier = crate::StockReviewTier::R3;
+        rule.consent_assurance = Some(crate::StockConsentAssurance::PersonAuthenticated);
+        let mut omitted = committed.clone();
+        omitted.governance = None;
+        let mut emptied = committed.clone();
+        emptied.governance = Some(crate::GovernanceConfig::default());
+        for candidate in [changed, omitted, emptied] {
+            assert!(matches!(
+                store.set(candidate).await,
+                Err(ConfigError::GovernanceAdministration)
+            ));
+            assert_eq!(tokio::fs::read_to_string(&path).await?, administered);
+        }
+        for delta in [
+            serde_json::json!({ "governance": null }),
+            serde_json::json!({ "governance": { "review": null } }),
+            serde_json::json!({ "governance": { "review": { "rules": [] } } }),
+            serde_json::json!({ "governance": { "review": { "reviewer": {
+                "identity": { "model": "claude-sonnet-5-5", "provider": "anthropic" },
+                "max_output_tokens": 64
+            } } } }),
+        ] {
+            assert!(
+                matches!(
+                    store.patch(ConfigDelta(delta.clone())).await,
+                    Err(ConfigError::GovernanceAdministration)
+                ),
+                "{delta}"
+            );
+            assert_eq!(tokio::fs::read_to_string(&path).await?, administered);
+        }
+
+        let patched = store
+            .patch(ConfigDelta(serde_json::json!({ "max_tokens": 2048 })))
+            .await?;
+        assert_eq!(patched.governance, committed.governance);
+        let mut kept = store.get().await?;
+        assert_eq!(kept.max_tokens, Some(2048));
+        kept.max_tokens = Some(1024);
+        store.set(kept).await?;
+        assert_eq!(store.get().await?.governance, committed.governance);
+        Ok(())
+    }
+
+    /// A write cannot state a governance section in a document that states
+    /// none, even one equal to what the document inherits: the restated
+    /// copy would shadow every later change of the parent's. A document that
+    /// cannot be parsed but names the section is never replaced; one that
+    /// cannot name it is, as a full replace never otherwise parses it.
+    #[tokio::test]
+    async fn an_ordinary_write_cannot_state_governance_a_document_does_not()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("config.toml");
+        tokio::fs::write(&path, "max_tokens = 4096\n").await?;
+        let store = FileConfigStore::new(
+            path.clone(),
+            *crate::model_profile::test_catalog::TEST_CATALOG,
+        );
+        let inherited = governed().governance;
+        let mut restated = store.get().await?;
+        restated.governance = inherited.clone();
+        assert!(matches!(
+            store.set(restated).await,
+            Err(ConfigError::GovernanceAdministration)
+        ));
+        let section = serde_json::to_value(&inherited)?;
+        assert!(matches!(
+            store
+                .patch(ConfigDelta(serde_json::json!({ "governance": section })))
+                .await,
+            Err(ConfigError::GovernanceAdministration)
+        ));
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await?,
+            "max_tokens = 4096\n"
+        );
+
+        // A document that is not TOML could state the section: it is never
+        // replaced by an ordinary write, whatever it names.
+        for unreadable in ["[governance\n", "[tools\n"] {
+            tokio::fs::write(&path, unreadable).await?;
+            assert!(matches!(
+                store.set(Config::default()).await,
+                Err(ConfigError::GovernanceAdministration)
+            ));
+            assert_eq!(tokio::fs::read_to_string(&path).await?, unreadable);
+        }
+        Ok(())
+    }
+
+    /// An explicitly empty section is stated: an ordinary write can neither
+    /// add one to a document that states none nor remove one a document
+    /// states. A section is found by its parsed key, so a quoted or escaped
+    /// key names it too.
+    #[tokio::test]
+    async fn an_explicitly_empty_or_quoted_section_is_kept_exactly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("config.toml");
+        let store = FileConfigStore::new(
+            path.clone(),
+            *crate::model_profile::test_catalog::TEST_CATALOG,
+        );
+        // Adding an empty section to a document that states none.
+        tokio::fs::write(&path, "max_tokens = 4096\n").await?;
+        let mut added = store.get().await?;
+        added.governance = Some(crate::GovernanceConfig::default());
+        assert!(matches!(
+            store.set(added).await,
+            Err(ConfigError::GovernanceAdministration)
+        ));
+        assert!(matches!(
+            store
+                .patch(ConfigDelta(serde_json::json!({ "governance": {} })))
+                .await,
+            Err(ConfigError::GovernanceAdministration)
+        ));
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await?,
+            "max_tokens = 4096\n"
+        );
+        // Removing an empty section a document states.
+        let stated = "max_tokens = 4096\n\n[governance]\n";
+        tokio::fs::write(&path, stated).await?;
+        let read = store.get().await?;
+        assert_eq!(read.governance, Some(crate::GovernanceConfig::default()));
+        let mut removed = read.clone();
+        removed.governance = None;
+        assert!(matches!(
+            store.set(removed).await,
+            Err(ConfigError::GovernanceAdministration)
+        ));
+        assert!(matches!(
+            store
+                .patch(ConfigDelta(serde_json::json!({ "governance": null })))
+                .await,
+            Err(ConfigError::GovernanceAdministration)
+        ));
+        assert_eq!(tokio::fs::read_to_string(&path).await?, stated);
+        // Keeping it is not a change: the section is written back as stated.
+        let mut kept = read;
+        kept.max_tokens = Some(2048);
+        store.set(kept).await?;
+        assert_eq!(
+            store.get().await?.governance,
+            Some(crate::GovernanceConfig::default())
+        );
+        // A quoted, escaped key is the same section.
+        let quoted = "[\"gov\\u0065rnance\".review]\nrules = []\n";
+        tokio::fs::write(&path, quoted).await?;
+        assert!(matches!(
+            store.set(Config::default()).await,
+            Err(ConfigError::GovernanceAdministration)
+        ));
+        assert_eq!(tokio::fs::read_to_string(&path).await?, quoted);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_memory_store_keeps_its_governance_section() {
+        let store = MemoryConfigStore::new(
+            governed(),
+            *crate::model_profile::test_catalog::TEST_CATALOG,
+        );
+        let mut omitted = governed();
+        omitted.governance = None;
+        assert!(matches!(
+            store.set(omitted).await,
+            Err(ConfigError::GovernanceAdministration)
+        ));
+        assert!(matches!(
+            store
+                .patch(ConfigDelta(serde_json::json!({ "governance": null })))
+                .await,
+            Err(ConfigError::GovernanceAdministration)
+        ));
+        store
+            .patch(ConfigDelta(serde_json::json!({ "max_tokens": 2048 })))
+            .await
+            .expect("an unrelated patch");
+        assert_eq!(
+            store.get().await.expect("config").governance,
+            governed().governance
+        );
     }
 }

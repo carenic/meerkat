@@ -2,7 +2,7 @@
 //! storage prune` (Phase 6 of the storage unification arc).
 //!
 //! This module is a **reusable library layer** over an arbitrary state
-//! directory — standalone mobkit gateways with no `rkat` CLI on the box run
+//! directory — standalone meta gateways with no `rkat` CLI on the box run
 //! their migrations through these same primitives. It owns:
 //!
 //! - [`RealmMaintenanceFence`]: the realm-wide exclusive maintenance fence.

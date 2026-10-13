@@ -5097,7 +5097,14 @@ async fn try_handle_supervisor_bridge_command(
                         .cancel_after_boundary_run_if_current(session_id, &run_id)
                         .await
                     {
-                        Ok(true) => BridgeHeldRun::CancelledAtBoundary { run_id },
+                        // Outcome-unknown: the exact-run cancel was recorded
+                        // and only its live delivery failed afterwards.
+                        Ok(true)
+                        | Err(
+                            crate::traits::RuntimeDriverError::InterruptDispatchOutcomeUnknown {
+                                ..
+                            },
+                        ) => BridgeHeldRun::CancelledAtBoundary { run_id },
                         Ok(false)
                         | Err(
                             crate::traits::RuntimeDriverError::StaleAuthority { .. }

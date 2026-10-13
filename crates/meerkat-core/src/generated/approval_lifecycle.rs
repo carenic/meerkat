@@ -6,7 +6,8 @@
     clippy::never_loop,
     clippy::nonminimal_bool,
     clippy::partialeq_to_none,
-    clippy::redundant_clone
+    clippy::redundant_clone,
+    clippy::too_many_arguments
 )]
 
 use std::{
@@ -44,6 +45,11 @@ pub enum ApprovalLifecycleRejectionReason {
     ReviewRetired,
     ReviewNotSatisfied,
     ReviewPending,
+    AuthenticationRequired,
+    ConsentLinked,
+    ConsentMismatch,
+    AlreadyConsumed,
+    NotConsent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -73,12 +79,20 @@ pub enum ReviewRetirementReason {
     AuthorityChanged,
     DeadlineExpired,
     Abandoned,
+    RunEnded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalLifecycleInput {
     CreateApproval {
         approval_id: String,
+        approve_allowed: bool,
+        deny_allowed: bool,
+        has_expiry: bool,
+    },
+    CreateConsentApproval {
+        approval_id: String,
+        review_id: String,
         approve_allowed: bool,
         deny_allowed: bool,
         has_expiry: bool,
@@ -90,6 +104,20 @@ pub enum ApprovalLifecycleInput {
         deny_allowed: bool,
         has_expiry: bool,
         decision: Option<ApprovalLifecycleDecision>,
+        consent: bool,
+        authenticated: bool,
+        consumed: bool,
+    },
+    ReconcileApproval {
+        approval_id: String,
+        status: ApprovalLifecycleStatus,
+        approve_allowed: bool,
+        deny_allowed: bool,
+        has_expiry: bool,
+        decision: Option<ApprovalLifecycleDecision>,
+        consent: bool,
+        authenticated: bool,
+        consumed: bool,
     },
     ObserveApprovalExpiry {
         approval_id: String,
@@ -98,6 +126,24 @@ pub enum ApprovalLifecycleInput {
     DecideApproval {
         approval_id: String,
         decision: ApprovalLifecycleDecision,
+    },
+    DecideConsent {
+        approval_id: String,
+        review_id: String,
+        decision: ApprovalLifecycleDecision,
+        authenticated: bool,
+    },
+    ConsumeConsentForEntry {
+        approval_id: String,
+        review_id: String,
+    },
+    WithdrawConsent {
+        approval_id: String,
+        review_id: String,
+        reason: ReviewRetirementReason,
+    },
+    SettleUnlinkedConsent {
+        approval_id: String,
     },
     BeginReview {
         review_id: String,
@@ -179,6 +225,11 @@ pub struct ApprovalLifecycleMachineState {
     approval_approve_allowed: BTreeMap<String, bool>,
     approval_deny_allowed: BTreeMap<String, bool>,
     approval_has_expiry: BTreeMap<String, bool>,
+    approval_consent: BTreeMap<String, bool>,
+    approval_consent_authenticated: BTreeMap<String, bool>,
+    approval_consent_consumed: BTreeMap<String, bool>,
+    approval_consent_review: BTreeMap<String, String>,
+    review_consent_approval: BTreeMap<String, String>,
     review_ids: BTreeSet<String>,
     review_statuses: BTreeMap<String, ReviewAttemptStatus>,
     review_retirements: BTreeMap<String, ReviewRetirementReason>,
@@ -189,6 +240,9 @@ enum ApprovalLifecycleTransition {
     CreateRejectedEmptyAllowedDecisions,
     CreateRejectedAlreadyExists,
     CreatePending,
+    CreateConsentRejectedEmptyAllowedDecisions,
+    CreateConsentRejectedAlreadyExists,
+    CreateConsentPending,
     RestoreRejectedDuplicate,
     RestoreRejectedEmptyAllowedDecisions,
     RestorePending,
@@ -197,6 +251,14 @@ enum ApprovalLifecycleTransition {
     RestoreApproved,
     RestoreDenied,
     RestoreRejectedInvalidRecord,
+    ReconcileRejectedMissing,
+    ReconcileRejectedLinked,
+    ReconcileRejectedInvalidRecord,
+    ReconcileAppliedPending,
+    ReconcileAppliedExpired,
+    ReconcileAppliedCancelled,
+    ReconcileAppliedApproved,
+    ReconcileAppliedDenied,
     ObserveExpiryRejectedMissing,
     ObserveExpiryExpiresPending,
     ObserveExpiryPendingNoop,
@@ -207,32 +269,63 @@ enum ApprovalLifecycleTransition {
     DecideRejectedMissing,
     DecideRejectedExpired,
     DecideRejectedAlreadyDecided,
+    DecideRejectedAuthenticationRequired,
     DecideRejectedApproveNotAllowed,
     DecideRejectedDenyNotAllowed,
     DecideApprove,
     DecideDeny,
+    DecideConsentRejectedMissing,
+    DecideConsentRejectedMismatch,
+    DecideConsentRejectedExpired,
+    DecideConsentRejectedAlreadyDecided,
+    DecideConsentRejectedAuthenticationRequired,
+    DecideConsentRejectedNotAllowed,
+    DecideConsentApprove,
+    DecideConsentDeny,
+    ConsumeConsentRejectedMissing,
+    ConsumeConsentRejectedAlreadyConsumed,
+    ConsumeConsentRejectedMismatch,
+    ConsumeConsentRejectedNotSatisfied,
+    ConsumeConsentForEntry,
+    WithdrawConsentRejectedMissing,
+    WithdrawConsentRejectedMismatch,
+    WithdrawConsentPending,
+    WithdrawConsentSettled,
+    SettleUnlinkedRejectedMissing,
+    SettleUnlinkedRejectedNotConsent,
+    SettleUnlinkedRejectedLinked,
+    SettleUnlinkedRejectedConsumed,
+    SettleUnlinkedRejectedExpired,
+    SettleUnlinkedRejectedSettled,
+    SettleUnlinkedPending,
+    SettleUnlinkedApproved,
     BeginReviewRejectedDuplicate,
     BeginReviewPending,
     RecordReviewVerdictRejectedMissing,
+    RecordReviewVerdictRejectedConsentLinked,
     RecordReviewVerdictRejectedRetired,
     RecordReviewVerdictRejectedSettled,
     RecordReviewVerdictAllowed,
     RecordReviewVerdictDenied,
     RecordReviewVerdictEscalated,
     RecordReviewUnavailableRejectedMissing,
+    RecordReviewUnavailableRejectedConsentLinked,
     RecordReviewUnavailableRejectedRetired,
     RecordReviewUnavailableRejectedSettled,
     RecordReviewUnavailable,
     RetireReviewRejectedMissing,
+    RetireReviewRejectedConsentLinked,
     RetireReviewRejectedRetired,
     RetireReviewRejectedSettled,
     RetireReview,
     ConsumeReviewRejectedMissing,
+    ConsumeReviewRejectedConsentLinked,
     ConsumeReviewRejectedRetired,
     ConsumeReviewRejectedUsed,
     ConsumeReviewRejectedNotSatisfied,
     ConsumeReviewForEntry,
     ReleaseReviewRejectedMissing,
+    ReleaseReviewRejectedConsentLinked,
     ReleaseReviewRejectedPending,
     ReleaseReviewAllowed,
     ReleaseReviewDenied,
@@ -257,6 +350,11 @@ impl ApprovalLifecycleMachineAuthority {
         state.approval_approve_allowed = BTreeMap::new();
         state.approval_deny_allowed = BTreeMap::new();
         state.approval_has_expiry = BTreeMap::new();
+        state.approval_consent = BTreeMap::new();
+        state.approval_consent_authenticated = BTreeMap::new();
+        state.approval_consent_consumed = BTreeMap::new();
+        state.approval_consent_review = BTreeMap::new();
+        state.review_consent_approval = BTreeMap::new();
         state.review_ids = BTreeSet::new();
         state.review_statuses = BTreeMap::new();
         state.review_retirements = BTreeMap::new();
@@ -323,6 +421,73 @@ impl ApprovalLifecycleMachineAuthority {
             .copied()
             .ok_or(ApprovalLifecycleError {
                 op: "approval_has_expiry",
+            })
+    }
+
+    #[allow(dead_code)]
+    fn approval_consent_value(&self, approval_id: &str) -> Result<bool, ApprovalLifecycleError> {
+        self.state
+            .approval_consent
+            .get(approval_id)
+            .copied()
+            .ok_or(ApprovalLifecycleError {
+                op: "approval_consent",
+            })
+    }
+
+    #[allow(dead_code)]
+    fn approval_consent_authenticated_value(
+        &self,
+        approval_id: &str,
+    ) -> Result<bool, ApprovalLifecycleError> {
+        self.state
+            .approval_consent_authenticated
+            .get(approval_id)
+            .copied()
+            .ok_or(ApprovalLifecycleError {
+                op: "approval_consent_authenticated",
+            })
+    }
+
+    #[allow(dead_code)]
+    fn approval_consent_consumed_value(
+        &self,
+        approval_id: &str,
+    ) -> Result<bool, ApprovalLifecycleError> {
+        self.state
+            .approval_consent_consumed
+            .get(approval_id)
+            .copied()
+            .ok_or(ApprovalLifecycleError {
+                op: "approval_consent_consumed",
+            })
+    }
+
+    #[allow(dead_code)]
+    fn approval_consent_review_value(
+        &self,
+        approval_id: &str,
+    ) -> Result<String, ApprovalLifecycleError> {
+        self.state
+            .approval_consent_review
+            .get(approval_id)
+            .cloned()
+            .ok_or(ApprovalLifecycleError {
+                op: "approval_consent_review",
+            })
+    }
+
+    #[allow(dead_code)]
+    fn review_consent_approval_value(
+        &self,
+        approval_id: &str,
+    ) -> Result<String, ApprovalLifecycleError> {
+        self.state
+            .review_consent_approval
+            .get(approval_id)
+            .cloned()
+            .ok_or(ApprovalLifecycleError {
+                op: "review_consent_approval",
             })
     }
 
@@ -427,6 +592,15 @@ impl ApprovalLifecycleMachineAuthority {
                         self.state
                             .approval_has_expiry
                             .insert(approval_id.clone(), has_expiry);
+                        self.state
+                            .approval_consent
+                            .insert(approval_id.clone(), false);
+                        self.state
+                            .approval_consent_authenticated
+                            .insert(approval_id.clone(), false);
+                        self.state
+                            .approval_consent_consumed
+                            .insert(approval_id.clone(), false);
                         self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
                         Ok(vec![ApprovalLifecycleEffect::ApprovalStatusResolved {
                             approval_id: approval_id.clone(),
@@ -438,6 +612,95 @@ impl ApprovalLifecycleMachineAuthority {
                     }),
                 }
             }
+            ApprovalLifecycleInput::CreateConsentApproval {
+                approval_id,
+                review_id,
+                approve_allowed,
+                deny_allowed,
+                has_expiry,
+            } => {
+                let mut matches = Vec::new();
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (allowed_non_empty(approve_allowed, deny_allowed) == false)
+                {
+                    matches.push(
+                        ApprovalLifecycleTransition::CreateConsentRejectedEmptyAllowedDecisions,
+                    );
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && ((allowed_non_empty(approve_allowed, deny_allowed))
+                        && ((self.state.approval_ids.contains(approval_id.as_str()))
+                            || (self.state.review_ids.contains(review_id.as_str()))))
+                {
+                    matches.push(ApprovalLifecycleTransition::CreateConsentRejectedAlreadyExists);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && ((allowed_non_empty(approve_allowed, deny_allowed))
+                        && (self.state.approval_ids.contains(approval_id.as_str()) == false)
+                        && (self.state.review_ids.contains(review_id.as_str()) == false))
+                {
+                    matches.push(ApprovalLifecycleTransition::CreateConsentPending);
+                }
+                let transition = Self::single_transition(matches, "CreateConsentApproval")?;
+                match transition {
+                    ApprovalLifecycleTransition::CreateConsentRejectedEmptyAllowedDecisions => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::EmptyAllowedDecisions,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::CreateConsentRejectedAlreadyExists => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::AlreadyExists,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::CreateConsentPending => {
+                        self.state.approval_ids.insert(approval_id.clone());
+                        self.state
+                            .approval_statuses
+                            .insert(approval_id.clone(), ApprovalLifecycleStatus::Pending);
+                        self.state
+                            .approval_approve_allowed
+                            .insert(approval_id.clone(), approve_allowed);
+                        self.state
+                            .approval_deny_allowed
+                            .insert(approval_id.clone(), deny_allowed);
+                        self.state
+                            .approval_has_expiry
+                            .insert(approval_id.clone(), has_expiry);
+                        self.state
+                            .approval_consent
+                            .insert(approval_id.clone(), true);
+                        self.state
+                            .approval_consent_authenticated
+                            .insert(approval_id.clone(), false);
+                        self.state
+                            .approval_consent_consumed
+                            .insert(approval_id.clone(), false);
+                        self.state.review_ids.insert(review_id.clone());
+                        self.state
+                            .review_statuses
+                            .insert(review_id.clone(), ReviewAttemptStatus::Pending);
+                        self.state
+                            .approval_consent_review
+                            .insert(approval_id.clone(), review_id.clone());
+                        self.state
+                            .review_consent_approval
+                            .insert(review_id.clone(), approval_id.clone());
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalStatusResolved {
+                            approval_id: approval_id.clone(),
+                            status: ApprovalLifecycleStatus::Pending,
+                        }])
+                    }
+                    _ => Err(ApprovalLifecycleError {
+                        op: "CreateConsentApproval_transition",
+                    }),
+                }
+            }
             ApprovalLifecycleInput::RestoreApproval {
                 approval_id,
                 status,
@@ -445,6 +708,9 @@ impl ApprovalLifecycleMachineAuthority {
                 deny_allowed,
                 has_expiry,
                 decision,
+                consent,
+                authenticated,
+                consumed,
             } => {
                 let mut matches = Vec::new();
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
@@ -462,7 +728,15 @@ impl ApprovalLifecycleMachineAuthority {
                     && ((self.state.approval_ids.contains(approval_id.as_str()) == false)
                         && (allowed_non_empty(approve_allowed, deny_allowed))
                         && (status == ApprovalLifecycleStatus::Pending)
-                        && (decision == None))
+                        && (restored_record_valid(
+                            status,
+                            approve_allowed,
+                            deny_allowed,
+                            decision,
+                            consent,
+                            authenticated,
+                            consumed,
+                        )))
                 {
                     matches.push(ApprovalLifecycleTransition::RestorePending);
                 }
@@ -470,7 +744,15 @@ impl ApprovalLifecycleMachineAuthority {
                     && ((self.state.approval_ids.contains(approval_id.as_str()) == false)
                         && (allowed_non_empty(approve_allowed, deny_allowed))
                         && (status == ApprovalLifecycleStatus::Expired)
-                        && (decision == None))
+                        && (restored_record_valid(
+                            status,
+                            approve_allowed,
+                            deny_allowed,
+                            decision,
+                            consent,
+                            authenticated,
+                            consumed,
+                        )))
                 {
                     matches.push(ApprovalLifecycleTransition::RestoreExpired);
                 }
@@ -478,42 +760,62 @@ impl ApprovalLifecycleMachineAuthority {
                     && ((self.state.approval_ids.contains(approval_id.as_str()) == false)
                         && (allowed_non_empty(approve_allowed, deny_allowed))
                         && (status == ApprovalLifecycleStatus::Cancelled)
-                        && (decision == None))
+                        && (restored_record_valid(
+                            status,
+                            approve_allowed,
+                            deny_allowed,
+                            decision,
+                            consent,
+                            authenticated,
+                            consumed,
+                        )))
                 {
                     matches.push(ApprovalLifecycleTransition::RestoreCancelled);
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && ((self.state.approval_ids.contains(approval_id.as_str()) == false)
                         && (allowed_non_empty(approve_allowed, deny_allowed))
-                        && (approve_allowed)
                         && (status == ApprovalLifecycleStatus::Approved)
-                        && (decision == Some(ApprovalLifecycleDecision::Approve)))
+                        && (restored_record_valid(
+                            status,
+                            approve_allowed,
+                            deny_allowed,
+                            decision,
+                            consent,
+                            authenticated,
+                            consumed,
+                        )))
                 {
                     matches.push(ApprovalLifecycleTransition::RestoreApproved);
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && ((self.state.approval_ids.contains(approval_id.as_str()) == false)
                         && (allowed_non_empty(approve_allowed, deny_allowed))
-                        && (deny_allowed)
                         && (status == ApprovalLifecycleStatus::Denied)
-                        && (decision == Some(ApprovalLifecycleDecision::Deny)))
+                        && (restored_record_valid(
+                            status,
+                            approve_allowed,
+                            deny_allowed,
+                            decision,
+                            consent,
+                            authenticated,
+                            consumed,
+                        )))
                 {
                     matches.push(ApprovalLifecycleTransition::RestoreDenied);
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && ((self.state.approval_ids.contains(approval_id.as_str()) == false)
                         && (allowed_non_empty(approve_allowed, deny_allowed))
-                        && (((status == ApprovalLifecycleStatus::Pending) && (decision != None))
-                            || ((status == ApprovalLifecycleStatus::Expired)
-                                && (decision != None))
-                            || ((status == ApprovalLifecycleStatus::Cancelled)
-                                && (decision != None))
-                            || ((status == ApprovalLifecycleStatus::Approved)
-                                && ((approve_allowed == false)
-                                    || (decision != Some(ApprovalLifecycleDecision::Approve))))
-                            || ((status == ApprovalLifecycleStatus::Denied)
-                                && ((deny_allowed == false)
-                                    || (decision != Some(ApprovalLifecycleDecision::Deny))))))
+                        && (restored_record_valid(
+                            status,
+                            approve_allowed,
+                            deny_allowed,
+                            decision,
+                            consent,
+                            authenticated,
+                            consumed,
+                        ) == false))
                 {
                     matches.push(ApprovalLifecycleTransition::RestoreRejectedInvalidRecord);
                 }
@@ -547,6 +849,15 @@ impl ApprovalLifecycleMachineAuthority {
                         self.state
                             .approval_has_expiry
                             .insert(approval_id.clone(), has_expiry);
+                        self.state
+                            .approval_consent
+                            .insert(approval_id.clone(), consent);
+                        self.state
+                            .approval_consent_authenticated
+                            .insert(approval_id.clone(), authenticated);
+                        self.state
+                            .approval_consent_consumed
+                            .insert(approval_id.clone(), consumed);
                         self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
                         Ok(vec![ApprovalLifecycleEffect::ApprovalStatusResolved {
                             approval_id: approval_id.clone(),
@@ -567,6 +878,15 @@ impl ApprovalLifecycleMachineAuthority {
                         self.state
                             .approval_has_expiry
                             .insert(approval_id.clone(), has_expiry);
+                        self.state
+                            .approval_consent
+                            .insert(approval_id.clone(), consent);
+                        self.state
+                            .approval_consent_authenticated
+                            .insert(approval_id.clone(), authenticated);
+                        self.state
+                            .approval_consent_consumed
+                            .insert(approval_id.clone(), consumed);
                         self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
                         Ok(vec![ApprovalLifecycleEffect::ApprovalStatusResolved {
                             approval_id: approval_id.clone(),
@@ -587,6 +907,15 @@ impl ApprovalLifecycleMachineAuthority {
                         self.state
                             .approval_has_expiry
                             .insert(approval_id.clone(), has_expiry);
+                        self.state
+                            .approval_consent
+                            .insert(approval_id.clone(), consent);
+                        self.state
+                            .approval_consent_authenticated
+                            .insert(approval_id.clone(), authenticated);
+                        self.state
+                            .approval_consent_consumed
+                            .insert(approval_id.clone(), consumed);
                         self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
                         Ok(vec![ApprovalLifecycleEffect::ApprovalStatusResolved {
                             approval_id: approval_id.clone(),
@@ -607,6 +936,15 @@ impl ApprovalLifecycleMachineAuthority {
                         self.state
                             .approval_has_expiry
                             .insert(approval_id.clone(), has_expiry);
+                        self.state
+                            .approval_consent
+                            .insert(approval_id.clone(), consent);
+                        self.state
+                            .approval_consent_authenticated
+                            .insert(approval_id.clone(), authenticated);
+                        self.state
+                            .approval_consent_consumed
+                            .insert(approval_id.clone(), consumed);
                         self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
                         Ok(vec![ApprovalLifecycleEffect::ApprovalStatusResolved {
                             approval_id: approval_id.clone(),
@@ -627,6 +965,15 @@ impl ApprovalLifecycleMachineAuthority {
                         self.state
                             .approval_has_expiry
                             .insert(approval_id.clone(), has_expiry);
+                        self.state
+                            .approval_consent
+                            .insert(approval_id.clone(), consent);
+                        self.state
+                            .approval_consent_authenticated
+                            .insert(approval_id.clone(), authenticated);
+                        self.state
+                            .approval_consent_consumed
+                            .insert(approval_id.clone(), consumed);
                         self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
                         Ok(vec![ApprovalLifecycleEffect::ApprovalStatusResolved {
                             approval_id: approval_id.clone(),
@@ -642,6 +989,485 @@ impl ApprovalLifecycleMachineAuthority {
                     }
                     _ => Err(ApprovalLifecycleError {
                         op: "RestoreApproval_transition",
+                    }),
+                }
+            }
+            ApprovalLifecycleInput::ReconcileApproval {
+                approval_id,
+                status,
+                approve_allowed,
+                deny_allowed,
+                has_expiry,
+                decision,
+                consent,
+                authenticated,
+                consumed,
+            } => {
+                let mut matches = Vec::new();
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (self.state.approval_ids.contains(approval_id.as_str()) == false)
+                {
+                    matches.push(ApprovalLifecycleTransition::ReconcileRejectedMissing);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && ((self.state.approval_ids.contains(approval_id.as_str()))
+                        && (self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str())))
+                {
+                    matches.push(ApprovalLifecycleTransition::ReconcileRejectedLinked);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(self.state.approval_ids.contains(approval_id.as_str())))
+                        || ((!(self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str())
+                            == false))
+                            || ((restored_record_valid(
+                                status,
+                                approve_allowed,
+                                deny_allowed,
+                                decision,
+                                consent,
+                                authenticated,
+                                consumed,
+                            ) == false)
+                                || ((self
+                                    .state
+                                    .approval_consent
+                                    .contains_key(approval_id.as_str()))
+                                    && (((self
+                                        .approval_consent_value(approval_id.as_str())?)
+                                        != consent)
+                                        || (self
+                                            .state
+                                            .approval_consent_consumed
+                                            .contains_key(approval_id.as_str())))))))
+                        && ((self.state.approval_ids.contains(approval_id.as_str()))
+                            && (self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false)
+                            && ((restored_record_valid(
+                                status,
+                                approve_allowed,
+                                deny_allowed,
+                                decision,
+                                consent,
+                                authenticated,
+                                consumed,
+                            ) == false)
+                                || ((self.approval_consent_value(approval_id.as_str())?)
+                                    != consent)
+                                || ((self
+                                    .approval_consent_consumed_value(approval_id.as_str())?)
+                                    && (consumed == false)))))
+                {
+                    matches.push(ApprovalLifecycleTransition::ReconcileRejectedInvalidRecord);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(status == ApprovalLifecycleStatus::Pending))
+                        || ((!(self.state.approval_ids.contains(approval_id.as_str())))
+                            || ((!(self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false))
+                                || ((!(restored_record_valid(
+                                    status,
+                                    approve_allowed,
+                                    deny_allowed,
+                                    decision,
+                                    consent,
+                                    authenticated,
+                                    consumed,
+                                ))) || ((self
+                                    .state
+                                    .approval_consent
+                                    .contains_key(approval_id.as_str()))
+                                    && ((!((self
+                                        .approval_consent_value(approval_id.as_str())?)
+                                        == consent))
+                                        || (self
+                                            .state
+                                            .approval_consent_consumed
+                                            .contains_key(approval_id.as_str()))))))))
+                        && ((status == ApprovalLifecycleStatus::Pending)
+                            && (self.state.approval_ids.contains(approval_id.as_str()))
+                            && (self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false)
+                            && (restored_record_valid(
+                                status,
+                                approve_allowed,
+                                deny_allowed,
+                                decision,
+                                consent,
+                                authenticated,
+                                consumed,
+                            ))
+                            && ((self.approval_consent_value(approval_id.as_str())?) == consent)
+                            && (((self.approval_consent_consumed_value(approval_id.as_str())?)
+                                == false)
+                                || (consumed))))
+                {
+                    matches.push(ApprovalLifecycleTransition::ReconcileAppliedPending);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(status == ApprovalLifecycleStatus::Expired))
+                        || ((!(self.state.approval_ids.contains(approval_id.as_str())))
+                            || ((!(self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false))
+                                || ((!(restored_record_valid(
+                                    status,
+                                    approve_allowed,
+                                    deny_allowed,
+                                    decision,
+                                    consent,
+                                    authenticated,
+                                    consumed,
+                                ))) || ((self
+                                    .state
+                                    .approval_consent
+                                    .contains_key(approval_id.as_str()))
+                                    && ((!((self
+                                        .approval_consent_value(approval_id.as_str())?)
+                                        == consent))
+                                        || (self
+                                            .state
+                                            .approval_consent_consumed
+                                            .contains_key(approval_id.as_str()))))))))
+                        && ((status == ApprovalLifecycleStatus::Expired)
+                            && (self.state.approval_ids.contains(approval_id.as_str()))
+                            && (self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false)
+                            && (restored_record_valid(
+                                status,
+                                approve_allowed,
+                                deny_allowed,
+                                decision,
+                                consent,
+                                authenticated,
+                                consumed,
+                            ))
+                            && ((self.approval_consent_value(approval_id.as_str())?) == consent)
+                            && (((self.approval_consent_consumed_value(approval_id.as_str())?)
+                                == false)
+                                || (consumed))))
+                {
+                    matches.push(ApprovalLifecycleTransition::ReconcileAppliedExpired);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(status == ApprovalLifecycleStatus::Cancelled))
+                        || ((!(self.state.approval_ids.contains(approval_id.as_str())))
+                            || ((!(self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false))
+                                || ((!(restored_record_valid(
+                                    status,
+                                    approve_allowed,
+                                    deny_allowed,
+                                    decision,
+                                    consent,
+                                    authenticated,
+                                    consumed,
+                                ))) || ((self
+                                    .state
+                                    .approval_consent
+                                    .contains_key(approval_id.as_str()))
+                                    && ((!((self
+                                        .approval_consent_value(approval_id.as_str())?)
+                                        == consent))
+                                        || (self
+                                            .state
+                                            .approval_consent_consumed
+                                            .contains_key(approval_id.as_str()))))))))
+                        && ((status == ApprovalLifecycleStatus::Cancelled)
+                            && (self.state.approval_ids.contains(approval_id.as_str()))
+                            && (self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false)
+                            && (restored_record_valid(
+                                status,
+                                approve_allowed,
+                                deny_allowed,
+                                decision,
+                                consent,
+                                authenticated,
+                                consumed,
+                            ))
+                            && ((self.approval_consent_value(approval_id.as_str())?) == consent)
+                            && (((self.approval_consent_consumed_value(approval_id.as_str())?)
+                                == false)
+                                || (consumed))))
+                {
+                    matches.push(ApprovalLifecycleTransition::ReconcileAppliedCancelled);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(status == ApprovalLifecycleStatus::Approved))
+                        || ((!(self.state.approval_ids.contains(approval_id.as_str())))
+                            || ((!(self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false))
+                                || ((!(restored_record_valid(
+                                    status,
+                                    approve_allowed,
+                                    deny_allowed,
+                                    decision,
+                                    consent,
+                                    authenticated,
+                                    consumed,
+                                ))) || ((self
+                                    .state
+                                    .approval_consent
+                                    .contains_key(approval_id.as_str()))
+                                    && ((!((self
+                                        .approval_consent_value(approval_id.as_str())?)
+                                        == consent))
+                                        || (self
+                                            .state
+                                            .approval_consent_consumed
+                                            .contains_key(approval_id.as_str()))))))))
+                        && ((status == ApprovalLifecycleStatus::Approved)
+                            && (self.state.approval_ids.contains(approval_id.as_str()))
+                            && (self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false)
+                            && (restored_record_valid(
+                                status,
+                                approve_allowed,
+                                deny_allowed,
+                                decision,
+                                consent,
+                                authenticated,
+                                consumed,
+                            ))
+                            && ((self.approval_consent_value(approval_id.as_str())?) == consent)
+                            && (((self.approval_consent_consumed_value(approval_id.as_str())?)
+                                == false)
+                                || (consumed))))
+                {
+                    matches.push(ApprovalLifecycleTransition::ReconcileAppliedApproved);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(status == ApprovalLifecycleStatus::Denied))
+                        || ((!(self.state.approval_ids.contains(approval_id.as_str())))
+                            || ((!(self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false))
+                                || ((!(restored_record_valid(
+                                    status,
+                                    approve_allowed,
+                                    deny_allowed,
+                                    decision,
+                                    consent,
+                                    authenticated,
+                                    consumed,
+                                ))) || ((self
+                                    .state
+                                    .approval_consent
+                                    .contains_key(approval_id.as_str()))
+                                    && ((!((self
+                                        .approval_consent_value(approval_id.as_str())?)
+                                        == consent))
+                                        || (self
+                                            .state
+                                            .approval_consent_consumed
+                                            .contains_key(approval_id.as_str()))))))))
+                        && ((status == ApprovalLifecycleStatus::Denied)
+                            && (self.state.approval_ids.contains(approval_id.as_str()))
+                            && (self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false)
+                            && (restored_record_valid(
+                                status,
+                                approve_allowed,
+                                deny_allowed,
+                                decision,
+                                consent,
+                                authenticated,
+                                consumed,
+                            ))
+                            && ((self.approval_consent_value(approval_id.as_str())?) == consent)
+                            && (((self.approval_consent_consumed_value(approval_id.as_str())?)
+                                == false)
+                                || (consumed))))
+                {
+                    matches.push(ApprovalLifecycleTransition::ReconcileAppliedDenied);
+                }
+                let transition = Self::single_transition(matches, "ReconcileApproval")?;
+                match transition {
+                    ApprovalLifecycleTransition::ReconcileRejectedMissing => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::NotFound,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::ReconcileRejectedLinked => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::ConsentLinked,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::ReconcileRejectedInvalidRecord => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::InvalidRestoredRecord,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::ReconcileAppliedPending => {
+                        self.state
+                            .approval_statuses
+                            .insert(approval_id.clone(), ApprovalLifecycleStatus::Pending);
+                        self.state
+                            .approval_approve_allowed
+                            .insert(approval_id.clone(), approve_allowed);
+                        self.state
+                            .approval_deny_allowed
+                            .insert(approval_id.clone(), deny_allowed);
+                        self.state
+                            .approval_has_expiry
+                            .insert(approval_id.clone(), has_expiry);
+                        self.state
+                            .approval_consent_authenticated
+                            .insert(approval_id.clone(), authenticated);
+                        self.state
+                            .approval_consent_consumed
+                            .insert(approval_id.clone(), consumed);
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalStatusResolved {
+                            approval_id: approval_id.clone(),
+                            status: ApprovalLifecycleStatus::Pending,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::ReconcileAppliedExpired => {
+                        self.state
+                            .approval_statuses
+                            .insert(approval_id.clone(), ApprovalLifecycleStatus::Expired);
+                        self.state
+                            .approval_approve_allowed
+                            .insert(approval_id.clone(), approve_allowed);
+                        self.state
+                            .approval_deny_allowed
+                            .insert(approval_id.clone(), deny_allowed);
+                        self.state
+                            .approval_has_expiry
+                            .insert(approval_id.clone(), has_expiry);
+                        self.state
+                            .approval_consent_authenticated
+                            .insert(approval_id.clone(), authenticated);
+                        self.state
+                            .approval_consent_consumed
+                            .insert(approval_id.clone(), consumed);
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalStatusResolved {
+                            approval_id: approval_id.clone(),
+                            status: ApprovalLifecycleStatus::Expired,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::ReconcileAppliedCancelled => {
+                        self.state
+                            .approval_statuses
+                            .insert(approval_id.clone(), ApprovalLifecycleStatus::Cancelled);
+                        self.state
+                            .approval_approve_allowed
+                            .insert(approval_id.clone(), approve_allowed);
+                        self.state
+                            .approval_deny_allowed
+                            .insert(approval_id.clone(), deny_allowed);
+                        self.state
+                            .approval_has_expiry
+                            .insert(approval_id.clone(), has_expiry);
+                        self.state
+                            .approval_consent_authenticated
+                            .insert(approval_id.clone(), authenticated);
+                        self.state
+                            .approval_consent_consumed
+                            .insert(approval_id.clone(), consumed);
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalStatusResolved {
+                            approval_id: approval_id.clone(),
+                            status: ApprovalLifecycleStatus::Cancelled,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::ReconcileAppliedApproved => {
+                        self.state
+                            .approval_statuses
+                            .insert(approval_id.clone(), ApprovalLifecycleStatus::Approved);
+                        self.state
+                            .approval_approve_allowed
+                            .insert(approval_id.clone(), approve_allowed);
+                        self.state
+                            .approval_deny_allowed
+                            .insert(approval_id.clone(), deny_allowed);
+                        self.state
+                            .approval_has_expiry
+                            .insert(approval_id.clone(), has_expiry);
+                        self.state
+                            .approval_consent_authenticated
+                            .insert(approval_id.clone(), authenticated);
+                        self.state
+                            .approval_consent_consumed
+                            .insert(approval_id.clone(), consumed);
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalStatusResolved {
+                            approval_id: approval_id.clone(),
+                            status: ApprovalLifecycleStatus::Approved,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::ReconcileAppliedDenied => {
+                        self.state
+                            .approval_statuses
+                            .insert(approval_id.clone(), ApprovalLifecycleStatus::Denied);
+                        self.state
+                            .approval_approve_allowed
+                            .insert(approval_id.clone(), approve_allowed);
+                        self.state
+                            .approval_deny_allowed
+                            .insert(approval_id.clone(), deny_allowed);
+                        self.state
+                            .approval_has_expiry
+                            .insert(approval_id.clone(), has_expiry);
+                        self.state
+                            .approval_consent_authenticated
+                            .insert(approval_id.clone(), authenticated);
+                        self.state
+                            .approval_consent_consumed
+                            .insert(approval_id.clone(), consumed);
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalStatusResolved {
+                            approval_id: approval_id.clone(),
+                            status: ApprovalLifecycleStatus::Denied,
+                        }])
+                    }
+                    _ => Err(ApprovalLifecycleError {
+                        op: "ReconcileApproval_transition",
                     }),
                 }
             }
@@ -846,14 +1672,42 @@ impl ApprovalLifecycleMachineAuthority {
                             .contains_key(approval_id.as_str()))
                             && ((!((self.approval_statuses_value(approval_id.as_str())?)
                                 == ApprovalLifecycleStatus::Pending))
-                                || ((!(decision == ApprovalLifecycleDecision::Approve))
-                                    || (self
-                                        .state
-                                        .approval_approve_allowed
-                                        .contains_key(approval_id.as_str()))))))
+                                || (self
+                                    .state
+                                    .approval_consent
+                                    .contains_key(approval_id.as_str())))))
                         && ((self.state.approval_ids.contains(approval_id.as_str()))
                             && ((self.approval_statuses_value(approval_id.as_str())?)
                                 == ApprovalLifecycleStatus::Pending)
+                            && (self.approval_consent_value(approval_id.as_str())?)))
+                {
+                    matches.push(ApprovalLifecycleTransition::DecideRejectedAuthenticationRequired);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(self.state.approval_ids.contains(approval_id.as_str())))
+                        || ((self
+                            .state
+                            .approval_statuses
+                            .contains_key(approval_id.as_str()))
+                            && ((!((self.approval_statuses_value(approval_id.as_str())?)
+                                == ApprovalLifecycleStatus::Pending))
+                                || ((self
+                                    .state
+                                    .approval_consent
+                                    .contains_key(approval_id.as_str()))
+                                    && ((!((self
+                                        .approval_consent_value(approval_id.as_str())?)
+                                        == false))
+                                        || ((!(decision
+                                            == ApprovalLifecycleDecision::Approve))
+                                            || (self
+                                                .state
+                                                .approval_approve_allowed
+                                                .contains_key(approval_id.as_str()))))))))
+                        && ((self.state.approval_ids.contains(approval_id.as_str()))
+                            && ((self.approval_statuses_value(approval_id.as_str())?)
+                                == ApprovalLifecycleStatus::Pending)
+                            && ((self.approval_consent_value(approval_id.as_str())?) == false)
                             && (decision == ApprovalLifecycleDecision::Approve)
                             && ((self.approval_approve_allowed_value(approval_id.as_str())?)
                                 == false)))
@@ -868,14 +1722,22 @@ impl ApprovalLifecycleMachineAuthority {
                             .contains_key(approval_id.as_str()))
                             && ((!((self.approval_statuses_value(approval_id.as_str())?)
                                 == ApprovalLifecycleStatus::Pending))
-                                || ((!(decision == ApprovalLifecycleDecision::Deny))
-                                    || (self
-                                        .state
-                                        .approval_deny_allowed
-                                        .contains_key(approval_id.as_str()))))))
+                                || ((self
+                                    .state
+                                    .approval_consent
+                                    .contains_key(approval_id.as_str()))
+                                    && ((!((self
+                                        .approval_consent_value(approval_id.as_str())?)
+                                        == false))
+                                        || ((!(decision == ApprovalLifecycleDecision::Deny))
+                                            || (self
+                                                .state
+                                                .approval_deny_allowed
+                                                .contains_key(approval_id.as_str()))))))))
                         && ((self.state.approval_ids.contains(approval_id.as_str()))
                             && ((self.approval_statuses_value(approval_id.as_str())?)
                                 == ApprovalLifecycleStatus::Pending)
+                            && ((self.approval_consent_value(approval_id.as_str())?) == false)
                             && (decision == ApprovalLifecycleDecision::Deny)
                             && ((self.approval_deny_allowed_value(approval_id.as_str())?)
                                 == false)))
@@ -890,14 +1752,23 @@ impl ApprovalLifecycleMachineAuthority {
                             .contains_key(approval_id.as_str()))
                             && ((!((self.approval_statuses_value(approval_id.as_str())?)
                                 == ApprovalLifecycleStatus::Pending))
-                                || ((!(decision == ApprovalLifecycleDecision::Approve))
-                                    || (self
-                                        .state
-                                        .approval_approve_allowed
-                                        .contains_key(approval_id.as_str()))))))
+                                || ((self
+                                    .state
+                                    .approval_consent
+                                    .contains_key(approval_id.as_str()))
+                                    && ((!((self
+                                        .approval_consent_value(approval_id.as_str())?)
+                                        == false))
+                                        || ((!(decision
+                                            == ApprovalLifecycleDecision::Approve))
+                                            || (self
+                                                .state
+                                                .approval_approve_allowed
+                                                .contains_key(approval_id.as_str()))))))))
                         && ((self.state.approval_ids.contains(approval_id.as_str()))
                             && ((self.approval_statuses_value(approval_id.as_str())?)
                                 == ApprovalLifecycleStatus::Pending)
+                            && ((self.approval_consent_value(approval_id.as_str())?) == false)
                             && (decision == ApprovalLifecycleDecision::Approve)
                             && (self.approval_approve_allowed_value(approval_id.as_str())?)))
                 {
@@ -911,14 +1782,22 @@ impl ApprovalLifecycleMachineAuthority {
                             .contains_key(approval_id.as_str()))
                             && ((!((self.approval_statuses_value(approval_id.as_str())?)
                                 == ApprovalLifecycleStatus::Pending))
-                                || ((!(decision == ApprovalLifecycleDecision::Deny))
-                                    || (self
-                                        .state
-                                        .approval_deny_allowed
-                                        .contains_key(approval_id.as_str()))))))
+                                || ((self
+                                    .state
+                                    .approval_consent
+                                    .contains_key(approval_id.as_str()))
+                                    && ((!((self
+                                        .approval_consent_value(approval_id.as_str())?)
+                                        == false))
+                                        || ((!(decision == ApprovalLifecycleDecision::Deny))
+                                            || (self
+                                                .state
+                                                .approval_deny_allowed
+                                                .contains_key(approval_id.as_str()))))))))
                         && ((self.state.approval_ids.contains(approval_id.as_str()))
                             && ((self.approval_statuses_value(approval_id.as_str())?)
                                 == ApprovalLifecycleStatus::Pending)
+                            && ((self.approval_consent_value(approval_id.as_str())?) == false)
                             && (decision == ApprovalLifecycleDecision::Deny)
                             && (self.approval_deny_allowed_value(approval_id.as_str())?)))
                 {
@@ -945,6 +1824,13 @@ impl ApprovalLifecycleMachineAuthority {
                         Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
                             approval_id: approval_id.clone(),
                             reason: ApprovalLifecycleRejectionReason::AlreadyDecided,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::DecideRejectedAuthenticationRequired => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::AuthenticationRequired,
                         }])
                     }
                     ApprovalLifecycleTransition::DecideRejectedApproveNotAllowed => {
@@ -983,6 +1869,1058 @@ impl ApprovalLifecycleMachineAuthority {
                     }
                     _ => Err(ApprovalLifecycleError {
                         op: "DecideApproval_transition",
+                    }),
+                }
+            }
+            ApprovalLifecycleInput::DecideConsent {
+                approval_id,
+                review_id,
+                decision,
+                authenticated,
+            } => {
+                let mut matches = Vec::new();
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (self.state.approval_ids.contains(approval_id.as_str()) == false)
+                {
+                    matches.push(ApprovalLifecycleTransition::DecideConsentRejectedMissing);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(self.state.approval_ids.contains(approval_id.as_str())))
+                        || ((self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str())
+                            == false)
+                            || (self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str()))))
+                        && ((self.state.approval_ids.contains(approval_id.as_str()))
+                            && ((self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false)
+                                || ((self
+                                    .approval_consent_review_value(approval_id.as_str())?)
+                                    != review_id))))
+                {
+                    matches.push(ApprovalLifecycleTransition::DecideConsentRejectedMismatch);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && ((((!(self
+                        .state
+                        .approval_consent_review
+                        .contains_key(approval_id.as_str())))
+                        || (self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str())))
+                        && ((!((self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str()))
+                            && ((self.approval_consent_review_value(approval_id.as_str())?)
+                                == review_id)))
+                            || (self
+                                .state
+                                .approval_statuses
+                                .contains_key(approval_id.as_str()))))
+                        && (((self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str()))
+                            && ((self.approval_consent_review_value(approval_id.as_str())?)
+                                == review_id))
+                            && ((self.approval_statuses_value(approval_id.as_str())?)
+                                == ApprovalLifecycleStatus::Expired)))
+                {
+                    matches.push(ApprovalLifecycleTransition::DecideConsentRejectedExpired);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && ((((!(self
+                        .state
+                        .approval_consent_review
+                        .contains_key(approval_id.as_str())))
+                        || (self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str())))
+                        && ((!((self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str()))
+                            && ((self.approval_consent_review_value(approval_id.as_str())?)
+                                == review_id)))
+                            || (self
+                                .state
+                                .approval_statuses
+                                .contains_key(approval_id.as_str()))))
+                        && (((self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str()))
+                            && ((self.approval_consent_review_value(approval_id.as_str())?)
+                                == review_id))
+                            && (is_terminal_status(
+                                self.approval_statuses_value(approval_id.as_str())?,
+                            ))))
+                {
+                    matches.push(ApprovalLifecycleTransition::DecideConsentRejectedAlreadyDecided);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && ((((!(self
+                        .state
+                        .approval_consent_review
+                        .contains_key(approval_id.as_str())))
+                        || (self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str())))
+                        && ((!((self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str()))
+                            && ((self.approval_consent_review_value(approval_id.as_str())?)
+                                == review_id)))
+                            || (self
+                                .state
+                                .approval_statuses
+                                .contains_key(approval_id.as_str()))))
+                        && (((self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str()))
+                            && ((self.approval_consent_review_value(approval_id.as_str())?)
+                                == review_id))
+                            && ((self.approval_statuses_value(approval_id.as_str())?)
+                                == ApprovalLifecycleStatus::Pending)
+                            && (authenticated == false)))
+                {
+                    matches.push(
+                        ApprovalLifecycleTransition::DecideConsentRejectedAuthenticationRequired,
+                    );
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && ((((!(self
+                        .state
+                        .approval_consent_review
+                        .contains_key(approval_id.as_str())))
+                        || (self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str())))
+                        && ((!((self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str()))
+                            && ((self.approval_consent_review_value(approval_id.as_str())?)
+                                == review_id)))
+                            || ((self
+                                .state
+                                .approval_statuses
+                                .contains_key(approval_id.as_str()))
+                                && ((!((self
+                                    .approval_statuses_value(approval_id.as_str())?)
+                                    == ApprovalLifecycleStatus::Pending))
+                                    || ((!(authenticated))
+                                        || (((!(decision
+                                            == ApprovalLifecycleDecision::Approve))
+                                            || (self
+                                                .state
+                                                .approval_approve_allowed
+                                                .contains_key(approval_id.as_str())))
+                                            && (((decision
+                                                == ApprovalLifecycleDecision::Approve)
+                                                && ((self
+                                                    .approval_approve_allowed_value(
+                                                        approval_id.as_str(),
+                                                    )?)
+                                                    == false))
+                                                || ((!(decision
+                                                    == ApprovalLifecycleDecision::Deny))
+                                                    || (self
+                                                        .state
+                                                        .approval_deny_allowed
+                                                        .contains_key(
+                                                            approval_id.as_str(),
+                                                        ))))))))))
+                        && (((self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str()))
+                            && ((self.approval_consent_review_value(approval_id.as_str())?)
+                                == review_id))
+                            && ((self.approval_statuses_value(approval_id.as_str())?)
+                                == ApprovalLifecycleStatus::Pending)
+                            && (authenticated)
+                            && (((decision == ApprovalLifecycleDecision::Approve)
+                                && ((self
+                                    .approval_approve_allowed_value(approval_id.as_str())?)
+                                    == false))
+                                || ((decision == ApprovalLifecycleDecision::Deny)
+                                    && ((self
+                                        .approval_deny_allowed_value(approval_id.as_str())?)
+                                        == false)))))
+                {
+                    matches.push(ApprovalLifecycleTransition::DecideConsentRejectedNotAllowed);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && ((((!(self
+                        .state
+                        .approval_consent_review
+                        .contains_key(approval_id.as_str())))
+                        || (self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str())))
+                        && ((!((self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str()))
+                            && ((self.approval_consent_review_value(approval_id.as_str())?)
+                                == review_id)))
+                            || ((self
+                                .state
+                                .approval_statuses
+                                .contains_key(approval_id.as_str()))
+                                && ((!((self
+                                    .approval_statuses_value(approval_id.as_str())?)
+                                    == ApprovalLifecycleStatus::Pending))
+                                    || ((!(authenticated))
+                                        || ((!(decision
+                                            == ApprovalLifecycleDecision::Approve))
+                                            || (self
+                                                .state
+                                                .approval_approve_allowed
+                                                .contains_key(approval_id.as_str()))))))))
+                        && (((self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str()))
+                            && ((self.approval_consent_review_value(approval_id.as_str())?)
+                                == review_id))
+                            && ((self.approval_statuses_value(approval_id.as_str())?)
+                                == ApprovalLifecycleStatus::Pending)
+                            && (authenticated)
+                            && (decision == ApprovalLifecycleDecision::Approve)
+                            && (self.approval_approve_allowed_value(approval_id.as_str())?)))
+                {
+                    matches.push(ApprovalLifecycleTransition::DecideConsentApprove);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && ((((!(self
+                        .state
+                        .approval_consent_review
+                        .contains_key(approval_id.as_str())))
+                        || (self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str())))
+                        && ((!((self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str()))
+                            && ((self.approval_consent_review_value(approval_id.as_str())?)
+                                == review_id)))
+                            || ((self
+                                .state
+                                .approval_statuses
+                                .contains_key(approval_id.as_str()))
+                                && ((!((self
+                                    .approval_statuses_value(approval_id.as_str())?)
+                                    == ApprovalLifecycleStatus::Pending))
+                                    || ((!(authenticated))
+                                        || ((!(decision == ApprovalLifecycleDecision::Deny))
+                                            || (self
+                                                .state
+                                                .approval_deny_allowed
+                                                .contains_key(approval_id.as_str()))))))))
+                        && (((self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str()))
+                            && ((self.approval_consent_review_value(approval_id.as_str())?)
+                                == review_id))
+                            && ((self.approval_statuses_value(approval_id.as_str())?)
+                                == ApprovalLifecycleStatus::Pending)
+                            && (authenticated)
+                            && (decision == ApprovalLifecycleDecision::Deny)
+                            && (self.approval_deny_allowed_value(approval_id.as_str())?)))
+                {
+                    matches.push(ApprovalLifecycleTransition::DecideConsentDeny);
+                }
+                let transition = Self::single_transition(matches, "DecideConsent")?;
+                match transition {
+                    ApprovalLifecycleTransition::DecideConsentRejectedMissing => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::NotFound,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::DecideConsentRejectedMismatch => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::ConsentMismatch,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::DecideConsentRejectedExpired => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::Expired,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::DecideConsentRejectedAlreadyDecided => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::AlreadyDecided,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::DecideConsentRejectedAuthenticationRequired => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::AuthenticationRequired,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::DecideConsentRejectedNotAllowed => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::InvalidDecision,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::DecideConsentApprove => {
+                        self.state
+                            .approval_statuses
+                            .insert(approval_id.clone(), ApprovalLifecycleStatus::Approved);
+                        self.state
+                            .approval_consent_authenticated
+                            .insert(approval_id.clone(), true);
+                        self.state
+                            .review_statuses
+                            .insert(review_id.clone(), ReviewAttemptStatus::Allowed);
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalStatusResolved {
+                            approval_id: approval_id.clone(),
+                            status: ApprovalLifecycleStatus::Approved,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::DecideConsentDeny => {
+                        self.state
+                            .approval_statuses
+                            .insert(approval_id.clone(), ApprovalLifecycleStatus::Denied);
+                        self.state
+                            .approval_consent_authenticated
+                            .insert(approval_id.clone(), true);
+                        self.state
+                            .review_statuses
+                            .insert(review_id.clone(), ReviewAttemptStatus::Denied);
+                        self.state
+                            .approval_consent_review
+                            .remove(approval_id.as_str());
+                        self.state
+                            .review_consent_approval
+                            .remove(review_id.as_str());
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalStatusResolved {
+                            approval_id: approval_id.clone(),
+                            status: ApprovalLifecycleStatus::Denied,
+                        }])
+                    }
+                    _ => Err(ApprovalLifecycleError {
+                        op: "DecideConsent_transition",
+                    }),
+                }
+            }
+            ApprovalLifecycleInput::ConsumeConsentForEntry {
+                approval_id,
+                review_id,
+            } => {
+                let mut matches = Vec::new();
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (self.state.approval_ids.contains(approval_id.as_str()) == false)
+                {
+                    matches.push(ApprovalLifecycleTransition::ConsumeConsentRejectedMissing);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(self.state.approval_ids.contains(approval_id.as_str())))
+                        || (self
+                            .state
+                            .approval_consent_consumed
+                            .contains_key(approval_id.as_str())))
+                        && ((self.state.approval_ids.contains(approval_id.as_str()))
+                            && (self.approval_consent_consumed_value(approval_id.as_str())?)))
+                {
+                    matches
+                        .push(ApprovalLifecycleTransition::ConsumeConsentRejectedAlreadyConsumed);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(self.state.approval_ids.contains(approval_id.as_str())))
+                        || ((self
+                            .state
+                            .approval_consent_consumed
+                            .contains_key(approval_id.as_str()))
+                            && ((!((self
+                                .approval_consent_consumed_value(approval_id.as_str())?)
+                                == false))
+                                || ((self
+                                    .state
+                                    .approval_consent_review
+                                    .contains_key(approval_id.as_str())
+                                    == false)
+                                    || (self
+                                        .state
+                                        .approval_consent_review
+                                        .contains_key(approval_id.as_str()))))))
+                        && ((self.state.approval_ids.contains(approval_id.as_str()))
+                            && ((self.approval_consent_consumed_value(approval_id.as_str())?)
+                                == false)
+                            && ((self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false)
+                                || ((self
+                                    .approval_consent_review_value(approval_id.as_str())?)
+                                    != review_id))))
+                {
+                    matches.push(ApprovalLifecycleTransition::ConsumeConsentRejectedMismatch);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(self.state.approval_ids.contains(approval_id.as_str())))
+                        || ((self
+                            .state
+                            .approval_consent_consumed
+                            .contains_key(approval_id.as_str()))
+                            && ((!((self
+                                .approval_consent_consumed_value(approval_id.as_str())?)
+                                == false))
+                                || (((!(self
+                                    .state
+                                    .approval_consent_review
+                                    .contains_key(approval_id.as_str())))
+                                    || (self
+                                        .state
+                                        .approval_consent_review
+                                        .contains_key(approval_id.as_str())))
+                                    && ((!((self
+                                        .state
+                                        .approval_consent_review
+                                        .contains_key(approval_id.as_str()))
+                                        && ((self.approval_consent_review_value(
+                                            approval_id.as_str(),
+                                        )?) == review_id)))
+                                        || ((self
+                                            .state
+                                            .approval_statuses
+                                            .contains_key(approval_id.as_str()))
+                                            && (((self.approval_statuses_value(
+                                                approval_id.as_str(),
+                                            )?) != ApprovalLifecycleStatus::Approved)
+                                                || ((self
+                                                    .state
+                                                    .approval_consent_authenticated
+                                                    .contains_key(approval_id.as_str()))
+                                                    && (((self
+                                                        .approval_consent_authenticated_value(
+                                                            approval_id.as_str(),
+                                                        )?)
+                                                        == false)
+                                                        || (self
+                                                            .state
+                                                            .review_statuses
+                                                            .contains_key(
+                                                                review_id.as_str(),
+                                                            )))))))))))
+                        && ((self.state.approval_ids.contains(approval_id.as_str()))
+                            && ((self.approval_consent_consumed_value(approval_id.as_str())?)
+                                == false)
+                            && ((self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str()))
+                                && ((self
+                                    .approval_consent_review_value(approval_id.as_str())?)
+                                    == review_id))
+                            && (((self.approval_statuses_value(approval_id.as_str())?)
+                                != ApprovalLifecycleStatus::Approved)
+                                || ((self.approval_consent_authenticated_value(
+                                    approval_id.as_str(),
+                                )?) == false)
+                                || ((self.review_statuses_value(review_id.as_str())?)
+                                    != ReviewAttemptStatus::Allowed))))
+                {
+                    matches.push(ApprovalLifecycleTransition::ConsumeConsentRejectedNotSatisfied);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(self.state.approval_ids.contains(approval_id.as_str())))
+                        || ((self
+                            .state
+                            .approval_consent_consumed
+                            .contains_key(approval_id.as_str()))
+                            && ((!((self
+                                .approval_consent_consumed_value(approval_id.as_str())?)
+                                == false))
+                                || (((!(self
+                                    .state
+                                    .approval_consent_review
+                                    .contains_key(approval_id.as_str())))
+                                    || (self
+                                        .state
+                                        .approval_consent_review
+                                        .contains_key(approval_id.as_str())))
+                                    && ((!((self
+                                        .state
+                                        .approval_consent_review
+                                        .contains_key(approval_id.as_str()))
+                                        && ((self.approval_consent_review_value(
+                                            approval_id.as_str(),
+                                        )?) == review_id)))
+                                        || ((self
+                                            .state
+                                            .approval_statuses
+                                            .contains_key(approval_id.as_str()))
+                                            && ((!((self.approval_statuses_value(
+                                                approval_id.as_str(),
+                                            )?)
+                                                == ApprovalLifecycleStatus::Approved))
+                                                || ((self
+                                                    .state
+                                                    .approval_consent_authenticated
+                                                    .contains_key(approval_id.as_str()))
+                                                    && ((!(self
+                                                        .approval_consent_authenticated_value(
+                                                            approval_id.as_str(),
+                                                        )?))
+                                                        || (self
+                                                            .state
+                                                            .review_statuses
+                                                            .contains_key(
+                                                                review_id.as_str(),
+                                                            )))))))))))
+                        && ((self.state.approval_ids.contains(approval_id.as_str()))
+                            && ((self.approval_consent_consumed_value(approval_id.as_str())?)
+                                == false)
+                            && ((self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str()))
+                                && ((self
+                                    .approval_consent_review_value(approval_id.as_str())?)
+                                    == review_id))
+                            && ((self.approval_statuses_value(approval_id.as_str())?)
+                                == ApprovalLifecycleStatus::Approved)
+                            && (self
+                                .approval_consent_authenticated_value(approval_id.as_str())?)
+                            && ((self.review_statuses_value(review_id.as_str())?)
+                                == ReviewAttemptStatus::Allowed)))
+                {
+                    matches.push(ApprovalLifecycleTransition::ConsumeConsentForEntry);
+                }
+                let transition = Self::single_transition(matches, "ConsumeConsentForEntry")?;
+                match transition {
+                    ApprovalLifecycleTransition::ConsumeConsentRejectedMissing => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::NotFound,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::ConsumeConsentRejectedAlreadyConsumed => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::AlreadyConsumed,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::ConsumeConsentRejectedMismatch => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::ConsentMismatch,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::ConsumeConsentRejectedNotSatisfied => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::ReviewNotSatisfied,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::ConsumeConsentForEntry => {
+                        self.state
+                            .approval_consent_consumed
+                            .insert(approval_id.clone(), true);
+                        self.state
+                            .review_statuses
+                            .insert(review_id.clone(), ReviewAttemptStatus::Used);
+                        self.state
+                            .approval_consent_review
+                            .remove(approval_id.as_str());
+                        self.state
+                            .review_consent_approval
+                            .remove(review_id.as_str());
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ReviewStatusResolved {
+                            review_id: review_id.clone(),
+                            status: ReviewAttemptStatus::Used,
+                        }])
+                    }
+                    _ => Err(ApprovalLifecycleError {
+                        op: "ConsumeConsentForEntry_transition",
+                    }),
+                }
+            }
+            ApprovalLifecycleInput::WithdrawConsent {
+                approval_id,
+                review_id,
+                reason,
+            } => {
+                let mut matches = Vec::new();
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (self.state.approval_ids.contains(approval_id.as_str()) == false)
+                {
+                    matches.push(ApprovalLifecycleTransition::WithdrawConsentRejectedMissing);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(self.state.approval_ids.contains(approval_id.as_str())))
+                        || ((self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str())
+                            == false)
+                            || (self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str()))))
+                        && ((self.state.approval_ids.contains(approval_id.as_str()))
+                            && ((self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false)
+                                || ((self
+                                    .approval_consent_review_value(approval_id.as_str())?)
+                                    != review_id))))
+                {
+                    matches.push(ApprovalLifecycleTransition::WithdrawConsentRejectedMismatch);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && ((((!(self
+                        .state
+                        .approval_consent_review
+                        .contains_key(approval_id.as_str())))
+                        || (self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str())))
+                        && ((!((self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str()))
+                            && ((self.approval_consent_review_value(approval_id.as_str())?)
+                                == review_id)))
+                            || (self
+                                .state
+                                .approval_statuses
+                                .contains_key(approval_id.as_str()))))
+                        && (((self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str()))
+                            && ((self.approval_consent_review_value(approval_id.as_str())?)
+                                == review_id))
+                            && ((self.approval_statuses_value(approval_id.as_str())?)
+                                == ApprovalLifecycleStatus::Pending)))
+                {
+                    matches.push(ApprovalLifecycleTransition::WithdrawConsentPending);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && ((((!(self
+                        .state
+                        .approval_consent_review
+                        .contains_key(approval_id.as_str())))
+                        || (self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str())))
+                        && ((!((self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str()))
+                            && ((self.approval_consent_review_value(approval_id.as_str())?)
+                                == review_id)))
+                            || (self
+                                .state
+                                .approval_statuses
+                                .contains_key(approval_id.as_str()))))
+                        && (((self
+                            .state
+                            .approval_consent_review
+                            .contains_key(approval_id.as_str()))
+                            && ((self.approval_consent_review_value(approval_id.as_str())?)
+                                == review_id))
+                            && ((self.approval_statuses_value(approval_id.as_str())?)
+                                != ApprovalLifecycleStatus::Pending)))
+                {
+                    matches.push(ApprovalLifecycleTransition::WithdrawConsentSettled);
+                }
+                let transition = Self::single_transition(matches, "WithdrawConsent")?;
+                match transition {
+                    ApprovalLifecycleTransition::WithdrawConsentRejectedMissing => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::NotFound,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::WithdrawConsentRejectedMismatch => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::ConsentMismatch,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::WithdrawConsentPending => {
+                        self.state
+                            .approval_statuses
+                            .insert(approval_id.clone(), ApprovalLifecycleStatus::Cancelled);
+                        self.state
+                            .review_statuses
+                            .insert(review_id.clone(), ReviewAttemptStatus::Retired);
+                        self.state
+                            .review_retirements
+                            .insert(review_id.clone(), reason);
+                        self.state
+                            .approval_consent_review
+                            .remove(approval_id.as_str());
+                        self.state
+                            .review_consent_approval
+                            .remove(review_id.as_str());
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalStatusResolved {
+                            approval_id: approval_id.clone(),
+                            status: ApprovalLifecycleStatus::Cancelled,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::WithdrawConsentSettled => {
+                        self.state
+                            .review_statuses
+                            .insert(review_id.clone(), ReviewAttemptStatus::Retired);
+                        self.state
+                            .review_retirements
+                            .insert(review_id.clone(), reason);
+                        self.state
+                            .approval_consent_review
+                            .remove(approval_id.as_str());
+                        self.state
+                            .review_consent_approval
+                            .remove(review_id.as_str());
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ReviewStatusResolved {
+                            review_id: review_id.clone(),
+                            status: ReviewAttemptStatus::Retired,
+                        }])
+                    }
+                    _ => Err(ApprovalLifecycleError {
+                        op: "WithdrawConsent_transition",
+                    }),
+                }
+            }
+            ApprovalLifecycleInput::SettleUnlinkedConsent { approval_id } => {
+                let mut matches = Vec::new();
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (self.state.approval_ids.contains(approval_id.as_str()) == false)
+                {
+                    matches.push(ApprovalLifecycleTransition::SettleUnlinkedRejectedMissing);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(self.state.approval_ids.contains(approval_id.as_str())))
+                        || (self
+                            .state
+                            .approval_consent
+                            .contains_key(approval_id.as_str())))
+                        && ((self.state.approval_ids.contains(approval_id.as_str()))
+                            && ((self.approval_consent_value(approval_id.as_str())?) == false)))
+                {
+                    matches.push(ApprovalLifecycleTransition::SettleUnlinkedRejectedNotConsent);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(self.state.approval_ids.contains(approval_id.as_str())))
+                        || (self
+                            .state
+                            .approval_consent
+                            .contains_key(approval_id.as_str())))
+                        && ((self.state.approval_ids.contains(approval_id.as_str()))
+                            && ((self.approval_consent_value(approval_id.as_str())?) == true)
+                            && (self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str()))))
+                {
+                    matches.push(ApprovalLifecycleTransition::SettleUnlinkedRejectedLinked);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(self.state.approval_ids.contains(approval_id.as_str())))
+                        || ((self
+                            .state
+                            .approval_consent
+                            .contains_key(approval_id.as_str()))
+                            && ((!((self.approval_consent_value(approval_id.as_str())?)
+                                == true))
+                                || ((!(self
+                                    .state
+                                    .approval_consent_review
+                                    .contains_key(approval_id.as_str())
+                                    == false))
+                                    || (self
+                                        .state
+                                        .approval_consent_consumed
+                                        .contains_key(approval_id.as_str()))))))
+                        && ((self.state.approval_ids.contains(approval_id.as_str()))
+                            && ((self.approval_consent_value(approval_id.as_str())?) == true)
+                            && (self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false)
+                            && ((self.approval_consent_consumed_value(approval_id.as_str())?)
+                                == true)))
+                {
+                    matches.push(ApprovalLifecycleTransition::SettleUnlinkedRejectedConsumed);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(self.state.approval_ids.contains(approval_id.as_str())))
+                        || ((self
+                            .state
+                            .approval_consent
+                            .contains_key(approval_id.as_str()))
+                            && ((!((self.approval_consent_value(approval_id.as_str())?)
+                                == true))
+                                || ((!(self
+                                    .state
+                                    .approval_consent_review
+                                    .contains_key(approval_id.as_str())
+                                    == false))
+                                    || ((self
+                                        .state
+                                        .approval_consent_consumed
+                                        .contains_key(approval_id.as_str()))
+                                        && ((!((self.approval_consent_consumed_value(
+                                            approval_id.as_str(),
+                                        )?) == false))
+                                            || (self
+                                                .state
+                                                .approval_statuses
+                                                .contains_key(approval_id.as_str()))))))))
+                        && ((self.state.approval_ids.contains(approval_id.as_str()))
+                            && ((self.approval_consent_value(approval_id.as_str())?) == true)
+                            && (self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false)
+                            && ((self.approval_consent_consumed_value(approval_id.as_str())?)
+                                == false)
+                            && ((self.approval_statuses_value(approval_id.as_str())?)
+                                == ApprovalLifecycleStatus::Expired)))
+                {
+                    matches.push(ApprovalLifecycleTransition::SettleUnlinkedRejectedExpired);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(self.state.approval_ids.contains(approval_id.as_str())))
+                        || ((self
+                            .state
+                            .approval_consent
+                            .contains_key(approval_id.as_str()))
+                            && ((!((self.approval_consent_value(approval_id.as_str())?)
+                                == true))
+                                || ((!(self
+                                    .state
+                                    .approval_consent_review
+                                    .contains_key(approval_id.as_str())
+                                    == false))
+                                    || ((self
+                                        .state
+                                        .approval_consent_consumed
+                                        .contains_key(approval_id.as_str()))
+                                        && ((!((self.approval_consent_consumed_value(
+                                            approval_id.as_str(),
+                                        )?) == false))
+                                            || ((self
+                                                .state
+                                                .approval_statuses
+                                                .contains_key(approval_id.as_str()))
+                                                && (((self.approval_statuses_value(
+                                                    approval_id.as_str(),
+                                                )?)
+                                                    == ApprovalLifecycleStatus::Denied)
+                                                    || (self
+                                                        .state
+                                                        .approval_statuses
+                                                        .contains_key(
+                                                            approval_id.as_str(),
+                                                        ))))))))))
+                        && ((self.state.approval_ids.contains(approval_id.as_str()))
+                            && ((self.approval_consent_value(approval_id.as_str())?) == true)
+                            && (self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false)
+                            && ((self.approval_consent_consumed_value(approval_id.as_str())?)
+                                == false)
+                            && (((self.approval_statuses_value(approval_id.as_str())?)
+                                == ApprovalLifecycleStatus::Denied)
+                                || ((self.approval_statuses_value(approval_id.as_str())?)
+                                    == ApprovalLifecycleStatus::Cancelled))))
+                {
+                    matches.push(ApprovalLifecycleTransition::SettleUnlinkedRejectedSettled);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(self.state.approval_ids.contains(approval_id.as_str())))
+                        || ((self
+                            .state
+                            .approval_consent
+                            .contains_key(approval_id.as_str()))
+                            && ((!((self.approval_consent_value(approval_id.as_str())?)
+                                == true))
+                                || ((!(self
+                                    .state
+                                    .approval_consent_review
+                                    .contains_key(approval_id.as_str())
+                                    == false))
+                                    || ((self
+                                        .state
+                                        .approval_consent_consumed
+                                        .contains_key(approval_id.as_str()))
+                                        && ((!((self.approval_consent_consumed_value(
+                                            approval_id.as_str(),
+                                        )?) == false))
+                                            || (self
+                                                .state
+                                                .approval_statuses
+                                                .contains_key(approval_id.as_str()))))))))
+                        && ((self.state.approval_ids.contains(approval_id.as_str()))
+                            && ((self.approval_consent_value(approval_id.as_str())?) == true)
+                            && (self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false)
+                            && ((self.approval_consent_consumed_value(approval_id.as_str())?)
+                                == false)
+                            && ((self.approval_statuses_value(approval_id.as_str())?)
+                                == ApprovalLifecycleStatus::Pending)))
+                {
+                    matches.push(ApprovalLifecycleTransition::SettleUnlinkedPending);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && (((!(self.state.approval_ids.contains(approval_id.as_str())))
+                        || ((self
+                            .state
+                            .approval_consent
+                            .contains_key(approval_id.as_str()))
+                            && ((!((self.approval_consent_value(approval_id.as_str())?)
+                                == true))
+                                || ((!(self
+                                    .state
+                                    .approval_consent_review
+                                    .contains_key(approval_id.as_str())
+                                    == false))
+                                    || ((self
+                                        .state
+                                        .approval_consent_consumed
+                                        .contains_key(approval_id.as_str()))
+                                        && ((!((self.approval_consent_consumed_value(
+                                            approval_id.as_str(),
+                                        )?) == false))
+                                            || (self
+                                                .state
+                                                .approval_statuses
+                                                .contains_key(approval_id.as_str()))))))))
+                        && ((self.state.approval_ids.contains(approval_id.as_str()))
+                            && ((self.approval_consent_value(approval_id.as_str())?) == true)
+                            && (self
+                                .state
+                                .approval_consent_review
+                                .contains_key(approval_id.as_str())
+                                == false)
+                            && ((self.approval_consent_consumed_value(approval_id.as_str())?)
+                                == false)
+                            && ((self.approval_statuses_value(approval_id.as_str())?)
+                                == ApprovalLifecycleStatus::Approved)))
+                {
+                    matches.push(ApprovalLifecycleTransition::SettleUnlinkedApproved);
+                }
+                let transition = Self::single_transition(matches, "SettleUnlinkedConsent")?;
+                match transition {
+                    ApprovalLifecycleTransition::SettleUnlinkedRejectedMissing => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::NotFound,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::SettleUnlinkedRejectedNotConsent => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::NotConsent,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::SettleUnlinkedRejectedLinked => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::ConsentLinked,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::SettleUnlinkedRejectedConsumed => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::AlreadyConsumed,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::SettleUnlinkedRejectedExpired => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::Expired,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::SettleUnlinkedRejectedSettled => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalLifecycleRejected {
+                            approval_id: approval_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::AlreadyDecided,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::SettleUnlinkedPending => {
+                        self.state
+                            .approval_statuses
+                            .insert(approval_id.clone(), ApprovalLifecycleStatus::Cancelled);
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalStatusResolved {
+                            approval_id: approval_id.clone(),
+                            status: ApprovalLifecycleStatus::Cancelled,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::SettleUnlinkedApproved => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ApprovalStatusResolved {
+                            approval_id: approval_id.clone(),
+                            status: ApprovalLifecycleStatus::Approved,
+                        }])
+                    }
+                    _ => Err(ApprovalLifecycleError {
+                        op: "SettleUnlinkedConsent_transition",
                     }),
                 }
             }
@@ -1031,9 +2969,30 @@ impl ApprovalLifecycleMachineAuthority {
                     matches.push(ApprovalLifecycleTransition::RecordReviewVerdictRejectedMissing);
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && ((self.state.review_ids.contains(review_id.as_str()))
+                        && (self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())))
+                {
+                    matches.push(
+                        ApprovalLifecycleTransition::RecordReviewVerdictRejectedConsentLinked,
+                    );
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || (self.state.review_statuses.contains_key(review_id.as_str())))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || (self.state.review_statuses.contains_key(review_id.as_str()))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Retired)))
                 {
@@ -1041,11 +3000,24 @@ impl ApprovalLifecycleMachineAuthority {
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || ((self.state.review_statuses.contains_key(review_id.as_str()))
-                            && ((!((self.review_statuses_value(review_id.as_str())?)
-                                != ReviewAttemptStatus::Pending))
-                                || (self.state.review_statuses.contains_key(review_id.as_str())))))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || ((self.state.review_statuses.contains_key(review_id.as_str()))
+                                && ((!((self.review_statuses_value(review_id.as_str())?)
+                                    != ReviewAttemptStatus::Pending))
+                                    || (self
+                                        .state
+                                        .review_statuses
+                                        .contains_key(review_id.as_str()))))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 != ReviewAttemptStatus::Pending)
                             && ((self.review_statuses_value(review_id.as_str())?)
@@ -1055,8 +3027,18 @@ impl ApprovalLifecycleMachineAuthority {
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || (self.state.review_statuses.contains_key(review_id.as_str())))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || (self.state.review_statuses.contains_key(review_id.as_str()))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Pending)
                             && (verdict == ReviewVerdict::Allow)))
@@ -1065,8 +3047,18 @@ impl ApprovalLifecycleMachineAuthority {
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || (self.state.review_statuses.contains_key(review_id.as_str())))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || (self.state.review_statuses.contains_key(review_id.as_str()))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Pending)
                             && (verdict == ReviewVerdict::Deny)))
@@ -1075,8 +3067,18 @@ impl ApprovalLifecycleMachineAuthority {
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || (self.state.review_statuses.contains_key(review_id.as_str())))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || (self.state.review_statuses.contains_key(review_id.as_str()))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Pending)
                             && (verdict == ReviewVerdict::Escalate)))
@@ -1090,6 +3092,13 @@ impl ApprovalLifecycleMachineAuthority {
                         Ok(vec![ApprovalLifecycleEffect::ReviewLifecycleRejected {
                             review_id: review_id.clone(),
                             reason: ApprovalLifecycleRejectionReason::NotFound,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::RecordReviewVerdictRejectedConsentLinked => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ReviewLifecycleRejected {
+                            review_id: review_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::ConsentLinked,
                         }])
                     }
                     ApprovalLifecycleTransition::RecordReviewVerdictRejectedRetired => {
@@ -1150,9 +3159,30 @@ impl ApprovalLifecycleMachineAuthority {
                         .push(ApprovalLifecycleTransition::RecordReviewUnavailableRejectedMissing);
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && ((self.state.review_ids.contains(review_id.as_str()))
+                        && (self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())))
+                {
+                    matches.push(
+                        ApprovalLifecycleTransition::RecordReviewUnavailableRejectedConsentLinked,
+                    );
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || (self.state.review_statuses.contains_key(review_id.as_str())))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || (self.state.review_statuses.contains_key(review_id.as_str()))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Retired)))
                 {
@@ -1161,11 +3191,24 @@ impl ApprovalLifecycleMachineAuthority {
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || ((self.state.review_statuses.contains_key(review_id.as_str()))
-                            && ((!((self.review_statuses_value(review_id.as_str())?)
-                                != ReviewAttemptStatus::Pending))
-                                || (self.state.review_statuses.contains_key(review_id.as_str())))))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || ((self.state.review_statuses.contains_key(review_id.as_str()))
+                                && ((!((self.review_statuses_value(review_id.as_str())?)
+                                    != ReviewAttemptStatus::Pending))
+                                    || (self
+                                        .state
+                                        .review_statuses
+                                        .contains_key(review_id.as_str()))))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 != ReviewAttemptStatus::Pending)
                             && ((self.review_statuses_value(review_id.as_str())?)
@@ -1176,8 +3219,18 @@ impl ApprovalLifecycleMachineAuthority {
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || (self.state.review_statuses.contains_key(review_id.as_str())))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || (self.state.review_statuses.contains_key(review_id.as_str()))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Pending)))
                 {
@@ -1190,6 +3243,13 @@ impl ApprovalLifecycleMachineAuthority {
                         Ok(vec![ApprovalLifecycleEffect::ReviewLifecycleRejected {
                             review_id: review_id.clone(),
                             reason: ApprovalLifecycleRejectionReason::NotFound,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::RecordReviewUnavailableRejectedConsentLinked => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ReviewLifecycleRejected {
+                            review_id: review_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::ConsentLinked,
                         }])
                     }
                     ApprovalLifecycleTransition::RecordReviewUnavailableRejectedRetired => {
@@ -1229,9 +3289,28 @@ impl ApprovalLifecycleMachineAuthority {
                     matches.push(ApprovalLifecycleTransition::RetireReviewRejectedMissing);
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && ((self.state.review_ids.contains(review_id.as_str()))
+                        && (self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())))
+                {
+                    matches.push(ApprovalLifecycleTransition::RetireReviewRejectedConsentLinked);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || (self.state.review_statuses.contains_key(review_id.as_str())))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || (self.state.review_statuses.contains_key(review_id.as_str()))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Retired)))
                 {
@@ -1239,21 +3318,31 @@ impl ApprovalLifecycleMachineAuthority {
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || ((self.state.review_statuses.contains_key(review_id.as_str()))
-                            && ((!((self.review_statuses_value(review_id.as_str())?)
-                                != ReviewAttemptStatus::Pending))
-                                || ((self
-                                    .state
-                                    .review_statuses
-                                    .contains_key(review_id.as_str()))
-                                    && ((!((self
-                                        .review_statuses_value(review_id.as_str())?)
-                                        != ReviewAttemptStatus::Allowed))
-                                        || (self
-                                            .state
-                                            .review_statuses
-                                            .contains_key(review_id.as_str())))))))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || ((self.state.review_statuses.contains_key(review_id.as_str()))
+                                && ((!((self.review_statuses_value(review_id.as_str())?)
+                                    != ReviewAttemptStatus::Pending))
+                                    || ((self
+                                        .state
+                                        .review_statuses
+                                        .contains_key(review_id.as_str()))
+                                        && ((!((self
+                                            .review_statuses_value(review_id.as_str())?)
+                                            != ReviewAttemptStatus::Allowed))
+                                            || (self
+                                                .state
+                                                .review_statuses
+                                                .contains_key(review_id.as_str()))))))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 != ReviewAttemptStatus::Pending)
                             && ((self.review_statuses_value(review_id.as_str())?)
@@ -1265,11 +3354,24 @@ impl ApprovalLifecycleMachineAuthority {
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || ((self.state.review_statuses.contains_key(review_id.as_str()))
-                            && (((self.review_statuses_value(review_id.as_str())?)
-                                == ReviewAttemptStatus::Pending)
-                                || (self.state.review_statuses.contains_key(review_id.as_str())))))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || ((self.state.review_statuses.contains_key(review_id.as_str()))
+                                && (((self.review_statuses_value(review_id.as_str())?)
+                                    == ReviewAttemptStatus::Pending)
+                                    || (self
+                                        .state
+                                        .review_statuses
+                                        .contains_key(review_id.as_str()))))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && (((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Pending)
                                 || ((self.review_statuses_value(review_id.as_str())?)
@@ -1284,6 +3386,13 @@ impl ApprovalLifecycleMachineAuthority {
                         Ok(vec![ApprovalLifecycleEffect::ReviewLifecycleRejected {
                             review_id: review_id.clone(),
                             reason: ApprovalLifecycleRejectionReason::NotFound,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::RetireReviewRejectedConsentLinked => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ReviewLifecycleRejected {
+                            review_id: review_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::ConsentLinked,
                         }])
                     }
                     ApprovalLifecycleTransition::RetireReviewRejectedRetired => {
@@ -1326,9 +3435,28 @@ impl ApprovalLifecycleMachineAuthority {
                     matches.push(ApprovalLifecycleTransition::ConsumeReviewRejectedMissing);
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && ((self.state.review_ids.contains(review_id.as_str()))
+                        && (self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())))
+                {
+                    matches.push(ApprovalLifecycleTransition::ConsumeReviewRejectedConsentLinked);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || (self.state.review_statuses.contains_key(review_id.as_str())))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || (self.state.review_statuses.contains_key(review_id.as_str()))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Retired)))
                 {
@@ -1336,8 +3464,18 @@ impl ApprovalLifecycleMachineAuthority {
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || (self.state.review_statuses.contains_key(review_id.as_str())))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || (self.state.review_statuses.contains_key(review_id.as_str()))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Used)))
                 {
@@ -1345,27 +3483,38 @@ impl ApprovalLifecycleMachineAuthority {
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || ((self.state.review_statuses.contains_key(review_id.as_str()))
-                            && (((self.review_statuses_value(review_id.as_str())?)
-                                == ReviewAttemptStatus::Pending)
-                                || ((self
-                                    .state
-                                    .review_statuses
-                                    .contains_key(review_id.as_str()))
-                                    && (((self.review_statuses_value(review_id.as_str())?)
-                                        == ReviewAttemptStatus::Denied)
-                                        || ((self
-                                            .state
-                                            .review_statuses
-                                            .contains_key(review_id.as_str()))
-                                            && (((self.review_statuses_value(
-                                                review_id.as_str(),
-                                            )?) == ReviewAttemptStatus::Escalated)
-                                                || (self
-                                                    .state
-                                                    .review_statuses
-                                                    .contains_key(review_id.as_str())))))))))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || ((self.state.review_statuses.contains_key(review_id.as_str()))
+                                && (((self.review_statuses_value(review_id.as_str())?)
+                                    == ReviewAttemptStatus::Pending)
+                                    || ((self
+                                        .state
+                                        .review_statuses
+                                        .contains_key(review_id.as_str()))
+                                        && (((self
+                                            .review_statuses_value(review_id.as_str())?)
+                                            == ReviewAttemptStatus::Denied)
+                                            || ((self
+                                                .state
+                                                .review_statuses
+                                                .contains_key(review_id.as_str()))
+                                                && (((self.review_statuses_value(
+                                                    review_id.as_str(),
+                                                )?) == ReviewAttemptStatus::Escalated)
+                                                    || (self
+                                                        .state
+                                                        .review_statuses
+                                                        .contains_key(review_id.as_str()))))))))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && (((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Pending)
                                 || ((self.review_statuses_value(review_id.as_str())?)
@@ -1379,8 +3528,18 @@ impl ApprovalLifecycleMachineAuthority {
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || (self.state.review_statuses.contains_key(review_id.as_str())))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || (self.state.review_statuses.contains_key(review_id.as_str()))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Allowed)))
                 {
@@ -1393,6 +3552,13 @@ impl ApprovalLifecycleMachineAuthority {
                         Ok(vec![ApprovalLifecycleEffect::ReviewLifecycleRejected {
                             review_id: review_id.clone(),
                             reason: ApprovalLifecycleRejectionReason::NotFound,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::ConsumeReviewRejectedConsentLinked => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ReviewLifecycleRejected {
+                            review_id: review_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::ConsentLinked,
                         }])
                     }
                     ApprovalLifecycleTransition::ConsumeReviewRejectedRetired => {
@@ -1439,9 +3605,28 @@ impl ApprovalLifecycleMachineAuthority {
                     matches.push(ApprovalLifecycleTransition::ReleaseReviewRejectedMissing);
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
+                    && ((self.state.review_ids.contains(review_id.as_str()))
+                        && (self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())))
+                {
+                    matches.push(ApprovalLifecycleTransition::ReleaseReviewRejectedConsentLinked);
+                }
+                if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || (self.state.review_statuses.contains_key(review_id.as_str())))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || (self.state.review_statuses.contains_key(review_id.as_str()))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Pending)))
                 {
@@ -1449,8 +3634,18 @@ impl ApprovalLifecycleMachineAuthority {
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || (self.state.review_statuses.contains_key(review_id.as_str())))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || (self.state.review_statuses.contains_key(review_id.as_str()))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Allowed)))
                 {
@@ -1458,8 +3653,18 @@ impl ApprovalLifecycleMachineAuthority {
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || (self.state.review_statuses.contains_key(review_id.as_str())))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || (self.state.review_statuses.contains_key(review_id.as_str()))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Denied)))
                 {
@@ -1467,8 +3672,18 @@ impl ApprovalLifecycleMachineAuthority {
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || (self.state.review_statuses.contains_key(review_id.as_str())))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || (self.state.review_statuses.contains_key(review_id.as_str()))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Escalated)))
                 {
@@ -1476,8 +3691,18 @@ impl ApprovalLifecycleMachineAuthority {
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || (self.state.review_statuses.contains_key(review_id.as_str())))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || (self.state.review_statuses.contains_key(review_id.as_str()))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Unavailable)))
                 {
@@ -1485,8 +3710,18 @@ impl ApprovalLifecycleMachineAuthority {
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || (self.state.review_statuses.contains_key(review_id.as_str())))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || (self.state.review_statuses.contains_key(review_id.as_str()))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Retired)))
                 {
@@ -1494,8 +3729,18 @@ impl ApprovalLifecycleMachineAuthority {
                 }
                 if (self.state.lifecycle_phase == ApprovalLifecyclePhase::Ready)
                     && (((!(self.state.review_ids.contains(review_id.as_str())))
-                        || (self.state.review_statuses.contains_key(review_id.as_str())))
+                        || ((!(self
+                            .state
+                            .review_consent_approval
+                            .contains_key(review_id.as_str())
+                            == false))
+                            || (self.state.review_statuses.contains_key(review_id.as_str()))))
                         && ((self.state.review_ids.contains(review_id.as_str()))
+                            && (self
+                                .state
+                                .review_consent_approval
+                                .contains_key(review_id.as_str())
+                                == false)
                             && ((self.review_statuses_value(review_id.as_str())?)
                                 == ReviewAttemptStatus::Used)))
                 {
@@ -1508,6 +3753,13 @@ impl ApprovalLifecycleMachineAuthority {
                         Ok(vec![ApprovalLifecycleEffect::ReviewLifecycleRejected {
                             review_id: review_id.clone(),
                             reason: ApprovalLifecycleRejectionReason::NotFound,
+                        }])
+                    }
+                    ApprovalLifecycleTransition::ReleaseReviewRejectedConsentLinked => {
+                        self.state.lifecycle_phase = ApprovalLifecyclePhase::Ready;
+                        Ok(vec![ApprovalLifecycleEffect::ReviewLifecycleRejected {
+                            review_id: review_id.clone(),
+                            reason: ApprovalLifecycleRejectionReason::ConsentLinked,
                         }])
                     }
                     ApprovalLifecycleTransition::ReleaseReviewRejectedPending => {
@@ -1624,6 +3876,24 @@ impl ApprovalLifecycleMachineAuthority {
         Self::outcome_from_effects(effects, "create_approval_effect")
     }
 
+    pub fn create_consent_approval(
+        &mut self,
+        approval_id: String,
+        review_id: String,
+        approve_allowed: bool,
+        deny_allowed: bool,
+        has_expiry: bool,
+    ) -> Result<ApprovalLifecycleOutcome, ApprovalLifecycleError> {
+        let effects = self.apply_input(ApprovalLifecycleInput::CreateConsentApproval {
+            approval_id,
+            review_id,
+            approve_allowed,
+            deny_allowed,
+            has_expiry,
+        })?;
+        Self::outcome_from_effects(effects, "create_consent_approval_effect")
+    }
+
     pub fn restore_approval(
         &mut self,
         approval_id: String,
@@ -1632,6 +3902,9 @@ impl ApprovalLifecycleMachineAuthority {
         deny_allowed: bool,
         has_expiry: bool,
         decision: Option<ApprovalLifecycleDecision>,
+        consent: bool,
+        authenticated: bool,
+        consumed: bool,
     ) -> Result<ApprovalLifecycleOutcome, ApprovalLifecycleError> {
         let effects = self.apply_input(ApprovalLifecycleInput::RestoreApproval {
             approval_id,
@@ -1640,8 +3913,37 @@ impl ApprovalLifecycleMachineAuthority {
             deny_allowed,
             has_expiry,
             decision,
+            consent,
+            authenticated,
+            consumed,
         })?;
         Self::outcome_from_effects(effects, "restore_approval_effect")
+    }
+
+    pub fn reconcile_approval(
+        &mut self,
+        approval_id: String,
+        status: ApprovalLifecycleStatus,
+        approve_allowed: bool,
+        deny_allowed: bool,
+        has_expiry: bool,
+        decision: Option<ApprovalLifecycleDecision>,
+        consent: bool,
+        authenticated: bool,
+        consumed: bool,
+    ) -> Result<ApprovalLifecycleOutcome, ApprovalLifecycleError> {
+        let effects = self.apply_input(ApprovalLifecycleInput::ReconcileApproval {
+            approval_id,
+            status,
+            approve_allowed,
+            deny_allowed,
+            has_expiry,
+            decision,
+            consent,
+            authenticated,
+            consumed,
+        })?;
+        Self::outcome_from_effects(effects, "reconcile_approval_effect")
     }
 
     pub fn observe_approval_expiry(
@@ -1666,6 +3968,57 @@ impl ApprovalLifecycleMachineAuthority {
             decision,
         })?;
         Self::outcome_from_effects(effects, "decide_approval_effect")
+    }
+
+    pub fn decide_consent(
+        &mut self,
+        approval_id: String,
+        review_id: String,
+        decision: ApprovalLifecycleDecision,
+        authenticated: bool,
+    ) -> Result<ApprovalLifecycleOutcome, ApprovalLifecycleError> {
+        let effects = self.apply_input(ApprovalLifecycleInput::DecideConsent {
+            approval_id,
+            review_id,
+            decision,
+            authenticated,
+        })?;
+        Self::outcome_from_effects(effects, "decide_consent_effect")
+    }
+
+    pub fn consume_consent_for_entry(
+        &mut self,
+        approval_id: String,
+        review_id: String,
+    ) -> Result<ApprovalLifecycleOutcome, ApprovalLifecycleError> {
+        let effects = self.apply_input(ApprovalLifecycleInput::ConsumeConsentForEntry {
+            approval_id,
+            review_id,
+        })?;
+        Self::outcome_from_effects(effects, "consume_consent_for_entry_effect")
+    }
+
+    pub fn withdraw_consent(
+        &mut self,
+        approval_id: String,
+        review_id: String,
+        reason: ReviewRetirementReason,
+    ) -> Result<ApprovalLifecycleOutcome, ApprovalLifecycleError> {
+        let effects = self.apply_input(ApprovalLifecycleInput::WithdrawConsent {
+            approval_id,
+            review_id,
+            reason,
+        })?;
+        Self::outcome_from_effects(effects, "withdraw_consent_effect")
+    }
+
+    pub fn settle_unlinked_consent(
+        &mut self,
+        approval_id: String,
+    ) -> Result<ApprovalLifecycleOutcome, ApprovalLifecycleError> {
+        let effects =
+            self.apply_input(ApprovalLifecycleInput::SettleUnlinkedConsent { approval_id })?;
+        Self::outcome_from_effects(effects, "settle_unlinked_consent_effect")
     }
 
     pub fn begin_review(
@@ -1731,6 +4084,38 @@ fn is_terminal_status(status: ApprovalLifecycleStatus) -> bool {
     (status == ApprovalLifecycleStatus::Approved)
         || (status == ApprovalLifecycleStatus::Denied)
         || (status == ApprovalLifecycleStatus::Cancelled)
+}
+
+fn restored_record_valid(
+    status: ApprovalLifecycleStatus,
+    approve_allowed: bool,
+    deny_allowed: bool,
+    decision: Option<ApprovalLifecycleDecision>,
+    consent: bool,
+    authenticated: bool,
+    consumed: bool,
+) -> bool {
+    (allowed_non_empty(approve_allowed, deny_allowed))
+        && ((((status == ApprovalLifecycleStatus::Pending)
+            || (status == ApprovalLifecycleStatus::Expired)
+            || (status == ApprovalLifecycleStatus::Cancelled))
+            && (decision == None))
+            || ((status == ApprovalLifecycleStatus::Approved)
+                && (approve_allowed)
+                && (decision == Some(ApprovalLifecycleDecision::Approve)))
+            || ((status == ApprovalLifecycleStatus::Denied)
+                && (deny_allowed)
+                && (decision == Some(ApprovalLifecycleDecision::Deny))))
+        && ((authenticated == false) || (consent))
+        && ((consent == false)
+            || (((status == ApprovalLifecycleStatus::Approved)
+                || (status == ApprovalLifecycleStatus::Denied))
+                && (authenticated))
+            || ((status != ApprovalLifecycleStatus::Approved)
+                && (status != ApprovalLifecycleStatus::Denied)
+                && (authenticated == false)))
+        && ((consumed == false)
+            || ((authenticated) && (status == ApprovalLifecycleStatus::Approved)))
 }
 
 impl Default for ApprovalLifecycleMachineAuthority {

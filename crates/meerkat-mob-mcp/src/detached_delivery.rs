@@ -118,8 +118,11 @@ pub fn detached_completion_notice(
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum DetachedOwnerError {
-    /// The owner session no longer exists (archived or deleted): a
-    /// completion for it can never be delivered.
+    /// The host holds no such session now: none is registered, staged, live
+    /// or persisted (archived or deleted, or absent only for the moment).
+    /// It proves nothing on its own: a completion's row is stranded only on
+    /// the session's own lifecycle proof, otherwise it waits for a later
+    /// wake.
     #[error("the owner session is gone: {detail}")]
     OwnerGone { detail: String },
     /// The host could not make the session live now.

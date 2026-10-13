@@ -5422,6 +5422,177 @@ fn suite_spec(name: &str) -> Option<&'static Spec> {
                 all_features: false,
             },
         }),
+        "cli-realm-mcp-access-ceiling" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "CLI realm MCP access ceilings hold in fresh processes",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "rkat",
+                test_target: "system_cli_realm_mcp",
+                test_name: "integration_real_cli_realm_mcp_access_ceiling",
+                features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
+        "cli-realm-mcp-ceiling-invocation" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "CLI realm MCP ceiling refuses an unoffered call at invocation",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "rkat",
+                test_target: "system_cli_realm_mcp",
+                test_name: "integration_real_cli_realm_mcp_ceiling_refuses_invocation",
+                features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
+        "cli-realm-mcp-installation-per-agent" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "CLI governed realm MCP installation is offered only to the granted agent",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "rkat",
+                test_target: "system_cli_realm_mcp",
+                test_name: "integration_real_cli_realm_mcp_installation_does_not_grant_every_agent",
+                features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
+        "cli-realm-mcp-original-session-restart" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "CLI original session gains, keeps and loses a realm MCP connection across restarts",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "rkat",
+                test_target: "system_cli_realm_mcp",
+                test_name: "integration_real_cli_realm_mcp_original_session_across_restart",
+                features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
+        "cli-realm-mcp-per-agent-grant" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "CLI governed realm MCP installation reaches only the granted agent",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "rkat",
+                test_target: "system_cli_realm_mcp",
+                test_name: "integration_real_cli_realm_mcp_installation_does_not_grant_every_agent",
+                features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
+        "rpc-mcp-original-session-attachment" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "RPC sign-in attaches an MCP connection to the original session only",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "meerkat-rpc",
+                test_target: "realm_mcp_original_session",
+                test_name: "integration_real_rpc_mcp_original_session_attachment",
+                features: &[],
+                all_features: false,
+            },
+        }),
+        "cli-realm-mcp-missing-tool-call-local" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "CLI model call to a missing tool is call-local feedback and the turn continues",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "rkat",
+                test_target: "system_cli_realm_mcp",
+                test_name: "integration_real_cli_realm_mcp_refused_write_is_call_local_feedback",
+                features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
+        "rpc-mcp-other-realm-no-credential" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "RPC another realm gets no MCP credential of the first realm",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "meerkat-rpc",
+                test_target: "realm_mcp_original_session",
+                test_name: "integration_real_rpc_mcp_other_realm_gets_no_credential",
+                features: &[],
+                all_features: false,
+            },
+        }),
+        "rpc-mcp-sign-out-unpublishes" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "RPC sign-out unpublishes an MCP connection and sign-in restores it",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "meerkat-rpc",
+                test_target: "realm_mcp_original_session",
+                test_name: "integration_real_rpc_mcp_sign_out_revokes_original_session",
+                features: &[],
+                all_features: false,
+            },
+        }),
         "rest-resume-metadata" => Some(&Spec {
             id: None,
             lane: Lane::System,
@@ -6682,12 +6853,12 @@ mod tests {
         fifo
     }
 
-    /// The reading end of a [`backgrounding_command`]'s FIFO: typed signals,
-    /// with no polling, for "the descendant is running" (its pid arrives) and
-    /// "the descendant is gone" (end of file: the kernel closes a process's
-    /// descriptors when it exits, and the descendant holds the last writer).
-    /// A descendant that is never killed never ends, so a regression shows
-    /// as a hung test, never as a pass.
+    /// The reading end of a [`backgrounding_command`]'s FIFO. Its pid signals
+    /// readiness; EOF signals closure of the last writer, not process exit.
+    /// After EOF, the process predicate must observe exit within a five-second
+    /// retry budget starting at the first live observation. This does not bound
+    /// blocking FIFO reads or OS latency in `ps`. Closing the FIFO cannot pass
+    /// a live process.
     #[cfg(unix)]
     struct DescendantWatch {
         pid: u32,
@@ -6715,20 +6886,108 @@ mod tests {
             Self { pid, fifo }
         }
 
-        /// Block until the descendant has exited.
-        fn wait_until_gone(mut self, what: &str) {
+        /// After FIFO closure, retry the process predicate within a fixed budget.
+        fn wait_until_gone(self, what: &str) {
+            let mut deadline = None;
+            self.wait_until_gone_with(what, process_running, || {
+                let deadline = deadline
+                    .get_or_insert_with(|| std::time::Instant::now() + Duration::from_secs(5));
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                true
+            });
+        }
+
+        fn wait_until_gone_with(
+            mut self,
+            what: &str,
+            mut running: impl FnMut(u32) -> bool,
+            mut wait_again: impl FnMut() -> bool,
+        ) {
             use std::io::Read;
             let mut rest = Vec::new();
             self.fifo
                 .read_to_end(&mut rest)
                 .expect("read the pid FIFO to its end");
             assert!(rest.is_empty(), "{what}: unexpected FIFO output {rest:?}");
-            assert!(
-                !process_running(self.pid),
-                "{what}: descendant {} closed the FIFO but still runs",
-                self.pid
-            );
+            while running(self.pid) {
+                assert!(
+                    wait_again(),
+                    "{what}: descendant {} closed the FIFO but did not exit before the deadline",
+                    self.pid
+                );
+            }
         }
+    }
+
+    #[cfg(unix)]
+    fn closed_fifo_watch() -> (tempfile::TempDir, DescendantWatch) {
+        use std::io::Write;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pid_fifo = make_pid_fifo(temp.path());
+        let writer_fifo = pid_fifo.clone();
+        let writer = std::thread::spawn(move || {
+            let mut fifo = std::fs::File::create(writer_fifo).expect("open the FIFO writer");
+            writeln!(fifo, "{}", std::process::id()).expect("report the live test process");
+        });
+        let watch = DescendantWatch::open(&pid_fifo);
+        writer.join().expect("close the last FIFO writer");
+        (temp, watch)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descendant_watch_waits_for_delayed_exit_after_fifo_close() {
+        let (_temp, watch) = closed_fifo_watch();
+        let mut observations = 0;
+        let mut waits = 0;
+        watch.wait_until_gone_with(
+            "controlled delayed exit",
+            |pid| {
+                assert_eq!(pid, std::process::id());
+                observations += 1;
+                observations == 1
+            },
+            || {
+                waits += 1;
+                assert_eq!(waits, 1);
+                true
+            },
+        );
+        assert_eq!(observations, 2, "observe live, then exited");
+        assert_eq!(waits, 1, "wait only after a live observation");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descendant_watch_refuses_live_process_after_fifo_close_at_deadline() {
+        let (_temp, watch) = closed_fifo_watch();
+        let mut observations = 0;
+        let mut deadline_checks = 0;
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            watch.wait_until_gone_with(
+                "closed FIFO with a live process",
+                |pid| {
+                    observations += 1;
+                    assert_eq!(pid, std::process::id());
+                    process_running(pid)
+                },
+                || {
+                    deadline_checks += 1;
+                    deadline_checks < 2
+                },
+            );
+        }));
+        assert!(
+            failure.is_err(),
+            "FIFO closure must not accept a live process"
+        );
+        assert_eq!(observations, 2, "keep checking the actual live process");
+        assert_eq!(deadline_checks, 2, "fail only when the deadline is reached");
+        assert!(process_running(std::process::id()));
     }
 
     /// A command that outlives its timeout is killed with everything it
@@ -6779,7 +7038,8 @@ mod tests {
     /// kills it before the harness exits: nothing the command started keeps
     /// running.
     ///
-    /// Every step waits on a typed signal, never on a clock. The helper is
+    /// Readiness and harness exit use explicit signals; descendant exit uses
+    /// a bounded process-predicate retry after FIFO closure. The helper is
     /// signalled only once it is interruptible: its handler is installed
     /// before its command spawns, the command's group is registered under
     /// the same lock the handler takes, and the command reports its

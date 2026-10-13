@@ -333,6 +333,81 @@ impl RetirementArchiveObservationSource {
     }
 }
 
+/// Which members one retirement stage's commit asserts.
+///
+/// A stage's commit treats any non-current fence as lost authority: the
+/// outcome is retained unresumable and the actor fail-stops for cold replay.
+/// Asserting a wired peer on a stage whose effect never touches that peer
+/// therefore turns an unrelated roster change of the peer (a session rebind,
+/// or its own retirement settling) into a whole-mob fail-stop, although
+/// nothing about this stage's outcome became uncertain.
+///
+/// The scope narrows ONLY that commit currentness. Deferral is not scoped:
+/// every stage parks the Retire/Respawn/Reload/Wire controls of every
+/// participant captured at endpoint observation, exactly as before scoping.
+/// A peer control admitted during a self-only stage could otherwise stay
+/// active across this retirement's later endpoint observation and trust
+/// cleanup and invalidate those peer-dependent commits, and nothing redrives
+/// a stage from a peer's outcome.
+///
+/// The scope is declared explicitly at every `dispatch_retirement` call site,
+/// justified against that stage's effect body. A stage that is not clearly
+/// classified stays [`Self::WithParticipants`]. The retiring member's own
+/// exact incarnation is fenced in BOTH scopes, and `RetirementCommit` keeps
+/// every own-incarnation, placement, owner-result, prior fail-stop and
+/// spawn-rollback check unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetirementFenceScope {
+    /// The stage's effect acts only on the retiring member's own session,
+    /// runtime, host, capability, projection or pending anchors, and takes
+    /// no authority from a wired peer. Its commit asserts only the retiring
+    /// member.
+    SelfOnly,
+    /// The stage's effect acts on (or was planned from) the wired peers
+    /// captured at endpoint observation, or it is not classified as
+    /// self-only. Its commit also asserts every captured participant exactly.
+    WithParticipants,
+}
+
+/// The two member sets of one retirement stage.
+#[derive(Debug, PartialEq, Eq)]
+struct RetirementStageFences {
+    /// Asserted at commit: always the retiring member's exact incarnation,
+    /// plus every captured participant for a
+    /// [`RetirementFenceScope::WithParticipants`] stage.
+    commit: Vec<MemberFence>,
+    /// Parked while the stage is owned, whatever its scope: every captured
+    /// participant other than the retiring member, which `commit` already
+    /// parks through its own fence.
+    parked: Vec<AgentIdentity>,
+}
+
+/// Split one stage's member sets by its declared scope; see
+/// [`RetirementStageFences`].
+fn retirement_stage_fences(
+    own: MemberIncarnationFence,
+    participants: &[MemberIncarnationFence],
+    scope: RetirementFenceScope,
+) -> RetirementStageFences {
+    let peers: Vec<&MemberIncarnationFence> = participants
+        .iter()
+        .filter(|fence| fence.identity != own.identity)
+        .collect();
+    let parked = peers.iter().map(|fence| fence.identity.clone()).collect();
+    let asserted_peers: &[&MemberIncarnationFence] = match scope {
+        RetirementFenceScope::SelfOnly => &[],
+        RetirementFenceScope::WithParticipants => &peers,
+    };
+    let commit = std::iter::once(MemberFence::Exact(own))
+        .chain(
+            asserted_peers
+                .iter()
+                .map(|&fence| MemberFence::Exact(fence.clone())),
+        )
+        .collect();
+    RetirementStageFences { commit, parked }
+}
+
 struct RetirementCommit {
     identity: AgentIdentity,
     ticket: u64,
@@ -492,20 +567,26 @@ impl MobActor {
             return;
         }
         let provisioner = self.provisioner.clone();
-        self.dispatch_retirement(continuation, "retire-pending-anchor-retry", async move {
-            let mut results = Vec::new();
-            for anchor in anchors {
-                let result = provisioner
-                    .abort_member_provision(
-                        &MemberRef::from_bridge_session_id(anchor.session_id.clone()),
-                        &anchor.operation_id,
-                        &anchor.reason,
-                    )
-                    .await;
-                results.push((anchor, result));
-            }
-            RetirementObservation::PendingAnchorsRetried(results)
-        });
+        // Fence scope: self-only; retries the retiring identity's own pending provision anchors.
+        self.dispatch_retirement(
+            continuation,
+            "retire-pending-anchor-retry",
+            RetirementFenceScope::SelfOnly,
+            async move {
+                let mut results = Vec::new();
+                for anchor in anchors {
+                    let result = provisioner
+                        .abort_member_provision(
+                            &MemberRef::from_bridge_session_id(anchor.session_id.clone()),
+                            &anchor.operation_id,
+                            &anchor.reason,
+                        )
+                        .await;
+                    results.push((anchor, result));
+                }
+                RetirementObservation::PendingAnchorsRetried(results)
+            },
+        );
     }
 
     async fn retirement_pending_anchors_retried(
@@ -679,9 +760,11 @@ impl MobActor {
             return;
         };
         if slot.task.as_ref().is_some_and(|task| !task.is_finished()) {
+            // Fence scope: with participants; conservative; not classified as self-only.
             self.dispatch_retirement(
                 continuation,
                 "retire-pending-task-observation",
+                RetirementFenceScope::WithParticipants,
                 async move {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     RetirementObservation::PendingTaskObserved
@@ -729,16 +812,22 @@ impl MobActor {
         self.pending_spawn_cleanup_anchors
             .insert(anchor.spawn_ticket, anchor.clone());
         let provisioner = self.provisioner.clone();
-        self.dispatch_retirement(continuation, "retire-pending-provision-abort", async move {
-            let result = provisioner
-                .abort_member_provision(
-                    &MemberRef::from_bridge_session_id(anchor.session_id.clone()),
-                    &anchor.operation_id,
-                    &anchor.reason,
-                )
-                .await;
-            RetirementObservation::PendingAnchorAborted { anchor, result }
-        });
+        // Fence scope: self-only; aborts the retiring member's exact pending provision anchor.
+        self.dispatch_retirement(
+            continuation,
+            "retire-pending-provision-abort",
+            RetirementFenceScope::SelfOnly,
+            async move {
+                let result = provisioner
+                    .abort_member_provision(
+                        &MemberRef::from_bridge_session_id(anchor.session_id.clone()),
+                        &anchor.operation_id,
+                        &anchor.reason,
+                    )
+                    .await;
+                RetirementObservation::PendingAnchorAborted { anchor, result }
+            },
+        );
     }
 
     async fn retirement_pending_anchor_aborted(
@@ -844,15 +933,22 @@ impl MobActor {
             authority,
             display,
         });
-        self.dispatch_retirement(continuation, "retire-pending-remote-release", async move {
-            let result = super::super::placed_carrier_cleanup::realize_placed_release(
-                release,
-                provisioner.as_ref(),
-                bridge,
-            )
-            .await;
-            RetirementObservation::PendingRemoteReleased { cleanup, result }
-        });
+        // Fence scope: self-only; realizes the retiring member's own placed release/carrier
+        // obligation.
+        self.dispatch_retirement(
+            continuation,
+            "retire-pending-remote-release",
+            RetirementFenceScope::SelfOnly,
+            async move {
+                let result = super::super::placed_carrier_cleanup::realize_placed_release(
+                    release,
+                    provisioner.as_ref(),
+                    bridge,
+                )
+                .await;
+                RetirementObservation::PendingRemoteReleased { cleanup, result }
+            },
+        );
     }
 
     async fn retirement_pending_remote_released(
@@ -892,9 +988,11 @@ impl MobActor {
         let provisioner = self.provisioner.clone();
         let metadata = self.runtime_metadata.clone();
         let mob = self.definition.id.clone();
+        // Fence scope: with participants; conservative; not classified as self-only.
         self.dispatch_retirement(
             continuation,
             "retire-pending-remote-operation-cleanup",
+            RetirementFenceScope::WithParticipants,
             async move {
                 let result = async {
                     provisioner
@@ -1001,9 +1099,11 @@ impl MobActor {
         }
         let provisioner = self.provisioner.clone();
         let member = continuation.entry.member_ref.clone();
+        // Fence scope: with participants; conservative; not classified as self-only.
         self.dispatch_retirement(
             continuation,
             "retire-external-comms-observation",
+            RetirementFenceScope::WithParticipants,
             async move {
                 RetirementObservation::ExternalCommsObserved(
                     provisioner.comms_runtime(&member).await,
@@ -1053,18 +1153,25 @@ impl MobActor {
                     }
                 };
             let owner = self.dsl_authority.generated_authority_owner_token();
-            self.dispatch_retirement(continuation, "retire-external-trust-remove", async move {
-                let result = Self::apply_trusted_peer_remove_with_owner_token(
-                    comms.as_ref(),
-                    Self::trusted_peer_removal_key(&prior),
-                    authority,
-                    &owner,
-                )
-                .await
-                .map(|_| ())
-                .map_err(MobError::from);
-                RetirementObservation::ExternalTrustRemoved { edge, result }
-            });
+            // Fence scope: with participants; removes an external peer edge already advanced in
+            // generated edge state.
+            self.dispatch_retirement(
+                continuation,
+                "retire-external-trust-remove",
+                RetirementFenceScope::WithParticipants,
+                async move {
+                    let result = Self::apply_trusted_peer_remove_with_owner_token(
+                        comms.as_ref(),
+                        Self::trusted_peer_removal_key(&prior),
+                        authority,
+                        &owner,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(MobError::from);
+                    RetirementObservation::ExternalTrustRemoved { edge, result }
+                },
+            );
         } else {
             // A pending host install for this edge can never re-validate once
             // the edge leaves the graph.
@@ -1153,9 +1260,11 @@ impl MobActor {
                             }
                         };
                     let owner = self.dsl_authority.generated_authority_owner_token();
+                    // Fence scope: with participants; conservative; not classified as self-only.
                     self.dispatch_retirement(
                         continuation,
                         "retire-external-trust-rollback",
+                        RetirementFenceScope::WithParticipants,
                         async move {
                             let result = Self::apply_trusted_peer_add_with_owner_token(
                                 comms.as_ref(),
@@ -1298,7 +1407,9 @@ impl MobActor {
                     continuation.entry.role.clone(),
                 )
             });
-        self.dispatch_retirement(continuation, "retire-endpoint-observations", async move {
+        // Fence scope: with participants; observes the wired peers' endpoints that the peer
+        // stages act on.
+        self.dispatch_retirement(continuation, "retire-endpoint-observations", RetirementFenceScope::WithParticipants, async move {
             let mut endpoints = BTreeMap::new();
             for (identity, plan) in plans {
                 let endpoint = match plan {
@@ -1758,7 +1869,9 @@ impl MobActor {
             }
         }
         let kickoff_notices = std::mem::take(&mut continuation.kickoff_notices);
-        self.dispatch_retirement(continuation, "retire-local-trust-cleanup", async move {
+        // Fence scope: with participants; removes trust on every captured peer comms endpoint and
+        // sends peer notices.
+        self.dispatch_retirement(continuation, "retire-local-trust-cleanup", RetirementFenceScope::WithParticipants, async move {
             if let Some(sender) = retiring_comms.as_ref() {
                 futures::stream::iter(notice_targets)
                     .for_each_concurrent(RETIRE_LOCAL_TRUST_CLEANUP_CONCURRENCY, |target| {
@@ -1857,9 +1970,14 @@ impl MobActor {
                 }
             };
             if let Some(prepared) = preparation.into_prepared() {
-                self.dispatch_retirement(continuation, "retire-remote-trust-cleanup", async move {
-                    RetirementObservation::RemoteEdge(prepared.realize().await)
-                });
+                // Fence scope: with participants; realizes a prepared wiring plan against a
+                // captured peer runtime.
+                self.dispatch_retirement(
+                    continuation,
+                    "retire-remote-trust-cleanup",
+                    RetirementFenceScope::WithParticipants,
+                    async move { RetirementObservation::RemoteEdge(prepared.realize().await) },
+                );
                 return;
             }
         }
@@ -1999,9 +2117,11 @@ impl MobActor {
             if let Some(endpoint) = endpoint
                 && let Some(mut state) = self.controlling_acceptor.take()
             {
+                // Fence scope: with participants; conservative; not classified as self-only.
                 self.dispatch_retirement(
                     continuation,
                     "retire-acceptor-registration",
+                    RetirementFenceScope::WithParticipants,
                     async move {
                         let result = state
                             .remove_registration(&meerkat_comms::PubKey::new(endpoint.pubkey))
@@ -2056,55 +2176,62 @@ impl MobActor {
             return;
         }
         let bridge = self.supervisor_bridge.clone();
-        self.dispatch_retirement(continuation, "retire-supervisor-revoke", async move {
-            let install = match bridge.trust_recipient(&peer).await {
-                Ok(install) => install,
-                Err(error) => {
-                    return RetirementObservation::SupervisorRevoked {
-                        peer,
-                        result: RetirementRevokeObservation::InstallUncertain(error),
-                    };
+        // Fence scope: self-only; revokes the retiring member's supervisor capability; the exact
+        // recipient and result stay in the observation.
+        self.dispatch_retirement(
+            continuation,
+            "retire-supervisor-revoke",
+            RetirementFenceScope::SelfOnly,
+            async move {
+                let install = match bridge.trust_recipient(&peer).await {
+                    Ok(install) => install,
+                    Err(error) => {
+                        return RetirementObservation::SupervisorRevoked {
+                            peer,
+                            result: RetirementRevokeObservation::InstallUncertain(error),
+                        };
+                    }
+                };
+                let result = async {
+                    let authority = bridge.authority().await;
+                    let spec = bridge
+                        .supervisor_spec_for_authority_and_recipient(&authority, &peer)
+                        .await?;
+                    let command = super::super::bridge_protocol::BridgeCommand::RevokeSupervisor(
+                        super::super::bridge_protocol::BridgeSupervisorPayload {
+                            supervisor: spec.into(),
+                            epoch: authority.epoch,
+                            protocol_version: authority.protocol_version,
+                        },
+                    );
+                    let value = bridge
+                        .send_bridge_command(&peer, &command, std::time::Duration::from_secs(5))
+                        .await?;
+                    if let Some(rejection) =
+                        Self::bridge_rejection_reply(command.protocol_version(), &value)
+                    {
+                        return Err(Self::bridge_rejection_error(rejection));
+                    }
+                    super::super::bridge_protocol::decode_bridge_payload::<
+                        super::super::bridge_protocol::BridgeAck,
+                    >(&command, value, "retirement supervisor revoke")
+                    .map(|_| ())
                 }
-            };
-            let result = async {
-                let authority = bridge.authority().await;
-                let spec = bridge
-                    .supervisor_spec_for_authority_and_recipient(&authority, &peer)
-                    .await?;
-                let command = super::super::bridge_protocol::BridgeCommand::RevokeSupervisor(
-                    super::super::bridge_protocol::BridgeSupervisorPayload {
-                        supervisor: spec.into(),
-                        epoch: authority.epoch,
-                        protocol_version: authority.protocol_version,
-                    },
-                );
-                let value = bridge
-                    .send_bridge_command(&peer, &command, std::time::Duration::from_secs(5))
-                    .await?;
-                if let Some(rejection) =
-                    Self::bridge_rejection_reply(command.protocol_version(), &value)
-                {
-                    return Err(Self::bridge_rejection_error(rejection));
-                }
-                super::super::bridge_protocol::decode_bridge_payload::<
-                    super::super::bridge_protocol::BridgeAck,
-                >(&command, value, "retirement supervisor revoke")
-                .map(|_| ())
-            }
-            .await;
-            let result = match result {
-                Ok(()) => RetirementRevokeObservation::Confirmed,
-                Err(error) => {
-                    let rollback = if Self::recipient_trust_was_newly_installed(install) {
-                        bridge.untrust_recipient(&peer).await
-                    } else {
-                        Ok(())
-                    };
-                    RetirementRevokeObservation::Refused { error, rollback }
-                }
-            };
-            RetirementObservation::SupervisorRevoked { peer, result }
-        });
+                .await;
+                let result = match result {
+                    Ok(()) => RetirementRevokeObservation::Confirmed,
+                    Err(error) => {
+                        let rollback = if Self::recipient_trust_was_newly_installed(install) {
+                            bridge.untrust_recipient(&peer).await
+                        } else {
+                            Ok(())
+                        };
+                        RetirementRevokeObservation::Refused { error, rollback }
+                    }
+                };
+                RetirementObservation::SupervisorRevoked { peer, result }
+            },
+        );
     }
 
     async fn retirement_supervisor_settled(
@@ -2197,9 +2324,11 @@ impl MobActor {
         peer: TrustedPeerDescriptor,
     ) {
         let bridge = self.supervisor_bridge.clone();
+        // Fence scope: with participants; conservative; not classified as self-only.
         self.dispatch_retirement(
             continuation,
             "retire-supervisor-trust-removal",
+            RetirementFenceScope::WithParticipants,
             async move {
                 RetirementObservation::SupervisorTrustRemoved(bridge.untrust_recipient(&peer).await)
             },
@@ -2244,7 +2373,8 @@ impl MobActor {
         let metadata = self.runtime_metadata.clone();
         let mob = self.definition.id.clone();
         let entry = continuation.entry.clone();
-        self.dispatch_retirement(continuation, "retire-capability-release", async move {
+        // Fence scope: self-only; releases the retiring identity/generation's attachment records.
+        self.dispatch_retirement(continuation, "retire-capability-release", RetirementFenceScope::SelfOnly, async move {
             let result = async {
                 metadata.delete_external_binding_overlay(&mob, &entry.agent_identity, entry.generation).await?;
                 for (record, service) in prepared {
@@ -2335,9 +2465,11 @@ impl MobActor {
                 let metadata = self.runtime_metadata.clone();
                 let provisioner = self.provisioner.clone();
                 let mob = self.definition.id.clone();
+                // Fence scope: with participants; conservative; not classified as self-only.
                 self.dispatch_retirement(
                     continuation,
                     "retire-terminal-carrier-cleanup",
+                    RetirementFenceScope::WithParticipants,
                     async move {
                         let result = async {
                             provisioner
@@ -2386,18 +2518,25 @@ impl MobActor {
         let metadata = self.runtime_metadata.clone();
         let mob = self.definition.id.clone();
         let generation = continuation.entry.generation;
-        self.dispatch_retirement(continuation, "retire-projection-cleanup", async move {
-            if let Err(error) = metadata
-                .delete_external_binding_overlay(&mob, &identity, generation)
-                .await
-            {
-                return RetirementObservation::ProjectionCleaned(Err(error.into()));
-            }
-            locks.prune(identity.as_str()).await;
-            diagnostics.write().await.remove(&identity);
-            pumps.stop_pump(&identity).await;
-            RetirementObservation::ProjectionCleaned(Ok(()))
-        });
+        // Fence scope: self-only; clears the retiring identity's projection, edge-lock entries
+        // and pump.
+        self.dispatch_retirement(
+            continuation,
+            "retire-projection-cleanup",
+            RetirementFenceScope::SelfOnly,
+            async move {
+                if let Err(error) = metadata
+                    .delete_external_binding_overlay(&mob, &identity, generation)
+                    .await
+                {
+                    return RetirementObservation::ProjectionCleaned(Err(error.into()));
+                }
+                locks.prune(identity.as_str()).await;
+                diagnostics.write().await.remove(&identity);
+                pumps.stop_pump(&identity).await;
+                RetirementObservation::ProjectionCleaned(Ok(()))
+            },
+        );
     }
 
     async fn retirement_prepare_disposal(&mut self, mut continuation: RetirementContinuation) {
@@ -2461,7 +2600,8 @@ impl MobActor {
                     delivery.settled.clone()
                 })
                 .collect::<Vec<_>>();
-            self.dispatch_retirement(continuation, "retire-peer-delivery-cancellation", async move {
+            // Fence scope: with participants; settles delivery waiters owed to wired peers.
+            self.dispatch_retirement(continuation, "retire-peer-delivery-cancellation", RetirementFenceScope::WithParticipants, async move {
                 for waiter in &mut waiters {
                     loop {
                         if *waiter.borrow_and_update() { break; }
@@ -2497,9 +2637,14 @@ impl MobActor {
                 }
             };
             if let Some(prepared) = preparation.into_prepared() {
-                self.dispatch_retirement(continuation, "retire-placed-edge", async move {
-                    RetirementObservation::PlacedEdge(prepared.realize().await)
-                });
+                // Fence scope: with participants; realizes a prepared placed-edge unwire against
+                // a captured peer.
+                self.dispatch_retirement(
+                    continuation,
+                    "retire-placed-edge",
+                    RetirementFenceScope::WithParticipants,
+                    async move { RetirementObservation::PlacedEdge(prepared.realize().await) },
+                );
                 return;
             }
         }
@@ -2608,7 +2753,8 @@ impl MobActor {
         let session = continuation.entry.bridge_session_id().cloned();
         #[cfg(feature = "runtime-adapter")]
         let adapter = self.runtime_adapter.clone();
-        self.dispatch_retirement(continuation, "retire-stop-host-loop", async move {
+        // Fence scope: self-only; stops the retiring member's own host loop, kickoff and session.
+        self.dispatch_retirement(continuation, "retire-stop-host-loop", RetirementFenceScope::SelfOnly, async move {
             if let Some(handle) = handle { handle.abort_and_join().await; }
             #[cfg(feature = "runtime-adapter")]
             if autonomous && !placed
@@ -2693,17 +2839,24 @@ impl MobActor {
             };
             let provisioner = self.provisioner.clone();
             let bridge = self.supervisor_bridge.clone();
-            self.dispatch_retirement(continuation, "retire-placed-archive", async move {
-                RetirementObservation::Archived(
-                    super::super::placed_carrier_cleanup::realize_placed_release(
-                        prepared,
-                        provisioner.as_ref(),
-                        bridge,
+            // Fence scope: self-only; realizes the retiring member's exact host release
+            // reservation/carrier.
+            self.dispatch_retirement(
+                continuation,
+                "retire-placed-archive",
+                RetirementFenceScope::SelfOnly,
+                async move {
+                    RetirementObservation::Archived(
+                        super::super::placed_carrier_cleanup::realize_placed_release(
+                            prepared,
+                            provisioner.as_ref(),
+                            bridge,
+                        )
+                        .await
+                        .map(|()| mob_dsl::MemberSessionDisposal::RuntimeReleasedOnlyHostOwned),
                     )
-                    .await
-                    .map(|()| mob_dsl::MemberSessionDisposal::RuntimeReleasedOnlyHostOwned),
-                )
-            });
+                },
+            );
             return;
         }
         if Self::runtime_binding_for_entry(&continuation.entry).is_some()
@@ -2725,31 +2878,37 @@ impl MobActor {
             #[cfg(feature = "runtime-adapter")]
             adapter: self.runtime_adapter.clone(),
         };
-        self.dispatch_retirement(continuation, "retire-session-archive", async move {
-            let result = async {
-                if let Some(session) = member.bridge_session_id()
-                    && observation.already_complete(session).await?
-                {
-                    return Ok(mob_dsl::MemberSessionDisposal::Archived);
+        // Fence scope: self-only; disposes the retiring member's own exact member/session.
+        self.dispatch_retirement(
+            continuation,
+            "retire-session-archive",
+            RetirementFenceScope::SelfOnly,
+            async move {
+                let result = async {
+                    if let Some(session) = member.bridge_session_id()
+                        && observation.already_complete(session).await?
+                    {
+                        return Ok(mob_dsl::MemberSessionDisposal::Archived);
+                    }
+                    let result = provisioner
+                        .retire_member_until(&member, &identity, deadline)
+                        .await;
+                    if matches!(
+                        &result,
+                        Err(MobError::SessionError(
+                            meerkat_core::service::SessionError::NotFound { .. }
+                        ))
+                    ) && let Some(session) = member.bridge_session_id()
+                        && observation.already_complete(session).await?
+                    {
+                        return Ok(mob_dsl::MemberSessionDisposal::Archived);
+                    }
+                    result
                 }
-                let result = provisioner
-                    .retire_member_until(&member, &identity, deadline)
-                    .await;
-                if matches!(
-                    &result,
-                    Err(MobError::SessionError(
-                        meerkat_core::service::SessionError::NotFound { .. }
-                    ))
-                ) && let Some(session) = member.bridge_session_id()
-                    && observation.already_complete(session).await?
-                {
-                    return Ok(mob_dsl::MemberSessionDisposal::Archived);
-                }
-                result
-            }
-            .await;
-            RetirementObservation::Archived(result)
-        });
+                .await;
+                RetirementObservation::Archived(result)
+            },
+        );
     }
 
     fn retirement_observe_route(&mut self, continuation: RetirementContinuation) {
@@ -2757,48 +2916,55 @@ impl MobActor {
         let service = self.session_service.clone();
         #[cfg(feature = "runtime-adapter")]
         let adapter = self.runtime_adapter.clone();
-        self.dispatch_retirement(continuation, "retire-route-observation", async move {
-            let result = async {
-                let Some(session) = session else {
-                    return Ok(RetirementRouteObservation {
-                        archive_complete: false,
-                        exact_local_target_quiescent: false,
-                    });
-                };
-                if service.has_live_session(&session).await?
-                    || service.load_persisted_session(&session).await?.is_some()
-                {
-                    return Ok(RetirementRouteObservation {
-                        archive_complete: false,
-                        exact_local_target_quiescent: false,
-                    });
+        // Fence scope: self-only; observes the retiring member's own session/runtime/archive
+        // attachment.
+        self.dispatch_retirement(
+            continuation,
+            "retire-route-observation",
+            RetirementFenceScope::SelfOnly,
+            async move {
+                let result = async {
+                    let Some(session) = session else {
+                        return Ok(RetirementRouteObservation {
+                            archive_complete: false,
+                            exact_local_target_quiescent: false,
+                        });
+                    };
+                    if service.has_live_session(&session).await?
+                        || service.load_persisted_session(&session).await?.is_some()
+                    {
+                        return Ok(RetirementRouteObservation {
+                            archive_complete: false,
+                            exact_local_target_quiescent: false,
+                        });
+                    }
+                    #[cfg(feature = "runtime-adapter")]
+                    let (runtime_absent, attachment_absent) = match adapter {
+                        Some(adapter) => (
+                            !adapter
+                                .archive_runtime_residue_present(&session)
+                                .await
+                                .map_err(|error| MobError::Internal(error.to_string()))?,
+                            adapter
+                                .current_executor_attachment_witness(&session)
+                                .await
+                                .is_none(),
+                        ),
+                        None => (true, false),
+                    };
+                    #[cfg(not(feature = "runtime-adapter"))]
+                    let (runtime_absent, attachment_absent) = (true, false);
+                    let archive_complete = runtime_absent
+                        && service.session_known_to_archive_authority(&session).await?;
+                    Ok(RetirementRouteObservation {
+                        archive_complete,
+                        exact_local_target_quiescent: runtime_absent && attachment_absent,
+                    })
                 }
-                #[cfg(feature = "runtime-adapter")]
-                let (runtime_absent, attachment_absent) = match adapter {
-                    Some(adapter) => (
-                        !adapter
-                            .archive_runtime_residue_present(&session)
-                            .await
-                            .map_err(|error| MobError::Internal(error.to_string()))?,
-                        adapter
-                            .current_executor_attachment_witness(&session)
-                            .await
-                            .is_none(),
-                    ),
-                    None => (true, false),
-                };
-                #[cfg(not(feature = "runtime-adapter"))]
-                let (runtime_absent, attachment_absent) = (true, false);
-                let archive_complete =
-                    runtime_absent && service.session_known_to_archive_authority(&session).await?;
-                Ok(RetirementRouteObservation {
-                    archive_complete,
-                    exact_local_target_quiescent: runtime_absent && attachment_absent,
-                })
-            }
-            .await;
-            RetirementObservation::RouteObserved(result)
-        });
+                .await;
+                RetirementObservation::RouteObserved(result)
+            },
+        );
     }
 
     async fn retirement_route_observed(
@@ -2905,11 +3071,19 @@ impl MobActor {
                 context: context.clone(),
             },
         };
-        self.dispatch_retirement(continuation, "retire-runtime-route", async move {
-            let result =
-                super::super::composition::dispatch_routed_effect(&binding, effect.clone()).await;
-            RetirementObservation::Routed { effect, result }
-        });
+        // Fence scope: self-only; routes RequestRuntimeRetire filtered to the retiring member's
+        // runtime.
+        self.dispatch_retirement(
+            continuation,
+            "retire-runtime-route",
+            RetirementFenceScope::SelfOnly,
+            async move {
+                let result =
+                    super::super::composition::dispatch_routed_effect(&binding, effect.clone())
+                        .await;
+                RetirementObservation::Routed { effect, result }
+            },
+        );
     }
 
     async fn retirement_route_settled(
@@ -3191,50 +3365,57 @@ impl MobActor {
             .flatten();
         #[cfg(feature = "runtime-adapter")]
         let adapter = self.runtime_adapter.clone();
-        self.dispatch_retirement(continuation, "retire-ingress-detach", async move {
-            let result = async {
-                #[cfg(test)]
-                if let Some(session_id) = session.as_ref()
-                    && let Ok(mut target) = FAIL_SESSION_INGRESS_DETACH_FOR_SESSION.lock()
-                    && target.as_ref() == Some(session_id)
-                {
-                    target.take();
-                    return Err(MobError::Internal(format!(
-                        "fault-injected session-ingress detach failure for {session_id}"
-                    )));
-                }
-                #[cfg(feature = "runtime-adapter")]
-                if let (Some(adapter), Some(session)) = (adapter, session.as_ref()) {
-                    match adapter
-                        .update_peer_ingress_context(session, false, None)
-                        .await
+        // Fence scope: self-only; detaches the retiring member's exact runtime
+        // attachment/ingress.
+        self.dispatch_retirement(
+            continuation,
+            "retire-ingress-detach",
+            RetirementFenceScope::SelfOnly,
+            async move {
+                let result = async {
+                    #[cfg(test)]
+                    if let Some(session_id) = session.as_ref()
+                        && let Ok(mut target) = FAIL_SESSION_INGRESS_DETACH_FOR_SESSION.lock()
+                        && target.as_ref() == Some(session_id)
                     {
-                        Ok(_)
-                        | Err(
-                            meerkat_runtime::RuntimeDriverError::NotFound { .. }
-                            | meerkat_runtime::RuntimeDriverError::Destroyed
-                            | meerkat_runtime::RuntimeDriverError::NotReady { .. },
-                        ) => {}
-                        Err(error) => {
+                        target.take();
+                        return Err(MobError::Internal(format!(
+                            "fault-injected session-ingress detach failure for {session_id}"
+                        )));
+                    }
+                    #[cfg(feature = "runtime-adapter")]
+                    if let (Some(adapter), Some(session)) = (adapter, session.as_ref()) {
+                        match adapter
+                            .update_peer_ingress_context(session, false, None)
+                            .await
+                        {
+                            Ok(_)
+                            | Err(
+                                meerkat_runtime::RuntimeDriverError::NotFound { .. }
+                                | meerkat_runtime::RuntimeDriverError::Destroyed
+                                | meerkat_runtime::RuntimeDriverError::NotReady { .. },
+                            ) => {}
+                            Err(error) => {
+                                return Err(MobError::Internal(format!(
+                                    "failed to detach peer ingress for session {session}: {error}"
+                                )));
+                            }
+                        }
+                        let owner = adapter.peer_ingress_owner(session).await;
+                        if !matches!(owner, meerkat_runtime::PeerIngressOwner::Unattached) {
                             return Err(MobError::Internal(format!(
-                                "failed to detach peer ingress for session {session}: {error}"
+                                "peer ingress owner remained attached after detach: {owner:?}"
                             )));
                         }
                     }
-                    let owner = adapter.peer_ingress_owner(session).await;
-                    if !matches!(owner, meerkat_runtime::PeerIngressOwner::Unattached) {
-                        return Err(MobError::Internal(format!(
-                            "peer ingress owner remained attached after detach: {owner:?}"
-                        )));
-                    }
+                    #[cfg(not(feature = "runtime-adapter"))]
+                    let _ = session;
+                    Ok(())
                 }
-                #[cfg(not(feature = "runtime-adapter"))]
-                let _ = session;
-                Ok(())
-            }
-            .await;
-            RetirementObservation::IngressDetached(result)
-        });
+                .await;
+                RetirementObservation::IngressDetached(result)
+            },
+        );
     }
 
     async fn retirement_detach_settled(
@@ -3488,13 +3669,23 @@ impl MobActor {
                 return;
             }
             let mut tasks = std::mem::take(&mut self.member_live_mutation_tasks);
-            self.dispatch_retirement(continuation, "retire-live-mutation-drain", async move {
-                let mut completed = Vec::new();
-                while let Some(joined) = tasks.join_next().await {
-                    completed.push(joined);
-                }
-                RetirementObservation::LiveMutations(completed)
-            });
+            // Fence scope: self-only; drains every member-live mutation task, not only this
+            // member's, but grants no new peer authorization: each drained operation keeps its
+            // own exact-target currentness and cleanup checks (a stale Open goes to exact-channel
+            // cleanup, an ambiguous Control is preserved, cleanup obligations are retained) and
+            // the outstanding-cleanup refusal below still applies.
+            self.dispatch_retirement(
+                continuation,
+                "retire-live-mutation-drain",
+                RetirementFenceScope::SelfOnly,
+                async move {
+                    let mut completed = Vec::new();
+                    while let Some(joined) = tasks.join_next().await {
+                        completed.push(joined);
+                    }
+                    RetirementObservation::LiveMutations(completed)
+                },
+            );
         }
     }
 
@@ -3516,7 +3707,9 @@ impl MobActor {
         let adapter = self.runtime_adapter.clone();
         #[cfg(feature = "runtime-adapter")]
         let ops = self.session_ops_adapter.clone();
-        self.dispatch_retirement(continuation, "retire-runtime-quiesce", async move {
+        // Fence scope: self-only; quiesces the retiring member's own session turn and member
+        // comms.
+        self.dispatch_retirement(continuation, "retire-runtime-quiesce", RetirementFenceScope::SelfOnly, async move {
             let result = async {
                 #[cfg(feature = "runtime-adapter")]
                 if let Some(session) = session.as_ref() {
@@ -3595,33 +3788,42 @@ impl MobActor {
                     };
                     let bridge = self.supervisor_bridge.clone();
                     let host = self.member_live_host.clone();
-                    self.dispatch_retirement(continuation, "retire-live-close", async move {
-                        let result = async {
-                            let Some(target) = target else { return Ok(()) };
-                            let status = match Self::member_live_status_for_target_owned(
-                                &bridge,
-                                host.as_ref(),
-                                &target,
-                            )
-                            .await
-                            {
-                                Ok(status) => status,
-                                Err(error) if Self::member_live_status_proves_absent(&error) => {
-                                    return Ok(());
-                                }
-                                Err(error) => return Err(error),
-                            };
-                            Self::close_exact_member_live_channel_owned(
-                                bridge,
-                                host,
-                                target,
-                                status.channel_id,
-                            )
-                            .await
-                        }
-                        .await;
-                        RetirementObservation::LiveClosed(result)
-                    });
+                    // Fence scope: self-only; closes the exact selected member-live
+                    // target/channel.
+                    self.dispatch_retirement(
+                        continuation,
+                        "retire-live-close",
+                        RetirementFenceScope::SelfOnly,
+                        async move {
+                            let result = async {
+                                let Some(target) = target else { return Ok(()) };
+                                let status = match Self::member_live_status_for_target_owned(
+                                    &bridge,
+                                    host.as_ref(),
+                                    &target,
+                                )
+                                .await
+                                {
+                                    Ok(status) => status,
+                                    Err(error)
+                                        if Self::member_live_status_proves_absent(&error) =>
+                                    {
+                                        return Ok(());
+                                    }
+                                    Err(error) => return Err(error),
+                                };
+                                Self::close_exact_member_live_channel_owned(
+                                    bridge,
+                                    host,
+                                    target,
+                                    status.channel_id,
+                                )
+                                .await
+                            }
+                            .await;
+                            RetirementObservation::LiveClosed(result)
+                        },
+                    );
                 })
             }
             RetirementObservation::LiveClosed(result) => boxed_arm_future(move || async move {
@@ -3939,6 +4141,7 @@ impl MobActor {
         &mut self,
         mut continuation: RetirementContinuation,
         context: &'static str,
+        scope: RetirementFenceScope,
         effect: impl std::future::Future<Output = RetirementObservation>
         + super::member_effect_lane::MemberEffectSend
         + 'static,
@@ -3949,42 +4152,54 @@ impl MobActor {
         continuation.ticket = ticket;
         self.retirement_enter_stage(&mut continuation, context);
         let interrupt = continuation.interrupt.clone();
-        let mut members = vec![MemberIncarnationFence::from_entry(&continuation.entry)];
-        members.extend(
-            continuation
-                .participants
-                .iter()
-                .filter(|fence| fence.identity != continuation.entry.agent_identity)
-                .cloned(),
+        // Deferral and commit currentness stay separate: the lane parks every
+        // captured participant for every stage, and the commit asserts only
+        // the members the stage's declared scope names.
+        let RetirementStageFences { commit, parked } = retirement_stage_fences(
+            MemberIncarnationFence::from_entry(&continuation.entry),
+            &continuation.participants,
+            scope,
         );
         self.retirements.insert(identity.clone(), continuation);
         let commit_identity = identity.clone();
-        self.dispatch_member_effect(MemberEffectRequest {
-            context,
-            members: members.into_iter().map(MemberFence::Exact).collect(),
-            effects: Box::pin(async move {
-                // A cooperative interrupt (mob Shutdown) ends the stage at
-                // its next await point; the commit then reports the stage as
-                // interrupted rather than as a stage without a result.
-                let observation = tokio::select! {
-                    biased;
-                    () = interrupt.cancelled() => None,
-                    observation = effect => Some(observation),
-                };
-                Box::new(RetirementCommit {
-                    identity: commit_identity,
+        #[cfg(test)]
+        let held = super::retirement_stage_hold::take(&identity, context);
+        self.dispatch_member_effect_parking(
+            MemberEffectRequest {
+                context,
+                members: commit,
+                effects: Box::pin(async move {
+                    #[cfg(test)]
+                    let effect = async move {
+                        if let Some(held) = held {
+                            held.hold().await;
+                        }
+                        effect.await
+                    };
+                    // A cooperative interrupt (mob Shutdown) ends the stage at
+                    // its next await point; the commit then reports the stage
+                    // as interrupted rather than as a stage without a result.
+                    let observation = tokio::select! {
+                        biased;
+                        () = interrupt.cancelled() => None,
+                        observation = effect => Some(observation),
+                    };
+                    Box::new(RetirementCommit {
+                        identity: commit_identity,
+                        ticket,
+                        interrupted: observation.is_none(),
+                        observation,
+                    }) as Box<dyn MemberEffectCommit>
+                }),
+                unsettled_commit: Box::new(RetirementCommit {
+                    identity,
                     ticket,
-                    interrupted: observation.is_none(),
-                    observation,
-                }) as Box<dyn MemberEffectCommit>
-            }),
-            unsettled_commit: Box::new(RetirementCommit {
-                identity,
-                ticket,
-                interrupted: false,
-                observation: None,
-            }),
-        });
+                    interrupted: false,
+                    observation: None,
+                }),
+            },
+            parked,
+        );
     }
 
     /// Record that `continuation` dispatches `context` next: log the settled
@@ -4582,9 +4797,11 @@ impl MobActor {
                     }
                 }
                 Ok(wiring_io::WiringPreparation::Prepared(prepared)) => {
+                    // Fence scope: with participants; spawn rollback keeps its fencing unchanged.
                     self.dispatch_retirement(
                         continuation,
                         "spawn-rollback-placed-unwire",
+                        RetirementFenceScope::WithParticipants,
                         async move {
                             RetirementObservation::SpawnRollback(
                                 SpawnRollbackObservation::PlacedTrust(prepared.realize().await),
@@ -4612,7 +4829,13 @@ impl MobActor {
         }
         let result = self.prepare_spawn_rollback_step(&mut continuation);
         match result {
-            Ok(Some(effect)) => self.dispatch_retirement(continuation, "spawn-rollback", effect),
+            // Fence scope: with participants; spawn rollback keeps its fencing unchanged.
+            Ok(Some(effect)) => self.dispatch_retirement(
+                continuation,
+                "spawn-rollback",
+                RetirementFenceScope::WithParticipants,
+                effect,
+            ),
             Ok(None) => {
                 let phase = continuation
                     .rollback
@@ -5306,9 +5529,11 @@ impl MobActor {
             let role = continuation.entry.role.clone();
             let description = rollback.peer_description.clone();
             let spec = endpoint.spec.clone();
+            // Fence scope: with participants; spawn rollback keeps its fencing unchanged.
             self.dispatch_retirement(
                 continuation,
                 "spawn-rollback-notice-compensation",
+                RetirementFenceScope::WithParticipants,
                 async move {
                     let result = async {
                         let params = meerkat_contracts::CommsPeerLifecycleParams {
@@ -5350,6 +5575,49 @@ impl MobActor {
 mod tests {
     use super::*;
     use crate::ids::{FenceToken, Generation};
+
+    fn incarnation_fence(identity: &str) -> MemberIncarnationFence {
+        let identity = AgentIdentity::from(identity);
+        MemberIncarnationFence {
+            agent_runtime_id: AgentRuntimeId::initial(identity.clone()),
+            identity,
+            generation: Generation::INITIAL,
+            fence_token: FenceToken::new(1),
+            member_ref: MemberRef::from_bridge_session_id(SessionId::new()),
+        }
+    }
+
+    /// The declared scope narrows only what a stage's commit asserts: a
+    /// self-only stage asserts only the retiring member, so a wired peer's
+    /// roster change cannot make its outcome non-current, and a stage that
+    /// acts on peers keeps the previous fence set (the retiring member first,
+    /// then every captured participant, never the member twice). The park
+    /// set is the same for both scopes: every captured participant stays
+    /// parked, and the retiring member is parked through its own fence.
+    #[test]
+    fn retirement_stage_parks_every_participant_and_scopes_only_commit_fences() {
+        let own = incarnation_fence("retiring");
+        let peer = incarnation_fence("peer");
+        let participants = vec![own.clone(), peer.clone()];
+        assert_eq!(
+            retirement_stage_fences(own.clone(), &participants, RetirementFenceScope::SelfOnly),
+            RetirementStageFences {
+                commit: vec![MemberFence::Exact(own.clone())],
+                parked: vec![peer.identity.clone()],
+            }
+        );
+        assert_eq!(
+            retirement_stage_fences(
+                own.clone(),
+                &participants,
+                RetirementFenceScope::WithParticipants
+            ),
+            RetirementStageFences {
+                commit: vec![MemberFence::Exact(own), MemberFence::Exact(peer.clone())],
+                parked: vec![peer.identity],
+            }
+        );
+    }
 
     #[tokio::test]
     async fn respawn_receipt_matches_sanitized_peer_address_without_accepting_a_successor() {

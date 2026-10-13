@@ -233,8 +233,15 @@ fn selected(template: &Input, model: &str, account: &str) -> ControllerModelSele
         .controller_model
         .as_ref()
         .expect("controller");
+    // Scoped to the template's own fixture account: the credential lease is
+    // process-wide, and concurrently running tests must not share one.
+    let template_account =
+        serde_json::to_value(old.credential()).expect("credential identity")["account"]
+            .as_str()
+            .expect("fixture account")
+            .to_owned();
     let credential: AuthCredentialIdentity = serde_json::from_value(serde_json::json!({
-        "realm": "native-test", "account": account,
+        "realm": "native-test", "account": format!("{account}-{template_account}"),
     }))
     .expect("real credential identity");
     ControllerModelSelection::new(

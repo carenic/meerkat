@@ -1109,7 +1109,8 @@ mod mob_realm_shell_delivery {
         let factory = AgentFactory::new(temp.path().join("sessions")).shell(true);
         let mut builder = FactoryAgentBuilder::new(factory, Config::default());
         builder.default_llm_client = Some(Arc::new(BackgroundShellScript::new()));
-        let (service, adapter) = build_runtime_backed_service(builder, 4, persistence);
+        let (service, adapter) = build_runtime_backed_service(builder, 4, persistence)
+            .expect("compose the runtime-backed service");
         let service: Arc<PersistentSessionService<FactoryAgentBuilder>> = Arc::new(service);
 
         let mob_realm = meerkat_core::mob_realm_id("test-mob").expect("mob realm id");

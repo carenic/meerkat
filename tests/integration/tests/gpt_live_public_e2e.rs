@@ -480,6 +480,7 @@ fn scenario_config() -> Config {
         binding: BTreeMap::new(),
         default_binding: Some(BINDING.to_string()),
         parent: None,
+        connector_client: BTreeMap::new(),
     };
     section.backend.insert(
         "openai_api".to_string(),
@@ -1134,7 +1135,7 @@ struct PublicLiveOpen<'a> {
     instructions_preface:
         Option<Arc<dyn meerkat::experimental_gpt_live::PublicGptLiveInstructionsPreface>>,
     /// Open (and reopen) with a concurrent bootstrap summary of the session's
-    /// canonical history, ungated, composed like the MobKit console's live
+    /// canonical history, ungated, composed like the Meta console's live
     /// host (factory summarizer, 4 MiB / 16 KiB / 60 s, `Concurrent`).
     /// Requires `evidence`; implies unmeasured playback.
     summary_bootstrap: bool,
@@ -1198,7 +1199,7 @@ async fn open_public_live_with(
     ));
     let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
     // A real WorkGraph store: the mob state rescopes it to the mob's realm
-    // (`mob.<id>`, default namespace) exactly as MobKit does, so live
+    // (`mob.<id>`, default namespace) exactly as Meta does, so live
     // delegation schedules through WorkGraph items (parallel mode) instead
     // of the DisabledWorkGraphStore serial fallback.
     let persistence = meerkat::PersistenceBundle::new_with_subsystem_stores(
@@ -1209,14 +1210,17 @@ async fn open_public_live_with(
         Arc::new(meerkat::MemoryWorkGraphStore::new()),
     )
     .expect("construct runtime authority");
-    let runtime = Arc::new(SessionRuntime::new_with_config_store(
-        factory.clone(),
-        config.clone(),
-        Arc::clone(&config_store),
-        16,
-        persistence,
-        NotificationSink::noop(),
-    ));
+    let runtime = Arc::new(
+        SessionRuntime::new_with_config_store(
+            factory.clone(),
+            config.clone(),
+            Arc::clone(&config_store),
+            16,
+            persistence,
+            NotificationSink::noop(),
+        )
+        .expect("compose the RPC session runtime"),
+    );
     runtime.set_realm_context(
         Some(binding.realm.clone()),
         None,
@@ -9090,7 +9094,7 @@ fn s104_policy() -> LiveDelegationExecutionPolicy {
 }
 
 /// Scenario 104: the session has typed history, the channel opens with a
-/// concurrent bootstrap summary (the MobKit console's composition), the
+/// concurrent bootstrap summary (the Meta console's composition), the
 /// user says nothing for 4 s (no fresh greeting allowed), starts a 20 s job
 /// by voice, the live channel is closed while it runs, a typed turn lands
 /// during the closure, then the channel reopens on the same session with a
@@ -9155,7 +9159,7 @@ async fn run_s104_handoff_voice_typed_voice(
         execution_policy: s104_policy(),
         bootstrap: None,
         // History is present before the first open, and the open requests a
-        // concurrent bootstrap summary of it: the composition the MobKit
+        // concurrent bootstrap summary of it: the composition the Meta
         // console uses, where the fresh-greeting regression was reported.
         seed_prompt: Some(format!(
             "For the record: the team mascot is a heron named {S104_SEED_TOKEN}. \

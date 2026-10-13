@@ -895,16 +895,26 @@ async fn memory_persistent_direct_accept_holds_credential_until_real_row_commit(
     store.block_next_atomic_input_persist(Arc::clone(&entered), release);
     // No test-owned credential guard: exercise the actual driver's acquisition
     // and continuation through its awaited physical row write.
-    let accepted = tokio::spawn(async move {
+    let mut accepted = tokio::spawn(async move {
         let mut locked = driver.lock().await;
         let DriverEntry::Persistent(persistent) = &mut *locked else {
             panic!("actual persistent driver")
         };
         persistent.accept_input(prompt).await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
-        .await
-        .expect("actual row commit reached");
+    let entry = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::select! {
+            () = entered.notified() => None,
+            result = &mut accepted => Some(result),
+        }
+    })
+    .await;
+    if !matches!(entry, Ok(None)) {
+        // Release the real store gate before reporting an early admission
+        // result or a timeout; neither establishes that the row write began.
+        drop(release_on_exit);
+        panic!("actual row commit was not reached: {entry:?}");
+    }
     let during = meerkat_core::try_acquire_auth_login_lifecycle_guard(&lease);
     let retained = during.is_none();
     drop(during);
@@ -942,4 +952,479 @@ async fn memory_persistent_direct_accept_holds_credential_until_real_row_commit(
         "completed acceptance released its own lease claim"
     );
     drop(after);
+}
+
+/// With required scoped destinations, governed work recovered after a
+/// restart stays queued (unstageable) until the registration owner binds the
+/// document's destination again, then it is the next selected batch.
+#[tokio::test]
+async fn memory_persistent_required_destination_holds_recovered_work_until_rebound() {
+    use crate::meerkat_machine::dsl::command_capabilities::AuthorizedRuntimeLoopBatch;
+    let store = InMemoryRuntimeStore::new();
+    let required = || {
+        let (mut configuration, prompt, domain) = configuration();
+        configuration.require_scoped_destination = true;
+        (configuration, prompt, domain)
+    };
+    let (configuration, mut prompt, _domain) = required();
+    let machine = MeerkatMachine::persistent_with_local_grant_authorization(
+        Arc::new(store.clone()),
+        Some(Arc::new(MemoryBlobStore::new())),
+        configuration,
+    )
+    .unwrap();
+    let session = SessionId::new();
+    machine.register_session(session.clone()).await.unwrap();
+    let runtime = LogicalRuntimeId::for_session(&session);
+    let observed = Arc::clone(prompt.header().ingress_context.as_ref().unwrap());
+    let mut candidate = prompt
+        .header()
+        .authority_association
+        .as_ref()
+        .unwrap()
+        .candidate()
+        .clone();
+    candidate.target.logical_runtime = EvidenceId::new(runtime.to_string()).unwrap();
+    let target = candidate.target.clone();
+    let selection = candidate.controller_model.clone().unwrap();
+    prompt.header_mut().authority_association =
+        Some(InputAuthorityAssociation::new(candidate).unwrap());
+    let ingress = NativeIngressContext::from_trusted_ingress(
+        &prompt,
+        observed.requester().clone(),
+        observed.ingress_actor().clone(),
+        observed.realm().clone(),
+        observed.authentication().clone(),
+    )
+    .unwrap()
+    .with_controller_client(
+        &prompt,
+        ControllerModelClient::new(selection.clone(), Arc::new(SelectedClient(selection))),
+    )
+    .unwrap();
+    let prompt = prompt.with_ingress_context(ingress).unwrap();
+    let id = prompt.id().clone();
+    let registration = machine
+        .current_session_registration_witness(&session)
+        .await
+        .unwrap();
+    machine
+        .bind_scoped_context(&registration, &target)
+        .await
+        .expect("bind the destination");
+    install_owner_fixture_credential(&machine, &prompt);
+    let custody = crate::meerkat_machine::credential_custody::NativeCredentialCustody::acquire(
+        &machine.native_work_authorization_host,
+        &prompt,
+        true,
+    )
+    .await
+    .unwrap();
+    {
+        let shared_driver =
+            Arc::clone(&machine.sessions.read().await.get(&session).unwrap().driver);
+        let mut driver = shared_driver.lock().await;
+        let DriverEntry::Persistent(persistent) = &mut *driver else {
+            panic!("actual persistent driver required")
+        };
+        persistent
+            .inner_mut()
+            .set_executor_work_authorization_support(true);
+        let resolved = persistent.resolve_admission(&prompt).unwrap();
+        persistent
+            .accept_resolved_input_with_credential(prompt, resolved, &custody)
+            .await
+            .expect("admitted for the bound destination");
+    }
+    drop(custody);
+    drop(registration);
+    drop(machine);
+
+    let reopened = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match MeerkatMachine::persistent_with_local_grant_authorization(
+                Arc::new(store.clone()),
+                Some(Arc::new(MemoryBlobStore::new())),
+                required().0,
+            ) {
+                Ok(machine) => return machine,
+                Err(RuntimeDriverError::ControllerReadinessUnavailable {
+                    reason: ControllerReadinessFailure::Busy,
+                }) => tokio::task::yield_now().await,
+                Err(error) => panic!("reopen failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("quiescent reopen");
+    // The durable row keeps its original destination witness; read
+    // detached (no live registration) its result is not disclosable.
+    let stored = reopened
+        .durable_input_witness_by_id(&session, &id)
+        .await
+        .unwrap()
+        .expect("durable row");
+    assert_eq!(
+        stored.state.scoped_destination,
+        crate::input_state::ScopedDestinationWitness::Bound {
+            binding: crate::input_authority::context_target_binding(&target).unwrap(),
+        }
+    );
+    assert!(
+        !reopened
+            .stored_result_disclosure_permitted(&session, &stored.state)
+            .await,
+        "a detached durable read has no current destination"
+    );
+    reopened.register_session(session.clone()).await.unwrap();
+    assert!(
+        !reopened
+            .stored_result_disclosure_permitted(&session, &stored.state)
+            .await,
+        "an attached durable read before the destination is bound again"
+    );
+    let state = || async {
+        let shared_driver =
+            Arc::clone(&reopened.sessions.read().await.get(&session).unwrap().driver);
+        let driver = shared_driver.lock().await;
+        let authority = driver.shared_dsl_authority();
+        let guard = authority.lock().unwrap();
+        guard.state().clone()
+    };
+    let recovered = state().await;
+    assert!(
+        recovered.input_lane.contains_key(&id.to_string()),
+        "the governed input was recovered and stays queued"
+    );
+    assert!(
+        AuthorizedRuntimeLoopBatch::authorize_runtime_loop_batch_from_state(&recovered).is_none(),
+        "no destination is bound yet after the restart"
+    );
+    let registration = reopened
+        .current_session_registration_witness(&session)
+        .await
+        .unwrap();
+    reopened
+        .bind_scoped_context(&registration, &target)
+        .await
+        .expect("the registration owner binds the destination again");
+    assert!(
+        reopened
+            .stored_result_disclosure_permitted(&session, &stored.state)
+            .await,
+        "an attached durable read under the original destination, bound again"
+    );
+    let rebound = state().await;
+    let (_, selected, _) =
+        AuthorizedRuntimeLoopBatch::authorize_runtime_loop_batch_from_state(&rebound)
+            .expect("the recovered work is selectable under its destination")
+            .into_parts();
+    assert_eq!(selected, vec![id.to_string()]);
+}
+
+/// A persistent owner's early pre-admission check carries no replay verdict,
+/// and its decisive check after the durable lookup carries
+/// FirstAuthentication. A host that permits the undecided early check but
+/// denies the decisive first authentication leaves no Accepted input: no
+/// live row and no durable row.
+#[tokio::test]
+async fn memory_persistent_decisive_first_authentication_denial_admits_nothing() {
+    use crate::input_authority::NativeReplayLookup;
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let store = InMemoryRuntimeStore::new();
+    let (mut configuration, mut prompt, _) = configuration();
+    let seen = Arc::clone(&observed);
+    configuration.ingress = Arc::new(move |_, _, ingress, _| {
+        seen.lock().unwrap().push(ingress.replay_lookup().cloned());
+        match ingress.replay_lookup() {
+            Some(NativeReplayLookup::FirstAuthentication) => Err(denied().into()),
+            _ => Ok(()),
+        }
+    });
+    let machine = MeerkatMachine::persistent_with_local_grant_authorization(
+        Arc::new(store.clone()),
+        Some(Arc::new(MemoryBlobStore::new())),
+        configuration,
+    )
+    .unwrap();
+    let session = SessionId::new();
+    machine.register_session(session.clone()).await.unwrap();
+    let runtime = LogicalRuntimeId::for_session(&session);
+    let ingress = Arc::clone(prompt.header().ingress_context.as_ref().unwrap());
+    let mut candidate = prompt
+        .header()
+        .authority_association
+        .as_ref()
+        .unwrap()
+        .candidate()
+        .clone();
+    candidate.target.logical_runtime = EvidenceId::new(runtime.to_string()).unwrap();
+    let selection = candidate.controller_model.clone().unwrap();
+    prompt.header_mut().authority_association =
+        Some(InputAuthorityAssociation::new(candidate).unwrap());
+    let context = NativeIngressContext::from_trusted_ingress(
+        &prompt,
+        ingress.requester().clone(),
+        ingress.ingress_actor().clone(),
+        ingress.realm().clone(),
+        ingress.authentication().clone(),
+    )
+    .unwrap()
+    .with_controller_client(
+        &prompt,
+        ControllerModelClient::new(selection.clone(), Arc::new(SelectedClient(selection))),
+    )
+    .unwrap();
+    let prompt = prompt.with_ingress_context(context).unwrap();
+    install_owner_fixture_credential(&machine, &prompt);
+    let custody = crate::meerkat_machine::credential_custody::NativeCredentialCustody::acquire(
+        &machine.native_work_authorization_host,
+        &prompt,
+        true,
+    )
+    .await
+    .unwrap();
+    let shared_driver = Arc::clone(&machine.sessions.read().await.get(&session).unwrap().driver);
+    let mut driver = shared_driver.lock().await;
+    let DriverEntry::Persistent(persistent) = &mut *driver else {
+        panic!("actual persistent driver required")
+    };
+    persistent
+        .inner_mut()
+        .set_executor_work_authorization_support(true);
+    let resolved = persistent.resolve_admission(&prompt).unwrap();
+    let result = persistent
+        .accept_resolved_input_with_credential(prompt, resolved, &custody)
+        .await;
+    assert!(
+        matches!(result, Err(RuntimeDriverError::InputRefused { .. })),
+        "the decisive first authentication is denied: {result:?}"
+    );
+    let verdicts = observed.lock().unwrap().clone();
+    assert_eq!(
+        verdicts.first(),
+        Some(&None),
+        "the early check is undecided and permitted"
+    );
+    assert_eq!(
+        verdicts.last(),
+        Some(&Some(NativeReplayLookup::FirstAuthentication)),
+        "the decisive check is a first authentication"
+    );
+    assert!(persistent.active_input_ids().is_empty(), "no live row");
+    drop(driver);
+    assert!(
+        store.load_input_states(&runtime).await.unwrap().is_empty(),
+        "no durable row"
+    );
+}
+
+/// A governed machine's session bindings carry its installed host's
+/// configured-MCP authority; this host does not decide configured servers, so
+/// every one is refused before discovery or spawn. An ungoverned machine's
+/// bindings carry none and keep the existing behaviour.
+#[tokio::test]
+async fn governed_bindings_refuse_configured_mcp_servers_by_default() {
+    use meerkat_core::mcp_attachment::McpAttachmentRefusal;
+    let server = meerkat_core::McpServerConfig::stdio(
+        "configured",
+        "/nonexistent/mcp-server".to_string(),
+        vec![],
+        std::collections::HashMap::new(),
+    );
+
+    let store = InMemoryRuntimeStore::new();
+    let machine = governed(&store);
+    let session = SessionId::new();
+    machine.register_session(session.clone()).await.unwrap();
+    let bindings = machine.prepare_bindings(session).await.unwrap();
+    let authority = bindings
+        .configured_mcp_attachment()
+        .expect("a governed machine installs its configured-attachment authority");
+    assert_eq!(
+        authority.authorize_configured(&server),
+        Err(McpAttachmentRefusal::Unavailable)
+    );
+    assert!(
+        bindings.clone().configured_mcp_attachment().is_some(),
+        "the authority survives a binding clone"
+    );
+
+    let plain_store = InMemoryRuntimeStore::new();
+    let plain = persistent(&plain_store);
+    let session = SessionId::new();
+    plain.register_session(session.clone()).await.unwrap();
+    let bindings = plain.prepare_bindings(session).await.unwrap();
+    assert!(bindings.configured_mcp_attachment().is_none());
+}
+
+/// On a host where destinations are optional, a reopened document is unbound
+/// until its owner binds it again, and recovery's ordinary recording skips
+/// the destination. The recovered governed input keeps the destination it was
+/// admitted under (from its row's witness): its result is withheld while the
+/// document is unbound and disclosed to that destination once it is bound
+/// again.
+#[tokio::test]
+async fn memory_persistent_optional_destination_recovers_the_admitted_destination() {
+    let store = InMemoryRuntimeStore::new();
+    let required = || {
+        let (mut configuration, prompt, domain) = configuration();
+        configuration.require_scoped_destination = false;
+        (configuration, prompt, domain)
+    };
+    let (configuration, mut prompt, _domain) = required();
+    let machine = MeerkatMachine::persistent_with_local_grant_authorization(
+        Arc::new(store.clone()),
+        Some(Arc::new(MemoryBlobStore::new())),
+        configuration,
+    )
+    .unwrap();
+    let session = SessionId::new();
+    machine.register_session(session.clone()).await.unwrap();
+    let runtime = LogicalRuntimeId::for_session(&session);
+    let observed = Arc::clone(prompt.header().ingress_context.as_ref().unwrap());
+    let mut candidate = prompt
+        .header()
+        .authority_association
+        .as_ref()
+        .unwrap()
+        .candidate()
+        .clone();
+    candidate.target.logical_runtime = EvidenceId::new(runtime.to_string()).unwrap();
+    let target = candidate.target.clone();
+    let selection = candidate.controller_model.clone().unwrap();
+    prompt.header_mut().authority_association =
+        Some(InputAuthorityAssociation::new(candidate).unwrap());
+    let ingress = NativeIngressContext::from_trusted_ingress(
+        &prompt,
+        observed.requester().clone(),
+        observed.ingress_actor().clone(),
+        observed.realm().clone(),
+        observed.authentication().clone(),
+    )
+    .unwrap()
+    .with_controller_client(
+        &prompt,
+        ControllerModelClient::new(selection.clone(), Arc::new(SelectedClient(selection))),
+    )
+    .unwrap();
+    let prompt = prompt.with_ingress_context(ingress).unwrap();
+    let id = prompt.id().clone();
+    let registration = machine
+        .current_session_registration_witness(&session)
+        .await
+        .unwrap();
+    machine
+        .bind_scoped_context(&registration, &target)
+        .await
+        .expect("bind the destination");
+    install_owner_fixture_credential(&machine, &prompt);
+    let custody = crate::meerkat_machine::credential_custody::NativeCredentialCustody::acquire(
+        &machine.native_work_authorization_host,
+        &prompt,
+        true,
+    )
+    .await
+    .unwrap();
+    {
+        let shared_driver =
+            Arc::clone(&machine.sessions.read().await.get(&session).unwrap().driver);
+        let mut driver = shared_driver.lock().await;
+        let DriverEntry::Persistent(persistent) = &mut *driver else {
+            panic!("actual persistent driver required")
+        };
+        persistent
+            .inner_mut()
+            .set_executor_work_authorization_support(true);
+        let resolved = persistent.resolve_admission(&prompt).unwrap();
+        persistent
+            .accept_resolved_input_with_credential(prompt, resolved, &custody)
+            .await
+            .expect("admitted for the bound destination");
+    }
+    drop(custody);
+    drop(registration);
+    drop(machine);
+
+    let reopened = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match MeerkatMachine::persistent_with_local_grant_authorization(
+                Arc::new(store.clone()),
+                Some(Arc::new(MemoryBlobStore::new())),
+                required().0,
+            ) {
+                Ok(machine) => return machine,
+                Err(RuntimeDriverError::ControllerReadinessUnavailable {
+                    reason: ControllerReadinessFailure::Busy,
+                }) => tokio::task::yield_now().await,
+                Err(error) => panic!("reopen failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("quiescent reopen");
+    // The durable row keeps its original destination witness; read
+    // detached (no live registration) its result is not disclosable.
+    let stored = reopened
+        .durable_input_witness_by_id(&session, &id)
+        .await
+        .unwrap()
+        .expect("durable row");
+    assert_eq!(
+        stored.state.scoped_destination,
+        crate::input_state::ScopedDestinationWitness::Bound {
+            binding: crate::input_authority::context_target_binding(&target).unwrap(),
+        }
+    );
+    assert!(
+        !reopened
+            .stored_result_disclosure_permitted(&session, &stored.state)
+            .await,
+        "a detached durable read has no current destination"
+    );
+    reopened.register_session(session.clone()).await.unwrap();
+    let authority = {
+        let shared_driver =
+            Arc::clone(&reopened.sessions.read().await.get(&session).unwrap().driver);
+        let driver = shared_driver.lock().await;
+        driver.shared_dsl_authority()
+    };
+    let binding = crate::input_authority::context_target_binding(&target).unwrap();
+    assert_eq!(
+        authority
+            .lock()
+            .unwrap()
+            .state()
+            .input_context_targets
+            .get(&id.to_string()),
+        Some(&binding),
+        "recovery restores the admitted destination from the row's witness"
+    );
+    let gate = crate::meerkat_machine::scoped_context::completion_disclosure_gate(
+        Arc::downgrade(&reopened.shared),
+        session.clone(),
+        Arc::clone(&authority),
+    );
+    assert!(
+        !gate(&id)
+            .expect("a held input is decided")
+            .permitted()
+            .await,
+        "unbound: no current destination"
+    );
+    let registration = reopened
+        .current_session_registration_witness(&session)
+        .await
+        .unwrap();
+    reopened
+        .bind_scoped_context(&registration, &target)
+        .await
+        .expect("the owner binds the destination again");
+    assert!(
+        gate(&id)
+            .expect("a held input is decided")
+            .permitted()
+            .await,
+        "the recovered input's own destination, bound again, receives its result"
+    );
 }

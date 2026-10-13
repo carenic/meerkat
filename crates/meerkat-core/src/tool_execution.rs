@@ -25,7 +25,7 @@ pub enum ToolDeadlineOwner {
     Dispatcher,
     ToolInternal,
     StreamingAbsolute,
-    MobkitPublicCallback,
+    MetaPublicCallback,
     SdkCallbackCancellation,
     GatewayWire,
     DetachedSubmission,
@@ -39,7 +39,7 @@ impl ToolDeadlineOwner {
             Self::Dispatcher => "dispatcher",
             Self::ToolInternal => "tool internal",
             Self::StreamingAbsolute => "streaming absolute",
-            Self::MobkitPublicCallback => "mobkit public callback",
+            Self::MetaPublicCallback => "meta public callback",
             Self::SdkCallbackCancellation => "sdk callback cancellation",
             Self::GatewayWire => "gateway wire",
             Self::DetachedSubmission => "detached submission",
@@ -483,6 +483,92 @@ pub struct ToolExecutionOwnerWitness {
     authority_key: String,
     owner_key: String,
     binding_fingerprint: EphemeralToolBindingFingerprint,
+    operation_target: Option<ToolOperationTarget>,
+}
+
+/// Typed, nonsecret identity of the exact operation an execution owner
+/// resolved a call to, produced by that owner with its witness and
+/// revalidated by the same live owner at dispatch. It is a fact for the
+/// operation policy owner, never a permission, and like its witness it is
+/// discarded on restart, recovery, reconstruction or replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolOperationTarget {
+    /// One registered MCP server's raw operation, on the server's current
+    /// physical connection generation. Two servers exposing the same raw
+    /// operation remain distinct by registration.
+    McpServerOperation {
+        server: String,
+        connection_generation: u64,
+        raw_operation: String,
+        /// The connector approval of the descriptor that connection was
+        /// opened from, for the operation owner to compare with the grant's
+        /// approved binding.
+        connector: crate::mcp_config::McpConnectorApproval,
+        /// The account that connection's operations act with, as its owners
+        /// state it for this exact connection: the connector binding's
+        /// account, the OAuth credential owner's selected account, the
+        /// server configuration's declaration that it acts with none, or
+        /// unavailable. Fixed for the connection's lifetime, so a changed
+        /// binding is a new connection generation.
+        account: std::sync::Arc<crate::OperationAccount>,
+    },
+    /// The session's own tool catalog control plane, produced only by the
+    /// catalog control dispatcher for the operation it owns. A tool that
+    /// merely carries a catalog tool name has no such target.
+    CatalogControl { operation: CatalogOperation },
+    /// One operation of a Rust tool bundle the host registered under
+    /// `bundle`, produced only by that registration's
+    /// [`crate::RegisteredToolBundleDispatcher`] and revalidated by it at
+    /// dispatch. `operation` is the bundle's own tool, distinct by
+    /// registration like an MCP server's raw operation: a tool that is merely
+    /// named like it, from any other dispatcher, has no such target.
+    /// `account` is the one the registration declared for the bundle's
+    /// operations ([`crate::RegisteredToolBundleDispatcher::with_account`]),
+    /// unavailable when it declared none.
+    RegisteredToolBundleOperation {
+        bundle: String,
+        operation: String,
+        account: std::sync::Arc<crate::OperationAccount>,
+    },
+    /// One registered MCP server's raw operation reached through the checked
+    /// route a trusted host registered under the stable name `route`, on
+    /// that server's current physical connection generation. Produced only
+    /// by that route and revalidated by it at dispatch; the other facts are
+    /// the ones [`Self::McpServerOperation`] states for the same connection.
+    /// `route` makes it a target of its own: the server's ordinary grant
+    /// never covers it, and its grant never covers the ordinary operation.
+    CheckedMcpServerOperation {
+        route: String,
+        server: String,
+        connection_generation: u64,
+        raw_operation: String,
+        connector: crate::mcp_config::McpConnectorApproval,
+        account: std::sync::Arc<crate::OperationAccount>,
+    },
+}
+
+impl ToolOperationTarget {
+    /// The account the owner states this exact operation acts with: `None`
+    /// for the session's own catalog control, which acts with no account of
+    /// its own.
+    #[must_use]
+    pub fn account(&self) -> Option<&crate::OperationAccount> {
+        match self {
+            Self::McpServerOperation { account, .. }
+            | Self::RegisteredToolBundleOperation { account, .. }
+            | Self::CheckedMcpServerOperation { account, .. } => Some(account),
+            Self::CatalogControl { .. } => None,
+        }
+    }
+}
+
+/// The catalog control plane's operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CatalogOperation {
+    Search,
+    Load,
 }
 
 impl ToolExecutionOwnerWitness {
@@ -503,7 +589,21 @@ impl ToolExecutionOwnerWitness {
             authority_key,
             owner_key,
             binding_fingerprint,
+            operation_target: None,
         })
+    }
+
+    /// This witness's owner resolved the call to `target`.
+    #[must_use]
+    pub fn with_operation_target(mut self, target: ToolOperationTarget) -> Self {
+        self.operation_target = Some(target);
+        self
+    }
+
+    /// The exact operation this witness's owner resolved the call to, when
+    /// the owner produces one.
+    pub fn operation_target(&self) -> Option<&ToolOperationTarget> {
+        self.operation_target.as_ref()
     }
 
     pub fn authority_key(&self) -> &str {
@@ -1558,7 +1658,7 @@ mod tests {
     fn deadline_chain_retains_every_contributor_and_selects_narrowest() {
         let chain = ToolDeadlineChain::new(vec![
             finite(ToolDeadlineOwner::CoreToolDispatch, 600),
-            finite(ToolDeadlineOwner::MobkitPublicCallback, 120),
+            finite(ToolDeadlineOwner::MetaPublicCallback, 120),
             finite(ToolDeadlineOwner::SdkCallbackCancellation, 125),
             finite(ToolDeadlineOwner::GatewayWire, 130),
         ])
@@ -1568,11 +1668,11 @@ mod tests {
         assert_eq!(chain.effective_timeout(), Some(Duration::from_secs(120)));
         assert_eq!(
             chain.winner().map(ToolDeadlineContributor::owner),
-            Some(ToolDeadlineOwner::MobkitPublicCallback)
+            Some(ToolDeadlineOwner::MetaPublicCallback)
         );
         assert_eq!(
             chain.diagnostic(),
-            "effective deadline: 120s\ncontributors:\n  core tool dispatch: 600s\n  mobkit public callback: 120s\n  sdk callback cancellation: 125s\n  gateway wire: 130s\nwinner: mobkit public callback"
+            "effective deadline: 120s\ncontributors:\n  core tool dispatch: 600s\n  meta public callback: 120s\n  sdk callback cancellation: 125s\n  gateway wire: 130s\nwinner: meta public callback"
         );
     }
 

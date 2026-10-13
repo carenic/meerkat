@@ -134,7 +134,11 @@ pub(crate) fn encode_marker_value(marker: DurableAuthLifecycleMarker) -> serde_j
         FIELD_REALM.to_string(),
         serde_json::Value::String(marker.token_key.realm().as_str().to_string()),
     );
-    match marker.token_key.credential_identity() {
+    // Only a credential key has a lifecycle; any other key kind has no marker.
+    let Some(identity) = marker.token_key.credential_identity() else {
+        return serde_json::Value::Null;
+    };
+    match identity {
         crate::AuthCredentialIdentity::Binding(binding) => {
             map.insert(
                 FIELD_CREDENTIAL_KIND.to_string(),

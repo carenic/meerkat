@@ -348,6 +348,13 @@ struct PreLlmDenyingHooks {
 
 #[async_trait]
 impl HookEngine for PreLlmDenyingHooks {
+    fn mandatory_topology(
+        &self,
+        _overrides: Option<&crate::config::HookRunOverrides>,
+    ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError> {
+        Ok(crate::hooks::HookMandatoryTopology::none())
+    }
+
     async fn execute(
         &self,
         invocation: HookInvocation,
@@ -395,6 +402,13 @@ struct PointDenyingHooks {
 
 #[async_trait]
 impl HookEngine for PointDenyingHooks {
+    fn mandatory_topology(
+        &self,
+        _overrides: Option<&crate::config::HookRunOverrides>,
+    ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError> {
+        Ok(crate::hooks::HookMandatoryTopology::none())
+    }
+
     async fn execute(
         &self,
         invocation: HookInvocation,

@@ -179,6 +179,17 @@ pub enum StoreError {
         expected: String,
         found: String,
     },
+
+    /// A realm operation that needs an existing realm found no manifest.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[error("realm '{realm_id}' has not been materialized")]
+    RealmNotMaterialized { realm_id: String },
+
+    /// The manifest's governance posture and its format disagree. Neither
+    /// posture is assumed.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[error("realm '{realm_id}' has an inconsistent governance record: {detail}; refusing to open")]
+    InvalidRealmGovernance { realm_id: String, detail: String },
 }
 
 /// Classify raw SQLite failures at the boundary where they enter the store
@@ -246,7 +257,10 @@ impl From<meerkat_sqlite::SqliteStoreError> for StoreError {
             | E::WalNotEstablished { .. }
             | E::WalConversionContended { .. }
             | E::InvalidMigrationList { .. }
-            | E::OpenRefused { .. }) => StoreError::Internal(other.to_string()),
+            | E::OpenRefused { .. }
+            // Only the non-waiting administrative open raises this; its own
+            // caller decides whether a busy cause is retryable.
+            | E::CurrentCatalogUnavailable { .. }) => StoreError::Internal(other.to_string()),
         }
     }
 }

@@ -110,10 +110,13 @@ async fn send_token_request(
     for (k, v) in &endpoints.extra_headers {
         req = req.header(k, v);
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| OAuthError::Network(e.to_string()))?;
+    let resp = req.send().await.map_err(|e| {
+        // The host egress profile's own resolver refused the endpoint.
+        match crate::http_egress::egress_refusal_in(&e) {
+            Some(refusal) => OAuthError::EgressRefused(refusal),
+            None => OAuthError::Network(e.to_string()),
+        }
+    })?;
     let status = resp.status();
     super::refuse_credential_redirect(status)?;
     if !status.is_success() {

@@ -93,6 +93,18 @@ impl ProcessChild {
         }
     }
 
+    /// Request direct-child termination without reaping an exited child, so
+    /// its PID, and any process group it leads, stays held until [`Self::wait`].
+    pub fn start_kill_without_reap(&mut self) -> io::Result<()> {
+        match &mut self.child {
+            // Tokio's request signals only a child it has not reaped, and
+            // does not reap.
+            ChildKind::Tokio(child) => child.start_kill(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            ChildKind::Native(child) => child.start_kill_without_reap(),
+        }
+    }
+
     pub async fn kill(&mut self) -> io::Result<()> {
         match &mut self.child {
             ChildKind::Tokio(child) => child.kill().await,

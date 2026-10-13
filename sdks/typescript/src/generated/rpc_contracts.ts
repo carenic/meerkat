@@ -105,6 +105,13 @@ import type {
   McpLiveOpResponse,
   McpReloadParams,
   McpRemoveParams,
+  MetaJobCancelAckParams,
+  MetaJobCheckpointParams,
+  MetaJobCompleteParams,
+  MetaJobFailParams,
+  MetaJobHeartbeatParams,
+  MetaJobMutationResult,
+  MetaJobProgressParams,
   MobAdoptMemberIdentityDeclarationParams,
   MobAdoptMemberIdentityDeclarationResult,
   MobAppendSystemContextParams,
@@ -210,13 +217,6 @@ import type {
   MobWireMembersBatchResult,
   MobWireParams,
   MobWireResult,
-  MobkitJobCancelAckParams,
-  MobkitJobCheckpointParams,
-  MobkitJobCompleteParams,
-  MobkitJobFailParams,
-  MobkitJobHeartbeatParams,
-  MobkitJobMutationResult,
-  MobkitJobProgressParams,
   ModelsCatalogResponse,
   MonitorsStartParams,
   MonitorsStartResult,
@@ -341,29 +341,29 @@ export interface RpcMethodContracts {
     params: JobsUnsubscribeParams;
     result: (JobsUnsubscribeResult) & Record<string, unknown>;
   };
-  "mobkit/jobs/heartbeat": {
-    params: MobkitJobHeartbeatParams;
-    result: (MobkitJobMutationResult) & Record<string, unknown>;
+  "meta/jobs/heartbeat": {
+    params: MetaJobHeartbeatParams;
+    result: (MetaJobMutationResult) & Record<string, unknown>;
   };
-  "mobkit/jobs/progress": {
-    params: MobkitJobProgressParams;
-    result: (MobkitJobMutationResult) & Record<string, unknown>;
+  "meta/jobs/progress": {
+    params: MetaJobProgressParams;
+    result: (MetaJobMutationResult) & Record<string, unknown>;
   };
-  "mobkit/jobs/checkpoint": {
-    params: MobkitJobCheckpointParams;
-    result: (MobkitJobMutationResult) & Record<string, unknown>;
+  "meta/jobs/checkpoint": {
+    params: MetaJobCheckpointParams;
+    result: (MetaJobMutationResult) & Record<string, unknown>;
   };
-  "mobkit/jobs/complete": {
-    params: MobkitJobCompleteParams;
-    result: (MobkitJobMutationResult) & Record<string, unknown>;
+  "meta/jobs/complete": {
+    params: MetaJobCompleteParams;
+    result: (MetaJobMutationResult) & Record<string, unknown>;
   };
-  "mobkit/jobs/fail": {
-    params: MobkitJobFailParams;
-    result: (MobkitJobMutationResult) & Record<string, unknown>;
+  "meta/jobs/fail": {
+    params: MetaJobFailParams;
+    result: (MetaJobMutationResult) & Record<string, unknown>;
   };
-  "mobkit/jobs/cancel_ack": {
-    params: MobkitJobCancelAckParams;
-    result: (MobkitJobMutationResult) & Record<string, unknown>;
+  "meta/jobs/cancel_ack": {
+    params: MetaJobCancelAckParams;
+    result: (MetaJobMutationResult) & Record<string, unknown>;
   };
   "session/create": {
     params: Record<string, unknown>;

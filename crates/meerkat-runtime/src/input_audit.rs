@@ -54,6 +54,23 @@ impl InputAuthorizationAudit {
         }
     }
 
+    /// Whether any record is a mandatory-hook withholding, which only stored
+    /// input state v6 and later can carry.
+    pub(crate) fn has_mandatory_hook_withholding(&self) -> bool {
+        let is_withholding = |record: &StoredAuthorizationAuditObservation| {
+            matches!(
+                record.observation.observation,
+                meerkat_authorization_contracts::audit::AuditObservation::MandatoryHookWithheld { .. }
+            )
+        };
+        match &self.0 {
+            AuditPayload::Pending(records) => records
+                .lock()
+                .is_ok_and(|records| records.iter().any(is_withholding)),
+            AuditPayload::Frozen(records) => records.iter().any(is_withholding),
+        }
+    }
+
     /// Freeze exactly the observed prefix for the existing row transaction.
     /// Concurrent appends remain on the live buffer for the next native row
     /// update. This method does not acknowledge or clear either prefix/suffix.
@@ -142,6 +159,7 @@ impl InputAuthorizationAudit {
         execution_scope: OperationExecutionScope,
         run_id: RunId,
         originals: &[RetainedInputAuthority],
+        retained_resume: bool,
     ) -> Result<Arc<dyn AuthorizationAuditSink>, OperationRefused> {
         let OperationExecutionScope::RuntimeInput {
             canonical_input_id, ..
@@ -149,9 +167,11 @@ impl InputAuthorizationAudit {
         else {
             return Err(malformed());
         };
+        // A resume of retained work is bound under the originals it
+        // resumes; it is never an original itself.
         if canonical_input_id != row_input_id
             || originals.is_empty()
-            || !originals.iter().any(|item| item.input_id() == row_input_id)
+            || (!retained_resume && !originals.iter().any(|item| item.input_id() == row_input_id))
         {
             return Err(malformed());
         }

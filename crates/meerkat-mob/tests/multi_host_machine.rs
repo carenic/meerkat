@@ -30,7 +30,8 @@ use meerkat_mob::machines::mob_machine::{
     MobMachineState, MobPhase, MobSpawnMemberAdmissionKind, PeerAddress, PeerId, PeerName,
     PeerSigningKey, PlacedCompletionLifecycleIntentKind, PlacedSpawnId, PrincipalId,
     RemoteTurnObligation, RouteInstallObligation, RouteObligationKind, RunId, SessionId,
-    SpawnExecPhase, SpawnPolicyRuntimeMode, StepId, WiringEdge,
+    SpawnExecPhase, SpawnPolicyRuntimeMode, StepId, SubmitWorkRejectReasonKind, WiringEdge,
+    WorkContentAttribution, WorkId, WorkOrigin,
 };
 
 fn identity(name: &str) -> AgentIdentity {
@@ -4390,6 +4391,130 @@ fn placed_member_revival_leaves_the_runtime_binding_to_its_member_host() {
             .member_revival_pending
             .contains(&identity("remote-revive")),
         "a resolved placed revival still clears the machine-owned obligation",
+    );
+    check_multi_host_invariants(authority.state());
+}
+
+// ==========================================================================
+// Internal work and external addressability
+// ==========================================================================
+
+fn submit_work(identity_name: &str, origin: WorkOrigin) -> MobMachineInput {
+    MobMachineInput::SubmitWork {
+        agent_identity: identity(identity_name),
+        agent_runtime_id: runtime_id(identity_name, 0),
+        fence_token: FenceToken(1),
+        expected_session_id: None,
+        work_id: WorkId::from(format!("{identity_name}-{origin:?}")),
+        origin,
+        content_attribution: WorkContentAttribution::Conversational,
+    }
+}
+
+fn submit_work_rejection(
+    authority: &mut MobMachineAuthority,
+    identity_name: &str,
+    origin: WorkOrigin,
+) -> SubmitWorkRejectReasonKind {
+    let resolved = MobMachineMutator::apply(
+        authority,
+        MobMachineInput::ResolveSubmitWorkRejection {
+            agent_identity: identity(identity_name),
+            agent_runtime_id: runtime_id(identity_name, 0),
+            fence_token: FenceToken(1),
+            expected_session_id: None,
+            origin,
+        },
+    )
+    .expect("the refused SubmitWork resolves its typed rejection");
+    resolved
+        .effects()
+        .iter()
+        .find_map(|effect| match effect {
+            MobMachineEffect::SubmitWorkRejected { reason, .. } => Some(*reason),
+            _ => None,
+        })
+        .expect("the typed rejection is emitted")
+}
+
+fn requests_ingress(transition: &meerkat_mob::machines::mob_machine::MobMachineTransition) -> bool {
+    transition.effects().iter().any(|effect| {
+        matches!(
+            effect,
+            MobMachineEffect::RequestRuntimeIngress { .. }
+                | MobMachineEffect::RequestPeerRuntimeIngress { .. }
+        )
+    })
+}
+
+/// The trusted host's internal governed route rests on the MobMachine's own
+/// origin rules. A session-bound member whose profile is not externally
+/// addressable is admitted internal work (with its ingress effect) and is
+/// refused external work as not externally addressable. A member with no
+/// session binding and no registered peer is refused internal work too,
+/// with the typed `NotExternallyAddressable` rejection and no ingress.
+#[test]
+fn internal_work_needs_a_session_binding_or_peer_and_never_addressability() {
+    let mut authority = MobMachineAuthority::new();
+    let bound = seed_local_member(
+        &mut authority,
+        "bound",
+        0,
+        SpawnPolicyRuntimeMode::TurnDriven,
+    );
+    authorize_spawn_profile(&mut authority, "unbound", 0, None);
+    MobMachineMutator::apply(
+        &mut authority,
+        begin_spawn_local("unbound", 0, None, SpawnPolicyRuntimeMode::TurnDriven),
+    )
+    .expect("an unbound member's BeginSpawnExec is accepted");
+    MobMachineMutator::apply(
+        &mut authority,
+        commit_membership_local("unbound", 0, None, SpawnPolicyRuntimeMode::TurnDriven),
+    )
+    .expect("an unbound member's CommitSpawnMembership is accepted");
+    assert!(
+        !authority
+            .state()
+            .externally_addressable_runtime_ids
+            .contains(&runtime_id("bound", 0)),
+        "the fixture member's profile is not externally addressable"
+    );
+
+    // External work to the session-bound, non-addressable member: refused.
+    assert!(
+        MobMachineMutator::apply(&mut authority, submit_work("bound", WorkOrigin::External))
+            .is_err(),
+        "external work needs external addressability"
+    );
+    assert_eq!(
+        submit_work_rejection(&mut authority, "bound", WorkOrigin::External),
+        SubmitWorkRejectReasonKind::NotExternallyAddressable
+    );
+
+    // Internal work to the same member: admitted, with its runtime ingress.
+    let admitted =
+        MobMachineMutator::apply(&mut authority, submit_work("bound", WorkOrigin::Internal))
+            .expect("internal work needs no external addressability");
+    assert!(admitted.effects().iter().any(|effect| matches!(
+        effect,
+        MobMachineEffect::RequestRuntimeIngress { session_id, origin, .. }
+            if session_id == &bound && *origin == WorkOrigin::Internal
+    )));
+
+    // Internal work to the member with no session binding and no peer:
+    // refused with the typed rejection and no ingress.
+    if let Ok(transition) =
+        MobMachineMutator::apply(&mut authority, submit_work("unbound", WorkOrigin::Internal))
+    {
+        assert!(
+            !requests_ingress(&transition),
+            "a member with no session binding and no peer gets no ingress"
+        );
+    }
+    assert_eq!(
+        submit_work_rejection(&mut authority, "unbound", WorkOrigin::Internal),
+        SubmitWorkRejectReasonKind::NotExternallyAddressable
     );
     check_multi_host_invariants(authority.state());
 }

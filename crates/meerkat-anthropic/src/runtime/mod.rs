@@ -136,7 +136,11 @@ impl ClaudeAiOAuthAuthorizer {
             cached: std::sync::Mutex::new(None),
         };
         let lease = authorizer.lease_key();
-        let guard = meerkat_core::acquire_auth_login_lifecycle_guard(&lease).await;
+        // Unattended setup never waits behind an operating-system credential
+        // call that holds the lease.
+        let guard = meerkat_core::acquire_auth_login_lifecycle_guard_for_unattended(&lease)
+            .await
+            .ok_or(ProviderAuthError::Auth(AuthError::CredentialAccessPending))?;
         let (snapshot, lifecycle) =
             meerkat_auth_core::resolver::observe_existing_managed_store_lifecycle_with_guard(
                 &authorizer.env,
@@ -225,7 +229,11 @@ impl ClaudeAiOAuthAuthorizer {
         &self,
     ) -> Result<(meerkat_core::AuthLoginLifecycleGuard, Arc<str>), AuthError> {
         let lease = self.lease_key();
-        let guard = meerkat_core::acquire_auth_login_lifecycle_guard(&lease).await;
+        // A request never waits behind an operating-system credential call
+        // that holds the lease: it answers pending at once.
+        let guard = meerkat_core::acquire_auth_login_lifecycle_guard_for_unattended(&lease)
+            .await
+            .ok_or(AuthError::CredentialAccessPending)?;
         let (snapshot, lifecycle) =
             match meerkat_auth_core::resolver::observe_existing_managed_store_lifecycle_with_guard(
                 &self.env,
@@ -374,6 +382,12 @@ fn anthropic_oauth_refresh_error(
         oauth::AnthropicOAuthError::Refresh(meerkat_auth_core::RefreshError::StalePreparation)
     ) {
         return ProviderAuthError::Auth(AuthError::StaleCredential);
+    }
+    // A refused credential access is not a refresh failure.
+    if let oauth::AnthropicOAuthError::Refresh(refresh) = &error
+        && let Some(access) = refresh.credential_access_error()
+    {
+        return ProviderAuthError::Auth(access);
     }
     let detail = if authmachine_failure.is_empty() {
         error.to_string()

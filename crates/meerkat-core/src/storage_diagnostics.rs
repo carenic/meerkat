@@ -4,7 +4,7 @@
 //! `rkat storage doctor` renders a [`StorageDiagnosis`]; the disk
 //! implementation lives in `meerkat-store::doctor`. The vocabulary lives
 //! here, below every store crate, because remote storage providers and the
-//! mobkit companion (its M1 doctor phase) bind to this shape *before* the
+//! meta companion (its M1 doctor phase) bind to this shape *before* the
 //! full Phase 4 provider trait exists — the report format is wire-stable
 //! from Phase 1 on.
 //!
@@ -232,7 +232,7 @@ pub enum StorageDiagnosticsError {
 /// Storage maintenance seam a storage provider exposes.
 ///
 /// Phase 1 deliberately ships only the read-only `diagnose` verb, defined as
-/// a small standalone trait so downstream consumers (mobkit M1, remote
+/// a small standalone trait so downstream consumers (meta M1, remote
 /// providers) bind to the hook shape before the Phase 4 provider trait
 /// (`RealmStorageProvider::migrator()`) exists. Do **not** add mutation
 /// verbs here outside the Phase 6 migration framework; when they land they

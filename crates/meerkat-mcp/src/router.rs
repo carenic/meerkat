@@ -6,7 +6,7 @@
 //! bound handle fails closed for lifecycle mutations until that owner is
 //! supplied.
 
-use crate::connection::StdioChildCustody;
+use crate::connection::{CustodyNotHeld, StdioChildCustody};
 use crate::external_tool_surface_authority::{
     ExternalToolSurfaceEffect, ExternalToolSurfaceError, ExternalToolSurfaceInput,
     ExternalToolSurfacePhase, ExternalToolSurfaceTransition, RemovalTimingInfo, StagedSurfaceOp,
@@ -32,6 +32,7 @@ use meerkat_core::handles::{
     ExternalToolSurfaceTransition as CoreSurfaceTransition, McpServerLifecycleHandle,
     SurfaceDiagnosticSnapshot, SurfaceSnapshot,
 };
+use meerkat_core::mcp_attachment::{McpAttachmentAuthority, McpAttachmentRefusal};
 use meerkat_core::mcp_config::McpTransportConfig;
 use meerkat_core::types::ToolDef;
 use meerkat_core::types::{ContentBlock, ToolCallView, ToolResult};
@@ -122,9 +123,113 @@ pub struct McpApplyResult {
     pub pending_count: usize,
 }
 
+/// Where one governed live add stands, from this router's own accepted
+/// outcome of exactly that add. Its sender travels from staging with the
+/// staged control, is keyed by the accepted completion obligation once the
+/// boundary schedules the attempt, and is resolved where the surface owner
+/// decides that attempt. Dropping the router drops every sender.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AttemptState {
+    Pending,
+    Installed { connection_generation: u64 },
+    Rejected(String),
+    Failed(String),
+    Superseded,
+}
+
+pub(crate) type AttemptSender = tokio::sync::watch::Sender<AttemptState>;
+pub(crate) type AttemptReceiver = tokio::sync::watch::Receiver<AttemptState>;
+
+fn resolve_attempt(attempt: Option<&AttemptSender>, state: AttemptState) {
+    if let Some(attempt) = attempt {
+        let _ = attempt.send(state);
+    }
+}
+
+/// What one tool is on the exact connection generation an accepted attempt
+/// installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstalledOperation {
+    /// That connection is current and a published route serves the
+    /// operation on it.
+    Callable,
+    /// That connection is current, but no published route serves the
+    /// operation.
+    NotRouted,
+    /// The server's current connection is another one, or none.
+    Replaced,
+}
+
 struct PendingResult {
     obligation: SurfaceCompletionObligation,
+    /// The exact config this attempt connected with.
+    config: McpServerConfig,
     result: Result<(McpConnection, Vec<Arc<ToolDef>>), McpError>,
+}
+
+/// One connection attempt the surface owner accepted as failed with
+/// [`McpError::AuthorizationRequired`]: its exact target, the config it
+/// attempted and the operation it ran. Only this record can be retried after
+/// a login ([`McpRouter::retry_authorized`]).
+#[derive(Debug, Clone)]
+struct AwaitingAuthorization {
+    target: McpServerIdentity,
+    config: McpServerConfig,
+    operation: AwaitingOperation,
+    /// For a [`AwaitingOperation::Released`] record: a sign-in for exactly
+    /// this target completed while the release's own removal was still
+    /// staged or settling. The server is staged again at the first boundary
+    /// after that removal settles, with no further sign-in; the flag stays
+    /// set until the owner accepts that add.
+    signed_in_during_release: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AwaitingOperation {
+    Add,
+    Reload,
+    /// The server was connected and its credential was released (signed
+    /// out, or refused at a call). Its removal is staged; the record outlives
+    /// that removal so a later sign-in adds the server back to this router.
+    Released,
+}
+
+/// What [`McpRouter::retry_authorized`] did for one completed login target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorizedRetry {
+    /// The failed operation was staged again with its retained config. It
+    /// applies at the next boundary and resolves the credential then.
+    Staged,
+    /// No accepted, unsuperseded failure awaits authorization for exactly
+    /// this target (absent, another URL or account, removed, or retried).
+    NotAwaiting,
+    /// A newer staged intent (including a remove) or an operation in flight
+    /// owns the server; it is left alone.
+    AlreadyPending,
+    /// The server's credential was released and the removal that release
+    /// staged has not settled yet. The sign-in is retained: the server is
+    /// staged again at the first boundary after that removal settles, with
+    /// no further sign-in.
+    AfterRelease,
+    /// The router was shut down.
+    RouterClosed,
+}
+
+/// What [`McpRouter::credential_released`] did for one released credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleasedCredential {
+    /// A connected server using exactly this credential is no longer usable:
+    /// its removal is staged (its tools are unpublished at the next
+    /// boundary) and it awaits sign-in, so a later login adds it back.
+    Unpublished,
+    /// No connected server uses exactly this credential (absent, another
+    /// URL or account, or not connected).
+    NotActive,
+    /// A newer staged intent (including a remove) or an operation in flight
+    /// owns the server; it is left alone.
+    AlreadyPending,
+    /// The router was shut down.
+    RouterClosed,
 }
 
 struct CompletedLifecycleUpdate {
@@ -293,9 +398,53 @@ impl ExternalToolSurfaceHandle for UnboundExternalToolSurfaceHandle {
     }
 }
 
+/// How a router holds its external tool surface handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpSurfaceOwnership {
+    /// The surface is the router's own (a standalone construction's private
+    /// handle): shutting the router down shuts the whole surface down.
+    Owned,
+    /// The surface belongs to someone else, such as a session registration
+    /// that outlives this router: shutting the router down releases only
+    /// the lineages this router staged, and the surface stays open for the
+    /// next holder.
+    Borrowed,
+}
+
+/// The staged intent lineages a router recorded, per surface id. Each was
+/// read from the `StageRecorded` effect of the router's own stage input, so
+/// it names exactly the staging this router made.
+pub type HeldSurfaceLineages = Arc<Mutex<BTreeMap<String, BTreeSet<u64>>>>;
+
+/// How the router holds its current surface handle, and whether its hold has
+/// ended, shared with whoever can rebind that handle.
+#[derive(Debug)]
+pub struct SurfaceHold {
+    ownership: McpSurfaceOwnership,
+    ended: bool,
+}
+
+impl SurfaceHold {
+    /// A rebind onto another owner's surface makes the hold `Borrowed`.
+    /// Refused (`false`) once the router ended its hold: nothing may be
+    /// published to a router that already released or shut its surface.
+    pub(crate) fn rebind_borrowed(&mut self) -> bool {
+        if self.ended {
+            return false;
+        }
+        self.ownership = McpSurfaceOwnership::Borrowed;
+        true
+    }
+}
+
+/// The router's [`SurfaceHold`], shared with whoever can rebind its handle.
+pub type SurfaceOwnershipSlot = Arc<Mutex<SurfaceHold>>;
+
 enum SurfaceOwner {
     Runtime {
         handle_slot: Arc<StdRwLock<Arc<dyn ExternalToolSurfaceHandle>>>,
+        ownership: SurfaceOwnershipSlot,
+        held: HeldSurfaceLineages,
     },
 }
 
@@ -303,7 +452,79 @@ impl SurfaceOwner {
     fn runtime(handle: Arc<dyn ExternalToolSurfaceHandle>) -> Self {
         Self::Runtime {
             handle_slot: Arc::new(StdRwLock::new(handle)),
+            ownership: Arc::new(Mutex::new(SurfaceHold {
+                ownership: McpSurfaceOwnership::Borrowed,
+                ended: false,
+            })),
+            held: HeldSurfaceLineages::default(),
         }
+    }
+
+    fn ownership_slot(&self) -> SurfaceOwnershipSlot {
+        match self {
+            Self::Runtime { ownership, .. } => Arc::clone(ownership),
+        }
+    }
+
+    fn ownership(&self) -> McpSurfaceOwnership {
+        self.ownership_slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ownership
+    }
+
+    fn set_ownership(&mut self, value: McpSurfaceOwnership) {
+        self.ownership_slot()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ownership = value;
+    }
+
+    fn held_lineages(&self) -> HeldSurfaceLineages {
+        match self {
+            Self::Runtime { held, .. } => Arc::clone(held),
+        }
+    }
+
+    /// End this router's hold on its surface: shut an owned surface down, or
+    /// release only this router's own lineages of a borrowed one. One
+    /// exclusive claim of the handle slot captures the handle, its ownership
+    /// and the held lineages together and marks the hold ended, and the
+    /// cleanup applies to exactly that captured handle. A rebind, which
+    /// replaces all three under the same write lock, therefore happens
+    /// entirely before the claim (and is what gets released) or after it, in
+    /// which case it publishes nothing and compensates what it seeded.
+    fn end_holding(&self) {
+        let Self::Runtime { handle_slot, .. } = self;
+        let handle = handle_slot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ownership = {
+            let slot = self.ownership_slot();
+            let mut hold = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            hold.ended = true;
+            hold.ownership
+        };
+        match ownership {
+            McpSurfaceOwnership::Owned => {
+                if let Err(error) = handle.apply_surface_input(CoreSurfaceInput::Shutdown) {
+                    tracing::debug!("owned surface not shut down: {error}");
+                }
+            }
+            McpSurfaceOwnership::Borrowed => self.release_held_on(handle.as_ref()),
+        }
+    }
+
+    fn release_held_on(&self, handle: &dyn ExternalToolSurfaceHandle) {
+        let held = std::mem::take(
+            &mut *self
+                .held_lineages()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        release_lineages(handle, held);
     }
 
     fn runtime_handle_slot(&self) -> Option<Arc<StdRwLock<Arc<dyn ExternalToolSurfaceHandle>>>> {
@@ -348,7 +569,7 @@ impl SurfaceOwner {
         removal_timeout: Duration,
     ) -> Result<(), ExternalToolSurfaceError> {
         match self {
-            Self::Runtime { handle_slot } => {
+            Self::Runtime { handle_slot, .. } => {
                 let timeout_ms = removal_timeout.as_millis().min(u128::from(u64::MAX)) as u64;
                 let handle = handle_slot
                     .read()
@@ -367,18 +588,24 @@ impl SurfaceOwner {
         input: ExternalToolSurfaceInput,
     ) -> Result<ExternalToolSurfaceTransition, ExternalToolSurfaceError> {
         match self {
-            Self::Runtime { handle_slot } => {
+            Self::Runtime {
+                handle_slot, held, ..
+            } => {
+                // Held across the apply and its lineage record, so a rebind
+                // (which replaces the handle and the held lineages together
+                // under the write lock) never pairs one surface's lineage
+                // with another surface.
                 let handle = handle_slot
                     .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                Self::apply_runtime(handle.as_ref(), input)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Self::apply_runtime(handle.as_ref(), held, input)
             }
         }
     }
 
     fn apply_runtime(
         handle: &dyn ExternalToolSurfaceHandle,
+        held: &HeldSurfaceLineages,
         input: ExternalToolSurfaceInput,
     ) -> Result<ExternalToolSurfaceTransition, ExternalToolSurfaceError> {
         let (input_name, core_input, applied_at_turn) = match input {
@@ -497,7 +724,10 @@ impl SurfaceOwner {
         };
         handle
             .apply_surface_input(core_input)
-            .map(|transition| runtime_transition_from_core(input_name, transition, applied_at_turn))
+            .map(|transition| {
+                record_stage_lineages(held, &transition);
+                runtime_transition_from_core(input_name, transition, applied_at_turn)
+            })
             .map_err(|error| runtime_surface_error(input_name, error))
     }
 
@@ -599,6 +829,50 @@ impl SurfaceOwner {
     }
 }
 
+/// Release exactly `held`'s lineages on `handle`. The surface clears
+/// whichever staged, pending or active slot still carries exactly that
+/// lineage and refuses the rest. Releasing an active slot can also cancel a
+/// different, staged Reload that depends on that active base.
+pub(crate) fn release_lineages(
+    handle: &dyn ExternalToolSurfaceHandle,
+    held: BTreeMap<String, BTreeSet<u64>>,
+) {
+    for (surface_id, lineages) in held {
+        for lineage in lineages {
+            if let Err(error) = handle.apply_surface_input(CoreSurfaceInput::Release {
+                surface_id: surface_id.clone(),
+                lineage,
+            }) {
+                // A lineage the surface no longer carries (completed,
+                // replaced, removed, or a closed registration) has
+                // nothing of this router's left to release.
+                tracing::debug!(
+                    surface = %surface_id,
+                    lineage,
+                    "surface lineage not released: {error}"
+                );
+            }
+        }
+    }
+}
+
+/// Record the lineage a stage input of this router just recorded.
+fn record_stage_lineages(held: &HeldSurfaceLineages, transition: &CoreSurfaceTransition) {
+    for effect in &transition.effects {
+        if let CoreSurfaceEffect::StageRecorded {
+            surface_id,
+            staged_intent_sequence,
+        } = effect
+        {
+            held.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(surface_id.clone())
+                .or_default()
+                .insert(*staged_intent_sequence);
+        }
+    }
+}
+
 fn runtime_transition_from_core(
     transition_name: &str,
     transition: CoreSurfaceTransition,
@@ -610,16 +884,17 @@ fn runtime_transition_from_core(
         effects: transition
             .effects
             .into_iter()
-            .map(|effect| runtime_effect_from_core(effect, applied_at_turn))
+            .filter_map(|effect| runtime_effect_from_core(effect, applied_at_turn))
             .collect(),
     }
 }
 
+/// `None` for the stager's lineage receipt, which the owner records itself.
 fn runtime_effect_from_core(
     effect: CoreSurfaceEffect,
     applied_at_turn: Option<TurnNumber>,
-) -> ExternalToolSurfaceEffect {
-    match effect {
+) -> Option<ExternalToolSurfaceEffect> {
+    Some(match effect {
         CoreSurfaceEffect::ScheduleSurfaceCompletion {
             surface_id,
             operation,
@@ -665,7 +940,8 @@ fn runtime_effect_from_core(
                 cause,
             }
         }
-    }
+        CoreSurfaceEffect::StageRecorded { .. } => return None,
+    })
 }
 
 fn runtime_surface_error(input_name: &str, error: DslTransitionError) -> ExternalToolSurfaceError {
@@ -925,6 +1201,38 @@ pub struct McpToolRoute {
     pub raw_operation: String,
 }
 
+/// One operation a checked route offers now: the raw operation and the
+/// server's genuine definition of it, under the name the route exposes.
+#[derive(Debug, Clone)]
+pub(crate) struct CheckedOperation {
+    pub(crate) raw_operation: String,
+    pub(crate) tool: Arc<ToolDef>,
+}
+
+/// A checked route's own conjunct for one call through it, which the
+/// router's call path asks at the final transport handoff: after every
+/// preparation await, immediately before the native reviewed entry.
+pub(crate) trait CheckedEntry: Send + Sync {
+    /// The raw operations the route admits instead of the access ceiling.
+    fn operations(&self) -> &BTreeSet<String>;
+
+    /// Reserve the single entry of the dispatched plan's occurrence through
+    /// the route, refusing unless the route is still open, the dispatch is
+    /// still its session's under actual bound work and a prepared
+    /// authorization for exactly this call and plan, the connection is still
+    /// the generation the plan names, and that occurrence never entered
+    /// through the route before.
+    fn reserve_entry(
+        &self,
+        call: ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+        connection_generation: u64,
+    ) -> Result<(), ToolError>;
+
+    /// Release a reservation whose native entry refused: nothing entered.
+    fn release_entry(&self);
+}
+
 /// Every raw route excluded by one exposed-name collision.
 ///
 /// Select distinct names using [`McpServerConfig::tool_names`] and reload the
@@ -1068,6 +1376,24 @@ pub struct McpRouter {
     servers: HashMap<String, ServerEntry>,
     projection: Arc<RouterProjectionSnapshot>,
     staged_payloads: HashMap<String, McpServerConfig>,
+    /// The prepared attachment control of a governed staged add, owned with
+    /// its staged payload under the same router borrow: a payload and its
+    /// control are installed, replaced, withdrawn and applied together, and
+    /// the control travels with the exact payload to the connection's
+    /// physical entry.
+    staged_controls: HashMap<String, Arc<dyn McpAttachmentAuthority>>,
+    /// The attempt of each governed staged add, staged and withdrawn with
+    /// its control.
+    staged_attempts: HashMap<String, AttemptSender>,
+    /// The attempt of each scheduled governed add, keyed by its accepted
+    /// completion obligation (server, pending task sequence).
+    pending_attempts: HashMap<(String, u64), AttemptSender>,
+    /// Servers attached under a governed control, and governed adds a
+    /// staged removal withdrew. Their descriptor never changes or reconnects
+    /// without a new control (no reload) until the removal's actual
+    /// disposition at a boundary: the surface is not attached, or its
+    /// removal finalized.
+    governed_servers: std::collections::HashSet<String>,
 
     // --- Async pending infrastructure ---
     pending_tx: mpsc::Sender<PendingResult>,
@@ -1097,7 +1423,12 @@ pub struct McpRouter {
     completed_updates: VecDeque<CompletedLifecycleUpdate>,
     /// Host-channel status: servers whose latest connection attempt ended in
     /// [`McpError::AuthorizationRequired`]. Never projected to the agent.
-    awaiting_authorization: BTreeMap<String, McpServerIdentity>,
+    awaiting_authorization: BTreeMap<String, AwaitingAuthorization>,
+    /// Connected servers a call found without a usable credential
+    /// ([`McpError::AuthorizationRequired`] at the call), with the exact
+    /// target the call reported. Calls only hold `&self`, so the next
+    /// boundary ([`Self::apply_staged`]) releases them before applying.
+    calls_refused_unauthorized: Mutex<Vec<(String, McpServerIdentity)>>,
     /// Optional session-scoped MCP server lifecycle handle
     /// (Phase 5G / T5g). When bound, every handshake event mirrors into
     /// the session's MeerkatMachine DSL `mcp_server_states`. Standalone
@@ -1114,7 +1445,12 @@ pub struct McpRouter {
     client_service_factory: Option<Arc<dyn crate::McpClientServiceFactory>>,
     /// Immutable for this router, including all later add and reload attempts.
     stdio_launch_profile: crate::McpStdioLaunchProfile,
+    /// The host's HTTP egress profile, retained by every later add, reload
+    /// and restore attempt of a remote server.
+    http_egress_profile: crate::HttpEgressProfile,
     call_context_provider: Option<Arc<dyn crate::McpCallContextProvider>>,
+    /// Close policy each stdio connection captures when it spawns its server.
+    stdio_close_bounds: crate::McpStdioCloseBounds,
     /// Bumped whenever the router makes progress a waiter could be blocked
     /// on: a tool call finishing (a draining server's in-flight count drops)
     /// or a connect attempt delivering its result. [`McpProgressWait`]
@@ -1172,6 +1508,282 @@ impl McpProgressWait {
 }
 
 impl McpRouter {
+    /// The exact operation `tool_name` routes to now: its registered server,
+    /// that server's current physical connection generation, the raw
+    /// operation, the connector approval of the descriptor that connection
+    /// was opened from and the account the connection acts with. `None` when the name routes nowhere or the server has no
+    /// live connection. A nonsecret fact for the operation policy owner; no
+    /// configuration or credential leaves the router.
+    /// What this router exposes now for one exact raw operation of `server`
+    /// (see [`meerkat_core::McpOperationObservation`]), from one read of the
+    /// current projection, the server's current connection and its accepted
+    /// surface state. A current route on a live connection is callable even
+    /// while a newer replacement is staged; a staged or connecting server
+    /// without one is pending, never callable. Nothing here is a permit.
+    pub fn observe_operation(
+        &self,
+        server: &str,
+        raw_operation: &str,
+    ) -> meerkat_core::McpOperationObservation {
+        use meerkat_core::McpOperationObservation as Observation;
+        let routed = self
+            .projection
+            .tool_routes
+            .values()
+            .any(|route| route.server_name == server && route.raw_operation == raw_operation);
+        if routed
+            && let Some(connection) = self
+                .servers
+                .get(server)
+                .and_then(|entry| entry.connection.as_ref())
+        {
+            return Observation::Callable {
+                connection_generation: connection.connection_id().generation(),
+                connector: connection.config().connector.as_ref().map(|binding| {
+                    meerkat_core::McpConnectorIdentity {
+                        realm_id: binding.realm_id.clone(),
+                        slot_id: binding.slot_id.clone(),
+                        issuer: binding.issuer.clone(),
+                        client: binding.client.clone(),
+                        account: binding.account.clone(),
+                    }
+                }),
+            };
+        }
+        let Some(snapshot) = self.surface_owner.surface_snapshot(server) else {
+            return Observation::Absent;
+        };
+        if snapshot.pending_op != meerkat_core::ExternalToolSurfacePendingOp::None
+            || snapshot.staged_op != meerkat_core::ExternalToolSurfaceStagedOp::None
+        {
+            return Observation::Pending;
+        }
+        if snapshot.base_state != Some(meerkat_core::ExternalToolSurfaceBaseState::Active)
+            && snapshot.last_delta_phase
+                == Some(meerkat_core::ExternalToolSurfaceDeltaPhase::Failed)
+        {
+            return Observation::Failed;
+        }
+        Observation::Absent
+    }
+
+    /// What `tool` of `server` is now on exactly the connection generation an
+    /// accepted attempt installed: the server's current connection must be
+    /// that generation, and the published routes must serve the tool on it.
+    pub(crate) fn installed_operation(
+        &self,
+        server: &str,
+        connection_generation: u64,
+        tool: &str,
+    ) -> InstalledOperation {
+        let current = self
+            .servers
+            .get(server)
+            .and_then(|entry| entry.connection.as_ref())
+            .is_some_and(|connection| {
+                connection.connection_id().generation() == connection_generation
+            });
+        if !current {
+            return InstalledOperation::Replaced;
+        }
+        if self
+            .projection
+            .tool_routes
+            .values()
+            .any(|route| route.server_name == server && route.raw_operation == tool)
+        {
+            InstalledOperation::Callable
+        } else {
+            InstalledOperation::NotRouted
+        }
+    }
+
+    /// Process connection results that have arrived, as lifecycle polling
+    /// does, while leaving their notices queued for the normal delivery.
+    pub(crate) fn progress_pending(&mut self) {
+        self.drain_pending();
+    }
+
+    pub(crate) fn operation_target(
+        &self,
+        tool_name: &str,
+    ) -> Option<meerkat_core::ToolOperationTarget> {
+        let route = self.projection.tool_routes.get(tool_name)?;
+        let connection = self.servers.get(&route.server_name)?.connection.as_ref()?;
+        Some(meerkat_core::ToolOperationTarget::McpServerOperation {
+            server: route.server_name.clone(),
+            connection_generation: connection.connection_id().generation(),
+            raw_operation: route.raw_operation.clone(),
+            connector: connection.config().connector_approval(),
+            account: Arc::clone(connection.operation_account()),
+        })
+    }
+
+    /// The operations a checked route to `server` offers now: of exactly
+    /// `operations`, the genuine definitions the server lists on its current
+    /// connection, each under the server's configured exposed name (its raw
+    /// name otherwise). Like the projection, an operation the server lists
+    /// with divergent definitions, one whose provenance names another
+    /// source, and an exposed name two of them share are withheld; so is an
+    /// exposed name the ordinary projection already routes. Nothing is
+    /// offered while the server is not visible or has no current
+    /// connection. The access ceiling is not consulted: the route's own
+    /// selection is its admission.
+    pub(crate) fn checked_operations(
+        &self,
+        server: &str,
+        operations: &BTreeSet<String>,
+    ) -> Vec<CheckedOperation> {
+        let visible = self
+            .surface_owner
+            .visible_surfaces()
+            .into_iter()
+            .any(|sid| sid.0 == server);
+        let Some(entry) = self.servers.get(server) else {
+            return Vec::new();
+        };
+        if !visible || entry.connection.is_none() {
+            return Vec::new();
+        }
+        let mut listed: BTreeMap<&str, &Arc<ToolDef>> = BTreeMap::new();
+        let mut divergent: BTreeSet<&str> = BTreeSet::new();
+        for tool in &entry.tools {
+            let raw = tool.name.as_str();
+            if !operations.contains(raw) {
+                continue;
+            }
+            match listed.get(raw) {
+                Some(existing) if !Self::tool_definitions_equivalent(existing, tool) => {
+                    divergent.insert(raw);
+                }
+                Some(_) => {}
+                None => {
+                    listed.insert(raw, tool);
+                }
+            }
+        }
+        let mut offered: BTreeMap<String, Option<CheckedOperation>> = BTreeMap::new();
+        for (raw, tool) in listed {
+            if divergent.contains(raw)
+                || tool.provenance.as_ref().is_some_and(|source| {
+                    source.kind != meerkat_core::types::ToolSourceKind::Mcp
+                        || source.source_id.as_str() != server
+                })
+            {
+                continue;
+            }
+            let exposed = entry.config.tool_names.get(raw).map_or(raw, String::as_str);
+            if self.projection.tool_routes.contains_key(exposed) {
+                continue;
+            }
+            let tool = if exposed == tool.name.as_str() {
+                Arc::clone(tool)
+            } else {
+                let mut renamed = (**tool).clone();
+                renamed.name = exposed.into();
+                Arc::new(renamed)
+            };
+            offered
+                .entry(exposed.to_string())
+                .and_modify(|shared| *shared = None)
+                .or_insert(Some(CheckedOperation {
+                    raw_operation: raw.to_string(),
+                    tool,
+                }));
+        }
+        offered.into_values().flatten().collect()
+    }
+
+    /// The operation target of `server`'s `raw_operation` reached through
+    /// the checked route `route`, on the server's current connection.
+    pub(crate) fn checked_operation_target(
+        &self,
+        route: &str,
+        server: &str,
+        raw_operation: &str,
+    ) -> Option<meerkat_core::ToolOperationTarget> {
+        let connection = self.servers.get(server)?.connection.as_ref()?;
+        Some(
+            meerkat_core::ToolOperationTarget::CheckedMcpServerOperation {
+                route: route.to_string(),
+                server: server.to_string(),
+                connection_generation: connection.connection_id().generation(),
+                raw_operation: raw_operation.to_string(),
+                connector: connection.config().connector_approval(),
+                account: Arc::clone(connection.operation_account()),
+            },
+        )
+    }
+
+    /// The declared mutation semantics of `server`'s `raw_operation`, from
+    /// the call-context provider for its current connection.
+    pub(crate) fn checked_mutation_class(
+        &self,
+        server: &str,
+        raw_operation: &str,
+    ) -> meerkat_core::ToolMutationClass {
+        let Some(connection) = self
+            .servers
+            .get(server)
+            .and_then(|entry| entry.connection.as_ref())
+        else {
+            return meerkat_core::ToolMutationClass::Unknown;
+        };
+        self.call_context_provider
+            .as_ref()
+            .map_or(meerkat_core::ToolMutationClass::Unknown, |provider| {
+                provider.tool_mutation_class(connection.config(), raw_operation)
+            })
+    }
+
+    /// Dispatch `call` as `server`'s `raw_operation` through the checked
+    /// route that owns `entry`: the ordinary call path (call accounting,
+    /// call-context and connector preparation, the reviewed entry at the
+    /// transport handoff), admitted by the route's selection instead of the
+    /// access ceiling, with the route's own conjunct reserved at that
+    /// handoff.
+    pub(crate) async fn dispatch_checked(
+        &self,
+        entry: &dyn CheckedEntry,
+        server: &str,
+        raw_operation: &str,
+        call: ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+    ) -> Result<meerkat_core::ops::ToolDispatchOutcome, ToolError> {
+        if context.read_only_execution_required()
+            && self.checked_mutation_class(server, raw_operation)
+                != meerkat_core::ToolMutationClass::ReadOnly
+        {
+            return Err(ToolError::access_denied(call.name));
+        }
+        let args = meerkat_core::ToolCallArguments::from_raw_json(call.args)
+            .map_err(|err| ToolError::invalid_arguments(call.name, err.to_string()))?;
+        let route = McpToolRoute {
+            server_name: server.to_string(),
+            raw_operation: raw_operation.to_string(),
+        };
+        let result = self
+            .call_route_with_context(
+                &route,
+                Some(entry),
+                call,
+                args.as_value(),
+                context,
+                |result| {
+                    let (blocks, is_error) =
+                        crate::protocol::project_tool_result(result, call.name)?;
+                    Ok(ToolResult::with_blocks(
+                        call.id.to_string(),
+                        blocks,
+                        is_error,
+                    ))
+                },
+            )
+            .await
+            .map_err(|error| tool_call_error(call.name, error))?;
+        Ok(result.into())
+    }
+
     fn with_surface_owner(surface_owner: SurfaceOwner) -> Self {
         Self::with_surface_owner_and_stdio_profile(
             surface_owner,
@@ -1189,6 +1801,10 @@ impl McpRouter {
             servers: HashMap::new(),
             projection: Arc::new(RouterProjectionSnapshot::default()),
             staged_payloads: HashMap::new(),
+            staged_controls: HashMap::new(),
+            staged_attempts: HashMap::new(),
+            pending_attempts: HashMap::new(),
+            governed_servers: std::collections::HashSet::new(),
             pending_tx: tx,
             pending_rx: Mutex::new(rx),
             pending_obligations: HashMap::new(),
@@ -1198,12 +1814,15 @@ impl McpRouter {
             pending_snapshot_alignment: None,
             completed_updates: VecDeque::new(),
             awaiting_authorization: BTreeMap::new(),
+            calls_refused_unauthorized: Mutex::new(Vec::new()),
             mcp_lifecycle_handle: Arc::new(StdRwLock::new(None)),
             mcp_auth_mode: McpAuthMode::Stored,
             mcp_auth_resolver: None,
             client_service_factory: None,
             stdio_launch_profile,
+            http_egress_profile: crate::HttpEgressProfile::trusted_host(),
             call_context_provider: None,
+            stdio_close_bounds: crate::McpStdioCloseBounds::DEFAULT,
             progress: Arc::new(tokio::sync::watch::Sender::new(0)),
             connect_attempts_spawned: 0,
             connect_results_delivered: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1310,6 +1929,30 @@ impl McpRouter {
         Self::with_surface_owner_and_stdio_profile(SurfaceOwner::runtime(surface_handle), profile)
     }
 
+    /// Declare how this router holds its surface handle. A supplied handle
+    /// is `Borrowed` unless the caller created it for this router alone.
+    pub fn with_surface_ownership(mut self, ownership: McpSurfaceOwnership) -> Self {
+        self.surface_owner.set_ownership(ownership);
+        self
+    }
+
+    /// How this router holds its surface handle.
+    pub fn surface_ownership(&self) -> McpSurfaceOwnership {
+        self.surface_owner.ownership()
+    }
+
+    /// The lineages this router staged, shared so a late surface rebind can
+    /// replace them with the lineages it re-derives on the new surface.
+    pub fn held_surface_lineages(&self) -> HeldSurfaceLineages {
+        self.surface_owner.held_lineages()
+    }
+
+    /// How this router holds its surface, shared so a late surface rebind
+    /// onto another owner's surface makes the router `Borrowed`.
+    pub fn surface_ownership_slot(&self) -> SurfaceOwnershipSlot {
+        self.surface_owner.ownership_slot()
+    }
+
     pub fn with_mcp_auth(
         mut self,
         mode: McpAuthMode,
@@ -1317,6 +1960,17 @@ impl McpRouter {
     ) -> Self {
         self.mcp_auth_mode = mode;
         self.mcp_auth_resolver = resolver;
+        self
+    }
+
+    /// Install the host's HTTP egress profile for every remote server this
+    /// router connects, including all later add, reload and restore
+    /// attempts. A required profile is an execution boundary, not a
+    /// permission: each refused destination fails its own connection with
+    /// the typed [`McpError::EgressRefused`]; the session continues. Stdio
+    /// servers are governed by the launch profile only.
+    pub fn with_http_egress_profile(mut self, profile: crate::HttpEgressProfile) -> Self {
+        self.http_egress_profile = profile;
         self
     }
 
@@ -1336,6 +1990,15 @@ impl McpRouter {
         provider: Arc<dyn crate::McpCallContextProvider>,
     ) -> Self {
         self.call_context_provider = Some(provider);
+        self
+    }
+
+    /// Set how long stdio servers get to exit when their connection closes
+    /// (remove, reload, replace, shutdown). Each connection captures the
+    /// bounds when it spawns its server, so this applies to connections
+    /// started afterwards.
+    pub fn with_stdio_close_bounds(mut self, bounds: crate::McpStdioCloseBounds) -> Self {
+        self.stdio_close_bounds = bounds;
         self
     }
 
@@ -1413,8 +2076,10 @@ impl McpRouter {
     /// Backward-compatible immediate add path.
     ///
     /// Prefer [`stage_add`](Self::stage_add) + [`apply_staged`](Self::apply_staged)
-    /// for boundary semantics.
+    /// for boundary semantics. A governed name is refused here as in
+    /// [`stage_add`](Self::stage_add): this path carries no control.
     pub async fn add_server(&mut self, config: McpServerConfig) -> Result<(), McpError> {
+        self.refuse_ungoverned_change(&config.name)?;
         self.install_active_server(config).await?;
         let _ = self.publish_projection_snapshot();
         Ok(())
@@ -1422,6 +2087,57 @@ impl McpRouter {
 
     /// Stage a server add for the next boundary apply.
     pub fn stage_add(&mut self, config: McpServerConfig) -> Result<(), McpError> {
+        // A governed name changes only under a new control.
+        self.refuse_ungoverned_change(&config.name)?;
+        self.stage_add_payload(config)
+    }
+
+    /// Stage a governed server add under its prepared attachment control.
+    ///
+    /// The payload and the control are installed together, replacing any
+    /// earlier staged payload and control for the name; the control must be
+    /// for this exact descriptor. It is asked once, at the connection's
+    /// physical entry, after any preparation wait.
+    pub fn stage_add_governed(
+        &mut self,
+        config: McpServerConfig,
+        control: Arc<dyn McpAttachmentAuthority>,
+    ) -> Result<(), McpError> {
+        self.stage_add_governed_attempt(config, control).map(|_| ())
+    }
+
+    /// [`Self::stage_add_governed`], returning this add's own attempt.
+    pub(crate) fn stage_add_governed_attempt(
+        &mut self,
+        config: McpServerConfig,
+        control: Arc<dyn McpAttachmentAuthority>,
+    ) -> Result<AttemptReceiver, McpError> {
+        if control.server() != &config {
+            return Err(McpError::AttachmentRefused(McpAttachmentRefusal::Mismatch));
+        }
+        let name = config.name.clone();
+        self.stage_add_payload(config)?;
+        self.staged_controls.insert(name.clone(), control);
+        // This add's own attempt; one it replaces before the boundary is
+        // superseded.
+        let (attempt, observed) = tokio::sync::watch::channel(AttemptState::Pending);
+        resolve_attempt(
+            self.staged_attempts.insert(name, attempt).as_ref(),
+            AttemptState::Superseded,
+        );
+        Ok(observed)
+    }
+
+    fn refuse_ungoverned_change(&self, server_name: &str) -> Result<(), McpError> {
+        if self.staged_controls.contains_key(server_name)
+            || self.governed_servers.contains(server_name)
+        {
+            return Err(McpError::AttachmentRefused(McpAttachmentRefusal::Mismatch));
+        }
+        Ok(())
+    }
+
+    fn stage_add_payload(&mut self, config: McpServerConfig) -> Result<(), McpError> {
         Self::validate_tool_names(&config)?;
         let server_name = config.name.clone();
         let sid = SurfaceId::from(server_name.as_str());
@@ -1468,6 +2184,16 @@ impl McpRouter {
             return Err(error.into());
         }
         self.staged_payloads.remove(&server_name);
+        // A removal withdraws a staged governed add with its control. The
+        // removal is only intent and can itself be replaced before apply, so
+        // the name stays governed until its actual disposition.
+        if self.staged_controls.remove(&server_name).is_some() {
+            self.governed_servers.insert(server_name.clone());
+        }
+        resolve_attempt(
+            self.staged_attempts.remove(&server_name).as_ref(),
+            AttemptState::Superseded,
+        );
         // An accepted removal withdraws any pending human-authorization ask.
         self.awaiting_authorization.remove(&server_name);
         Ok(())
@@ -1482,6 +2208,9 @@ impl McpRouter {
                 (config.name.clone(), Some(config))
             }
         };
+        // A governed server never reconnects or changes descriptor without a
+        // new control; its reload is a governed add.
+        self.refuse_ungoverned_change(&server_name)?;
         let sid = SurfaceId::from(server_name.as_str());
         match self
             .surface_owner
@@ -1529,6 +2258,12 @@ impl McpRouter {
         let mut delta = McpApplyDelta::default();
         // 1. Drain pending results from background tasks.
         self.drain_pending();
+        // 2. Servers a call found without a usable credential are released
+        // before this boundary applies, so their removal applies now.
+        self.release_servers_refused_at_call()?;
+        // 3. Sign-ins kept through a settled release are staged again, so
+        // they apply in this boundary.
+        self.restage_retained_sign_ins(&mut delta);
         let staged_intents = self.surface_owner.staged_intents_in_order();
         let mut snapshot_alignment = None;
 
@@ -1557,6 +2292,19 @@ impl McpRouter {
                 ),
                 StagedSurfaceOp::Remove | StagedSurfaceOp::None => None,
             };
+            // A removal reaching its boundary for a surface that is neither
+            // attached nor connecting (its governed add was withdrawn before
+            // it ever applied) has no connection to protect: that is its
+            // disposition. Any other stays governed until its removal
+            // finalizes.
+            // The marker is released only once that boundary is accepted; a
+            // rejected boundary (for example a stale sequence) keeps it.
+            let no_connection_removal = matches!(staged_op, StagedSurfaceOp::Remove)
+                && matches!(
+                    self.surface_owner.surface_base(&surface_id),
+                    SurfaceBaseState::Absent | SurfaceBaseState::Removed
+                )
+                && !self.surface_owner.pending_surfaces().contains(&surface_id);
             let applied_at_turn = self.turn_number_from_staged_sequence(staged_sequence);
             match self
                 .surface_owner
@@ -1566,10 +2314,27 @@ impl McpRouter {
                     applied_at_turn,
                 }) {
                 Ok(transition) => {
+                    // The control moves with this exact payload into its
+                    // connection; a rejected boundary keeps both staged.
+                    let (control, attempt) = match staged_op {
+                        StagedSurfaceOp::Add => (
+                            self.staged_controls.remove(&server_name),
+                            self.staged_attempts.remove(&server_name),
+                        ),
+                        _ => (None, None),
+                    };
+                    if control.is_some() {
+                        self.governed_servers.insert(server_name.clone());
+                    }
+                    if no_connection_removal {
+                        self.governed_servers.remove(&server_name);
+                    }
                     self.execute_effects(
                         &transition.effects,
                         &mut delta,
                         config.as_ref(),
+                        control,
+                        attempt,
                         &mut snapshot_alignment,
                     );
                     if matches!(staged_op, StagedSurfaceOp::Add | StagedSurfaceOp::Reload) {
@@ -1582,6 +2347,14 @@ impl McpRouter {
                         error = %error,
                         "Surface owner rejected ApplyBoundary for staged intent"
                     );
+                    // The exact staged attempt's typed answer: its boundary
+                    // was refused.
+                    if matches!(staged_op, StagedSurfaceOp::Add) {
+                        resolve_attempt(
+                            self.staged_attempts.remove(&server_name).as_ref(),
+                            AttemptState::Rejected(error.to_string()),
+                        );
+                    }
                     // K14: the rejection is a typed per-server fact on the
                     // apply result, not just a log line.
                     delta.rejected_boundaries.push(McpBoundaryRejection {
@@ -1614,6 +2387,8 @@ impl McpRouter {
         effects: &[ExternalToolSurfaceEffect],
         delta: &mut McpApplyDelta,
         config: Option<&McpServerConfig>,
+        mut control: Option<Arc<dyn McpAttachmentAuthority>>,
+        mut attempt: Option<AttemptSender>,
         snapshot_alignment: &mut Option<SurfaceSnapshotAlignmentObligation>,
     ) {
         self.reap_closing();
@@ -1639,7 +2414,12 @@ impl McpRouter {
                             continue;
                         }
                         if let Some(obligation) = obligations.pop_front() {
-                            self.spawn_pending(config.clone(), obligation);
+                            self.spawn_pending(
+                                config.clone(),
+                                control.take(),
+                                attempt.take(),
+                                obligation,
+                            );
                         }
                     }
                 }
@@ -1695,7 +2475,18 @@ impl McpRouter {
                             .with_detail(Some(error.to_string())),
                         });
                     }
-                    self.awaiting_authorization.remove(&surface_id.0);
+                    // A release-staged removal keeps its sign-in record: the
+                    // server awaits sign-in to be added back. Any other
+                    // removal withdraws the ask.
+                    // A sign-in kept on that record is staged again at the
+                    // next boundary ([`Self::restage_retained_sign_ins`]).
+                    if self
+                        .awaiting_authorization
+                        .get(&surface_id.0)
+                        .is_some_and(|awaiting| awaiting.operation != AwaitingOperation::Released)
+                    {
+                        self.awaiting_authorization.remove(&surface_id.0);
+                    }
                     delta.removed_servers.push(surface_id.0.clone());
                 }
                 ExternalToolSurfaceEffect::RejectSurfaceCall { .. } => {
@@ -1703,16 +2494,34 @@ impl McpRouter {
                 }
             }
         }
+        // An accepted boundary that scheduled no connection for this add
+        // leaves its attempt nothing to wait for.
+        resolve_attempt(
+            attempt.as_ref(),
+            AttemptState::Failed("the accepted boundary scheduled no connection".to_string()),
+        );
     }
 
     /// Spawn a background task to connect and enumerate tools for a server.
-    fn spawn_pending(&mut self, config: McpServerConfig, obligation: SurfaceCompletionObligation) {
+    fn spawn_pending(
+        &mut self,
+        config: McpServerConfig,
+        control: Option<Arc<dyn McpAttachmentAuthority>>,
+        attempt: Option<AttemptSender>,
+        obligation: SurfaceCompletionObligation,
+    ) {
         let server_name = config.name.clone();
+        if let Some(attempt) = attempt {
+            self.pending_attempts.insert(
+                (server_name.clone(), obligation.pending_task_sequence),
+                attempt,
+            );
+        }
         self.pending_obligations
             .insert(server_name, obligation.clone());
 
         let stdio_custody = matches!(config.transport, McpTransportConfig::Stdio(_)).then(|| {
-            let custody = StdioChildCustody::default();
+            let custody = StdioChildCustody::with_bounds(self.stdio_close_bounds);
             self.pending_child_custody.insert(
                 (
                     obligation.surface_id.clone(),
@@ -1730,19 +2539,28 @@ impl McpRouter {
         let auth_resolver = self.mcp_auth_resolver.clone();
         let client_factory = self.client_service_factory.clone();
         let stdio_profile = self.stdio_launch_profile.clone();
+        let http_egress = self.http_egress_profile.clone();
         // Reap tasks that already finished so the owned set stays bounded.
         while self.connect_tasks.try_join_next().is_some() {}
         self.connect_tasks.spawn(async move {
-            let result = McpConnection::connect_and_enumerate_with_custody(
+            let result = McpConnection::connect_and_enumerate_with_custody_and_egress(
                 &config,
                 auth_mode,
                 auth_resolver,
                 client_factory,
                 stdio_custody,
                 &stdio_profile,
+                &http_egress,
+                control,
             )
             .await;
-            let sent = tx.send(PendingResult { obligation, result }).await;
+            let sent = tx
+                .send(PendingResult {
+                    obligation,
+                    config,
+                    result,
+                })
+                .await;
             delivered.fetch_add(1, Ordering::AcqRel);
             progress.send_modify(|seen| *seen = seen.wrapping_add(1));
             if let Err(error) = sent {
@@ -1793,22 +2611,20 @@ impl McpRouter {
         &mut self,
         result: PendingResult,
     ) -> Option<SurfaceSnapshotAlignmentObligation> {
-        let PendingResult { obligation, result } = result;
+        let PendingResult {
+            obligation,
+            config,
+            result,
+        } = result;
         let server_name = obligation.surface_id.clone();
+        // The exact attempt this accepted obligation scheduled, if governed.
+        let attempt = self
+            .pending_attempts
+            .remove(&(server_name.clone(), obligation.pending_task_sequence));
         // The result (a connection, or an error after the process exited) now
         // carries the process; the attempt's custody entry is done.
         self.pending_child_custody
             .remove(&(server_name.clone(), obligation.pending_task_sequence));
-        match &result {
-            Err(McpError::AuthorizationRequired { target }) => {
-                self.awaiting_authorization
-                    .insert(server_name.clone(), (**target).clone());
-            }
-            _ => {
-                self.awaiting_authorization.remove(&server_name);
-            }
-        }
-
         match result {
             Ok((conn, tools)) => {
                 let tool_count = tools.len();
@@ -1824,6 +2640,9 @@ impl McpRouter {
                     }) {
                     Ok(transition) => {
                         self.pending_obligations.remove(&server_name);
+                        // The owner accepted this attempt's success: any
+                        // authorization ask for the server is answered.
+                        self.awaiting_authorization.remove(&server_name);
                         let Some(operation) = lifecycle_operation_from_effects(
                             &transition.effects,
                             SurfaceDeltaPhase::Applied,
@@ -1831,6 +2650,12 @@ impl McpRouter {
                             tracing::error!(
                                 server = %server_name,
                                 "Surface owner accepted PendingSucceeded without an applied lifecycle delta"
+                            );
+                            resolve_attempt(
+                                attempt.as_ref(),
+                                AttemptState::Failed(
+                                    "the accepted connection carried no applied delta".to_string(),
+                                ),
                             );
                             return None;
                         };
@@ -1844,6 +2669,10 @@ impl McpRouter {
                         // canonical lifecycle channel (the same channel
                         // background connection failures use).
                         if let Err(error) = self.notify_lifecycle_connected(&server_name) {
+                            resolve_attempt(
+                                attempt.as_ref(),
+                                AttemptState::Failed(error.to_string()),
+                            );
                             self.spawn_close(server_name.clone(), Some(conn));
                             self.completed_updates.push_back(CompletedLifecycleUpdate {
                                 action: McpLifecycleAction::new(
@@ -1865,6 +2694,7 @@ impl McpRouter {
                         }
 
                         // Install the new entry (or replace existing).
+                        let connection_generation = conn.connection_id().generation();
                         let config = conn.config().clone();
                         let new_entry = ServerEntry {
                             config,
@@ -1887,6 +2717,12 @@ impl McpRouter {
                             )
                             .with_tool_count(Some(tool_count)),
                         });
+                        resolve_attempt(
+                            attempt.as_ref(),
+                            AttemptState::Installed {
+                                connection_generation,
+                            },
+                        );
                         snapshot_alignment
                     }
                     Err(e) => {
@@ -1895,6 +2731,7 @@ impl McpRouter {
                             error = %e,
                             "Surface owner rejected PendingSucceeded"
                         );
+                        resolve_attempt(attempt.as_ref(), AttemptState::Superseded);
                         self.spawn_close(server_name, Some(conn));
                         None
                     }
@@ -1920,6 +2757,8 @@ impl McpRouter {
                 ) {
                     Ok(transition) => {
                         self.pending_obligations.remove(&server_name);
+                        resolve_attempt(attempt.as_ref(), AttemptState::Failed(err.to_string()));
+                        self.record_accepted_failure(&server_name, &err, config, &obligation);
                         let Some(operation) = lifecycle_operation_from_effects(
                             &transition.effects,
                             SurfaceDeltaPhase::Failed,
@@ -1938,6 +2777,7 @@ impl McpRouter {
                             error = %e,
                             "Surface owner rejected PendingFailed"
                         );
+                        resolve_attempt(attempt.as_ref(), AttemptState::Superseded);
                         // Even when the surface owner rejects the failure
                         // input, a rejected lifecycle mirror apply must still
                         // surface typed on the canonical action channel.
@@ -1997,7 +2837,355 @@ impl McpRouter {
     /// clears the entry. It reflects background results already drained by
     /// the normal lifecycle polling; it drains nothing itself.
     pub fn servers_awaiting_authorization(&self) -> Vec<McpServerIdentity> {
-        self.awaiting_authorization.values().cloned().collect()
+        self.awaiting_authorization
+            .values()
+            .map(|awaiting| awaiting.target.clone())
+            .collect()
+    }
+
+    /// Record the authorization outcome of a failure the surface owner just
+    /// accepted. Only an accepted completion reaches here, so a stale result
+    /// can neither insert an old record nor erase a newer one. An
+    /// `AuthorizationRequired` failure is retained only while no newer
+    /// intent (a remove included) is staged for the server.
+    fn record_accepted_failure(
+        &mut self,
+        server_name: &str,
+        error: &McpError,
+        config: McpServerConfig,
+        obligation: &SurfaceCompletionObligation,
+    ) {
+        self.awaiting_authorization.remove(server_name);
+        let McpError::AuthorizationRequired { target } = error else {
+            return;
+        };
+        let operation = match obligation.operation {
+            ExternalToolSurfaceDeltaOperation::Add => AwaitingOperation::Add,
+            ExternalToolSurfaceDeltaOperation::Reload => AwaitingOperation::Reload,
+            _ => return,
+        };
+        if self.has_staged_intent(server_name) {
+            return;
+        }
+        self.awaiting_authorization.insert(
+            server_name.to_owned(),
+            AwaitingAuthorization {
+                target: (**target).clone(),
+                config,
+                operation,
+                signed_in_during_release: false,
+            },
+        );
+    }
+
+    fn has_staged_intent(&self, server_name: &str) -> bool {
+        self.surface_owner
+            .staged_intents_in_order()
+            .iter()
+            .any(|(surface_id, _, _)| surface_id.0 == server_name)
+    }
+
+    /// Whether the removal a credential release staged for this server is
+    /// still staged, or applied and still closing the connection. A newer
+    /// staged add or reload is not that removal.
+    fn release_removal_unsettled(&self, server_name: &str) -> bool {
+        let staged = self
+            .surface_owner
+            .staged_intents_in_order()
+            .into_iter()
+            .find(|(surface_id, _, _)| surface_id.0 == server_name)
+            .map(|(_, op, _)| op);
+        match staged {
+            Some(StagedSurfaceOp::Remove) => true,
+            Some(_) => false,
+            None => self
+                .servers
+                .get(server_name)
+                .is_some_and(|entry| entry.connection.is_some()),
+        }
+    }
+
+    /// Stage again every released server whose sign-in landed while its
+    /// release removal settled, once that removal has closed the connection,
+    /// exactly as [`Self::retry_authorized`] would have. Runs at the start of
+    /// each boundary, so the add applies in that boundary; it reads the
+    /// current credential when it connects.
+    ///
+    /// A newer staged intent or an operation in flight for the server wins
+    /// and the sign-in stays kept. A staging refusal is reported as a failed
+    /// add lifecycle action in this boundary's result and the sign-in stays
+    /// kept, so a later boundary tries again. Once the owner accepts the
+    /// add, its payload is installed before the lifecycle mirror, and a
+    /// mirror refusal is reported the same way without undoing the accepted
+    /// intent.
+    fn restage_retained_sign_ins(&mut self, delta: &mut McpApplyDelta) {
+        let due: Vec<String> = self
+            .awaiting_authorization
+            .iter()
+            .filter(|(_, awaiting)| {
+                awaiting.operation == AwaitingOperation::Released
+                    && awaiting.signed_in_during_release
+            })
+            .filter(|(name, _)| {
+                self.servers
+                    .get(name.as_str())
+                    .is_none_or(|entry| entry.connection.is_none())
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for server_name in due {
+            let surface_id = SurfaceId::from(server_name.as_str());
+            if self.has_staged_intent(&server_name)
+                || self.surface_owner.pending_surfaces().contains(&surface_id)
+            {
+                continue;
+            }
+            let Some(config) = self
+                .awaiting_authorization
+                .get(&server_name)
+                .map(|awaiting| awaiting.config.clone())
+            else {
+                continue;
+            };
+            if let Err(error) = Self::validate_tool_names(&config).and_then(|()| {
+                self.surface_owner
+                    .apply(ExternalToolSurfaceInput::StageAdd { surface_id })
+                    .map(drop)
+                    .map_err(McpError::from)
+            }) {
+                tracing::warn!(
+                    server = %server_name,
+                    %error,
+                    "could not stage the released server again after its sign-in; kept for the next boundary"
+                );
+                delta.lifecycle_actions.push(
+                    McpLifecycleAction::new(
+                        server_name.clone(),
+                        ToolConfigChangeOperation::Add,
+                        McpLifecyclePhase::Failed,
+                    )
+                    .with_detail(Some(error.to_string())),
+                );
+                continue;
+            }
+            // The owner accepted the add: the kept sign-in is answered and
+            // the payload is installed before the lifecycle mirror.
+            if let Some(record) = self.awaiting_authorization.get_mut(&server_name) {
+                record.signed_in_during_release = false;
+            }
+            self.staged_payloads.insert(server_name.clone(), config);
+            if let Err(error) = self.notify_lifecycle_connect_pending(&server_name) {
+                delta.lifecycle_actions.push(
+                    McpLifecycleAction::new(
+                        server_name.clone(),
+                        ToolConfigChangeOperation::Add,
+                        McpLifecyclePhase::Failed,
+                    )
+                    .with_detail(Some(error.to_string())),
+                );
+            }
+        }
+    }
+
+    /// After a successful login for `target`, stage again the one failed
+    /// operation that awaits exactly that target, with the config it
+    /// attempted. It applies at the next boundary through the normal
+    /// lifecycle and reads the credential then; this copies no credential.
+    ///
+    /// A newer staged intent (including a remove) or an operation in flight
+    /// for the server wins and is left alone. Pending results are drained
+    /// first, so an accepted result supersedes or refreshes the record.
+    /// A staging fault is returned typed; the accepted intent keeps its
+    /// payload, so the next boundary does not fail for a missing payload.
+    pub fn retry_authorized(
+        &mut self,
+        target: &McpServerIdentity,
+    ) -> Result<AuthorizedRetry, McpError> {
+        self.drain_pending();
+        // A call refusal queued for this target before the sign-in describes
+        // the credential that was replaced: the server stays connected and
+        // usable with the new one, so the refusal no longer releases it.
+        self.calls_refused_unauthorized
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(_, refused)| refused != target);
+        let Some((server_name, awaiting)) = self
+            .awaiting_authorization
+            .iter()
+            .find(|(_, awaiting)| awaiting.target == *target)
+            .map(|(name, awaiting)| (name.clone(), awaiting.clone()))
+        else {
+            return Ok(AuthorizedRetry::NotAwaiting);
+        };
+        let surface_id = SurfaceId::from(server_name.as_str());
+        if awaiting.operation == AwaitingOperation::Released
+            && self.release_removal_unsettled(&server_name)
+        {
+            // An explicit remove withdraws this record, so a staged remove
+            // here is the release's own; keep the sign-in for its settlement.
+            if let Some(record) = self.awaiting_authorization.get_mut(&server_name) {
+                record.signed_in_during_release = true;
+            }
+            return Ok(AuthorizedRetry::AfterRelease);
+        }
+        if self.has_staged_intent(&server_name)
+            || self.surface_owner.pending_surfaces().contains(&surface_id)
+        {
+            return Ok(AuthorizedRetry::AlreadyPending);
+        }
+        let input = match awaiting.operation {
+            AwaitingOperation::Add | AwaitingOperation::Released => {
+                Self::validate_tool_names(&awaiting.config)?;
+                ExternalToolSurfaceInput::StageAdd { surface_id }
+            }
+            AwaitingOperation::Reload => ExternalToolSurfaceInput::StageReload { surface_id },
+        };
+        if let Err(error) = self.surface_owner.apply(input) {
+            tracing::warn!(
+                server = %server_name,
+                error = %error,
+                "Surface owner rejected the post-login retry"
+            );
+            return Err(error.into());
+        }
+        // The owner accepted the intent: its payload is installed before the
+        // lifecycle mirror, so a mirror fault cannot leave the boundary
+        // without it.
+        self.staged_payloads
+            .insert(server_name.clone(), awaiting.config);
+        match awaiting.operation {
+            AwaitingOperation::Add | AwaitingOperation::Released => {
+                self.notify_lifecycle_connect_pending(&server_name)?;
+            }
+            AwaitingOperation::Reload => self.notify_lifecycle_reload(&server_name)?,
+        }
+        Ok(AuthorizedRetry::Staged)
+    }
+
+    /// After the credential for `target` was released (signed out), stop
+    /// offering every connected server that uses exactly that credential.
+    /// Calls are already refused at the bearer, which reads the credential
+    /// per request; this unpublishes the tools. Each such server gets the
+    /// ordinary staged removal (applied at the next boundary through the
+    /// surface owner) and is recorded as awaiting sign-in with the config it
+    /// connected with, so a later login for the same target
+    /// ([`Self::retry_authorized`]) adds it back to this router.
+    ///
+    /// The server's identity is derived from its config exactly as a
+    /// connection derives the target it reports (server name, URL, account
+    /// selection, and the realm this router's resolver serves), so another
+    /// URL, account or realm never matches. A newer staged intent or an operation in flight
+    /// for the server wins and is left alone.
+    pub fn credential_released(
+        &mut self,
+        target: &McpServerIdentity,
+    ) -> Result<ReleasedCredential, McpError> {
+        self.drain_pending();
+        let mut matching: Vec<String> = self
+            .servers
+            .iter()
+            .filter(|(_, entry)| entry.connection.is_some())
+            .filter(|(_, entry)| {
+                self.connected_identity(&entry.config)
+                    .is_some_and(|id| id == *target)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        matching.sort();
+        let mut outcome = ReleasedCredential::NotActive;
+        for server_name in matching {
+            // A sign-out after a sign-in retained during this server's
+            // release supersedes it.
+            if let Some(record) = self.awaiting_authorization.get_mut(&server_name)
+                && record.operation == AwaitingOperation::Released
+            {
+                record.signed_in_during_release = false;
+            }
+            match self.release_server(&server_name, target)? {
+                ReleasedCredential::Unpublished => outcome = ReleasedCredential::Unpublished,
+                ReleasedCredential::AlreadyPending if outcome == ReleasedCredential::NotActive => {
+                    outcome = ReleasedCredential::AlreadyPending;
+                }
+                _ => {}
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// The identity a connection for `config` resolves and reports: its
+    /// config identity, scoped to the realm this router's resolver serves
+    /// (as `McpConnection` scopes it), so it equals the host's target.
+    fn connected_identity(&self, config: &McpServerConfig) -> Option<McpServerIdentity> {
+        let identity = McpServerIdentity::from_config(config).ok()?;
+        Some(
+            match self
+                .mcp_auth_resolver
+                .as_deref()
+                .and_then(McpAuthResolver::credential_realm)
+            {
+                Some(realm) => identity.in_realm(realm),
+                None => identity,
+            },
+        )
+    }
+
+    /// Stage the removal of one connected server whose credential for
+    /// `target` is gone, keeping its config as a sign-in record.
+    fn release_server(
+        &mut self,
+        server_name: &str,
+        target: &McpServerIdentity,
+    ) -> Result<ReleasedCredential, McpError> {
+        let Some(config) = self
+            .servers
+            .get(server_name)
+            .filter(|entry| entry.connection.is_some())
+            .map(|entry| entry.config.clone())
+        else {
+            return Ok(ReleasedCredential::NotActive);
+        };
+        let surface_id = SurfaceId::from(server_name);
+        if self.has_staged_intent(server_name)
+            || self.surface_owner.pending_surfaces().contains(&surface_id)
+        {
+            return Ok(ReleasedCredential::AlreadyPending);
+        }
+        self.stage_remove(server_name)?;
+        self.awaiting_authorization.insert(
+            server_name.to_owned(),
+            AwaitingAuthorization {
+                target: target.clone(),
+                config,
+                operation: AwaitingOperation::Released,
+                signed_in_during_release: false,
+            },
+        );
+        tracing::info!(
+            server = %server_name,
+            "MCP credential released; the server is unpublished and awaits sign-in"
+        );
+        Ok(ReleasedCredential::Unpublished)
+    }
+
+    /// Release every connected server a call found without a usable
+    /// credential, if it still connects with exactly the reported target.
+    fn release_servers_refused_at_call(&mut self) -> Result<(), McpError> {
+        let refused = std::mem::take(
+            &mut *self
+                .calls_refused_unauthorized
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for (server_name, target) in refused {
+            let still_this_target = self.servers.get(&server_name).is_some_and(|entry| {
+                self.connected_identity(&entry.config)
+                    .is_some_and(|id| id == target)
+            });
+            if still_this_target {
+                self.release_server(&server_name, &target)?;
+            }
+        }
+        Ok(())
     }
 
     /// Drain pending results and return queued canonical lifecycle actions.
@@ -2102,20 +3290,34 @@ impl McpRouter {
             }
         };
 
-        let result = McpConnection::connect_and_enumerate_with_services_and_stdio_profile(
+        let stdio_custody = matches!(config.transport, McpTransportConfig::Stdio(_))
+            .then(|| StdioChildCustody::with_bounds(self.stdio_close_bounds));
+        let result = McpConnection::connect_and_enumerate_with_custody_and_egress(
             &config,
             self.mcp_auth_mode,
             self.mcp_auth_resolver.clone(),
             self.client_service_factory.clone(),
+            stdio_custody,
             &self.stdio_launch_profile,
+            &self.http_egress_profile,
+            None,
         )
         .await;
         let confinement_error = result.as_ref().err().and_then(|error| match error {
             McpError::Confinement(refusal) => Some(*refusal),
             _ => None,
         });
+        let egress_error = result.as_ref().err().and_then(McpError::egress_error);
+        let service_secret_refusal = result.as_ref().err().and_then(|error| match error {
+            McpError::ServiceSecretRefused { refusal, .. } => Some(refusal.clone()),
+            _ => None,
+        });
         let connect_error = result.as_ref().err().map(ToString::to_string);
-        let snapshot_alignment = self.process_pending_result(PendingResult { obligation, result });
+        let snapshot_alignment = self.process_pending_result(PendingResult {
+            obligation,
+            config: config.clone(),
+            result,
+        });
 
         self.record_snapshot_alignment(snapshot_alignment);
         let published = self.publish_projection_snapshot();
@@ -2126,6 +3328,15 @@ impl McpRouter {
 
         if let Some(refusal) = confinement_error {
             return Err(McpError::Confinement(refusal));
+        }
+        if let Some(error) = egress_error {
+            return Err(McpError::from_egress(&server_name, error));
+        }
+        if let Some(refusal) = service_secret_refusal {
+            return Err(McpError::ServiceSecretRefused {
+                server: server_name,
+                refusal,
+            });
         }
         if let Some(message) = connect_error {
             return Err(McpError::ProtocolError { message });
@@ -2201,7 +3412,16 @@ impl McpRouter {
                             "surface owner rejected finalize removal for '{server_name}': {e}"
                         ),
                     })?;
-            self.execute_effects(&transition.effects, delta, None, snapshot_alignment);
+            self.execute_effects(
+                &transition.effects,
+                delta,
+                None,
+                None,
+                None,
+                snapshot_alignment,
+            );
+            // The removal's disposition: the name is no longer governed.
+            self.governed_servers.remove(&server_name);
             if degraded {
                 delta.degraded_removals.push(server_name);
             }
@@ -2282,8 +3502,12 @@ impl McpRouter {
         }
     }
 
+    /// Refuse a server whose exposure map, access policy or secret
+    /// declaration is invalid, before any lifecycle or transport effect.
     fn validate_tool_names(config: &McpServerConfig) -> Result<(), McpError> {
         use meerkat_core::tool_catalog::{TOOL_CATALOG_LOAD_NAME, TOOL_CATALOG_SEARCH_NAME};
+        config.validate_access()?;
+        config.validate_secret_env()?;
         for (raw_operation, exposed) in &config.tool_names {
             let reason = if raw_operation.is_empty() {
                 Some("raw operation must not be empty")
@@ -2368,6 +3592,12 @@ impl McpRouter {
             }
 
             for (raw_operation, tool) in server_tools {
+                // An operation outside the server's access ceiling is not
+                // offered or routed under any name (its connection also
+                // refuses the call).
+                if !entry.config.permits_operation(&raw_operation) {
+                    continue;
+                }
                 let exposed = entry
                     .config
                     .tool_names
@@ -2844,6 +4074,22 @@ impl McpRouter {
             .tool_routes
             .get(call.name)
             .ok_or_else(|| McpError::ToolNotFound(call.name.to_string()))?;
+        self.call_route_with_context(route, None, call, args, context, project)
+            .await
+    }
+
+    /// One call of `route`: under its server's current access ceiling, or,
+    /// through a checked route's `route_entry`, under exactly that route's
+    /// selected operations and its own conjunct at the transport handoff.
+    async fn call_route_with_context<T>(
+        &self,
+        route: &McpToolRoute,
+        route_entry: Option<&dyn CheckedEntry>,
+        call: ToolCallView<'_>,
+        args: &Value,
+        context: &meerkat_core::ToolDispatchContext,
+        project: impl FnOnce(rmcp::model::CallToolResult) -> Result<T, McpError>,
+    ) -> Result<T, McpError> {
         let server_name = &route.server_name;
         let entry = self
             .servers
@@ -2853,6 +4099,20 @@ impl McpRouter {
             .connection
             .as_ref()
             .ok_or_else(|| McpError::ServerNotFound(server_name.clone()))?;
+        // The current connection's access ceiling (or the checked route's
+        // own selection), before call accounting, host preparation and
+        // review entry (its `tools/call` checks the same admission again
+        // before sending).
+        let admission = match route_entry {
+            None => crate::connection::CallAdmission::Ceiling(conn.config().access.as_ref()),
+            Some(entry) => crate::connection::CallAdmission::CheckedRoute(entry.operations()),
+        };
+        if !admission.admits(&route.raw_operation) {
+            return Err(McpError::OperationNotPermitted {
+                server: server_name.clone(),
+                operation: route.raw_operation.clone(),
+            });
+        }
         let sid = SurfaceId::from(server_name.as_str());
         match self
             .surface_owner
@@ -2901,9 +4161,18 @@ impl McpRouter {
                 }
                 None => None,
             };
+            // A connector-bound server's calls need their connector
+            // preparation. Without one (no provider, a binding the provider
+            // refused to install, or a provider that does not serve it) the
+            // call is refused locally, never sent unbound.
+            if preparation.is_none() && conn.config().connector.is_some() {
+                return Err(McpError::CallContext(
+                    crate::McpCallContextError::Unavailable,
+                ));
+            }
             // The guard remains owned by this future until transport and
             // conversion finish, and drops immediately if the future is cancelled.
-            let (metadata, _lease) = match preparation {
+            let (metadata, _lease, final_check) = match preparation {
                 Some(prepared) => {
                     let mut metadata = prepared.metadata;
                     if metadata.contains_key(meerkat_core::CALL_ORIGIN_META_KEY)
@@ -2916,9 +4185,10 @@ impl McpRouter {
                         serde_json::to_value(origin)
                             .map_err(|_| crate::McpCallContextError::Unavailable)?,
                     );
-                    (Some(metadata), Some(prepared.guard))
+                    let lease: Arc<dyn Send + Sync> = Arc::from(prepared.guard);
+                    (Some(metadata), Some(lease), prepared.final_check)
                 }
-                None => (None, None),
+                None => (None, None, None),
             };
             if let Some(control) = context.tool_application_control() {
                 control
@@ -2929,25 +4199,59 @@ impl McpRouter {
             self.validate_app_call(call, context)?;
             // The native entry step runs inside the connection, after its
             // final request preparation and immediately before the local
-            // transport handoff. The preparation lease (`_lease`) stays held
-            // until the call completes.
+            // transport handoff. The preparation's own final check, fallible,
+            // runs first, so a refusal there leaves review unspent; then the
+            // single consuming reviewed entry. The preparation lease and the
+            // entered review's custody travel with the request to the native
+            // send owner, and this future also holds the lease until the call
+            // completes.
+            let send_lease = _lease.clone();
+            let generation = conn.connection_id().generation();
             let result = conn
-                .call_tool_result_entering(&route.raw_operation, args, metadata, || {
+                .call_tool_result_admitted(admission, &route.raw_operation, args, metadata, || {
                     self.validate_app_call(call, context)?;
                     if let Some(control) = context.tool_application_control() {
                         control
                             .revalidate()
                             .map_err(|error| McpError::EntryRefused(Box::new(error.into())))?;
                     }
-                    context
-                        .enter_reviewed_effect(call, None)
-                        .map(drop)
-                        .map_err(|error| McpError::EntryRefused(Box::new(error)))
+                    // What the check guards stays held through the
+                    // reviewed entry and the handoff, with the request.
+                    let checked = final_check
+                        .map(|check| check().map_err(McpError::CallContext))
+                        .transpose()?;
+                    // A checked route's own conjunct, after every await:
+                    // its single entry is reserved here, and released only
+                    // if the native entry below refuses.
+                    if let Some(entry) = route_entry {
+                        entry
+                            .reserve_entry(call, context, generation)
+                            .map_err(|error| McpError::EntryRefused(Box::new(error)))?;
+                    }
+                    let (entering, review) = context
+                        .enter_reviewed_effect_held(call, None)
+                        .map_err(|error| {
+                            if let Some(entry) = route_entry {
+                                entry.release_entry();
+                            }
+                            McpError::EntryRefused(Box::new(error))
+                        })?;
+                    Ok(Some(crate::transport::protected::SendCustody::new((
+                        send_lease, checked, review, entering,
+                    ))))
                 })
                 .await?;
             project(result)
         }
         .await;
+        // A call that found no usable credential releases the server at the
+        // next boundary, as a sign-out in this process would.
+        if let Err(McpError::AuthorizationRequired { target }) = &result {
+            self.calls_refused_unauthorized
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((server_name.clone(), (**target).clone()));
+        }
         // Refuse a result whose canonical completion was rejected.
         lifetime.finish()?;
         result
@@ -2958,18 +4262,25 @@ impl McpRouter {
         // First consume any finished pending tasks through normal processing so
         // stale completion payloads close their transports via existing paths.
         self.drain_pending();
-        let _ = self.surface_owner.apply(ExternalToolSurfaceInput::Shutdown);
+        // An owned surface is shut down; a borrowed one outlives this router,
+        // which releases only what it staged.
+        self.surface_owner.end_holding();
         self.pending_obligations.clear();
         self.pending_snapshot_alignment = None;
         self.completed_updates.clear();
         self.staged_payloads.clear();
+        self.awaiting_authorization.clear();
+        self.staged_controls.clear();
+        self.staged_attempts.clear();
+        self.pending_attempts.clear();
         let (replacement_tx, _replacement_rx) = mpsc::channel(PENDING_CHANNEL_CAPACITY);
         let old_pending_tx = std::mem::replace(&mut self.pending_tx, replacement_tx);
         drop(old_pending_tx);
-        // Abort and join every connect task still running, then terminate the
+        // Abort and join every connect task still running, then close the
         // stdio process of every attempt whose result was never processed.
-        // The custody outlives the aborted attempt, so its process has exited
-        // by the time terminate returns.
+        // The custody outlives the aborted attempt, and so does a close the
+        // attempt already started (after a failed handshake or enumeration):
+        // that close runs in its own task, which the close below joins.
         self.connect_tasks.abort_all();
         while let Some(joined) = self.connect_tasks.join_next().await {
             if let Err(error) = joined
@@ -2978,10 +4289,30 @@ impl McpRouter {
                 tracing::warn!("MCP connect task panicked before shutdown: {error}");
             }
         }
+        // Every close below runs as a router-owned task joined at the end, so
+        // servers use their close grace concurrently rather than in turn.
+        self.reap_closing();
         for ((server, _), custody) in std::mem::take(&mut self.pending_child_custody) {
-            if let Some(Err(error)) = custody.terminate().await {
-                tracing::warn!(server = %server, error = %error, "failed to reap MCP stdio server process");
-            }
+            self.closing.spawn(async move {
+                match custody.terminate_or_join().await {
+                    Ok(Some(receipt)) => {
+                        crate::connection::trace_close_receipt(&server, &receipt);
+                        Ok(())
+                    }
+                    // Never spawned, or the attempt that started the close
+                    // took (and traced) its receipt.
+                    Ok(None) | Err(CustodyNotHeld::NeverSpawned) => Ok(()),
+                    Err(not_held) => Err((
+                        server,
+                        McpError::ConnectionFailed {
+                            reason: format!(
+                                "stdio server close did not finish ({not_held:?}); its process \
+                                 group was killed without its exit being observed"
+                            ),
+                        },
+                    )),
+                }
+            });
         }
         // Drain any completion payloads that arrived after pending_tx drop.
         let drained_results: Vec<PendingResult> = {
@@ -3002,12 +4333,12 @@ impl McpRouter {
         };
         for pending in drained_results {
             if let Ok((conn, _)) = pending.result {
-                Self::close_entry_connection(pending.obligation.surface_id, Some(conn)).await;
+                self.spawn_close(pending.obligation.surface_id, Some(conn));
             }
         }
         let servers = std::mem::take(&mut self.servers);
         for (_, entry) in servers {
-            Self::close_entry_connection(entry.config.name, entry.connection).await;
+            self.spawn_close(entry.config.name, entry.connection);
         }
         while let Some(joined) = self.closing.join_next().await {
             Self::report_close(joined);
@@ -3314,6 +4645,24 @@ fn tool_call_error(tool: &str, error: McpError) -> ToolError {
         McpError::ToolNotFound(name) => ToolError::NotFound { name },
         McpError::EntryRefused(error) => *error,
         McpError::Confinement(refusal) => ToolError::ConfinementRefused { refusal },
+        // Refused locally by the host egress profile before anything was
+        // sent: the tool cannot currently be called from this host.
+        McpError::EgressRefused { .. } | McpError::EgressUnavailable { .. } => {
+            ToolError::unavailable(
+                tool,
+                meerkat_core::ToolUnavailableReason::NotCurrentlyCallable,
+            )
+        }
+        // Refused by the server's access policy before anything was sent.
+        McpError::OperationNotPermitted { .. } => ToolError::access_denied(tool),
+        // The call-context provider's typed verdict, before anything was
+        // sent: a denial stays a denial, and an unavailable context stays an
+        // availability result.
+        McpError::CallContext(crate::McpCallContextError::Denied) => ToolError::access_denied(tool),
+        McpError::CallContext(crate::McpCallContextError::Unavailable) => ToolError::unavailable(
+            tool,
+            meerkat_core::ToolUnavailableReason::TemporarilyUnavailable,
+        ),
         // Its own session 404, or a redirect shown by its own response, then
         // a failure: neither success nor denial. Nothing is re-sent and the
         // session is not re-initialized; a redirected call can have been
@@ -3327,7 +4676,7 @@ fn tool_call_error(tool: &str, error: McpError) -> ToolError {
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -3338,6 +4687,12 @@ mod tests {
             },
             ToolError::ReviewUnsatisfied {
                 kind: meerkat_core::ReviewUnsatisfiedKind::ContextChanged,
+                approval_id: None,
+            },
+            // The owner's consent reference survives the router mapping.
+            ToolError::ReviewUnsatisfied {
+                kind: meerkat_core::ReviewUnsatisfiedKind::HumanConsentRequired,
+                approval_id: Some(meerkat_core::ApprovalId::new()),
             },
             ToolError::AuthorizationRefused {
                 refusal: meerkat_core::authorization::OperationRefused::new(
@@ -3370,6 +4725,49 @@ mod tests {
             ),
             ToolError::ExecutionFailed { .. }
         ));
+    }
+
+    #[test]
+    fn call_context_verdicts_keep_their_typed_feedback() {
+        let denied = tool_call_error(
+            "tool",
+            McpError::CallContext(crate::McpCallContextError::Denied),
+        );
+        assert_eq!(
+            denied,
+            ToolError::AccessDenied {
+                name: "tool".into()
+            }
+        );
+        assert_eq!(
+            denied.to_error_payload(),
+            serde_json::json!({
+                "error": "access_denied",
+                "message": "Tool 'tool' is not allowed by policy",
+            })
+        );
+
+        let unavailable = tool_call_error(
+            "tool",
+            McpError::CallContext(crate::McpCallContextError::Unavailable),
+        );
+        assert_eq!(
+            unavailable,
+            ToolError::Unavailable {
+                name: "tool".into(),
+                reason: meerkat_core::ToolUnavailableReason::TemporarilyUnavailable,
+            }
+        );
+        assert_eq!(
+            unavailable.to_error_payload(),
+            serde_json::json!({
+                "error": "tool_unavailable",
+                "message": format!(
+                    "Tool 'tool' is currently unavailable: {}",
+                    meerkat_core::ToolUnavailableReason::TemporarilyUnavailable
+                ),
+            })
+        );
     }
     use crate::connection::McpConnection;
     use meerkat_core::ExternalToolSurfaceFailureCause;
@@ -3748,6 +5146,12 @@ mod tests {
                 };
                 router.process_pending_result(PendingResult {
                     obligation: obligation.clone(),
+                    config: McpServerConfig::stdio(
+                        obligation.surface_id.clone(),
+                        "/bin/true",
+                        Vec::new(),
+                        HashMap::new(),
+                    ),
                     result: Err(error),
                 });
                 let notice = router
@@ -3777,6 +5181,12 @@ mod tests {
                 // The settled obligation is now stale. Even a typed error on
                 // its replay cannot publish a second refusal notice.
                 router.process_pending_result(PendingResult {
+                    config: McpServerConfig::stdio(
+                        obligation.surface_id.clone(),
+                        "/bin/true",
+                        Vec::new(),
+                        HashMap::new(),
+                    ),
                     obligation,
                     result: Err(McpError::Confinement(ConfinementRefusal::InvalidLaunch)),
                 });
@@ -4461,6 +5871,7 @@ mod tests {
             tool.provenance = Some(meerkat_core::ToolProvenance {
                 kind: meerkat_core::ToolSourceKind::Mcp,
                 source_id: server.into(),
+                artifact: None,
             });
             insert_entry_with_tool_defs(&mut router, server, vec![tool.clone(), tool]);
             map_names(
@@ -4586,6 +5997,7 @@ mod tests {
             tool.provenance = Some(meerkat_core::ToolProvenance {
                 kind,
                 source_id: source.into(),
+                artifact: None,
             });
             insert_entry_with_tool_defs(&mut router, "a", vec![tool]);
             map_names(&mut router, "a", &[("search", "home_search")]);
@@ -4923,6 +6335,121 @@ mod tests {
         );
     }
 
+    /// Shutdown routes the close of a still-connecting server's process and
+    /// of an established server through the router's owned close tasks, so
+    /// their graces run concurrently rather than in turn. Both ignore stdin
+    /// EOF and exit on the SIGTERM at their 2 s EOF deadline. (Fails-old:
+    /// shutdown awaited each close in turn, at least 4 s here.)
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shutdown_closes_pending_and_established_stdio_servers_concurrently() {
+        use crate::stdio_test_fixture::{PidReport, process_exited, sh_mcp_server_args};
+        let bounds =
+            crate::McpStdioCloseBounds::new(Duration::from_secs(2), Duration::from_secs(10))
+                .expect("bounds within the maximum");
+        let mut router = generated_handle_owner_router().with_stdio_close_bounds(bounds);
+        let mut established = PidReport::new("concurrent-established");
+        let mut pending = PidReport::new("concurrent-pending");
+        let established_config = McpServerConfig::stdio(
+            "eof-ignoring",
+            "/bin/sh",
+            sh_mcp_server_args(Some(established.path())),
+            HashMap::new(),
+        );
+        // Never answers its handshake, so its connect is still running.
+        let pending_config = McpServerConfig::stdio(
+            "still-connecting",
+            "/bin/sh",
+            vec![
+                "-c".to_string(),
+                format!("echo $$ > '{}'; exec sleep 60", pending.path().display()),
+            ],
+            HashMap::new(),
+        );
+        let (added, mut pids) =
+            tokio::join!(router.add_server(established_config), established.pids());
+        added.expect("add_server");
+        router.stage_add(pending_config).expect("stage add");
+        router.apply_staged().await.expect("apply staged add");
+        pids.extend(pending.pids().await);
+
+        let started = tokio::time::Instant::now();
+        router.shutdown().await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "servers were signalled before their EOF deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(3_500),
+            "shutdown closed the servers in turn: {elapsed:?}"
+        );
+        for pid in pids {
+            assert!(process_exited(pid), "stdio process {pid} outlived shutdown");
+        }
+    }
+
+    /// Shutdown joins the close a failed connect attempt already started
+    /// instead of cutting it short: the server, which closes its stdout
+    /// (failing the handshake) and handles SIGTERM, gets the SIGTERM at its
+    /// EOF deadline and runs its handler. (Fails-old: aborting the attempt
+    /// dropped its close, so the group was SIGKILLed at once and the pending
+    /// cleanup reported nothing.)
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shutdown_joins_a_close_a_failed_connect_attempt_started() {
+        let marker = std::env::temp_dir().join(format!(
+            "meerkat-mcp-failed-attempt-{}-{}.marker",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+        let bounds =
+            crate::McpStdioCloseBounds::new(Duration::from_millis(500), Duration::from_secs(10))
+                .expect("bounds within the maximum");
+        let mut router = generated_handle_owner_router().with_stdio_close_bounds(bounds);
+        let config = McpServerConfig::stdio(
+            "fails-handshake",
+            "/bin/sh",
+            vec![
+                "-c".to_string(),
+                format!(
+                    "trap \"echo termed > '{}'; exit 0\" TERM\nexec >&-\nwhile :; do sleep 0.1; done\n",
+                    marker.display()
+                ),
+            ],
+            HashMap::new(),
+        );
+        router.stage_add(config).expect("stage add");
+        router.apply_staged().await.expect("apply staged add");
+        let custody = router
+            .pending_child_custody
+            .values()
+            .next()
+            .cloned()
+            .expect("the attempt's custody");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !custody.is_closing() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the failed attempt started its close");
+
+        router.shutdown().await;
+
+        let content = std::fs::read_to_string(&marker).unwrap_or_default();
+        let _ = std::fs::remove_file(&marker);
+        assert_eq!(
+            content.trim(),
+            "termed",
+            "the server did not get its SIGTERM at the EOF deadline"
+        );
+    }
+
     #[tokio::test]
     async fn removing_state_rejects_new_calls_and_drains_inflight() {
         let server_path = mcp_test_server::fixture_binary();
@@ -5038,6 +6565,714 @@ mod tests {
         assert!(router.servers_awaiting_authorization().is_empty());
     }
 
+    /// A router whose first Add of an OAuth-protected server failed with
+    /// `AuthorizationRequired` and was accepted: the retained retry record
+    /// exists. The resolver holds no credential until the test "logs in".
+    pub(crate) async fn router_awaiting_authorization() -> (
+        McpRouter,
+        McpServerIdentity,
+        Arc<crate::connection::tests::FakeMcpAuthResolver>,
+        Arc<crate::connection::tests::HttpMcpTestState>,
+    ) {
+        use crate::connection::tests::{FakeMcpAuthResolver, spawn_http_mcp_server};
+
+        let (url, server) = spawn_http_mcp_server("interactive-token").await;
+        let config = McpServerConfig::streamable_http("guarded", url, HashMap::new());
+        let target = McpServerIdentity::from_config(&config).unwrap();
+        let resolver =
+            Arc::new(FakeMcpAuthResolver::new(None, "unused").with_human_authorization_required());
+        let mut router = generated_handle_owner_router()
+            .with_mcp_auth(McpAuthMode::Interactive, Some(resolver.clone()));
+        router.stage_add(config).expect("stage add");
+        router.apply_staged().await.expect("apply staged add");
+        wait_for_phase(&mut router, McpLifecyclePhase::Failed).await;
+        assert_eq!(
+            router.servers_awaiting_authorization(),
+            vec![target.clone()]
+        );
+        (router, target, resolver, server)
+    }
+
+    /// A router with "guarded" connected under a stored credential for an
+    /// explicit account, so the bearer refuses locally once it is gone.
+    async fn router_connected_under_credential() -> (
+        McpRouter,
+        McpServerIdentity,
+        Arc<crate::connection::tests::FakeMcpAuthResolver>,
+        Arc<crate::connection::tests::HttpMcpTestState>,
+    ) {
+        use crate::connection::tests::{FakeMcpAuthResolver, spawn_http_mcp_server};
+
+        let (url, server) = spawn_http_mcp_server("interactive-token").await;
+        let mut config = McpServerConfig::streamable_http("guarded", url, HashMap::new());
+        if let McpTransportConfig::Http(http) = &mut config.transport {
+            http.oauth_account = Some("subject-7".into());
+        }
+        let target = McpServerIdentity::from_config(&config).unwrap();
+        let resolver = Arc::new(
+            FakeMcpAuthResolver::new(Some("interactive-token"), "unused")
+                .with_human_authorization_required(),
+        );
+        let mut router = generated_handle_owner_router()
+            .with_mcp_auth(McpAuthMode::Interactive, Some(resolver.clone()));
+        router.stage_add(config).expect("stage add");
+        router.apply_staged().await.expect("apply staged add");
+        wait_for_phase(&mut router, McpLifecyclePhase::Applied).await;
+        assert_eq!(router.active_server_names(), vec!["guarded".to_string()]);
+        assert!(router.list_tools().iter().any(|tool| tool.name == "echo"));
+        (router, target, resolver, server)
+    }
+
+    #[tokio::test]
+    async fn sign_out_unpublishes_the_connected_server_and_sign_in_adds_it_back() {
+        let (mut router, target, resolver, _server) = router_connected_under_credential().await;
+        *resolver.stored_token_for_testing() = None;
+
+        assert_eq!(
+            router.credential_released(&target).unwrap(),
+            ReleasedCredential::Unpublished
+        );
+        // A duplicate release while the removal is staged changes nothing.
+        assert_eq!(
+            router.credential_released(&target).unwrap(),
+            ReleasedCredential::AlreadyPending
+        );
+        router.apply_staged().await.expect("apply the release");
+        assert!(router.active_server_names().is_empty());
+        assert!(!router.list_tools().iter().any(|tool| tool.name == "echo"));
+        // It awaits sign-in for exactly its credential.
+        assert_eq!(
+            router.servers_awaiting_authorization(),
+            vec![target.clone()]
+        );
+        assert_eq!(
+            router.credential_released(&target).unwrap(),
+            ReleasedCredential::NotActive
+        );
+
+        // A new sign-in adds the same server back to this router.
+        *resolver.stored_token_for_testing() = Some("interactive-token".into());
+        assert_eq!(
+            router.retry_authorized(&target).unwrap(),
+            AuthorizedRetry::Staged
+        );
+        router.apply_staged().await.expect("apply the retry");
+        wait_for_phase(&mut router, McpLifecyclePhase::Applied).await;
+        assert_eq!(router.active_server_names(), vec!["guarded".to_string()]);
+        assert!(router.list_tools().iter().any(|tool| tool.name == "echo"));
+        assert!(router.servers_awaiting_authorization().is_empty());
+        router.shutdown().await;
+    }
+
+    /// A resolver serving one realm, as a native host binds it: the
+    /// connection reports and resolves realm-scoped targets.
+    struct RealmScopedResolver {
+        inner: Arc<crate::connection::tests::FakeMcpAuthResolver>,
+        realm: meerkat_core::connection::RealmId,
+    }
+
+    #[async_trait::async_trait]
+    impl McpAuthResolver for RealmScopedResolver {
+        async fn stored_bearer_token(
+            &self,
+            target: &McpServerIdentity,
+        ) -> Result<Option<String>, meerkat_auth_core::McpOAuthError> {
+            self.inner.stored_bearer_token(target).await
+        }
+
+        async fn interactive_login(
+            &self,
+            target: &McpServerIdentity,
+            www_authenticate: Option<&str>,
+        ) -> Result<String, meerkat_auth_core::McpOAuthError> {
+            self.inner.interactive_login(target, www_authenticate).await
+        }
+
+        fn credential_realm(&self) -> Option<meerkat_core::connection::RealmId> {
+            Some(self.realm.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_out_matches_the_realm_scoped_target_the_host_reports() {
+        use crate::connection::tests::{FakeMcpAuthResolver, spawn_http_mcp_server};
+
+        let (url, _server) = spawn_http_mcp_server("interactive-token").await;
+        let mut config = McpServerConfig::streamable_http("guarded", url, HashMap::new());
+        if let McpTransportConfig::Http(http) = &mut config.transport {
+            http.oauth_account = Some("subject-7".into());
+        }
+        let realm = meerkat_core::connection::RealmId::parse("alpha").unwrap();
+        let unscoped = McpServerIdentity::from_config(&config).unwrap();
+        let target = unscoped.clone().in_realm(realm.clone());
+        let fake = Arc::new(
+            FakeMcpAuthResolver::new(Some("interactive-token"), "unused")
+                .with_human_authorization_required(),
+        );
+        let resolver = Arc::new(RealmScopedResolver {
+            inner: Arc::clone(&fake),
+            realm,
+        });
+        let mut router =
+            generated_handle_owner_router().with_mcp_auth(McpAuthMode::Interactive, Some(resolver));
+        router.stage_add(config).expect("stage add");
+        router.apply_staged().await.expect("apply staged add");
+        wait_for_phase(&mut router, McpLifecyclePhase::Applied).await;
+
+        // The realm-less identity is another credential slot: no match.
+        assert_eq!(
+            router.credential_released(&unscoped).unwrap(),
+            ReleasedCredential::NotActive
+        );
+        // The host's realm-scoped target matches and unpublishes.
+        *fake.stored_token_for_testing() = None;
+        assert_eq!(
+            router.credential_released(&target).unwrap(),
+            ReleasedCredential::Unpublished
+        );
+        router.apply_staged().await.expect("apply the release");
+        assert!(router.active_server_names().is_empty());
+        assert_eq!(
+            router.servers_awaiting_authorization(),
+            vec![target.clone()]
+        );
+
+        // A sign-in for that same target adds it back.
+        *fake.stored_token_for_testing() = Some("interactive-token".into());
+        assert_eq!(
+            router.retry_authorized(&target).unwrap(),
+            AuthorizedRetry::Staged
+        );
+        router.apply_staged().await.expect("apply the retry");
+        wait_for_phase(&mut router, McpLifecyclePhase::Applied).await;
+        assert_eq!(router.active_server_names(), vec!["guarded".to_string()]);
+        router.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_release_of_another_credential_leaves_the_server_published() {
+        let (mut router, target, _resolver, _server) = router_connected_under_credential().await;
+        let mut other_account =
+            McpServerConfig::streamable_http("guarded", target.server_url(), HashMap::new());
+        if let McpTransportConfig::Http(http) = &mut other_account.transport {
+            http.oauth_account = Some("another-account".into());
+        }
+        let other_account = McpServerIdentity::from_config(&other_account).unwrap();
+        let other_url = McpServerIdentity::from_config(&{
+            let mut config = McpServerConfig::streamable_http(
+                "guarded",
+                "http://127.0.0.1:1/other",
+                HashMap::new(),
+            );
+            if let McpTransportConfig::Http(http) = &mut config.transport {
+                http.oauth_account = Some("subject-7".into());
+            }
+            config
+        })
+        .unwrap();
+        for other in [other_account, other_url] {
+            assert_ne!(other, target);
+            assert_eq!(
+                router.credential_released(&other).unwrap(),
+                ReleasedCredential::NotActive
+            );
+        }
+        router.apply_staged().await.expect("apply nothing");
+        assert_eq!(router.active_server_names(), vec!["guarded".to_string()]);
+        assert!(router.servers_awaiting_authorization().is_empty());
+        router.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_newer_staged_intent_wins_over_a_release() {
+        let (mut router, target, _resolver, _server) = router_connected_under_credential().await;
+        router.stage_reload("guarded").expect("stage reload");
+        assert_eq!(
+            router.credential_released(&target).unwrap(),
+            ReleasedCredential::AlreadyPending
+        );
+        assert!(router.servers_awaiting_authorization().is_empty());
+        router.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_call_without_a_usable_credential_unpublishes_at_the_next_boundary() {
+        let (mut router, target, resolver, server) = router_connected_under_credential().await;
+        let seen_before = server.seen_authorizations.lock().unwrap().len();
+        // Signed out in another process: this router got no release.
+        *resolver.stored_token_for_testing() = None;
+
+        let refused = router
+            .call_tool("echo", &serde_json::json!({ "message": "hi" }))
+            .await;
+        assert!(
+            matches!(refused, Err(McpError::AuthorizationRequired { .. })),
+            "the call is refused for its missing credential: {refused:?}"
+        );
+        // Refused before anything was sent.
+        assert_eq!(
+            server.seen_authorizations.lock().unwrap().len(),
+            seen_before
+        );
+        // Still listed until the boundary; the boundary releases it.
+        assert_eq!(router.active_server_names(), vec!["guarded".to_string()]);
+        router.apply_staged().await.expect("apply the release");
+        assert!(router.active_server_names().is_empty());
+        assert!(!router.list_tools().iter().any(|tool| tool.name == "echo"));
+        assert_eq!(router.servers_awaiting_authorization(), vec![target]);
+        router.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_before_the_release_boundary_restores_the_server_without_another_sign_in() {
+        let (mut router, target, resolver, _server) = router_connected_under_credential().await;
+        *resolver.stored_token_for_testing() = None;
+        assert_eq!(
+            router.credential_released(&target).unwrap(),
+            ReleasedCredential::Unpublished
+        );
+        // The sign-in completes before the release's removal applies.
+        *resolver.stored_token_for_testing() = Some("interactive-token".into());
+        assert_eq!(
+            router.retry_authorized(&target).unwrap(),
+            AuthorizedRetry::AfterRelease
+        );
+        // This boundary applies the removal, which closes the connection.
+        router.apply_staged().await.expect("apply the release");
+        assert!(router.active_server_names().is_empty());
+        // The next boundary stages the server again and connects it, with no
+        // further sign-in.
+        router
+            .apply_staged()
+            .await
+            .expect("apply the retained retry");
+        wait_for_phase(&mut router, McpLifecyclePhase::Applied).await;
+        assert_eq!(router.active_server_names(), vec!["guarded".to_string()]);
+        assert!(router.list_tools().iter().any(|tool| tool.name == "echo"));
+        assert!(router.servers_awaiting_authorization().is_empty());
+        router.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_restage_is_reported_and_the_sign_in_is_kept() {
+        let (mut router, target, resolver, _server) = router_connected_under_credential().await;
+        *resolver.stored_token_for_testing() = None;
+        router.credential_released(&target).unwrap();
+        *resolver.stored_token_for_testing() = Some("interactive-token".into());
+        assert_eq!(
+            router.retry_authorized(&target).unwrap(),
+            AuthorizedRetry::AfterRelease
+        );
+        router.apply_staged().await.expect("apply the release");
+        assert!(router.active_server_names().is_empty());
+
+        // The owner refuses the re-add: the boundary reports it and the
+        // sign-in stays kept.
+        let slot = router
+            .external_surface_handle_slot()
+            .expect("a runtime surface owner");
+        let owner = Arc::clone(&*slot.read().unwrap());
+        *slot.write().unwrap() = Arc::new(UnboundExternalToolSurfaceHandle::new());
+        let refused = router.apply_staged().await.expect("the boundary runs");
+        assert!(
+            refused.delta.lifecycle_actions.iter().any(|action| {
+                action.target == "guarded"
+                    && action.operation == ToolConfigChangeOperation::Add
+                    && action.phase == McpLifecyclePhase::Failed
+            }),
+            "the refused re-add is in the boundary result: {:?}",
+            refused.delta.lifecycle_actions
+        );
+        assert!(!router.staged_payloads.contains_key("guarded"));
+        assert!(
+            router
+                .awaiting_authorization
+                .get("guarded")
+                .is_some_and(|awaiting| awaiting.signed_in_during_release),
+            "the completed sign-in is kept, not consumed"
+        );
+
+        // With the owner back, the next boundary stages and applies it.
+        *slot.write().unwrap() = owner;
+        router.apply_staged().await.expect("the boundary applies");
+        wait_for_phase(&mut router, McpLifecyclePhase::Applied).await;
+        assert_eq!(router.active_server_names(), vec!["guarded".to_string()]);
+        assert!(router.servers_awaiting_authorization().is_empty());
+        router.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_sign_out_after_a_retained_sign_in_supersedes_it() {
+        let (mut router, target, resolver, _server) = router_connected_under_credential().await;
+        *resolver.stored_token_for_testing() = None;
+        router.credential_released(&target).unwrap();
+        *resolver.stored_token_for_testing() = Some("interactive-token".into());
+        assert_eq!(
+            router.retry_authorized(&target).unwrap(),
+            AuthorizedRetry::AfterRelease
+        );
+        // Signed out again before the boundary: the retained sign-in is gone.
+        *resolver.stored_token_for_testing() = None;
+        assert_eq!(
+            router.credential_released(&target).unwrap(),
+            ReleasedCredential::AlreadyPending
+        );
+        router.apply_staged().await.expect("apply the release");
+        router.apply_staged().await.expect("apply nothing more");
+        assert!(router.active_server_names().is_empty());
+        assert_eq!(router.servers_awaiting_authorization(), vec![target]);
+        router.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_explicit_remove_during_a_release_withdraws_the_sign_in_record() {
+        let (mut router, target, resolver, _server) = router_connected_under_credential().await;
+        *resolver.stored_token_for_testing() = None;
+        router.credential_released(&target).unwrap();
+        // The host removes the server itself: its intent is newer.
+        router.stage_remove("guarded").expect("stage remove");
+        *resolver.stored_token_for_testing() = Some("interactive-token".into());
+        assert_eq!(
+            router.retry_authorized(&target).unwrap(),
+            AuthorizedRetry::NotAwaiting
+        );
+        router.apply_staged().await.expect("apply the remove");
+        router.apply_staged().await.expect("apply nothing more");
+        assert!(router.active_server_names().is_empty());
+        assert!(router.servers_awaiting_authorization().is_empty());
+        router.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_before_a_queued_call_refusal_keeps_the_server_published() {
+        let (mut router, target, resolver, _server) = router_connected_under_credential().await;
+        *resolver.stored_token_for_testing() = None;
+        let refused = router
+            .call_tool("echo", &serde_json::json!({ "message": "hi" }))
+            .await;
+        assert!(matches!(
+            refused,
+            Err(McpError::AuthorizationRequired { .. })
+        ));
+        // Signed in again before the boundary that would release it.
+        *resolver.stored_token_for_testing() = Some("interactive-token".into());
+        assert_eq!(
+            router.retry_authorized(&target).unwrap(),
+            AuthorizedRetry::NotAwaiting
+        );
+        router.apply_staged().await.expect("apply the boundary");
+        assert_eq!(router.active_server_names(), vec!["guarded".to_string()]);
+        assert!(router.list_tools().iter().any(|tool| tool.name == "echo"));
+        assert!(router.servers_awaiting_authorization().is_empty());
+        router.shutdown().await;
+    }
+
+    pub(crate) async fn wait_for_phase(router: &mut McpRouter, phase: McpLifecyclePhase) {
+        let deadline = Instant::now() + async_connect_test_timeout();
+        loop {
+            let ext = router.take_external_updates();
+            if ext
+                .notices
+                .iter()
+                .any(|notice| notice.target == "guarded" && notice.phase == phase)
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {phase:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_after_login_reconnects_the_failed_first_add_once_at_the_boundary() {
+        let (mut router, target, resolver, _server) = router_awaiting_authorization().await;
+        *resolver.stored_token_for_testing() = Some("interactive-token".into());
+
+        assert_eq!(
+            router.retry_authorized(&target).unwrap(),
+            AuthorizedRetry::Staged
+        );
+        // A duplicate trigger while the retry is staged changes nothing.
+        assert_eq!(
+            router.retry_authorized(&target).unwrap(),
+            AuthorizedRetry::AlreadyPending
+        );
+        // Nothing connects before the boundary.
+        assert!(router.active_server_names().is_empty());
+
+        router.apply_staged().await.expect("apply the retry");
+        // A duplicate trigger while the retry is in flight changes nothing.
+        assert_eq!(
+            router.retry_authorized(&target).unwrap(),
+            AuthorizedRetry::AlreadyPending
+        );
+        wait_for_phase(&mut router, McpLifecyclePhase::Applied).await;
+        assert_eq!(router.active_server_names(), vec!["guarded".to_string()]);
+        assert!(router.servers_awaiting_authorization().is_empty());
+        // The record was answered: a later trigger is not a second retry.
+        assert_eq!(
+            router.retry_authorized(&target).unwrap(),
+            AuthorizedRetry::NotAwaiting
+        );
+        router.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn retry_touches_only_the_exact_retained_target() {
+        let (mut router, target, _resolver, _server) = router_awaiting_authorization().await;
+        let other_url = McpServerIdentity::from_config(&McpServerConfig::streamable_http(
+            "guarded",
+            "http://127.0.0.1:1/other",
+            HashMap::new(),
+        ))
+        .unwrap();
+        assert_eq!(
+            router.retry_authorized(&other_url).unwrap(),
+            AuthorizedRetry::NotAwaiting
+        );
+        let mut with_account =
+            McpServerConfig::streamable_http("guarded", target.server_url(), HashMap::new());
+        if let McpTransportConfig::Http(http) = &mut with_account.transport {
+            http.oauth_account = Some("another-account".into());
+        }
+        let other_account = McpServerIdentity::from_config(&with_account).unwrap();
+        assert_ne!(other_account, target);
+        assert_eq!(
+            router.retry_authorized(&other_account).unwrap(),
+            AuthorizedRetry::NotAwaiting
+        );
+        assert_eq!(
+            router.servers_awaiting_authorization(),
+            vec![target.clone()]
+        );
+
+        let mut fresh = generated_handle_owner_router();
+        assert_eq!(
+            fresh.retry_authorized(&target).unwrap(),
+            AuthorizedRetry::NotAwaiting
+        );
+        router.shutdown().await;
+        fresh.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_remove_staged_ahead_of_the_old_failure_wins() {
+        use crate::connection::tests::{FakeMcpAuthResolver, spawn_http_mcp_server};
+
+        let (url, _server) = spawn_http_mcp_server("interactive-token").await;
+        let config = McpServerConfig::streamable_http("guarded", url, HashMap::new());
+        let target = McpServerIdentity::from_config(&config).unwrap();
+        let resolver =
+            Arc::new(FakeMcpAuthResolver::new(None, "unused").with_human_authorization_required());
+        let mut router = generated_handle_owner_router()
+            .with_mcp_auth(McpAuthMode::Interactive, Some(resolver.clone()));
+        router.stage_add(config).expect("stage add");
+        router.apply_staged().await.expect("apply staged add");
+        // The remove is staged before the add's failure is observed.
+        router.stage_remove("guarded").expect("stage remove");
+        let deadline = Instant::now() + async_connect_test_timeout();
+        while router.connect_results_delivered.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline, "connect result never arrived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        *resolver.stored_token_for_testing() = Some("interactive-token".into());
+        // Hook before the removal boundary: the old failure is observed now,
+        // and the newer remove keeps it from becoming a retry.
+        assert_eq!(
+            router.retry_authorized(&target).unwrap(),
+            AuthorizedRetry::NotAwaiting
+        );
+        assert!(router.servers_awaiting_authorization().is_empty());
+        router.apply_staged().await.expect("apply staged remove");
+        // Hook after the removal boundary: nothing to retry.
+        assert_eq!(
+            router.retry_authorized(&target).unwrap(),
+            AuthorizedRetry::NotAwaiting
+        );
+        router.apply_staged().await.expect("nothing staged");
+        assert!(router.active_server_names().is_empty());
+        router.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_accepted_host_remove_withdraws_the_retry() {
+        let (mut router, target, resolver, _server) = router_awaiting_authorization().await;
+        *resolver.stored_token_for_testing() = Some("interactive-token".into());
+        router.stage_remove("guarded").expect("host remove");
+        assert_eq!(
+            router.retry_authorized(&target).unwrap(),
+            AuthorizedRetry::NotAwaiting
+        );
+        router.apply_staged().await.expect("apply remove");
+        assert!(router.active_server_names().is_empty());
+        router.shutdown().await;
+    }
+
+    /// A lifecycle mirror that rejects connect-pending only.
+    struct RejectConnectPendingMirror;
+
+    impl McpServerLifecycleHandle for RejectConnectPendingMirror {
+        fn apply_connect_pending(&self, _server_id: &str) -> Result<(), DslTransitionError> {
+            Err(DslTransitionError::guard_rejected(
+                "RejectConnectPendingMirror::apply_connect_pending",
+                "injected lifecycle mirror rejection",
+            ))
+        }
+        fn apply_connected(&self, _server_id: &str) -> Result<(), DslTransitionError> {
+            Ok(())
+        }
+        fn apply_failed(&self, _server_id: &str, _error: &str) -> Result<(), DslTransitionError> {
+            Ok(())
+        }
+        fn apply_disconnected(&self, _server_id: &str) -> Result<(), DslTransitionError> {
+            Ok(())
+        }
+        fn apply_reload(&self, _server_id: &str) -> Result<(), DslTransitionError> {
+            Ok(())
+        }
+        fn pending_server_ids(&self) -> BTreeSet<String> {
+            BTreeSet::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_mirror_fault_is_typed_and_the_boundary_runs_the_retained_config() {
+        let (mut router, target, resolver, _server) = router_awaiting_authorization().await;
+        let retained = router.awaiting_authorization["guarded"].config.clone();
+        *resolver.stored_token_for_testing() = Some("interactive-token".into());
+        *router.mcp_lifecycle_handle_slot().write().unwrap() =
+            Some(Arc::new(RejectConnectPendingMirror) as Arc<dyn McpServerLifecycleHandle>);
+
+        let error = router
+            .retry_authorized(&target)
+            .expect_err("a rejected lifecycle mirror is a typed staging fault");
+        assert!(
+            matches!(
+                &error,
+                McpError::LifecycleMirrorRejected { server, .. } if server == "guarded"
+            ),
+            "{error}"
+        );
+        // The owner accepted the intent and its exact retained config is
+        // staged for the boundary.
+        assert_eq!(router.staged_payloads.get("guarded"), Some(&retained));
+        let applied = router.apply_staged().await.expect("the boundary applies");
+        assert!(applied.delta.rejected_boundaries.is_empty());
+        wait_for_phase(&mut router, McpLifecyclePhase::Applied).await;
+        assert_eq!(router.active_server_names(), vec!["guarded".to_string()]);
+        router.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_owner_staging_rejection_keeps_the_record_for_a_later_retry() {
+        let (mut router, target, resolver, _server) = router_awaiting_authorization().await;
+        *resolver.stored_token_for_testing() = Some("interactive-token".into());
+        let slot = router
+            .external_surface_handle_slot()
+            .expect("a runtime surface owner");
+        let owner = Arc::clone(&*slot.read().unwrap());
+        *slot.write().unwrap() = Arc::new(UnboundExternalToolSurfaceHandle::new());
+
+        assert!(
+            router.retry_authorized(&target).is_err(),
+            "the owner refused the retry"
+        );
+        assert!(router.staged_payloads.is_empty());
+        assert_eq!(
+            router.servers_awaiting_authorization(),
+            vec![target.clone()]
+        );
+
+        *slot.write().unwrap() = owner;
+        assert_eq!(
+            router.retry_authorized(&target).unwrap(),
+            AuthorizedRetry::Staged
+        );
+        router.apply_staged().await.expect("the boundary applies");
+        wait_for_phase(&mut router, McpLifecyclePhase::Applied).await;
+        assert_eq!(router.active_server_names(), vec!["guarded".to_string()]);
+        router.shutdown().await;
+    }
+
+    /// A stale result for an older attempt (owner-rejected) neither erases
+    /// nor replaces the newer retry record.
+    #[tokio::test]
+    async fn stale_results_cannot_clear_or_replace_a_newer_retry_record() {
+        use crate::connection::tests::{FakeMcpAuthResolver, spawn_http_mcp_server};
+
+        let (url, _server) = spawn_http_mcp_server("interactive-token").await;
+        let config = McpServerConfig::streamable_http("guarded", url, HashMap::new());
+        let target = McpServerIdentity::from_config(&config).unwrap();
+        let resolver =
+            Arc::new(FakeMcpAuthResolver::new(None, "unused").with_human_authorization_required());
+        let mut router = generated_handle_owner_router()
+            .with_mcp_auth(McpAuthMode::Interactive, Some(resolver.clone()));
+        router.stage_add(config.clone()).expect("stage add");
+        router.apply_staged().await.expect("apply staged add");
+        let first = router
+            .pending_obligations
+            .get("guarded")
+            .cloned()
+            .expect("the first attempt is pending");
+        wait_for_phase(&mut router, McpLifecyclePhase::Failed).await;
+        // A newer attempt (the retry) fails too and replaces the record.
+        assert_eq!(
+            router.retry_authorized(&target).unwrap(),
+            AuthorizedRetry::Staged
+        );
+        router.apply_staged().await.expect("apply the retry");
+        wait_for_phase(&mut router, McpLifecyclePhase::Failed).await;
+        assert_eq!(
+            router.servers_awaiting_authorization(),
+            vec![target.clone()]
+        );
+
+        let mut other = config.clone();
+        other.connect_timeout_secs = Some(1);
+        // A stale SUCCESS for the old attempt (a real connection) is
+        // rejected by the owner: it neither clears nor replaces the record,
+        // and its connection is closed.
+        *resolver.stored_token_for_testing() = Some("interactive-token".into());
+        let stale_connection = McpConnection::connect_and_enumerate_with_custody(
+            &config,
+            McpAuthMode::Interactive,
+            Some(resolver.clone()),
+            None,
+            None,
+            &crate::McpStdioLaunchProfile::trusted_host(),
+            None,
+        )
+        .await
+        .expect("a real connection for the stale success");
+        *resolver.stored_token_for_testing() = None;
+        router.process_pending_result(PendingResult {
+            obligation: first.clone(),
+            config: other.clone(),
+            result: Ok(stale_connection),
+        });
+        let record = &router.awaiting_authorization["guarded"];
+        assert_eq!(record.config, config, "a stale success replaced the record");
+        assert!(router.active_server_names().is_empty());
+        for stale in [
+            Err(McpError::AuthorizationRequired {
+                target: Box::new(target.clone()),
+            }),
+            Err(McpError::ConnectionFailed {
+                reason: "stale failure".into(),
+            }),
+        ] {
+            router.process_pending_result(PendingResult {
+                obligation: first.clone(),
+                config: other.clone(),
+                result: stale,
+            });
+            let record = &router.awaiting_authorization["guarded"];
+            assert_eq!(record.target, target);
+            assert_eq!(record.config, config, "a stale result replaced the record");
+        }
+        router.shutdown().await;
+    }
+
     #[tokio::test]
     async fn apply_staged_add_is_non_blocking() {
         let server_path = mcp_test_server::fixture_binary();
@@ -5098,6 +7333,152 @@ mod tests {
         assert!(
             err_msg.contains("Timed out"),
             "error should mention timeout: {err_msg}"
+        );
+    }
+
+    /// A server with an access ceiling offers and admits exactly its allowed
+    /// operations, under their exposed names too: the others are neither
+    /// published nor callable, through the router or directly on its
+    /// connection. The ceiling does not certify the allowed ones read-only.
+    #[tokio::test]
+    async fn access_ceiling_admits_only_its_allowed_operations() {
+        let server_path = mcp_test_server::fixture_binary();
+        let mut config = test_server_config("read-only", &server_path);
+        config.access = Some(meerkat_core::McpServerAccess::allowing(["echo"]));
+        config.tool_names.insert("add".into(), "plus".into());
+        let mut router = generated_handle_owner_router();
+        router.add_server(config.clone()).await.expect("add_server");
+
+        let published: Vec<String> = router
+            .list_tools()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(published, vec!["echo".to_string()]);
+        assert_eq!(
+            AgentToolDispatcher::tool_mutation_class(&router, "echo"),
+            meerkat_core::ToolMutationClass::Unknown,
+            "a config ceiling narrows access but does not certify read-only"
+        );
+        router
+            .call_tool("echo", &serde_json::json!({"message": "hi"}))
+            .await
+            .expect("a listed operation is callable");
+        for name in ["add", "plus"] {
+            let refused = router
+                .call_tool(name, &serde_json::json!({"a": 1, "b": 2}))
+                .await
+                .expect_err("an operation outside the ceiling is not routed");
+            assert!(matches!(refused, McpError::ToolNotFound(_)), "{refused:?}");
+        }
+        router
+            .call_tool("echo", &serde_json::json!({"message": "again"}))
+            .await
+            .expect("an allowed sibling still works after a refusal");
+
+        let conn = McpConnection::connect(&config).await.expect("connect");
+        let refused = conn
+            .call_tool("add", &serde_json::json!({"a": 1, "b": 2}))
+            .await
+            .expect_err("the connection refuses an unlisted operation");
+        assert!(
+            matches!(
+                &refused,
+                McpError::OperationNotPermitted { server, operation }
+                    if server == "read-only" && operation == "add"
+            ),
+            "{refused:?}"
+        );
+        conn.close().await.expect("close");
+        router.shutdown().await;
+    }
+
+    /// The access ceiling and a connector binding intersect at call time: a
+    /// binding broader than the ceiling is valid configuration, an operation
+    /// the binding lists but the ceiling refuses is refused locally before
+    /// any connector preparation, and an operation both admit is prepared.
+    #[tokio::test]
+    async fn access_ceiling_and_connector_binding_intersect_at_call_time() {
+        struct CountingProvider(std::sync::Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl crate::McpCallContextProvider for CountingProvider {
+            async fn prepare(
+                &self,
+                target: crate::McpCallTarget<'_>,
+                _: meerkat_core::types::ToolCallView<'_>,
+                _: &meerkat_core::ToolDispatchContext,
+            ) -> Result<Option<crate::McpCallContext>, crate::McpCallContextError> {
+                self.0.lock().unwrap().push(target.raw_operation.to_owned());
+                Ok(Some(crate::McpCallContext::new(
+                    serde_json::Map::from_iter([(
+                        "io.example/connector".to_owned(),
+                        serde_json::json!({"authorization": "Bearer fixture"}),
+                    )]),
+                    (),
+                )))
+            }
+        }
+        let server_path = mcp_test_server::fixture_binary();
+        let mut config = test_server_config("bound", &server_path);
+        config.access = Some(meerkat_core::McpServerAccess::allowing(["echo"]));
+        let operation = |destination: &str| meerkat_core::mcp_config::McpConnectorOperation {
+            required_scopes: Default::default(),
+            destination_origin: destination.to_owned(),
+            read_only: false,
+        };
+        config.connector = Some(meerkat_core::mcp_config::McpConnectorBinding {
+            realm_id: "tenant-a".into(),
+            slot_id: "work".into(),
+            issuer: "https://issuer.example".into(),
+            client: "client".into(),
+            resource: "https://api.example".into(),
+            strategy_id: "oidc-userinfo-v1".into(),
+            account: "subject-a".into(),
+            operations: BTreeMap::from([
+                ("echo".to_owned(), operation("https://api.example")),
+                ("add".to_owned(), operation("https://api.example")),
+            ]),
+        });
+        let provider = Arc::new(CountingProvider(std::sync::Mutex::new(Vec::new())));
+        let mut router =
+            generated_handle_owner_router().with_call_context_provider(provider.clone());
+        router
+            .add_server(config)
+            .await
+            .expect("a binding broader than the ceiling is valid configuration");
+
+        let refused = router
+            .call_tool("add", &serde_json::json!({"a": 1, "b": 2}))
+            .await
+            .expect_err("the ceiling refuses an operation the binding lists");
+        assert!(
+            matches!(
+                refused,
+                McpError::ToolNotFound(_) | McpError::OperationNotPermitted { .. }
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            provider.0.lock().unwrap().is_empty(),
+            "the refused operation reached no connector preparation"
+        );
+        router
+            .call_tool("echo", &serde_json::json!({"message": "hi"}))
+            .await
+            .expect("an operation both admit is callable");
+        assert_eq!(*provider.0.lock().unwrap(), vec!["echo".to_owned()]);
+        router.shutdown().await;
+    }
+
+    /// An access ceiling that admits nothing is refused before staging.
+    #[test]
+    fn an_empty_access_ceiling_is_refused_at_staging() {
+        let mut config = McpServerConfig::stdio("empty", "/bin/true", vec![], HashMap::new());
+        config.access = Some(meerkat_core::McpServerAccess::allowing(Vec::<String>::new()));
+        let refused = McpRouter::validate_tool_names(&config).expect_err("empty ceiling");
+        assert!(
+            matches!(refused, McpError::InvalidAccessPolicy(_)),
+            "{refused:?}"
         );
     }
 

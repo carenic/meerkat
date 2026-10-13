@@ -72,6 +72,7 @@ impl BuiltinTool for TaskListTool {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Builtin,
                 source_id: "builtin".into(),
+                artifact: None,
             }),
         }
     }

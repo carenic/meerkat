@@ -163,6 +163,12 @@ impl PhysicalExecutionClaim {
     pub(super) fn belongs_to(&self, owner: &Arc<PhysicalExecutionCustody>) -> bool {
         Arc::ptr_eq(&self.owner, owner)
     }
+
+    /// Whether this claim locks `owner`'s database file: both bind the
+    /// canonical database path, so equal lock paths name one file.
+    pub(super) fn binds_same_file(&self, owner: &Arc<PhysicalExecutionCustody>) -> bool {
+        self.belongs_to(owner) || self.owner.lifetime_path == owner.lifetime_path
+    }
 }
 
 fn lock_path(database: &Path, suffix: &str) -> PathBuf {

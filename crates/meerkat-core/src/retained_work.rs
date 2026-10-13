@@ -89,3 +89,13 @@ impl RetainedWorkIdentity {
         self.controller.as_ref()
     }
 }
+
+/// One staged input of a run that resumes retained work: the input, and the
+/// identity of the staged run it resumes (its committed resume record). The
+/// runtime attaches these to the resumed run's work context. Identity data
+/// only, never a permission or custody.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumedInput {
+    pub input_id: InputId,
+    pub resumes: RetainedWorkIdentity,
+}

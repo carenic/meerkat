@@ -99,6 +99,16 @@ pub enum ApprovalLifecycleRejectionReason {
     ReviewNotSatisfied,
     #[serde(rename = "ReviewPending")]
     ReviewPending,
+    #[serde(rename = "AuthenticationRequired")]
+    AuthenticationRequired,
+    #[serde(rename = "ConsentLinked")]
+    ConsentLinked,
+    #[serde(rename = "ConsentMismatch")]
+    ConsentMismatch,
+    #[serde(rename = "AlreadyConsumed")]
+    AlreadyConsumed,
+    #[serde(rename = "NotConsent")]
+    NotConsent,
 }
 impl ApprovalLifecycleRejectionReason {
     pub fn as_str(&self) -> &'static str {
@@ -113,6 +123,11 @@ impl ApprovalLifecycleRejectionReason {
             Self::ReviewRetired => "ReviewRetired",
             Self::ReviewNotSatisfied => "ReviewNotSatisfied",
             Self::ReviewPending => "ReviewPending",
+            Self::AuthenticationRequired => "AuthenticationRequired",
+            Self::ConsentLinked => "ConsentLinked",
+            Self::ConsentMismatch => "ConsentMismatch",
+            Self::AlreadyConsumed => "AlreadyConsumed",
+            Self::NotConsent => "NotConsent",
         }
     }
 }
@@ -130,6 +145,11 @@ impl std::convert::TryFrom<&str> for ApprovalLifecycleRejectionReason {
             "ReviewRetired" => Ok(Self::ReviewRetired),
             "ReviewNotSatisfied" => Ok(Self::ReviewNotSatisfied),
             "ReviewPending" => Ok(Self::ReviewPending),
+            "AuthenticationRequired" => Ok(Self::AuthenticationRequired),
+            "ConsentLinked" => Ok(Self::ConsentLinked),
+            "ConsentMismatch" => Ok(Self::ConsentMismatch),
+            "AlreadyConsumed" => Ok(Self::AlreadyConsumed),
+            "NotConsent" => Ok(Self::NotConsent),
             other => Err(format!(
                 "invalid ApprovalLifecycleRejectionReason value `{other}`"
             )),
@@ -303,6 +323,8 @@ pub enum ReviewRetirementReason {
     DeadlineExpired,
     #[serde(rename = "Abandoned")]
     Abandoned,
+    #[serde(rename = "RunEnded")]
+    RunEnded,
 }
 impl ReviewRetirementReason {
     pub fn as_str(&self) -> &'static str {
@@ -311,6 +333,7 @@ impl ReviewRetirementReason {
             Self::AuthorityChanged => "AuthorityChanged",
             Self::DeadlineExpired => "DeadlineExpired",
             Self::Abandoned => "Abandoned",
+            Self::RunEnded => "RunEnded",
         }
     }
 }
@@ -322,6 +345,7 @@ impl std::convert::TryFrom<&str> for ReviewRetirementReason {
             "AuthorityChanged" => Ok(Self::AuthorityChanged),
             "DeadlineExpired" => Ok(Self::DeadlineExpired),
             "Abandoned" => Ok(Self::Abandoned),
+            "RunEnded" => Ok(Self::RunEnded),
             other => Err(format!("invalid ReviewRetirementReason value `{other}`")),
         }
     }
@@ -410,6 +434,11 @@ pub struct State {
     pub approval_approve_allowed: std::collections::BTreeMap<String, bool>,
     pub approval_deny_allowed: std::collections::BTreeMap<String, bool>,
     pub approval_has_expiry: std::collections::BTreeMap<String, bool>,
+    pub approval_consent: std::collections::BTreeMap<String, bool>,
+    pub approval_consent_authenticated: std::collections::BTreeMap<String, bool>,
+    pub approval_consent_consumed: std::collections::BTreeMap<String, bool>,
+    pub approval_consent_review: std::collections::BTreeMap<String, String>,
+    pub review_consent_approval: std::collections::BTreeMap<String, String>,
     pub review_ids: std::collections::BTreeSet<String>,
     pub review_statuses: std::collections::BTreeMap<String, ReviewAttemptStatus>,
     pub review_retirements: std::collections::BTreeMap<String, ReviewRetirementReason>,
@@ -431,6 +460,14 @@ pub mod inputs {
         pub has_expiry: bool,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct CreateConsentApproval {
+        pub approval_id: String,
+        pub review_id: String,
+        pub approve_allowed: bool,
+        pub deny_allowed: bool,
+        pub has_expiry: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RestoreApproval {
         pub approval_id: String,
         pub status: ApprovalLifecycleStatus,
@@ -438,6 +475,21 @@ pub mod inputs {
         pub deny_allowed: bool,
         pub has_expiry: bool,
         pub decision: Option<ApprovalLifecycleDecision>,
+        pub consent: bool,
+        pub authenticated: bool,
+        pub consumed: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ReconcileApproval {
+        pub approval_id: String,
+        pub status: ApprovalLifecycleStatus,
+        pub approve_allowed: bool,
+        pub deny_allowed: bool,
+        pub has_expiry: bool,
+        pub decision: Option<ApprovalLifecycleDecision>,
+        pub consent: bool,
+        pub authenticated: bool,
+        pub consumed: bool,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct ObserveApprovalExpiry {
@@ -448,6 +500,28 @@ pub mod inputs {
     pub struct DecideApproval {
         pub approval_id: String,
         pub decision: ApprovalLifecycleDecision,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct DecideConsent {
+        pub approval_id: String,
+        pub review_id: String,
+        pub decision: ApprovalLifecycleDecision,
+        pub authenticated: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ConsumeConsentForEntry {
+        pub approval_id: String,
+        pub review_id: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct WithdrawConsent {
+        pub approval_id: String,
+        pub review_id: String,
+        pub reason: ReviewRetirementReason,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct SettleUnlinkedConsent {
+        pub approval_id: String,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct BeginReview {
@@ -480,9 +554,15 @@ pub mod inputs {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Input {
     CreateApproval(inputs::CreateApproval),
+    CreateConsentApproval(inputs::CreateConsentApproval),
     RestoreApproval(inputs::RestoreApproval),
+    ReconcileApproval(inputs::ReconcileApproval),
     ObserveApprovalExpiry(inputs::ObserveApprovalExpiry),
     DecideApproval(inputs::DecideApproval),
+    DecideConsent(inputs::DecideConsent),
+    ConsumeConsentForEntry(inputs::ConsumeConsentForEntry),
+    WithdrawConsent(inputs::WithdrawConsent),
+    SettleUnlinkedConsent(inputs::SettleUnlinkedConsent),
     BeginReview(inputs::BeginReview),
     RecordReviewVerdict(inputs::RecordReviewVerdict),
     RecordReviewUnavailable(inputs::RecordReviewUnavailable),
@@ -494,9 +574,15 @@ impl Input {
     pub fn kind(&self) -> InputKind {
         match self {
             Self::CreateApproval(_) => InputKind::CreateApproval,
+            Self::CreateConsentApproval(_) => InputKind::CreateConsentApproval,
             Self::RestoreApproval(_) => InputKind::RestoreApproval,
+            Self::ReconcileApproval(_) => InputKind::ReconcileApproval,
             Self::ObserveApprovalExpiry(_) => InputKind::ObserveApprovalExpiry,
             Self::DecideApproval(_) => InputKind::DecideApproval,
+            Self::DecideConsent(_) => InputKind::DecideConsent,
+            Self::ConsumeConsentForEntry(_) => InputKind::ConsumeConsentForEntry,
+            Self::WithdrawConsent(_) => InputKind::WithdrawConsent,
+            Self::SettleUnlinkedConsent(_) => InputKind::SettleUnlinkedConsent,
             Self::BeginReview(_) => InputKind::BeginReview,
             Self::RecordReviewVerdict(_) => InputKind::RecordReviewVerdict,
             Self::RecordReviewUnavailable(_) => InputKind::RecordReviewUnavailable,
@@ -509,9 +595,15 @@ impl Input {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum InputKind {
     CreateApproval,
+    CreateConsentApproval,
     RestoreApproval,
+    ReconcileApproval,
     ObserveApprovalExpiry,
     DecideApproval,
+    DecideConsent,
+    ConsumeConsentForEntry,
+    WithdrawConsent,
+    SettleUnlinkedConsent,
     BeginReview,
     RecordReviewVerdict,
     RecordReviewUnavailable,
@@ -566,6 +658,9 @@ pub enum TransitionId {
     CreateRejectedEmptyAllowedDecisions,
     CreateRejectedAlreadyExists,
     CreatePending,
+    CreateConsentRejectedEmptyAllowedDecisions,
+    CreateConsentRejectedAlreadyExists,
+    CreateConsentPending,
     RestoreRejectedDuplicate,
     RestoreRejectedEmptyAllowedDecisions,
     RestorePending,
@@ -574,6 +669,14 @@ pub enum TransitionId {
     RestoreApproved,
     RestoreDenied,
     RestoreRejectedInvalidRecord,
+    ReconcileRejectedMissing,
+    ReconcileRejectedLinked,
+    ReconcileRejectedInvalidRecord,
+    ReconcileAppliedPending,
+    ReconcileAppliedExpired,
+    ReconcileAppliedCancelled,
+    ReconcileAppliedApproved,
+    ReconcileAppliedDenied,
     ObserveExpiryRejectedMissing,
     ObserveExpiryExpiresPending,
     ObserveExpiryPendingNoop,
@@ -584,32 +687,63 @@ pub enum TransitionId {
     DecideRejectedMissing,
     DecideRejectedExpired,
     DecideRejectedAlreadyDecided,
+    DecideRejectedAuthenticationRequired,
     DecideRejectedApproveNotAllowed,
     DecideRejectedDenyNotAllowed,
     DecideApprove,
     DecideDeny,
+    DecideConsentRejectedMissing,
+    DecideConsentRejectedMismatch,
+    DecideConsentRejectedExpired,
+    DecideConsentRejectedAlreadyDecided,
+    DecideConsentRejectedAuthenticationRequired,
+    DecideConsentRejectedNotAllowed,
+    DecideConsentApprove,
+    DecideConsentDeny,
+    ConsumeConsentRejectedMissing,
+    ConsumeConsentRejectedAlreadyConsumed,
+    ConsumeConsentRejectedMismatch,
+    ConsumeConsentRejectedNotSatisfied,
+    ConsumeConsentForEntry,
+    WithdrawConsentRejectedMissing,
+    WithdrawConsentRejectedMismatch,
+    WithdrawConsentPending,
+    WithdrawConsentSettled,
+    SettleUnlinkedRejectedMissing,
+    SettleUnlinkedRejectedNotConsent,
+    SettleUnlinkedRejectedLinked,
+    SettleUnlinkedRejectedConsumed,
+    SettleUnlinkedRejectedExpired,
+    SettleUnlinkedRejectedSettled,
+    SettleUnlinkedPending,
+    SettleUnlinkedApproved,
     BeginReviewRejectedDuplicate,
     BeginReviewPending,
     RecordReviewVerdictRejectedMissing,
+    RecordReviewVerdictRejectedConsentLinked,
     RecordReviewVerdictRejectedRetired,
     RecordReviewVerdictRejectedSettled,
     RecordReviewVerdictAllowed,
     RecordReviewVerdictDenied,
     RecordReviewVerdictEscalated,
     RecordReviewUnavailableRejectedMissing,
+    RecordReviewUnavailableRejectedConsentLinked,
     RecordReviewUnavailableRejectedRetired,
     RecordReviewUnavailableRejectedSettled,
     RecordReviewUnavailable,
     RetireReviewRejectedMissing,
+    RetireReviewRejectedConsentLinked,
     RetireReviewRejectedRetired,
     RetireReviewRejectedSettled,
     RetireReview,
     ConsumeReviewRejectedMissing,
+    ConsumeReviewRejectedConsentLinked,
     ConsumeReviewRejectedRetired,
     ConsumeReviewRejectedUsed,
     ConsumeReviewRejectedNotSatisfied,
     ConsumeReviewForEntry,
     ReleaseReviewRejectedMissing,
+    ReleaseReviewRejectedConsentLinked,
     ReleaseReviewRejectedPending,
     ReleaseReviewAllowed,
     ReleaseReviewDenied,
@@ -694,6 +828,11 @@ pub fn initial_state() -> State {
         approval_approve_allowed: Default::default(),
         approval_deny_allowed: Default::default(),
         approval_has_expiry: Default::default(),
+        approval_consent: Default::default(),
+        approval_consent_authenticated: Default::default(),
+        approval_consent_consumed: Default::default(),
+        approval_consent_review: Default::default(),
+        review_consent_approval: Default::default(),
         review_ids: Default::default(),
         review_statuses: Default::default(),
         review_retirements: Default::default(),

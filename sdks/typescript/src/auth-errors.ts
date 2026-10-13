@@ -31,6 +31,10 @@ export const WIRE_AUTH_ERROR_REASONS: readonly WireAuthErrorReason[] = [
   "callback_unavailable",
   "upstream_failure",
   "configuration_invalid",
+  "credential_access_denied",
+  "credential_interaction_required",
+  "credential_access_pending",
+  "credential_store_unavailable",
   "infrastructure",
 ];
 

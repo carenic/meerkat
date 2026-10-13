@@ -2077,6 +2077,9 @@ struct MockSessionService {
     turn_finalization_entry_gates: RwLock<HashMap<SessionId, Arc<TestRuntimeControlBarrier>>>,
     turn_finalization_acquire_started: AtomicU64,
     turn_finalization_acquire_completed: AtomicU64,
+    /// The session of every turn-finalization boundary acquisition, in the
+    /// order they started.
+    turn_finalization_acquire_sessions: std::sync::Mutex<Vec<SessionId>>,
     turn_finalization_acquire_panics_remaining: AtomicU64,
     cancel_after_boundary_supported: AtomicBool,
     cancel_after_boundary_calls: AtomicU64,
@@ -2116,10 +2119,21 @@ struct MockSessionService {
     load_persisted_session_max_in_flight: AtomicU64,
     create_session_in_flight: AtomicU64,
     create_session_max_in_flight: AtomicU64,
+    /// Ask the request's tool-surface gate at create, as the real factory
+    /// does before it finishes the agent; a refusal fails the create.
+    decide_tool_surface_at_create: AtomicBool,
+    /// How a held member's controller route query is answered; unset keeps
+    /// the service trait's default (`Unsupported`).
+    controller_route_answer: std::sync::Mutex<Option<MockControllerRouteAnswer>>,
+    /// Controller route queries started (each held member's hold asks once).
+    controller_route_queries: AtomicU64,
     create_session_gates: RwLock<HashMap<SessionId, Arc<TestRuntimeControlBarrier>>>,
     /// Parks the supervisor-publish trust install on the next created
     /// session's comms runtime (see `park_next_session_supervisor_publish`).
     next_session_supervisor_publish_gate: std::sync::Mutex<Option<Arc<TestRuntimeControlBarrier>>>,
+    /// Parks the next session creation, whatever its session id (see
+    /// `park_next_session_creation`).
+    next_session_creation_gate: std::sync::Mutex<Option<Arc<TestRuntimeControlBarrier>>>,
     archive_delay_ms: AtomicU64,
     start_turn_delay_ms: AtomicU64,
     /// Typed turn hold: while set, every non-host `start_turn` parks until
@@ -2275,6 +2289,7 @@ impl MockSessionService {
             turn_finalization_entry_gates: RwLock::new(HashMap::new()),
             turn_finalization_acquire_started: AtomicU64::new(0),
             turn_finalization_acquire_completed: AtomicU64::new(0),
+            turn_finalization_acquire_sessions: std::sync::Mutex::new(Vec::new()),
             turn_finalization_acquire_panics_remaining: AtomicU64::new(0),
             cancel_after_boundary_supported: AtomicBool::new(true),
             cancel_after_boundary_calls: AtomicU64::new(0),
@@ -2305,9 +2320,13 @@ impl MockSessionService {
             load_persisted_session_in_flight: AtomicU64::new(0),
             load_persisted_session_max_in_flight: AtomicU64::new(0),
             create_session_in_flight: AtomicU64::new(0),
+            decide_tool_surface_at_create: AtomicBool::new(false),
+            controller_route_answer: std::sync::Mutex::new(None),
+            controller_route_queries: AtomicU64::new(0),
             create_session_max_in_flight: AtomicU64::new(0),
             create_session_gates: RwLock::new(HashMap::new()),
             next_session_supervisor_publish_gate: std::sync::Mutex::new(None),
+            next_session_creation_gate: std::sync::Mutex::new(None),
             archive_delay_ms: AtomicU64::new(0),
             start_turn_delay_ms: AtomicU64::new(0),
             hold_start_turns: AtomicBool::new(false),
@@ -2976,6 +2995,27 @@ impl MockSessionService {
         gate
     }
 
+    /// Park the next session this service creates, whatever its id, inside
+    /// its creation (after it counts as in flight) until the gate is
+    /// released; only that creation parks.
+    fn park_next_session_creation(&self) -> Arc<TestRuntimeControlBarrier> {
+        let gate = Arc::new(TestRuntimeControlBarrier::new());
+        *self
+            .next_session_creation_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// The session of every turn-finalization boundary acquisition started
+    /// so far, in order.
+    fn turn_finalization_sessions(&self) -> Vec<SessionId> {
+        self.turn_finalization_acquire_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     async fn park_session_creation(&self, session_id: SessionId) -> Arc<TestRuntimeControlBarrier> {
         let gate = Arc::new(TestRuntimeControlBarrier::new());
         self.create_session_gates
@@ -3451,12 +3491,51 @@ impl MockSessionService {
     }
 }
 
+/// How the mock answers a held member's controller route query.
+#[derive(Clone)]
+enum MockControllerRouteAnswer {
+    Observed(super::session_service::ControllerRouteObservation),
+    /// The exact actor is gone.
+    ActorLost,
+    /// Never answers; the query parks until it is dropped.
+    Parked,
+}
+
 impl MockSessionService {
+    /// Answer every held member's controller route query with `answer`.
+    fn answer_controller_route(&self, answer: MockControllerRouteAnswer) {
+        *self
+            .controller_route_answer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(answer);
+    }
+
+    /// Decide each created session's prepared surface through the gate its
+    /// runtime bindings carry, as the real factory does.
+    fn decide_tool_surface_at_create(&self) {
+        self.decide_tool_surface_at_create
+            .store(true, Ordering::SeqCst);
+    }
+
     async fn create_session_with_actor_witness_slot(
         &self,
         req: CreateSessionRequest,
         actor_witness_slot: Option<&meerkat_session::LiveSessionActorWitnessSlot>,
     ) -> Result<RunResult, SessionError> {
+        if self.decide_tool_surface_at_create.load(Ordering::SeqCst)
+            && let Some(meerkat_core::runtime_epoch::RuntimeBuildMode::SessionOwned(bindings)) =
+                req.build.as_ref().map(|build| &build.runtime_build_mode)
+            && let Some(gate) = bindings.tool_surface_gate()
+        {
+            let surface = meerkat_core::PreparedToolSurface {
+                tools: Vec::new(),
+                projected: Vec::new(),
+                catalog: meerkat_core::PreparedToolCatalog::VisibleOnly,
+            };
+            gate.decide(&surface)
+                .await
+                .map_err(|refusal| SessionError::Unsupported(refusal.to_string()))?;
+        }
         let in_flight = self
             .create_session_in_flight
             .fetch_add(1, Ordering::Relaxed)
@@ -3498,6 +3577,15 @@ impl MockSessionService {
             .cloned();
         if let Some(gate) = creation_gate {
             gate.boundary_calls.fetch_add(1, Ordering::Release);
+            gate.wait_for_release().await;
+        }
+        let next_creation_gate = self
+            .next_session_creation_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(gate) = next_creation_gate {
+            gate.record_boundary_call();
             gate.wait_for_release().await;
         }
         if self.create_fail_sessions.read().await.contains(&session_id) {
@@ -4793,6 +4881,34 @@ impl MockSessionService {
 
 #[async_trait]
 impl MobSessionService for MockSessionService {
+    async fn controller_route_under_runtime_turn_boundary(
+        &self,
+        actor: &meerkat_session::LiveSessionActorWitness,
+    ) -> Result<super::session_service::ControllerRouteObservation, SessionError> {
+        self.controller_route_queries
+            .fetch_add(1, Ordering::Release);
+        let answer = self
+            .controller_route_answer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match answer {
+            None => Ok(super::session_service::ControllerRouteObservation::Unsupported),
+            Some(MockControllerRouteAnswer::Observed(observation)) => Ok(observation),
+            Some(MockControllerRouteAnswer::ActorLost) => Err(SessionError::NotFound {
+                id: actor.session_id().clone(),
+            }),
+            Some(MockControllerRouteAnswer::Parked) => std::future::pending().await,
+        }
+    }
+
+    async fn live_visible_tool_defs(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Option<Vec<meerkat_core::ToolDef>>, SessionError> {
+        Ok(Some(Vec::new()))
+    }
+
     async fn subscribe_session_activity(
         &self,
         session_id: &SessionId,
@@ -5176,6 +5292,10 @@ impl MobSessionService for MockSessionService {
     {
         self.turn_finalization_acquire_started
             .fetch_add(1, Ordering::Release);
+        self.turn_finalization_acquire_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(session_id.clone());
         let entry_gate = self
             .turn_finalization_entry_gates
             .write()
@@ -6048,6 +6168,9 @@ impl FaultInjectedMobEventStore {
             MobEventKind::TopologyViolation { .. } => "TopologyViolation",
             MobEventKind::SupervisorEscalation { .. } => "SupervisorEscalation",
             MobEventKind::SupervisorEscalationFailed { .. } => "SupervisorEscalationFailed",
+            MobEventKind::OrchestratorResumeNotificationFailed { .. } => {
+                "OrchestratorResumeNotificationFailed"
+            }
             MobEventKind::OperatorActionRecorded { .. } => "OperatorActionRecorded",
         }
     }
@@ -13842,6 +13965,7 @@ async fn archived_document_without_runtime_record_is_revivable() {
             ops_registry: None,
             generated_self_owned_operation_owner: Some(session_id.clone()),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+            held_bound: None,
         })
         .await
         .expect("materialize imported archived document through the real resume transaction");
@@ -15792,6 +15916,35 @@ async fn test_destroy_is_terminal_for_commands() {
         matches!(err, MobError::ActorCommandChannelClosed),
         "destroy should terminate the actor loop: {err:?}"
     );
+}
+
+/// The actor task watch reports `Returned` only once the destroyed mob's
+/// actor future has returned; while the actor runs it reports nothing. It
+/// observes the actor of its own mob instance only.
+#[tokio::test]
+async fn test_actor_task_watch_reports_the_destroyed_actors_return() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    // Another instance needs its own id: mob comms routes are process-wide.
+    let mut other_definition = sample_definition();
+    other_definition.id = MobId::from(format!("{}-other", test_mob_id()));
+    let (other, _other_service) = create_test_mob(other_definition).await;
+    let mut watch = handle.actor_task_watch();
+    assert!(watch.observes(&handle));
+    assert!(watch.observes(&handle.clone()));
+    assert!(
+        !watch.observes(&other),
+        "another instance has its own actor task"
+    );
+    let mut running = watch.clone();
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), running.wait())
+            .await
+            .ok(),
+        None,
+        "a running actor's task has not ended"
+    );
+    handle.destroy().await.expect("destroy");
+    assert_eq!(watch.wait().await, crate::MobActorTaskWait::Returned);
 }
 
 #[tokio::test]
@@ -18369,7 +18522,7 @@ fn external_descriptor_from_published_member(
 }
 
 /// #1500: a host holds the run starts of exactly the restored members it
-/// lists (MobKit: the ones whose tools are not published yet). After a cold
+/// lists (Meta: the ones whose tools are not published yet). After a cold
 /// restart and Resume, a listed member's runtime is held from its
 /// registration and an unlisted one is not; releasing the listed member's
 /// hold through the handle lets it start runs. A non-member is
@@ -24101,6 +24254,7 @@ async fn a_mounted_rust_bundle_carries_its_identity_into_a_witnessed_ceiling() {
         Some(ToolProvenance {
             kind: ToolSourceKind::RustBundle,
             source_id: ToolSourceId::new("bundle-a"),
+            artifact: None,
         }),
         "the mounted bundle tool carries its bundle's identity"
     );
@@ -24153,6 +24307,7 @@ fn rust_bundle_provenance(bundle: &str) -> meerkat_core::types::ToolProvenance {
     meerkat_core::types::ToolProvenance {
         kind: meerkat_core::types::ToolSourceKind::RustBundle,
         source_id: meerkat_core::types::ToolSourceId::new(bundle),
+        artifact: None,
     }
 }
 
@@ -24555,6 +24710,7 @@ async fn profile_tools_mcp_allowlist_scopes_default_external_tools() {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Mcp,
                 source_id: ToolSourceId::new(source),
+                artifact: None,
             }),
         })
     }
@@ -24641,6 +24797,7 @@ async fn profile_tools_mcp_empty_passes_all_default_external_tools() {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Mcp,
                 source_id: ToolSourceId::new(source),
+                artifact: None,
             }),
         })
     }
@@ -25540,7 +25697,7 @@ async fn caller_turn_fork_child(
 }
 
 /// Ownership is durable per identity: both respawn forms keep the spawner,
-/// including a successor spec (MobKit's destructive reset uses it).
+/// including a successor spec (Meta's destructive reset uses it).
 #[tokio::test]
 async fn spawned_by_survives_respawn_and_successor_respawn() {
     let (handle, service) = create_test_mob(sample_definition()).await;
@@ -25646,7 +25803,7 @@ async fn ownership_is_transitive_and_autokill_cascades_to_grandchildren() {
 }
 
 /// Plain `MobHandle::retire` cascades too (contracts review): every host
-/// retire path, MobKit's idle sweep included, uses it. A forks C, C forks D;
+/// retire path, Meta's idle sweep included, uses it. A forks C, C forks D;
 /// retiring C alone retires D, and A keeps its seat.
 #[tokio::test]
 async fn plain_retire_cascades_to_the_members_descendants() {
@@ -27316,7 +27473,7 @@ async fn fork_member_then_run_detached_reports_completion_and_records_the_spawne
 // ---------------------------------------------------------------------------
 
 /// A per-spawn overlay with fixed tool names, standing in for a host's local
-/// tools (a downstream app's calendar tools, MobKit's per-spawn `memory` recorder).
+/// tools (a downstream app's calendar tools, Meta's per-spawn `memory` recorder).
 struct FixedOverlayTools(Vec<&'static str>);
 
 #[async_trait]
@@ -27606,9 +27763,9 @@ async fn delegate_and_spawned_children_are_not_built_as_forks() {
 // repeats their first build
 // ---------------------------------------------------------------------------
 
-/// The source's roster labels as MobKit stamps them: the application labels
+/// The source's roster labels as Meta stamps them: the application labels
 /// plus every standard mob member label, carrying the source's values
-/// (`agent_identity` is MobKit's durable identity, `domain:calendar`).
+/// (`agent_identity` is Meta's durable identity, `domain:calendar`).
 fn fork_source_identity_labels() -> BTreeMap<String, String> {
     let mut labels = fork_source_app_labels();
     for key in crate::build::STANDARD_MOB_MEMBER_LABEL_KEYS {
@@ -27628,8 +27785,8 @@ fn assert_no_source_identity_label(labels: &BTreeMap<String, String>, surface: &
 }
 
 /// Regression (identity confusion): the source's roster labels were merged
-/// verbatim into the child's, so a MobKit fork child's roster entry claimed
-/// `agent_identity: domain:calendar`, MobKit's durable identity of its source.
+/// verbatim into the child's, so a Meta fork child's roster entry claimed
+/// `agent_identity: domain:calendar`, Meta's durable identity of its source.
 /// The child's roster entry, `MemberSpawned` event and `list_members` entry
 /// carry the source's application labels and none of its member-naming ones;
 /// the child's build stamps its own identity.
@@ -27911,7 +28068,7 @@ async fn revived_fork_child_is_rebuilt_with_its_first_build_inputs() {
 }
 
 /// A host's spawn customizer that re-supplies per-spawn overlays by identity
-/// on resume, as MobKit does: the fork source gets its calendar tools back,
+/// on resume, as Meta does: the fork source gets its calendar tools back,
 /// every other member a generic overlay.
 struct IdentityOverlayCustomizer {
     source: AgentIdentity,
@@ -32408,6 +32565,141 @@ async fn test_resume_fails_when_orchestrator_resume_notification_fails() {
             MobError::Internal(message) if message.contains("mock start_turn failure")
         ),
         "resume must surface orchestrator start_turn failures, got {error:?}"
+    );
+}
+
+/// A cold resume of a RUNNING mob hands its TurnDriven orchestrator's resume
+/// notification to the actor's lifecycle owner instead of awaiting the turn.
+/// The reconstruction returns while that notification is still held; when it
+/// then fails, the failure reaches the host as a mob event naming the planned
+/// orchestrator and session, and the mob keeps running.
+#[tokio::test]
+async fn test_cold_resume_of_a_running_mob_reports_a_late_orchestrator_notification_failure() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let mut def = sample_definition();
+    for profile in def.profiles.values_mut().filter_map(|b| b.as_inline_mut()) {
+        profile.runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    }
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let handle = MobBuilder::new(def, storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    handle
+        .spawn_with_options(
+            ProfileName::from("lead"),
+            AgentIdentity::from("lead-1"),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn orchestrator");
+    let orchestrator_session = handle
+        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("orchestrator session");
+    let cursor = handle
+        .events()
+        .latest_cursor()
+        .await
+        .expect("event cursor before the restart");
+
+    service.hold_start_turns();
+    service.set_fail_start_turn(true);
+    let mut held = service.held_start_turn_entries();
+    let entered_before = *held.borrow_and_update();
+    let prompts_before = service.recorded_start_turn_prompts().await.len();
+    crash_stop_and_release_routes(handle).await;
+    let resumed = tokio::time::timeout(
+        Duration::from_secs(10),
+        MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+            events,
+            runtime_metadata,
+        ))
+        .with_session_service(service.clone())
+        .resume(),
+    )
+    .await
+    .expect("the reconstruction does not wait on the orchestrator's turn")
+    .expect("running mob reconstruction");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        held.wait_for(|entries| *entries > entered_before),
+    )
+    .await
+    .expect("the resume notification enters its turn")
+    .expect("held-turn signal");
+    assert_eq!(
+        *held.borrow(),
+        entered_before + 1,
+        "exactly one resume notification entered"
+    );
+
+    service.release_held_start_turns();
+    let failures = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let found = resumed
+                .events()
+                .poll(cursor, 1000)
+                .await
+                .expect("poll events")
+                .into_iter()
+                .filter_map(|event| match event.kind {
+                    MobEventKind::OrchestratorResumeNotificationFailed {
+                        member_id,
+                        session_id,
+                        reason,
+                    } => Some((member_id, session_id, reason)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if !found.is_empty() {
+                break found;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the late notification failure is recorded");
+    assert_eq!(failures.len(), 1, "exactly one failure event: {failures:?}");
+    let failure = failures.into_iter().next().expect("one failure");
+    assert_eq!(failure.0, AgentIdentity::from("lead-1"));
+    assert_eq!(failure.1, orchestrator_session);
+    assert!(
+        failure.2.contains("mock start_turn failure"),
+        "the recorded reason is the delivery failure: {}",
+        failure.2
+    );
+    // Every turn call since the restart is that one resume notification
+    // (the runtime's own attempts at its single input), and no call follows
+    // the recorded outcome.
+    let calls_at_failure = service.non_host_start_turn_calls.load(Ordering::Acquire);
+    let prompts = service.recorded_start_turn_prompts().await;
+    let since_restart = &prompts[prompts_before..];
+    assert!(!since_restart.is_empty());
+    assert!(
+        since_restart.iter().all(|(session_id, prompt)| {
+            *session_id == orchestrator_session && prompt.contains("resumed with")
+        }),
+        "only the resume notification ran after the restart: {since_restart:?}"
+    );
+    let _ = resumed.status().await;
+    let _ = resumed.status().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        service.non_host_start_turn_calls.load(Ordering::Acquire),
+        calls_at_failure,
+        "no further turn call after the failure is recorded"
+    );
+    assert_eq!(
+        resumed.status().await.expect("status"),
+        MobState::Running,
+        "a late notification failure leaves the mob running"
     );
 }
 
@@ -44468,6 +44760,7 @@ async fn provision_runtime_backed_disposal_fixture(
             ops_registry: None,
             generated_self_owned_operation_owner: Some(session_id),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+            held_bound: None,
         })
         .await
         .unwrap_or_else(|error| {
@@ -47776,7 +48069,7 @@ async fn test_retire_deadline_after_archive_commit_retains_anchor_and_retry_conv
 }
 
 /// Force cancel and cancel-all-work on a member whose runtime is attached but
-/// has no run (MobKit CI: "local interrupt_member failed: Runtime not ready:
+/// has no run (Meta CI: "local interrupt_member failed: Runtime not ready:
 /// attached"). Both succeed: the member has no run left that the cancel is
 /// responsible for. Neither leaves a cancel behind for the member's next run:
 /// no boundary cancel is dispatched, and the next turn completes.
@@ -48112,6 +48405,7 @@ async fn test_provision_member_uses_local_bindings_before_routed_runtime_bound()
             ops_registry: None,
             generated_self_owned_operation_owner: Some(bridge_session_id.clone()),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+            held_bound: None,
         })
         .await
         .expect("member provision should install local runtime resources");
@@ -48199,6 +48493,7 @@ async fn retained_resume_request(
         ops_registry: None,
         generated_self_owned_operation_owner: Some(session_id.clone()),
         runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+        held_bound: None,
     }
 }
 
@@ -48519,6 +48814,7 @@ async fn test_multi_backend_session_provision_forwards_injected_authorized_resum
             ops_registry: None,
             generated_self_owned_operation_owner: Some(session_id.clone()),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+            held_bound: None,
         })
         .await
         .expect_err("stale injected authority must fail after Prepared");
@@ -48589,6 +48885,7 @@ async fn test_multi_backend_session_provision_forwards_injected_authorized_resum
             ops_registry: None,
             generated_self_owned_operation_owner: Some(session_id.clone()),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+            held_bound: None,
         })
         .await
         .expect("session arm should consume the injected resume authorization");
@@ -48876,6 +49173,7 @@ async fn test_fresh_provision_failure_preserves_resumable_document_and_quiesces_
             ops_registry: None,
             generated_self_owned_operation_owner: Some(SessionId::new()),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+            held_bound: None,
         })
         .await
         .expect_err("post-create owner mismatch must fail before receipt publication");
@@ -48952,6 +49250,7 @@ async fn test_fresh_provision_failure_preserves_resumable_document_and_quiesces_
             ops_registry: None,
             generated_self_owned_operation_owner: Some(session_id.clone()),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+            held_bound: None,
         })
         .await
         .expect("explicit resume should reconstruct the preserved session");
@@ -49029,6 +49328,7 @@ async fn test_retired_session_revival_failure_preserves_resumable_document() {
             ops_registry: None,
             generated_self_owned_operation_owner: Some(session_id.clone()),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+            held_bound: None,
         })
         .await
         .expect("seed session provision");
@@ -49106,6 +49406,7 @@ async fn test_retired_session_revival_failure_preserves_resumable_document() {
             ops_registry: None,
             generated_self_owned_operation_owner: Some(mismatched_owner),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+            held_bound: None,
         })
         .await
         .expect_err("post-attachment validation must fail");
@@ -49192,6 +49493,7 @@ async fn test_retired_session_revival_failure_preserves_resumable_document() {
             ops_registry: None,
             generated_self_owned_operation_owner: Some(session_id.clone()),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+            held_bound: None,
         })
         .await
         .expect("explicit resume should reconstruct the preserved promoted session");
@@ -50150,6 +50452,782 @@ async fn test_concurrent_spawn_and_retire_same_meerkat_is_serialized() {
         roster.is_empty() || (roster.len() == 1 && roster[0].agent_identity.as_str() == "w-1"),
         "serialized spawn/retire should never corrupt roster"
     );
+}
+
+/// A downstream app's role-migration crash (Meta 0.8.47 on meerkat 0.8.51, 2026-10-09):
+/// two wired members are retired at once and both retirements are admitted
+/// before either observes its endpoints, so each captures the other as a
+/// participant. One finishes while the other is still in a later stage; that
+/// stage's commit then found its participant gone. A wired peer's own
+/// completed retirement is not an uncertain durable outcome: the remaining
+/// retirement must finish and the actor must keep serving, never
+/// crash-quiesce for cold replay.
+///
+/// The ordering is held, not raced: both retirements are acknowledged right
+/// after their durable admission, before either observes its endpoints; `a`
+/// then runs to its session archive and is held there, and only then does
+/// `b` run, settling while `a`'s archive is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_concurrent_retirement_of_wired_peers_does_not_fail_stop_the_actor() {
+    let a = AgentIdentity::from("w-pair-a");
+    let b = AgentIdentity::from("w-pair-b");
+    let (handle, service) = spawn_wired_pair_for_retire_fence_test(
+        with_unique_mob_id(sample_definition(), "concurrent-wired-retirement"),
+        &a,
+        &b,
+    )
+    .await;
+    let a_session = handle
+        .resolve_bridge_session_id(&a)
+        .await
+        .expect("session-backed");
+    let archive = Arc::new(TestRuntimeControlBarrier::new());
+    service
+        .retirement_archive_gates
+        .write()
+        .await
+        .insert(a_session, Arc::clone(&archive));
+    // Each retirement is held at its first stage after the durable admission.
+    let a_admitted = super::actor::retirement_stage_hold::install(&a, "retire-runtime-quiesce");
+    let b_admitted = super::actor::retirement_stage_hold::install(&b, "retire-runtime-quiesce");
+
+    // Both retirements are submitted together, as a role migration that
+    // resumes its migrated members concurrently submits them.
+    let retire_a = {
+        let handle = handle.clone();
+        let a = a.clone();
+        tokio::spawn(async move { retire_to_terminal(&handle, &a).await })
+    };
+    let retire_b = {
+        let handle = handle.clone();
+        let b = b.clone();
+        tokio::spawn(async move { retire_to_terminal(&handle, &b).await })
+    };
+    for (identity, admitted) in [(&a, &a_admitted), (&b, &b_admitted)] {
+        tokio::time::timeout(Duration::from_secs(10), admitted.entered())
+            .await
+            .unwrap_or_else(|_| panic!("{identity}'s retirement is admitted"));
+        let progress = handle
+            .retirement_settlement(identity)
+            .expect("the owned retirement publishes its progress")
+            .current();
+        assert!(
+            matches!(
+                &progress,
+                crate::runtime::RetirementSettlement::InProgress { stage }
+                    if stage.as_str() == "retire-runtime-quiesce"
+            ),
+            "{identity} is held right after its admission, before its endpoint observation: {progress:?}"
+        );
+    }
+
+    // `a` observes its endpoints (capturing the admitted `b`) and is held in
+    // its session archive.
+    a_admitted.release();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while archive.boundary_calls.load(Ordering::Acquire) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a's retirement reaches its session archive");
+    // The ordering of the crash: b's retirement settles while a's is held in
+    // a later stage.
+    b_admitted.release();
+    let retire_b = tokio::time::timeout(Duration::from_secs(20), retire_b)
+        .await
+        .expect("b's retirement settles while a's is held")
+        .expect("join");
+    assert!(
+        matches!(retire_b, Ok(())),
+        "b retires while a's retirement is in flight: {retire_b:?}"
+    );
+    let progress = handle
+        .retirement_settlement(&a)
+        .expect("the owned retirement publishes its progress")
+        .current();
+    assert!(
+        matches!(
+            &progress,
+            crate::runtime::RetirementSettlement::InProgress { stage }
+                if stage.as_str() == "retire-session-archive"
+        ),
+        "a is still held in its session archive: {progress:?}"
+    );
+
+    archive.release_all();
+    let retire_a = tokio::time::timeout(Duration::from_secs(20), retire_a)
+        .await
+        .map(|joined| joined.expect("join"));
+    assert!(
+        handle.status().await.is_ok(),
+        "the mob actor keeps serving instead of crash-quiescing: a={retire_a:?}"
+    );
+    assert!(
+        matches!(retire_a, Ok(Ok(()))),
+        "a's retirement settles: {retire_a:?}"
+    );
+    assert!(handle.list_all_members().await.is_empty());
+    let mut spec = SpawnMemberSpec::new("worker", "w-pair-c");
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("the actor still provisions members");
+}
+
+/// Rebind `identity`'s roster entry in place, as session-binding recovery or
+/// a boot-time binding repair records it: identity, generation, runtime id
+/// and fence token stay equal, only `member_ref` names a new session. This is
+/// a roster change the runtime performs itself, outside the retire/respawn
+/// control lane, so an in-flight member effect does not defer it. Returns the
+/// new `member_ref`.
+async fn rebind_member_ref_for_retire_fence_test(
+    handle: &MobHandle,
+    identity: &AgentIdentity,
+) -> crate::event::MemberRef {
+    let rebound = crate::event::MemberRef::from_bridge_session_id(SessionId::new());
+    let mut roster = handle.roster.write().await;
+    let mut snapshot = roster.snapshot();
+    let entry = snapshot.get_mut(identity).expect("member roster entry");
+    assert_ne!(entry.member_ref, rebound);
+    entry.member_ref = rebound.clone();
+    *roster = super::roster_authority::RosterAuthority::from_roster(snapshot);
+    rebound
+}
+
+/// Spawn `a` and `b` as turn-driven members of a fresh mob and wire them.
+async fn spawn_wired_pair_for_retire_fence_test(
+    definition: MobDefinition,
+    a: &AgentIdentity,
+    b: &AgentIdentity,
+) -> (MobHandle, Arc<MockSessionService>) {
+    let (handle, service) = create_test_mob(definition).await;
+    for identity in [a, b] {
+        let mut spec = SpawnMemberSpec::new("worker", identity.as_str());
+        spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+        handle.spawn_spec(spec).await.expect("spawn");
+    }
+    handle
+        .wire(a.clone(), b.clone())
+        .await
+        .expect("wire the peers");
+    (handle, service)
+}
+
+/// Work for a member whose retirement already released its session binding,
+/// while the member is still Retiring, gets the mob machine's own typed
+/// rejection for a retiring member (`MemberNotFound`), not an internal error.
+/// The refusal is operation-local: a sibling's work is admitted and its turn
+/// completes, the mob keeps running, the retiring member's session is
+/// archived only by its own retirement, and that retirement then completes.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_work_for_a_retiring_member_is_refused_typed_while_sibling_work_continues() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let _adapter = service.enable_runtime_adapter();
+    service.set_return_exact_run_result(true);
+    let retiring = AgentIdentity::from("c1-retiring");
+    let sibling = AgentIdentity::from("c1-sibling");
+    for member in [&retiring, &sibling] {
+        handle
+            .spawn_with_options(
+                ProfileName::from("worker"),
+                member.clone(),
+                None,
+                Some(crate::MobRuntimeMode::TurnDriven),
+                None,
+            )
+            .await
+            .expect("spawn member");
+    }
+    let retiring_session = handle
+        .resolve_bridge_session_id(&retiring)
+        .await
+        .expect("retiring member session");
+    let hold = super::actor::retirement_stage_hold::install(&retiring, "retire-stop-host-loop");
+    let retire = {
+        let handle = handle.clone();
+        let retiring = retiring.clone();
+        tokio::spawn(async move { handle.retire(retiring).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), hold.entered())
+        .await
+        .expect("the retirement reaches its stop-host-loop stage");
+    let dsl_retiring = crate::machines::mob_machine::AgentIdentity::from_domain(&retiring);
+    let machine_state = handle
+        .query_machine_state()
+        .await
+        .expect("machine state while the retirement is held");
+    assert!(
+        !machine_state
+            .member_session_bindings
+            .contains_key(&dsl_retiring),
+        "the retirement released the member's session binding"
+    );
+    assert_eq!(
+        machine_state
+            .member_lifecycle_for_identity(&dsl_retiring)
+            .status,
+        crate::machines::mob_machine::MobMemberLifecycleStatus::Retiring,
+        "the member is still retiring"
+    );
+
+    let spec = BoundedResultSpec::new("c1-turn", 256).expect("bounded spec");
+    let work =
+        |text: &str| WorkSpec::new(ContentInput::Text(text.to_string()), WorkOrigin::Internal);
+    let refused = handle
+        .start_work_for_identity_bounded(
+            retiring.clone(),
+            work("for the retiring member"),
+            HandlingMode::Queue,
+            spec.clone(),
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(MobError::MemberNotFound(member)) if member == &retiring),
+        "work for a retiring member gets the machine's typed refusal: {:?}",
+        refused.as_ref().map(|_| "admitted")
+    );
+
+    let sibling_turn = handle
+        .start_work_for_identity_bounded(
+            sibling.clone(),
+            work("for the sibling"),
+            HandlingMode::Queue,
+            spec.clone(),
+        )
+        .await
+        .expect("the sibling's work is admitted while the retirement is held");
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        sibling_turn.wait_bounded(spec.clone()),
+    )
+    .await
+    .expect("the sibling's turn completes while the retirement is held")
+    .expect("the sibling's turn succeeds");
+    assert_eq!(result.result().result().text(), "for the sibling");
+
+    // The refusal terminated nothing.
+    assert_eq!(
+        handle.status().await.expect("mob status"),
+        MobState::Running
+    );
+    assert_eq!(
+        service.archive_call_count(&retiring_session).await,
+        0,
+        "the refusal did not archive the retiring member's session"
+    );
+    hold.release();
+    tokio::time::timeout(Duration::from_secs(10), retire)
+        .await
+        .expect("the retirement completes")
+        .expect("retire task")
+        .expect("the retirement succeeds");
+    assert!(
+        handle
+            .get_member(&retiring)
+            .await
+            .expect("read roster")
+            .is_none(),
+        "the retirement removed the member"
+    );
+    let again = handle
+        .start_work_for_identity_bounded(
+            sibling.clone(),
+            work("again"),
+            HandlingMode::Queue,
+            spec.clone(),
+        )
+        .await
+        .expect("the sibling still takes work after the retirement");
+    let result = tokio::time::timeout(Duration::from_secs(10), again.wait_bounded(spec))
+        .await
+        .expect("the sibling's next turn completes")
+        .expect("the sibling's next turn succeeds");
+    assert_eq!(result.result().result().text(), "again");
+}
+
+/// Only a retiring member's missing session binding is a typed refusal. A
+/// member the machine holds Active without a session binding (a peer-only
+/// member here) still fails tracked work admission as an invariant failure:
+/// the exact `Internal` error, not a member-state refusal.
+#[tokio::test]
+async fn test_tracked_work_for_an_active_member_without_a_session_binding_stays_internal() {
+    let _serial = lock_real_comms_tests();
+    let definition = with_unique_mob_id(
+        sample_definition_with_external_backend(),
+        "c1-active-without-binding",
+    );
+    let mob_id = definition.id.clone();
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, MobStorage::in_memory())
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create mob");
+    let member = AgentIdentity::from("w-c1-ext");
+    let external =
+        spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", member.as_str())).await;
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            member.clone(),
+            None,
+            external.binding(),
+        )
+        .await
+        .expect("spawn peer-only member");
+    let dsl_member = crate::machines::mob_machine::AgentIdentity::from_domain(&member);
+    let machine_state = handle.query_machine_state().await.expect("machine state");
+    assert!(
+        !machine_state
+            .member_session_bindings
+            .contains_key(&dsl_member),
+        "a peer-only member has no session binding"
+    );
+    assert_eq!(
+        machine_state
+            .member_lifecycle_for_identity(&dsl_member)
+            .status,
+        crate::machines::mob_machine::MobMemberLifecycleStatus::Active,
+        "the member is active"
+    );
+
+    let result = handle
+        .start_work_for_identity_bounded(
+            member.clone(),
+            WorkSpec::new(
+                ContentInput::Text("tracked work".to_string()),
+                WorkOrigin::Internal,
+            ),
+            HandlingMode::Queue,
+            BoundedResultSpec::new("c1-turn", 256).expect("bounded spec"),
+        )
+        .await;
+    let expected =
+        format!("tracked work admission for '{member}' has no machine-owned session binding");
+    assert!(
+        matches!(&result, Err(MobError::Internal(detail)) if detail == &expected),
+        "an active member without a session binding stays an invariant failure: {:?}",
+        result.as_ref().map(|_| "admitted")
+    );
+    drop(external);
+}
+
+/// Spawn a wired pair and hold `retiring`'s retirement in its session archive
+/// stage (after its endpoint observation captured `peer` as a participant).
+async fn hold_wired_retirement_at_session_archive(
+    retiring: &AgentIdentity,
+    peer: &AgentIdentity,
+) -> (
+    MobHandle,
+    Arc<TestRuntimeControlBarrier>,
+    tokio::task::JoinHandle<Result<(), MobError>>,
+) {
+    let (handle, service) =
+        spawn_wired_pair_for_retire_fence_test(sample_definition(), retiring, peer).await;
+    let session = handle
+        .resolve_bridge_session_id(retiring)
+        .await
+        .expect("session-backed");
+    let gate = Arc::new(TestRuntimeControlBarrier::new());
+    service
+        .retirement_archive_gates
+        .write()
+        .await
+        .insert(session, Arc::clone(&gate));
+    let retire = {
+        let handle = handle.clone();
+        let retiring = retiring.clone();
+        tokio::spawn(async move { handle.retire(retiring).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while gate.boundary_calls.load(Ordering::Acquire) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the retirement reaches its session archive");
+    (handle, gate, retire)
+}
+
+/// Spawn a wired pair and hold `retiring`'s retirement in its stop-host-loop
+/// stage: the first self-only stage after its endpoint observation captured
+/// `peer` as a participant. Answers once the hold is acknowledged.
+async fn hold_wired_retirement_at_stop_host_loop(
+    retiring: &AgentIdentity,
+    peer: &AgentIdentity,
+) -> (
+    MobHandle,
+    Arc<super::actor::retirement_stage_hold::RetirementStageHold>,
+    tokio::task::JoinHandle<Result<(), MobError>>,
+) {
+    let (handle, _service) =
+        spawn_wired_pair_for_retire_fence_test(sample_definition(), retiring, peer).await;
+    let hold = super::actor::retirement_stage_hold::install(retiring, "retire-stop-host-loop");
+    let retire = {
+        let handle = handle.clone();
+        let retiring = retiring.clone();
+        tokio::spawn(async move { handle.retire(retiring).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), hold.entered())
+        .await
+        .expect("the retirement reaches its stop-host-loop stage");
+    let progress = handle
+        .retirement_settlement(retiring)
+        .expect("the owned retirement publishes its progress")
+        .current();
+    assert!(
+        matches!(
+            &progress,
+            crate::runtime::RetirementSettlement::InProgress { stage }
+                if stage.as_str() == "retire-stop-host-loop"
+        ),
+        "the retirement is held in its stop-host-loop stage: {progress:?}"
+    );
+    (handle, hold, retire)
+}
+
+/// A wired peer's lifecycle command arrives while a retirement is held in
+/// stop-host-loop, a self-only stage after its endpoint observation. That
+/// stage's commit asserts only the retiring member, but the actor still
+/// parks the peer's command until the retirement settles: an admitted peer
+/// retirement could otherwise outlive this retirement's later endpoint
+/// observation and trust cleanup and invalidate those peer-dependent
+/// commits. Both operations then settle and the actor keeps serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_a_wired_peer_lifecycle_command_is_parked_while_a_retirement_holds_a_self_only_stage()
+{
+    let retiring = AgentIdentity::from("w-park-r");
+    let peer = AgentIdentity::from("w-park-p");
+    let (handle, hold, retire) = hold_wired_retirement_at_stop_host_loop(&retiring, &peer).await;
+
+    let mut parked = handle
+        .lifecycle_observations
+        .parked_member_controls
+        .subscribe();
+    let retire_peer = {
+        let handle = handle.clone();
+        let peer = peer.clone();
+        tokio::spawn(async move { retire_to_terminal(&handle, &peer).await })
+    };
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        parked.wait_for(|parked| parked.contains_key(&peer)),
+    )
+    .await
+    .expect("the actor parks the wired peer's retire")
+    .expect("the probe outlives the test");
+    assert!(
+        handle.retirement_settlement(&peer).is_none(),
+        "the parked retire has not started the peer's retirement"
+    );
+    assert!(
+        !retire_peer.is_finished(),
+        "the parked retire is still owned"
+    );
+    assert!(
+        handle.status().await.is_ok(),
+        "the actor serves while the peer's retire is parked"
+    );
+
+    let mut settlement = handle
+        .retirement_settlement(&retiring)
+        .expect("the owned retirement publishes its progress");
+    hold.release();
+    let settled = tokio::time::timeout(Duration::from_secs(20), settlement.settled())
+        .await
+        .expect("the held retirement settles once released");
+    assert!(
+        matches!(settled, Some(crate::runtime::RetirementSettlement::Retired)),
+        "the held retirement retires its member: {settled:?}"
+    );
+    match tokio::time::timeout(Duration::from_secs(10), retire)
+        .await
+        .expect("the held retire answers")
+        .expect("join")
+    {
+        Ok(()) => {}
+        Err(error) => assert!(
+            is_retirement_in_progress(&error),
+            "the held retire answers only typed in-progress at its budget: {error:?}"
+        ),
+    }
+    let retire_peer = tokio::time::timeout(Duration::from_secs(20), retire_peer)
+        .await
+        .expect("the parked retire settles once the held retirement settles")
+        .expect("join");
+    assert!(
+        matches!(retire_peer, Ok(())),
+        "the parked retire retires the peer: {retire_peer:?}"
+    );
+    assert!(
+        handle.status().await.is_ok(),
+        "the mob actor keeps serving instead of crash-quiescing"
+    );
+    assert!(handle.list_all_members().await.is_empty());
+    let mut spec = SpawnMemberSpec::new("worker", "w-park-c");
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("the actor still provisions members");
+}
+
+/// A wired peer's roster entry is rebound (new `member_ref`) by the runtime
+/// itself while another member's retirement is held in its session archive
+/// stage. That stage disposes only the retiring member's own session, so the
+/// peer's binding change is not an uncertain outcome of it: the retirement
+/// must finish and the actor must keep serving, never crash-quiesce for cold
+/// replay. Before stage-scoped fencing, every retirement stage re-asserted
+/// the exact incarnation of each wired peer captured at endpoint observation,
+/// so this fail-stopped the whole mob actor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_a_wired_peer_rebound_during_a_self_only_retirement_stage_does_not_fail_stop_the_actor()
+ {
+    let retiring = AgentIdentity::from("w-rebind-r");
+    let peer = AgentIdentity::from("w-rebind-p");
+    let (handle, gate, retire) = hold_wired_retirement_at_session_archive(&retiring, &peer).await;
+
+    let rebound = rebind_member_ref_for_retire_fence_test(&handle, &peer).await;
+    gate.release_all();
+    let retire = tokio::time::timeout(Duration::from_secs(10), retire)
+        .await
+        .map(|joined| joined.expect("join"));
+    assert!(
+        handle.status().await.is_ok(),
+        "the mob actor keeps serving instead of crash-quiescing: retire={retire:?}"
+    );
+    assert!(
+        matches!(retire, Ok(Ok(()))),
+        "the held retirement completes: {retire:?}"
+    );
+    let members = handle.list_all_members().await;
+    assert!(
+        members.iter().all(|entry| entry.agent_identity != retiring),
+        "the retired member is gone"
+    );
+    assert!(
+        members.iter().any(|entry| entry.agent_identity == peer),
+        "the rebound peer stays a member"
+    );
+    // `list_all_members` projects from machine state; the rebind lives in
+    // the shared roster the stage fences are checked against.
+    assert_eq!(
+        handle
+            .roster
+            .read()
+            .await
+            .get(&peer)
+            .map(|entry| entry.member_ref.clone()),
+        Some(rebound),
+        "the rebound peer keeps its new binding in the fenced roster"
+    );
+    let mut spec = SpawnMemberSpec::new("worker", "w-rebind-c");
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("the actor still provisions members");
+}
+
+/// Control: the retiring member's OWN roster entry is rebound while its
+/// retirement is held in the same session archive stage. The stage outcome
+/// no longer belongs to the exact incarnation it was authorized for, so the
+/// actor still fail-stops for cold replay (stage scoping narrows only which
+/// PEERS a stage fences, never the retiring member's own fence).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_the_retiring_member_rebound_during_its_retirement_stage_still_fail_stops_the_actor() {
+    let retiring = AgentIdentity::from("w-own-r");
+    let peer = AgentIdentity::from("w-own-p");
+    let (handle, gate, retire) = hold_wired_retirement_at_session_archive(&retiring, &peer).await;
+
+    rebind_member_ref_for_retire_fence_test(&handle, &retiring).await;
+    gate.release_all();
+    let retire = tokio::time::timeout(Duration::from_secs(10), retire)
+        .await
+        .map(|joined| joined.expect("join"));
+    let stopped = tokio::time::timeout(Duration::from_secs(10), async {
+        while handle.status().await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        stopped.is_ok(),
+        "the retiring member's own incarnation loss still fail-stops the actor: retire={retire:?}"
+    );
+    assert!(
+        !matches!(retire, Ok(Ok(()))),
+        "a retirement whose own incarnation moved is not reported as retired: {retire:?}"
+    );
+}
+
+/// A wired peer is replaced (respawned to a new incarnation, as a role
+/// migration resumes a retired member under its new role) while another
+/// member's retirement is held in its session archive stage. The held
+/// stage's fence names the peer's old incarnation. A peer's own lifecycle is
+/// not an uncertain durable outcome of this retirement: it must still finish
+/// and the actor must keep serving, never crash-quiesce for cold replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_a_wired_peer_replaced_during_a_retirement_stage_does_not_fail_stop_the_actor() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    for name in ["w-swap-a", "w-swap-b"] {
+        let mut spec = SpawnMemberSpec::new("worker", name);
+        spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+        handle.spawn_spec(spec).await.expect("spawn");
+    }
+    handle
+        .wire(
+            AgentIdentity::from("w-swap-a"),
+            AgentIdentity::from("w-swap-b"),
+        )
+        .await
+        .expect("wire the peers");
+    let b_session = handle
+        .resolve_bridge_session_id(&AgentIdentity::from("w-swap-b"))
+        .await
+        .expect("session-backed");
+    let gate = Arc::new(TestRuntimeControlBarrier::new());
+    service
+        .retirement_archive_gates
+        .write()
+        .await
+        .insert(b_session, Arc::clone(&gate));
+
+    let retire_b = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.retire(AgentIdentity::from("w-swap-b")).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while gate.boundary_calls.load(Ordering::Acquire) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("b's retirement reaches its session archive");
+
+    let respawn_a = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.respawn(AgentIdentity::from("w-swap-a"), None).await })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    gate.release_all();
+    let respawn_a = respawn_a.await.expect("join");
+    let retire_b = retire_b.await.expect("join");
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while handle
+            .list_all_members()
+            .await
+            .iter()
+            .any(|entry| entry.agent_identity.as_str() == "w-swap-b")
+        {
+            let _ = handle.retire(AgentIdentity::from("w-swap-b")).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("the held retirement settles: respawn={respawn_a:?} retire={retire_b:?}")
+    });
+    assert!(
+        handle.status().await.is_ok(),
+        "the mob actor keeps serving instead of crash-quiescing: respawn={respawn_a:?} retire={retire_b:?}"
+    );
+    let mut spec = SpawnMemberSpec::new("worker", "w-swap-c");
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("the actor still provisions members");
+}
+
+/// Concurrent retirement of two wired members (as a boot-time role migration
+/// retires its members): one member's retirement is held in its session
+/// archive stage while its wired peer retires completely. The held stage's
+/// fence names the peer, which is now gone. A peer's own retirement is not
+/// an uncertain durable outcome: the held retirement must still finish and
+/// the actor must keep serving, never crash-quiesce for cold replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_a_wired_peer_retiring_during_a_retirement_stage_does_not_fail_stop_the_actor() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    for name in ["w-race-a", "w-race-b"] {
+        let mut spec = SpawnMemberSpec::new("worker", name);
+        spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+        handle.spawn_spec(spec).await.expect("spawn");
+    }
+    handle
+        .wire(
+            AgentIdentity::from("w-race-a"),
+            AgentIdentity::from("w-race-b"),
+        )
+        .await
+        .expect("wire the peers");
+    let b_session = handle
+        .resolve_bridge_session_id(&AgentIdentity::from("w-race-b"))
+        .await
+        .expect("session-backed");
+    let gate = Arc::new(TestRuntimeControlBarrier::new());
+    service
+        .retirement_archive_gates
+        .write()
+        .await
+        .insert(b_session, Arc::clone(&gate));
+
+    let retire_b = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.retire(AgentIdentity::from("w-race-b")).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while gate.boundary_calls.load(Ordering::Acquire) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("b's retirement reaches its session archive");
+
+    // The peer's retirement is submitted while the held one is in flight, as
+    // a role migration submits both; the operation keeps running even when
+    // the caller's wait ends first.
+    let retire_a = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.retire(AgentIdentity::from("w-race-a")).await })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    gate.release_all();
+    let retire_a = retire_a.await.expect("join");
+    let retire_b = retire_b.await.expect("join");
+    // Each caller retries a retryable answer, as the role migration's next
+    // reconcile does, until both members are gone.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let remaining = handle.list_all_members().await;
+            if remaining.is_empty() {
+                return;
+            }
+            for entry in remaining {
+                let _ = handle.retire(entry.agent_identity.clone()).await;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("both retirements settle: first answers a={retire_a:?} b={retire_b:?}")
+    });
+    assert!(
+        handle.status().await.is_ok(),
+        "the mob actor keeps serving instead of crash-quiescing"
+    );
+    assert!(handle.list_all_members().await.is_empty());
+    let mut spec = SpawnMemberSpec::new("worker", "w-race-c");
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("the actor still provisions members");
 }
 
 #[tokio::test]
@@ -59164,6 +60242,7 @@ async fn spawn_preparations_are_bounded_and_all_complete() {
                     spawn_source: super::handle::SpawnSource::Consumer,
                     owner_bridge_session_id: None,
                     ops_registry: None,
+                    held: None,
                     reply_tx,
                 })
                 .await
@@ -71980,6 +73059,7 @@ async fn mcp_provenance_filter_scopes_only_mcp_tools_to_allowlist() {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Mcp,
                 source_id: ToolSourceId::new(source),
+                artifact: None,
             }),
         })
     }
@@ -71993,6 +73073,7 @@ async fn mcp_provenance_filter_scopes_only_mcp_tools_to_allowlist() {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Callback,
                 source_id: ToolSourceId::new("inline"),
+                artifact: None,
             }),
         })
     }
@@ -72076,6 +73157,7 @@ async fn mcp_provenance_filter_preserves_dispatch_context() {
                 Some(ToolProvenance {
                     kind: ToolSourceKind::Mcp,
                     source_id: ToolSourceId::new("linear"),
+                    artifact: None,
                 }),
             ),
             context_recording_tool(
@@ -72083,6 +73165,7 @@ async fn mcp_provenance_filter_preserves_dispatch_context() {
                 Some(ToolProvenance {
                     kind: ToolSourceKind::Mcp,
                     source_id: ToolSourceId::new("github"),
+                    artifact: None,
                 }),
             ),
         ],
@@ -72138,6 +73221,7 @@ async fn mcp_provenance_filter_preserves_exact_catalog_and_gates_hybrid_resoluti
             Some(ToolProvenance {
                 kind: ToolSourceKind::Mcp,
                 source_id: ToolSourceId::new("linear"),
+                artifact: None,
             }),
         ),
         context_recording_tool(
@@ -72145,6 +73229,7 @@ async fn mcp_provenance_filter_preserves_exact_catalog_and_gates_hybrid_resoluti
             Some(ToolProvenance {
                 kind: ToolSourceKind::Mcp,
                 source_id: ToolSourceId::new("github"),
+                artifact: None,
             }),
         ),
     ])) as Arc<dyn AgentToolDispatcher>;
@@ -75692,15 +76777,46 @@ async fn test_step_condition_referencing_absent_root_skips_not_fails() {
     );
 }
 
+/// Root-frame siblings stay independent of each other's failure, and of a
+/// supervisory effect that fails afterwards (#116). The supervisor role is
+/// declared but never spawned, so every escalation fails at once with
+/// NoEligibleSupervisor; each terminal step must still be projected (run
+/// status, ledger row, event) before the failed root frame carries out its
+/// escalations.
 #[tokio::test]
 async fn test_root_frame_step_failure_does_not_abort_independent_siblings() {
-    use crate::definition::{FlowNodeSpec, FrameSpec, FrameStepSpec};
+    use crate::definition::{FlowNodeSpec, FrameSpec, FrameStepSpec, SupervisorSpec};
+    use crate::event::FlowFailureClass;
     use crate::ids::FlowNodeId;
 
     let mut definition = sample_definition();
+    // A declared-but-never-spawned supervisor role, as in
+    // test_failed_escalation_leaves_continue_policy_run_completed.
+    let auditor_profile = definition
+        .profiles
+        .get(&ProfileName::from("worker"))
+        .cloned()
+        .expect("worker profile is declared by sample_definition");
+    definition
+        .profiles
+        .insert(ProfileName::from("auditor"), auditor_profile);
+    definition.supervisor = Some(SupervisorSpec {
+        role: ProfileName::from("auditor"),
+        escalation_threshold: 1,
+        escalation_turn_timeout_ms: None,
+    });
+
     let mut steps = IndexMap::new();
     steps.insert(step_id("needs_lead"), flow_step("lead", "Lead-only task"));
     steps.insert(step_id("worker_task"), flow_step("worker", "Worker task"));
+    steps.insert(
+        step_id("after_lead"),
+        flow_step("worker", "Follow-up of the lead-only task"),
+    );
+    steps.insert(
+        step_id("second_lead"),
+        flow_step("lead", "Second lead-only task"),
+    );
 
     let mut root_nodes = IndexMap::new();
     root_nodes.insert(
@@ -75717,6 +76833,28 @@ async fn test_root_frame_step_failure_does_not_abort_independent_siblings() {
         FlowNodeId::from("worker-node"),
         FlowNodeSpec::Step(FrameStepSpec {
             step_id: step_id("worker_task"),
+            depends_on: Vec::new(),
+            depends_on_mode: DependencyMode::All,
+            branch: None,
+            failure_policy: Default::default(),
+        }),
+    );
+    // Listed after the escalating failure: a dependent of it (skipped) and a
+    // second independent failure.
+    root_nodes.insert(
+        FlowNodeId::from("after-lead-node"),
+        FlowNodeSpec::Step(FrameStepSpec {
+            step_id: step_id("after_lead"),
+            depends_on: vec![FlowNodeId::from("needs-lead-node")],
+            depends_on_mode: DependencyMode::All,
+            branch: None,
+            failure_policy: Default::default(),
+        }),
+    );
+    root_nodes.insert(
+        FlowNodeId::from("second-lead-node"),
+        FlowNodeSpec::Step(FrameStepSpec {
+            step_id: step_id("second_lead"),
             depends_on: Vec::new(),
             depends_on_mode: DependencyMode::All,
             branch: None,
@@ -75752,6 +76890,9 @@ async fn test_root_frame_step_failure_does_not_abort_independent_siblings() {
     service
         .set_flow_turn_fail_for_session(&lead_session_id, true)
         .await;
+    service
+        .set_flow_turn_completed_result(r#"{"sibling":"worker-output"}"#)
+        .await;
 
     let run_id = handle
         .run_flow(FlowId::from("demo"), serde_json::json!({}))
@@ -75759,21 +76900,103 @@ async fn test_root_frame_step_failure_does_not_abort_independent_siblings() {
         .expect("run flow");
     let terminal = wait_for_run_terminal(&handle, &run_id, Duration::from_secs(3)).await;
     assert_eq!(terminal.status, MobRunStatus::Failed);
+
+    // The escalation that could not be carried out stays the run's reported
+    // failure, exactly once.
+    let events = handle.events().replay_all().await.expect("replay");
+    let flow_failures: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            MobEventKind::FlowFailed {
+                run_id: id,
+                cause,
+                reason,
+                ..
+            } if id == &run_id => Some((*cause, reason.clone())),
+            _ => None,
+        })
+        .collect();
     assert!(
-        terminal.step_ledger.iter().any(|entry| {
-            entry.step_id.as_str() == "worker_task" && entry.status == StepRunStatus::Completed
-        }),
-        "independent worker sibling should still complete even if another root node fails"
-    );
-    assert!(
-        terminal
-            .failure_ledger
-            .iter()
-            .any(|entry| entry.step_id.as_str() == "needs_lead"),
-        "root-frame failure should project a failure ledger entry for the failed node"
+        matches!(
+            flow_failures.as_slice(),
+            [(FlowFailureClass::SupervisorEscalation, reason)]
+                if reason.contains("no active supervisor member for role 'auditor'")
+        ),
+        "the failed escalation must stay the run's reported failure: {flow_failures:?}"
     );
 
-    let events = handle.events().replay_all().await.expect("replay");
+    // Every step keeps its frame terminal status; none is folded to Canceled.
+    let run_step_statuses = |run: &crate::run::MobRun| {
+        run.flow_state
+            .step_status
+            .iter()
+            .map(|(step, status)| (step.to_string(), status.map(|status| status.as_str())))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        run_step_statuses(&terminal),
+        BTreeMap::from([
+            ("after_lead".to_string(), Some("Skipped")),
+            ("needs_lead".to_string(), Some("Failed")),
+            ("second_lead".to_string(), Some("Failed")),
+            ("worker_task".to_string(), Some("Completed")),
+        ]),
+        "a failed escalation must not fold the steps projected after it to Canceled"
+    );
+
+    // The later-listed completed sibling carries its exact output in the ledger.
+    let worker_output = terminal
+        .root_step_outputs
+        .get(&step_id("worker_task"))
+        .expect("frame completion saved the sibling's output");
+    assert!(
+        worker_output.to_string().contains("worker-output"),
+        "the saved output is the sibling's own turn result: {worker_output}"
+    );
+    let ledger_rows = |step: &str, status: StepRunStatus| {
+        terminal
+            .step_ledger
+            .iter()
+            .filter(|entry| entry.step_id.as_str() == step && entry.status == status)
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        matches!(
+            ledger_rows("worker_task", StepRunStatus::Completed).as_slice(),
+            [row] if row.output.as_ref() == Some(worker_output)
+        ),
+        "independent worker sibling should still complete, with its exact output, even if \
+         another root node fails"
+    );
+    assert_eq!(
+        ledger_rows("after_lead", StepRunStatus::Skipped).len(),
+        1,
+        "the skipped dependent is recorded once"
+    );
+    assert_eq!(
+        ledger_rows("second_lead", StepRunStatus::Failed).len(),
+        1,
+        "the later failure is recorded once"
+    );
+    for failed in ["needs_lead", "second_lead"] {
+        assert_eq!(
+            terminal
+                .failure_ledger
+                .iter()
+                .filter(|entry| entry.step_id.as_str() == failed)
+                .count(),
+            1,
+            "root-frame failure should project exactly one failure ledger entry for '{failed}'"
+        );
+    }
+    assert!(
+        terminal
+            .step_ledger
+            .iter()
+            .all(|entry| entry.status != StepRunStatus::Canceled),
+        "no step of the failed root frame is recorded Canceled"
+    );
+
     assert!(
         events.iter().any(|event| {
             matches!(
@@ -75783,6 +77006,60 @@ async fn test_root_frame_step_failure_does_not_abort_independent_siblings() {
             )
         }),
         "independent worker sibling should still emit StepCompleted"
+    );
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                MobEventKind::StepSkipped { run_id: id, step_id, .. }
+                    if id == &run_id && step_id.as_str() == "after_lead"
+            )
+        }),
+        "the skipped dependent emits StepSkipped"
+    );
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                MobEventKind::StepFailed { run_id: id, step_id, .. }
+                    if id == &run_id && step_id.as_str() == "second_lead"
+            )
+        }),
+        "the later failure emits StepFailed"
+    );
+    assert!(
+        !events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                MobEventKind::SupervisorEscalation { run_id: id, .. } if id == &run_id
+            )
+        }),
+        "no escalation reached a supervisor"
+    );
+    assert_eq!(
+        handle.list_members().await.len(),
+        2,
+        "an escalation that never reached a supervisor does not reset the mob"
+    );
+
+    // Reading the terminal run again returns the same record.
+    let reread = handle
+        .flow_status(run_id.clone())
+        .await
+        .expect("flow status")
+        .expect("run exists");
+    let record = |run: &crate::run::MobRun| {
+        (
+            run.status.clone(),
+            run_step_statuses(run),
+            serde_json::to_value(&run.step_ledger).expect("step ledger serializes"),
+            serde_json::to_value(&run.failure_ledger).expect("failure ledger serializes"),
+        )
+    };
+    assert_eq!(
+        record(&reread),
+        record(&terminal),
+        "the terminal run reads back unchanged"
     );
 }
 
@@ -80483,6 +81760,7 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
             "member_role_migration_rejected".to_string()
         }
         MobError::DeliveryInteractionConflict { .. } => "delivery_interaction_conflict".to_string(),
+        MobError::AdmissionClosed { reason, .. } => format!("admission_closed:{reason:?}"),
         MobError::IdentityConvergenceAdmissionClosed { .. } => {
             "identity_convergence_admission_closed".to_string()
         }
@@ -80493,6 +81771,8 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::WorkInputCompletionUnavailable { .. } => {
             "work_input_completion_unavailable".to_string()
         }
+        MobError::MemberInputRefused { .. } => "member_input_refused".to_string(),
+        MobError::GovernedInputUnbound { .. } => "governed_input_unbound".to_string(),
         MobError::InvalidTransition { from, to } => {
             format!("invalid_transition:{}->{}", from.as_str(), to.as_str())
         }
@@ -80555,7 +81835,11 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
         MobError::MemberAdmissionBacklogFull { .. } => "member_admission_backlog_full".to_string(),
         MobError::ActorCommandTimedOut { .. } => "actor_command_timed_out".to_string(),
         MobError::MemberReloadRefused { .. } => "member_reload_refused".to_string(),
+        MobError::HeldProvisionUnsupported { .. } => "held_provision_unsupported".to_string(),
         MobError::MemberReloadTimedOut { .. } => "member_reload_timed_out".to_string(),
+        MobError::HeldSpawnUnsupported { .. } => "held_spawn_unsupported".to_string(),
+        MobError::HeldSpawnAborted { .. } => "held_spawn_aborted".to_string(),
+        MobError::HeldSpawnExpired { .. } => "held_spawn_expired".to_string(),
         MobError::DefinitionError(_) => "definition_error".to_string(),
         MobError::DefinitionParse(_) => "definition_parse".to_string(),
         MobError::UnsupportedProfileKey { .. } => "unsupported_profile_key".to_string(),
@@ -80594,6 +81878,8 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
             "callback_pending".to_string()
         }
         MobError::StaleFenceToken { .. } => "stale_fence_token".to_string(),
+        MobError::StaleDeliveryScope { .. } => "stale_delivery_scope".to_string(),
+        MobError::DeliveryScopeUnavailable { .. } => "delivery_scope_unavailable".to_string(),
         MobError::StaleMemberOperatorAuthority { .. } => {
             "stale_member_operator_authority".to_string()
         }
@@ -85176,7 +86462,7 @@ fn a_stop_cancel_that_finds_its_run_over_reports_it_ended() {
             state: meerkat_runtime::RuntimeState::Idle,
         }),
         // The run committed back to Attached between the hold and the cancel
-        // (MobKit: stop right after a turn reached the model).
+        // (Meta: stop right after a turn reached the model).
         Err(meerkat_runtime::RuntimeDriverError::NotReady {
             state: meerkat_runtime::RuntimeState::Attached,
         }),
@@ -85829,7 +87115,7 @@ async fn wait_for_turn_finalization_guard_request(
     .expect("the turn-finalization request counter outlives the test")
 }
 
-/// Regression (MobKit #512 trace: `control_run=None queue_len=1` at retire):
+/// Regression (Meta #512 trace: `control_run=None queue_len=1` at retire):
 /// an input admitted before retire but not yet opened as a run must be
 /// resolved typed by retire's pre-boundary step. Before the fix the step read
 /// "no bound run" as nothing to cancel; the queued input then opened a run
@@ -87654,6 +88940,42 @@ async fn test_member_turn_rejects_conflicting_metadata_handling_mode_before_admi
 }
 
 #[tokio::test]
+async fn test_ordinary_member_turn_handle_carries_no_governed_admission() {
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("lead"))
+        .expect("lead profile")
+        .as_inline_mut()
+        .unwrap()
+        .runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    let (handle, _service) = create_test_mob_with_runtime_backed_real_comms(definition).await;
+    let identity = AgentIdentity::from("lead-ordinary-admission");
+    handle
+        .spawn(ProfileName::from("lead"), identity.clone(), None)
+        .await
+        .expect("spawn lead");
+    let member = handle.member(&identity).await.expect("member handle");
+    let turn = member
+        .start_turn(
+            ContentInput::Text("an ordinary turn".into()),
+            HandlingMode::Queue,
+            crate::MemberTurnOptions::default(),
+            None,
+        )
+        .await
+        .expect("ordinary runtime input is admitted");
+    assert!(
+        turn.admission().is_none(),
+        "only governed input forwards a canonical admission"
+    );
+    tokio::time::timeout(Duration::from_secs(5), turn.wait())
+        .await
+        .expect("completion should resolve")
+        .expect("the ordinary turn succeeds");
+}
+
+#[tokio::test]
 async fn test_member_turn_handle_reports_post_admission_runtime_failure() {
     let mut definition = sample_definition();
     definition
@@ -87953,11 +89275,20 @@ fn placement_fixture_uses_local_mob_authority_types() {
         "shared unit fixtures must not import the separately compiled self-dev-dependency",
     );
 }
+/// D67: public ownership and the Closing admission state.
+mod admission_close;
 /// #1497 member continuations resolve through the mob roster.
 #[cfg(not(target_arch = "wasm32"))]
 mod continuation_resolver;
+/// Delivery scope correctness: scope-bound submit and original-session
+/// recovery over real persistent stores.
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod delivery_scope_gates;
 /// #1497 fork job terminals are committed once and validated on every read.
 mod fork_job_terminal;
+/// Producer bridge Part B: held spawns.
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod held_spawn;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod host_outage_recovery;
 /// Member-level safe-boundary instruction activation on real persistent
@@ -88290,3 +89621,254 @@ async fn member_without_snapshot_rebuild_declares_the_roles_added_deny() {
     );
     crash_stop_and_release_routes(resumed).await;
 }
+
+/// Resume a mob only to tear it down, admitting its destroy before start as
+/// `principal`. The returned custody keeps the automatic destroy retry idle.
+#[allow(clippy::too_many_arguments)]
+async fn resume_admitting_destroy_before_start(
+    events: Arc<FaultInjectedMobEventStore>,
+    runs: Arc<InMemoryMobRunStore>,
+    specs: Arc<InMemoryMobSpecStore>,
+    runtime_metadata: Arc<InMemoryMobRuntimeMetadataStore>,
+    identity: Arc<InMemoryMobIdentityStore>,
+    identity_status: Arc<InMemoryMobIdentityStatusStore>,
+    service: Arc<MockSessionService>,
+    principal: crate::control_policy::MobControlPrincipal,
+) -> (
+    Result<MobHandle, MobError>,
+    crate::runtime::StartAdmittedDestroyCustody,
+) {
+    let (custody, watch) = crate::runtime::start_admitted_destroy_custody();
+    let resumed = MobBuilder::for_resume(MobStorage::custom_with_runtime_metadata(
+        events,
+        runs,
+        specs,
+        runtime_metadata,
+        identity,
+        identity_status,
+    ))
+    .with_session_service(service)
+    .notify_orchestrator_on_resume(false)
+    .admit_destroy_before_start(
+        crate::control_policy::CommandAuthority::principal(principal),
+        watch,
+    )
+    .resume()
+    .await;
+    (resumed, custody)
+}
+
+/// Lifecycle facts a destroy admission writes, after `from` events.
+async fn destroy_admission_writes(events: &FaultInjectedMobEventStore, from: usize) -> usize {
+    events
+        .replay_all()
+        .await
+        .expect("replay events")
+        .iter()
+        .skip(from)
+        .filter(|event| {
+            matches!(
+                event.kind,
+                MobEventKind::MobDestroying
+                    | MobEventKind::MobDestroyStorageFinalizing
+                    | MobEventKind::PlacedCompletionLifecycleQuiesceStarted { .. }
+            )
+        })
+        .count()
+}
+
+/// A destroy admitted before start crosses the same remote-authority
+/// preflight as a `Destroy` command: an unfinished host revoke refuses it,
+/// and the refused resume writes no lifecycle fact.
+#[tokio::test]
+async fn test_destroy_admitted_before_start_refuses_an_unfinished_host_revoke() {
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let definition = with_unique_mob_id(sample_definition(), "start-destroy-revoke-anchor");
+    let (handle, service, runs, specs, runtime_metadata, identity, identity_status) =
+        create_test_mob_with_recoverable_fault_events(definition, events.clone()).await;
+    let mob_id = handle.mob_id().clone();
+    handle.shutdown().await.expect("stop the first incarnation");
+    // A bound host whose revoke started but has no remote confirmation: cold
+    // resume keeps it as a revoke to retry.
+    let record = crate::store::sample_mob_host_authority_record("host-pending-revoke", 7);
+    runtime_metadata
+        .put_mob_host_authority(
+            &mob_id,
+            &record,
+            &crate::store::mob_host_authority_persistence_authority_for_record(&record)
+                .expect("host authority persistence"),
+        )
+        .await
+        .expect("seed the bound host");
+    events
+        .append(crate::event::NewMobEvent {
+            mob_id,
+            timestamp: None,
+            kind: MobEventKind::RemoteHostRevokeStarted {
+                operation_id: meerkat_core::time_compat::new_uuid_v7().to_string(),
+                host_id: record.host_id.clone(),
+                epoch: record.authority_epoch,
+                binding_generation: record.binding_generation,
+            },
+        })
+        .await
+        .expect("inject unfinished revoke anchor");
+    let before = events.replay_all().await.expect("replay events").len();
+
+    let (Err(error), _custody) = resume_admitting_destroy_before_start(
+        events.clone(),
+        runs,
+        specs,
+        runtime_metadata,
+        identity,
+        identity_status,
+        service,
+        crate::control_policy::MobControlPrincipal::Owner,
+    )
+    .await
+    else {
+        panic!("a destroy admitted before start must not cross an unfinished host revoke");
+    };
+    assert!(
+        error.to_string().contains("revoke operation"),
+        "the refusal names the remote-authority preflight: {error}"
+    );
+    assert_eq!(
+        destroy_admission_writes(&events, before).await,
+        0,
+        "a refused admission writes no lifecycle fact"
+    );
+}
+
+/// A destroy admitted before start passes chokepoint (a) for its principal:
+/// a principal without the destroy scope is refused with the typed denial,
+/// and nothing is written.
+#[tokio::test]
+async fn test_destroy_admitted_before_start_refuses_an_unauthorized_principal() {
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let definition = with_unique_mob_id(sample_definition(), "start-destroy-principal");
+    let (handle, service, runs, specs, runtime_metadata, identity, identity_status) =
+        create_test_mob_with_recoverable_fault_events(definition, events.clone()).await;
+    handle.shutdown().await.expect("stop the first incarnation");
+    let before = events.replay_all().await.expect("replay events").len();
+
+    let (Err(error), _custody) = resume_admitting_destroy_before_start(
+        events.clone(),
+        runs,
+        specs,
+        runtime_metadata,
+        identity,
+        identity_status,
+        service,
+        crate::control_policy::MobControlPrincipal::Unresolved,
+    )
+    .await
+    else {
+        panic!("an unresolved principal must not admit a destroy");
+    };
+    assert!(
+        matches!(error, MobError::ScopeDenied(_)),
+        "the refusal is the typed scope denial: {error}"
+    );
+    assert_eq!(destroy_admission_writes(&events, before).await, 0);
+}
+
+/// An authorized destroy admitted before start records `MobDestroying`
+/// before the actor runs; the caller then drives the destroy to its end.
+#[tokio::test]
+async fn test_destroy_admitted_before_start_is_driven_by_its_caller() {
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let definition = with_unique_mob_id(sample_definition(), "start-destroy-admitted");
+    let (handle, service, runs, specs, runtime_metadata, identity, identity_status) =
+        create_test_mob_with_recoverable_fault_events(definition, events.clone()).await;
+    handle.shutdown().await.expect("stop the first incarnation");
+    let before = events.replay_all().await.expect("replay events").len();
+
+    let (resumed, custody) = resume_admitting_destroy_before_start(
+        events.clone(),
+        runs,
+        specs,
+        runtime_metadata,
+        identity,
+        identity_status,
+        service,
+        crate::control_policy::MobControlPrincipal::Owner,
+    )
+    .await;
+    let resumed = resumed.expect("an authorized destroy is admitted before start");
+    assert!(
+        events
+            .replay_all()
+            .await
+            .expect("replay events")
+            .iter()
+            .skip(before)
+            .any(|event| matches!(event.kind, MobEventKind::MobDestroying)),
+        "the admission is durable before the actor runs"
+    );
+    resumed
+        .destroy()
+        .await
+        .expect("the caller drives the admitted destroy");
+    drop(custody);
+    assert_eq!(
+        resumed.status().await.expect("terminal status"),
+        MobState::Destroyed
+    );
+}
+
+/// The caller's custody of a destroy admitted before start holds the
+/// automatic retry idle; releasing it without driving the destroy hands the
+/// admitted cleanup to that retry. This proves the retry runs the destroy to
+/// its storage-finalizing marker (or log clear); it does not prove full
+/// terminal cleanup such as a host's file unlink.
+#[tokio::test]
+async fn test_released_start_admission_custody_hands_cleanup_to_the_retry() {
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let definition = with_unique_mob_id(sample_definition(), "start-destroy-custody");
+    let (handle, service, runs, specs, runtime_metadata, identity, identity_status) =
+        create_test_mob_with_recoverable_fault_events(definition, events.clone()).await;
+    handle.shutdown().await.expect("stop the first incarnation");
+    // A completed destroy reaches its storage-finalizing marker and then
+    // clears the mob's log; either shows the admitted cleanup ran.
+    let finalized = |events: Vec<MobEvent>| {
+        events
+            .iter()
+            .any(|event| matches!(event.kind, MobEventKind::MobDestroyStorageFinalizing))
+            || !events
+                .iter()
+                .any(|event| matches!(event.kind, MobEventKind::MobDestroying))
+    };
+
+    let (resumed, custody) = resume_admitting_destroy_before_start(
+        events.clone(),
+        runs,
+        specs,
+        runtime_metadata,
+        identity,
+        identity_status,
+        service,
+        crate::control_policy::MobControlPrincipal::Owner,
+    )
+    .await;
+    let _resumed = resumed.expect("an authorized destroy is admitted before start");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !finalized(events.replay_all().await.expect("replay events")),
+        "while the caller holds custody, no automatic destroy runs"
+    );
+
+    drop(custody);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !finalized(events.replay_all().await.expect("replay events")) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the released retry completes the admitted cleanup"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(feature = "runtime-adapter")]
+#[path = "registration_hook_tests.rs"]
+mod registration_hook_tests;

@@ -2183,6 +2183,72 @@ pub(super) mod stop_idle_wait_probe {
     }
 }
 
+/// Test-only hold of one member's retirement at one stage: the stage is
+/// dispatched (the member effect lane owns its ticket, with its fence and
+/// park sets) but its effect waits until the test releases it. Keyed by
+/// member identity, which each test keeps unique; a hold applies to the next
+/// dispatch of that stage only.
+#[cfg(test)]
+pub(super) mod retirement_stage_hold {
+    use crate::ids::AgentIdentity;
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    type Holds = Vec<(AgentIdentity, &'static str, Arc<RetirementStageHold>)>;
+
+    static HOLDS: Mutex<Holds> = Mutex::new(Vec::new());
+
+    pub(crate) struct RetirementStageHold {
+        entered: tokio::sync::watch::Sender<bool>,
+        released: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl RetirementStageHold {
+        /// Resolve once the held stage's effect has entered the hold.
+        pub(crate) async fn entered(&self) {
+            let mut entered = self.entered.subscribe();
+            let _closed = entered.wait_for(|entered| *entered).await;
+        }
+
+        /// Let the held stage's effect run.
+        pub(crate) fn release(&self) {
+            self.released.send_replace(true);
+        }
+
+        pub(super) async fn hold(&self) {
+            self.entered.send_replace(true);
+            let mut released = self.released.subscribe();
+            let _closed = released.wait_for(|released| *released).await;
+        }
+    }
+
+    /// Hold `identity`'s next dispatch of the retirement stage named `stage`
+    /// (its `RetirementStage` name) until the returned hold is released.
+    pub(crate) fn install(
+        identity: &AgentIdentity,
+        stage: &'static str,
+    ) -> Arc<RetirementStageHold> {
+        let hold = Arc::new(RetirementStageHold {
+            entered: tokio::sync::watch::channel(false).0,
+            released: tokio::sync::watch::channel(false).0,
+        });
+        HOLDS.lock().unwrap_or_else(PoisonError::into_inner).push((
+            identity.clone(),
+            stage,
+            Arc::clone(&hold),
+        ));
+        hold
+    }
+
+    /// Take the hold installed for this dispatch, if any.
+    pub(super) fn take(identity: &AgentIdentity, stage: &str) -> Option<Arc<RetirementStageHold>> {
+        let mut holds = HOLDS.lock().unwrap_or_else(PoisonError::into_inner);
+        let index = holds
+            .iter()
+            .position(|(held, held_stage, _)| held == identity && *held_stage == stage)?;
+        Some(holds.remove(index).2)
+    }
+}
+
 /// Typed flag set recording which physical wiring side(s) of a peer-only edge
 /// were successfully installed (local recipient, peer recipient, or both).
 ///
@@ -2262,6 +2328,15 @@ enum SubmitWorkDispatchCompletion {
         /// from the optional caller transcript identity.
         placed_input_id: Option<String>,
     },
+    /// A caller-bound governed input for a local session-backed member,
+    /// admitted by that member's lane after readiness, exactly as bound.
+    AwaitGovernedAdmission {
+        agent_identity: AgentIdentity,
+        readiness: Option<LocalTurnAdmissionReadiness>,
+        member_ref: MemberRef,
+        input: Box<super::state::GovernedInputDelivery>,
+        completion_tx: super::handle::ExactTurnCompletionSender,
+    },
     /// Local AutonomousHost delivery: readiness, the steer admission-barrier
     /// probe, and the runtime-admit-or-inbox-inject decision all run in the
     /// member's admission lane (#1102). Only the DSL admission stays inline.
@@ -2313,6 +2388,7 @@ impl SubmitWorkDispatchCompletion {
         match self {
             Self::Completed => "Completed",
             Self::AwaitTurnAdmission { .. } => "AwaitTurnAdmission",
+            Self::AwaitGovernedAdmission { .. } => "AwaitGovernedAdmission",
             Self::AwaitAutonomousDispatch { .. } => "AwaitAutonomousDispatch",
             Self::AwaitPolicySpawn { .. } => "AwaitPolicySpawn",
             Self::AwaitTurnCompletion { .. } => "AwaitTurnCompletion",
@@ -2375,6 +2451,13 @@ enum PendingTurnDispatch {
         placed_input_id: Option<String>,
     },
     Autonomous(Box<AutonomousDispatchMaterial>),
+    /// A caller-bound governed input, admitted to the member's session
+    /// exactly as bound.
+    Governed {
+        member_ref: MemberRef,
+        input: Box<super::state::GovernedInputDelivery>,
+        completion_tx: super::handle::ExactTurnCompletionSender,
+    },
     /// TurnCompleted-ack delivery (local tracked completion or placed
     /// completion with its actor-registered waiter). Routed through the same
     /// lane as IngressAccepted deliveries so a completion-bearing send cannot
@@ -3200,6 +3283,9 @@ impl Drop for ActorInlineStepWatchdog {
 }
 
 struct SubmitWorkDispatchRequest {
+    /// A caller-bound governed input realized in place of a turn built from
+    /// `content` (see `SubmitWorkPayload::governed_input`).
+    governed_input: Option<Box<super::state::GovernedInputDelivery>>,
     content: ContentInput,
     /// Optional ordinary System message authored for this exact work turn.
     system_prompt: Option<String>,
@@ -3211,7 +3297,7 @@ struct SubmitWorkDispatchRequest {
     /// into `RuntimeTurnMetadata.transcript_identity` on turn-driven
     /// dispatch and onto the injected inbox event on autonomous dispatch,
     /// so the committed transcript messages persist the id the host's live
-    /// interaction frames carry (mobkit ask-15 addendum).
+    /// interaction frames carry (meta ask-15 addendum).
     interaction_id: Option<meerkat_core::interaction::InteractionId>,
     objective_id: Option<meerkat_core::interaction::ObjectiveId>,
     handling_mode: meerkat_core::types::HandlingMode,
@@ -4794,6 +4880,16 @@ pub(super) struct BatchWireTrustRollback {
     comms: Arc<dyn CoreCommsRuntime>,
 }
 
+/// What a destroy admission hands its cleanup: the report so far, whether
+/// the destroy input is still needed, the roster it admitted against and the
+/// retire trust plans it proved.
+struct DestroyAdmission {
+    report: super::handle::MobDestroyReport,
+    destroy_input_needed: bool,
+    entries: Vec<crate::roster::RosterEntry>,
+    trust_cleanup_plan_by_member: BTreeMap<AgentIdentity, RetireTrustCleanupPlan>,
+}
+
 struct RetireTrustCleanupPlan {
     retiring_comms: Option<Arc<dyn CoreCommsRuntime>>,
     retiring_spec: Option<TrustedPeerDescriptor>,
@@ -5620,6 +5716,7 @@ impl DeferredResumeProvision {
             generated_self_owned_operation_owner,
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
             direct_member_incarnation,
+            held_bound: None,
         };
         let materialized_session_id = admit_bridge_session_for_spawn(&mut request.create_session);
         if materialized_session_id != resume_id {
@@ -6020,6 +6117,7 @@ enum SpawnEnqueueOrigin {
     Ordinary {
         source: super::handle::SpawnSource,
         identity_member_permit: Option<crate::identity::IdentityActuationPermit>,
+        held: Option<super::held_spawn::HeldSpawnRequest>,
     },
     Respawn {
         origin: Option<RespawnOrigin>,
@@ -7270,6 +7368,26 @@ pub(super) struct MobActor {
     /// A completed Shutdown waiting for its retained completions before it
     /// replies and the actor exits.
     pub(super) shutdown_exit: Option<PendingShutdownExit>,
+    /// The Closing admission state (D67), terminal for this actor: once set,
+    /// commands that would create members, start work or revive the mob are
+    /// refused typed. Teardown, cancellation and reads stay admitted.
+    pub(super) admission_closed: Option<MobAdmissionCloseReason>,
+    /// Sole writer of the handles' Closing admission projection.
+    pub(super) admission_closed_tx: tokio::sync::watch::Sender<Option<MobAdmissionCloseReason>>,
+    /// Owner presence and the Closing state shared with the handles: every
+    /// close is decided under its lock, so an owner acquired before the
+    /// decision keeps the mob open and one acquired after it is refused.
+    pub(super) ownership: Arc<super::admission_close::MobOwnership>,
+    /// Latched once the last owner dropped: the actor closes admission at
+    /// the first loop boundary where no owner is present and the mob is idle.
+    /// Cleared when an owner is present again; its release signals anew.
+    pub(super) public_owner_released: bool,
+    /// Commands that were already in the mailbox when the release was
+    /// observed: an owner's sends before its drop are among them. The latched
+    /// release is decided once these have been received, so a command an
+    /// owner sent first is served first, while commands enqueued later (for
+    /// example a non-owning observer's status reads) never postpone it.
+    pub(super) public_owner_release_backlog: usize,
     pub(super) next_spawn_ticket: u64,
     /// Monotonically increasing fence token counter.
     /// Each spawn/respawn/reset issues a strictly newer token.
@@ -11943,6 +12061,52 @@ impl MobActor {
             .map(|_| ())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    async fn rebind_member_session_for_test(
+        &mut self,
+        agent_identity: &AgentIdentity,
+        session_id: &SessionId,
+    ) -> Result<(), MobError> {
+        let dsl_identity = mob_dsl::AgentIdentity::from_domain(agent_identity);
+        let state = self.dsl_authority.state();
+        let agent_runtime_id = state
+            .identity_to_runtime
+            .get(&dsl_identity)
+            .cloned()
+            .ok_or_else(|| MobError::MemberNotFound(agent_identity.clone()))?;
+        let (runtime_id, _) = state
+            .member_runtime_material_for_identity(&dsl_identity)
+            .map(|material| material.to_domain_for_identity(agent_identity))
+            .ok_or_else(|| MobError::MemberNotFound(agent_identity.clone()))?;
+        let replacing = state.member_session_bindings.get(&dsl_identity).cloned();
+        // Like a production binding recovery, the move is durable history
+        // before it is authority, so it stays provable after a restart.
+        self.events
+            .append(NewMobEvent {
+                mob_id: self.definition.id.clone(),
+                timestamp: None,
+                kind: MobEventKind::MemberSessionBindingRecovered(
+                    crate::event::MemberSessionBindingRecoveredEvent::new(
+                        agent_identity.clone(),
+                        runtime_id,
+                        session_id.clone(),
+                    ),
+                ),
+            })
+            .await?;
+        self.apply_dsl_signal_collect_transition(
+            mob_dsl::MobMachineSignal::RecoverMemberSessionBinding {
+                agent_identity: dsl_identity,
+                agent_runtime_id,
+                bridge_session_id: mob_dsl::SessionId::from_domain(session_id),
+                replacing,
+            },
+            "rebind_member_session_for_test",
+        )?;
+        self.publish_machine_state_projection();
+        Ok(())
+    }
+
     fn apply_dsl_signal_collect_transition(
         &mut self,
         signal: mob_dsl::MobMachineSignal,
@@ -13839,6 +14003,11 @@ impl MobActor {
             member_admission_backlog: Arc::clone(&self.member_admission_backlog),
             lifecycle_observations: Arc::clone(&self.lifecycle_observations),
             per_spawn_external_tools: Arc::clone(&self.per_spawn_external_tools),
+            // Member tools are the actor's own clone: they never keep the mob
+            // open for its owners (D67).
+            public_owner: None,
+            ownership: Arc::clone(&self.ownership),
+            admission_closed_rx: self.admission_closed_tx.subscribe(),
         }
     }
 
@@ -15350,6 +15519,7 @@ impl MobActor {
         dsl_identity: &mob_dsl::AgentIdentity,
         dsl_runtime_id: &mob_dsl::AgentRuntimeId,
         dsl_fence_token: mob_dsl::FenceToken,
+        dsl_expected_session_id: Option<mob_dsl::SessionId>,
         runtime_id: &AgentRuntimeId,
         origin: WorkOrigin,
         agent_identity: &AgentIdentity,
@@ -15362,6 +15532,7 @@ impl MobActor {
                 agent_identity: dsl_identity.clone(),
                 agent_runtime_id: dsl_runtime_id.clone(),
                 fence_token: dsl_fence_token,
+                expected_session_id: dsl_expected_session_id.clone(),
                 origin: dsl_origin,
             },
         ) {
@@ -15414,6 +15585,25 @@ impl MobActor {
             Some((mob_dsl::SubmitWorkRejectReasonKind::NotExternallyAddressable, _, _)) => {
                 MobError::NotExternallyAddressable(agent_identity.clone())
             }
+            Some((mob_dsl::SubmitWorkRejectReasonKind::StaleSessionBinding, _, _)) => {
+                let parse = |session: &mob_dsl::SessionId| SessionId::parse(&session.0).ok();
+                let actual_session = authority
+                    .state()
+                    .member_session_bindings
+                    .get(dsl_identity)
+                    .and_then(parse);
+                match dsl_expected_session_id.as_ref().and_then(parse) {
+                    Some(expected_session) => MobError::StaleDeliveryScope {
+                        agent_identity: agent_identity.clone(),
+                        expected_session,
+                        actual_session,
+                    },
+                    None => MobError::Internal(
+                        "MobMachine rejected SubmitWork as a stale session binding without a valid expected session"
+                            .into(),
+                    ),
+                }
+            }
             None => MobError::Internal(
                 "MobMachine rejected SubmitWork without typed rejection feedback".into(),
             ),
@@ -15427,6 +15617,7 @@ impl MobActor {
         dsl_identity: &mob_dsl::AgentIdentity,
         dsl_runtime_id: &mob_dsl::AgentRuntimeId,
         dsl_fence_token: mob_dsl::FenceToken,
+        dsl_expected_session_id: Option<mob_dsl::SessionId>,
         runtime_id: &AgentRuntimeId,
         origin: WorkOrigin,
         agent_identity: &AgentIdentity,
@@ -15442,6 +15633,7 @@ impl MobActor {
             dsl_identity,
             dsl_runtime_id,
             dsl_fence_token,
+            dsl_expected_session_id,
             runtime_id,
             origin,
             agent_identity,
@@ -15670,6 +15862,7 @@ impl MobActor {
                 agent_identity: dsl_identity.clone(),
                 agent_runtime_id: dsl_runtime_id.clone(),
                 fence_token: dsl_fence_token,
+                expected_session_id: None,
                 work_id: mob_dsl::WorkId::from_work_ref(work_ref),
                 origin: mob_dsl::WorkOrigin::from(origin),
                 content_attribution: mob_dsl::WorkContentAttribution::Conversational,
@@ -15682,6 +15875,7 @@ impl MobActor {
                 &dsl_identity,
                 &dsl_runtime_id,
                 dsl_fence_token,
+                None,
                 &domain_runtime_id,
                 origin,
                 agent_identity,
@@ -16169,11 +16363,16 @@ impl MobActor {
             let identity = mob_dsl::AgentIdentity::from_domain(&payload.runtime_id.identity);
             let runtime = mob_dsl::AgentRuntimeId::from_domain(&payload.runtime_id);
             let fence = mob_dsl::FenceToken::from_domain(payload.fence_token);
+            let expected_session = payload
+                .expected_session_id
+                .as_ref()
+                .map(mob_dsl::SessionId::from_domain);
             if let Err(error) = self.probe_command_admission(
                 mob_dsl::MobMachineInput::SubmitWork {
                     agent_identity: identity.clone(),
                     agent_runtime_id: runtime.clone(),
                     fence_token: fence,
+                    expected_session_id: expected_session.clone(),
                     work_id: mob_dsl::WorkId::from_work_ref(&payload.work_ref),
                     origin: mob_dsl::WorkOrigin::from(payload.origin),
                     content_attribution: payload.content_attribution,
@@ -16190,6 +16389,7 @@ impl MobActor {
                     &identity,
                     &runtime,
                     fence,
+                    expected_session.clone(),
                     &payload.runtime_id,
                     payload.origin,
                     &payload.runtime_id.identity,
@@ -16696,6 +16896,7 @@ impl MobActor {
         if let Some(readiness) = readiness {
             let member_ref = match &dispatch {
                 PendingTurnDispatch::Admission { member_ref, .. }
+                | PendingTurnDispatch::Governed { member_ref, .. }
                 | PendingTurnDispatch::Completion { member_ref, .. } => member_ref,
                 PendingTurnDispatch::Autonomous(material) => &material.member_ref,
             };
@@ -16713,6 +16914,12 @@ impl MobActor {
                 return;
             }
         }
+        #[cfg(any(test, feature = "test-support"))]
+        super::handle::run_member_turn_admission_test_gate(
+            &agent_identity,
+            super::handle::MemberTurnAdmissionTestStage::BeforeRuntimeAdmission,
+        )
+        .await;
         match dispatch {
             PendingTurnDispatch::Admission {
                 member_ref,
@@ -16734,12 +16941,50 @@ impl MobActor {
                     placed_input_id,
                 )
                 .await;
+                #[cfg(any(test, feature = "test-support"))]
+                super::handle::run_member_turn_admission_test_gate(
+                    &agent_identity,
+                    super::handle::MemberTurnAdmissionTestStage::AfterRuntimeAdmission,
+                )
+                .await;
                 let _ = reply_tx.send(result);
             }
             PendingTurnDispatch::Autonomous(material) => {
                 let result = context
                     .dispatch_autonomous(&agent_identity, *material)
                     .await;
+                let _ = reply_tx.send(result);
+            }
+            PendingTurnDispatch::Governed {
+                member_ref,
+                input,
+                completion_tx,
+            } => {
+                // The canonical admission reaches the caller before the
+                // lane answers.
+                #[cfg(feature = "runtime-adapter")]
+                let result = {
+                    let super::state::GovernedInputDelivery {
+                        input,
+                        admission_tx,
+                        custody,
+                    } = *input;
+                    context
+                        .provisioner
+                        .admit_governed_input(&member_ref, input, completion_tx, custody)
+                        .await
+                        .map(|admission| {
+                            let _ = admission_tx.send(admission);
+                        })
+                };
+                #[cfg(not(feature = "runtime-adapter"))]
+                let result = {
+                    let _ = (member_ref, input, completion_tx);
+                    Err(MobError::UnsupportedForMode {
+                        mode: crate::MobRuntimeMode::TurnDriven,
+                        reason: "governed input requires the runtime adapter".to_string(),
+                    })
+                };
                 let _ = reply_tx.send(result);
             }
             PendingTurnDispatch::Completion {
@@ -17985,6 +18230,209 @@ impl MobActor {
 
     /// Whether a Shutdown has started and is parked (on its members' stops
     /// or on its runtime teardown) rather than finished.
+    /// What keeps the mob from being idle (D67), read on the serialized
+    /// admission path: roster transitions and lifecycle operations in
+    /// progress, flow runs and admitted member work, and work parked or
+    /// deferred ahead of admission.
+    fn admission_busy(&self, deferred_commands: &VecDeque<RoutedMobCommand>) -> MobBusy {
+        let state = self.dsl_authority.state();
+        let roster_transitions = usize::try_from(state.pending_spawn_count)
+            .unwrap_or(usize::MAX)
+            .saturating_add(usize::from(!self.pending_spawns.is_empty()))
+            .saturating_add(self.spawn_preparations.len())
+            .saturating_add(self.pending_spawn_activations.len())
+            .saturating_add(self.retirements.len())
+            .saturating_add(usize::from(self.retirement_batch.is_some()))
+            .saturating_add(state.pending_respawn_topology.len())
+            .saturating_add(state.member_revival_pending.len())
+            .saturating_add(state.member_kickoff_pending.len())
+            .saturating_add(state.member_kickoff_starting.len())
+            .saturating_add(usize::from(state.explicit_resume_attempt.is_some()))
+            .saturating_add(usize::from(self.pending_resume_lifecycle.is_some()))
+            .saturating_add(usize::from(self.pending_resume_rollback.is_some()))
+            .saturating_add(usize::from(self.pending_autonomous_stop.is_some()))
+            .saturating_add(usize::from(self.pending_shutdown_teardown.is_some()))
+            .saturating_add(usize::from(self.shutdown_exit.is_some()))
+            .saturating_add(self.identity_reconcile_queue.len());
+        let member_work = state
+            .member_in_flight_work
+            .values()
+            .fold(0_u64, |total, work| total.saturating_add(*work));
+        let runs = self
+            .run_tasks
+            .len()
+            .saturating_add(usize::try_from(member_work).unwrap_or(usize::MAX))
+            .saturating_add(self.peer_delivery_tasks.len())
+            .saturating_add(self.member_effect_tasks.len())
+            .saturating_add(self.member_live_mutation_tasks.len())
+            .saturating_add(self.wiring_io_tasks.len())
+            .saturating_add(self.wiring_io_queued.len())
+            .saturating_add(self.lifecycle_tasks.len());
+        let parked_admission = self
+            .member_admission_lanes
+            .values()
+            .map(|lane| usize::from(lane.inflight.is_some()).saturating_add(lane.parked.len()))
+            .fold(0_usize, usize::saturating_add)
+            .saturating_add(
+                self.policy_spawn_waiters
+                    .values()
+                    .map(Vec::len)
+                    .sum::<usize>(),
+            )
+            .saturating_add(deferred_commands.len())
+            .saturating_add(self.pending_resume_controls.len())
+            .saturating_add(self.pending_autonomous_stop_controls.len())
+            .saturating_add(self.retained_actor_completions.len());
+        MobBusy {
+            roster_transitions,
+            runs,
+            parked_admission,
+            foreground_owners: 0,
+        }
+    }
+
+    /// Member sessions whose native runtime holds accepted work that has not
+    /// reached a terminal: queued, held at its start, or running.
+    async fn native_accepted_work(&self) -> usize {
+        #[cfg(feature = "runtime-adapter")]
+        if let Some(runtime) = self.runtime_adapter.as_ref() {
+            let sessions: Vec<SessionId> = self
+                .roster
+                .read()
+                .await
+                .list()
+                .filter_map(|entry| entry.bridge_session_id().cloned())
+                .collect();
+            let mut busy_sessions = 0_usize;
+            for session_id in &sessions {
+                if runtime.session_has_active_inputs(session_id).await {
+                    busy_sessions = busy_sessions.saturating_add(1);
+                }
+            }
+            return busy_sessions;
+        }
+        0
+    }
+
+    /// Decide one close on the serialized admission path. Mob-admitted work
+    /// only enters through this actor, so nothing is admitted between the
+    /// native observation and the decision; owner acquisition and the close
+    /// are decided under the ownership lock.
+    async fn decide_admission_close(
+        &mut self,
+        request: super::admission_close::CloseRequest,
+        deferred_commands: &VecDeque<RoutedMobCommand>,
+    ) -> super::admission_close::CloseDecision {
+        let mut busy = self.admission_busy(deferred_commands);
+        if busy.is_idle() {
+            busy.runs = self.native_accepted_work().await;
+        }
+        let ownership = Arc::clone(&self.ownership);
+        let decision = ownership.decide(request, || busy);
+        if let super::admission_close::CloseDecision::Closed { reason, .. } = decision {
+            self.enter_admission_closed(reason);
+        }
+        decision
+    }
+
+    /// Close admission if the mob is idle and no foreground owner holds a
+    /// lease: the idle decision and the close are one step on the serialized
+    /// admission path, so a command is either admitted first (the mob is
+    /// busy) or refused after (Closing).
+    async fn close_admission_if_idle(
+        &mut self,
+        deferred_commands: &VecDeque<RoutedMobCommand>,
+    ) -> CloseIfIdleOutcome {
+        use super::admission_close::{CloseDecision, CloseRequest};
+        match self
+            .decide_admission_close(CloseRequest::IfIdle, deferred_commands)
+            .await
+        {
+            CloseDecision::Closed { .. } => CloseIfIdleOutcome::Closed,
+            CloseDecision::AlreadyClosed { reason, .. } => {
+                CloseIfIdleOutcome::AlreadyClosed(reason)
+            }
+            CloseDecision::Busy(busy) => CloseIfIdleOutcome::Busy(busy),
+            // Only a last-owner release can find an owner present.
+            CloseDecision::OwnerPresent => CloseIfIdleOutcome::Busy(MobBusy::default()),
+        }
+    }
+
+    /// Close admission unconditionally into the same Closing state, keeping
+    /// the first reason. Answers what was still in flight.
+    async fn close_admission(
+        &mut self,
+        reason: MobAdmissionCloseReason,
+        deferred_commands: &VecDeque<RoutedMobCommand>,
+    ) -> Option<MobBusy> {
+        use super::admission_close::{CloseDecision, CloseRequest};
+        match self
+            .decide_admission_close(CloseRequest::Unconditional(reason), deferred_commands)
+            .await
+        {
+            CloseDecision::Closed { busy, .. } | CloseDecision::AlreadyClosed { busy, .. } => {
+                (!busy.is_idle()).then_some(busy)
+            }
+            CloseDecision::Busy(busy) => Some(busy),
+            CloseDecision::OwnerPresent => None,
+        }
+    }
+
+    /// The latched last-owner release: close once no owner is present and
+    /// the mob is idle. An owner present again clears the latch; its own
+    /// release signals anew.
+    async fn close_admission_after_owner_release(
+        &mut self,
+        deferred_commands: &VecDeque<RoutedMobCommand>,
+    ) {
+        use super::admission_close::{CloseDecision, CloseRequest};
+        match self
+            .decide_admission_close(CloseRequest::LastOwnerReleased, deferred_commands)
+            .await
+        {
+            CloseDecision::OwnerPresent => self.public_owner_released = false,
+            CloseDecision::Closed { .. }
+            | CloseDecision::AlreadyClosed { .. }
+            | CloseDecision::Busy(_) => {}
+        }
+    }
+
+    /// Account one physical receive from the command mailbox against the
+    /// backlog counted at the last-owner release. Every receive site calls
+    /// this exactly once per command it takes off the mailbox; a deferred or
+    /// retained command replayed later is not received again.
+    fn note_command_received(&mut self) {
+        self.public_owner_release_backlog = self.public_owner_release_backlog.saturating_sub(1);
+    }
+
+    /// Whether this command re-enters admission from a member admission lane
+    /// slot it already holds: the lane admitted it, in FIFO order, before any
+    /// close. Its revival is not fresh admission.
+    fn is_member_lane_revival(&self, cmd: &MobCommand) -> bool {
+        let MobCommand::SubmitWork { payload, .. } = cmd else {
+            return false;
+        };
+        self.member_admission_lanes
+            .get(&payload.runtime_id.identity)
+            .is_some_and(|lane| {
+                matches!(
+                    &lane.inflight,
+                    Some(MemberAdmissionInFlight::SubmitWorkDispatching { work_ref, .. })
+                        if *work_ref == payload.work_ref
+                )
+            })
+    }
+
+    fn enter_admission_closed(&mut self, reason: MobAdmissionCloseReason) {
+        self.admission_closed = Some(reason);
+        self.admission_closed_tx.send_replace(Some(reason));
+        tracing::info!(
+            mob_id = %self.definition.id,
+            %reason,
+            "mob admission closed"
+        );
+    }
+
     fn shutdown_in_progress(&self) -> bool {
         self.pending_shutdown_teardown.is_some()
             || self
@@ -18368,9 +18816,13 @@ impl MobActor {
     ) -> ActorLoopControl {
         if result.is_ok() {
             let mut retained = std::mem::take(&mut self.retained_actor_completions);
+            let mut received = 0;
             let tail = Box::pin(self.shutdown_actor_owned_background_work());
-            Self::serve_refusals_while(command_rx, &mut joined, &mut retained, tail).await;
+            Self::serve_refusals_while(command_rx, &mut joined, &mut retained, &mut received, tail)
+                .await;
             self.retained_actor_completions = retained;
+            self.public_owner_release_backlog =
+                self.public_owner_release_backlog.saturating_sub(received);
             // The hold was realized before the member interrupts; the
             // committed transition must still carry it.
             let applied = self
@@ -22017,6 +22469,7 @@ impl MobActor {
         command_rx: &mut mpsc::Receiver<RoutedMobCommand>,
         joined: &mut Vec<LifecycleReplyTx>,
         retained: &mut VecDeque<RoutedMobCommand>,
+        received: &mut usize,
         work: F,
     ) -> F::Output
     where
@@ -22031,12 +22484,16 @@ impl MobActor {
                     // Answer what is already queued too, so a completion sent
                     // before the step ended is retained, not left behind.
                     while let Ok(routed) = command_rx.try_recv() {
+                        *received = received.saturating_add(1);
                         Self::answer_while_shutting_down(routed, joined, retained);
                     }
                     return output;
                 }
                 routed = command_rx.recv(), if channel_open => match routed {
-                    Some(routed) => Self::answer_while_shutting_down(routed, joined, retained),
+                    Some(routed) => {
+                        *received = received.saturating_add(1);
+                        Self::answer_while_shutting_down(routed, joined, retained);
+                    }
                     None => channel_open = false,
                 },
             }
@@ -24453,6 +24910,30 @@ impl MobActor {
         )
         .await;
 
+        // The Closing admission state (D67) fences fresh realization at its
+        // existing owner: no session, registration or member is created for a
+        // closed mob. Admission closing, drain, cancellation, retirement and
+        // release keep converging.
+        if self.admission_closed.is_some()
+            && matches!(
+                decision,
+                IdentityReconcileDecision::EnsureSessionAuthority
+                    | IdentityReconcileDecision::EnsureRuntimeRegistration
+                    | IdentityReconcileDecision::EnsureExternalBindingReceipt
+                    | IdentityReconcileDecision::EnsureExternalBinding
+                    | IdentityReconcileDecision::EnsureMemberMaterialization
+                    | IdentityReconcileDecision::EnsureInitialDeliveryReceipt
+                    | IdentityReconcileDecision::EnsureInitialDelivery
+            )
+        {
+            tracing::debug!(
+                mob_id = %self.definition.id,
+                identity = %identity,
+                ?decision,
+                "identity actuation fenced: mob admission is closed"
+            );
+            return Ok(IdentityReconcilePassDisposition::Outcome(false));
+        }
         let action: Result<bool, MobError> = async {
             match decision {
                 IdentityReconcileDecision::CloseMemberAdmission => {
@@ -24900,6 +25381,7 @@ impl MobActor {
                     spawn_source,
                     owner_bridge_session_id,
                     ops_registry,
+                    held,
                     reply_tx,
                 } => {
                     tracing::debug!(
@@ -24908,14 +25390,19 @@ impl MobActor {
                         owner_bound = owner_bridge_session_id.is_some(),
                         "MobActor received Spawn command"
                     );
-                    Box::pin(self.enqueue_spawn(
-                        *spec,
-                        spawn_source,
-                        None,
-                        owner_bridge_session_id,
-                        ops_registry,
-                        reply_tx,
-                    ))
+                    Box::pin(boxed_arm_future(|| {
+                        self.enqueue_spawn_with_origin(
+                            *spec,
+                            SpawnEnqueueOrigin::Ordinary {
+                                source: spawn_source,
+                                identity_member_permit: None,
+                                held,
+                            },
+                            owner_bridge_session_id,
+                            ops_registry,
+                            reply_tx,
+                        )
+                    }))
                     .await;
                 }
                 MobCommand::SpawnProvisioned {
@@ -24932,10 +25419,14 @@ impl MobActor {
                                         result,
                                     },
                                 ..
-                            }) => completions.push((spawn_ticket, result)),
+                            }) => {
+                                self.note_command_received();
+                                completions.push((spawn_ticket, result));
+                            }
                             // Deferred commands keep their routing authority
                             // and re-enter the scope gate when popped.
                             Ok(other) => {
+                                self.note_command_received();
                                 deferred_commands.push_back(other);
                                 break;
                             }
@@ -25582,6 +26073,28 @@ impl MobActor {
                                             placed_identity,
                                             placed_incarnation,
                                             placed_input_id,
+                                        },
+                                    }),
+                                    reply_tx,
+                                );
+                            }
+                        }
+                        Ok(SubmitWorkDispatchCompletion::AwaitGovernedAdmission {
+                            agent_identity,
+                            readiness,
+                            member_ref,
+                            input,
+                            completion_tx,
+                        }) => {
+                            if !self.respawn_topology_reply_withheld {
+                                self.enqueue_member_turn_admission(
+                                    Box::new(PendingMemberTurnAdmission {
+                                        agent_identity,
+                                        readiness,
+                                        dispatch: PendingTurnDispatch::Governed {
+                                            member_ref,
+                                            input,
+                                            completion_tx,
                                         },
                                     }),
                                     reply_tx,
@@ -27612,6 +28125,14 @@ impl MobActor {
                 MobCommand::QueryPhase { reply_tx } => {
                     let _ = reply_tx.send(Ok(self.state()));
                 }
+                MobCommand::CloseIfIdle { reply_tx } => {
+                    let outcome = self.close_admission_if_idle(deferred_commands).await;
+                    let _ = reply_tx.send(Ok(outcome));
+                }
+                MobCommand::CloseAdmission { reason, reply_tx } => {
+                    let busy = self.close_admission(reason, deferred_commands).await;
+                    let _ = reply_tx.send(Ok(busy));
+                }
                 @control
                 MobCommand::SetSpawnPolicy { reply_tx, .. } => {
                     // The outer AST-visible catalog gate owns this variant.
@@ -27647,6 +28168,18 @@ impl MobActor {
                         self.resolve_autonomous_member_stops(ticket, outcomes, command_rx),
                     )
                     .await;
+                }
+                #[cfg(any(test, feature = "test-support"))]
+                MobCommand::RebindMemberSessionForTest {
+                    agent_identity,
+                    session_id,
+                    reply_tx,
+                } => {
+                    let result = self
+                        .rebind_member_session_for_test(&agent_identity, &session_id)
+                        .await;
+                    let _ = reply_tx.send(result);
+                    ActorLoopControl::ProceedBoundary
                 }
                 MobCommand::ShutdownTeardownResolved { ticket, outcomes } => {
                     self.inline_step_watchdog.set_step("shutdown_teardown_resolved");
@@ -27690,10 +28223,12 @@ impl MobActor {
                     // actor keeps answering while it drains.
                     let mut joined = Vec::new();
                     let mut retained = std::mem::take(&mut self.retained_actor_completions);
+                    let mut received = 0;
                     let drained = Self::serve_refusals_while(
                         command_rx,
                         &mut joined,
                         &mut retained,
+                        &mut received,
                         Box::pin(async {
                             self.drain_wiring_io_for_lifecycle().await;
                             self.drain_member_effects_for_lifecycle().await?;
@@ -27702,6 +28237,8 @@ impl MobActor {
                     )
                     .await;
                     self.retained_actor_completions = retained;
+                    self.public_owner_release_backlog =
+                        self.public_owner_release_backlog.saturating_sub(received);
                     let reply_tx = LifecycleReplyTx::Unit(reply_tx);
                     if let Err(error) = drained {
                         send_lifecycle_result(reply_tx, joined, Err(error), &self.current_stop_report());
@@ -27884,6 +28421,7 @@ impl MobActor {
             IdentityReconcile,
             IdentityBackoffDeadline,
             IdentitySafetyScan,
+            PublicOwnerReleased,
         }
 
         let actor_io_pending = !self.actor_io_tasks.is_empty();
@@ -27901,9 +28439,16 @@ impl MobActor {
             .iter()
             .position(|routed| !self.resume_member_control_is_pending(&routed.cmd));
         let deferred_command_pending = ready_deferred.is_some();
+        // The last owner's release is signalled with a stored permit, so it
+        // is observed even when it happened while the actor was busy.
+        let public_owner_pending = self.admission_closed.is_none() && !self.public_owner_released;
+        let ownership = Arc::clone(&self.ownership);
         let regular_wake = async {
             tokio::select! {
                 routed = command_rx.recv() => RegularActorWake::Routed(routed),
+                _released = ownership.released().notified(), if public_owner_pending => {
+                    RegularActorWake::PublicOwnerReleased
+                }
                 _tick = host_status_poll.tick() => RegularActorWake::HostStatusPoll,
                 _ready = std::future::ready(()), if identity_reconcile_pending => {
                     RegularActorWake::IdentityReconcile
@@ -27999,7 +28544,10 @@ impl MobActor {
             }
             wake = regular_wake => {
                 match wake {
-                    RegularActorWake::Routed(Some(routed)) => routed,
+                    RegularActorWake::Routed(Some(routed)) => {
+                        self.note_command_received();
+                        routed
+                    }
                     RegularActorWake::Routed(None) => {
                         return ActorLoopWakeSelection::BreakActor;
                     }
@@ -28020,6 +28568,11 @@ impl MobActor {
                     }
                     RegularActorWake::IdentitySafetyScan => {
                         boxed_arm_future(|| self.enqueue_next_identity_intent_safety_page()).await;
+                        return ActorLoopWakeSelection::Continue;
+                    }
+                    RegularActorWake::PublicOwnerReleased => {
+                        self.public_owner_released = true;
+                        self.public_owner_release_backlog = command_rx.len();
                         return ActorLoopWakeSelection::Continue;
                     }
                 }
@@ -28200,6 +28753,21 @@ impl MobActor {
                 }
                 break;
             }
+            // The last public owner is gone: close admission at the first
+            // boundary where the mob is idle. Admitted work is never stopped;
+            // until it drains the mob stays busy and admission stays open.
+            // A command an owner sent before dropping its handle is already
+            // in the mailbox when the release is observed, so those commands
+            // are served first: the release is decided once the backlog
+            // counted at the release has been received. Later traffic does
+            // not extend it.
+            if self.public_owner_released
+                && self.admission_closed.is_none()
+                && self.public_owner_release_backlog == 0
+            {
+                boxed_arm_future(|| self.close_admission_after_owner_release(&deferred_commands))
+                    .await;
+            }
             let routed = match boxed_arm_future(|| {
                 self.wait_for_actor_wake(
                     &mut command_rx,
@@ -28234,6 +28802,18 @@ impl MobActor {
                 );
                 control
             } else {
+                // The Closing admission state (D67) refuses new members, new
+                // work and lifecycle revival before any deferral or handler.
+                if let Some(reason) = self.admission_closed
+                    && cmd.refused_while_admission_closed()
+                    && !self.is_member_lane_revival(&cmd)
+                {
+                    cmd.reject_with_error(MobError::AdmissionClosed {
+                        mob_id: self.definition.id.clone(),
+                        reason,
+                    });
+                    continue;
+                }
                 if self.resume_member_control_is_pending(&cmd) {
                     self.interrupt_owned_retirements_for_deferred_shutdown(&cmd);
                     let identity = Self::resume_member_control_target(&cmd).cloned();
@@ -28250,6 +28830,10 @@ impl MobActor {
                                 depth,
                             });
                         } else {
+                            #[cfg(test)]
+                            self.lifecycle_observations
+                                .parked_member_controls
+                                .send_modify(|parked| *parked.entry(identity).or_default() += 1);
                             deferred_commands.push_back(RoutedMobCommand { authority, cmd });
                         }
                     } else if cmd.required_control_scope().is_some()
@@ -29636,6 +30220,7 @@ impl MobActor {
                 SpawnEnqueueOrigin::Ordinary {
                     source: spawn_source,
                     identity_member_permit,
+                    held: None,
                 },
                 owner_bridge_session_id,
                 ops_registry,
@@ -29653,12 +30238,13 @@ impl MobActor {
         ops_registry: Option<Arc<dyn meerkat_core::ops_lifecycle::OpsLifecycleRegistry>>,
         reply_tx: oneshot::Sender<Result<super::handle::MemberSpawnReceipt, MobError>>,
     ) {
-        let (spawn_source, identity_member_permit, respawn_origin, restore_wiring) =
+        let (spawn_source, identity_member_permit, respawn_origin, restore_wiring, held) =
             match enqueue_origin {
                 SpawnEnqueueOrigin::Ordinary {
                     source,
                     identity_member_permit,
-                } => (source, identity_member_permit, None, None),
+                    held,
+                } => (source, identity_member_permit, None, None, held),
                 SpawnEnqueueOrigin::Respawn {
                     origin,
                     restore_wiring,
@@ -29667,6 +30253,7 @@ impl MobActor {
                     None,
                     origin,
                     restore_wiring,
+                    None,
                 ),
             };
         self.inline_step_watchdog
@@ -29801,6 +30388,20 @@ impl MobActor {
                      build source",
                     spawn_source.as_str()
                 ))
+            );
+        }
+        // A held spawn stops at the local provisioner's hold point: placed,
+        // resumed and identity-reconciled members never reach it.
+        if held.is_some()
+            && (spec.placement.is_some()
+                || spec.launch_mode.resume_bridge_session_id().is_some()
+                || identity_member_permit.is_some())
+        {
+            reject_spawn_before_custody!(
+                "held_spawn_mode",
+                MobError::HeldSpawnUnsupported {
+                    reason: "only a fresh locally provisioned member can be held".to_string(),
+                }
             );
         }
         // Multi-host §7.3: a placed spawn takes the remote materialization
@@ -30071,6 +30672,15 @@ impl MobActor {
         let precomputed_bundle_tools =
             super::tools::resolve_profile_bundle_tools(&profile, &self.tool_bundles);
         let fallback_prompt = self.fallback_spawn_prompt(&profile_name, &agent_identity);
+        // A held setup whose bound ended while this command waited for the
+        // actor, or during the inline preparation above, stops before any
+        // spawn effect exists.
+        if let Some(error) = held
+            .as_ref()
+            .and_then(|held| held.bound.ended_failure())
+        {
+            reject_spawn_before_custody!("held_setup_bound", error);
+        }
         let preparation_context = spawn_preparation::LocalSpawnPreparationContext::from_actor(self);
         let preparation_identity = agent_identity.clone();
         let carry = spawn_preparation::SpawnPreparationCarry {
@@ -30088,6 +30698,7 @@ impl MobActor {
             fork_overlay,
             owner_bridge_session_id: owner_bridge_session_id.clone(),
             ops_registry: ops_registry.clone(),
+            held,
         };
         let preparation = spawn_preparation::typed_preparation(async move {
             // ---------- Resume bridge-session fast-path ----------
@@ -30398,6 +31009,7 @@ impl MobActor {
                         runtime_revival_intent:
                             super::provisioner::RuntimeRevivalIntent::None,
                         direct_member_incarnation: None,
+                        held_bound: None,
                     };
                     let resolved_labels = labels.unwrap_or_default();
                     return Ok((
@@ -30533,6 +31145,7 @@ impl MobActor {
                 generated_self_owned_operation_owner: None,
                 runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
                 direct_member_incarnation: None,
+                held_bound: None,
             };
             let resolved_labels = labels.unwrap_or_default();
             Ok((
@@ -30586,6 +31199,7 @@ impl MobActor {
             fork_overlay,
             owner_bridge_session_id,
             ops_registry,
+            held,
         } = carry;
         macro_rules! reject_spawn_before_custody {
             ($stage:literal, $error:expr) => {{
@@ -30656,6 +31270,11 @@ impl MobActor {
                 reject_spawn_before_custody!("prepare", error);
             }
         };
+        // A held setup whose bound ended while the preparation ran off the
+        // loop stops here, before the ladder below takes any effect.
+        if let Some(error) = held.as_ref().and_then(|held| held.bound.ended_failure()) {
+            reject_spawn_before_custody!("held_setup_bound", error);
+        }
         self.inline_step_watchdog
             .set_spawn_stage(SpawnInlineStage::PreparedAdmission);
         // Actor state may have moved while the preparation ran: the mob may
@@ -31069,6 +31688,23 @@ impl MobActor {
                         // Deferred-resume request preparation (resume verdict,
                         // config build) shares the spawn-preparation bound so a
                         // cold-boot burst cannot run unbounded durable reads.
+                        // A held setup waits for that permit only within its
+                        // bound: the wait owns nothing, and a typed failure
+                        // here is unwound by the staged spawn's ordinary
+                        // failure path.
+                        #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+                        let preparation_permit = match held.as_ref() {
+                            Some(held) => held
+                                .bound
+                                .within(spawn_preparation_permits.acquire_owned())
+                                .await?
+                                .ok(),
+                            None => spawn_preparation_permits.acquire_owned().await.ok(),
+                        };
+                        #[cfg(not(all(
+                            feature = "runtime-adapter",
+                            not(target_arch = "wasm32")
+                        )))]
                         let preparation_permit =
                             spawn_preparation_permits.acquire_owned().await.ok();
                         let provision_request = meerkat_runtime::stack_relief::box_in_own_frame(
@@ -31076,10 +31712,36 @@ impl MobActor {
                         )
                         .await?;
                         drop(preparation_permit);
-                        let spawn_receipt = meerkat_runtime::stack_relief::box_in_own_frame(
-                            || provisioner.provision_member(provision_request),
-                        )
-                        .await?;
+                        let spawn_receipt = match held {
+                            #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+                            Some(held) => {
+                                meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                                    super::held_spawn::provision_held(
+                                        &provisioner,
+                                        provision_request,
+                                        held,
+                                        spawn_member_identity.as_str(),
+                                    )
+                                })
+                                .await?
+                            }
+                            #[cfg(not(all(
+                                feature = "runtime-adapter",
+                                not(target_arch = "wasm32")
+                            )))]
+                            Some(_) => {
+                                return Err(MobError::HeldSpawnUnsupported {
+                                    reason: "held spawns require the native runtime-adapter build"
+                                        .to_string(),
+                                });
+                            }
+                            None => {
+                                meerkat_runtime::stack_relief::box_in_own_frame(|| {
+                                    provisioner.provision_member(provision_request)
+                                })
+                                .await?
+                            }
+                        };
                         if let Some(bridge_session_id) =
                             spawn_receipt.member_ref.bridge_session_id().cloned()
                         {
@@ -33549,6 +34211,7 @@ impl MobActor {
             generated_self_owned_operation_owner: None,
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
             direct_member_incarnation: None,
+            held_bound: None,
         };
         let admitted_bridge_session_id =
             admit_bridge_session_for_spawn(&mut provision_request.create_session);
@@ -47273,6 +47936,52 @@ impl MobActor {
     async fn handle_destroy(
         &mut self,
     ) -> Result<super::handle::MobDestroyReport, super::handle::MobDestroyError> {
+        self.destroy_preflight_and_quiesce().await?;
+        let was_active = self.destroy_cleanup_active;
+        self.destroy_cleanup_active = true;
+        let result = self.handle_destroy_inner().await;
+        self.destroy_cleanup_active = was_active;
+        result
+    }
+
+    /// Admit this mob's destroy before the actor starts any work, for a host
+    /// that restores a mob only to tear it down. Runs the same path a
+    /// `Destroy` command runs up to and including its durable
+    /// `MobDestroying` marker: chokepoint (a) for `authority`, the destroy
+    /// preflight and quiesce, then the destroy admission. A refusal admits no
+    /// fresh destroy; one before the quiesce makes no destroy write of its
+    /// own. After `Ok` the mob starts as the recovery of an admitted destroy.
+    pub(super) async fn admit_destroy_before_start(
+        &mut self,
+        authority: &crate::control_policy::CommandAuthority,
+    ) -> Result<(), super::handle::MobDestroyError> {
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        if let ScopeAdmission::Denied =
+            self.admit_command_scope(authority, MobCommand::Destroy { reply_tx })
+        {
+            return Err(match reply_rx.try_recv() {
+                Ok(Err(error)) => error,
+                _ => super::handle::MobDestroyError::from(MobError::Internal(
+                    "destroy admission before start was denied without a typed reason".to_string(),
+                )),
+            });
+        }
+        if self.destroy_admitted() {
+            return Ok(());
+        }
+        self.destroy_preflight_and_quiesce().await?;
+        let was_active = self.destroy_cleanup_active;
+        self.destroy_cleanup_active = true;
+        let result = boxed_arm_future(|| self.admit_destroy_cleanup())
+            .await
+            .map(|_| ());
+        self.destroy_cleanup_active = was_active;
+        result
+    }
+
+    async fn destroy_preflight_and_quiesce(
+        &mut self,
+    ) -> Result<(), super::handle::MobDestroyError> {
         // A fresh Destroy must not publish its durable work-origin latch until
         // every fallible, proved-nonmutating shell preflight has succeeded.
         // Admitted/recovered Destroy retries repeat the checks in
@@ -47301,16 +48010,17 @@ impl MobActor {
             .await
             .map_err(super::handle::MobDestroyError::from)?;
         }
-        let was_active = self.destroy_cleanup_active;
-        self.destroy_cleanup_active = true;
-        let result = self.handle_destroy_inner().await;
-        self.destroy_cleanup_active = was_active;
-        result
+        Ok(())
     }
 
-    async fn handle_destroy_inner(
+    /// The admission half of a destroy, shared by a `Destroy` command and a
+    /// destroy admitted before start: bind and authority anchors, spawn and
+    /// flow alignment, retire trust plans, then the durable `MobDestroying`
+    /// marker. A retry of an admitted destroy repeats the checks against its
+    /// recovery-owned anchors and appends nothing new.
+    async fn admit_destroy_cleanup(
         &mut self,
-    ) -> Result<super::handle::MobDestroyReport, super::handle::MobDestroyError> {
+    ) -> Result<DestroyAdmission, super::handle::MobDestroyError> {
         use super::handle::{MobDestroyError, MobDestroyReport};
 
         // Construct nested futures in their own frames: the debug coordinator
@@ -47415,6 +48125,25 @@ impl MobActor {
             report.push_error(format!("destroy marker append failed: {error}"));
             return Err(MobDestroyError::Incomplete { report });
         }
+        Ok(DestroyAdmission {
+            report,
+            destroy_input_needed,
+            entries,
+            trust_cleanup_plan_by_member,
+        })
+    }
+
+    async fn handle_destroy_inner(
+        &mut self,
+    ) -> Result<super::handle::MobDestroyReport, super::handle::MobDestroyError> {
+        use super::handle::MobDestroyError;
+
+        let DestroyAdmission {
+            mut report,
+            destroy_input_needed,
+            entries,
+            mut trust_cleanup_plan_by_member,
+        } = boxed_arm_future(|| self.admit_destroy_cleanup()).await?;
         boxed_arm_future(|| self.fail_all_pending_spawns("mob is destroying"))
             .await
             .map_err(|error| {
@@ -52411,6 +53140,7 @@ impl MobActor {
         let super::state::SubmitWorkPayload {
             runtime_id,
             fence_token,
+            expected_session_id,
             work_ref,
             content,
             origin,
@@ -52427,7 +53157,11 @@ impl MobActor {
             llm_identity_applied_tx,
             mut ack_mode,
             content_attribution,
+            governed_input,
         } = *payload;
+        let dsl_expected_session_id = expected_session_id
+            .as_ref()
+            .map(mob_dsl::SessionId::from_domain);
         if content_attribution
             == crate::mob_machine::WorkContentAttribution::InjectedExecutionContext
             && (origin != WorkOrigin::Internal
@@ -52464,6 +53198,7 @@ impl MobActor {
                 agent_identity: dsl_identity.clone(),
                 agent_runtime_id: declared_dsl_runtime_id.clone(),
                 fence_token: declared_dsl_fence_token,
+                expected_session_id: dsl_expected_session_id.clone(),
                 work_id: mob_dsl::WorkId::from_work_ref(&work_ref),
                 origin: mob_dsl::WorkOrigin::from(origin),
                 content_attribution,
@@ -52511,8 +53246,14 @@ impl MobActor {
                 e
             }
             None => {
+                // Governed input names its bound member session; it never
+                // auto-spawns one. A scope-bound submit never materializes a
+                // member either: it was captured against an existing session,
+                // so an absent target is a typed refusal, never a policy spawn.
                 if matches!(origin, WorkOrigin::Internal)
                     || content_attribution == crate::mob_machine::WorkContentAttribution::HostHuman
+                    || governed_input.is_some()
+                    || expected_session_id.is_some()
                 {
                     let current_state = self.state();
                     return Err(Self::resolve_submit_work_projection_missing_or_rejection(
@@ -52521,6 +53262,7 @@ impl MobActor {
                         &dsl_identity,
                         &declared_dsl_runtime_id,
                         declared_dsl_fence_token,
+                        dsl_expected_session_id.clone(),
                         &runtime_id,
                         origin,
                         &agent_identity,
@@ -52541,6 +53283,7 @@ impl MobActor {
                         payload: Box::new(super::state::SubmitWorkPayload {
                             runtime_id,
                             fence_token,
+                            expected_session_id,
                             work_ref,
                             content,
                             origin,
@@ -52557,6 +53300,7 @@ impl MobActor {
                             llm_identity_applied_tx,
                             ack_mode,
                             content_attribution,
+                            governed_input,
                         }),
                     });
                 }
@@ -52567,6 +53311,7 @@ impl MobActor {
                     &dsl_identity,
                     &declared_dsl_runtime_id,
                     declared_dsl_fence_token,
+                    dsl_expected_session_id.clone(),
                     &runtime_id,
                     origin,
                     &agent_identity,
@@ -52685,6 +53430,24 @@ impl MobActor {
                     .to_string(),
             });
         }
+        // A governed input is realized only by a local session-backed
+        // member's native admission, with its completion observed. Refuse
+        // anything else before MobMachine emits an ingress effect.
+        if governed_input.is_some() {
+            if remotely_hosted || entry.member_ref.bridge_session_id().is_none() {
+                return Err(MobError::UnsupportedForMode {
+                    mode: entry.runtime_mode,
+                    reason: "governed input requires a local session-backed member".to_string(),
+                });
+            }
+            if completion_tx.is_none()
+                || ack_mode != crate::mob_machine::SubmitWorkAckMode::IngressAccepted
+            {
+                return Err(MobError::Internal(
+                    "governed input requires a tracked ingress admission".to_string(),
+                ));
+            }
+        }
         validate_member_turn_carriers(
             &entry,
             remotely_hosted,
@@ -52800,6 +53563,7 @@ impl MobActor {
             agent_identity: dsl_identity.clone(),
             agent_runtime_id: dsl_runtime_id.clone(),
             fence_token: dsl_fence_token,
+            expected_session_id: dsl_expected_session_id.clone(),
             work_id: dsl_work_id.clone(),
             origin: dsl_origin,
             content_attribution,
@@ -52825,6 +53589,7 @@ impl MobActor {
                 &dsl_identity,
                 &dsl_runtime_id,
                 dsl_fence_token,
+                dsl_expected_session_id.clone(),
                 &admission_runtime_id,
                 origin,
                 &agent_identity,
@@ -52912,6 +53677,7 @@ impl MobActor {
                     &dsl_identity,
                     &dsl_runtime_id,
                     dsl_fence_token,
+                    dsl_expected_session_id.clone(),
                     &admission_runtime_id,
                     origin,
                     &agent_identity,
@@ -52980,6 +53746,7 @@ impl MobActor {
                     operation_id: None,
                     placed_completion_obligation: placed_completion_obligation.clone(),
                     placed_completion_context,
+                    governed_input,
                 },
             )
             .await
@@ -53575,6 +54342,7 @@ impl MobActor {
             operation_id,
             placed_completion_obligation,
             placed_completion_context,
+            governed_input,
         } = request;
         if ingress_authority.content_attribution() != content_attribution {
             return Err(MobError::Internal(
@@ -53692,6 +54460,27 @@ impl MobActor {
             runtime_mode = ?entry.runtime_mode,
             "dispatch_member_turn_after_machine_admission dispatching runtime mode"
         );
+
+        // The generated ingress effect, verified against the machine-owned
+        // session ref above, is realized by the member lane with the bound
+        // input exactly as the caller bound it.
+        if let Some(input) = governed_input {
+            let completion_tx = completion_tx.ok_or_else(|| {
+                MobError::Internal("admitted governed input lost its completion".to_string())
+            })?;
+            if placed_identity.is_some() || ingress_authority.is_peer_runtime() {
+                return Err(MobError::Internal(
+                    "admitted governed input resolved to a non-local member".to_string(),
+                ));
+            }
+            return Ok(SubmitWorkDispatchCompletion::AwaitGovernedAdmission {
+                agent_identity: entry.agent_identity.clone(),
+                readiness,
+                member_ref: machine_member_ref,
+                input,
+                completion_tx,
+            });
+        }
 
         // Placement selects the physical owner before runtime mode. Both
         // TurnDriven and AutonomousHost members can live on a remote member
@@ -59156,6 +59945,8 @@ mod routed_effect_containment_tests {
                 llm_identity_applied_tx: None,
                 ack_mode: crate::mob_machine::SubmitWorkAckMode::IngressAccepted,
                 content_attribution: crate::mob_machine::WorkContentAttribution::Conversational,
+                governed_input: None,
+                expected_session_id: None,
             })
         };
         let (reply_tx, reply_rx) = oneshot::channel();

@@ -161,7 +161,8 @@ async fn build_service(
     let mut builder = FactoryAgentBuilder::new(factory, config);
     builder.default_llm_client = Some(client);
     let (service, _adapter) =
-        meerkat::surface::build_runtime_backed_service(builder, 8, persistence);
+        meerkat::surface::build_runtime_backed_service(builder, 8, persistence)
+            .expect("compose the runtime-backed service");
     Arc::new(service)
 }
 

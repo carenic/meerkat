@@ -1376,7 +1376,7 @@ pub trait SessionStore: Send + Sync {
 
     /// Load only the summary metadata row for a session.
     ///
-    /// Metadata-only read seam (mobkit ask-24 clause 3): callers that need
+    /// Metadata-only read seam (meta ask-24 clause 3): callers that need
     /// session-level metadata facts (the reserved `session_*` authority keys
     /// carried on [`SessionMeta::metadata`]) but not the transcript can avoid
     /// materializing the full session document.

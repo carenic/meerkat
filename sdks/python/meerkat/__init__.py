@@ -22,6 +22,7 @@ Quick start::
 
 # Core client and session
 from .client import MeerkatClient
+from .consent import CONSENT_NOTICE_NOTIFICATION, parse_consent_notice
 from .live import LiveChannel, LiveNotification, parse_live_notification
 from .mob import (
     MemberDeliveryReceipt,
@@ -392,10 +393,12 @@ from .errors import (
     SessionNotFoundError,
     SkillNotFoundError,
     StaleCursorError,
+    StaleDeliveryScopeError,
     StaleFenceError,
     WireHostUnavailableDetail,
     WireScopeDeniedDetail,
     WireStaleCursorDetail,
+    WireStaleDeliveryScopeDetail,
     WireStaleFenceDetail,
     meerkat_error_from_jsonrpc_code,
     meerkat_error_from_semantic_code,
@@ -473,6 +476,8 @@ __all__ = [
     "LiveChannel",
     "LiveNotification",
     "parse_live_notification",
+    "CONSENT_NOTICE_NOTIFICATION",
+    "parse_consent_notice",
     "DeferredSession",
     "Session",
     "Mob",
@@ -817,10 +822,12 @@ __all__ = [
     "SessionNotFoundError",
     "SkillNotFoundError",
     "StaleCursorError",
+    "StaleDeliveryScopeError",
     "StaleFenceError",
     "WireHostUnavailableDetail",
     "WireScopeDeniedDetail",
     "WireStaleCursorDetail",
+    "WireStaleDeliveryScopeDetail",
     "WireStaleFenceDetail",
     "meerkat_error_from_jsonrpc_code",
     "meerkat_error_from_semantic_code",

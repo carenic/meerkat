@@ -58,6 +58,8 @@ async fn connector_commit_refuses_unbound_tokens_then_consumes_and_publishes_exa
         redirect_uri: redirect.into(),
         expected_account: "verified-account".into(),
         strategy_id: "verified-test-profile".into(),
+        client_auth_profile: None,
+        protocol: None,
     }
     .try_into()
     .expect("valid descriptor");

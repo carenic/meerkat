@@ -527,6 +527,33 @@ is written to the OS keyring. Use the same keyring-aware backend in every
 process that must see desktop-first credentials; the stock CLI intentionally
 uses the file profile to avoid surprise OS keychain prompts.
 
+Every token-store load, save and clear states its access: `Status`,
+`Unattended` (provider setup, request preparation, refresh) or `Interactive`
+(an explicit login, logout, save or clear). With a keyring-aware store:
+
+- `status` never waits for credential work and never reads the OS keychain. A
+  credential it did not read carries `credential_observation`
+  (`not_observed`, `owner_busy`, `pending`, `denied`,
+  `interaction_required` or `unavailable`); that is never absence.
+- Provider setup and refresh admit at most one bounded keychain lookup per
+  credential, off the async workers. Concurrent requests answer
+  `credential_access_pending` at once, and capacity beyond
+  `KEYCHAIN_OPERATION_CAPACITY` answers `credential_store_unavailable` with no
+  call. The OS may still show its own access dialog for that one lookup.
+- While that lookup or an interactive keychain call holds a credential's
+  lease, provider requests, refresh, MCP and connector use answer
+  `credential_access_pending` at once instead of waiting for it.
+- A denial (`credential_access_denied`) is not retried until an interactive
+  login, save or clear succeeds. A denial, a refused interaction or a locked,
+  read-only or otherwise inaccessible keychain never falls back to the file
+  store; only a platform report that there is no credential store does.
+- Auth errors carry the same four kinds as their `reason`:
+  `credential_access_denied`, `credential_interaction_required`,
+  `credential_access_pending` and `credential_store_unavailable`.
+- Before dropping its runtime, a host settles credential work with
+  `settle_in_flight_credential_mutations(bound)` and reports
+  `Unsettled { pending }` instead of claiming cleanup.
+
 The browser flow is split for native UI:
 
 1. Bind the loopback listener and choose its redirect URI.

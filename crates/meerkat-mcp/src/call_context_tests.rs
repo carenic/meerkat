@@ -28,6 +28,9 @@ const PRIVATE_KEY: &str = "io.example/call";
 #[derive(Clone)]
 struct Server {
     requests: Arc<std::sync::Mutex<Vec<Value>>>,
+    /// When set, each request records how many final-check custodies had
+    /// been dropped when it arrived.
+    custody_probe: Arc<std::sync::Mutex<Option<Arc<AtomicUsize>>>>,
     entered: Arc<Semaphore>,
     release: Arc<Semaphore>,
 }
@@ -56,9 +59,18 @@ impl ServerHandler for Server {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.requests.lock().unwrap().push(
-            json!({"name": request.name, "arguments": request.arguments, "meta": context.meta}),
-        );
+        let custody_dropped = self
+            .custody_probe
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|probe| probe.load(Ordering::SeqCst));
+        self.requests.lock().unwrap().push(json!({
+            "name": request.name,
+            "arguments": request.arguments,
+            "meta": context.meta,
+            "custody_dropped": custody_dropped,
+        }));
         let action = request
             .arguments
             .as_ref()
@@ -93,6 +105,7 @@ impl Fixture {
     async fn start() -> Self {
         let server = Server {
             requests: Default::default(),
+            custody_probe: Default::default(),
             entered: Arc::new(Semaphore::new(0)),
             release: Arc::new(Semaphore::new(0)),
         };
@@ -172,6 +185,10 @@ struct Provider {
     reserved: bool,
     unselected_class: ToolMutationClass,
     restrictions: std::sync::Mutex<Vec<bool>>,
+    /// The final check this provider attaches: `Some(passes)`.
+    final_check: Option<bool>,
+    final_checked: Arc<AtomicUsize>,
+    final_custody_dropped: Arc<AtomicUsize>,
 }
 
 impl Provider {
@@ -184,6 +201,9 @@ impl Provider {
             reserved: false,
             unselected_class: ToolMutationClass::Unknown,
             restrictions: Default::default(),
+            final_check: None,
+            final_checked: Default::default(),
+            final_custody_dropped: Default::default(),
         }
     }
 }
@@ -218,13 +238,28 @@ impl McpCallContextProvider for Provider {
         } else {
             PRIVATE_KEY
         };
-        Ok(Some(McpCallContext::new(
+        let prepared = McpCallContext::new(
             serde_json::Map::from_iter([(
                 key.into(),
                 json!({"correlation":format!("private-{sequence}")}),
             )]),
             Lease(Arc::clone(&self.dropped)),
-        )))
+        );
+        Ok(Some(match self.final_check {
+            None => prepared,
+            Some(passes) => {
+                let checked = Arc::clone(&self.final_checked);
+                let custody = Arc::clone(&self.final_custody_dropped);
+                prepared.with_final_check(move || {
+                    checked.fetch_add(1, Ordering::SeqCst);
+                    if passes {
+                        Ok(Lease(custody))
+                    } else {
+                        Err(McpCallContextError::Denied)
+                    }
+                })
+            }
+        }))
     }
 
     fn tool_mutation_class(
@@ -417,7 +452,11 @@ async fn no_provider_and_unselected_exact_destination_preserve_call_payloads() {
 }
 
 #[tokio::test]
-async fn cancellation_drops_lease_finishes_native_call_and_wakes_progress() {
+/// Cancelling an entered call finishes the native call and wakes progress,
+/// but the preparation lease stays with the native send owner, which still
+/// holds the request, until that request settles. (Fails-old: the lease
+/// dropped with the caller while the request could still be in flight.)
+async fn cancellation_finishes_native_call_and_the_send_owner_keeps_the_lease() {
     let fixture = Fixture::start().await;
     let provider = Arc::new(Provider::new(fixture.config.clone()));
     let mut router = fixture
@@ -450,18 +489,29 @@ async fn cancellation_drops_lease_finishes_native_call_and_wakes_progress() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(provider.dropped.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            router.external_tool_surface_snapshot().entries[0].inflight_call_count,
-            0
-        );
-        assert_eq!(
-            router.servers["context-fixture"]
-                .active_calls
-                .load(Ordering::SeqCst),
-            0
-        );
+        let held_after_cancel = provider.dropped.load(Ordering::SeqCst) == 0;
+        let inflight = router.external_tool_surface_snapshot().entries[0].inflight_call_count;
+        let active = router.servers["context-fixture"]
+            .active_calls
+            .load(Ordering::SeqCst);
+        // Release the server before asserting, so a failure cannot leave the
+        // fixture blocked behind the in-flight request.
         fixture.server.release.add_permits(1);
+        let released = tokio::time::timeout(LIMIT, async {
+            while provider.dropped.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            held_after_cancel,
+            "the send owner still holds the in-flight request's lease"
+        );
+        assert_eq!((inflight, active), (0, 0));
+        assert!(
+            released.is_ok(),
+            "the lease is released once the request settles"
+        );
         router.stage_remove("context-fixture").unwrap();
         router.apply_staged().await.unwrap();
         router.progress_removals().await.unwrap();
@@ -529,3 +579,102 @@ mod policy_tests;
 
 #[path = "call_context_review_tests.rs"]
 mod review_tests;
+
+/// A preparation's final check runs once at the call's final native entry: a
+/// refusal there sends nothing and drops the lease, and a pass sends the
+/// prepared metadata.
+#[tokio::test]
+async fn a_final_check_refusal_sends_nothing_and_a_pass_sends_the_metadata() {
+    let fixture = Fixture::start().await;
+    let mut refusing = Provider::new(fixture.config.clone());
+    refusing.final_check = Some(false);
+    let refusing = Arc::new(refusing);
+    let mut passing = Provider::new(fixture.config.clone());
+    passing.final_check = Some(true);
+    let passing = Arc::new(passing);
+    let refused_router = fixture
+        .router(Some(refusing.clone()), fixture.config.clone())
+        .await;
+    let passing_router = fixture
+        .router(Some(passing.clone()), fixture.config.clone())
+        .await;
+    let result = AssertUnwindSafe(async {
+        let args = serde_json::value::to_raw_value(&json!({"action":"ok"})).unwrap();
+        let call = ToolCallView {
+            id: "final-check",
+            name: "read",
+            args: &args,
+        };
+        let refused = refused_router.dispatch_with_context(call, &context()).await;
+        assert!(refused.is_err(), "the final check refused the call");
+        assert_eq!(refusing.final_checked.load(Ordering::SeqCst), 1);
+        assert_eq!(refusing.dropped.load(Ordering::SeqCst), 1);
+        assert!(
+            fixture.server.requests.lock().unwrap().is_empty(),
+            "a refused final check sent nothing"
+        );
+
+        *fixture.server.custody_probe.lock().unwrap() =
+            Some(Arc::clone(&passing.final_custody_dropped));
+        passing_router
+            .dispatch_with_context(call, &context())
+            .await
+            .unwrap();
+        assert_eq!(passing.final_checked.load(Ordering::SeqCst), 1);
+        let requests = fixture.server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0]["meta"].get(PRIVATE_KEY).is_some());
+        // What the passed check guards was still held when the request
+        // reached the server: through the reviewed entry and the handoff.
+        assert_eq!(requests[0]["custody_dropped"], json!(0));
+    })
+    .catch_unwind()
+    .await;
+    refused_router.shutdown().await;
+    passing_router.shutdown().await;
+    fixture.finish(result).await;
+}
+
+/// A connector-bound server's call with no connector preparation (here no
+/// provider at all) is refused locally and never reaches the server unbound.
+#[tokio::test]
+async fn a_bound_server_without_its_preparation_is_refused_locally() {
+    let fixture = Fixture::start().await;
+    let mut config = fixture.config.clone();
+    config.connector = Some(meerkat_core::mcp_config::McpConnectorBinding {
+        realm_id: "tenant-a".into(),
+        slot_id: "mail-work".into(),
+        issuer: "https://issuer.example".into(),
+        client: "client".into(),
+        resource: "https://mail.example".into(),
+        strategy_id: "oidc-userinfo-v1".into(),
+        account: "subject-a".into(),
+        operations: std::collections::BTreeMap::from([(
+            "read".to_owned(),
+            meerkat_core::mcp_config::McpConnectorOperation {
+                required_scopes: Default::default(),
+                destination_origin: "https://mail.example".into(),
+                read_only: false,
+            },
+        )]),
+    });
+    let router = fixture.router(None, config).await;
+    let result = AssertUnwindSafe(async {
+        let args = serde_json::value::to_raw_value(&json!({"action":"ok"})).unwrap();
+        let call = ToolCallView {
+            id: "unprepared",
+            name: "read",
+            args: &args,
+        };
+        let refused = router.dispatch_with_context(call, &context()).await;
+        assert!(refused.is_err(), "an unprepared bound call was refused");
+        assert!(
+            fixture.server.requests.lock().unwrap().is_empty(),
+            "nothing reached the server"
+        );
+    })
+    .catch_unwind()
+    .await;
+    router.shutdown().await;
+    fixture.finish(result).await;
+}

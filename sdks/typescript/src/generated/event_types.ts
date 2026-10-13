@@ -27,6 +27,7 @@ import type {
   LiveBridgeEffectOutcome,
   LiveChannelId,
   LiveContextObservationId,
+  McpAttachmentRestoreWireOutcome,
   MeerkatSchema,
   OpenAiImageMetadata,
   OperationId,

@@ -1419,7 +1419,7 @@ async fn placed_member_publishes_its_transport_key_and_retires_at_its_real_addre
     let b2_peer = b2_runtime.peer_id().expect("b2 peer id");
     let b2_key = b2_runtime.public_key().expect("b2 transport key");
 
-    // MobKit-style member_peer_info: peer id plus a decodable key that
+    // Meta-style member_peer_info: peer id plus a decodable key that
     // derives that same peer id.
     let entry = controlling
         .handle

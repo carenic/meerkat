@@ -7,7 +7,8 @@
 use std::sync::Arc;
 
 use meerkat_core::authorization::{
-    OperationObservationError, OperationObservedOutcome, OperationRefusalKind,
+    MandatoryHookWithholding, OperationObservationError, OperationObservedOutcome,
+    OperationRefusalKind,
 };
 use meerkat_core::exact_operation::OperationExecutionScope;
 use meerkat_core::{InputId, OperationId, PrincipalRef, RunId, SessionId};
@@ -159,6 +160,11 @@ pub enum AuditObservation {
     Outcome {
         outcome: OperationObservedOutcome,
     },
+    /// A mandatory hook withheld this model operation's dependent effects.
+    /// Historical and bounded; not a permission decision, never replayed.
+    MandatoryHookWithheld {
+        withholding: MandatoryHookWithholding,
+    },
 }
 
 /// Protected data submitted to the native row-bound sink. Construction and
@@ -256,6 +262,8 @@ pub enum SafeAuditObservation {
     Refused,
     EntryAttempt,
     Returned,
+    /// A mandatory hook withheld dependent effects; no hook or effect detail.
+    MandatoryHookWithheld,
 }
 
 impl AuthorizationAuditObservation {
@@ -270,6 +278,9 @@ impl AuthorizationAuditObservation {
             AuditObservation::Refused { .. } => SafeAuditObservation::Refused,
             AuditObservation::Entry => SafeAuditObservation::EntryAttempt,
             AuditObservation::Outcome { .. } => SafeAuditObservation::Returned,
+            AuditObservation::MandatoryHookWithheld { .. } => {
+                SafeAuditObservation::MandatoryHookWithheld
+            }
         }
     }
 }
@@ -278,6 +289,85 @@ impl AuthorizationAuditObservation {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn withholding_record() -> AuthorizationAuditObservation {
+        use meerkat_core::authorization::{
+            MandatoryHookCause, MandatoryHookProviderTool, MandatoryHookWithheldEffect,
+        };
+        let (provider_native_tools, omitted) = MandatoryHookProviderTool::bounded(&[
+            meerkat_core::ServerToolKind::ProviderNative {
+                name: "code_exec".into(),
+            },
+            meerkat_core::ServerToolKind::ProviderNative {
+                name: "n".repeat(300),
+            },
+        ]);
+        AuthorizationAuditObservation {
+            operation_id: OperationId::new(),
+            execution_scope: OperationExecutionScope::Domain,
+            run_id: Some(RunId::new()),
+            context_revision: None,
+            review_attribution: None,
+            observation: AuditObservation::MandatoryHookWithheld {
+                withholding: MandatoryHookWithholding {
+                    sequence: 3,
+                    hook_id: Some(meerkat_core::HookId::new("gate")),
+                    hook_id_omitted: false,
+                    point: meerkat_core::HookPoint::PostLlmResponse,
+                    cause: MandatoryHookCause::Denied {
+                        reason_code: meerkat_core::HookReasonCode::PolicyViolation,
+                    },
+                    effect: MandatoryHookWithheldEffect::LocalDispatchAndCommitWithheld {
+                        local_tool_calls: 1,
+                        text_output_produced: true,
+                        provider_native_tools,
+                        provider_native_tools_total: 2,
+                        provider_native_tools_omitted: omitted,
+                    },
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn mandatory_hook_withholding_round_trips_bounded_and_rejects_unknown_shapes() {
+        let record = withholding_record();
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["observation"]["kind"], "mandatory_hook_withheld");
+        assert!(
+            !value.to_string().contains(&"n".repeat(300)),
+            "an oversized provider name is omitted, not stored"
+        );
+        assert_eq!(
+            serde_json::from_value::<AuthorizationAuditObservation>(value.clone()).unwrap(),
+            record
+        );
+        assert_eq!(
+            record.safe_projection(),
+            SafeAuditObservation::MandatoryHookWithheld
+        );
+        let stored = StoredAuthorizationAuditObservation {
+            observation: record,
+            contributors: Vec::new().into(),
+        };
+        let stored_value = serde_json::to_value(&stored).unwrap();
+        assert_eq!(
+            serde_json::from_value::<StoredAuthorizationAuditObservation>(stored_value).unwrap(),
+            stored
+        );
+
+        let mut unknown_field = value.clone();
+        unknown_field["observation"]["withholding"]["recovered_allowance"] =
+            serde_json::json!(true);
+        assert!(serde_json::from_value::<AuthorizationAuditObservation>(unknown_field).is_err());
+        let mut unknown_kind = value.clone();
+        unknown_kind["observation"]["kind"] = serde_json::json!("future_hook_kind");
+        assert!(serde_json::from_value::<AuthorizationAuditObservation>(unknown_kind).is_err());
+        let mut unknown_effect = value;
+        unknown_effect["observation"]["withholding"]["effect"]["kind"] =
+            serde_json::json!("undone");
+        assert!(serde_json::from_value::<AuthorizationAuditObservation>(unknown_effect).is_err());
+    }
 
     #[test]
     fn old_audit_records_remain_unattributed_and_round_trip_without_new_fields() {

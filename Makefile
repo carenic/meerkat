@@ -72,11 +72,13 @@ test-mob-dense-topology:
 # Refusal controls and the subprocess probe entrypoints stay in the ordinary
 # runs and are not selected here.
 CONFINEMENT_MCP_POSITIVE := test(/^connection::process_confinement_tests::supported_native::/)
-CONFINEMENT_MCP_POSITIVE_COUNT := 5
+CONFINEMENT_MCP_POSITIVE_COUNT := 6
 CONFINEMENT_HOOK_POSITIVE := test(=process_custody::tests::required_command_hook_enters_only_with_its_durable_custody_record) | test(=required_command_hook_enters_with_exact_argv_cwd_environment_and_custody)
 CONFINEMENT_HOOK_POSITIVE_COUNT := 2
 CONFINEMENT_SANDBOX_POSITIVE := test(=allowed_command_runs_but_outside_read_write_and_symlink_escape_fail) | test(=baseline_supports_declared_shell_commands_and_spawn_preserves_pid) | test(=child_has_only_explicit_environment) | test(=denial_does_not_prevent_a_later_permitted_launch) | test(=deny_ip_blocks_tcp_udp_and_proxy_environment_cannot_bypass_it) | test(=independent_agent_roots_remain_separate_in_simultaneous_launches) | test(=inherited_connected_socket_cannot_bypass_network_denial) | test(=inherited_descriptor_cannot_bypass_filesystem_denial) | test(=linux_denies_host_signal_and_resource_mutation_equivalents) | test(=linux_denies_unix_connect_independently_of_ip_permission) | test(=linux_initial_backend_compiles_a_supported_profile) | test(=linux_late_setup_failure_never_executes_and_reaps_the_failed_child) | test(=linux_refuses_directory_and_non_stream_stdio_before_target_entry) | test(=linux_strict_paths_cover_metadata_and_namespace_escape) | test(=linux_unix_pair_cannot_bypass_unix_denial_when_ip_is_permitted) | test(=sparse_high_descriptor_is_closed_without_changing_parent_limits) | test(=cancelled_native_wait_retains_child_for_kill_and_cached_reaping) | test(=confined_custody_gate_eof_or_wrong_release_never_runs_target) | test(=confined_custody_gate_waits_for_release_and_preserves_pid) | test(=dropping_live_native_child_kills_and_reaps_the_exact_pid) | test(=one_compiled_profile_binds_distinct_launches_with_exact_capability_report)
 CONFINEMENT_SANDBOX_POSITIVE_COUNT := 21
+CONFINEMENT_SHELL_POSITIVE := test(/^builtin::shell::confinement_tests::platform::/)
+CONFINEMENT_SHELL_POSITIVE_COUNT := 4
 
 test-mcp-confinement-positive:
 	@echo "$(GREEN)Running confinement positive acceptance lane...$(NC)"
@@ -100,6 +102,7 @@ test-mcp-confinement-positive:
 	suite "-p meerkat-mcp --lib" '$(CONFINEMENT_MCP_POSITIVE)' $(CONFINEMENT_MCP_POSITIVE_COUNT); \
 	suite "-p meerkat --lib --test command_hook_confinement" '$(CONFINEMENT_HOOK_POSITIVE)' $(CONFINEMENT_HOOK_POSITIVE_COUNT); \
 	suite "-p meerkat-sandbox --test process_confinement --test compiled_confinement" '$(CONFINEMENT_SANDBOX_POSITIVE)' $(CONFINEMENT_SANDBOX_POSITIVE_COUNT); \
+	suite "-p meerkat-tools --lib" '$(CONFINEMENT_SHELL_POSITIVE)' $(CONFINEMENT_SHELL_POSITIVE_COUNT); \
 	exit $$status
 
 # Integration-fast tests only (no unit tests). The `int` cargo alias excludes
@@ -182,9 +185,18 @@ test-sdk-typescript:
 
 # Web SDK test suite. test:packed smokes the package as npm ships it: the
 # packed wasm's stack and one turn through the packed JS and wasm.
+# wasm-pack runs plain `cargo`, so without CARGO_TARGET_DIR the release wasm
+# build lands in the checkout's own target/, which the pre-push dispatcher's
+# `git clean -ffdqx` deletes before every hook run: each push rebuilt it cold.
+# Hand the build the repo-cargo lane target (an explicit CARGO_TARGET_DIR, as
+# CI sets, wins) so its Rust artifacts survive between runs.
 test-sdk-web:
 	@echo "$(GREEN)Running Web SDK tests...$(NC)"
-	@(cd sdks/web && \
+	@target_dir="$${CARGO_TARGET_DIR:-$$(./scripts/repo-cargo --print-env | sed -n 's/^CARGO_TARGET_DIR=//p')}"; \
+	if [ -z "$$target_dir" ]; then echo "error: could not resolve the repo-cargo lane CARGO_TARGET_DIR" >&2; exit 1; fi; \
+	echo "Web SDK wasm build target: $$target_dir"; \
+	(cd sdks/web && \
+		export CARGO_TARGET_DIR="$$target_dir" && \
 		npm install --ignore-scripts && \
 		npm run build && \
 		npm test && \

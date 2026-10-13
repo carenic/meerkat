@@ -576,13 +576,10 @@ async fn copilot_live_account_routes_tools_images_and_switches() {
         blob_store,
     )
     .expect("construct runtime authority");
-    let runtime = Arc::new(SessionRuntime::new(
-        factory,
-        config.clone(),
-        8,
-        bundle,
-        NotificationSink::noop(),
-    ));
+    let runtime = Arc::new(
+        SessionRuntime::new(factory, config.clone(), 8, bundle, NotificationSink::noop())
+            .expect("compose the RPC session runtime"),
+    );
     runtime.set_realm_context(
         Some(RealmId::global()),
         Some("copilot-live-e2e".to_string()),

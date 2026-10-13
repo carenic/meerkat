@@ -357,6 +357,7 @@ fn replay_config() -> Config {
         binding: BTreeMap::new(),
         default_binding: Some(BINDING.to_string()),
         parent: None,
+        connector_client: BTreeMap::new(),
     };
     section.backend.insert(
         "openai_api".to_string(),
@@ -464,7 +465,7 @@ async fn open_replay_host(
         16,
         persistence,
         NotificationSink::noop(),
-    ));
+    )?);
     runtime.set_realm_context(
         Some(binding.realm.clone()),
         None,

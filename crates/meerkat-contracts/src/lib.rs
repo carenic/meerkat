@@ -614,6 +614,7 @@ pub use wire::{
     WireSessionTranscriptRevisionEntry,
     WireSessionTranscriptRevisionList,
     WireStaleCursorDetail,
+    WireStaleDeliveryScopeDetail,
     WireStaleFenceDetail,
     WireStopReason,
     WireSwitchTurnControlResult,
@@ -632,4 +633,7 @@ pub use wire::{
     WireWorkOrigin,
     WorkEventsResult,
     WorkItemsResult,
+};
+pub use wire::{
+    CONSENT_NOTICE_NOTIFICATION, ConsentNoticeKind, ConsentNoticeParams, ConsentPresentationParams,
 };

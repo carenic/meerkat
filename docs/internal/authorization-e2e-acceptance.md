@@ -121,6 +121,69 @@ Harness anchors: `crates/meerkat-tools/src/builtin/shell/confinement_tests.rs`,
 `crates/meerkat-sandbox/tests/process_confinement.rs`, and
 `crates/meerkat-sandbox/tests/compiled_confinement.rs`.
 
+## 5. Model review uses current owner facts
+
+Add two parameterized families to the existing native model-review suite. At
+`bf3290f5268979cbdf8f8e972888a32a7c7e6d4e`, these remain specifications for
+missing native Agent coverage, not implemented or executed acceptance for these
+two families. Keep deterministic reviewer responses and assert the native material,
+local feedback and actual effect. This does not assess the quality of a real
+model's judgment.
+
+First, allow the original-input source read but make one required current fact
+unavailable: either the selected action account or the applicable mandate/policy
+explanation. The reviewer HTTP request and target effect must both remain zero.
+Assert typed `ReviewUnavailableKind::ContextUnavailable` feedback, a permitted R1 sibling,
+the next controller response and fresh governed work. An owner-confirmed inapplicable
+account or absent policy edit is a positive control, not missing material.
+Reuse existing protected-observation fault cases to preserve their separate
+infrastructure result; do not classify them as ordinary unavailable review.
+
+Second, hold the reviewer response after it receives the current owner material.
+Change only the selected action account or required mandate/policy facts through
+the existing native publication owner; keep the permission result and R2 tier
+unchanged. Release an `allow` response and assert that the stale review cannot
+enter the target or record `Used`. Retire that attempt and return
+`ReviewUnsatisfied::ContextChanged`. Its local feedback and permitted sibling
+must reach the next model turn. Explicitly attempt the action afresh with a new
+binding and review attempt, verify the new owner facts in the reviewer request,
+and require one target entry under the new selection.
+Keep request arguments unchanged where the operation's account is owner-selected.
+
+Include an applicability-change variant: begin with an owner-confirmed
+inapplicable fact, hold the review, then have the same native publication owner
+make that fact required but unavailable without changing permission or R2 tier.
+Releasing the stale `allow` must yield `ReviewUnsatisfied::ContextChanged`, with
+no `Used` or target entry. An explicit fresh attempt must yield
+`ReviewUnavailableKind::ContextUnavailable` before any new reviewer HTTP request or
+target effect. Neither result retries implicitly; local feedback, a permitted
+sibling and the next model step must continue.
+
+The fixture needs an account-aware owner and an effect recorder that observes
+the selected sink. Historical attribution, an account name in model arguments
+or the reviewer's own credential cannot serve as that assertion. Relevant fact
+changes must participate in the same authorization publication used by entry
+currentness; a fixture-only generation counter does not establish that behavior.
+Reuse the existing R1 no-review control to keep this optional context path out
+of ordinary local authorization.
+
+No production account-aware sink owner exists at this source: the in-tree
+owners implement `OperationPolicyOwner::review_action_account` and
+`AdmittedWorkPolicyOwner::review_mandate` only as tests, explicit
+inapplicability or the native mandate forwarding wrapper. The first family is
+therefore an integration obligation for the host owner that wires those
+methods to its actual selected sink and mandate records; it is not built here,
+and a fixture-only owner would not establish that production derivation.
+
+Harness anchors:
+`crates/meerkat-authorization/tests/native_governed_loop/e1_policy_control/model_reviewer.rs`
+(`ControlledReviewReply` is defined in the parent `e1_policy_control.rs`) and
+`crates/meerkat-authorization/tests/native_governed_loop/e1_policy_control/a8_requester_revocation.rs`
+for the existing canonical publication pattern. Use their controlled reviewer
+response and native publication barriers. Keep these cases under the existing
+`native_governed_loop` target and normal CI
+selection; no additional validation runner is required.
+
 ## Next-slice source inventory
 
 The acceptance source branch starts at consent checkpoint
@@ -203,7 +266,7 @@ boundaries, grants, file effects and audit. They include fresh admission,
 continuing work and individual fenced tool calls. Deterministic model transport
 and application resource mapping remain fixtures.
 
-Before the quiet allocation, build the optimized target in each exact source
+Before the task-scoped allocation, build the optimized target in each exact source
 checkout selected by the execution owner. Use Cargo's emitted executable path
 for `MEAN_BINARY` and `TAIL_BINARY`, respectively; they may have different source
 and binary identities. Preserve each identity with its own raw output and
@@ -285,11 +348,19 @@ model call and inactivity timers are disabled in the tail fixture; per-tool and
 outer deadlines remain.
 
 Require release-build and correctness evidence for each selected source before
-measurement. The GCP lead owns the quiet exact-head allocation; machine-wide
-competing build/test/benchmark load must be absent, not merely an idle named lane. The unchanged
-targets are native added per-operation p99 strictly below 1 ms and
-representative overhead at most 10 percent, under the acceptance plan's mean
-inference rules. W20/N32 cannot establish p99. Keep each mode's raw costs:
+measurement. The exact-head allocation is task-scoped and pinned, not a machine-wide
+quiet window: the GCP scheduler owns the allocation on a shared host, with
+the timing runs pinned to a dedicated core set with `taskset`, at normal
+priority, while other build/test/benchmark lanes on the same host run
+under `chrt` idle and `ionice` idle. Record the actual host conditions at
+measurement time (load, memory, concurrent build processes, and per-core
+usage of the pinned set) alongside the raw samples, and carry the
+shared-host limitation forward as an explicit measurement assumption and
+source of uncertainty for the results. The acceptance gates are native
+added per-operation p99 strictly below 1 ms,
+responsiveness and full coverage. Representative overhead at most 10 percent,
+under the acceptance plan's mean inference rules, is a nonblocking optimization
+target. W20/N32 cannot establish p99. Keep each mode's raw costs:
 governed-minus-trusted differences can cancel a regression common to both modes.
 
 Before claiming reviewed-leaf performance, close the source coverage gap in

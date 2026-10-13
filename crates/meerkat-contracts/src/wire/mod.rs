@@ -40,6 +40,9 @@ pub use approval::{
     ApprovalProposedAction, ApprovalRecord, ApprovalRequest, ApprovalRequestParams,
     ApprovalResourceId, ApprovalResourceKind, ApprovalResourceRef, ApprovalRisk, ApprovalStatus,
 };
+pub use approval::{
+    CONSENT_NOTICE_NOTIFICATION, ConsentNoticeKind, ConsentNoticeParams, ConsentPresentationParams,
+};
 pub use comms::{
     CommsChecksumTokenParams, CommsChecksumTokenResult, CommsChecksumTokenResultIntent,
     CommsCommandError, CommsCommandProjectionError, CommsCommandRequest, CommsPeerEntry,
@@ -54,9 +57,9 @@ pub use comms::{
 #[cfg(not(target_arch = "wasm32"))]
 pub use config::ConfigWriteResult;
 pub use config::{
-    ConfigPatchParams, ConfigSetParams, WireLiveChannelCloseFailure, WireLiveChannelRefreshFailure,
-    WireLiveCloseFailure, WireLiveConfigPropagationReport, WireLiveHotSwapSkip,
-    WireLiveHotSwapSkipReason, WireLiveRefreshFailure, WireLiveSwapFailure,
+    ConfigPatchParams, ConfigSetParams, WireConfigWriteRefusal, WireLiveChannelCloseFailure,
+    WireLiveChannelRefreshFailure, WireLiveCloseFailure, WireLiveConfigPropagationReport,
+    WireLiveHotSwapSkip, WireLiveHotSwapSkipReason, WireLiveRefreshFailure, WireLiveSwapFailure,
 };
 pub use connection::{
     AuthLogoutParams, AuthStatusParams, BindingIdParams, ConnectorLoginCancelParams,
@@ -102,7 +105,7 @@ pub use auth::{
 pub use error::{
     WireControllerReadinessFailure, WireConversionError, WireCredentialUseDisposition,
     WireHostUnavailableDetail, WireInputAdmissionErrorDetail, WireInputRefusalKind,
-    WireMobErrorDetail, WireStaleCursorDetail, WireStaleFenceDetail,
+    WireMobErrorDetail, WireStaleCursorDetail, WireStaleDeliveryScopeDetail, WireStaleFenceDetail,
 };
 pub use event::{
     EventReplayCursor, EventReplayCursorError, EventReplayEnvelope, EventReplayEventId,

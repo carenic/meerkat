@@ -114,13 +114,28 @@ impl RetirementSettlementWatch {
     }
 }
 
-/// Member lifecycle observations written only by the mob actor and shared
-/// read-only with its handles: per-member retirement settlements and the
-/// report of the most recent Shutdown.
+/// How the mob's actor task ended, published once by the task's spawn
+/// wrapper after the actor future returned or was dropped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ActorTaskEnd {
+    #[default]
+    Running,
+    /// The actor future returned: the actor, and every store handle it
+    /// owned, has dropped.
+    Returned,
+    /// The task ended without its future returning (a panic or an abort).
+    Lost,
+}
+
+/// Member lifecycle observations written only by the mob actor (and its
+/// task's spawn wrapper) and shared read-only with its handles: per-member
+/// retirement settlements, the report of the most recent Shutdown, and how
+/// the actor task ended.
 #[derive(Debug, Default)]
 pub(crate) struct MemberLifecycleObservations {
     members: std::sync::Mutex<BTreeMap<AgentIdentity, SettlementChannel>>,
     last_shutdown_report: std::sync::Mutex<Option<MobShutdownReport>>,
+    actor_task: crate::tokio::sync::watch::Sender<ActorTaskEnd>,
     /// Test probe: set once a Shutdown parks on its off-actor teardown.
     #[cfg(test)]
     pub(crate) shutdown_teardown_parked: crate::tokio::sync::watch::Sender<bool>,
@@ -128,6 +143,12 @@ pub(crate) struct MemberLifecycleObservations {
     /// lifecycle drains.
     #[cfg(test)]
     pub(crate) shutdown_admitted: crate::tokio::sync::watch::Sender<bool>,
+    /// Test probe: how many Retire/Respawn/Reload controls the actor has
+    /// parked in its deferred-command queue, per target member, counted when
+    /// it parks them.
+    #[cfg(test)]
+    pub(crate) parked_member_controls:
+        crate::tokio::sync::watch::Sender<BTreeMap<AgentIdentity, u64>>,
 }
 
 #[derive(Debug)]
@@ -190,6 +211,16 @@ impl MemberLifecycleObservations {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Record how the actor task ended. Written once, by its spawn wrapper.
+    pub(crate) fn record_actor_task_end(&self, end: ActorTaskEnd) {
+        self.actor_task.send_replace(end);
+    }
+
+    /// Observe how the actor task ends.
+    pub(crate) fn subscribe_actor_task(&self) -> crate::tokio::sync::watch::Receiver<ActorTaskEnd> {
+        self.actor_task.subscribe()
     }
 
     pub(crate) fn subscribe(&self, identity: &AgentIdentity) -> Option<RetirementSettlementWatch> {

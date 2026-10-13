@@ -14,6 +14,7 @@ use meerkat_auth_core::resolver::{
 };
 use meerkat_core::auth::{
     PersistedAuthMode, PersistedTokens, ProviderAuthPersistence, RefreshError, RefreshFn,
+    TokenStoreAccess,
 };
 use meerkat_core::{
     AuthCredentialIdentity, AuthError, AuthMetadata, HttpAuthorizationReceipt,
@@ -790,6 +791,11 @@ impl CopilotRoutedClient {
 
 #[async_trait]
 impl meerkat_llm_core::LlmClient for CopilotRoutedClient {
+    /// The current route's account limit.
+    fn output_token_limit(&self) -> Option<u32> {
+        self.sync_client().output_token_limit()
+    }
+
     async fn prepare_controller_credential(&self) -> Result<(), AuthError> {
         self.connection
             .resolved_authorizer()
@@ -1071,6 +1077,14 @@ impl CopilotCapabilityGatedClient {
 impl meerkat_llm_core::LlmClient for CopilotCapabilityGatedClient {
     async fn prepare_controller_credential(&self) -> Result<(), AuthError> {
         self.inner.prepare_controller_credential().await
+    }
+
+    /// The account model's own output limit, the one the gate enforces.
+    fn output_token_limit(&self) -> Option<u32> {
+        self.capabilities
+            .limits
+            .max_output_tokens
+            .or_else(|| self.inner.output_token_limit())
     }
 
     fn project_replay_messages(
@@ -1797,6 +1811,9 @@ fn auth_error_from_provider(error: ProviderAuthError) -> AuthError {
 }
 
 fn auth_error_from_refresh(error: RefreshError) -> AuthError {
+    if let Some(access) = error.credential_access_error() {
+        return access;
+    }
     match error {
         RefreshError::StalePreparation => AuthError::StaleCredential,
         RefreshError::ReauthRequired(_)
@@ -1989,9 +2006,9 @@ async fn refresh_github_tokens(
         let http = http.clone();
         Box::pin(async move {
             let current = token_store
-                .load(&key)
+                .load_for(&key, TokenStoreAccess::Unattended)
                 .await
-                .map_err(|error| RefreshError::Refresh(error.to_string()))?
+                .map_err(RefreshError::from_token_store)?
                 .ok_or_else(|| {
                     RefreshError::Refresh(
                         "Copilot source credential disappeared before refresh".to_string(),
@@ -3014,6 +3031,15 @@ mod tests {
             client.request_pressure(&request),
             Err(meerkat_llm_core::LlmError::InvalidRequest { .. })
         ));
+        assert_eq!(
+            client.output_token_limit(),
+            Some(16),
+            "the limit the gate enforces is stated to the factory"
+        );
+        assert_eq!(
+            capability_gated_client(Arc::new(NoopLlmClient), None).output_token_limit(),
+            None
+        );
     }
 
     #[test]

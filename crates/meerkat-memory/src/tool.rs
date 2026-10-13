@@ -88,6 +88,7 @@ impl MemorySearchDispatcher {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Memory,
                 source_id: "memory".into(),
+                artifact: None,
             }),
         });
 

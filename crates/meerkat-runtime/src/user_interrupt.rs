@@ -333,6 +333,13 @@ impl MeerkatMachine {
                 .try_wait_with_terminal_outcome()
                 .await
                 .map_err(|error| {
+                    if error.is_disclosure_refused() {
+                        // The contributor completed; only its result is
+                        // withheld from this reader.
+                        return RuntimeDriverError::ScopedResultWithheld {
+                            input_id: input_id.clone(),
+                        };
+                    }
                     RuntimeDriverError::Internal(format!(
                         "stopped run {expected_run_id} contributor {input_id} completion failed: {error}"
                     ))

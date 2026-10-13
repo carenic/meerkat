@@ -425,7 +425,8 @@ mod tests {
         let factory = AgentFactory::new(root.join("sessions"));
         let mut builder = FactoryAgentBuilder::new(factory, Config::default());
         builder.default_llm_client = Some(client);
-        let (service, adapter) = build_runtime_backed_service(builder, 4, persistence);
+        let (service, adapter) = build_runtime_backed_service(builder, 4, persistence)
+            .expect("compose the runtime-backed service");
         (Arc::new(service), adapter)
     }
 
@@ -455,7 +456,8 @@ mod tests {
         let factory = AgentFactory::new(root.join("sessions")).memory(true);
         let mut builder = FactoryAgentBuilder::new(factory, Config::default());
         builder.default_llm_client = Some(client);
-        let (service, adapter) = build_runtime_backed_service(builder, 4, bundle);
+        let (service, adapter) = build_runtime_backed_service(builder, 4, bundle)
+            .expect("compose the runtime-backed service");
         (Arc::new(service), adapter, runtime_store)
     }
 
@@ -706,7 +708,8 @@ mod tests {
         let factory = AgentFactory::new(root.join("sessions")).memory(true);
         let mut builder = FactoryAgentBuilder::new(factory, Config::default());
         builder.default_llm_client = Some(client);
-        let (service, adapter) = build_runtime_backed_service(builder, 4, bundle);
+        let (service, adapter) = build_runtime_backed_service(builder, 4, bundle)
+            .expect("compose the runtime-backed service");
         let event_store = Arc::new(FailNextRewriteAuditEventStore::new(
             root.join(".rkat").join("events"),
         ));
@@ -1319,7 +1322,8 @@ mod tests {
         let factory = AgentFactory::new(root.join("sessions")).memory(true);
         let mut builder = FactoryAgentBuilder::new(factory, Config::default());
         builder.default_llm_client = Some(client);
-        let (service, adapter) = build_runtime_backed_service(builder, 4, bundle);
+        let (service, adapter) = build_runtime_backed_service(builder, 4, bundle)
+            .expect("compose the runtime-backed service");
         (Arc::new(service), adapter, fault_store, raw_runtime_store)
     }
 
@@ -2273,7 +2277,8 @@ mod tests {
         let factory = AgentFactory::new(root.join("sessions"));
         let mut builder = FactoryAgentBuilder::new(factory, Config::default());
         builder.default_llm_client = Some(Arc::new(HistorySummarizingTestClient));
-        let (service, adapter) = build_runtime_backed_service(builder, 4, bundle);
+        let (service, adapter) = build_runtime_backed_service(builder, 4, bundle)
+            .expect("compose the runtime-backed service");
         (Arc::new(service), adapter, raw_row_store)
     }
 

@@ -878,7 +878,7 @@ impl<T: AgentToolDispatcher + ?Sized + 'static> AgentToolDispatcher
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::handles::{
         DslTransitionError, ExternalToolSurfaceHandle, ExternalToolSurfaceInput,
@@ -1093,7 +1093,7 @@ mod tests {
 
     /// Fully-unsupported registry stub: the spy dispatcher never calls into
     /// the registry, so every method fails loud if it ever does.
-    struct UnsupportedOpsRegistry;
+    pub(crate) struct UnsupportedOpsRegistry;
 
     fn unsupported(op: &str) -> OpsLifecycleError {
         OpsLifecycleError::Unsupported(op.into())

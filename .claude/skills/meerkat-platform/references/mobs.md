@@ -285,7 +285,10 @@ is local to that RPC host; a controlling host cannot use `session/*` or
 `live/*` to proxy a placed member's remote session.
 
 All console surfaces consume the same four classified failures:
-`scope_denied`, `host_unavailable`, `stale_cursor`, and `stale_fence`.
+`scope_denied`, `host_unavailable`, `stale_cursor`, and `stale_fence`, plus
+`stale_delivery_scope` for a scope-bound submit whose member session moved
+under a current fence (re-capture the scope; `stale_fence` means re-resolve
+the member).
 Unclassified failures keep each route or protocol's legacy rendering.
 
 Runtime-mode behavior is shared across these surfaces because dispatch comes from the same mob runtime:
@@ -594,7 +597,7 @@ lifetime token counters are not copied into the child.
 `fork_off` is detached where the host can deliver a later completion: it
 declares `DetachedCompletionDelivery::Available` and has a runtime adapter
 (the default for hosts built with one: the JSON-RPC, REST and MCP servers,
-MobKit; also `rkat run --keep-alive` and `rkat mob deploy --surface rpc`). It
+Meta; also `rkat run --keep-alive` and `rkat mob deploy --surface rpc`). It
 returns once the child is seated and its turn admitted: `status: "running"`,
 `agent_identity`, `member_ref`, `fork_session_id`, a `job_id`, and a `note`
 (no `cache_inheritance`: that host-side accounting stays on
@@ -613,7 +616,7 @@ retired. The outcome status is `completed` (with `bounded_result`, `usage`,
 `turns`, `tool_calls`), `failed` (child retired), `max_run_elapsed` (run
 cancelled, child retired), `supervisor_stopped`, or `restart_interrupted`. The
 child's durable `ForkJobRecord` lets a restarted host re-link it: a one-time
-pass after restore (or when MobKit inserts a restored handle) delivers a reply
+pass after restore (or when Meta inserts a restored handle) delivers a reply
 already in the child's durable transcript, observes a still-running child with
 `max_run` measured from the original start, or delivers `restart_interrupted`,
 under the same idempotency key, and wakes an idle forker; a job whose
@@ -648,10 +651,10 @@ them, and only them, in `mob_list_members`; the member operator tools
 apply the same rule. Retirement cascades to descendants, deepest first, in
 the core retire (`MobHandle::retire`; `retire_with_descendants` is an alias):
 the retire tools, autokill, failed-child cleanup, host `mob/retire` /
-`meerkat_mob_retire`, and MobKit's retire paths all take it, and a child
+`meerkat_mob_retire`, and Meta's retire paths all take it, and a child
 forked mid-cascade is retired too. A child whose own turn fails is
 retired automatically; a child whose turn completes stays seated until its
-forker retires it. Meerkat adds no retention limit; MobKit applies its
+forker retires it. Meerkat adds no retention limit; Meta applies its
 `idle_retire_secs` policy.
 
 `council` requires creation authority and scope over each source mob. Supply a
@@ -668,7 +671,7 @@ it status `failed`. A detached council also re-links after a restart: its
 custody record carries the convener's job, and the outcome (or
 `coordinator_interrupted` once the dead coordinator's lease expires) is
 delivered once. The council recovery sweep that does this runs only on a
-`MobMcpState` built with `into_shared()` (MobKit 0.8.43 does; a plain
+`MobMcpState` built with `into_shared()` (Meta 0.8.43 does; a plain
 `Arc::new` never runs it). `council_id` may contain only ASCII alphanumerics,
 `-` and `_` (the derived default is `agent-<uuid>`). On a
 one-shot host, or for a plain-session convener on a host without a

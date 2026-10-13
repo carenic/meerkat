@@ -14488,6 +14488,159 @@ mod tests {
         assert_eq!(session.provider_reads.load(AtomicOrdering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn production_sideband_close_retains_entered_seed_reservation_until_actual_settlement() {
+        // A close request or a dropped resolution waiter is not proof that
+        // entered seed work settled. The spawned seed task owns the process
+        // open-projection reservation and stays in sideband custody until the
+        // provider settles it; only that settlement returns the reservation,
+        // and the retained acknowledgement is never replayed.
+        fn custody_state(custody: &ExperimentalGptLiveSeedCustody) -> &'static str {
+            match custody {
+                ExperimentalGptLiveSeedCustody::Pending(_) => "pending",
+                ExperimentalGptLiveSeedCustody::InFlight { .. } => "in flight",
+                ExperimentalGptLiveSeedCustody::Ready => "ready",
+                ExperimentalGptLiveSeedCustody::Failed(_) => "failed",
+            }
+        }
+
+        let session = Arc::new(ControlledSeedBrokerSession {
+            seed_calls: AtomicUsize::new(0),
+            provider_reads: AtomicUsize::new(0),
+            started: Notify::new(),
+            release: Notify::new(),
+            commentary: Mutex::new(ControlledSeedCommentary::NotCalled),
+        });
+        let admission = meerkat_core::RealtimeOpenProjectionAdmission::new(1, 1)
+            .expect("isolated seed projection admission");
+        let seed = ExperimentalGptLiveInitialSeed {
+            context: GptLiveSeedContext::Commentary(Some("exact canonical commentary".to_string())),
+            canonical_seed_cursor: 7,
+            _projection_lease: admission.try_acquire().expect("projection lease"),
+        };
+        let binding = ProviderWebrtcBinding::new(
+            meerkat_live::LiveChannelId::new("closed-seed-release"),
+            meerkat_core::SessionId::new(),
+            meerkat_live::LiveRuntimeBindingGeneration::new(1),
+            meerkat_live::LiveRuntimeBindingFence::new(1),
+        );
+        let (synthetic_tx, synthetic_rx) = mpsc::channel(8);
+        let sideband = Arc::new(ExperimentalGptLiveSideband {
+            binding,
+            session: Arc::clone(&session) as Arc<dyn ExperimentalGptLiveBrokerSession>,
+            seed_custody: Mutex::new(ExperimentalGptLiveSeedCustody::Pending(Some(seed))),
+            seed_changed: Notify::new(),
+            correlations: Mutex::new(SidebandCorrelations::default()),
+            synthetic_tx,
+            synthetic_rx: Mutex::new(synthetic_rx),
+            closing: AtomicBool::new(false),
+        });
+
+        // 1. Real seed work enters through the production resolver, and the
+        //    controlled provider holds it.
+        let resolver_sideband = Arc::clone(&sideband);
+        let resolver = tokio::spawn(async move { resolver_sideband.resolve_initial_seed().await });
+        session.started.notified().await;
+        assert_eq!(session.seed_calls.load(AtomicOrdering::SeqCst), 1);
+        assert!(
+            matches!(
+                admission.try_acquire(),
+                Err(meerkat_core::RealtimeOpenProjectionAdmissionError::Backpressured { .. })
+            ),
+            "entered seed work holds the process reservation"
+        );
+
+        // 2. Request the provider close, then drop the resolution waiter,
+        //    while the provider still holds the seed.
+        sideband.close().await.expect("close requested");
+        assert!(sideband.closing.load(AtomicOrdering::Acquire));
+        resolver.abort();
+        let dropped_waiter = resolver.await;
+        assert!(
+            matches!(
+                admission.try_acquire(),
+                Err(meerkat_core::RealtimeOpenProjectionAdmissionError::Backpressured { .. })
+            ),
+            "neither the close request nor the dropped waiter returns the reservation"
+        );
+        {
+            let custody = sideband.seed_custody.lock().await;
+            let ExperimentalGptLiveSeedCustody::InFlight {
+                canonical_seed_cursor,
+                task,
+            } = &*custody
+            else {
+                panic!(
+                    "the entered seed task must stay in pending custody, found {}",
+                    custody_state(&custody)
+                );
+            };
+            assert_eq!(*canonical_seed_cursor, 7);
+            assert!(!task.is_finished(), "the provider still holds the seed");
+        }
+        assert!(
+            dropped_waiter
+                .expect_err("the waiter was dropped before the seed settled")
+                .is_cancelled()
+        );
+        assert_eq!(session.seed_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(session.provider_reads.load(AtomicOrdering::SeqCst), 0);
+
+        // 3. The controlled provider settles the entered seed.
+        session.release.notify_one();
+
+        // 4. The seed task's own settlement returns the reservation, with no
+        //    waiter joined to it.
+        let reacquired = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(lease) = admission.try_acquire() {
+                    break lease;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual seed settlement returns the process reservation");
+        assert!(
+            matches!(
+                admission.try_acquire(),
+                Err(meerkat_core::RealtimeOpenProjectionAdmissionError::Backpressured { .. })
+            ),
+            "settlement returned exactly one reservation"
+        );
+        {
+            let custody = sideband.seed_custody.lock().await;
+            let ExperimentalGptLiveSeedCustody::InFlight { task, .. } = &*custody else {
+                panic!(
+                    "settlement without a waiter leaves the settled task in custody, found {}",
+                    custody_state(&custody)
+                );
+            };
+            assert!(task.is_finished());
+        }
+        assert_eq!(
+            sideband.resolve_initial_seed().await,
+            Ok(7),
+            "joining the retained custody reports the original acknowledgement"
+        );
+        assert_eq!(
+            sideband.resolve_initial_seed().await,
+            Err(ProviderWebrtcBrokerError::ProtocolDrift),
+            "the acknowledgement is claimed exactly once"
+        );
+        assert_eq!(
+            session.seed_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "the provider seed is never replayed"
+        );
+        assert_eq!(
+            &*session.commentary.lock().await,
+            &ControlledSeedCommentary::Called(Some("exact canonical commentary".to_string()))
+        );
+        assert_eq!(session.provider_reads.load(AtomicOrdering::SeqCst), 0);
+        drop(reacquired);
+    }
+
     /// One refused lifecycle fact must not end the provider stream: the
     /// observation actor keeps consuming and every later lifecycle fact still
     /// reaches the activator.
@@ -14958,7 +15111,8 @@ mod tests {
         let mut builder = crate::FactoryAgentBuilder::new(factory, crate::Config::default());
         builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
         let (service, runtime) =
-            crate::surface::build_runtime_backed_service(builder, 4, persistence);
+            crate::surface::build_runtime_backed_service(builder, 4, persistence)
+                .expect("compose the runtime-backed service");
         let service = Arc::new(service);
         let session = crate::Session::new();
         let session_id = session.id().clone();
@@ -15191,7 +15345,8 @@ mod tests {
         let mut builder = crate::FactoryAgentBuilder::new(factory, crate::Config::default());
         builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
         let (service, runtime) =
-            crate::surface::build_runtime_backed_service(builder, 4, persistence);
+            crate::surface::build_runtime_backed_service(builder, 4, persistence)
+                .expect("compose the runtime-backed service");
         let service = Arc::new(service);
         let session = crate::Session::new();
         let session_id = session.id().clone();
@@ -15314,7 +15469,8 @@ mod tests {
         let mut builder = crate::FactoryAgentBuilder::new(factory, crate::Config::default());
         builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
         let (service, runtime) =
-            crate::surface::build_runtime_backed_service(builder, 4, persistence);
+            crate::surface::build_runtime_backed_service(builder, 4, persistence)
+                .expect("compose the runtime-backed service");
         let service = Arc::new(service);
         let session = crate::Session::new();
         let session_id = session.id().clone();
@@ -18798,7 +18954,8 @@ mod tests {
             let mut builder = crate::FactoryAgentBuilder::new(factory, config);
             builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
             let (service, runtime) =
-                crate::surface::build_runtime_backed_service(builder, 4, persistence);
+                crate::surface::build_runtime_backed_service(builder, 4, persistence)
+                    .expect("compose the runtime-backed service");
             let service = Arc::new(service);
             let projection = Arc::new(crate::surface::ServiceLiveProjection::new(
                 Arc::clone(&service),
@@ -22137,7 +22294,8 @@ mod tests {
         let mut builder = crate::FactoryAgentBuilder::new(factory, config);
         builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
         let (service, runtime) =
-            crate::surface::build_runtime_backed_service(builder, 4, persistence);
+            crate::surface::build_runtime_backed_service(builder, 4, persistence)
+                .expect("compose the runtime-backed service");
         let service = Arc::new(service);
 
         let projection = Arc::new(crate::surface::ServiceLiveProjection::new(
@@ -25128,7 +25286,8 @@ mod tests {
             let mut builder = crate::FactoryAgentBuilder::new(factory, config);
             builder.default_llm_client = Some(client.clone());
             let (service, runtime) =
-                crate::surface::build_runtime_backed_service(builder, 4, persistence);
+                crate::surface::build_runtime_backed_service(builder, 4, persistence)
+                    .expect("compose the runtime-backed service");
             let service = Arc::new(service);
             let session = crate::Session::new();
             let session_id = session.id().clone();

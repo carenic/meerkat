@@ -213,6 +213,11 @@ pub enum OAuthError {
     /// request is sent with another client.
     #[error(transparent)]
     HttpClientUnavailable(#[from] CredentialHttpClientUnavailable),
+    /// The host egress profile refused the endpoint's resolved destination;
+    /// nothing was connected. A local refusal, never evidence about the
+    /// credential.
+    #[error("credential endpoint refused by the host egress profile: {0}")]
+    EgressRefused(crate::http_egress::HttpEgressRefusal),
 }
 
 /// The redirect-free HTTP client for server-to-server credential requests
@@ -317,6 +322,7 @@ impl std::fmt::Debug for OAuthError {
             Self::HttpClientUnavailable(error) => {
                 f.debug_tuple("HttpClientUnavailable").field(error).finish()
             }
+            Self::EgressRefused(refusal) => f.debug_tuple("EgressRefused").field(refusal).finish(),
         }
     }
 }
@@ -370,7 +376,9 @@ pub fn oauth_refresh_observation(error: &OAuthError) -> RefreshFailureObservatio
         | OAuthError::Timeout
         | OAuthError::InvalidConfig(_)
         | OAuthError::RedirectRefused { .. }
-        | OAuthError::HttpClientUnavailable(_) => RefreshFailureObservation::transient(),
+        | OAuthError::HttpClientUnavailable(_)
+        // A local egress refusal says nothing about the credential.
+        | OAuthError::EgressRefused(_) => RefreshFailureObservation::transient(),
         OAuthError::AuthorizationPending => {
             RefreshFailureObservation::oauth_error_code("authorization_pending")
         }

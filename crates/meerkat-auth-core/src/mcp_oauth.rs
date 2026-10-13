@@ -23,11 +23,14 @@ use crate::auth_oauth::{
 };
 use crate::auth_store::{
     CredentialMutationError, PersistedAuthMode, PersistedTokens, ProviderAuthPersistence,
-    RefreshCoordinator, RefreshError, TokenKey, TokenStore,
+    RefreshCoordinator, RefreshError, TokenKey, TokenStore, TokenStoreAccess,
 };
 use crate::connector_oauth::{
     AccountSelection, AccountVerification, ConnectorAccountObservation, ConnectorOAuthDescriptor,
     ConnectorOAuthParameters, ConnectorOAuthRefusal, McpCredentialBinding, OAuthBrowserActionRef,
+};
+use crate::http_egress::{
+    HttpEgressError, HttpEgressProfile, HttpEgressRefusal, HttpEgressUnavailable,
 };
 use crate::oauth_flow::{
     OAuthBrowserFlowCompletion, OAuthBrowserFlowIdentity, OAuthFlowAuthority, OAuthFlowError,
@@ -69,6 +72,10 @@ pub struct McpServerIdentity {
     server_name: String,
     server_url: String,
     selection: McpAccountSelection,
+    /// The Meerkat realm whose credential this is. `None` only for an identity
+    /// built by the realm-less constructors, which name the shared pre-realm
+    /// slot; native hosts bind every target to their runtime realm.
+    realm: Option<RealmId>,
 }
 
 /// How an MCP target's OAuth credential is bound to a provider account.
@@ -121,6 +128,42 @@ impl McpServerIdentity {
             server_name: server_name.into(),
             server_url: server_url.into(),
             selection: McpAccountSelection::Legacy,
+            realm: None,
+        }
+    }
+
+    /// The same target in `realm`: its own credential slot, lifecycle lease
+    /// and login attempts, never shared with another realm or with the
+    /// realm-less slot.
+    pub fn in_realm(mut self, realm: RealmId) -> Self {
+        self.realm = Some(realm);
+        self
+    }
+
+    /// [`Self::from_config`] in `realm`.
+    pub fn from_config_in_realm(
+        realm: RealmId,
+        config: &meerkat_core::McpServerConfig,
+    ) -> Result<Self, McpOAuthError> {
+        Ok(Self::from_config(config)?.in_realm(realm))
+    }
+
+    /// The realm of the credential, when the target names one.
+    pub fn realm(&self) -> Option<&RealmId> {
+        self.realm.as_ref()
+    }
+
+    /// The target as a host serving `host_realm` addresses it: bound to that
+    /// realm when it names none, refused when it names another
+    /// ([`McpOAuthError::RealmMismatch`]), unchanged for a realm-less host.
+    pub fn scoped_to(&self, host_realm: Option<&RealmId>) -> Result<Self, McpOAuthError> {
+        match (host_realm, &self.realm) {
+            (None, _) => Ok(self.clone()),
+            (Some(host), None) => Ok(self.clone().in_realm(host.clone())),
+            (Some(host), Some(own)) if host == own => Ok(self.clone()),
+            (Some(_), Some(_)) => Err(McpOAuthError::RealmMismatch {
+                server_name: self.server_name.clone(),
+            }),
         }
     }
 
@@ -232,6 +275,12 @@ impl McpServerIdentity {
         hasher.update(self.server_name.as_bytes());
         hasher.update(b"\0");
         hasher.update(self.server_url.as_bytes());
+        // A realm-scoped target has its own slot per realm. The realm-less
+        // slot keeps its pre-realm digest and is never read for a realm.
+        if let Some(realm) = &self.realm {
+            hasher.update(b"\0mcp-realm-v1\0");
+            hasher.update(realm.as_str().as_bytes());
+        }
         // Each selection mode has its own key tag, so the slots of Known,
         // Discover, Unverified and legacy targets never coincide.
         match &self.selection {
@@ -290,6 +339,7 @@ impl std::fmt::Debug for McpServerIdentity {
             .field("server_name", &self.server_name)
             .field("server_url", &self.server_url)
             .field("account_selection", &self.selection.mode_name())
+            .field("realm", &self.realm.as_ref().map(RealmId::as_str))
             .finish()
     }
 }
@@ -357,6 +407,13 @@ pub trait McpOAuthAccountStrategy: Send + Sync {
     async fn preflight(&self, _issuer: &str) -> Result<(), ConnectorOAuthRefusal> {
         Ok(())
     }
+
+    /// The host egress profile this strategy's own HTTP traffic enforces, if
+    /// any. A credential owner under a required profile is bound to it only
+    /// when its strategy enforces that same profile. Default: none.
+    fn http_egress(&self) -> Option<HttpEgressProfile> {
+        None
+    }
 }
 
 /// Stable strategy identifier bound into OIDC UserInfo descriptors.
@@ -386,6 +443,9 @@ pub struct OidcUserInfoAccountStrategy {
     /// and never falls back to a client that follows redirects.
     http: Result<Client, CredentialHttpClientUnavailable>,
     required_scopes: std::collections::BTreeSet<String>,
+    /// The host egress profile every request of this strategy is admitted
+    /// by; a required profile also supplies the client.
+    egress: HttpEgressProfile,
 }
 
 impl Default for OidcUserInfoAccountStrategy {
@@ -401,6 +461,7 @@ impl OidcUserInfoAccountStrategy {
         Self {
             http: no_redirect_client(),
             required_scopes: std::collections::BTreeSet::new(),
+            egress: HttpEgressProfile::trusted_host(),
         }
     }
 
@@ -408,13 +469,32 @@ impl OidcUserInfoAccountStrategy {
         Self {
             http: Ok(http),
             required_scopes: std::collections::BTreeSet::new(),
+            egress: HttpEgressProfile::trusted_host(),
         }
     }
 
-    fn http(&self) -> Result<&Client, ConnectorOAuthRefusal> {
-        self.http
-            .as_ref()
-            .map_err(|_| ConnectorOAuthRefusal::VerificationUnavailable)
+    /// Enforce the host's egress `profile` for every request of this
+    /// strategy. A required profile admits each URL and supplies the
+    /// redirect-free client; a refusal is a local verification refusal.
+    #[must_use]
+    pub fn with_http_egress(mut self, profile: &HttpEgressProfile) -> Self {
+        self.egress = profile.clone();
+        self
+    }
+
+    /// The client for one request to `url`, after the egress profile admits
+    /// it.
+    fn http_for(&self, url: &str) -> Result<&Client, ConnectorOAuthRefusal> {
+        self.egress
+            .admit(url)
+            .map_err(verification_egress_refusal)?;
+        match self.egress.credential_client() {
+            Some(client) => client.map_err(|_| ConnectorOAuthRefusal::VerificationUnavailable),
+            None => self
+                .http
+                .as_ref()
+                .map_err(|_| ConnectorOAuthRefusal::VerificationUnavailable),
+        }
     }
 
     /// Additional scopes the MCP resource requires, requested alongside
@@ -458,6 +538,8 @@ impl McpOAuthAccountStrategy for OidcUserInfoAccountStrategy {
             scopes,
             expected_account: context.account.clone(),
             strategy_id: OIDC_USERINFO_STRATEGY_ID.to_owned(),
+            client_auth_profile: None,
+            protocol: None,
         }
         .try_into()
     }
@@ -475,6 +557,10 @@ impl McpOAuthAccountStrategy for OidcUserInfoAccountStrategy {
     async fn preflight(&self, issuer: &str) -> Result<(), ConnectorOAuthRefusal> {
         self.userinfo_endpoint(issuer).await.map(|_| ())
     }
+
+    fn http_egress(&self) -> Option<HttpEgressProfile> {
+        self.egress.is_required().then(|| self.egress.clone())
+    }
 }
 
 impl OidcUserInfoAccountStrategy {
@@ -488,11 +574,11 @@ impl OidcUserInfoAccountStrategy {
             issuer.trim_end_matches('/')
         );
         let configuration: OpenIdConfiguration = self
-            .http()?
+            .http_for(&configuration_url)?
             .get(&configuration_url)
             .send()
             .await
-            .map_err(unavailable)?
+            .map_err(verification_send_error)?
             .error_for_status()
             .map_err(unavailable)?
             .json()
@@ -524,12 +610,12 @@ impl OidcUserInfoAccountStrategy {
         let facts = descriptor.parameters();
         let userinfo_url = self.userinfo_endpoint(&facts.issuer).await?;
         let userinfo: OidcUserInfo = self
-            .http()?
+            .http_for(userinfo_url.as_str())?
             .get(userinfo_url)
             .bearer_auth(&tokens.access_token)
             .send()
             .await
-            .map_err(unavailable)?
+            .map_err(verification_send_error)?
             .error_for_status()
             .map_err(unavailable)?
             .json()
@@ -546,6 +632,38 @@ impl OidcUserInfoAccountStrategy {
             account: userinfo.sub,
             granted_scopes,
         })
+    }
+}
+
+/// A verification request the host egress profile did not admit: a typed
+/// local refusal, never evidence about the account.
+fn verification_egress_refusal(error: HttpEgressError) -> ConnectorOAuthRefusal {
+    match error {
+        HttpEgressError::Refused(refusal) => ConnectorOAuthRefusal::EgressRefused(refusal),
+        HttpEgressError::Unavailable(_) => ConnectorOAuthRefusal::VerificationUnavailable,
+    }
+}
+
+/// A failed verification request: the egress profile's own resolver
+/// refusal stays typed; anything else is unavailable evidence.
+fn verification_send_error(error: reqwest::Error) -> ConnectorOAuthRefusal {
+    crate::http_egress::egress_refusal_in(&error).map_or(
+        ConnectorOAuthRefusal::VerificationUnavailable,
+        ConnectorOAuthRefusal::EgressRefused,
+    )
+}
+
+/// A failed OAuth request of the credential owner: the egress profile's own
+/// resolver refusal is the typed egress outcome; anything else is
+/// `otherwise`.
+fn oauth_send_error(
+    target: &McpServerIdentity,
+    error: reqwest::Error,
+    otherwise: impl FnOnce(reqwest::Error) -> McpOAuthError,
+) -> McpOAuthError {
+    match crate::http_egress::egress_refusal_in(&error) {
+        Some(refusal) => McpOAuthError::from_egress(target, HttpEgressError::Refused(refusal)),
+        None => otherwise(error),
     }
 }
 
@@ -628,6 +746,12 @@ pub struct McpOAuthPendingLogin {
     completion: PendingCompletion,
     /// What the completion's own retire guard observed, if it ran.
     guard_retirement: RetireObserver,
+    /// This login's wake-up registration: a confirmed retirement of its
+    /// attempt (cancel by state or reference, logout, a cancel handle) ends
+    /// the wait.
+    wake: AttemptWakeRegistration,
+    /// A wait observed the flow owner's confirmed retirement of the attempt.
+    confirmed_retired: bool,
 }
 
 /// Whether, and how, the code reached the canonical completion.
@@ -684,11 +808,46 @@ pub struct McpOAuthPendingClose {
     pub listener: McpOAuthListenerCleanup,
 }
 
+/// Retires one pending loopback login's attempt from another task. Holds no
+/// code; the state stays redacted in `Debug`.
+#[derive(Clone)]
+pub struct McpOAuthCancelHandle {
+    authority: McpOAuthAuthority,
+    start: McpOAuthLoginStart,
+}
+
+impl McpOAuthCancelHandle {
+    /// Retire the attempt through its flow owner. A confirmed retirement
+    /// wakes the login's wait; an absent attempt (completed, retired or
+    /// expired) is `Flow(Missing)` and wakes nothing.
+    pub fn cancel(&self) -> Result<(), McpOAuthError> {
+        self.authority.login_cancel(&self.start.target, &self.start)
+    }
+}
+
+impl std::fmt::Debug for McpOAuthCancelHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpOAuthCancelHandle")
+            .field("server_name", &self.start.target.server_name())
+            .finish_non_exhaustive()
+    }
+}
+
 impl McpOAuthPendingLogin {
     /// Host-only browser navigation for this attempt (see
     /// [`McpOAuthLoginStart`]).
     pub fn start(&self) -> &McpOAuthLoginStart {
         &self.start
+    }
+
+    /// A handle another task can use to retire this login's attempt. Its
+    /// retirement goes through the flow owner like any cancel, and the
+    /// confirmed retirement wakes this login's wait.
+    pub fn cancel_handle(&self) -> McpOAuthCancelHandle {
+        McpOAuthCancelHandle {
+            authority: self.authority.clone(),
+            start: self.start.clone(),
+        }
     }
 
     /// Launch the browser with `open` on the blocking pool, never on the
@@ -716,20 +875,47 @@ impl McpOAuthPendingLogin {
     ///
     /// The wait keeps the listener's legacy tie: like `tokio::time::timeout`,
     /// it polls the callback and drain once before the window is consulted.
+    ///
+    /// A confirmed retirement of the attempt (cancel by state or reference,
+    /// logout, a [`cancel_handle`](Self::cancel_handle)) ends the wait with
+    /// [`McpOAuthError::AttemptRetired`], carrying this login's
+    /// [`close`](Self::close) receipt: the listener is joined first.
     pub async fn complete(self, timeout: Duration) -> Result<McpOAuthLoginComplete, McpOAuthError> {
         let mut pending = self;
         let server_name = pending.start.target.server_name().to_owned();
-        let Some(callback) = pending.callback.take() else {
-            return Err(McpOAuthError::HumanAuthorizationRequired { server_name });
-        };
-        pending.listener = Some(McpOAuthListenerCleanup::NotReported);
         let window = timeout.min(pending.start.remaining());
-        // A failed wait leaves the attempt admitted: dropping `pending`
-        // retires it.
-        let outcome = callback
-            .wait(window)
-            .await
-            .map_err(|error| callback_wait_error(server_name, error))?;
+        let deadline = tokio::time::Instant::now() + window;
+        let step = {
+            let McpOAuthPendingLogin { callback, wake, .. } = &mut pending;
+            let Some(callback) = callback.as_mut() else {
+                return Err(McpOAuthError::HumanAuthorizationRequired { server_name });
+            };
+            tokio::select! {
+                biased;
+                () = wake.retired() => None,
+                outcome = callback.wait_poll_first(deadline) => Some(outcome),
+            }
+        };
+        let outcome = match step {
+            None => {
+                pending.confirmed_retired = true;
+                let cleanup = pending.close().await;
+                return Err(McpOAuthError::AttemptRetired {
+                    server_name,
+                    cleanup: Some(Box::new(cleanup)),
+                });
+            }
+            // A failed wait leaves the attempt admitted: dropping `pending`
+            // retires it.
+            Some(outcome) => outcome.map_err(|error| callback_wait_error(server_name, error))?,
+        };
+        if let Some(callback) = pending.callback.take() {
+            // The delivered wait already joined the drain.
+            pending.listener = Some(match callback.close().await {
+                Ok(closed) => McpOAuthListenerCleanup::Joined(closed),
+                Err(error) => McpOAuthListenerCleanup::Failed(error),
+            });
+        }
         pending.run_completion(outcome).await
     }
 
@@ -751,14 +937,28 @@ impl McpOAuthPendingLogin {
         deadline: tokio::time::Instant,
     ) -> Result<McpOAuthLoginComplete, McpOAuthError> {
         let server_name = self.start.target.server_name().to_owned();
-        let Some(callback) = self.callback.as_mut() else {
-            return Err(McpOAuthError::HumanAuthorizationRequired { server_name });
-        };
         let expires = tokio::time::Instant::from_std(self.start.expires_at);
-        let outcome = callback
-            .wait_until(deadline.min(expires))
-            .await
-            .map_err(|error| callback_wait_error(server_name, error))?;
+        let step = {
+            let McpOAuthPendingLogin { callback, wake, .. } = &mut *self;
+            let Some(callback) = callback.as_mut() else {
+                return Err(McpOAuthError::HumanAuthorizationRequired { server_name });
+            };
+            tokio::select! {
+                biased;
+                () = wake.retired() => None,
+                outcome = callback.wait_until(deadline.min(expires)) => Some(outcome),
+            }
+        };
+        let Some(outcome) = step else {
+            // The flow owner confirmed the retirement. The listener stays with
+            // this login for its joined `close`.
+            self.confirmed_retired = true;
+            return Err(McpOAuthError::AttemptRetired {
+                server_name,
+                cleanup: None,
+            });
+        };
+        let outcome = outcome.map_err(|error| callback_wait_error(server_name, error))?;
         if let Some(callback) = self.callback.take() {
             // The delivered wait already joined the drain, so this close
             // returns its recorded result without suspending.
@@ -810,6 +1010,11 @@ impl McpOAuthPendingLogin {
         let completion = std::mem::replace(&mut pending.completion, PendingCompletion::Consumed);
         let attempt = match completion {
             PendingCompletion::Consumed => McpOAuthAttemptCleanup::Consumed,
+            // The flow owner confirmed a retirement of this attempt, whether
+            // or not a wait observed it.
+            _ if pending.confirmed_retired || *pending.wake.retired.borrow() => {
+                McpOAuthAttemptCleanup::Retired
+            }
             completion => {
                 let guard = pending.guard_retirement.lock().take();
                 match guard {
@@ -894,7 +1099,10 @@ fn attempt_cleanup(
 
 impl Drop for McpOAuthPendingLogin {
     fn drop(&mut self) {
-        if self.completion != PendingCompletion::Consumed {
+        if self.completion != PendingCompletion::Consumed
+            && !self.confirmed_retired
+            && !*self.wake.retired.borrow()
+        {
             // Best effort, result unobserved: the exact attempt is retired
             // unless a completion consumed it. Retiring one the completion's
             // guard already retired is a harmless `Missing`.
@@ -996,7 +1204,8 @@ struct AttemptRetireGuard {
 impl Drop for AttemptRetireGuard {
     fn drop(&mut self) {
         if self.armed {
-            let retired = self.authority.expire(
+            let retired = retire_attempt(
+                self.authority.as_ref(),
                 &self.state,
                 &self.target,
                 self.identity.clone(),
@@ -1047,6 +1256,10 @@ pub struct McpOAuthLoginComplete {
 pub enum McpOAuthError {
     #[error("MCP OAuth expected account selection is invalid")]
     InvalidAccountSelection,
+    /// The target names another realm than the authority serves. Realms
+    /// never share or reach each other's MCP credentials.
+    #[error("MCP server '{server_name}' belongs to another realm than this host serves")]
+    RealmMismatch { server_name: String },
     #[error("MCP OAuth interactive login requires an explicit expected account")]
     AccountSelectionRequired,
     #[error(
@@ -1079,6 +1292,13 @@ pub enum McpOAuthError {
     RefreshFailed { server_name: String, reason: String },
     #[error("MCP OAuth token store error: {0}")]
     TokenStore(String),
+    /// The credential store refused access (denied, interaction required,
+    /// pending or unavailable): never a refresh failure or absence.
+    #[error("MCP OAuth credential access refused ({refusal}): {detail}")]
+    CredentialAccess {
+        refusal: meerkat_core::auth::TokenStoreRefusal,
+        detail: String,
+    },
     #[error("MCP OAuth token key error for '{server_name}': {reason}")]
     TokenKey { server_name: String, reason: String },
     #[error("MCP OAuth metadata missing from stored token for '{server_name}'")]
@@ -1100,10 +1320,43 @@ pub enum McpOAuthError {
     /// OAuth request is sent.
     #[error(transparent)]
     HttpClientUnavailable(CredentialHttpClientUnavailable),
+    /// The flow owner confirmed the retirement of the attempt a loopback wait
+    /// was serving (cancel by state or reference, logout, a cancel handle).
+    /// A consuming wait carries its joined close receipt; a borrowed wait
+    /// leaves the listener with the login for its own close.
+    #[error("MCP OAuth login for '{server_name}' was cancelled")]
+    AttemptRetired {
+        server_name: String,
+        cleanup: Option<Box<McpOAuthPendingClose>>,
+    },
+    /// A loopback login admitted its attempt, but reading it back from the
+    /// flow owner failed. The login's own close then ran: `cleanup` reports
+    /// the attempt retirement and the listener join beside the read fault.
+    #[error("MCP OAuth login for '{server_name}' could not confirm its admitted attempt: {read}")]
+    AdmissionReadFailed {
+        server_name: String,
+        read: Box<McpOAuthError>,
+        cleanup: Box<McpOAuthPendingClose>,
+    },
     #[error("MCP OAuth credential slot for '{server_name}' refused the login: {refusal}")]
     CredentialSlot {
         server_name: String,
         refusal: crate::auth_store::CredentialSlotRefusal,
+    },
+    /// The host's required egress profile refused an OAuth endpoint (or the
+    /// MCP target itself) before anything was sent to it.
+    #[error("MCP OAuth for '{server_name}' was refused by the host egress profile: {refusal}")]
+    EgressRefused {
+        server_name: String,
+        refusal: HttpEgressRefusal,
+    },
+    /// The host's required egress profile cannot be enforced for this
+    /// credential owner (an invalid policy, an unbuildable client, or an
+    /// account strategy not bound to the same profile). Nothing was sent.
+    #[error("MCP OAuth for '{server_name}' cannot enforce the host egress profile: {reason}")]
+    EgressUnavailable {
+        server_name: String,
+        reason: HttpEgressUnavailable,
     },
 }
 
@@ -1117,15 +1370,19 @@ impl McpOAuthError {
             Self::InvalidAccountSelection
             | Self::AccountSelectionRequired
             | Self::UnsupportedAccountSelection
+            | Self::RealmMismatch { .. }
             | Self::Verification(_)
             | Self::MissingStoredToken { .. }
             | Self::HumanAuthorizationRequired { .. }
             | Self::ReauthRequired { .. }
             | Self::DisconnectRequired { .. }
             | Self::CredentialSlot { .. }
+            | Self::AttemptRetired { .. }
+            | Self::EgressRefused { .. }
             | Self::TokenKey { .. } => true,
             // Flow-owner persistence and lifecycle failures are not refusals.
             Self::Flow(error) => error.is_refusal(),
+            Self::AdmissionReadFailed { read, .. } => read.is_refusal(),
             Self::StalePreparation
             | Self::Callback { .. }
             | Self::DiscoveryFailed { .. }
@@ -1133,9 +1390,27 @@ impl McpOAuthError {
             | Self::TokenExchangeFailed { .. }
             | Self::RefreshFailed { .. }
             | Self::TokenStore(_)
+            | Self::CredentialAccess { .. }
             | Self::MissingStoredMetadata { .. }
             | Self::HttpClientUnavailable(_)
+            | Self::EgressUnavailable { .. }
             | Self::AuthLifecycle { .. } => false,
+        }
+    }
+
+    /// The typed MCP OAuth outcome of a required egress profile that did not
+    /// admit an effect for `target`.
+    pub fn from_egress(target: &McpServerIdentity, error: HttpEgressError) -> Self {
+        let server_name = target.server_name().to_owned();
+        match error {
+            HttpEgressError::Refused(refusal) => Self::EgressRefused {
+                server_name,
+                refusal,
+            },
+            HttpEgressError::Unavailable(reason) => Self::EgressUnavailable {
+                server_name,
+                reason,
+            },
         }
     }
 }
@@ -1157,9 +1432,33 @@ pub struct McpOAuthAuthority {
         Arc<dyn OAuthFlowAuthority>,
         Arc<dyn McpOAuthAccountStrategy>,
     )>,
+    /// The host runtime realm every target is bound to, when the host serves
+    /// one. Each entry point scopes its target to it first, so keys, leases
+    /// and attempts never fall back to the realm-less shared slot.
+    realm: Option<RealmId>,
+    /// The host egress profile every OAuth request of this authority is
+    /// admitted by; a required profile also supplies its client.
+    egress: HttpEgressProfile,
 }
 
 impl McpOAuthAuthority {
+    /// Serve `realm`: every target is bound to it, and a target of another
+    /// realm is refused ([`McpOAuthError::RealmMismatch`]).
+    pub fn in_realm(mut self, realm: RealmId) -> Self {
+        self.realm = Some(realm);
+        self
+    }
+
+    /// The realm this authority serves, if any.
+    pub fn realm(&self) -> Option<&RealmId> {
+        self.realm.as_ref()
+    }
+
+    /// `target` bound to this authority's realm.
+    fn scoped(&self, target: &McpServerIdentity) -> Result<McpServerIdentity, McpOAuthError> {
+        target.scoped_to(self.realm.as_ref())
+    }
+
     /// The default HTTP client follows no redirects: metadata, client
     /// registration and token requests go only to validated endpoints.
     pub fn new(
@@ -1171,6 +1470,8 @@ impl McpOAuthAuthority {
             provider_auth_persistence,
             auth_lease,
             interactive: None,
+            realm: None,
+            egress: HttpEgressProfile::trusted_host(),
         }
     }
 
@@ -1186,7 +1487,58 @@ impl McpOAuthAuthority {
             provider_auth_persistence,
             auth_lease,
             interactive: None,
+            realm: None,
+            egress: HttpEgressProfile::trusted_host(),
         }
+    }
+
+    /// Enforce the host's egress `profile` for every OAuth request of this
+    /// authority: discovery, client registration, code exchange and refresh.
+    /// A required profile admits each endpoint URL before it is sent and
+    /// supplies the redirect-free client (with its own resolver and no
+    /// ambient proxy), replacing this authority's client. An account
+    /// strategy is bound separately (for the native strategy,
+    /// [`OidcUserInfoAccountStrategy::with_http_egress`]).
+    #[must_use]
+    pub fn with_http_egress(mut self, profile: &HttpEgressProfile) -> Self {
+        self.egress = profile.clone();
+        self
+    }
+
+    /// The required egress profile this authority enforces for all of its
+    /// OAuth traffic, its interactive account strategy included; `None` for
+    /// a trusted-host authority or one whose strategy is not bound to the
+    /// same profile.
+    pub fn bound_http_egress(&self) -> Option<&HttpEgressProfile> {
+        if !self.egress.is_required() {
+            return None;
+        }
+        let strategy_bound = self.interactive.as_ref().is_none_or(|(_, strategy)| {
+            strategy
+                .http_egress()
+                .is_some_and(|bound| bound.same_profile(&self.egress))
+        });
+        strategy_bound.then_some(&self.egress)
+    }
+
+    /// Refuse a ceremony whose account strategy would send OAuth traffic
+    /// outside this authority's required egress profile.
+    fn require_bound_strategy(
+        &self,
+        target: &McpServerIdentity,
+        strategy: &dyn McpOAuthAccountStrategy,
+    ) -> Result<(), McpOAuthError> {
+        if self.egress.is_required()
+            && !strategy
+                .http_egress()
+                .is_some_and(|bound| bound.same_profile(&self.egress))
+        {
+            return Err(McpOAuthError::from_egress(
+                target,
+                HttpEgressError::Unavailable(HttpEgressUnavailable::CredentialOwnerNotBound),
+            ));
+        }
+        Ok(())
     }
 
     /// The redirect-free HTTP client, or the typed build failure.
@@ -1194,6 +1546,20 @@ impl McpOAuthAuthority {
         self.http
             .as_ref()
             .map_err(|error| McpOAuthError::HttpClientUnavailable(*error))
+    }
+
+    /// The client for one OAuth request to `url`, after the egress profile
+    /// admits it. Nothing is sent when it is refused.
+    fn http_for(&self, target: &McpServerIdentity, url: &str) -> Result<&Client, McpOAuthError> {
+        self.egress
+            .admit(url)
+            .map_err(|error| McpOAuthError::from_egress(target, error))?;
+        match self.egress.credential_client() {
+            Some(client) => client.map_err(|reason| {
+                McpOAuthError::from_egress(target, HttpEgressError::Unavailable(reason))
+            }),
+            None => self.http(),
+        }
     }
 
     pub fn with_interactive_strategy(
@@ -1249,13 +1615,19 @@ impl McpOAuthAuthority {
         &self,
         target: &McpServerIdentity,
     ) -> Result<Option<String>, McpOAuthError> {
+        let target = &self.scoped(target)?;
         if self.interactive.is_some() && !target.is_selected() {
             return Err(McpOAuthError::AccountSelectionRequired);
         }
         let key = target.token_key()?;
         let lease_key = target.lease_key()?;
         let admitted = {
-            let _guard = meerkat_core::acquire_auth_login_lifecycle_guard(&lease_key).await;
+            // A request never waits behind an operating-system credential
+            // call that holds the lease: it answers pending at once.
+            let _guard =
+                meerkat_core::acquire_auth_login_lifecycle_guard_for_unattended(&lease_key)
+                    .await
+                    .ok_or_else(mcp_owner_busy)?;
             self.load_admitted_stored_credential(target, &key, &_guard)
                 .await?
         };
@@ -1266,9 +1638,21 @@ impl McpOAuthAuthority {
             CredentialUseDisposition::Authorized => Ok(admitted.tokens.primary_secret),
             CredentialUseDisposition::RefreshRequired
             | CredentialUseDisposition::AlreadyRefreshing => {
+                // Known before any refresh is coordinated, so nothing is
+                // exchanged: a verified refresh re-observes the subject
+                // through the account strategy, which under a required
+                // egress profile must be bound to that exact profile, and an
+                // unadmitted token endpoint is refused typed.
+                if let Some((_, strategy)) = &self.interactive
+                    && subject_to_reobserve(target, &admitted.tokens).is_some()
+                {
+                    self.require_bound_strategy(target, strategy.as_ref())?;
+                }
+                self.egress
+                    .admit(&admitted.metadata.discovery.token_endpoint)
+                    .map_err(|error| McpOAuthError::from_egress(target, error))?;
                 let authority = self.clone();
                 let refresh_target = target.clone();
-                let error_target = refresh_target.clone();
                 let refresh_key = key.clone();
                 let refreshed = self
                     .refresh_coordinator()
@@ -1286,7 +1670,7 @@ impl McpOAuthAuthority {
                         }),
                     )
                     .await
-                    .map_err(|error| map_coordinated_refresh_error(&error_target, error))?;
+                    .map_err(|error| map_coordinated_refresh_error(target, error))?;
                 // A coordinator may return another waiter's result. Recheck
                 // the selected subject on that exact result before use.
                 verify_stored_account(target, &refreshed)?;
@@ -1333,11 +1717,13 @@ impl McpOAuthAuthority {
         redirect_uri: &str,
         www_authenticate: Option<&str>,
     ) -> Result<McpOAuthLoginStart, McpOAuthError> {
+        let target = &self.scoped(target)?;
         self.validate_interactive_selection(target)?;
         let (authority, strategy) = self
             .interactive
             .as_ref()
             .ok_or(ConnectorOAuthRefusal::VerificationUnavailable)?;
+        self.require_bound_strategy(target, strategy.as_ref())?;
         require_loopback_redirect(redirect_uri)?;
         let credential_identity: meerkat_core::AuthCredentialIdentity =
             target.auth_binding_ref()?.into();
@@ -1461,11 +1847,12 @@ impl McpOAuthAuthority {
         &self,
         target: &McpServerIdentity,
     ) -> Result<Option<SlotOccupant>, McpOAuthError> {
+        // A login start reads the slot it may publish into: interactive.
         let Some(tokens) = self
             .token_store()
-            .load(&target.token_key()?)
+            .load_for(&target.token_key()?, TokenStoreAccess::Interactive)
             .await
-            .map_err(|error| McpOAuthError::TokenStore(error.to_string()))?
+            .map_err(mcp_store_error)?
         else {
             return Ok(None);
         };
@@ -1502,14 +1889,14 @@ impl McpOAuthAuthority {
             // A failed retirement is propagated: no fresh attempt is admitted
             // beside one the flow owner still holds.
             if let Some((authority, _)) = self.interactive.as_ref() {
-                authority
-                    .expire(
-                        state,
-                        &record.target,
-                        record.provider.clone(),
-                        &record.redirect_uri,
-                    )
-                    .map_err(McpOAuthError::Flow)?;
+                retire_attempt(
+                    authority.as_ref(),
+                    state,
+                    &record.target,
+                    record.provider.clone(),
+                    &record.redirect_uri,
+                )
+                .map_err(McpOAuthError::Flow)?;
             }
             return Ok(None);
         }
@@ -1552,6 +1939,10 @@ impl McpOAuthAuthority {
         target: &McpServerIdentity,
         www_authenticate: Option<&str>,
     ) -> Result<McpOAuthLoopbackBegin, McpOAuthError> {
+        let target = &self.scoped(target)?;
+        // Everything fallible that needs no admission runs before it.
+        let credential_identity: meerkat_core::AuthCredentialIdentity =
+            target.auth_binding_ref()?.into();
         let binding = bind_loopback_callback(MCP_OAUTH_CALLBACK_PATH)
             .await
             .map_err(|_| McpOAuthError::Callback {
@@ -1572,15 +1963,41 @@ impl McpOAuthAuthority {
             let _ = binding.cancel().await;
             return Ok(McpOAuthLoopbackBegin::Joined(start));
         }
+        // The attempt is admitted: this login takes its cleanup custody at
+        // once. The wake-up is registered before the attempt is read back
+        // from its flow owner, so a retirement between admission and
+        // registration is not lost: this read observes it, or the wait does.
+        let wake = AttemptWakeRegistration::register(&start.state);
         let callback = binding.expect_state(start.state.clone());
-        Ok(McpOAuthLoopbackBegin::Started(McpOAuthPendingLogin {
+        let pending = McpOAuthPendingLogin {
             authority: self.clone(),
             start,
             callback: Some(callback),
             listener: None,
             completion: PendingCompletion::NotEntered,
             guard_retirement: RetireObserver::default(),
-        }))
+            wake,
+            confirmed_retired: false,
+        };
+        let live = match self.interactive.as_ref() {
+            Some((authority, _)) => authority
+                .admitted_connector_browser_attempt(&pending.start.state, &credential_identity)
+                .map_err(McpOAuthError::Flow),
+            None => Err(ConnectorOAuthRefusal::VerificationUnavailable.into()),
+        };
+        let read = match live {
+            Ok(Some(_)) => return Ok(McpOAuthLoopbackBegin::Started(pending)),
+            Ok(None) => McpOAuthError::Flow(OAuthFlowError::Missing),
+            Err(error) => error,
+        };
+        // The read-back failed: retire the attempt and join the listener
+        // through the login's own close, and report both beside the fault.
+        let cleanup = pending.close().await;
+        Err(McpOAuthError::AdmissionReadFailed {
+            server_name: target.server_name().to_owned(),
+            read: Box::new(read),
+            cleanup: Box::new(cleanup),
+        })
     }
 
     /// Complete one admitted attempt from the host's loopback callback.
@@ -1611,11 +2028,13 @@ impl McpOAuthAuthority {
         callback: McpOAuthCallback,
         observed: Option<RetireObserver>,
     ) -> Result<McpOAuthLoginComplete, McpOAuthError> {
+        let target = &self.scoped(target)?;
         self.validate_interactive_selection(target)?;
         let (authority, strategy) = self
             .interactive
             .as_ref()
             .ok_or(ConnectorOAuthRefusal::VerificationUnavailable)?;
+        self.require_bound_strategy(target, strategy.as_ref())?;
         let McpOAuthCallback {
             redirect_uri,
             state,
@@ -1682,18 +2101,24 @@ impl McpOAuthAuthority {
             token_endpoint_auth_method: "none".to_owned(),
             redirect_uri: record.redirect_uri.clone(),
         };
+        let endpoints = mcp_oauth_endpoints(&discovery, &client);
         let token = exchange_authorization_code_with_state(
-            self.http()?,
-            &mcp_oauth_endpoints(&discovery, &client),
+            self.http_for(target, &endpoints.token_url)?,
+            &endpoints,
             &code,
             &record.pkce_verifier,
             None,
             Some(&state),
         )
         .await
-        .map_err(|_| McpOAuthError::TokenExchangeFailed {
-            server_name: target.server_name().to_owned(),
-            reason: "authorization-code exchange failed".into(),
+        .map_err(|error| match error {
+            crate::auth_oauth::OAuthError::EgressRefused(refusal) => {
+                McpOAuthError::from_egress(target, HttpEgressError::Refused(refusal))
+            }
+            _ => McpOAuthError::TokenExchangeFailed {
+                server_name: target.server_name().to_owned(),
+                reason: "authorization-code exchange failed".into(),
+            },
         })?;
         let binding = McpCredentialBinding::for_descriptor(descriptor);
         let mut persisted = persisted_tokens_from_result(
@@ -1757,18 +2182,19 @@ impl McpOAuthAuthority {
         target: &McpServerIdentity,
         start: &McpOAuthLoginStart,
     ) -> Result<(), McpOAuthError> {
+        let target = &self.scoped(target)?;
         let (authority, _) = self
             .interactive
             .as_ref()
             .ok_or(ConnectorOAuthRefusal::VerificationUnavailable)?;
-        authority
-            .expire(
-                &start.state,
-                &target.auth_binding_ref()?.into(),
-                start.identity.clone(),
-                &start.redirect_uri,
-            )
-            .map_err(McpOAuthError::Flow)
+        retire_attempt(
+            authority.as_ref(),
+            &start.state,
+            &target.auth_binding_ref()?.into(),
+            start.identity.clone(),
+            &start.redirect_uri,
+        )
+        .map_err(McpOAuthError::Flow)
     }
 
     /// Typed cancel by `state` for hosts that keep no start projection (for
@@ -1779,6 +2205,7 @@ impl McpOAuthAuthority {
         target: &McpServerIdentity,
         state: &str,
     ) -> Result<(), McpOAuthError> {
+        let target = &self.scoped(target)?;
         let (authority, _) = self
             .interactive
             .as_ref()
@@ -1789,14 +2216,14 @@ impl McpOAuthAuthority {
             .admitted_connector_browser_attempt(state, &credential_identity)
             .map_err(McpOAuthError::Flow)?
             .ok_or(McpOAuthError::Flow(OAuthFlowError::Missing))?;
-        authority
-            .expire(
-                state,
-                &credential_identity,
-                record.provider,
-                &record.redirect_uri,
-            )
-            .map_err(McpOAuthError::Flow)
+        retire_attempt(
+            authority.as_ref(),
+            state,
+            &credential_identity,
+            record.provider,
+            &record.redirect_uri,
+        )
+        .map_err(McpOAuthError::Flow)
     }
 
     /// The attempt pending for `target`, if any, without its secrets.
@@ -1811,6 +2238,7 @@ impl McpOAuthAuthority {
         &self,
         target: &McpServerIdentity,
     ) -> Result<Option<McpOAuthPendingAttempt>, McpOAuthError> {
+        let target = &self.scoped(target)?;
         if !target.is_selected() {
             return Ok(None);
         }
@@ -1848,6 +2276,7 @@ impl McpOAuthAuthority {
         target: &McpServerIdentity,
         attempt_ref: &str,
     ) -> Result<(), McpOAuthError> {
+        let target = &self.scoped(target)?;
         let (authority, _) = self
             .interactive
             .as_ref()
@@ -1863,14 +2292,14 @@ impl McpOAuthAuthority {
         {
             return Err(McpOAuthError::Flow(OAuthFlowError::Missing));
         }
-        authority
-            .expire(
-                &state,
-                &credential_identity,
-                record.provider,
-                &record.redirect_uri,
-            )
-            .map_err(McpOAuthError::Flow)
+        retire_attempt(
+            authority.as_ref(),
+            &state,
+            &credential_identity,
+            record.provider,
+            &record.redirect_uri,
+        )
+        .map_err(McpOAuthError::Flow)
     }
 
     /// Disconnect `target`: retire every browser attempt pending for its
@@ -1881,6 +2310,7 @@ impl McpOAuthAuthority {
     /// its commit finds the attempt retired. Nothing is revoked at the
     /// provider.
     pub async fn logout(&self, target: &McpServerIdentity) -> Result<(), McpOAuthError> {
+        let target = &self.scoped(target)?;
         let credential_identity: meerkat_core::AuthCredentialIdentity =
             target.auth_binding_ref()?.into();
         if let Some((authority, _)) = self.interactive.as_ref() {
@@ -1890,14 +2320,14 @@ impl McpOAuthAuthority {
                 .pending_connector_browser_attempt(&credential_identity)
                 .map_err(McpOAuthError::Flow)?
             {
-                authority
-                    .expire(
-                        &state,
-                        &credential_identity,
-                        record.provider,
-                        &record.redirect_uri,
-                    )
-                    .map_err(McpOAuthError::Flow)?;
+                retire_attempt(
+                    authority.as_ref(),
+                    &state,
+                    &credential_identity,
+                    record.provider,
+                    &record.redirect_uri,
+                )
+                .map_err(McpOAuthError::Flow)?;
             }
         }
         meerkat_core::clear_tokens_and_publish_lifecycle_released_coordinated_for_identity(
@@ -1926,9 +2356,9 @@ impl McpOAuthAuthority {
         }
         let Some(mut tokens) = self
             .token_store()
-            .load(key)
+            .load_for(key, TokenStoreAccess::Unattended)
             .await
-            .map_err(|error| McpOAuthError::TokenStore(error.to_string()))?
+            .map_err(mcp_store_error)?
         else {
             let lease_key = target.lease_key()?;
             let snapshot = self.auth_lease.snapshot(&lease_key);
@@ -2000,10 +2430,7 @@ impl McpOAuthAuthority {
                 guard,
             )
             .await
-            .map_err(|error| McpOAuthError::AuthLifecycle {
-                server_name: target.server_name().to_string(),
-                reason: error.to_string(),
-            })?
+            .map_err(|error| mcp_rehydrate_error(target, error))?
             .ok_or_else(|| McpOAuthError::ReauthRequired {
                 server_name: target.server_name().to_string(),
             })?;
@@ -2067,13 +2494,16 @@ impl McpOAuthAuthority {
     ) -> Result<PersistedTokens, RefreshError> {
         // Before any lifecycle transition: without a redirect-free client no
         // refresh begins.
-        let http = self
-            .http()
+        self.http()
             .map_err(|error| RefreshError::Refresh(error.to_string()))?;
         let lease_key = target
             .lease_key()
             .map_err(|error| RefreshError::Refresh(error.to_string()))?;
-        let _guard = meerkat_core::acquire_auth_login_lifecycle_guard(&lease_key).await;
+        // Unattended refresh never waits behind an operating-system
+        // credential call that holds the lease.
+        let _guard = meerkat_core::acquire_auth_login_lifecycle_guard_for_unattended(&lease_key)
+            .await
+            .ok_or_else(lifecycle_owner_busy)?;
         let mut admitted = self
             .load_admitted_stored_credential(target, key, &_guard)
             .await
@@ -2108,6 +2538,19 @@ impl McpOAuthAuthority {
             ));
         }
 
+        // Before the refresh begins: the token endpoint of the credential
+        // that is actually refreshed is admitted, and the client is the
+        // egress profile's own. A refusal here begins nothing to close.
+        let http = self
+            .http_for(target, &admitted.metadata.discovery.token_endpoint)
+            .map_err(|error| match error {
+                McpOAuthError::EgressRefused { refusal, .. } => RefreshError::EgressRefused {
+                    refusal,
+                    observation: meerkat_core::RefreshFailureObservation::transient(),
+                    disposition: None,
+                },
+                other => RefreshError::Refresh(other.to_string()),
+            })?;
         let begin_disposition = self
             .auth_lease
             .resolve_credential_use_admission(&lease_key, CredentialUseIntent::BeginRefresh)
@@ -2172,14 +2615,48 @@ impl McpOAuthAuthority {
         )
         .await;
         let _guard = meerkat_core::acquire_auth_login_lifecycle_guard(&lease_key).await;
-        let current_tokens = self
+        let current_tokens = match self
             .token_store()
-            .load(key)
+            .load_for(key, TokenStoreAccess::Unattended)
             .await
-            .map_err(|error| RefreshError::Refresh(error.to_string()))?;
-        if current_tokens.as_ref() != Some(&admitted.tokens)
-            || self.auth_lease.snapshot(&lease_key) != refreshing_snapshot
         {
+            Ok(current_tokens) => current_tokens,
+            Err(error) => {
+                // A refused reread publishes nothing and keeps the stored
+                // credential. The refresh this owner began still closes, unless
+                // another owner already moved the lease.
+                let cause = RefreshError::from_token_store(error);
+                if self.auth_lease.snapshot(&lease_key) == refreshing_snapshot
+                    && let Err(transition_error) = self.auth_lease.refresh_failed(
+                        &lease_key,
+                        meerkat_core::RefreshFailureObservation::transient(),
+                    )
+                {
+                    return Err(RefreshError::Refresh(format!(
+                        "{cause}; AuthMachine refresh_failed rejected closure: {transition_error}"
+                    )));
+                }
+                return Err(cause);
+            }
+        };
+        let lifecycle_current = self.auth_lease.snapshot(&lease_key) == refreshing_snapshot;
+        if current_tokens.as_ref() != Some(&admitted.tokens) || !lifecycle_current {
+            // Durable bytes that moved outside the protocol while this owner's
+            // lifecycle is still current: the result stays stale and the
+            // current bytes stay, but the refresh this owner began closes
+            // transiently. A changed lifecycle belongs to its new owner and
+            // is left untouched.
+            if lifecycle_current
+                && let Err(transition_error) = self.auth_lease.refresh_failed(
+                    &lease_key,
+                    meerkat_core::RefreshFailureObservation::transient(),
+                )
+            {
+                return Err(RefreshError::Refresh(format!(
+                    "{}; AuthMachine refresh_failed rejected closure: {transition_error}",
+                    RefreshError::StalePreparation
+                )));
+            }
             return Err(RefreshError::StalePreparation);
         }
         let refreshed = match exchange {
@@ -2200,6 +2677,16 @@ impl McpOAuthAuthority {
                 let disposition = self
                     .close_refresh_failure(key, &lease_key, &observation)
                     .await?;
+                // A local egress refusal closes as a transient failure (it
+                // never invalidates the credential) and stays typed for every
+                // reader of this coordinated result.
+                if let crate::auth_oauth::OAuthError::EgressRefused(refusal) = &error {
+                    return Err(RefreshError::EgressRefused {
+                        refusal: *refusal,
+                        observation,
+                        disposition: Some(disposition),
+                    });
+                }
                 return Err(RefreshError::Classified {
                     message: error.to_string(),
                     observation,
@@ -2210,12 +2697,7 @@ impl McpOAuthAuthority {
         // Subject: a verified credential's refreshed token must still be the
         // bound account. An unverified grant stays unverified: nothing is
         // observed for it.
-        if let Some(bound) = admitted
-            .tokens
-            .account_id
-            .as_deref()
-            .filter(|_| target.account_verification() == Some(AccountVerification::Verified))
-        {
+        if let Some(bound) = subject_to_reobserve(target, &admitted.tokens) {
             match self
                 .observe_refreshed_subject(target, metadata, bound, &refreshed)
                 .await
@@ -2232,13 +2714,32 @@ impl McpOAuthAuthority {
                         },
                     );
                 }
-                Err(reason) => {
+                // The provider's evidence for the refreshed token was
+                // unavailable: an upstream refresh failure, not a mismatch.
+                // The strategy's own request refused by the egress profile
+                // stays typed for every reader. Only a failed AuthMachine
+                // closure is a local failure.
+                Err(unobserved) => {
                     let observation = meerkat_core::RefreshFailureObservation::transient();
                     return Err(
-                        match self.auth_lease.refresh_failed(&lease_key, observation) {
-                            Ok(_) => RefreshError::Refresh(reason.to_owned()),
+                        match self
+                            .auth_lease
+                            .refresh_failed(&lease_key, observation.clone())
+                        {
+                            Ok(_) => match unobserved.egress_refused {
+                                Some(refusal) => RefreshError::EgressRefused {
+                                    refusal,
+                                    observation,
+                                    disposition: None,
+                                },
+                                None => RefreshError::Observed {
+                                    message: unobserved.reason.to_owned(),
+                                    observation,
+                                },
+                            },
                             Err(error) => RefreshError::Refresh(format!(
-                                "{reason}; AuthMachine refresh_failed rejected closure: {error}"
+                                "{}; AuthMachine refresh_failed rejected closure: {error}",
+                                unobserved.reason
                             )),
                         },
                     );
@@ -2305,19 +2806,31 @@ impl McpOAuthAuthority {
                         &lease_key,
                         &admitted.tokens,
                         &admitted.restore_snapshot,
-                        format!("failed to mark refreshed MCP OAuth token: {error}"),
+                        RefreshError::Refresh(format!(
+                            "failed to mark refreshed MCP OAuth token: {error}"
+                        )),
                     )
                     .await);
             }
         };
-        if let Err(error) = self.token_store().save(key, &published).await {
+        if let Err(error) = self
+            .token_store()
+            .save_for(key, &published, TokenStoreAccess::Unattended)
+            .await
+        {
+            let cause = match error.credential_access() {
+                Some((refusal, detail)) => RefreshError::CredentialAccess { refusal, detail },
+                None => RefreshError::Refresh(format!(
+                    "failed to save refreshed MCP OAuth token: {error}"
+                )),
+            };
             return Err(self
                 .rollback_refresh_publication(
                     key,
                     &lease_key,
                     &admitted.tokens,
                     &admitted.restore_snapshot,
-                    format!("failed to save refreshed MCP OAuth token: {error}"),
+                    cause,
                 )
                 .await);
         }
@@ -2326,18 +2839,23 @@ impl McpOAuthAuthority {
 
     /// The subject the account strategy observes for a refreshed token of a
     /// verified credential bound to `bound`. `Err` means the subject could
-    /// not be observed (no strategy, another strategy or context, or the
-    /// provider evidence was unavailable), which is distinct from a
-    /// different subject.
+    /// not be observed (no strategy, another strategy or context, the
+    /// provider evidence was unavailable, or the strategy's own request was
+    /// refused by the egress profile), which is distinct from a different
+    /// subject.
     async fn observe_refreshed_subject(
         &self,
         target: &McpServerIdentity,
         metadata: &StoredMcpOAuthMetadata,
         bound: &str,
         refreshed: &OAuthTokenResult,
-    ) -> Result<String, &'static str> {
+    ) -> Result<String, SubjectUnobserved> {
+        let unobserved = |reason| SubjectUnobserved {
+            reason,
+            egress_refused: None,
+        };
         let Some((_, strategy)) = self.interactive.as_ref() else {
-            return Err("MCP OAuth account strategy is not installed");
+            return Err(unobserved("MCP OAuth account strategy is not installed"));
         };
         let account = AccountSelection::Known(bound.to_owned());
         let descriptor = strategy
@@ -2351,18 +2869,28 @@ impl McpOAuthAuthority {
                     account: &account,
                 },
             )
-            .map_err(|_| "MCP OAuth account strategy refused the stored context")?;
+            .map_err(|_| unobserved("MCP OAuth account strategy refused the stored context"))?;
         if let Some(binding) = &metadata.account_binding
             && (binding.stable_context != descriptor.stable_context()
                 || binding.strategy_id != descriptor.parameters().strategy_id)
         {
-            return Err("installed MCP OAuth account strategy differs from the bound one");
+            return Err(unobserved(
+                "installed MCP OAuth account strategy differs from the bound one",
+            ));
         }
         strategy
             .observe_account(&descriptor, refreshed)
             .await
             .map(|observation| observation.account)
-            .map_err(|_| "refreshed MCP OAuth subject could not be observed")
+            .map_err(|refusal| SubjectUnobserved {
+                reason: "refreshed MCP OAuth subject could not be observed",
+                // The strategy's own endpoint refused by the egress profile:
+                // typed for the caller, never a subject mismatch.
+                egress_refused: match refusal {
+                    ConnectorOAuthRefusal::EgressRefused(refusal) => Some(refusal),
+                    _ => None,
+                },
+            })
     }
 
     /// Close every begun refresh through AuthMachine. Permanently unusable
@@ -2383,7 +2911,11 @@ impl McpOAuthAuthority {
             // clear, a new authority observes no credential and cannot restore
             // the permanently rejected marker. The coordinator-owned task then
             // closes the in-memory Refreshing phase without a cancellation gap.
-            if let Err(error) = self.token_store().clear(key).await {
+            if let Err(error) = self
+                .token_store()
+                .clear_for(key, TokenStoreAccess::Unattended)
+                .await
+            {
                 let closure = self
                     .auth_lease
                     .refresh_failed(lease_key, observation.clone())
@@ -2430,7 +2962,7 @@ impl McpOAuthAuthority {
         lease_key: &LeaseKey,
         previous_tokens: &PersistedTokens,
         previous_snapshot: &AuthLeaseRestoreSnapshot,
-        reason: String,
+        cause: RefreshError,
     ) -> RefreshError {
         let mut rollback_errors = Vec::new();
         if let Err(error) = self.auth_lease.release_credential_lifecycle(lease_key) {
@@ -2451,15 +2983,21 @@ impl McpOAuthAuthority {
             Ok(None) => {}
             Err(error) => rollback_errors.push(format!("AuthMachine restore failed: {error}")),
         }
-        if let Err(error) = self.token_store().save(key, &restored_tokens).await {
+        if let Err(error) = self
+            .token_store()
+            .save_for(key, &restored_tokens, TokenStoreAccess::Unattended)
+            .await
+        {
             rollback_errors.push(format!("TokenStore restore failed: {error}"));
         }
-        let suffix = if rollback_errors.is_empty() {
-            String::new()
+        if rollback_errors.is_empty() {
+            // The compensation completed: the original cause stands, typed.
+            cause
         } else {
-            format!("; {}", rollback_errors.join("; "))
-        };
-        RefreshError::Refresh(format!("{reason}{suffix}"))
+            // A failed compensation is its own failure, never the original
+            // cause alone.
+            RefreshError::Refresh(format!("{cause}; {}", rollback_errors.join("; ")))
+        }
     }
 
     async fn discover(
@@ -2482,13 +3020,15 @@ impl McpOAuthAuthority {
             }
         };
         let resource: ProtectedResourceMetadata = self
-            .http()?
+            .http_for(target, &resource_metadata_url)?
             .get(resource_metadata_url.clone())
             .send()
             .await
-            .map_err(|error| McpOAuthError::DiscoveryFailed {
-                server_name: target.server_name().to_string(),
-                reason: error.to_string(),
+            .map_err(|error| {
+                oauth_send_error(target, error, |error| McpOAuthError::DiscoveryFailed {
+                    server_name: target.server_name().to_string(),
+                    reason: error.to_string(),
+                })
             })?
             .error_for_status_refusing_redirects()
             .map_err(|error| McpOAuthError::DiscoveryFailed {
@@ -2555,12 +3095,17 @@ impl McpOAuthAuthority {
         require_https_or_loopback(target, &auth_server, "authorization server issuer")?;
         let mut found = None;
         for candidate in authorization_server_metadata_urls(&auth_server)? {
-            let response = self.http()?.get(&candidate).send().await.map_err(|error| {
-                McpOAuthError::DiscoveryFailed {
-                    server_name: target.server_name().to_string(),
-                    reason: error.to_string(),
-                }
-            })?;
+            let response = self
+                .http_for(target, &candidate)?
+                .get(&candidate)
+                .send()
+                .await
+                .map_err(|error| {
+                    oauth_send_error(target, error, |error| McpOAuthError::DiscoveryFailed {
+                        server_name: target.server_name().to_string(),
+                        reason: error.to_string(),
+                    })
+                })?;
             // Only an absent document moves on to the next well-known URI;
             // any other refusal fails closed.
             if matches!(
@@ -2658,11 +3203,24 @@ impl McpOAuthAuthority {
         target: &McpServerIdentity,
     ) -> Result<String, McpOAuthError> {
         for candidate in protected_resource_well_known_candidates(target.server_url())? {
-            let response = self.http()?.get(&candidate).send().await;
-            if let Ok(response) = response
-                && response.status().is_success()
-            {
-                return Ok(candidate);
+            let response = self
+                .http_for(target, &candidate)?
+                .get(&candidate)
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => return Ok(candidate),
+                // The egress profile's own resolver refusal is typed; it is
+                // never taken as an absent document.
+                Err(error) if crate::http_egress::egress_refusal_in(&error).is_some() => {
+                    return Err(oauth_send_error(target, error, |_| {
+                        McpOAuthError::DiscoveryFailed {
+                            server_name: target.server_name().to_string(),
+                            reason: "egress refusal".to_string(),
+                        }
+                    }));
+                }
+                _ => {}
             }
         }
         Err(McpOAuthError::DiscoveryFailed {
@@ -2689,14 +3247,16 @@ impl McpOAuthAuthority {
             "token_endpoint_auth_method": "none",
         });
         let wire: DynamicClientRegistrationResponse = self
-            .http()?
+            .http_for(target, &discovery.registration_endpoint)?
             .post(&discovery.registration_endpoint)
             .json(&body)
             .send()
             .await
-            .map_err(|error| McpOAuthError::RegistrationFailed {
-                server_name: target.server_name().to_string(),
-                reason: error.to_string(),
+            .map_err(|error| {
+                oauth_send_error(target, error, |error| McpOAuthError::RegistrationFailed {
+                    server_name: target.server_name().to_string(),
+                    reason: error.to_string(),
+                })
             })?
             .error_for_status_refusing_redirects()
             .map_err(|error| McpOAuthError::RegistrationFailed {
@@ -2852,6 +3412,8 @@ fn unverified_descriptor(
         redirect_uri: context.redirect_uri.to_owned(),
         expected_account: AccountSelection::Unverified,
         strategy_id: UNVERIFIED_RESOURCE_STRATEGY_ID.to_owned(),
+        client_auth_profile: None,
+        protocol: None,
     }
     .try_into()?)
 }
@@ -2884,6 +3446,77 @@ fn preflight_receipt_retained(state: &str) -> bool {
     preflight_receipts()
         .lock()
         .contains_key(OAuthBrowserActionRef::project(state).as_str())
+}
+
+/// Process-local wake-ups for loopback waits, keyed by the non-secret
+/// reference of the attempt's state. A wake-up is only a signal: the flow
+/// owner stays the single retirement authority, and [`retire_attempt`] sends
+/// one only after the owner confirmed the retirement. Shared by every
+/// `McpOAuthAuthority` in the process, including request-scoped ones.
+type AttemptWakers = std::collections::HashMap<String, (u64, tokio::sync::watch::Sender<bool>)>;
+
+fn attempt_wakers() -> &'static parking_lot::Mutex<AttemptWakers> {
+    static WAKERS: std::sync::OnceLock<parking_lot::Mutex<AttemptWakers>> =
+        std::sync::OnceLock::new();
+    WAKERS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// One pending login's wake-up registration. Dropping it removes only this
+/// registration, never a later one for the same reference.
+struct AttemptWakeRegistration {
+    key: String,
+    id: u64,
+    retired: tokio::sync::watch::Receiver<bool>,
+}
+
+impl AttemptWakeRegistration {
+    fn register(state: &str) -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let key = OAuthBrowserActionRef::project(state).as_str().to_owned();
+        let (sender, retired) = tokio::sync::watch::channel(false);
+        attempt_wakers().lock().insert(key.clone(), (id, sender));
+        Self { key, id, retired }
+    }
+
+    /// Resolves once a confirmed retirement of this attempt was signalled.
+    async fn retired(&mut self) {
+        if self.retired.wait_for(|retired| *retired).await.is_err() {
+            // The sender is owned by this registration's own entry; a closed
+            // channel never means retirement.
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+impl Drop for AttemptWakeRegistration {
+    fn drop(&mut self) {
+        let mut wakers = attempt_wakers().lock();
+        if wakers.get(&self.key).is_some_and(|(id, _)| *id == self.id) {
+            wakers.remove(&self.key);
+        }
+    }
+}
+
+/// The single retirement seam for an admitted attempt: the flow owner
+/// retires it (including its durable removal), and only that confirmed
+/// retirement wakes the attempt's local wait. A refused or absent
+/// retirement wakes nothing: an absent attempt may have been consumed.
+fn retire_attempt(
+    authority: &dyn OAuthFlowAuthority,
+    state: &str,
+    target: &meerkat_core::AuthCredentialIdentity,
+    identity: OAuthBrowserFlowIdentity,
+    redirect_uri: &str,
+) -> Result<(), OAuthFlowError> {
+    authority.expire(state, target, identity, redirect_uri)?;
+    if let Some((_, sender)) = attempt_wakers()
+        .lock()
+        .get(OAuthBrowserActionRef::project(state).as_str())
+    {
+        sender.send_replace(true);
+    }
+    Ok(())
 }
 
 /// Serializes start-or-join per MCP target within this process, so a target
@@ -3184,6 +3817,9 @@ fn map_coordinated_login_error(
             server_name: target.server_name().to_string(),
             reason: "credential mutation coordinator cancelled the login commit".to_string(),
         },
+        CredentialMutationError::CredentialAccess { refusal, detail } => {
+            McpOAuthError::CredentialAccess { refusal, detail }
+        }
     }
 }
 
@@ -3192,6 +3828,88 @@ pub(crate) fn lifecycle_snapshot_is_absent(snapshot: &AuthLeaseSnapshot) -> bool
         && !snapshot.credential_present
         && snapshot.generation == 0
         && snapshot.credential_published_at_millis.is_none()
+}
+
+/// The bound subject a refresh of `tokens` re-observes through the account
+/// strategy: a verified target's bound account. Every admitted credential of
+/// a verified target has one.
+fn subject_to_reobserve<'a>(
+    target: &McpServerIdentity,
+    tokens: &'a PersistedTokens,
+) -> Option<&'a str> {
+    tokens
+        .account_id
+        .as_deref()
+        .filter(|_| target.account_verification() == Some(AccountVerification::Verified))
+}
+
+/// Why a refreshed credential's subject was not observed, with the egress
+/// refusal of the strategy's own request when that was the cause.
+struct SubjectUnobserved {
+    reason: &'static str,
+    egress_refused: Option<HttpEgressRefusal>,
+}
+
+/// Why unattended use of a credential is refused at once: an
+/// operating-system credential call still physically holds its lifecycle
+/// owner.
+const LIFECYCLE_OWNER_BUSY: &str =
+    "an operating-system credential call for this credential is still running";
+
+/// Unattended refresh of a credential whose lifecycle owner an
+/// operating-system credential call still physically holds: refused at once,
+/// never waited for.
+fn lifecycle_owner_busy() -> RefreshError {
+    RefreshError::CredentialAccess {
+        refusal: meerkat_core::auth::TokenStoreRefusal::Pending,
+        detail: LIFECYCLE_OWNER_BUSY.into(),
+    }
+}
+
+/// The same refusal for an unattended use of the stored credential.
+fn mcp_owner_busy() -> McpOAuthError {
+    McpOAuthError::CredentialAccess {
+        refusal: meerkat_core::auth::TokenStoreRefusal::Pending,
+        detail: LIFECYCLE_OWNER_BUSY.into(),
+    }
+}
+
+/// A status rehydration error, keeping a refused credential access typed.
+fn mcp_rehydrate_error(
+    target: &McpServerIdentity,
+    error: meerkat_core::AuthStatusRehydrateError,
+) -> McpOAuthError {
+    let lifecycle = |reason: String| McpOAuthError::AuthLifecycle {
+        server_name: target.server_name().to_string(),
+        reason,
+    };
+    match error {
+        meerkat_core::AuthStatusRehydrateError::TokenStore(store) => {
+            match store.credential_access() {
+                Some((refusal, detail)) => McpOAuthError::CredentialAccess { refusal, detail },
+                None => {
+                    lifecycle(meerkat_core::AuthStatusRehydrateError::TokenStore(store).to_string())
+                }
+            }
+        }
+        meerkat_core::AuthStatusRehydrateError::MarkerSave(store) => {
+            match store.credential_access() {
+                Some((refusal, detail)) => McpOAuthError::CredentialAccess { refusal, detail },
+                None => {
+                    lifecycle(meerkat_core::AuthStatusRehydrateError::MarkerSave(store).to_string())
+                }
+            }
+        }
+        other => lifecycle(other.to_string()),
+    }
+}
+
+/// A token-store error, keeping a refused or failed credential access typed.
+fn mcp_store_error(error: crate::auth_store::TokenStoreError) -> McpOAuthError {
+    match error.credential_access() {
+        Some((refusal, detail)) => McpOAuthError::CredentialAccess { refusal, detail },
+        None => McpOAuthError::TokenStore(error.to_string()),
+    }
 }
 
 fn refresh_error_from_mcp(error: McpOAuthError) -> RefreshError {
@@ -3204,6 +3922,9 @@ fn refresh_error_from_mcp(error: McpOAuthError) -> RefreshError {
         | McpOAuthError::MissingStoredToken { .. }
         | McpOAuthError::MissingStoredMetadata { .. } => {
             RefreshError::ReauthRequired(error.to_string())
+        }
+        McpOAuthError::CredentialAccess { refusal, detail } => {
+            RefreshError::CredentialAccess { refusal, detail }
         }
         other => RefreshError::Refresh(other.to_string()),
     }
@@ -3227,6 +3948,12 @@ fn map_coordinated_refresh_error(target: &McpServerIdentity, error: RefreshError
         };
     }
     match &error {
+        // A destination the host egress profile refused: the same typed
+        // local refusal for every reader of the coordinated result.
+        RefreshError::EgressRefused { refusal, .. } => McpOAuthError::EgressRefused {
+            server_name: target.server_name().to_string(),
+            refusal: *refusal,
+        },
         // A failure the token endpoint reported: an upstream failure.
         RefreshError::Classified { .. } | RefreshError::Observed { .. } => {
             McpOAuthError::RefreshFailed {
@@ -3246,6 +3973,11 @@ fn map_coordinated_refresh_error(target: &McpServerIdentity, error: RefreshError
         | RefreshError::DurableTerminalCommit { .. } => McpOAuthError::AuthLifecycle {
             server_name: target.server_name().to_string(),
             reason: error.to_string(),
+        },
+        // The credential store refused access: not a refresh failure.
+        RefreshError::CredentialAccess { refusal, detail } => McpOAuthError::CredentialAccess {
+            refusal: *refusal,
+            detail: detail.clone(),
         },
     }
 }
@@ -3471,6 +4203,7 @@ mod tests {
         let strategy = OidcUserInfoAccountStrategy {
             http: Err(CredentialHttpClientUnavailable),
             required_scopes: BTreeSet::new(),
+            egress: HttpEgressProfile::trusted_host(),
         };
         // No request is sent with some other client: the strategy refuses.
         assert_eq!(
@@ -3520,6 +4253,73 @@ mod tests {
         )
         .expect_err("remote http issuer should fail closed");
         assert!(error.to_string().contains("must use https"));
+    }
+
+    /// Each credential-store refusal, and a failed backend, keeps its type
+    /// through the admitted load, the refresh round trip and the login exit.
+    #[test]
+    fn credential_access_refusals_keep_their_type_through_every_conversion() {
+        use crate::auth_store::TokenStoreError;
+        use meerkat_core::auth::TokenStoreRefusal as Refusal;
+        let target = McpServerIdentity::from_server_config("srv", "https://mcp.example/api");
+        let refused = |refusal| {
+            TokenStoreError::refused(
+                "keyring",
+                TokenStoreAccess::Unattended,
+                refusal,
+                "the platform cause",
+            )
+        };
+        for (error, refusal) in [
+            (refused(Refusal::Denied), Refusal::Denied),
+            (
+                refused(Refusal::InteractionRequired),
+                Refusal::InteractionRequired,
+            ),
+            (refused(Refusal::Pending), Refusal::Pending),
+            (refused(Refusal::Unavailable), Refusal::Unavailable),
+            (refused(Refusal::NotObserved), Refusal::NotObserved),
+            (refused(Refusal::Unsupported), Refusal::Unsupported),
+            (
+                TokenStoreError::BackendFailed {
+                    backend: "keyring",
+                    detail: "the platform cause".into(),
+                },
+                Refusal::Unavailable,
+            ),
+        ] {
+            let loaded = mcp_store_error(error);
+            assert!(
+                matches!(
+                    &loaded,
+                    McpOAuthError::CredentialAccess { refusal: kept, detail }
+                        if *kept == refusal && detail == "the platform cause"
+                ),
+                "admitted load: {loaded:?}"
+            );
+            assert!(!loaded.is_refusal(), "not a refused request");
+            let refreshed = refresh_error_from_mcp(loaded);
+            assert!(
+                matches!(&refreshed, RefreshError::CredentialAccess { refusal: kept, .. } if *kept == refusal),
+                "refresh: {refreshed:?}"
+            );
+            let restored = map_coordinated_refresh_error(&target, refreshed);
+            assert!(
+                matches!(&restored, McpOAuthError::CredentialAccess { refusal: kept, .. } if *kept == refusal),
+                "refresh exit: {restored:?}"
+            );
+            let login = map_coordinated_login_error(
+                &target,
+                CredentialMutationError::CredentialAccess {
+                    refusal,
+                    detail: "the platform cause".into(),
+                },
+            );
+            assert!(
+                matches!(&login, McpOAuthError::CredentialAccess { refusal: kept, .. } if *kept == refusal),
+                "login exit: {login:?}"
+            );
+        }
     }
 
     #[test]
@@ -3854,6 +4654,119 @@ mod tests {
         .unwrap()
     }
 
+    fn realm(id: &str) -> RealmId {
+        RealmId::parse(id).unwrap()
+    }
+
+    /// The same server in two realms, and realm-less, has three distinct
+    /// credential slots and leases; the realm tag cannot collide with an
+    /// account selection.
+    #[test]
+    fn each_realm_has_its_own_mcp_credential_slot() {
+        let base = McpServerIdentity::from_server_config("slack", "https://mcp.example/slack");
+        let in_a = base.clone().in_realm(realm("alpha"));
+        let in_b = base.clone().in_realm(realm("beta"));
+        let keys = [&base, &in_a, &in_b].map(|target| target.token_key().unwrap());
+        assert_ne!(keys[0], keys[1]);
+        assert_ne!(keys[0], keys[2]);
+        assert_ne!(keys[1], keys[2]);
+        for target in [&base, &in_a, &in_b] {
+            assert_eq!(
+                target.token_key().unwrap().binding().unwrap().as_str(),
+                target.lease_key().unwrap().binding().unwrap().as_str()
+            );
+        }
+        assert_eq!(
+            in_a.token_key().unwrap(),
+            base.clone().in_realm(realm("alpha")).token_key().unwrap()
+        );
+        assert!(in_a.binding_slug().starts_with("slack-"));
+        // A realm whose name is a selection tag stays distinct from it.
+        let known = base.clone().with_expected_account("discover").unwrap();
+        let tagged = base.clone().in_realm(realm("discover"));
+        assert_ne!(known.token_key().unwrap(), tagged.token_key().unwrap());
+        assert_ne!(in_a, base);
+    }
+
+    /// A target scoped for a realm host binds to that realm, keeps its own
+    /// realm, and is refused across realms.
+    #[test]
+    fn targets_scope_to_the_host_realm_and_never_cross_it() {
+        let base = McpServerIdentity::from_server_config("slack", "https://mcp.example/slack");
+        assert_eq!(base.scoped_to(None).unwrap(), base);
+        let alpha = realm("alpha");
+        let bound = base.scoped_to(Some(&alpha)).unwrap();
+        assert_eq!(bound.realm(), Some(&alpha));
+        assert_eq!(bound.scoped_to(Some(&alpha)).unwrap(), bound);
+        assert!(matches!(
+            bound.scoped_to(Some(&realm("beta"))),
+            Err(McpOAuthError::RealmMismatch { .. })
+        ));
+    }
+
+    /// A realm host resolves only its realm's credential: one stored in
+    /// another realm, or in the realm-less pre-realm slot, is not used (the
+    /// realm needs its own login); its logout leaves both of them in place.
+    #[tokio::test]
+    async fn a_realm_host_uses_and_clears_only_its_own_mcp_credential() {
+        let (base, _state) = spawn_oauth_fixture().await;
+        let store = Arc::new(EphemeralTokenStore::new());
+        let auth = test_auth_lease();
+        let shared = ce_refresh_authority(store.clone(), auth.clone());
+        let target = McpServerIdentity::from_server_config("slack", format!("{base}/mcp"));
+        let in_beta = target.clone().in_realm(realm("beta"));
+        ce_seed_stored_credential(&shared, &target, &base).await;
+        ce_seed_stored_credential(&shared, &in_beta, &base).await;
+
+        let alpha = shared.clone().in_realm(realm("alpha"));
+        let beta = shared.clone().in_realm(realm("beta"));
+        assert_eq!(
+            alpha.stored_bearer_token(&target).await.unwrap(),
+            None,
+            "alpha has no credential of its own: a fresh realm login is required"
+        );
+        assert_eq!(
+            beta.stored_bearer_token(&target).await.unwrap().as_deref(),
+            Some("access-token")
+        );
+        assert!(matches!(
+            alpha.stored_bearer_token(&in_beta).await,
+            Err(McpOAuthError::RealmMismatch { .. })
+        ));
+
+        alpha.logout(&target).await.unwrap();
+        assert!(
+            store
+                .load(&target.token_key().unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .load(&in_beta.token_key().unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        beta.logout(&target).await.unwrap();
+        assert!(
+            store
+                .load(&in_beta.token_key().unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .load(&target.token_key().unwrap())
+                .await
+                .unwrap()
+                .is_some(),
+            "a realm logout never deletes the pre-realm shared credential"
+        );
+    }
+
     struct CeRefreshRelease(Arc<TestState>);
     impl Drop for CeRefreshRelease {
         fn drop(&mut self) {
@@ -3919,86 +4832,453 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ce_mcp_stale_success_and_failure_preserve_replacement() {
-        let mut observations = Vec::new();
-        for invalid_grant in [false, true] {
-            let (base, state) = spawn_oauth_fixture().await;
-            let store = Arc::new(EphemeralTokenStore::new());
-            let auth = test_auth_lease();
-            let authority = ce_refresh_authority(store.clone(), auth.clone());
-            let target =
-                McpServerIdentity::from_server_config("ce-mcp-stale", format!("{base}/mcp"));
-            ce_seed_stored_credential(&authority, &target, &base).await;
-            republish_stored_tokens(&authority, store.as_ref(), &target, |tokens| {
-                tokens.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
-            })
-            .await;
-            let key = target.token_key().unwrap();
-            let lease = target.lease_key().unwrap();
-            state.pause_refresh.store(true, Ordering::SeqCst);
-            let release = CeRefreshRelease(state.clone());
-            let child = authority.clone();
-            let child_target = target.clone();
-            let mut task =
-                tokio::spawn(async move { child.stored_bearer_token(&child_target).await });
-            let entered =
-                tokio::time::timeout(Duration::from_secs(10), state.refresh_started.notified())
-                    .await;
-            // Explicit off-protocol fault injection through the real generated
-            // owner, to exercise stale checks without fabricating snapshots.
-            let mut replacement = store.load(&key).await.unwrap().unwrap();
-            replacement.primary_secret = Some("ce-mcp-new-access".into());
-            replacement.refresh_token = Some("ce-mcp-new-refresh".into());
-            replacement.expires_at = Some(Utc::now() + chrono::Duration::hours(1));
-            let transition = auth
-                .acquire_lease(
-                    &lease,
-                    meerkat_core::persisted_token_expires_at_epoch_secs(&replacement),
-                )
-                .unwrap();
-            let replacement = meerkat_core::mark_tokens_lifecycle_published_for_transition(
-                &key,
-                &replacement,
-                &transition,
-            )
-            .unwrap();
-            store.save(&key, &replacement).await.unwrap();
-            auth.begin_refresh(&lease).unwrap();
-            let expected = auth.snapshot(&lease);
-            *state.token_fails.lock() = invalid_grant;
-            drop(release);
-            let finished = tokio::time::timeout(Duration::from_secs(10), &mut task).await;
-            if finished.is_err() {
-                task.abort();
-                let _ = task.await;
+    async fn ce_mcp_refresh_save_refusal_survives_successful_rollback() {
+        use crate::auth_store::TokenStoreError;
+        use meerkat_core::auth::TokenStoreRefusal;
+        use std::sync::atomic::AtomicUsize;
+
+        struct FailNextSaveStore {
+            inner: EphemeralTokenStore,
+            fail_next_save: AtomicBool,
+            save_attempts: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl TokenStore for FailNextSaveStore {
+            async fn load(
+                &self,
+                key: &TokenKey,
+            ) -> Result<Option<PersistedTokens>, TokenStoreError> {
+                self.inner.load(key).await
             }
-            assert!(entered.is_ok(), "actual paused endpoint is mandatory");
-            let refused = matches!(
-                finished.unwrap().unwrap(),
-                Err(McpOAuthError::StalePreparation)
-            );
-            let count = state
+
+            async fn save(
+                &self,
+                key: &TokenKey,
+                tokens: &PersistedTokens,
+            ) -> Result<(), TokenStoreError> {
+                self.save_attempts.fetch_add(1, Ordering::SeqCst);
+                if self.fail_next_save.swap(false, Ordering::SeqCst) {
+                    return Err(TokenStoreError::refused(
+                        self.backend_name(),
+                        TokenStoreAccess::Unattended,
+                        TokenStoreRefusal::InteractionRequired,
+                        "post-exchange save needs credential interaction",
+                    ));
+                }
+                self.inner.save(key, tokens).await
+            }
+
+            async fn clear(&self, key: &TokenKey) -> Result<(), TokenStoreError> {
+                self.inner.clear(key).await
+            }
+
+            async fn list(&self) -> Result<Vec<TokenKey>, TokenStoreError> {
+                self.inner.list().await
+            }
+
+            fn backend_name(&self) -> &'static str {
+                "test-refresh-store"
+            }
+        }
+
+        let (base, state) = spawn_oauth_fixture().await;
+        let store = Arc::new(FailNextSaveStore {
+            inner: EphemeralTokenStore::new(),
+            fail_next_save: AtomicBool::new(false),
+            save_attempts: AtomicUsize::new(0),
+        });
+        let auth = test_auth_lease();
+        let authority = McpOAuthAuthority::with_http(
+            ProviderAuthPersistence::new(store.clone(), Arc::new(InMemoryCoordinator::new())),
+            Client::new(),
+            auth.clone(),
+        );
+        let target =
+            McpServerIdentity::from_server_config("ce-mcp-save-refusal", format!("{base}/mcp"));
+        ce_seed_stored_credential(&authority, &target, &base).await;
+        let previous = republish_stored_tokens(&authority, store.as_ref(), &target, |tokens| {
+            tokens.primary_secret = Some("previous-access-token".into());
+            tokens.refresh_token = Some("previous-refresh-token".into());
+            tokens.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        })
+        .await;
+        let key = target.token_key().unwrap();
+        let lease = target.lease_key().unwrap();
+        // Initial and post-exchange loads succeed. Only the publication save
+        // fails; the existing rollback can restore the prior credential.
+        store.save_attempts.store(0, Ordering::SeqCst);
+        store.fail_next_save.store(true, Ordering::SeqCst);
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            authority.stored_bearer_token(&target),
+        )
+        .await
+        .expect("the mock refresh must finish")
+        .expect_err("a refused publication must not yield the refreshed bearer");
+
+        assert_eq!(state.token_requests.lock().len(), 1, "refresh reached HTTP");
+        assert_eq!(
+            store.save_attempts.load(Ordering::SeqCst),
+            2,
+            "one refused publication and one successful rollback save"
+        );
+        let restored = store.load(&key).await.unwrap().unwrap();
+        assert_eq!(restored.primary_secret, previous.primary_secret);
+        assert_eq!(restored.refresh_token, previous.refresh_token);
+        assert_eq!(restored.expires_at, previous.expires_at);
+        let snapshot = auth.snapshot(&lease);
+        assert!(snapshot.credential_present);
+        assert_ne!(
+            snapshot.phase,
+            Some(meerkat_core::handles::AuthLeasePhase::Refreshing),
+            "successful rollback must close this refresh"
+        );
+        assert_eq!(
+            durable_marker::marker_relation_for_tokens_and_snapshot(&restored, &snapshot, &key),
+            durable_marker::AuthLeaseDurableMarkerRelation::Matches
+        );
+        assert!(
+            matches!(
+                &error,
+                McpOAuthError::CredentialAccess {
+                    refusal: TokenStoreRefusal::InteractionRequired,
+                    detail,
+                } if detail == "post-exchange save needs credential interaction"
+            ),
+            "successful rollback must preserve the original typed store cause: {error:?}"
+        );
+        assert!(
+            !error.is_refusal(),
+            "credential access is not a request denial"
+        );
+    }
+
+    /// Refuses exactly the `refuse_load`-th read (counted from one; zero
+    /// refuses none) with an interaction requirement carrying `detail`. Every
+    /// other operation reaches `inner`.
+    struct RefuseNthLoadStore {
+        inner: EphemeralTokenStore,
+        loads: std::sync::atomic::AtomicUsize,
+        refuse_load: std::sync::atomic::AtomicUsize,
+        detail: &'static str,
+    }
+
+    impl RefuseNthLoadStore {
+        fn new(detail: &'static str) -> Self {
+            Self {
+                inner: EphemeralTokenStore::new(),
+                loads: std::sync::atomic::AtomicUsize::new(0),
+                refuse_load: std::sync::atomic::AtomicUsize::new(0),
+                detail,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TokenStore for RefuseNthLoadStore {
+        async fn load(
+            &self,
+            key: &TokenKey,
+        ) -> Result<Option<PersistedTokens>, crate::auth_store::TokenStoreError> {
+            let number = self.loads.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.refuse_load.load(Ordering::SeqCst) == number {
+                return Err(crate::auth_store::TokenStoreError::refused(
+                    self.backend_name(),
+                    TokenStoreAccess::Unattended,
+                    meerkat_core::auth::TokenStoreRefusal::InteractionRequired,
+                    self.detail,
+                ));
+            }
+            self.inner.load(key).await
+        }
+
+        async fn save(
+            &self,
+            key: &TokenKey,
+            tokens: &PersistedTokens,
+        ) -> Result<(), crate::auth_store::TokenStoreError> {
+            self.inner.save(key, tokens).await
+        }
+
+        async fn clear(&self, key: &TokenKey) -> Result<(), crate::auth_store::TokenStoreError> {
+            self.inner.clear(key).await
+        }
+
+        async fn list(&self) -> Result<Vec<TokenKey>, crate::auth_store::TokenStoreError> {
+            self.inner.list().await
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "test-refuse-load-store"
+        }
+    }
+
+    /// A refused read while a fresh owner rehydrates the stored credential
+    /// keeps the typed store cause through the real admission.
+    #[tokio::test]
+    async fn ce_mcp_refused_rehydration_read_keeps_its_typed_cause() {
+        use meerkat_core::auth::TokenStoreRefusal;
+
+        let (base, _state) = spawn_oauth_fixture().await;
+        let store = Arc::new(RefuseNthLoadStore::new(
+            "rehydration read needs credential interaction",
+        ));
+        let persistence =
+            ProviderAuthPersistence::new(store.clone(), Arc::new(InMemoryCoordinator::new()));
+        let seeding =
+            McpOAuthAuthority::with_http(persistence.clone(), Client::new(), test_auth_lease());
+        let target = McpServerIdentity::from_server_config(
+            "ce-mcp-rehydrate-refusal",
+            format!("{base}/mcp"),
+        );
+        ce_seed_stored_credential(&seeding, &target, &base).await;
+        // A fresh owner has no lifecycle: its admission reads the stored
+        // credential, then rehydrates it with a second read, which is refused.
+        let fresh = McpOAuthAuthority::with_http(persistence, Client::new(), test_auth_lease());
+        store.loads.store(0, Ordering::SeqCst);
+        store.refuse_load.store(2, Ordering::SeqCst);
+        let error =
+            tokio::time::timeout(Duration::from_secs(10), fresh.stored_bearer_token(&target))
+                .await
+                .expect("the admission finishes")
+                .expect_err("a refused rehydration yields no bearer");
+        assert_eq!(
+            store.loads.load(Ordering::SeqCst),
+            2,
+            "the admitted read, then the refused rehydration read"
+        );
+        assert!(
+            matches!(
+                &error,
+                McpOAuthError::CredentialAccess {
+                    refusal: TokenStoreRefusal::InteractionRequired,
+                    detail,
+                } if detail == "rehydration read needs credential interaction"
+            ),
+            "the rehydration keeps the typed store cause: {error:?}"
+        );
+    }
+
+    /// A refused durable reread after the refresh exchange closes the refresh
+    /// this owner began instead of leaving AuthMachine in `Refreshing`. The
+    /// stored credential and its exact bytes survive, so a later use through
+    /// the same authority refreshes again once the store answers.
+    #[tokio::test]
+    async fn ce_mcp_refused_post_exchange_reread_closes_the_begun_refresh() {
+        use meerkat_core::auth::TokenStoreRefusal;
+
+        let (base, state) = spawn_oauth_fixture().await;
+        let store = Arc::new(RefuseNthLoadStore::new(
+            "post-exchange reread needs credential interaction",
+        ));
+        let auth = test_auth_lease();
+        let authority = McpOAuthAuthority::with_http(
+            ProviderAuthPersistence::new(store.clone(), Arc::new(InMemoryCoordinator::new())),
+            Client::new(),
+            auth.clone(),
+        );
+        let target =
+            McpServerIdentity::from_server_config("ce-mcp-reread-refusal", format!("{base}/mcp"));
+        ce_seed_stored_credential(&authority, &target, &base).await;
+        republish_stored_tokens(&authority, store.as_ref(), &target, |tokens| {
+            tokens.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        })
+        .await;
+        let key = target.token_key().unwrap();
+        let lease = target.lease_key().unwrap();
+        // The exact stored bytes, read beside the refusal counter.
+        let original = store.inner.load(&key).await.unwrap();
+        let refresh_exchanges = || {
+            state
                 .token_requests
                 .lock()
                 .iter()
-                .filter(|r| r["grant_type"] == "refresh_token")
-                .count();
-            observations.push((
-                refused,
-                expected,
-                auth.snapshot(&lease),
-                replacement,
-                store.load(&key).await.unwrap(),
-                count,
-            ));
+                .filter(|request| request["grant_type"] == "refresh_token")
+                .count()
+        };
+
+        state.pause_refresh.store(true, Ordering::SeqCst);
+        let release = CeRefreshRelease(state.clone());
+        let child = authority.clone();
+        let child_target = target.clone();
+        let mut task = tokio::spawn(async move { child.stored_bearer_token(&child_target).await });
+        let entered =
+            tokio::time::timeout(Duration::from_secs(10), state.refresh_started.notified()).await;
+        // Every read before the exchange has happened: the next one is the
+        // post-exchange reread of the durable credential.
+        store
+            .refuse_load
+            .store(store.loads.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+        drop(release);
+        let finished = tokio::time::timeout(Duration::from_secs(10), &mut task).await;
+        if finished.is_err() {
+            task.abort();
+            let _ = task.await;
         }
-        for (refused, expected, actual, replacement, stored, count) in observations {
+        assert!(
+            entered.is_ok(),
+            "must observe the actual MCP refresh endpoint"
+        );
+        let error = finished
+            .expect("the refused reread must finish")
+            .expect("the refresh task must not panic")
+            .expect_err("a refused reread yields no bearer");
+
+        // Immediately after the return and before any retry: the begun
+        // refresh is closed and the credential is retained.
+        let snapshot = auth.snapshot(&lease);
+        assert_ne!(
+            snapshot.phase,
+            Some(meerkat_core::handles::AuthLeasePhase::Refreshing),
+            "a refused post-exchange reread must close the refresh it began"
+        );
+        assert!(snapshot.credential_present, "the credential is retained");
+        assert!(
+            matches!(
+                &error,
+                McpOAuthError::CredentialAccess {
+                    refusal: TokenStoreRefusal::InteractionRequired,
+                    detail,
+                } if detail == "post-exchange reread needs credential interaction"
+            ),
+            "the refused reread keeps the typed store cause: {error:?}"
+        );
+        assert_eq!(refresh_exchanges(), 1, "exactly one exchange");
+        assert_eq!(
+            store.inner.load(&key).await.unwrap(),
+            original,
+            "a refused reread publishes nothing"
+        );
+        assert!(
+            meerkat_core::try_acquire_auth_login_lifecycle_guard(&lease).is_some(),
+            "the lifecycle guard is obtainable after the refusal"
+        );
+
+        // The store answers again: a retry through the same authority
+        // refreshes once more and yields the bearer.
+        store.refuse_load.store(0, Ordering::SeqCst);
+        let retried = tokio::time::timeout(
+            Duration::from_secs(10),
+            authority.stored_bearer_token(&target),
+        )
+        .await
+        .expect("the retry must finish")
+        .expect("the retry yields the bearer");
+        assert_eq!(retried.as_deref(), Some("access-token"));
+        assert_eq!(refresh_exchanges(), 2, "exactly one additional exchange");
+    }
+
+    #[tokio::test]
+    async fn ce_mcp_stale_success_and_failure_preserve_replacement() {
+        let mut observations = Vec::new();
+        // A replacement owner moves both the bytes and the lifecycle. A
+        // token-only drift moves only the durable bytes, outside the protocol,
+        // while the lifecycle this owner began stays current.
+        for token_only in [false, true] {
+            for invalid_grant in [false, true] {
+                let (base, state) = spawn_oauth_fixture().await;
+                let store = Arc::new(EphemeralTokenStore::new());
+                let auth = test_auth_lease();
+                let authority = ce_refresh_authority(store.clone(), auth.clone());
+                let target =
+                    McpServerIdentity::from_server_config("ce-mcp-stale", format!("{base}/mcp"));
+                ce_seed_stored_credential(&authority, &target, &base).await;
+                republish_stored_tokens(&authority, store.as_ref(), &target, |tokens| {
+                    tokens.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+                })
+                .await;
+                let key = target.token_key().unwrap();
+                let lease = target.lease_key().unwrap();
+                state.pause_refresh.store(true, Ordering::SeqCst);
+                let release = CeRefreshRelease(state.clone());
+                let child = authority.clone();
+                let child_target = target.clone();
+                let mut task =
+                    tokio::spawn(async move { child.stored_bearer_token(&child_target).await });
+                let entered =
+                    tokio::time::timeout(Duration::from_secs(10), state.refresh_started.notified())
+                        .await;
+                // Explicit off-protocol fault injection through the real generated
+                // owner, to exercise stale checks without fabricating snapshots.
+                let mut replacement = store.load(&key).await.unwrap().unwrap();
+                replacement.primary_secret = Some("ce-mcp-new-access".into());
+                replacement.refresh_token = Some("ce-mcp-new-refresh".into());
+                replacement.expires_at = Some(Utc::now() + chrono::Duration::hours(1));
+                let replacement = if token_only {
+                    replacement
+                } else {
+                    let transition = auth
+                        .acquire_lease(
+                            &lease,
+                            meerkat_core::persisted_token_expires_at_epoch_secs(&replacement),
+                        )
+                        .unwrap();
+                    meerkat_core::mark_tokens_lifecycle_published_for_transition(
+                        &key,
+                        &replacement,
+                        &transition,
+                    )
+                    .unwrap()
+                };
+                store.save(&key, &replacement).await.unwrap();
+                if !token_only {
+                    auth.begin_refresh(&lease).unwrap();
+                }
+                let expected = auth.snapshot(&lease);
+                *state.token_fails.lock() = invalid_grant;
+                drop(release);
+                let finished = tokio::time::timeout(Duration::from_secs(10), &mut task).await;
+                if finished.is_err() {
+                    task.abort();
+                    let _ = task.await;
+                }
+                assert!(entered.is_ok(), "actual paused endpoint is mandatory");
+                let refused = matches!(
+                    finished.unwrap().unwrap(),
+                    Err(McpOAuthError::StalePreparation)
+                );
+                // Immediately after the return, before any retry.
+                let actual = auth.snapshot(&lease);
+                let count = state
+                    .token_requests
+                    .lock()
+                    .iter()
+                    .filter(|r| r["grant_type"] == "refresh_token")
+                    .count();
+                observations.push((
+                    token_only,
+                    refused,
+                    expected,
+                    actual,
+                    replacement,
+                    store.load(&key).await.unwrap(),
+                    count,
+                ));
+            }
+        }
+        for (token_only, refused, expected, actual, replacement, stored, count) in observations {
             assert!(refused, "stale result must not yield a bearer credential");
             assert_eq!(count, 1);
-            assert_eq!(
-                actual, expected,
-                "stale HTTP may not fail the replacement's refresh owner"
-            );
+            if token_only {
+                // Only the unchanged refresh this owner began closes, and only
+                // transiently: neither result is applied to the drifted bytes.
+                assert_eq!(
+                    expected.phase,
+                    Some(meerkat_core::handles::AuthLeasePhase::Refreshing)
+                );
+                assert_eq!(
+                    actual.phase,
+                    Some(meerkat_core::handles::AuthLeasePhase::Expiring),
+                    "token-only drift must close the refresh it began, transiently"
+                );
+                assert!(actual.credential_present);
+            } else {
+                assert_eq!(
+                    actual, expected,
+                    "stale HTTP may not fail the replacement's refresh owner"
+                );
+            }
             assert_eq!(
                 stored,
                 Some(replacement),
@@ -4342,5 +5622,232 @@ mod tests {
                 OAuthFlowError::BrowserIdentityMismatch
             ))
         ));
+    }
+
+    fn egress_origin(text: &str) -> crate::http_egress::HttpEgressOrigin {
+        crate::http_egress::HttpEgressOrigin::parse(text).unwrap()
+    }
+
+    /// A required egress profile refuses a refresh token endpoint outside it,
+    /// typed and before any request reaches the endpoint; the same credential
+    /// refreshes through the profile's own client once its endpoint is
+    /// deliberately admitted.
+    #[tokio::test]
+    async fn a_required_egress_profile_refuses_an_unadmitted_refresh_endpoint_unsent() {
+        let (base, state) = spawn_oauth_fixture().await;
+        let store = Arc::new(EphemeralTokenStore::new());
+        let auth = test_auth_lease();
+        let authority = ce_refresh_authority(store.clone(), auth.clone());
+        let target = McpServerIdentity::from_server_config("egress-refresh", format!("{base}/mcp"));
+        ce_seed_stored_credential(&authority, &target, &base).await;
+        republish_stored_tokens(&authority, store.as_ref(), &target, |tokens| {
+            tokens.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        })
+        .await;
+
+        let profile = HttpEgressProfile::required(
+            crate::http_egress::HttpEgressPolicy::new()
+                .allow_public(egress_origin("https://mcp.example.com")),
+        );
+        let bound = authority.clone().with_http_egress(&profile);
+        assert!(
+            bound
+                .bound_http_egress()
+                .is_some_and(|bound| bound.same_profile(&profile))
+        );
+        let result = bound.stored_bearer_token(&target).await;
+        assert!(
+            matches!(
+                result,
+                Err(McpOAuthError::EgressRefused {
+                    refusal: HttpEgressRefusal::HostNotAdmitted,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(
+            state.token_requests.lock().is_empty(),
+            "nothing reached the token endpoint"
+        );
+
+        let admitted = HttpEgressProfile::required(
+            crate::http_egress::HttpEgressPolicy::new()
+                .allow_local(egress_origin(&base), ["127.0.0.1".parse().unwrap()]),
+        );
+        let refreshed = authority
+            .with_http_egress(&admitted)
+            .stored_bearer_token(&target)
+            .await
+            .unwrap();
+        assert_eq!(refreshed.as_deref(), Some("access-token"));
+        assert_eq!(state.token_requests.lock().len(), 1);
+    }
+
+    /// Discovery is admitted URL by URL: a protected resource outside the
+    /// profile is refused typed before any well-known request is sent.
+    #[tokio::test]
+    async fn a_required_egress_profile_refuses_discovery_outside_it_before_any_arrival() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let arrivals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&arrivals);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let profile =
+            HttpEgressProfile::required(crate::http_egress::HttpEgressPolicy::new().allow_local(
+                egress_origin(&format!("http://127.0.0.1:{}", port.wrapping_add(1))),
+                ["127.0.0.1".parse().unwrap()],
+            ));
+        let authority =
+            ce_refresh_authority(Arc::new(EphemeralTokenStore::new()), test_auth_lease())
+                .with_http_egress(&profile);
+        let target = McpServerIdentity::from_server_config(
+            "egress-discovery",
+            format!("http://127.0.0.1:{port}/mcp"),
+        );
+        let result = authority
+            .discover(&target, None, "http://127.0.0.1:1/callback")
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(McpOAuthError::EgressRefused {
+                    refusal: HttpEgressRefusal::PortNotAdmitted,
+                    ..
+                })
+            ),
+            "{:?}",
+            result.as_ref().err()
+        );
+        assert_eq!(arrivals.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_native_account_strategy_reports_only_its_own_required_profile() {
+        let profile = HttpEgressProfile::required(crate::http_egress::HttpEgressPolicy::new());
+        assert!(OidcUserInfoAccountStrategy::new().http_egress().is_none());
+        assert!(
+            OidcUserInfoAccountStrategy::new()
+                .with_http_egress(&HttpEgressProfile::trusted_host())
+                .http_egress()
+                .is_none()
+        );
+        assert!(
+            OidcUserInfoAccountStrategy::new()
+                .with_http_egress(&profile)
+                .http_egress()
+                .is_some_and(|bound| bound.same_profile(&profile))
+        );
+    }
+
+    /// The token endpoint's own resolution is outside the profile: the
+    /// refresh is refused typed through the coordinator, nothing reaches the
+    /// endpoint, and the credential is never invalidated; deliberate local
+    /// authority then refreshes the same credential.
+    #[tokio::test]
+    async fn a_resolver_refused_refresh_is_typed_and_never_invalidates_the_credential() {
+        let (base, state) = spawn_oauth_fixture().await;
+        let port = reqwest::Url::parse(&base).unwrap().port().unwrap();
+        let named = format!("http://localhost:{port}");
+        let store = Arc::new(EphemeralTokenStore::new());
+        let auth = test_auth_lease();
+        let authority = ce_refresh_authority(store.clone(), auth.clone());
+        let target =
+            McpServerIdentity::from_server_config("egress-dns-refresh", format!("{named}/mcp"));
+        ce_seed_stored_credential(&authority, &target, &named).await;
+        republish_stored_tokens(&authority, store.as_ref(), &target, |tokens| {
+            tokens.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        })
+        .await;
+        let key = target.token_key().unwrap();
+        let before = store.load(&key).await.unwrap();
+        assert!(before.is_some());
+
+        let public_only = HttpEgressProfile::required(
+            crate::http_egress::HttpEgressPolicy::new().allow_public(egress_origin(&named)),
+        );
+        let result = authority
+            .clone()
+            .with_http_egress(&public_only)
+            .stored_bearer_token(&target)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(McpOAuthError::EgressRefused {
+                    refusal: HttpEgressRefusal::AddressNotAdmitted,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(state.token_requests.lock().is_empty());
+        assert_eq!(
+            store.load(&key).await.unwrap(),
+            before,
+            "a local egress refusal never invalidates or rewrites the credential"
+        );
+
+        let deliberate =
+            HttpEgressProfile::required(crate::http_egress::HttpEgressPolicy::new().allow_local(
+                egress_origin(&named),
+                ["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()],
+            ));
+        let refreshed = authority
+            .with_http_egress(&deliberate)
+            .stored_bearer_token(&target)
+            .await
+            .unwrap();
+        assert_eq!(refreshed.as_deref(), Some("access-token"));
+        assert_eq!(state.token_requests.lock().len(), 1);
+    }
+
+    /// The native account strategy's UserInfo discovery is admitted by the
+    /// profile: an endpoint outside it, or one whose resolution is refused,
+    /// is a typed egress refusal (never evidence about the account), and
+    /// nothing reaches it.
+    #[tokio::test]
+    async fn userinfo_verification_refusals_are_typed_and_unsent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let arrivals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&arrivals);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let elsewhere = OidcUserInfoAccountStrategy::new().with_http_egress(
+            &HttpEgressProfile::required(crate::http_egress::HttpEgressPolicy::new().allow_local(
+                egress_origin(&format!("http://127.0.0.1:{}", port.wrapping_add(1))),
+                ["127.0.0.1".parse().unwrap()],
+            )),
+        );
+        assert_eq!(
+            elsewhere
+                .preflight(&format!("http://127.0.0.1:{port}"))
+                .await,
+            Err(ConnectorOAuthRefusal::EgressRefused(
+                HttpEgressRefusal::PortNotAdmitted
+            ))
+        );
+        let named = format!("http://localhost:{port}");
+        let resolved =
+            OidcUserInfoAccountStrategy::new().with_http_egress(&HttpEgressProfile::required(
+                crate::http_egress::HttpEgressPolicy::new().allow_public(egress_origin(&named)),
+            ));
+        assert_eq!(
+            resolved.preflight(&named).await,
+            Err(ConnectorOAuthRefusal::EgressRefused(
+                HttpEgressRefusal::AddressNotAdmitted
+            ))
+        );
+        assert_eq!(arrivals.load(Ordering::SeqCst), 0);
     }
 }

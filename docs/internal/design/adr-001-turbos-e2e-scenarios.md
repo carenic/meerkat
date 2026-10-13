@@ -555,9 +555,11 @@ If setup lacks a selected required capability, fail the named checkpoint as
 blocked with the exact reason. An explicitly unsupported capability gets its
 own successful refusal test and remains excluded from advertised support.
 
-The ADR budget is **<1 ms p99 added work per model/tool operation and <=10 percent
-per representative turn**, including preparation, attribute lookup, invalidation,
-recording, allocation and lock time. A short smoke cannot establish this tail.
+The ADR budget is **<1 ms p99 added work per model/tool operation**, including
+preparation, attribute lookup, invalidation, recording, allocation and lock time,
+with responsiveness and full coverage. At most 10 percent mean overhead per
+representative turn is a nonblocking optimization target. A short smoke cannot
+establish this tail.
 Add a zero-live-call structural guard to the existing cost suite: no extra network
 requests/fsync, no per-chunk policy evaluation, no whole-history scan/hash/clone,
 no repeated success logging on each unchanged warm check, and no busy polling

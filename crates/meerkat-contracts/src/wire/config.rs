@@ -58,6 +58,11 @@ pub struct ConfigContractSchema {
     pub model_fallback: meerkat_core::config::ModelFallbackConfig,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub presentation: Value,
+    /// Readable through the ordinary config surfaces; an ordinary write
+    /// cannot change it (governance is administered by the realm's trusted
+    /// host).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance: Option<meerkat_core::GovernanceConfig>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub realm: std::collections::BTreeMap<String, Value>,
 }
@@ -163,6 +168,17 @@ pub struct ConfigWriteResult {
     pub live_propagation: Option<WireLiveConfigPropagationReport>,
 }
 
+/// Typed `data` of a refused config write. RPC and the MCP server attach it
+/// to their invalid-params refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WireConfigWriteRefusal {
+    /// The write would change, remove or restate the realm's governance
+    /// section, which only the realm's trusted host administers.
+    GovernanceAdministrationRequired,
+}
+
 /// Parameters for the RPC `config/set` method — replace the config (bare
 /// config or wrapped with an optimistic-concurrency generation).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +223,40 @@ mod tests {
                 .and_then(serde_json::Value::as_u64),
             Some(1),
             "Config::validate rejects max_tokens == 0, so the public config-set schema must not advertise zero as valid"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn config_write_refusal_keeps_its_wire_shape() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            serde_json::to_value(WireConfigWriteRefusal::GovernanceAdministrationRequired)?,
+            serde_json::json!({ "type": "governance_administration_required" })
+        );
+        Ok(())
+    }
+
+    /// The governance section is described as it reads; its tier and
+    /// assurance stay plain string enums for the generated SDK types.
+    #[test]
+    fn config_contract_schema_describes_the_governance_section()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = serde_json::to_value(schemars::schema_for!(ConfigContractSchema))?;
+        assert!(schema.pointer("/properties/governance").is_some());
+        let definitions = schema
+            .get("$defs")
+            .or_else(|| schema.get("definitions"))
+            .ok_or("schema definitions")?;
+        assert_eq!(
+            definitions.pointer("/StockReviewTier/enum"),
+            Some(&serde_json::json!(["r2", "r3"]))
+        );
+        assert_eq!(
+            definitions.pointer("/StockConsentAssurance/enum"),
+            Some(&serde_json::json!([
+                "device_trusted",
+                "person_authenticated"
+            ]))
         );
         Ok(())
     }

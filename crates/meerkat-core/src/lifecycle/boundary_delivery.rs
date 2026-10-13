@@ -398,6 +398,7 @@ mod tests {
                     category: "test".to_string(),
                     detail: Some(detail.to_string()),
                     payload: None,
+                    content: Vec::new(),
                 }],
             },
             identity: None,

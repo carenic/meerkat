@@ -48,31 +48,37 @@ pub struct RedactedUrl<'a>(pub &'a str);
 
 impl fmt::Debug for RedactedUrl<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (base, suffix) = match self.0.find(['?', '#']) {
-            Some(index) => (&self.0[..index], Some(&self.0[index..=index])),
-            None => (self.0, None),
-        };
-        let (scheme, rest) = match base.find("://") {
-            Some(index) => base.split_at(index + 3),
-            None => ("", base),
-        };
-        let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-        let mut shown = String::with_capacity(self.0.len());
-        shown.push_str(scheme);
-        match authority.rfind('@') {
-            Some(index) => {
-                shown.push_str(REDACTED);
-                shown.push_str(&authority[index..]);
-            }
-            None => shown.push_str(authority),
-        }
-        shown.push_str(path);
-        if let Some(separator) = suffix {
-            shown.push_str(separator);
-            shown.push_str(REDACTED);
-        }
-        fmt::Debug::fmt(&shown, f)
+        fmt::Debug::fmt(&redacted_url(self.0), f)
     }
+}
+
+/// `url` with scheme, host and path kept; userinfo, query and fragment
+/// replaced by [`REDACTED`].
+pub(crate) fn redacted_url(url: &str) -> String {
+    let (base, suffix) = match url.find(['?', '#']) {
+        Some(index) => (&url[..index], Some(&url[index..=index])),
+        None => (url, None),
+    };
+    let (scheme, rest) = match base.find("://") {
+        Some(index) => base.split_at(index + 3),
+        None => ("", base),
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let mut shown = String::with_capacity(url.len());
+    shown.push_str(scheme);
+    match authority.rfind('@') {
+        Some(index) => {
+            shown.push_str(REDACTED);
+            shown.push_str(&authority[index..]);
+        }
+        None => shown.push_str(authority),
+    }
+    shown.push_str(path);
+    if let Some(separator) = suffix {
+        shown.push_str(separator);
+        shown.push_str(REDACTED);
+    }
+    shown
 }
 
 /// An optional secret: `None`, or `Some("<redacted>")`.

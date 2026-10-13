@@ -866,6 +866,7 @@ impl InteractionTerminalPublicationError {
             | crate::RuntimeDriverError::InputIdempotencyConflict { .. }
             | crate::RuntimeDriverError::RecoveryCorruption { .. }
             | crate::RuntimeDriverError::InputTerminalWithoutReceipt { .. }
+            | crate::RuntimeDriverError::ScopedResultWithheld { .. }
             | crate::RuntimeDriverError::HostingClaimInvariantViolated { .. }
             | crate::RuntimeDriverError::RecoveryRepairBlocked { .. } => Self::Corrupt(detail),
             crate::RuntimeDriverError::ControllerReadinessUnavailable { .. }
@@ -877,6 +878,7 @@ impl InteractionTerminalPublicationError {
             | crate::RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. }
             | crate::RuntimeDriverError::InterruptDispatchPanicked { .. }
             | crate::RuntimeDriverError::RecoveryBackoff { .. }
+            | crate::RuntimeDriverError::ConsentOwnerLossUnsettled { .. }
             | crate::RuntimeDriverError::MaterializationRegistrationOwned { .. }
             | crate::RuntimeDriverError::Internal(_) => Self::Retryable(detail),
         }
@@ -2554,6 +2556,18 @@ struct RuntimeLoopTerminalHandoff {
     executor_stop_retry_reason: Option<String>,
     deferred_executor_stop_error: Option<crate::RuntimeDriverError>,
     disposition: RuntimeLoopTeardownDisposition,
+    /// The machine whose runless-terminal hint the loop's canonical stop
+    /// tells about the inputs it terminalizes.
+    machine: std::sync::Weak<crate::meerkat_machine::MeerkatMachine>,
+}
+
+impl RuntimeLoopTerminalHandoff {
+    fn runless_terminal_announcement(&self) -> crate::meerkat_machine::RunlessTerminalAnnouncement {
+        self.machine
+            .upgrade()
+            .map(|machine| machine.runless_terminal_announcement())
+            .unwrap_or_default()
+    }
 }
 
 impl Default for RuntimeLoopTerminalHandoff {
@@ -2565,6 +2579,7 @@ impl Default for RuntimeLoopTerminalHandoff {
             ),
             deferred_executor_stop_error: None,
             disposition: RuntimeLoopTeardownDisposition::PreserveRegistration,
+            machine: std::sync::Weak::new(),
         }
     }
 }
@@ -2597,6 +2612,54 @@ pub(crate) struct RuntimeLoopTeardownSlot {
     owned_terminalization_state: std::sync::Mutex<Option<OwnedTerminalizationState>>,
     pending_nondirected_run_terminal: std::sync::Mutex<Option<PendingNondirectedRunTerminal>>,
     changed: tokio::sync::Notify,
+    /// Watcher kickoffs in flight on this exact slot (see
+    /// [`Self::begin_watcher_kickoff`]). Taken under `last_unregister_result`.
+    watcher_kickoffs: std::sync::Mutex<usize>,
+    watcher_kickoffs_released: tokio::sync::Notify,
+    #[cfg(test)]
+    watcher_test_hooks: std::sync::Mutex<WatcherTestHooks>,
+}
+
+/// Test holds and witnesses on one slot's watcher and its unregister
+/// publication. A hold parks at its point, reports the park, and resumes once
+/// its release sender is used or dropped.
+#[cfg(test)]
+#[derive(Default)]
+struct WatcherTestHooks {
+    wake_hold: Option<WatcherTestHold>,
+    kickoff_hold: Option<WatcherTestHold>,
+    kickoff_refused: Option<tokio::sync::oneshot::Sender<()>>,
+    publication_waits: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
+type WatcherTestHold = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+/// One runtime-loop watcher kickoff in flight on its exact teardown slot.
+///
+/// The watcher takes it before it upgrades the machine and drops it only
+/// after every alias the kickoff took (the machine, the session driver it
+/// observed) is dropped. Dropping it wakes an unregister publication that
+/// waits for the slot's kickoffs.
+pub(crate) struct RuntimeLoopWatcherKickoff {
+    slot: std::sync::Arc<RuntimeLoopTeardownSlot>,
+}
+
+impl Drop for RuntimeLoopWatcherKickoff {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .slot
+            .watcher_kickoffs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *in_flight = in_flight.saturating_sub(1);
+        if *in_flight == 0 {
+            self.slot.watcher_kickoffs_released.notify_waiters();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2654,6 +2717,10 @@ impl RuntimeLoopTeardownSlot {
             owned_terminalization_state: std::sync::Mutex::new(None),
             pending_nondirected_run_terminal: std::sync::Mutex::new(None),
             changed: tokio::sync::Notify::new(),
+            watcher_kickoffs: std::sync::Mutex::new(0),
+            watcher_kickoffs_released: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            watcher_test_hooks: std::sync::Mutex::default(),
         })
     }
 
@@ -2675,6 +2742,10 @@ impl RuntimeLoopTeardownSlot {
             owned_terminalization_state: std::sync::Mutex::new(None),
             pending_nondirected_run_terminal: std::sync::Mutex::new(None),
             changed: tokio::sync::Notify::new(),
+            watcher_kickoffs: std::sync::Mutex::new(0),
+            watcher_kickoffs_released: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            watcher_test_hooks: std::sync::Mutex::default(),
         })
     }
 
@@ -2989,6 +3060,169 @@ impl RuntimeLoopTeardownSlot {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
+    /// Begin one watcher kickoff, which may take the machine and the session
+    /// driver it observes.
+    ///
+    /// `None` once a successful unregister of this exact slot has
+    /// acknowledged its result: that publication may already be under way
+    /// and the registration is gone, so the watcher has nothing left to
+    /// observe and must not take the machine again. The check and the count
+    /// share the acknowledgement's lock, so every kickoff either began before
+    /// the acknowledgement (and the publication waits for it) or sees it.
+    pub(crate) fn begin_watcher_kickoff(
+        self: &std::sync::Arc<Self>,
+    ) -> Option<RuntimeLoopWatcherKickoff> {
+        let last_unregister_result = self
+            .last_unregister_result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*last_unregister_result, Some(Ok(()))) {
+            return None;
+        }
+        let mut in_flight = self
+            .watcher_kickoffs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *in_flight = in_flight.saturating_add(1);
+        Some(RuntimeLoopWatcherKickoff {
+            slot: std::sync::Arc::clone(self),
+        })
+    }
+
+    /// Wait until no watcher kickoff of this slot holds its aliases any more.
+    ///
+    /// An unregister of this slot calls this after acknowledging its result
+    /// and before publishing it. A kickoff never waits for that publication,
+    /// so this cannot wait on itself.
+    pub(crate) async fn watcher_kickoffs_released(&self) {
+        loop {
+            let mut released = std::pin::pin!(self.watcher_kickoffs_released.notified());
+            released.as_mut().enable();
+            if *self
+                .watcher_kickoffs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                == 0
+            {
+                return;
+            }
+            #[cfg(test)]
+            self.report_watcher_test_witness(|hooks| hooks.publication_waits.take());
+            released.await;
+        }
+    }
+
+    /// Park this slot's watcher right after its wake, before its kickoff
+    /// (test support): a watcher that the scheduler runs late.
+    #[cfg(test)]
+    pub(crate) fn test_hold_watcher_wake(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.arm_watcher_test_hold(|hooks, hold| hooks.wake_hold = Some(hold))
+    }
+
+    /// Park this slot's next watcher kickoff after its work and before it
+    /// releases its aliases (test support).
+    #[cfg(test)]
+    pub(crate) fn test_hold_next_watcher_kickoff(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.arm_watcher_test_hold(|hooks, hold| hooks.kickoff_hold = Some(hold))
+    }
+
+    /// Report the next time this slot's watcher is refused a kickoff (test
+    /// support).
+    #[cfg(test)]
+    pub(crate) fn test_witness_watcher_kickoff_refused(
+        &self,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        self.arm_watcher_test_witness(|hooks, witness| hooks.kickoff_refused = Some(witness))
+    }
+
+    /// Report the next time an unregister publication of this slot waits for
+    /// a watcher kickoff still in flight (test support).
+    #[cfg(test)]
+    pub(crate) fn test_witness_publication_waits_for_kickoff(
+        &self,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        self.arm_watcher_test_witness(|hooks, witness| hooks.publication_waits = Some(witness))
+    }
+
+    #[cfg(test)]
+    fn arm_watcher_test_hold(
+        &self,
+        arm: impl FnOnce(&mut WatcherTestHooks, WatcherTestHold),
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        arm(
+            &mut self
+                .watcher_test_hooks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            (parked_tx, release_rx),
+        );
+        (parked_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    fn arm_watcher_test_witness(
+        &self,
+        arm: impl FnOnce(&mut WatcherTestHooks, tokio::sync::oneshot::Sender<()>),
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        let (witness_tx, witness_rx) = tokio::sync::oneshot::channel();
+        arm(
+            &mut self
+                .watcher_test_hooks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            witness_tx,
+        );
+        witness_rx
+    }
+
+    #[cfg(test)]
+    async fn run_watcher_test_hold(
+        &self,
+        take: impl FnOnce(&mut WatcherTestHooks) -> Option<WatcherTestHold>,
+    ) {
+        let hold = take(
+            &mut self
+                .watcher_test_hooks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if let Some((parked_tx, release_rx)) = hold {
+            let _ = parked_tx.send(());
+            let _ = release_rx.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn report_watcher_test_witness(
+        &self,
+        take: impl FnOnce(&mut WatcherTestHooks) -> Option<tokio::sync::oneshot::Sender<()>>,
+    ) {
+        let witness = take(
+            &mut self
+                .watcher_test_hooks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if let Some(witness) = witness {
+            let _ = witness.send(());
+        }
+    }
+
     fn publish(&self, mut handoff: RuntimeLoopExitHandoff) {
         let mut retained_receipt = None;
         let mut state = self
@@ -3290,11 +3524,17 @@ impl RuntimeLoopTeardownSlot {
                 .recovery_context
                 .as_ref()
                 .and_then(|recovery| recovery.completions.as_ref());
-            if let Err(error) = crate::control_plane::terminalize_async_stop(
+            let runless_terminal = self
+                .recovery_context
+                .as_ref()
+                .map(|recovery| recovery.authority_binding.runless_terminal_announcement())
+                .unwrap_or_default();
+            if let Err(error) = crate::control_plane::terminalize_async_stop_announcing(
                 driver,
                 completions,
                 publication_handle,
                 None,
+                runless_terminal,
             )
             .await
             {
@@ -3709,6 +3949,7 @@ async fn apply_runtime_loop_effect_and_record_handoff(
         executor,
         effect,
         turn_finalization_guard,
+        handoff.runless_terminal_announcement(),
     )
     .await
     {
@@ -4577,6 +4818,15 @@ impl RuntimeLoopAuthorityBinding {
         }
     }
 
+    /// An announcement of the runless input terminals a step of this loop
+    /// commits, told through the machine's installed hint.
+    fn runless_terminal_announcement(&self) -> crate::meerkat_machine::RunlessTerminalAnnouncement {
+        self.machine
+            .upgrade()
+            .map(|machine| machine.runless_terminal_announcement())
+            .unwrap_or_default()
+    }
+
     fn new(
         machine: std::sync::Weak<crate::meerkat_machine::MeerkatMachine>,
         session_id: meerkat_core::types::SessionId,
@@ -5204,23 +5454,61 @@ pub(crate) fn spawn_runtime_loop_with_completions(
     let teardown_session_id = session_id;
     tokio::spawn(async move {
         teardown_watcher_slot.wait_until_published().await;
+        #[cfg(test)]
+        teardown_watcher_slot
+            .run_watcher_test_hold(|hooks| hooks.wake_hold.take())
+            .await;
         let disposition = teardown_watcher_slot.disposition();
-        let Some(machine) = teardown_machine.upgrade() else {
-            return;
-        };
         // This watcher is deliberately separate from both the loop body and
         // the owned unregister saga. It may join an already-running direct
         // unregister or observe its retained terminal result, but never turns
         // a completed failure into an implicit retry. The saga never awaits
         // this watcher, so no self-join cycle is possible.
-        if let Err(error) = machine
-            .observe_runtime_loop_teardown(
-                &teardown_session_id,
-                std::sync::Arc::clone(&teardown_watcher_slot),
-                disposition,
-            )
-            .await
-        {
+        //
+        // Nobody joins this watcher either. It takes the machine, and through
+        // it the session driver, only inside a kickoff fenced on its exact
+        // slot, and waits for what that kickoff joined on result channels
+        // alone. An unregister of this slot publishes its result only after a
+        // kickoff in flight has dropped those aliases, and once a successful
+        // unregister has acknowledged its result no later kickoff takes the
+        // machine at all.
+        let observed = {
+            let Some(kickoff) = teardown_watcher_slot.begin_watcher_kickoff() else {
+                #[cfg(test)]
+                teardown_watcher_slot
+                    .report_watcher_test_witness(|hooks| hooks.kickoff_refused.take());
+                return;
+            };
+            let Some(machine) = teardown_machine.upgrade() else {
+                return;
+            };
+            let observed = machine
+                .observe_runtime_loop_teardown(
+                    &teardown_session_id,
+                    std::sync::Arc::clone(&teardown_watcher_slot),
+                    disposition,
+                )
+                .await;
+            #[cfg(test)]
+            teardown_watcher_slot
+                .run_watcher_test_hold(|hooks| hooks.kickoff_hold.take())
+                .await;
+            drop(machine);
+            drop(kickoff);
+            observed
+        };
+        let finished = match observed {
+            Ok(wait) => {
+                wait.finish(
+                    &teardown_machine,
+                    &teardown_session_id,
+                    &teardown_watcher_slot,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = finished {
             // Never an implicit retry and never a timer: the outcome is typed.
             // A saga still running keeps its coordinator
             // (`RuntimeDetachedUnregister::InFlight`); a failed one leaves the
@@ -5260,6 +5548,7 @@ pub(crate) fn spawn_runtime_loop_with_completions(
         }
         let mut terminal_handoff = RuntimeLoopTerminalHandoff {
             disposition: RuntimeLoopTeardownDisposition::UnservedAttachment,
+            machine: authority_binding.machine.clone(),
             ..RuntimeLoopTerminalHandoff::default()
         };
         // Feed-based idle wake state (local to this loop).
@@ -6671,6 +6960,7 @@ async fn process_queue(
                     driver,
                     run_id.clone(),
                     batch,
+                    authority_binding.runless_terminal_announcement(),
                 )
                 .await
                 {
@@ -11511,10 +11801,14 @@ mod tests {
         // this fixture must assert it actually staged: silently proceeding
         // with nothing staged would make the expect message below a lie for
         // every disposition test built on this fixture.
-        let outcome =
-            crate::meerkat_machine::prepare_runtime_loop_batch_start(driver, run_id.clone(), batch)
-                .await
-                .expect("staging an accepted batch must succeed");
+        let outcome = crate::meerkat_machine::prepare_runtime_loop_batch_start(
+            driver,
+            run_id.clone(),
+            batch,
+            crate::meerkat_machine::RunlessTerminalAnnouncement::default(),
+        )
+        .await
+        .expect("staging an accepted batch must succeed");
         assert!(
             matches!(
                 outcome,

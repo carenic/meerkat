@@ -68,6 +68,25 @@ impl LocalAuthorizationPublication {
         Ok(guard)
     }
 
+    /// [`Self::begin_owner_change`] without waiting, for a synchronous step
+    /// that holds native custody it must not wait under.
+    ///
+    /// Take this writer first, then try-lock the owner. When the owner is
+    /// contended, change no facts and drop the guard: dropping it advances the
+    /// sequence, which conservatively invalidates every disposable observation
+    /// without claiming that a change happened. Retry by rebuilding from the
+    /// actual owners; never revalidate an observation made before the guard.
+    ///
+    /// # Errors
+    /// Writer contention or poison is `Unavailable` before any mutation and
+    /// leaves publication and every stamp unchanged. A poisoned or exhausted
+    /// publication stays unavailable, as for [`Self::begin_owner_change`].
+    pub fn try_begin_owner_change(&self) -> Result<LocalPublicationGuard<'_>, PublicationError> {
+        let mut guard = self.try_reserve_owner_change()?;
+        guard.publish();
+        Ok(guard)
+    }
+
     /// Reserve the writer without invalidating observations yet. This private
     /// path is only for a mutation whose complete facts stay inaccessible under
     /// one owner mutex until `publish` is called. Validate exhaustion before any
@@ -182,6 +201,16 @@ impl LocalPublicationGuard<'_> {
             self.published = true;
         }
     }
+
+    /// Whether `stamp` was observed on this same publication and no owner
+    /// change has published since. [`LocalPublicationStamp::check_current`]
+    /// alone compares only with the stamp's own publication, so a stamp of
+    /// another publication must be refused here first. No other owner change
+    /// can publish while this reservation is held, so the answer holds until
+    /// this guard publishes or drops.
+    pub(crate) fn stamp_is_current(&self, stamp: &LocalPublicationStamp) -> bool {
+        std::ptr::eq(self.inner, Arc::as_ptr(&stamp.inner)) && stamp.check_current().is_ok()
+    }
 }
 
 impl Drop for LocalPublicationGuard<'_> {
@@ -244,6 +273,56 @@ impl LocalPublicationStamp {
             current if current == self.sequence => Ok(()),
             _ => Err(PublicationError::Changed),
         }
+    }
+}
+
+/// Human-consent approver eligibility as of one coherent publication of the
+/// host's eligibility owner facts.
+///
+/// The approval owner checks it again when a consent decision commits, with
+/// the same allocation-free atomic read as an operation's final entry check:
+/// any owner change published since the observation (a revocation, a role
+/// change) refuses the decision. It is evidence of eligibility, never an
+/// authentication: the approver is still the host's authenticated assertion.
+pub struct PublishedConsentEligibility {
+    stamp: LocalPublicationStamp,
+}
+
+impl PublishedConsentEligibility {
+    /// Observe the eligibility owner under `publication`. `eligible` must
+    /// read the owner's real facts for the exact approver and approval,
+    /// without I/O. An ineligible approver, or an owner change during the
+    /// observation, yields no evidence.
+    ///
+    /// # Errors
+    /// [`meerkat_core::approval::consent::ConsentIneligible`] when there is
+    /// no current evidence of eligibility.
+    pub fn observe(
+        publication: &LocalAuthorizationPublication,
+        eligible: impl FnOnce() -> bool,
+    ) -> Result<
+        Arc<dyn meerkat_core::approval::consent::ConsentEligibility>,
+        meerkat_core::approval::consent::ConsentIneligible,
+    > {
+        match publication.observe(eligible) {
+            Ok((true, stamp)) => Ok(Arc::new(Self { stamp })),
+            Ok((false, _)) | Err(_) => Err(meerkat_core::approval::consent::ConsentIneligible),
+        }
+    }
+}
+
+impl fmt::Debug for PublishedConsentEligibility {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PublishedConsentEligibility")
+            .finish_non_exhaustive()
+    }
+}
+
+impl meerkat_core::approval::consent::ConsentEligibility for PublishedConsentEligibility {
+    fn check_current(&self) -> Result<(), meerkat_core::approval::consent::ConsentIneligible> {
+        self.stamp
+            .check_current()
+            .map_err(|_| meerkat_core::approval::consent::ConsentIneligible)
     }
 }
 
@@ -324,6 +403,131 @@ mod tests {
         ));
         assert!(matches!(
             publication.begin_owner_change(),
+            Err(PublicationError::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn a_contended_try_begin_changes_nothing_and_keeps_the_stamp() {
+        let publication = LocalAuthorizationPublication::new();
+        let ((), stamp) = publication.observe(|| ()).expect("initial stamp");
+        let reservation = publication
+            .try_reserve_owner_change()
+            .expect("another owner holds the writer");
+        assert!(matches!(
+            publication.try_begin_owner_change(),
+            Err(PublicationError::Unavailable)
+        ));
+        assert_eq!(stamp.check_current(), Ok(()));
+        drop(reservation);
+        assert_eq!(stamp.check_current(), Ok(()));
+        let ((), unchanged) = publication.observe(|| ()).expect("nothing was published");
+        assert_eq!(
+            unchanged.observation_sequence(),
+            stamp.observation_sequence()
+        );
+    }
+
+    #[test]
+    fn a_contended_source_owner_keeps_its_facts_and_invalidates_the_stamp() {
+        let publication = LocalAuthorizationPublication::new();
+        let owner = Mutex::new("not admitted");
+        let (facts, stamp) = publication
+            .observe(|| *owner.lock().expect("owner"))
+            .expect("initial view");
+        let busy = owner.lock().expect("the owner is busy elsewhere");
+        let change = publication
+            .try_begin_owner_change()
+            .expect("the writer is free");
+        assert!(owner.try_lock().is_err(), "the source owner is contended");
+        drop(change);
+        drop(busy);
+        assert_eq!(*owner.lock().expect("owner"), facts, "no fact changed");
+        assert_eq!(stamp.check_current(), Err(PublicationError::Changed));
+
+        let (rebuilt, retry_stamp) = publication
+            .observe(|| *owner.lock().expect("owner"))
+            .expect("a retry rebuilds from the actual owner");
+        assert_eq!(rebuilt, facts);
+        let change = publication
+            .try_begin_owner_change()
+            .expect("the writer is free");
+        *owner.try_lock().expect("the source owner is free") = "admitted";
+        drop(change);
+        assert_eq!(retry_stamp.check_current(), Err(PublicationError::Changed));
+        let (after, current) = publication
+            .observe(|| *owner.lock().expect("owner"))
+            .expect("the retry published");
+        assert_eq!(after, "admitted");
+        assert_eq!(current.check_current(), Ok(()));
+    }
+
+    #[test]
+    fn a_reservation_admits_only_a_current_stamp_of_its_own_publication() {
+        let publication = LocalAuthorizationPublication::new();
+        let ((), stale) = publication.observe(|| ()).expect("initial stamp");
+        drop(publication.begin_owner_change().expect("owner change"));
+        let ((), current) = publication.observe(|| ()).expect("current stamp");
+        let unrelated = LocalAuthorizationPublication::new();
+        let ((), foreign) = unrelated.observe(|| ()).expect("unrelated stamp");
+        assert_eq!(foreign.check_current(), Ok(()), "current on its own");
+
+        let reservation = publication
+            .try_reserve_owner_change()
+            .expect("the writer is free");
+        assert!(reservation.stamp_is_current(&current));
+        assert!(!reservation.stamp_is_current(&stale));
+        assert!(!reservation.stamp_is_current(&foreign));
+        drop(reservation);
+        assert_eq!(current.check_current(), Ok(()), "nothing was published");
+    }
+
+    #[test]
+    fn a_successful_try_begin_publishes_coherently() {
+        let publication = LocalAuthorizationPublication::new();
+        let owner = Mutex::new("before");
+        let (_, before) = publication
+            .observe(|| *owner.lock().expect("owner"))
+            .expect("initial view");
+        let change = publication
+            .try_begin_owner_change()
+            .expect("the writer is free");
+        assert_eq!(before.check_current(), Err(PublicationError::Changed));
+        assert!(matches!(
+            publication.observe(|| *owner.lock().expect("owner")),
+            Err(PublicationError::Changed)
+        ));
+        *owner.try_lock().expect("the source owner is free") = "after";
+        drop(change);
+        let (after, stamp) = publication
+            .observe(|| *owner.lock().expect("owner"))
+            .expect("a coherent view of the new facts");
+        assert_eq!(after, "after");
+        assert_eq!(stamp.check_current(), Ok(()));
+        assert_eq!(before.check_current(), Err(PublicationError::Changed));
+    }
+
+    #[test]
+    #[allow(clippy::panic)] // Deliberately inject a partial owner-mutation panic.
+    fn a_panic_under_try_begin_stays_poisoned() {
+        let publication = LocalAuthorizationPublication::new();
+        let ((), stamp) = publication.observe(|| ()).expect("initial stamp");
+        let result = std::panic::catch_unwind(|| {
+            let _change = publication.try_begin_owner_change().expect("owner change");
+            panic!("simulated partial owner mutation");
+        });
+        assert!(result.is_err());
+        assert_eq!(stamp.check_current(), Err(PublicationError::Unavailable));
+        assert!(matches!(
+            publication.try_begin_owner_change(),
+            Err(PublicationError::Unavailable)
+        ));
+        assert!(matches!(
+            publication.begin_owner_change(),
+            Err(PublicationError::Unavailable)
+        ));
+        assert!(matches!(
+            publication.observe(|| ()),
             Err(PublicationError::Unavailable)
         ));
     }

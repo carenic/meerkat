@@ -84,6 +84,7 @@ impl meerkat_core::AgentToolDispatcher for HostNote {
             .with_provenance(meerkat_core::ToolProvenance {
                 kind: meerkat_core::ToolSourceKind::Callback,
                 source_id: HOST_NOTE.into(),
+                artifact: None,
             }),
         )])
     }
@@ -169,6 +170,8 @@ type Seen = Arc<Mutex<Option<BTreeMap<String, String>>>>;
 #[derive(Default, Clone)]
 struct Observed {
     parent: Seen,
+    /// The parent's own call to the family's tool.
+    direct: Seen,
     helper: Seen,
     grandchild: Seen,
     /// One entry per worker turn.
@@ -302,11 +305,10 @@ fn script(
             };
         }
         if user.contains(DIRECT_PROBE) {
-            return ScriptedTurn::ToolCall {
-                id: "call-parent-probe".to_string(),
-                name: probe.tool.to_string(),
-                args: probe.args.clone(),
-            };
+            let seen = Arc::clone(&observed.direct);
+            return probe_once(results, "call-parent-probe", &probe, |r| {
+                *seen.lock().unwrap() = Some(r);
+            });
         }
         if !user.contains(PROBE) {
             return ScriptedTurn::Text("ok".to_string());
@@ -405,15 +407,28 @@ impl ParentMob {
     }
 
     /// Precondition: the family is off for the parent itself, so its own
-    /// call is an unknown tool (which ends that turn).
-    async fn assert_family_off_for_parent(&self, probe: &FamilyProbe) {
-        let Err(direct) = self.parent_turn(DIRECT_PROBE).await else {
-            panic!("the parent's own call to a tool of a family it leaves off fails its turn");
-        };
+    /// call names a tool it does not have. That is feedback for that call
+    /// only: the model gets the typed not-found result, the tool never runs,
+    /// and the turn goes on to its answer.
+    async fn assert_family_off_for_parent(&self, probe: &FamilyProbe, observed: &Observed) {
+        self.parent_turn(DIRECT_PROBE)
+            .await
+            .expect("the parent's call to a tool it does not have is call-local feedback");
+        let direct = seen(&observed.direct, "parent's own probe");
+        let result = &direct["call-parent-probe"];
         assert!(
-            format!("{direct:?}").contains(&format!("Tool not found: {}", probe.tool)),
-            "{} is not mounted for the parent: {direct:?}",
+            !result.contains(probe.executed_marker),
+            "{} is not mounted for the parent, yet it ran: {result}",
             probe.tool
+        );
+        assert!(
+            result.contains("\"error\":\"tool_not_found\"") && result.contains(probe.tool),
+            "the parent's {} call is the typed not-found: {result}",
+            probe.tool
+        );
+        assert!(
+            !result.contains("access_denied"),
+            "a tool the parent does not have is not an authorization denial: {result}"
         );
     }
 
@@ -487,7 +502,7 @@ async fn assert_delegate_helper_is_capped(probe: FamilyProbe, hidden_first: bool
         ),
     )
     .await;
-    mob.assert_family_off_for_parent(&probe).await;
+    mob.assert_family_off_for_parent(&probe, &observed).await;
     mob.parent_turn(PROBE)
         .await
         .expect("a refused helper call does not fail the parent's turn");
@@ -578,7 +593,7 @@ async fn a_recursive_inline_delegate_profile_stays_within_the_root_parent() {
         ),
     )
     .await;
-    mob.assert_family_off_for_parent(&probe).await;
+    mob.assert_family_off_for_parent(&probe, &observed).await;
     mob.parent_turn(PROBE)
         .await
         .expect("a refused grandchild call does not fail the parent's turn");
@@ -642,7 +657,7 @@ async fn an_inline_spawn_member_profile_cannot_enable_shell_the_parent_leaves_of
         ),
     )
     .await;
-    mob.assert_family_off_for_parent(&probe).await;
+    mob.assert_family_off_for_parent(&probe, &observed).await;
     mob.parent_turn(PROBE)
         .await
         .expect("the parent's spawn turn");

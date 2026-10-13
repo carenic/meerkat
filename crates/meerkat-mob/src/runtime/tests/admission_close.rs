@@ -1,0 +1,622 @@
+//! D67: public ownership of a running mob and the Closing admission state.
+//! An idle close is decided on the actor's serialized admission path, so a
+//! racing command is either admitted first (the close answers Busy) or
+//! refused after it, never both; the actor's own clones never keep a mob
+//! open, and a retained public handle does.
+
+use super::*;
+use crate::runtime::actor::spawn_preparation::SpawnPreparationTestGate;
+use crate::runtime::admission_close::{CloseIfIdleOutcome, MobAdmissionCloseReason};
+
+/// Bound for test steps that must happen promptly; it only turns a hang into
+/// a failure.
+const STEP: Duration = Duration::from_secs(10);
+
+/// A turn-driven worker: it has no kickoff turn, so once seated it leaves
+/// the mob idle. (An autonomous member's unresolved kickoff is work in
+/// flight and keeps the mob busy.)
+fn worker_spec(name: &str) -> SpawnMemberSpec {
+    let mut spec = SpawnMemberSpec::new(ProfileName::from("worker"), AgentIdentity::from(name));
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    spec
+}
+
+fn assert_admission_closed(error: MobError, expected: MobAdmissionCloseReason) {
+    match error {
+        MobError::AdmissionClosed { reason, .. } => assert_eq!(reason, expected),
+        other => panic!("expected AdmissionClosed ({expected}), got {other}"),
+    }
+}
+
+/// Hold the named member's spawn preparation until a permit is added.
+fn hold_spawn(identity: &str) -> Arc<tokio::sync::Semaphore> {
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    arm_spawn_preparation_gate_for_test(
+        &AgentIdentity::from(identity),
+        SpawnPreparationTestGate {
+            entered: None,
+            release: Some(Arc::clone(&release)),
+            settled: None,
+        },
+    );
+    release
+}
+
+/// [`hold_spawn`], also reporting when the named member's preparation has
+/// entered the hold: the spawn is then admitted work in flight.
+fn hold_spawn_entered(
+    identity: &str,
+) -> (
+    Arc<tokio::sync::Semaphore>,
+    tokio::sync::mpsc::UnboundedReceiver<AgentIdentity>,
+) {
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (entered_tx, entered) = tokio::sync::mpsc::unbounded_channel();
+    arm_spawn_preparation_gate_for_test(
+        &AgentIdentity::from(identity),
+        SpawnPreparationTestGate {
+            entered: Some(entered_tx),
+            release: Some(Arc::clone(&release)),
+            settled: None,
+        },
+    );
+    (release, entered)
+}
+
+/// Wait until the held spawn's preparation has entered its hold.
+async fn spawn_entered(entered: &mut tokio::sync::mpsc::UnboundedReceiver<AgentIdentity>) {
+    tokio::time::timeout(STEP, entered.recv())
+        .await
+        .expect("the spawn preparation enters its hold promptly")
+        .expect("spawn preparation gate");
+}
+
+async fn enqueue_spawn(
+    handle: &MobHandle,
+    identity: &str,
+) -> oneshot::Receiver<Result<crate::runtime::MemberSpawnReceipt, MobError>> {
+    handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::Spawn {
+            spec: Box::new(worker_spec(identity)),
+            spawn_source: super::handle::SpawnSource::Consumer,
+            owner_bridge_session_id: None,
+            ops_registry: None,
+            held: None,
+            reply_tx,
+        })
+        .await
+        .expect("enqueue spawn")
+}
+
+async fn enqueue_close_if_idle(
+    handle: &MobHandle,
+) -> oneshot::Receiver<Result<CloseIfIdleOutcome, MobError>> {
+    handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::CloseIfIdle { reply_tx })
+        .await
+        .expect("enqueue close")
+}
+
+async fn reply<T>(reply: oneshot::Receiver<Result<T, MobError>>) -> Result<T, MobError> {
+    tokio::time::timeout(STEP, reply)
+        .await
+        .expect("the actor answers promptly")
+        .expect("reply channel")
+}
+
+/// One actor round trip, letting commands queued before it run. The owner
+/// release is a separate wake branch, so a round trip does not prove when the
+/// release was observed; the assertions that follow hold either way.
+async fn actor_round_trip(handle: &MobHandle) {
+    let phase = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::QueryPhase { reply_tx })
+        .await
+        .expect("enqueue phase query");
+    reply(phase).await.expect("phase query");
+}
+
+async fn await_closed(handle: &MobHandle) -> MobAdmissionCloseReason {
+    let mut closed = handle.admission_closed();
+    let waited = tokio::time::timeout(STEP, closed.wait_for(Option::is_some))
+        .await
+        .map(|closed| closed.map(|reason| *reason));
+    match waited {
+        Ok(Ok(Some(reason))) => reason,
+        _ => {
+            // Report what kept it open: a busy snapshot, or `None` when the
+            // mob is idle and the owner release itself never arrived.
+            let busy = handle
+                .close_admission(MobAdmissionCloseReason::StandDown)
+                .await;
+            panic!("admission did not close; busy snapshot: {busy:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn idle_close_closes_admission_and_refuses_later_mutation() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    assert!(handle.admission_closed().borrow().is_none());
+
+    assert_eq!(
+        handle.close_if_idle().await.expect("close if idle"),
+        CloseIfIdleOutcome::Closed
+    );
+    assert_eq!(
+        *handle.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::IdleClose)
+    );
+    assert_admission_closed(
+        handle
+            .spawn_spec(worker_spec("d67-idle-late"))
+            .await
+            .expect_err("a spawn after the close is refused"),
+        MobAdmissionCloseReason::IdleClose,
+    );
+    assert_eq!(
+        handle.close_if_idle().await.expect("second close"),
+        CloseIfIdleOutcome::AlreadyClosed(MobAdmissionCloseReason::IdleClose)
+    );
+    // A later unconditional close keeps the first reason.
+    assert_eq!(
+        handle
+            .close_admission(MobAdmissionCloseReason::StandDown)
+            .await
+            .expect("close admission"),
+        None
+    );
+    assert_eq!(
+        *handle.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::IdleClose)
+    );
+    // Reads and the ordinary Stop stay admitted on a closed mob.
+    assert!(
+        handle
+            .get_member(&AgentIdentity::from("d67-idle-late"))
+            .await
+            .expect("read")
+            .is_none()
+    );
+    handle
+        .stop()
+        .await
+        .expect("Stop is unchanged on a closed mob");
+}
+
+#[tokio::test]
+async fn admission_racing_the_close_is_admitted_or_refused_never_both() {
+    // Spawn first in mailbox order: admitted, so the close finds it in flight
+    // and leaves it alone.
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let release = hold_spawn("d67-race-first");
+    let spawn = enqueue_spawn(&handle, "d67-race-first").await;
+    let close = enqueue_close_if_idle(&handle).await;
+    match reply(close).await.expect("close answers") {
+        CloseIfIdleOutcome::Busy(busy) => assert!(busy.roster_transitions > 0, "{busy:?}"),
+        other => panic!("an admitted spawn keeps the mob busy, got {other:?}"),
+    }
+    release.add_permits(1);
+    reply(spawn).await.expect("the admitted spawn completes");
+    assert!(handle.admission_closed().borrow().is_none());
+    assert!(
+        handle
+            .get_member(&AgentIdentity::from("d67-race-first"))
+            .await
+            .expect("read")
+            .is_some()
+    );
+    handle.shutdown().await.expect("shutdown");
+
+    // Close first: the mob closes and the spawn behind it is refused.
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let close = enqueue_close_if_idle(&handle).await;
+    let spawn = enqueue_spawn(&handle, "d67-race-second").await;
+    assert_eq!(
+        reply(close).await.expect("close answers"),
+        CloseIfIdleOutcome::Closed
+    );
+    assert_admission_closed(
+        reply(spawn)
+            .await
+            .expect_err("the spawn after the close is refused"),
+        MobAdmissionCloseReason::IdleClose,
+    );
+    assert!(
+        handle
+            .get_member(&AgentIdentity::from("d67-race-second"))
+            .await
+            .expect("read")
+            .is_none()
+    );
+    handle.shutdown().await.expect("shutdown");
+
+    // Truly concurrent callers: whichever wins, the two answers agree.
+    for round in 0..16 {
+        let (handle, _service) = create_test_mob(sample_definition()).await;
+        let name = format!("d67-race-{round}");
+        let (spawned, closed) = tokio::join!(
+            handle.spawn_spec(worker_spec(&name)),
+            handle.close_if_idle()
+        );
+        let closed = closed.expect("close answers");
+        let present = handle
+            .get_member(&AgentIdentity::from(name.as_str()))
+            .await
+            .expect("read")
+            .is_some();
+        match spawned {
+            Ok(_) => {
+                assert!(
+                    present,
+                    "round {round}: an admitted spawn seated its member"
+                );
+                assert!(
+                    matches!(
+                        closed,
+                        CloseIfIdleOutcome::Busy(_) | CloseIfIdleOutcome::Closed
+                    ),
+                    "round {round}: {closed:?}"
+                );
+            }
+            Err(error) => {
+                assert_admission_closed(error, MobAdmissionCloseReason::IdleClose);
+                assert_eq!(closed, CloseIfIdleOutcome::Closed, "round {round}");
+                assert!(!present, "round {round}: a refused spawn seated nothing");
+            }
+        }
+        handle.shutdown().await.expect("shutdown");
+    }
+}
+
+#[tokio::test]
+async fn internal_clones_do_not_keep_an_idle_mob_open() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let observer = handle.observer();
+    let read = handle.read_handle();
+    assert!(handle.is_public_owner());
+    assert!(!observer.is_public_owner());
+
+    // The actor's flow executor, event pumps and recovery drivers still hold
+    // their clones; only the public owner goes away.
+    drop(handle);
+    assert_eq!(
+        await_closed(&observer).await,
+        MobAdmissionCloseReason::LastOwnerReleased
+    );
+    assert_admission_closed(
+        observer
+            .spawn_spec(worker_spec("d67-released-late"))
+            .await
+            .expect_err("a spawn after the release is refused"),
+        MobAdmissionCloseReason::LastOwnerReleased,
+    );
+    drop(read);
+    observer
+        .stop()
+        .await
+        .expect("the observer can still tear the mob down");
+}
+
+#[tokio::test]
+async fn a_retained_public_handle_keeps_the_mob_open() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let retained = handle.clone();
+    let observer = handle.observer();
+    drop(handle);
+    actor_round_trip(&observer).await;
+    actor_round_trip(&observer).await;
+    assert!(
+        observer.admission_closed().borrow().is_none(),
+        "a retained public clone keeps admission open"
+    );
+    retained
+        .spawn_spec(worker_spec("d67-retained"))
+        .await
+        .expect("the retained owner still admits work");
+
+    drop(retained);
+    assert_eq!(
+        await_closed(&observer).await,
+        MobAdmissionCloseReason::LastOwnerReleased
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_released_busy_mob_closes_once_its_admitted_work_drains() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let observer = handle.observer();
+    let (release, mut entered) = hold_spawn_entered("d67-drain");
+    let spawn = enqueue_spawn(&handle, "d67-drain").await;
+    // The spawn is admitted and in flight before the last owner leaves.
+    spawn_entered(&mut entered).await;
+    drop(handle);
+    // Non-owning observers keep status reads queued for the rest of the
+    // test: later traffic must not postpone the release decision forever.
+    let reading = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let readers = (0..4)
+        .map(|_| {
+            let reader = observer.observer();
+            let reading = Arc::clone(&reading);
+            tokio::spawn(async move {
+                while reading.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = reader.status().await;
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    actor_round_trip(&observer).await;
+    actor_round_trip(&observer).await;
+    assert!(
+        observer.admission_closed().borrow().is_none(),
+        "admitted work in flight keeps the released mob open"
+    );
+
+    release.add_permits(1);
+    reply(spawn).await.expect("the admitted spawn completes");
+    assert_eq!(
+        await_closed(&observer).await,
+        MobAdmissionCloseReason::LastOwnerReleased
+    );
+    reading.store(false, std::sync::atomic::Ordering::SeqCst);
+    for reader in readers {
+        reader.await.expect("status reader");
+    }
+    assert!(
+        observer
+            .get_member(&AgentIdentity::from("d67-drain"))
+            .await
+            .expect("read")
+            .is_some(),
+        "closing never undoes admitted work"
+    );
+}
+
+/// The release counts the commands already queued when it is observed. A
+/// batch of spawn completions behind it is taken off the mailbox together
+/// (the first by the ordinary receive, the rest inline), and each counts
+/// once: the release then closes the idle mob with no later traffic.
+#[tokio::test]
+async fn a_release_counted_behind_a_spawn_completion_batch_closes_without_later_traffic() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let observer = handle.observer();
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let parked = handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::ParkActorForObservationTest {
+            entered_tx,
+            release_rx,
+            reply_tx,
+        })
+        .await
+        .expect("park the actor");
+    tokio::time::timeout(STEP, entered_rx)
+        .await
+        .expect("the actor parks")
+        .expect("park signal");
+    // A batch of completions for tickets no slot holds: the batch handler
+    // only reports them, and admits nothing.
+    for ticket in [u64::MAX, u64::MAX - 1, u64::MAX - 2] {
+        handle
+            .command_tx
+            .send(super::super::scope_gate::RoutedMobCommand::internal(
+                MobCommand::SpawnProvisioned {
+                    spawn_ticket: ticket,
+                    result: Err(MobError::Internal("test completion".to_string())),
+                },
+            ))
+            .await
+            .expect("queue a spawn completion");
+    }
+    drop(handle);
+    let _ = release_tx.send(());
+    reply(parked).await.expect("the parked command answers");
+    assert_eq!(
+        await_closed(&observer).await,
+        MobAdmissionCloseReason::LastOwnerReleased,
+        "the counted batch is paid off by its own receives"
+    );
+}
+
+#[tokio::test]
+async fn close_admission_closes_a_busy_mob_without_stopping_its_work() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let release = hold_spawn("d67-stand-down");
+    let spawn = enqueue_spawn(&handle, "d67-stand-down").await;
+    let busy = handle
+        .close_admission(MobAdmissionCloseReason::StandDown)
+        .await
+        .expect("close admission")
+        .expect("the in-flight spawn is reported");
+    assert!(busy.roster_transitions > 0, "{busy:?}");
+    assert_eq!(
+        *handle.admission_closed().borrow(),
+        Some(MobAdmissionCloseReason::StandDown)
+    );
+    assert_admission_closed(
+        handle
+            .spawn_spec(worker_spec("d67-stand-down-late"))
+            .await
+            .expect_err("new work is refused"),
+        MobAdmissionCloseReason::StandDown,
+    );
+
+    release.add_permits(1);
+    reply(spawn)
+        .await
+        .expect("work admitted before the close completes");
+    assert_eq!(
+        handle.close_if_idle().await.expect("close if idle"),
+        CloseIfIdleOutcome::AlreadyClosed(MobAdmissionCloseReason::StandDown)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acquire_owner_racing_the_close_is_owned_or_refused_never_both() {
+    for round in 0..16 {
+        let (handle, _service) = create_test_mob(sample_definition()).await;
+        let observer = handle.observer();
+        let acquirer = observer.clone();
+        let acquire = tokio::spawn(async move { acquirer.acquire_owner() });
+        let closer = observer.clone();
+        let close = tokio::spawn(async move { closer.close_if_idle().await });
+        let acquired = acquire.await.expect("acquire task");
+        let closed = close.await.expect("close task").expect("close answers");
+        match acquired {
+            Ok(lease) => {
+                assert!(lease.is_public_owner());
+                match closed {
+                    CloseIfIdleOutcome::Busy(busy) => {
+                        assert!(busy.foreground_owners >= 1, "round {round}: {busy:?}");
+                    }
+                    other => panic!("round {round}: an acquired owner was closed: {other:?}"),
+                }
+                assert!(observer.admission_closed().borrow().is_none());
+            }
+            Err(error) => {
+                assert_admission_closed(error, MobAdmissionCloseReason::IdleClose);
+                assert_eq!(closed, CloseIfIdleOutcome::Closed, "round {round}");
+            }
+        }
+        handle.shutdown().await.expect("shutdown");
+    }
+}
+
+#[tokio::test]
+async fn an_owner_acquired_after_the_release_keeps_a_draining_mob_open() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let observer = handle.observer();
+    let (release, mut entered) = hold_spawn_entered("d67-lease-drain");
+    let spawn = enqueue_spawn(&handle, "d67-lease-drain").await;
+    // The last owner leaves while the spawn is in flight: the release is
+    // latched behind the busy mob.
+    spawn_entered(&mut entered).await;
+    drop(handle);
+    actor_round_trip(&observer).await;
+    let lease = observer
+        .acquire_owner()
+        .expect("an open mob grants a foreground owner");
+
+    release.add_permits(1);
+    reply(spawn).await.expect("the admitted spawn completes");
+    actor_round_trip(&observer).await;
+    actor_round_trip(&observer).await;
+    assert!(
+        observer.admission_closed().borrow().is_none(),
+        "the earlier release does not close a mob a new owner holds"
+    );
+
+    drop(lease);
+    assert_eq!(
+        await_closed(&observer).await,
+        MobAdmissionCloseReason::LastOwnerReleased
+    );
+    match observer.acquire_owner() {
+        Ok(_) => panic!("a closed mob grants no owner"),
+        Err(error) => assert_admission_closed(error, MobAdmissionCloseReason::LastOwnerReleased),
+    }
+}
+
+#[tokio::test]
+async fn an_owner_call_in_flight_keeps_the_mob_open_until_it_is_admitted() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let observer = handle.observer();
+    let release = hold_spawn("d67-in-flight");
+    let caller = handle.clone();
+    let call = tokio::spawn(async move {
+        caller
+            .spawn_spec(worker_spec("d67-in-flight"))
+            .await
+            .map(|_| ())
+    });
+    drop(handle);
+    actor_round_trip(&observer).await;
+    actor_round_trip(&observer).await;
+    assert!(
+        observer.admission_closed().borrow().is_none(),
+        "the caller's owning handle keeps the mob open while its spawn is in flight"
+    );
+
+    release.add_permits(1);
+    tokio::time::timeout(STEP, call)
+        .await
+        .expect("the call completes")
+        .expect("call task")
+        .expect("the in-flight spawn is admitted, not orphaned");
+    assert_eq!(
+        await_closed(&observer).await,
+        MobAdmissionCloseReason::LastOwnerReleased
+    );
+    assert!(
+        observer
+            .get_member(&AgentIdentity::from("d67-in-flight"))
+            .await
+            .expect("read")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn native_accepted_but_held_work_keeps_the_mob_busy() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let identity = AgentIdentity::from("d67-held");
+    // The lead profile is externally addressable, so it takes direct turns.
+    let mut spec = SpawnMemberSpec::new(ProfileName::from("lead"), identity.clone());
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("spawn turn-driven lead");
+
+    service.hold_start_turns();
+    let mut held = service.held_start_turn_entries();
+    let entered_before = *held.borrow_and_update();
+    handle
+        .member(&identity)
+        .await
+        .expect("member handle")
+        .send("hold this turn", HandlingMode::Queue)
+        .await
+        .expect("the turn is admitted");
+    tokio::time::timeout(STEP, held.wait_for(|entries| *entries > entered_before))
+        .await
+        .expect("the turn enters the hold")
+        .expect("held-turn signal");
+
+    match handle.close_if_idle().await.expect("close if idle") {
+        CloseIfIdleOutcome::Busy(busy) => assert!(busy.runs >= 1, "{busy:?}"),
+        other => panic!("a held native turn keeps the mob busy, got {other:?}"),
+    }
+    assert!(handle.admission_closed().borrow().is_none());
+
+    service.release_held_start_turns();
+    let closed = tokio::time::timeout(STEP, async {
+        loop {
+            match handle.close_if_idle().await.expect("close if idle") {
+                CloseIfIdleOutcome::Closed => break,
+                CloseIfIdleOutcome::Busy(_) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "the mob closes once the held turn ends");
+}
+
+#[test]
+fn live_control_is_classified_by_verb() {
+    use super::super::bridge_protocol::BridgeLiveControlVerb;
+    let control = |verb| {
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        MobCommand::MemberLiveControl {
+            agent_identity: AgentIdentity::from("d67-live"),
+            channel_id: "channel".to_string(),
+            verb,
+            reply_tx,
+        }
+    };
+    assert!(control(BridgeLiveControlVerb::CommitInput).refused_while_admission_closed());
+    assert!(!control(BridgeLiveControlVerb::Interrupt).refused_while_admission_closed());
+    assert!(!control(BridgeLiveControlVerb::Refresh).refused_while_admission_closed());
+}

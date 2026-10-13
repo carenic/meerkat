@@ -130,6 +130,26 @@
         "const": "SESSION_RUNTIME_UNAVAILABLE",
         "description": "Runtime authority is unavailable before a session operation starts.",
         "type": "string"
+      },
+      {
+        "const": "APPROVAL_STORE_UNAVAILABLE",
+        "description": "The approval store committed nothing (unavailable or contended). An\nexplicitly attempted retry through fresh checks is valid.",
+        "type": "string"
+      },
+      {
+        "const": "APPROVAL_CONFLICT",
+        "description": "Another owner of the approval store changed the approval first; it\nis reconciled before reuse.",
+        "type": "string"
+      },
+      {
+        "const": "APPROVAL_COMMIT_UNKNOWN",
+        "description": "The approval store cannot confirm whether the commit happened; the\napproval is reconciled from the store before reuse, never resent.",
+        "type": "string"
+      },
+      {
+        "const": "STALE_DELIVERY_SCOPE",
+        "description": "A scope-bound mob submit named a member session that is no longer the\nmember's current session binding: the session rotated under a still\ncurrent runtime incarnation and fence. Distinct from\n[`Self::StaleFence`] (a superseded incarnation): the recovery is to\nre-capture the delivery scope, not to re-resolve the member.",
+        "type": "string"
       }
     ],
     "title": "ErrorCode"
@@ -138,6 +158,7 @@
     "HOST_UNAVAILABLE": -32026,
     "SCOPE_DENIED": -32025,
     "STALE_CURSOR": -32027,
+    "STALE_DELIVERY_SCOPE": -32036,
     "STALE_FENCE": -32028
   },
   "WireError": {
@@ -265,6 +286,26 @@
           {
             "const": "SESSION_RUNTIME_UNAVAILABLE",
             "description": "Runtime authority is unavailable before a session operation starts.",
+            "type": "string"
+          },
+          {
+            "const": "APPROVAL_STORE_UNAVAILABLE",
+            "description": "The approval store committed nothing (unavailable or contended). An\nexplicitly attempted retry through fresh checks is valid.",
+            "type": "string"
+          },
+          {
+            "const": "APPROVAL_CONFLICT",
+            "description": "Another owner of the approval store changed the approval first; it\nis reconciled before reuse.",
+            "type": "string"
+          },
+          {
+            "const": "APPROVAL_COMMIT_UNKNOWN",
+            "description": "The approval store cannot confirm whether the commit happened; the\napproval is reconciled from the store before reuse, never resent.",
+            "type": "string"
+          },
+          {
+            "const": "STALE_DELIVERY_SCOPE",
+            "description": "A scope-bound mob submit named a member session that is no longer the\nmember's current session binding: the session rotated under a still\ncurrent runtime incarnation and fence. Distinct from\n[`Self::StaleFence`] (a superseded incarnation): the recovery is to\nre-capture the delivery scope, not to re-resolve the member.",
             "type": "string"
           }
         ]

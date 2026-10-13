@@ -352,6 +352,18 @@ fn auth_error_from_wire(error: meerkat_contracts::WireAuthError) -> meerkat_core
         meerkat_contracts::WireAuthError::Other { detail } => {
             meerkat_core::AuthError::Other(detail)
         }
+        meerkat_contracts::WireAuthError::CredentialAccessDenied => {
+            meerkat_core::AuthError::CredentialAccessDenied
+        }
+        meerkat_contracts::WireAuthError::CredentialInteractionRequired => {
+            meerkat_core::AuthError::CredentialInteractionRequired
+        }
+        meerkat_contracts::WireAuthError::CredentialAccessPending => {
+            meerkat_core::AuthError::CredentialAccessPending
+        }
+        meerkat_contracts::WireAuthError::CredentialStoreUnavailable { detail } => {
+            meerkat_core::AuthError::CredentialStoreUnavailable(detail)
+        }
     }
 }
 

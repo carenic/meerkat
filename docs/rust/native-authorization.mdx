@@ -521,7 +521,7 @@ Ordinary credential acquisition, refresh and cached command reads do not scan
 historical work. Continue to use the credential owner's normal API rather than
 editing its backing files or reconstructing readiness from stored identity.
 
-The Console Access panel changes MobKit's console ABAC rules; it is not a native
+The Console Access panel changes Meta's console ABAC rules; it is not a native
 grant editor. Native permission repair belongs to the embedding's authorized
 grant/resource owners. Keep local refusals as affected-call feedback while
 permitted work continues; audit availability and launch failures require their
@@ -724,9 +724,24 @@ let setup = GovernedJsonlSetup {
     client: selected_client,
     connection,
     tools: catalog,
+    mcp_attachment_identity_key_custody: None,
+    session_binder: None,
+    connector_authority: None,
 };
 serve_governed_jsonl(reader, writer, setup).await?;
 ```
+
+`mcp_attachment_identity_key_custody: None` fits this callback-only recipe. A
+host separately commissioned for live MCP attachment supplies `Some` persistence
+from its selected persistent backend's `open_with_refresh_authority()`, and
+reopens the same backend after a restart. That custody protects attachment
+identity only: the governed profile gains no provider or MCP credential from it.
+With `None`, an attachment whose target carries command arguments or URL
+credentials is recorded unbound and restores as renewal-required. When
+persistence is supplied, failure to create or read its identity key refuses that
+attachment admission before anything is recorded or staged, and a restore only
+loads the realm's existing key. Constructing the persistence does not check
+filesystem access.
 
 The entry constructs `AgentFactory::minimal()` internally and owns one private
 runtime, config store and callback connection. It installs the host's catalog once
@@ -753,10 +768,13 @@ effect.
 This first slice supports deferred create, turn execution, callback replies and
 necessary initialization/cancellation protocol. Dynamic tool registration,
 configuration changes, cold/restarted sessions, public history/observation and
-MCP setup are outside it. The constructor rejects an MCP-enabled build and
-configurations enabling skills, hooks, built-in tools, shell, comms, mobs,
-scheduling, workgraphs, model fallback or a system-prompt file. Broader transport,
-SQLite/recovery, policy-administration and full ADR coverage remain pending.
+MCP setup are outside it. For this uncommissioned recipe the constructor rejects
+an MCP-enabled build: it admits one only for a connection commissioned for live
+MCP attachment, and setting the identity-key custody does not commission one. It
+also rejects configurations enabling skills, hooks, built-in tools, shell, comms,
+mobs, scheduling, workgraphs, model fallback or a system-prompt file. Broader
+transport, SQLite/recovery, policy-administration and full ADR coverage remain
+pending.
 
 The focused fixture requires the non-MCP feature profile:
 

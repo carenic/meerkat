@@ -35,8 +35,9 @@ pub mod transport;
 
 pub use server::{
     LiveConfig, LiveWsConfig, serve_stdio, serve_stdio_with_options,
-    serve_stdio_with_skill_runtime, serve_tcp, serve_tcp_connection,
-    serve_tcp_connection_with_options, serve_tcp_with_options,
+    serve_stdio_with_options_until, serve_stdio_with_skill_runtime, serve_tcp,
+    serve_tcp_connection, serve_tcp_connection_with_options, serve_tcp_with_options,
+    serve_tcp_with_options_until,
 };
 
 /// Default capacity for notification / event channels throughout the crate.

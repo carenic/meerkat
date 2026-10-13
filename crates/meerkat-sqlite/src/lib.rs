@@ -57,7 +57,8 @@ pub mod profile;
 pub mod watch;
 
 pub use error::{
-    BridgeEligibility, SqliteErrorClass, SqliteStoreError, classify_sqlite_error, is_busy_or_locked,
+    BridgeEligibility, CurrentCatalogUnavailability, SqliteErrorClass, SqliteStoreError,
+    classify_sqlite_error, is_busy_or_locked,
 };
 pub use fence::{ExclusiveFence, OperationGuard, fence_lock_path};
 pub use json_column::JsonColumnBytes;

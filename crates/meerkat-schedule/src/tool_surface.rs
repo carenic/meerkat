@@ -72,6 +72,7 @@ fn build_tool_defs() -> Arc<[Arc<ToolDef>]> {
                 provenance: Some(ToolProvenance {
                     kind: ToolSourceKind::Schedule,
                     source_id: "schedule".into(),
+                    artifact: None,
                 }),
             })
         })

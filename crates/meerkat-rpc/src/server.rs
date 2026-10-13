@@ -968,6 +968,30 @@ pub struct RpcServer<R, W> {
     /// runtime is shared across sequential connections and must not be destroyed
     /// when a single client disconnects.
     pub skip_shutdown_on_eof: bool,
+    /// Process shutdown (SIGTERM or interrupt): when it fires, the read loop
+    /// ends as on EOF and the same graceful drain runs.
+    shutdown_signal: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Ordinary (inline) request handlers this connection started. The
+    /// connection owns them: when it ends, they are joined (bounded by
+    /// [`INLINE_REQUEST_DRAIN`]) before the runtime is shut down, so a
+    /// handler that already owns work (an MCP login completion, a credential
+    /// save) settles first.
+    inline_requests: tokio::task::JoinSet<()>,
+}
+
+/// How long a closing connection waits for its inline request handlers
+/// before aborting the rest.
+const INLINE_REQUEST_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolves once `signal` fires; never when there is none or its sender is
+/// gone without firing.
+async fn shutdown_requested(signal: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    if let Some(signal) = signal
+        && signal.wait_for(|fired| *fired).await.is_ok()
+    {
+        return;
+    }
+    std::future::pending::<()>().await;
 }
 
 impl<R: AsyncBufRead + Unpin, W: TransportWriter> RpcServer<R, W> {
@@ -1040,7 +1064,16 @@ impl<R: AsyncBufRead + Unpin, W: TransportWriter> RpcServer<R, W> {
             rpc_frame_read_admission: JsonlFrameAdmission::production(),
             callback_response_admission: RpcCallbackResponseAdmission::production(),
             skip_shutdown_on_eof: false,
+            shutdown_signal: None,
+            inline_requests: tokio::task::JoinSet::new(),
         })
+    }
+
+    /// Stop reading and drain as on EOF once `signal` turns true, as the
+    /// ordinary stdio and TCP servers do on process termination.
+    #[cfg(feature = "local-authorization")]
+    pub(crate) fn set_shutdown_signal(&mut self, signal: tokio::sync::watch::Receiver<bool>) {
+        self.shutdown_signal = Some(signal);
     }
 
     #[cfg(feature = "local-authorization")]
@@ -1193,6 +1226,8 @@ impl<R: AsyncBufRead + Unpin, W: TransportWriter> RpcServer<R, W> {
             rpc_frame_read_admission: JsonlFrameAdmission::production(),
             callback_response_admission: RpcCallbackResponseAdmission::production(),
             skip_shutdown_on_eof: false,
+            shutdown_signal: None,
+            inline_requests: tokio::task::JoinSet::new(),
         }
     }
 
@@ -1361,7 +1396,9 @@ impl<R: AsyncBufRead + Unpin, W: TransportWriter> RpcServer<R, W> {
 
                             let router = self.router.clone();
                             let resp_tx = self.response_tx.clone();
-                            tokio::spawn(async move {
+                            // Reap finished handlers so the owned set stays bounded.
+                            while self.inline_requests.try_join_next().is_some() {}
+                            self.inline_requests.spawn(async move {
                                 let response = Box::pin(router.dispatch_for_transport(request)).await;
                                 // Admission is non-blocking in the server loop.
                                 // Move the reservation with the response so it
@@ -1489,11 +1526,22 @@ impl<R: AsyncBufRead + Unpin, W: TransportWriter> RpcServer<R, W> {
                 _ = callback_sweep.tick() => {
                     self.pending_callbacks.retain(|_, tx| !tx.is_closed());
                 }
+
+                // Process shutdown: stop reading and drain as on EOF.
+                () = shutdown_requested(&mut self.shutdown_signal) => {
+                    break;
+                }
                 }
             }
             Ok(())
         }
         .await;
+
+        // The connection is closed. A governed pipe's consent scope retires
+        // here, first, so no eligibility observed for the pipe stays current
+        // while the handlers and sessions below drain.
+        #[cfg(feature = "local-authorization")]
+        self.router.close_governed_connection();
 
         // EOF or any read/write failure closes the response queue before we
         // return. Dispatch tasks that finish later receive a send error and
@@ -1508,23 +1556,54 @@ impl<R: AsyncBufRead + Unpin, W: TransportWriter> RpcServer<R, W> {
         // response as typed `tool_unavailable` immediately, instead of
         // waiting on a client that can never answer.
         self.close_callback_route();
-        connection_result?;
+        // Settle the inline handlers this connection owns before anything
+        // else ends, on the error path too: a handler that already owns work
+        // finishes (its response is rejected by the closed queue). Past the
+        // drain bound the rest are aborted.
+        self.drain_inline_requests().await;
 
         // Graceful shutdown: close all sessions (unless this is a shared TCP
-        // runtime where client disconnect should not destroy state).
+        // runtime where client disconnect should not destroy state). It runs
+        // on a transport error too, which keeps the connection error and
+        // logs any cleanup error beside it.
         self.request_executor.shutdown_and_abort_stragglers().await;
-        if !self.skip_shutdown_on_eof {
-            self.router
-                .runtime()
-                .try_shutdown()
-                .await
-                .map_err(|error| {
-                    ServerError::Io(std::io::Error::other(format!(
-                        "session shutdown error: {error}"
-                    )))
-                })?;
+        let cleanup = if self.skip_shutdown_on_eof {
+            Ok(())
+        } else {
+            self.router.runtime().try_shutdown().await.map_err(|error| {
+                ServerError::Io(std::io::Error::other(format!(
+                    "session shutdown error: {error}"
+                )))
+            })
+        };
+        match (connection_result, cleanup) {
+            (Err(connection), Err(cleanup)) => {
+                tracing::error!(%cleanup, "runtime shutdown after a connection error also failed");
+                Err(connection)
+            }
+            (Err(connection), Ok(())) => Err(connection),
+            (Ok(()), cleanup) => cleanup,
         }
-        Ok(())
+    }
+
+    async fn drain_inline_requests(&mut self) {
+        let drained = tokio::time::timeout(INLINE_REQUEST_DRAIN, async {
+            while self.inline_requests.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            let remaining = self.inline_requests.len();
+            tracing::warn!(
+                remaining,
+                "inline RPC requests still running when the connection ended; aborting them"
+            );
+            // An aborted handler may have handed work to an owner that keeps
+            // running (a consumed login's credential save): the runtime's
+            // shutdown must not report that as settled.
+            self.router.runtime().note_unsettled_requests(remaining);
+            self.inline_requests.abort_all();
+            while self.inline_requests.join_next().await.is_some() {}
+        }
     }
 
     fn spawn_long_running_request(
@@ -1800,6 +1879,128 @@ pub async fn serve_stdio_with_options(
     server.run().await
 }
 
+/// Process stdin read on its own OS thread and handed over in chunks. The
+/// server owns it: dropping it stops the reader, which ends after its current
+/// read returns and hands nothing more over. A read still blocked on an open
+/// stdin is not waited for; it ends with the process.
+struct DetachedStdin {
+    chunks: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    pending: Vec<u8>,
+    position: usize,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for DetachedStdin {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        self.chunks.close();
+    }
+}
+
+impl DetachedStdin {
+    fn spawn() -> std::io::Result<Self> {
+        let (send, chunks) = tokio::sync::mpsc::channel(16);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        std::thread::Builder::new()
+            .name("rkat-rpc-stdin".into())
+            .spawn(move || {
+                use std::io::Read as _;
+                let mut stdin = std::io::stdin();
+                let mut buffer = vec![0_u8; 64 * 1024];
+                loop {
+                    if stopped.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    let chunk = match stdin.read(&mut buffer) {
+                        Ok(0) => return,
+                        Ok(read) => Ok(buffer[..read].to_vec()),
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => Err(error),
+                    };
+                    let failed = chunk.is_err();
+                    if send.blocking_send(chunk).is_err() || failed {
+                        return;
+                    }
+                }
+            })?;
+        Ok(Self {
+            chunks,
+            pending: Vec::new(),
+            position: 0,
+            stop,
+        })
+    }
+}
+
+impl tokio::io::AsyncRead for DetachedStdin {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.position == self.pending.len() {
+            match self.chunks.poll_recv(cx) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                // The reader thread ended: end of input.
+                std::task::Poll::Ready(None) => return std::task::Poll::Ready(Ok(())),
+                std::task::Poll::Ready(Some(Err(error))) => {
+                    return std::task::Poll::Ready(Err(error));
+                }
+                std::task::Poll::Ready(Some(Ok(chunk))) => {
+                    self.pending = chunk;
+                    self.position = 0;
+                }
+            }
+        }
+        let available = &self.pending[self.position..];
+        let take = available.len().min(buf.remaining());
+        buf.put_slice(&available[..take]);
+        self.position += take;
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// [`serve_stdio_with_options`] that also ends, like stdin EOF, when
+/// `shutdown` resolves (for example on SIGTERM): the read loop stops, request
+/// owners are drained and the runtime is shut down.
+pub async fn serve_stdio_with_options_until(
+    runtime: Arc<SessionRuntime>,
+    config_store: Arc<dyn ConfigStore>,
+    skill_runtime: Option<Arc<meerkat_core::skills::SkillRuntime>>,
+    live: Option<LiveConfig>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), ServerError> {
+    // Read stdin on a detached thread rather than tokio's blocking pool: a
+    // read pending on a still-open stdin must not keep the runtime (and so
+    // the process) alive after a signal-driven shutdown, while work the
+    // runtime still owns on its blocking pool is waited for as before.
+    let stdin = DetachedStdin::spawn()?;
+    let stdout = BlockingWriter::stdout();
+    let reader = BufReader::new(stdin);
+    let mut server =
+        RpcServer::new_with_skill_runtime(reader, stdout, runtime, config_store, skill_runtime)?;
+    if let Some(live) = live {
+        if let Some(ws) = live.ws {
+            server = server.with_live_ws(ws.state, ws.base_url);
+        }
+        #[cfg(feature = "live-webrtc")]
+        if let Some(webrtc_state) = live.webrtc_state {
+            server = server.with_live_webrtc(webrtc_state);
+        }
+        server = server.with_live_session_factory_opt(live.session_factory);
+    }
+    let (fire, signal) = tokio::sync::watch::channel(false);
+    let watcher = tokio::spawn(async move {
+        shutdown.await;
+        fire.send_replace(true);
+    });
+    server.shutdown_signal = Some(signal);
+    let served = server.run().await;
+    watcher.abort();
+    served
+}
+
 /// Optional live transport configuration to thread into the RPC server.
 #[derive(Clone)]
 pub struct LiveConfig {
@@ -1846,10 +2047,12 @@ pub async fn serve_tcp_connection_with_options(
         live,
         None,
         connection_permit,
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_tcp_connection_with_options_and_admission(
     stream: tokio::net::TcpStream,
     runtime: Arc<SessionRuntime>,
@@ -1858,6 +2061,7 @@ async fn serve_tcp_connection_with_options_and_admission(
     live: Option<LiveConfig>,
     admission: Option<RpcRequestAdmission>,
     _connection_permit: OwnedSemaphorePermit,
+    shutdown_signal: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<(), ServerError> {
     let (read_half, write_half) = stream.into_split();
     let reader = BufReader::new(read_half);
@@ -1882,6 +2086,7 @@ async fn serve_tcp_connection_with_options_and_admission(
         server = server.with_live_session_factory_opt(live.session_factory);
     }
     server.skip_shutdown_on_eof = true;
+    server.shutdown_signal = shutdown_signal;
     server.run().await
 }
 
@@ -1937,6 +2142,7 @@ pub async fn serve_tcp_with_options(
                 live,
                 Some(admission),
                 connection_permit,
+                None,
             )
             .await
             {
@@ -1946,6 +2152,82 @@ pub async fn serve_tcp_with_options(
             }
         });
     }
+}
+
+/// [`serve_tcp_with_options`] that also shuts down when `shutdown` resolves
+/// (for example on SIGTERM). The listener stops accepting first, then every
+/// connection ends as on EOF (each keeps the shared runtime alive, as a
+/// client disconnect does), all connection tasks are joined, and only then is
+/// the shared runtime shut down. A connection ending on its own leaves the
+/// runtime running, unchanged.
+pub async fn serve_tcp_with_options_until(
+    addr: &str,
+    runtime: Arc<SessionRuntime>,
+    config_store: Arc<dyn ConfigStore>,
+    skill_runtime: Option<Arc<meerkat_core::skills::SkillRuntime>>,
+    live: Option<LiveConfig>,
+    shutdown: impl Future<Output = ()> + Send,
+) -> Result<(), ServerError> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let rpc_request_admission = RpcRequestAdmission::production();
+    let connection_admission = RpcTcpConnectionAdmission::production();
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let mut connections = tokio::task::JoinSet::new();
+    tracing::info!("RPC TCP listener bound to {addr}");
+    tokio::pin!(shutdown);
+    let accept_result = loop {
+        let (stream, peer_addr) = tokio::select! {
+            () = &mut shutdown => break Ok(()),
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => break Err(ServerError::Io(error)),
+            },
+            Some(_) = connections.join_next(), if !connections.is_empty() => continue,
+        };
+        let connection_permit = match connection_admission.try_acquire() {
+            Ok(permit) => permit,
+            Err(error) => {
+                tracing::warn!(%peer_addr, %error, "rejecting RPC TCP connection");
+                drop(stream);
+                continue;
+            }
+        };
+        tracing::info!("RPC client connected from {peer_addr}");
+        let runtime = Arc::clone(&runtime);
+        let config_store = Arc::clone(&config_store);
+        let skill_runtime = skill_runtime.clone();
+        let live = live.clone();
+        let admission = rpc_request_admission.clone();
+        let stopped = stopped.clone();
+        connections.spawn(async move {
+            if let Err(e) = serve_tcp_connection_with_options_and_admission(
+                stream,
+                runtime,
+                config_store,
+                skill_runtime,
+                live,
+                Some(admission),
+                connection_permit,
+                Some(stopped),
+            )
+            .await
+            {
+                tracing::warn!("RPC client {peer_addr} disconnected: {e}");
+            } else {
+                tracing::info!("RPC client {peer_addr} disconnected cleanly");
+            }
+        });
+    };
+    // Stop admission: no new connection, then every connection drains.
+    drop(listener);
+    stop.send_replace(true);
+    while connections.join_next().await.is_some() {}
+    let shutdown_result = runtime.try_shutdown().await.map_err(|error| {
+        ServerError::Io(std::io::Error::other(format!(
+            "session shutdown error: {error}"
+        )))
+    });
+    accept_result.and(shutdown_result)
 }
 
 #[cfg(test)]
@@ -2396,10 +2678,8 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "live-webrtc")]
     struct FailingWriter;
 
-    #[cfg(feature = "live-webrtc")]
     #[async_trait]
     impl TransportWriter for FailingWriter {
         async fn write_message(&mut self, _bytes: Vec<u8>) -> Result<(), TransportError> {
@@ -3753,7 +4033,8 @@ mod tests {
             )
             .expect("construct runtime authority"),
             crate::router::NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
         let config_store: Arc<dyn meerkat_core::ConfigStore> = Arc::new(MemoryConfigStore::new(
             Config::default(),
             meerkat_models::canonical(),
@@ -3764,6 +4045,95 @@ mod tests {
             temp.path().join("config_state.json"),
         )));
         (Arc::new(runtime), config_store)
+    }
+
+    /// A stdio connection that ends on a transport error still runs the
+    /// owning runtime shutdown (and its MCP attempt sweep), and keeps the
+    /// connection error.
+    #[tokio::test]
+    async fn a_transport_error_still_shuts_the_runtime_down() {
+        let temp = tempfile::tempdir().expect("test tempdir");
+        let (runtime, config_store) = build_test_runtime(&temp);
+        /// A transport whose read fails at once.
+        struct FailingReader;
+        impl tokio::io::AsyncRead for FailingReader {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("injected read failure")))
+            }
+        }
+        let reader = BufReader::new(FailingReader);
+        let mut server = RpcServer::new(reader, FailingWriter, Arc::clone(&runtime), config_store)
+            .expect("construct runtime authority");
+        let served = tokio::time::timeout(std::time::Duration::from_secs(20), server.run())
+            .await
+            .expect("the server ends");
+        assert!(served.is_err(), "the transport error is kept");
+        assert!(runtime.mcp_admission_closed_for_testing().await);
+    }
+
+    /// SIGTERM-style shutdown of the TCP server: the listener stops, the open
+    /// connection drains (the client sees EOF) and only then is the shared
+    /// runtime shut down. A connection ending on its own does not.
+    #[tokio::test]
+    async fn tcp_until_drains_connections_then_shuts_the_runtime_down() {
+        use tokio::io::AsyncReadExt;
+        let temp = tempfile::tempdir().expect("test tempdir");
+        let (runtime, config_store) = build_test_runtime(&temp);
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr = format!("127.0.0.1:{port}");
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = {
+            let (runtime, addr) = (Arc::clone(&runtime), addr.clone());
+            tokio::spawn(async move {
+                serve_tcp_with_options_until(&addr, runtime, config_store, None, None, async {
+                    let _ = stopped.await;
+                })
+                .await
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let first = loop {
+            match tokio::net::TcpStream::connect(&addr).await {
+                Ok(stream) => break stream,
+                Err(_) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "server never listened"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        };
+        // A connection that ends on its own leaves the runtime running.
+        drop(first);
+        let mut open = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!runtime.mcp_admission_closed_for_testing().await);
+
+        stop.send(()).unwrap();
+        let served = tokio::time::timeout(std::time::Duration::from_secs(20), server)
+            .await
+            .expect("the server drains and returns")
+            .unwrap();
+        assert!(served.is_ok(), "{served:?}");
+        let mut buf = [0_u8; 16];
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), open.read(&mut buf))
+                .await
+                .expect("the drained connection is closed")
+                .unwrap(),
+            0
+        );
+        assert!(runtime.mcp_admission_closed_for_testing().await);
+        assert!(tokio::net::TcpStream::connect(&addr).await.is_err());
     }
 
     /// Regression: one session whose delivery application fails must not

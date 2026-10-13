@@ -52,13 +52,15 @@ struct Staged {
     grant: Option<GrantLineageRef>,
 }
 
-async fn register_and_stage(machine: &MeerkatMachine, governed: bool) -> Staged {
-    register_and_stage_with_ancestor(machine, governed, false).await
+async fn register_and_stage(machine: &MeerkatMachine, host: Option<&TestIngress>) -> Staged {
+    register_and_stage_with_ancestor(machine, host, false).await
 }
 
+/// Governed when `host` is given: the original is that host's fixture input,
+/// under the host's own controller credential.
 async fn register_and_stage_with_ancestor(
     machine: &MeerkatMachine,
-    governed: bool,
+    host: Option<&TestIngress>,
     include_ancestor: bool,
 ) -> Staged {
     let session_id = SessionId::new();
@@ -71,8 +73,8 @@ async fn register_and_stage_with_ancestor(
         let entry = sessions.get(&session_id).expect("native session");
         (Arc::clone(&entry.driver), entry.runtime_id.clone())
     };
-    let (prompt, grant) = if governed {
-        let mut prompt = input("caller");
+    let (prompt, grant) = if let Some(host) = host {
+        let mut prompt = host.input("caller");
         let original = Arc::clone(
             prompt
                 .header()
@@ -226,11 +228,11 @@ async fn finish(staged: &Staged, ending: Ending) {
 async fn abandoned_governed_original_keeps_binding_until_each_actual_run_terminal() {
     for ending in [Ending::Completed, Ending::Failed, Ending::Cancelled] {
         let machine = MeerkatMachine::ephemeral();
-        let host = Arc::new(TestIngress::new(machine.generated_auth_lease_handle()));
+        let host = Arc::new(TestIngress::isolated(machine.generated_auth_lease_handle()));
         let machine = machine
-            .with_native_work_authorization_host(host)
+            .with_native_work_authorization_host(host.clone())
             .expect("host");
-        let staged = register_and_stage(&machine, true).await;
+        let staged = register_and_stage(&machine, Some(&host)).await;
         let grant = staged.grant.as_ref().expect("controller");
         let store = InMemoryRuntimeStore::new();
         {
@@ -362,7 +364,7 @@ async fn abandoned_governed_original_keeps_binding_until_each_actual_run_termina
 #[tokio::test]
 async fn ungoverned_terminal_original_keeps_existing_archive_behavior_during_run() {
     let machine = MeerkatMachine::ephemeral();
-    let staged = register_and_stage(&machine, false).await;
+    let staged = register_and_stage(&machine, None).await;
     let mut locked = staged.driver.lock().await;
     let DriverEntry::Ephemeral(driver) = &mut *locked else {
         panic!("storeless")
@@ -388,12 +390,12 @@ async fn ungoverned_terminal_original_keeps_existing_archive_behavior_during_run
 #[tokio::test]
 async fn controller_custody_checks_all_attached_runs_not_only_one_terminal_driver() {
     let machine = MeerkatMachine::ephemeral();
-    let host = Arc::new(TestIngress::new(machine.generated_auth_lease_handle()));
+    let host = Arc::new(TestIngress::isolated(machine.generated_auth_lease_handle()));
     let machine = machine
-        .with_native_work_authorization_host(host)
+        .with_native_work_authorization_host(host.clone())
         .expect("host");
-    let first = register_and_stage(&machine, true).await;
-    let second = register_and_stage(&machine, true).await;
+    let first = register_and_stage(&machine, Some(&host)).await;
+    let second = register_and_stage(&machine, Some(&host)).await;
     assert_eq!(first.grant, second.grant);
     for staged in [&first, &second] {
         let mut locked = staged.driver.lock().await;
@@ -428,11 +430,11 @@ async fn controller_custody_checks_all_attached_runs_not_only_one_terminal_drive
 #[tokio::test]
 async fn actual_cold_registration_settles_old_run_before_omitting_closed_terminal_original() {
     let machine = MeerkatMachine::ephemeral();
-    let host = Arc::new(TestIngress::new(machine.generated_auth_lease_handle()));
+    let host = Arc::new(TestIngress::isolated(machine.generated_auth_lease_handle()));
     let machine = machine
-        .with_native_work_authorization_host(host)
+        .with_native_work_authorization_host(host.clone())
         .expect("host");
-    let staged = register_and_stage(&machine, true).await;
+    let staged = register_and_stage(&machine, Some(&host)).await;
     let store = Arc::new(InMemoryRuntimeStore::new());
     {
         let mut locked = staged.driver.lock().await;
@@ -570,7 +572,7 @@ async fn sqlite_detached_terminal_original_vetoes_controller_mutation_until_cold
     use std::cell::Cell;
 
     let machine = MeerkatMachine::ephemeral();
-    let host = Arc::new(TestIngress::new(machine.generated_auth_lease_handle()));
+    let host = Arc::new(TestIngress::isolated(machine.generated_auth_lease_handle()));
     let credential = host
         .input("caller")
         .header()
@@ -584,7 +586,7 @@ async fn sqlite_detached_terminal_original_vetoes_controller_mutation_until_cold
         .credential()
         .clone();
     let machine = machine
-        .with_native_work_authorization_host(host)
+        .with_native_work_authorization_host(host.clone())
         .expect("actual native ingress owner");
     let credentials = meerkat_auth_core::auth_store::TokenStoreBackend::Ephemeral
         .open_with_refresh_authority()
@@ -597,7 +599,7 @@ async fn sqlite_detached_terminal_original_vetoes_controller_mutation_until_cold
     )
     .await
     .expect("publish the actual fixture credential before admitting work");
-    let staged = register_and_stage_with_ancestor(&machine, true, true).await;
+    let staged = register_and_stage_with_ancestor(&machine, Some(&host), true).await;
     let dir = tempfile::TempDir::new().expect("SQLite fixture directory");
     let path = dir.path().join("runtime.sqlite3");
     let store = crate::store::SqliteRuntimeStore::new_whole_blob(path.clone())
@@ -679,7 +681,11 @@ async fn sqlite_detached_terminal_original_vetoes_controller_mutation_until_cold
     );
     let machine = MeerkatMachine::persistent_with_mode(store.clone(), None, true)
         .expect("actual governed physical execution claim");
-    let host = Arc::new(TestIngress::new(machine.generated_auth_lease_handle()));
+    // The reopened host serves the same controller credential.
+    let host = Arc::new(TestIngress::with_selection(
+        machine.generated_auth_lease_handle(),
+        host.selection().clone(),
+    ));
     let machine = machine
         .install_native_work_authorization(|_| host)
         .expect("native fixture ingress installation under governed custody");
@@ -830,6 +836,26 @@ async fn sqlite_detached_terminal_original_vetoes_controller_mutation_until_cold
 
     let mut unrelated = lineage[0].clone();
     unrelated.authority_namespace = EvidenceId::new("unrelated-namespace").expect("namespace");
+    // The read-only reference check sees the same detached durable row: with
+    // the session detached no driver is attached, so only durable rows answer.
+    #[cfg(feature = "local-authorization")]
+    {
+        let custody = machine
+            .try_controller_grant_mutation()
+            .expect("complete durable custody");
+        for reference in &lineage {
+            assert_eq!(
+                custody.unfinished_work_references_grant(reference, &NoOriginals),
+                Ok(true),
+                "a detached unfinished durable row references its controller lineage"
+            );
+        }
+        assert_eq!(
+            custody.unfinished_work_references_grant(&unrelated, &NoOriginals),
+            Ok(false)
+        );
+        assert_eq!(read_bytes(), before, "the read-only check changes no rows");
+    }
     let entered = Cell::new(0);
     let result = machine
         .try_controller_grant_mutation()
@@ -939,4 +965,33 @@ async fn sqlite_detached_terminal_original_vetoes_controller_mutation_until_cold
         after_convergence,
         "credential mutation preserves native history"
     );
+}
+
+/// A source owner holding no originals: this fixture's work names none.
+#[cfg(feature = "local-authorization")]
+struct NoOriginals;
+#[cfg(feature = "local-authorization")]
+impl crate::meerkat_machine::AuthenticatedOriginalSource for NoOriginals {
+    fn authenticated_original(
+        &self,
+        _: &crate::input_authority::NativeIngressContext,
+        _: &meerkat_authorization_contracts::work_association::QualifiedIngressNamespace,
+        _: &meerkat_authorization_contracts::work_association::OriginalWorkRef,
+    ) -> Result<
+        Option<crate::meerkat_machine::AuthenticatedOriginal>,
+        meerkat_core::authorization::ControllerReadinessFailure,
+    > {
+        Ok(None)
+    }
+
+    fn retained_original(
+        &self,
+        _: &meerkat_authorization_contracts::work_association::QualifiedIngressNamespace,
+        _: &meerkat_authorization_contracts::work_association::OriginalWorkRef,
+    ) -> Result<
+        Option<meerkat_authorization_contracts::work_association::WorkAuthorityBasis>,
+        meerkat_core::authorization::ControllerReadinessFailure,
+    > {
+        Ok(None)
+    }
 }

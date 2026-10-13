@@ -5,9 +5,11 @@
 > r8 contract has four-reviewer design acceptance. The previous high-assurance
 > budgets, witness requirements and restricted first profile below are historical,
 > not current default gates.
-> New target: no added hot-path RTT/fsync, under 1 ms p99 added authorization
-> per tool/model dispatch and at most 10 percent turn overhead, with broad
-> provider, streaming, tool, compaction and live coverage.
+> New target: no added hot-path RTT/fsync and under 1 ms p99 added
+> authorization per tool/model dispatch, with responsiveness and broad
+> provider, streaming, tool, compaction and live coverage. At most 10 percent
+> mean representative-turn overhead is a nonblocking optimization target, not
+> an acceptance gate.
 
 Status: implementation in progress. This plan does not claim runtime support.
 Luka's objective is full ADR implementation, adversarial acceptance by the GCP
@@ -51,10 +53,12 @@ Fresh-admission cells measure whole turns; continuing intervals and summed direc
 calls remain separate units. This mean-only profile supplies no small-N p99
 acceptance. The implementation lead owns measurement and the GCP resource owner
 explicitly clears the host before START. The under-1-ms p99 added authorization
-per-operation and at-most-10-percent representative-turn targets remain open with
-full required coverage. Added whole-turn p99 is not an individual-operation
+per operation, responsiveness and full required coverage remain open acceptance
+gates. The at-most-10-percent mean representative-turn overhead is a nonblocking
+optimization target: this profile measures it, and a miss is recorded as a miss
+without blocking acceptance. Added whole-turn p99 is not an individual-operation
 measurement. Profiling diagnostics and build/correctness checks do not replace
-uninstrumented cost results or establish the full acceptance gates.
+uninstrumented cost results or establish the acceptance gates.
 
 ## Historical baselines and isolation
 

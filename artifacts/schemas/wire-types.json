@@ -4106,6 +4106,23 @@
         ],
         "type": "object"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "MeerkatSchema": {
         "description": "A Meerkat-native JSON schema."
       },
@@ -6226,13 +6243,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -6550,6 +6576,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -7431,6 +7468,342 @@
         ],
         "type": "string"
       },
+      "ApprovalAssurance": {
+        "description": "Authentication assurance the host's ingress owner established for one\ndecision event. A displayed identity alone never implies it.",
+        "oneOf": [
+          {
+            "const": "person_authenticated",
+            "description": "The person was authenticated on the actual channel event.",
+            "type": "string"
+          },
+          {
+            "const": "service_credential",
+            "description": "A delegated service credential authenticated the event.",
+            "type": "string"
+          },
+          {
+            "const": "device_trusted",
+            "description": "Only device or network trust was established.",
+            "type": "string"
+          }
+        ]
+      },
+      "ApprovalConsentApprover": {
+        "description": "The authenticated approver recorded on a consent decision.",
+        "properties": {
+          "assurance": {
+            "$ref": "#/$defs/ApprovalAssurance"
+          },
+          "principal": {
+            "$ref": "#/$defs/PrincipalRef"
+          }
+        },
+        "required": [
+          "principal",
+          "assurance"
+        ],
+        "type": "object"
+      },
+      "ApprovalConsentCustody": {
+        "description": "Cross-run custody history of a retained consent candidate.",
+        "oneOf": [
+          {
+            "description": "Parked at its run's close for a resumed run of its origin work.",
+            "properties": {
+              "state": {
+                "const": "parked",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Transferred once into the resumed run staged with this admitted\nnotice input.",
+            "properties": {
+              "input_id": {
+                "type": "string"
+              },
+              "state": {
+                "const": "transferred",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "input_id"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ApprovalConsentDelivery": {
+        "description": "One committed transition's notice obligation.",
+        "properties": {
+          "committed_at": {
+            "description": "When the transition (and with it this obligation) committed.",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/$defs/ApprovalConsentDeliveryState"
+          },
+          "transition": {
+            "$ref": "#/$defs/ApprovalConsentTransition"
+          }
+        },
+        "required": [
+          "transition",
+          "committed_at",
+          "state"
+        ],
+        "type": "object"
+      },
+      "ApprovalConsentDeliveryState": {
+        "description": "Where one transition's notice stands. It is committed `Owed` with its\ntransition, and only the delivery owner's exact receipt for that same\ntransition settles it.",
+        "oneOf": [
+          {
+            "description": "Committed with its transition and not known to be admitted. An\nunknown admission stays owed until it is reconciled.",
+            "properties": {
+              "status": {
+                "const": "owed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The owning session's native admission durably accepted the notice.\nNot model observation and not execution: a notice wakes work and\nspends nothing.",
+            "properties": {
+              "input_id": {
+                "type": "string"
+              },
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "status": {
+                "const": "admitted",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "session_id",
+              "input_id"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Proven terminal non-delivery, such as a settled policy refusal or a\nretired owner. Never inferred from a later refusal after an unknown\nearlier attempt.",
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "status": {
+                "const": "failed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ApprovalConsentOrigin": {
+        "description": "The retained work of the run that admitted a consent candidate: with the\nscope, the exact native destination of the consent's notices.\n\nCommitted at issuance and never changed. Never authority: a notice is\nadmitted only through the runtime's own retained-resume validation of\nthis identity, and a cross-run transfer compares the runtime-minted\nresume evidence, never this copy.",
+        "properties": {
+          "retained_work": true
+        },
+        "required": [
+          "retained_work"
+        ],
+        "type": "object"
+      },
+      "ApprovalConsentRecord": {
+        "description": "Consent facts of an approval issued for one retained R3 candidate.\n\nA durable projection of the approval owner's own transitions. Decision\nstatus, spend and execution are separate facts: `Approved` with no\n`consumed_at` is not spendable after a restart, and `consumed_at` is not\nproof that the effect completed.",
+        "properties": {
+          "approver": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ApprovalConsentApprover"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The authenticated approver of the recorded decision."
+          },
+          "consumed_at": {
+            "description": "When a fresh exact attempt consumed the approval at its entry.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "custody": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ApprovalConsentCustody"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Cross-run custody history of the retained candidate. History only:\ncustody itself is process-local and never restored from this."
+          },
+          "deliveries": {
+            "description": "One delivery obligation per committed transition that owes the\nowning session a notice, committed with that transition.",
+            "items": {
+              "$ref": "#/$defs/ApprovalConsentDelivery"
+            },
+            "type": "array"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ApprovalConsentOrigin"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The retained work of the run that admitted the candidate, committed\nat issuance with the scope. Together they are the exact native\ndestination of this consent's notices."
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ApprovalConsentScope"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The owner scope committed at issuance, when the admitting run had one."
+          },
+          "withdrawal": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ApprovalConsentWithdrawal"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The owner withdrew the unspent consent: a pending approval is then\n`Cancelled` (never a denial), and approved history stays `Approved`\nbut can no longer be spent. Never set on spent consent."
+          }
+        },
+        "type": "object"
+      },
+      "ApprovalConsentScope": {
+        "description": "Passive owner scope of a consent approval, committed with its issuance:\nthe hosting domain and the session of the run that admitted the\ncandidate. On the native path the runtime fills it from the work it\nadmitted and staged; request metadata never supplies it. A trusted host\nthat builds its own work context may set it too\n([`crate::WorkAuthorizationContext::with_consent_scope`]).\n\nNever authority. Every owner-authored transition of the row keeps it\nunchanged; that is not tamper-proofing, since the store row is writable.\nRecovery, wake and handoff re-validate it against the actual hosting\nclaim and current candidate and never treat it as custody. A consent row\nwithout it takes no part in them.",
+        "properties": {
+          "domain": {
+            "$ref": "#/$defs/HostingDomainRef"
+          },
+          "session_id": {
+            "$ref": "#/$defs/SessionId"
+          }
+        },
+        "required": [
+          "domain",
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "ApprovalConsentTransition": {
+        "description": "A committed consent transition that owes the owning session a notice.\nEach transition is owed on its own: a later transition never settles,\nreplaces or retracts an earlier one's notice.",
+        "oneOf": [
+          {
+            "const": "approved",
+            "description": "An authenticated human approved it.",
+            "type": "string"
+          },
+          {
+            "const": "denied",
+            "description": "An authenticated human declined it.",
+            "type": "string"
+          },
+          {
+            "const": "withdrawn",
+            "description": "The owner withdrew the unspent consent, for any withdrawal reason\n(the row's `withdrawal` says which).",
+            "type": "string"
+          }
+        ]
+      },
+      "ApprovalConsentWithdrawal": {
+        "description": "The owner's durable withdrawal of unspent consent.",
+        "properties": {
+          "reason": {
+            "$ref": "#/$defs/ApprovalConsentWithdrawalReason"
+          },
+          "withdrawn_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "withdrawn_at"
+        ],
+        "type": "object"
+      },
+      "ApprovalConsentWithdrawalReason": {
+        "description": "Why the owner withdrew unspent consent. None of these is a human denial.",
+        "oneOf": [
+          {
+            "const": "run_ended",
+            "description": "The run that admitted the candidate closed.",
+            "type": "string"
+          },
+          {
+            "const": "context_changed",
+            "description": "The consented decision is no longer the current one.",
+            "type": "string"
+          },
+          {
+            "const": "authority_changed",
+            "description": "The current authorization refused the consented operation.",
+            "type": "string"
+          },
+          {
+            "const": "expired",
+            "description": "The consent request or its spendability expired.",
+            "type": "string"
+          },
+          {
+            "const": "abandoned",
+            "description": "The owner abandoned the custody (for example after a conflicting or\nuncertain store commit).",
+            "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The admitted notice input that would have moved the parked consent\ninto a resumed run ended before the move. It names that input only:\nhow the input ended stays the runtime owner's fact.",
+            "properties": {
+              "notice_input_ended": {
+                "properties": {
+                  "input_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "input_id"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "notice_input_ended"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ApprovalDecision": {
         "description": "Allowed terminal decisions.",
         "enum": [
@@ -7613,6 +7986,17 @@
           "approval_id": {
             "$ref": "#/$defs/ApprovalId"
           },
+          "consent": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ApprovalConsentRecord"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present only on an approval the native owner issued for one retained\nR3 candidate (human consent). History, never an executable\ncapability: spendable consent lives only in the owner's process-local\ncustody of that candidate."
+          },
           "created_at": {
             "type": "string"
           },
@@ -7728,6 +8112,116 @@
         ],
         "type": "string"
       },
+      "HostingDomainRef": {
+        "description": "Passive identity of one hosting domain: the exclusion domain of a store's\nsession hosting claims. Claims are keyed by their lock path, so two\ndomains may host sessions with equal ids; this reference tells them\napart.\n\nIt is a hash of the canonical lock directory, and identity data only. It\ngrants nothing and proves nothing: no held claim, no owner death, no\nauthenticated host, and no equality of domains across hosts. Recovery,\nwake and handoff decide on the actual hosting claim, never on this\nreference. A domain whose lock directory moved is a different domain.",
+        "type": "string"
+      },
+      "PrincipalId": {
+        "description": "Stable, caller-visible principal id.\n\nLegacy deserialization preserves previously persisted strings, including\nthose rejected by [`Self::new`]. Qualified [`PrincipalRef`] deserialization\nvalidates the id; migrating unqualified persisted ids is a separate step.",
+        "type": "string"
+      },
+      "PrincipalKind": {
+        "description": "Generic principal categories. Product-specific role names belong outside\ncore and may be mapped to these typed categories by clients.",
+        "enum": [
+          "human",
+          "personal_agent",
+          "shared_agent",
+          "runtime_host",
+          "service_account"
+        ],
+        "type": "string"
+      },
+      "PrincipalQualification": {
+        "description": "Whether an identity has an explicit trust-domain namespace.\n\nUnqualified identity preserves trusted-embedded and legacy wire contracts;\nit must not be silently assigned a domain for governed use. Qualification\nis identity vocabulary, not proof of authentication or authorization.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unqualified",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "qualified",
+                "type": "string"
+              },
+              "trust_domain_id": {
+                "$ref": "#/$defs/TrustDomainId"
+              }
+            },
+            "required": [
+              "kind",
+              "trust_domain_id"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PrincipalRef": {
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "qualification": {
+                  "properties": {
+                    "kind": {
+                      "const": "qualified"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                }
+              },
+              "required": [
+                "qualification"
+              ]
+            },
+            "then": {
+              "properties": {
+                "id": {
+                  "allOf": [
+                    {
+                      "pattern": "[^\\u0009\\u000a\\u000b\\u000c\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]"
+                    },
+                    {
+                      "not": {
+                        "pattern": "[\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\u0008\\u0009\\u000a\\u000b\\u000c\\u000d\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f\\u007f\\u0080\\u0081\\u0082\\u0083\\u0084\\u0085\\u0086\\u0087\\u0088\\u0089\\u008a\\u008b\\u008c\\u008d\\u008e\\u008f\\u0090\\u0091\\u0092\\u0093\\u0094\\u0095\\u0096\\u0097\\u0098\\u0099\\u009a\\u009b\\u009c\\u009d\\u009e\\u009f]"
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ],
+        "description": "Typed principal reference.\n\nPublic fields preserve the existing data contract, so an in-memory value\nis not proof of valid or authenticated identity. Governed admission must\ncall [`Self::validate_qualified`] and separately establish caller authority.",
+        "properties": {
+          "id": {
+            "$ref": "#/$defs/PrincipalId"
+          },
+          "kind": {
+            "$ref": "#/$defs/PrincipalKind"
+          },
+          "qualification": {
+            "$ref": "#/$defs/PrincipalQualification"
+          }
+        },
+        "required": [
+          "kind",
+          "id"
+        ],
+        "type": "object"
+      },
       "RunId": {
         "description": "Unique identifier for a run (a single execution of the agent loop).\n\nCore emits this in `RunEvent` and tracks it across the run lifecycle.",
         "type": "string"
@@ -7751,6 +8245,20 @@
           }
         },
         "type": "object"
+      },
+      "TrustDomainId": {
+        "allOf": [
+          {
+            "pattern": "[^\\u0009\\u000a\\u000b\\u000c\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]"
+          },
+          {
+            "not": {
+              "pattern": "[\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\u0008\\u0009\\u000a\\u000b\\u000c\\u000d\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f\\u007f\\u0080\\u0081\\u0082\\u0083\\u0084\\u0085\\u0086\\u0087\\u0088\\u0089\\u008a\\u008b\\u008c\\u008d\\u008e\\u008f\\u0090\\u0091\\u0092\\u0093\\u0094\\u0095\\u0096\\u0097\\u0098\\u0099\\u009a\\u009b\\u009c\\u009d\\u009e\\u009f]"
+            }
+          }
+        ],
+        "description": "Exact, opaque trust-domain namespace for a qualified principal id.\n\nDomain ids are not inferred from hostnames or normalized. Constructing one\nvalidates its syntax, not the caller's authority to assert that domain.",
+        "type": "string"
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -7783,6 +8291,342 @@
           "other"
         ],
         "type": "string"
+      },
+      "ApprovalAssurance": {
+        "description": "Authentication assurance the host's ingress owner established for one\ndecision event. A displayed identity alone never implies it.",
+        "oneOf": [
+          {
+            "const": "person_authenticated",
+            "description": "The person was authenticated on the actual channel event.",
+            "type": "string"
+          },
+          {
+            "const": "service_credential",
+            "description": "A delegated service credential authenticated the event.",
+            "type": "string"
+          },
+          {
+            "const": "device_trusted",
+            "description": "Only device or network trust was established.",
+            "type": "string"
+          }
+        ]
+      },
+      "ApprovalConsentApprover": {
+        "description": "The authenticated approver recorded on a consent decision.",
+        "properties": {
+          "assurance": {
+            "$ref": "#/$defs/ApprovalAssurance"
+          },
+          "principal": {
+            "$ref": "#/$defs/PrincipalRef"
+          }
+        },
+        "required": [
+          "principal",
+          "assurance"
+        ],
+        "type": "object"
+      },
+      "ApprovalConsentCustody": {
+        "description": "Cross-run custody history of a retained consent candidate.",
+        "oneOf": [
+          {
+            "description": "Parked at its run's close for a resumed run of its origin work.",
+            "properties": {
+              "state": {
+                "const": "parked",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Transferred once into the resumed run staged with this admitted\nnotice input.",
+            "properties": {
+              "input_id": {
+                "type": "string"
+              },
+              "state": {
+                "const": "transferred",
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "input_id"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ApprovalConsentDelivery": {
+        "description": "One committed transition's notice obligation.",
+        "properties": {
+          "committed_at": {
+            "description": "When the transition (and with it this obligation) committed.",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/$defs/ApprovalConsentDeliveryState"
+          },
+          "transition": {
+            "$ref": "#/$defs/ApprovalConsentTransition"
+          }
+        },
+        "required": [
+          "transition",
+          "committed_at",
+          "state"
+        ],
+        "type": "object"
+      },
+      "ApprovalConsentDeliveryState": {
+        "description": "Where one transition's notice stands. It is committed `Owed` with its\ntransition, and only the delivery owner's exact receipt for that same\ntransition settles it.",
+        "oneOf": [
+          {
+            "description": "Committed with its transition and not known to be admitted. An\nunknown admission stays owed until it is reconciled.",
+            "properties": {
+              "status": {
+                "const": "owed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The owning session's native admission durably accepted the notice.\nNot model observation and not execution: a notice wakes work and\nspends nothing.",
+            "properties": {
+              "input_id": {
+                "type": "string"
+              },
+              "session_id": {
+                "$ref": "#/$defs/SessionId"
+              },
+              "status": {
+                "const": "admitted",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "session_id",
+              "input_id"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Proven terminal non-delivery, such as a settled policy refusal or a\nretired owner. Never inferred from a later refusal after an unknown\nearlier attempt.",
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "status": {
+                "const": "failed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ApprovalConsentOrigin": {
+        "description": "The retained work of the run that admitted a consent candidate: with the\nscope, the exact native destination of the consent's notices.\n\nCommitted at issuance and never changed. Never authority: a notice is\nadmitted only through the runtime's own retained-resume validation of\nthis identity, and a cross-run transfer compares the runtime-minted\nresume evidence, never this copy.",
+        "properties": {
+          "retained_work": true
+        },
+        "required": [
+          "retained_work"
+        ],
+        "type": "object"
+      },
+      "ApprovalConsentRecord": {
+        "description": "Consent facts of an approval issued for one retained R3 candidate.\n\nA durable projection of the approval owner's own transitions. Decision\nstatus, spend and execution are separate facts: `Approved` with no\n`consumed_at` is not spendable after a restart, and `consumed_at` is not\nproof that the effect completed.",
+        "properties": {
+          "approver": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ApprovalConsentApprover"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The authenticated approver of the recorded decision."
+          },
+          "consumed_at": {
+            "description": "When a fresh exact attempt consumed the approval at its entry.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "custody": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ApprovalConsentCustody"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Cross-run custody history of the retained candidate. History only:\ncustody itself is process-local and never restored from this."
+          },
+          "deliveries": {
+            "description": "One delivery obligation per committed transition that owes the\nowning session a notice, committed with that transition.",
+            "items": {
+              "$ref": "#/$defs/ApprovalConsentDelivery"
+            },
+            "type": "array"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ApprovalConsentOrigin"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The retained work of the run that admitted the candidate, committed\nat issuance with the scope. Together they are the exact native\ndestination of this consent's notices."
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ApprovalConsentScope"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The owner scope committed at issuance, when the admitting run had one."
+          },
+          "withdrawal": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ApprovalConsentWithdrawal"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The owner withdrew the unspent consent: a pending approval is then\n`Cancelled` (never a denial), and approved history stays `Approved`\nbut can no longer be spent. Never set on spent consent."
+          }
+        },
+        "type": "object"
+      },
+      "ApprovalConsentScope": {
+        "description": "Passive owner scope of a consent approval, committed with its issuance:\nthe hosting domain and the session of the run that admitted the\ncandidate. On the native path the runtime fills it from the work it\nadmitted and staged; request metadata never supplies it. A trusted host\nthat builds its own work context may set it too\n([`crate::WorkAuthorizationContext::with_consent_scope`]).\n\nNever authority. Every owner-authored transition of the row keeps it\nunchanged; that is not tamper-proofing, since the store row is writable.\nRecovery, wake and handoff re-validate it against the actual hosting\nclaim and current candidate and never treat it as custody. A consent row\nwithout it takes no part in them.",
+        "properties": {
+          "domain": {
+            "$ref": "#/$defs/HostingDomainRef"
+          },
+          "session_id": {
+            "$ref": "#/$defs/SessionId"
+          }
+        },
+        "required": [
+          "domain",
+          "session_id"
+        ],
+        "type": "object"
+      },
+      "ApprovalConsentTransition": {
+        "description": "A committed consent transition that owes the owning session a notice.\nEach transition is owed on its own: a later transition never settles,\nreplaces or retracts an earlier one's notice.",
+        "oneOf": [
+          {
+            "const": "approved",
+            "description": "An authenticated human approved it.",
+            "type": "string"
+          },
+          {
+            "const": "denied",
+            "description": "An authenticated human declined it.",
+            "type": "string"
+          },
+          {
+            "const": "withdrawn",
+            "description": "The owner withdrew the unspent consent, for any withdrawal reason\n(the row's `withdrawal` says which).",
+            "type": "string"
+          }
+        ]
+      },
+      "ApprovalConsentWithdrawal": {
+        "description": "The owner's durable withdrawal of unspent consent.",
+        "properties": {
+          "reason": {
+            "$ref": "#/$defs/ApprovalConsentWithdrawalReason"
+          },
+          "withdrawn_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason",
+          "withdrawn_at"
+        ],
+        "type": "object"
+      },
+      "ApprovalConsentWithdrawalReason": {
+        "description": "Why the owner withdrew unspent consent. None of these is a human denial.",
+        "oneOf": [
+          {
+            "const": "run_ended",
+            "description": "The run that admitted the candidate closed.",
+            "type": "string"
+          },
+          {
+            "const": "context_changed",
+            "description": "The consented decision is no longer the current one.",
+            "type": "string"
+          },
+          {
+            "const": "authority_changed",
+            "description": "The current authorization refused the consented operation.",
+            "type": "string"
+          },
+          {
+            "const": "expired",
+            "description": "The consent request or its spendability expired.",
+            "type": "string"
+          },
+          {
+            "const": "abandoned",
+            "description": "The owner abandoned the custody (for example after a conflicting or\nuncertain store commit).",
+            "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The admitted notice input that would have moved the parked consent\ninto a resumed run ended before the move. It names that input only:\nhow the input ended stays the runtime owner's fact.",
+            "properties": {
+              "notice_input_ended": {
+                "properties": {
+                  "input_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "input_id"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "notice_input_ended"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "ApprovalDecision": {
         "description": "Allowed terminal decisions.",
@@ -8007,6 +8851,116 @@
         ],
         "type": "string"
       },
+      "HostingDomainRef": {
+        "description": "Passive identity of one hosting domain: the exclusion domain of a store's\nsession hosting claims. Claims are keyed by their lock path, so two\ndomains may host sessions with equal ids; this reference tells them\napart.\n\nIt is a hash of the canonical lock directory, and identity data only. It\ngrants nothing and proves nothing: no held claim, no owner death, no\nauthenticated host, and no equality of domains across hosts. Recovery,\nwake and handoff decide on the actual hosting claim, never on this\nreference. A domain whose lock directory moved is a different domain.",
+        "type": "string"
+      },
+      "PrincipalId": {
+        "description": "Stable, caller-visible principal id.\n\nLegacy deserialization preserves previously persisted strings, including\nthose rejected by [`Self::new`]. Qualified [`PrincipalRef`] deserialization\nvalidates the id; migrating unqualified persisted ids is a separate step.",
+        "type": "string"
+      },
+      "PrincipalKind": {
+        "description": "Generic principal categories. Product-specific role names belong outside\ncore and may be mapped to these typed categories by clients.",
+        "enum": [
+          "human",
+          "personal_agent",
+          "shared_agent",
+          "runtime_host",
+          "service_account"
+        ],
+        "type": "string"
+      },
+      "PrincipalQualification": {
+        "description": "Whether an identity has an explicit trust-domain namespace.\n\nUnqualified identity preserves trusted-embedded and legacy wire contracts;\nit must not be silently assigned a domain for governed use. Qualification\nis identity vocabulary, not proof of authentication or authorization.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unqualified",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "qualified",
+                "type": "string"
+              },
+              "trust_domain_id": {
+                "$ref": "#/$defs/TrustDomainId"
+              }
+            },
+            "required": [
+              "kind",
+              "trust_domain_id"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PrincipalRef": {
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "qualification": {
+                  "properties": {
+                    "kind": {
+                      "const": "qualified"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ]
+                }
+              },
+              "required": [
+                "qualification"
+              ]
+            },
+            "then": {
+              "properties": {
+                "id": {
+                  "allOf": [
+                    {
+                      "pattern": "[^\\u0009\\u000a\\u000b\\u000c\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]"
+                    },
+                    {
+                      "not": {
+                        "pattern": "[\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\u0008\\u0009\\u000a\\u000b\\u000c\\u000d\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f\\u007f\\u0080\\u0081\\u0082\\u0083\\u0084\\u0085\\u0086\\u0087\\u0088\\u0089\\u008a\\u008b\\u008c\\u008d\\u008e\\u008f\\u0090\\u0091\\u0092\\u0093\\u0094\\u0095\\u0096\\u0097\\u0098\\u0099\\u009a\\u009b\\u009c\\u009d\\u009e\\u009f]"
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ],
+        "description": "Typed principal reference.\n\nPublic fields preserve the existing data contract, so an in-memory value\nis not proof of valid or authenticated identity. Governed admission must\ncall [`Self::validate_qualified`] and separately establish caller authority.",
+        "properties": {
+          "id": {
+            "$ref": "#/$defs/PrincipalId"
+          },
+          "kind": {
+            "$ref": "#/$defs/PrincipalKind"
+          },
+          "qualification": {
+            "$ref": "#/$defs/PrincipalQualification"
+          }
+        },
+        "required": [
+          "kind",
+          "id"
+        ],
+        "type": "object"
+      },
       "RunId": {
         "description": "Unique identifier for a run (a single execution of the agent loop).\n\nCore emits this in `RunEvent` and tracks it across the run lifecycle.",
         "type": "string"
@@ -8030,6 +8984,20 @@
           }
         },
         "type": "object"
+      },
+      "TrustDomainId": {
+        "allOf": [
+          {
+            "pattern": "[^\\u0009\\u000a\\u000b\\u000c\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]"
+          },
+          {
+            "not": {
+              "pattern": "[\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\u0008\\u0009\\u000a\\u000b\\u000c\\u000d\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f\\u007f\\u0080\\u0081\\u0082\\u0083\\u0084\\u0085\\u0086\\u0087\\u0088\\u0089\\u008a\\u008b\\u008c\\u008d\\u008e\\u008f\\u0090\\u0091\\u0092\\u0093\\u0094\\u0095\\u0096\\u0097\\u0098\\u0099\\u009a\\u009b\\u009c\\u009d\\u009e\\u009f]"
+            }
+          }
+        ],
+        "description": "Exact, opaque trust-domain namespace for a qualified principal id.\n\nDomain ids are not inferred from hostnames or normalized. Constructing one\nvalidates its syntax, not the caller's authority to assert that domain.",
+        "type": "string"
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -8044,6 +9012,17 @@
       },
       "approval_id": {
         "$ref": "#/$defs/ApprovalId"
+      },
+      "consent": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ApprovalConsentRecord"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Present only on an approval the native owner issued for one retained\nR3 candidate (human consent). History, never an executable\ncapability: spendable consent lives only in the owner's process-local\ncustody of that candidate."
       },
       "created_at": {
         "type": "string"
@@ -13070,6 +14049,24 @@
         ],
         "type": "string"
       },
+      "McpServerAccess": {
+        "additionalProperties": false,
+        "description": "Host access ceiling for one MCP server, enforced by the connection that\ncalls it.\n\nOnly the raw MCP operations in `allowed_operations` may be called. The\nrouter does not offer any other under any name, and the connection\nrefuses any other before anything is sent.\nThe ceiling only narrows access. It does not certify that the listed\noperations are reads: session read-only policy still requires a trusted\nhost declaration for the exact destination and operation. Nothing is\ninferred from operation names or from the server's annotations.",
+        "properties": {
+          "allowed_operations": {
+            "description": "The raw MCP operation names that may be called.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "allowed_operations"
+        ],
+        "type": "object"
+      },
       "MeerkatSchema": {
         "description": "A Meerkat-native JSON schema."
       },
@@ -13635,6 +14632,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "args": {
                 "items": {
                   "type": "string"
@@ -13679,6 +14687,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "connect_timeout_secs": {
                 "format": "uint64",
                 "minimum": 0,
@@ -21774,6 +22793,24 @@
         ],
         "type": "string"
       },
+      "McpServerAccess": {
+        "additionalProperties": false,
+        "description": "Host access ceiling for one MCP server, enforced by the connection that\ncalls it.\n\nOnly the raw MCP operations in `allowed_operations` may be called. The\nrouter does not offer any other under any name, and the connection\nrefuses any other before anything is sent.\nThe ceiling only narrows access. It does not certify that the listed\noperations are reads: session read-only policy still requires a trusted\nhost declaration for the exact destination and operation. Nothing is\ninferred from operation names or from the server's annotations.",
+        "properties": {
+          "allowed_operations": {
+            "description": "The raw MCP operation names that may be called.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "allowed_operations"
+        ],
+        "type": "object"
+      },
       "MeerkatSchema": {
         "description": "A Meerkat-native JSON schema."
       },
@@ -21970,6 +23007,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "args": {
                 "items": {
                   "type": "string"
@@ -22014,6 +23062,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "connect_timeout_secs": {
                 "format": "uint64",
                 "minimum": 0,
@@ -27845,6 +28904,23 @@
         ],
         "type": "object"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "MeerkatSchema": {
         "description": "A Meerkat-native JSON schema."
       },
@@ -29999,13 +31075,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -30323,6 +31408,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -31857,6 +32953,23 @@
         ],
         "type": "object"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "OpenAiAssistantPhase": {
         "description": "Responses assistant-message phase, distinct from reasoning metadata.",
         "enum": [
@@ -32388,13 +33501,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -32663,6 +33785,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -36010,7 +37143,11 @@
           "interactive_login_required",
           "host_owned_unavailable",
           "io",
-          "other"
+          "other",
+          "credential_access_denied",
+          "credential_interaction_required",
+          "credential_access_pending",
+          "credential_store_unavailable"
         ],
         "type": "string"
       },
@@ -39085,7 +40222,11 @@
           "interactive_login_required",
           "host_owned_unavailable",
           "io",
-          "other"
+          "other",
+          "credential_access_denied",
+          "credential_interaction_required",
+          "credential_access_pending",
+          "credential_store_unavailable"
         ],
         "type": "string"
       },
@@ -39825,7 +40966,7 @@
           },
           {
             "additionalProperties": false,
-            "description": "The current run was cancelled at its next boundary.",
+            "description": "A cancel at its next boundary was recorded for the current run. The\nreply does not wait for the run to reach that boundary.",
             "properties": {
               "run": {
                 "const": "cancelled_at_boundary",
@@ -42874,6 +44015,23 @@
         ],
         "type": "string"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "MeerkatSchema": {
         "description": "A Meerkat-native JSON schema."
       },
@@ -45270,13 +46428,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -45621,6 +46788,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -53990,7 +55168,11 @@
           "interactive_login_required",
           "host_owned_unavailable",
           "io",
-          "other"
+          "other",
+          "credential_access_denied",
+          "credential_interaction_required",
+          "credential_access_pending",
+          "credential_store_unavailable"
         ],
         "type": "string"
       },
@@ -56487,7 +57669,7 @@
           },
           {
             "additionalProperties": false,
-            "description": "The current run was cancelled at its next boundary.",
+            "description": "A cancel at its next boundary was recorded for the current run. The\nreply does not wait for the run to reach that boundary.",
             "properties": {
               "run": {
                 "const": "cancelled_at_boundary",
@@ -60865,6 +62047,23 @@
         ],
         "type": "string"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "McpHttpTransport": {
         "description": "HTTP transport selection for URL-based servers",
         "enum": [
@@ -60872,6 +62071,24 @@
           "sse"
         ],
         "type": "string"
+      },
+      "McpServerAccess": {
+        "additionalProperties": false,
+        "description": "Host access ceiling for one MCP server, enforced by the connection that\ncalls it.\n\nOnly the raw MCP operations in `allowed_operations` may be called. The\nrouter does not offer any other under any name, and the connection\nrefuses any other before anything is sent.\nThe ceiling only narrows access. It does not certify that the listed\noperations are reads: session read-only policy still requires a trusted\nhost declaration for the exact destination and operation. Nothing is\ninferred from operation names or from the server's annotations.",
+        "properties": {
+          "allowed_operations": {
+            "description": "The raw MCP operation names that may be called.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "allowed_operations"
+        ],
+        "type": "object"
       },
       "MeerkatSchema": {
         "description": "A Meerkat-native JSON schema."
@@ -61939,6 +63156,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "args": {
                 "items": {
                   "type": "string"
@@ -61983,6 +63211,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "connect_timeout_secs": {
                 "format": "uint64",
                 "minimum": 0,
@@ -64407,13 +65646,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -64886,6 +66134,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -71799,6 +73058,24 @@
         ],
         "type": "string"
       },
+      "McpServerAccess": {
+        "additionalProperties": false,
+        "description": "Host access ceiling for one MCP server, enforced by the connection that\ncalls it.\n\nOnly the raw MCP operations in `allowed_operations` may be called. The\nrouter does not offer any other under any name, and the connection\nrefuses any other before anything is sent.\nThe ceiling only narrows access. It does not certify that the listed\noperations are reads: session read-only policy still requires a trusted\nhost declaration for the exact destination and operation. Nothing is\ninferred from operation names or from the server's annotations.",
+        "properties": {
+          "allowed_operations": {
+            "description": "The raw MCP operation names that may be called.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "allowed_operations"
+        ],
+        "type": "object"
+      },
       "MeerkatSchema": {
         "description": "A Meerkat-native JSON schema."
       },
@@ -72364,6 +73641,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "args": {
                 "items": {
                   "type": "string"
@@ -72408,6 +73696,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "connect_timeout_secs": {
                 "format": "uint64",
                 "minimum": 0,
@@ -76471,7 +77770,11 @@
           "interactive_login_required",
           "host_owned_unavailable",
           "io",
-          "other"
+          "other",
+          "credential_access_denied",
+          "credential_interaction_required",
+          "credential_access_pending",
+          "credential_store_unavailable"
         ],
         "type": "string"
       },
@@ -77211,7 +78514,7 @@
           },
           {
             "additionalProperties": false,
-            "description": "The current run was cancelled at its next boundary.",
+            "description": "A cancel at its next boundary was recorded for the current run. The\nreply does not wait for the run to reach that boundary.",
             "properties": {
               "run": {
                 "const": "cancelled_at_boundary",
@@ -81073,6 +82376,23 @@
         ],
         "type": "string"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "MeerkatSchema": {
         "description": "A Meerkat-native JSON schema."
       },
@@ -83469,13 +84789,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -83820,6 +85149,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -87102,6 +88442,198 @@
   },
   "ConfigSetParams": {
     "$defs": {
+      "AnthropicCacheControlPolicy": {
+        "description": "Typed shape of Anthropic's prompt-cache breakpoint policy.",
+        "oneOf": [
+          {
+            "const": "disabled",
+            "description": "Do not request Anthropic prompt-cache breakpoints.",
+            "type": "string"
+          },
+          {
+            "const": "automatic",
+            "description": "Ask Anthropic to keep a moving breakpoint on the last cacheable block.\n\nThis is the normal multi-turn policy: the provider advances the\nbreakpoint as conversation history grows. Anthropic searches backward\nup to 20 cacheable blocks from that breakpoint, so a hit is not\nguaranteed when more than 20 new blocks are added between requests.",
+            "type": "string"
+          },
+          {
+            "const": "system_prefix",
+            "description": "Mark the stable top-level system prompt as an ephemeral cache prefix.",
+            "type": "string"
+          },
+          {
+            "const": "system_and_conversation",
+            "description": "Mark the stable system/profile prefix and up to three recent\nconversation boundaries. This is explicit provider authoring, not a\nprocess-wide cache default.",
+            "type": "string"
+          }
+        ]
+      },
+      "AnthropicCacheTtl": {
+        "description": "Anthropic prompt-cache TTL selected per agent/profile.",
+        "oneOf": [
+          {
+            "const": "5m",
+            "description": "Provider-default five-minute cache lifetime.",
+            "type": "string"
+          },
+          {
+            "const": "1h",
+            "description": "One-hour cache lifetime for sufficiently frequent profiles.",
+            "type": "string"
+          }
+        ]
+      },
+      "AnthropicCompactionConfig": {
+        "description": "Typed shape of Anthropic's automatic-compaction knob.",
+        "oneOf": [
+          {
+            "description": "`\"auto\"` — provider picks trigger and instructions.",
+            "properties": {
+              "kind": {
+                "const": "auto",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Caller-provided edit body merged into the compact edit shape.\nFields like `trigger` / `instructions` are preserved verbatim.",
+            "properties": {
+              "edit": {
+                "$ref": "#/$defs/OpaqueProviderBody"
+              },
+              "kind": {
+                "const": "custom",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "edit"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "AnthropicContextWindow": {
+        "description": "Typed shape of Anthropic's context-window opt-in.",
+        "oneOf": [
+          {
+            "const": "one_megabyte",
+            "description": "1M-token beta context window (2025-08-07 beta header).",
+            "type": "string"
+          }
+        ]
+      },
+      "AnthropicEffort": {
+        "description": "Typed shape of Anthropic's response-effort knob.\n`XHigh` is the Opus 4.8 / 4.7 extended-high effort level.",
+        "enum": [
+          "low",
+          "medium",
+          "high",
+          "max",
+          "x_high"
+        ],
+        "type": "string"
+      },
+      "AnthropicInferenceGeo": {
+        "description": "Typed shape of Anthropic's data-residency knob.",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "us",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "global",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Caller-provided region string — providers may accept region codes\nthis typed variant does not yet enumerate.",
+            "properties": {
+              "kind": {
+                "const": "other",
+                "type": "string"
+              },
+              "region": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "region"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "AnthropicThinkingConfig": {
+        "description": "Typed shape of Anthropic's extended-thinking knob.",
+        "oneOf": [
+          {
+            "description": "Adaptive thinking — provider picks the budget.",
+            "properties": {
+              "type": {
+                "const": "adaptive",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Explicit budget — model emits at most `budget_tokens` tokens of\nreasoning before the assistant text.",
+            "properties": {
+              "budget_tokens": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": {
+                "const": "enabled",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "budget_tokens"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "No up-front thinking: the model only writes short progress updates\nbetween tool calls. The lowest thinking setting on models whose\ncatalog row admits it (Claude Sonnet 5.5), accepted at `high` effort\nor below; wire shape `{\"type\": \"between_tools\"}`.",
+            "properties": {
+              "type": {
+                "const": "between_tools",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "AuthBindingRef": {
         "description": "Session-facing reference to a binding inside a realm.\n\n`AuthBindingRef` is purely structural — it does NOT carry a `\"realm:binding\"`\nstring form. Wave-b deleted `parse` and `Display` so that no code path\naccidentally ferries the opaque join through the runtime. CLI input that\narrives as `\"realm:binding[:profile]\"` must be split at the CLI boundary\nand constructed field-by-field.",
         "properties": {
@@ -87158,6 +88690,17 @@
           "budget": true,
           "comms": true,
           "compaction": true,
+          "governance": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/GovernanceConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Readable through the ordinary config surfaces; an ordinary write\ncannot change it (governance is administered by the realm's trusted\nhost)."
+          },
           "hooks": true,
           "limits": true,
           "max_tokens": {
@@ -87197,6 +88740,64 @@
           "tools": true
         },
         "type": "object"
+      },
+      "GeminiThinkingConfig": {
+        "additionalProperties": false,
+        "description": "Typed shape of Gemini's thinking knob.",
+        "properties": {
+          "include_thoughts": {
+            "description": "Whether reasoning output is included in the response.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "thinking_budget": {
+            "description": "Reasoning token budget.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "thinking_level": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/GeminiThinkingLevel"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Gemini 3 reasoning level."
+          }
+        },
+        "type": "object"
+      },
+      "GeminiThinkingLevel": {
+        "description": "Gemini 3 reasoning levels accepted by the API.",
+        "enum": [
+          "minimal",
+          "low",
+          "medium",
+          "high"
+        ],
+        "type": "string"
+      },
+      "GovernanceConfig": {
+        "additionalProperties": false,
+        "description": "Governance of a realm's native composition. Empty by default: a stock\ngoverned realm keeps every operation at its local R1 tier and calls no\nreviewer. A present section ([`crate::Config::governance`]), even an\nempty one, replaces an inherited one as a whole.",
+        "properties": {
+          "review": {
+            "$ref": "#/$defs/StockReviewConfig",
+            "description": "The review the stock governed host requires."
+          }
+        },
+        "type": "object"
+      },
+      "MeerkatSchema": {
+        "description": "A Meerkat-native JSON schema."
       },
       "ModelFallbackConfig": {
         "additionalProperties": false,
@@ -87312,6 +88913,130 @@
         ],
         "type": "string"
       },
+      "OpaqueProviderBody": {
+        "description": "Opaque provider-native JSON body carried verbatim from caller to\nprovider. Used for pass-through sub-shapes (web search config,\nprovider-native custom compaction edits, OpenAI-compatible\n`chat_template_kwargs`/`thinking`/`reasoning` forwards) where the\nexact wire shape varies across downstream providers (Anthropic /\nDeepSeek / OpenRouter / custom proxies) and the runtime deliberately\ndoes not parse the body — it simply forwards it.",
+        "type": "string"
+      },
+      "OpenAiPromptCacheMode": {
+        "description": "Request-wide GPT-5.6 prompt-cache breakpoint policy.",
+        "enum": [
+          "implicit",
+          "explicit"
+        ],
+        "type": "string"
+      },
+      "OpenAiPromptCacheOptions": {
+        "additionalProperties": false,
+        "description": "GPT-5.6 request-wide prompt-cache controls.",
+        "properties": {
+          "mode": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/OpenAiPromptCacheMode"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Automatic (`implicit`) placement or Meerkat-authored explicit placement."
+          },
+          "ttl": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/OpenAiPromptCacheTtl"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Minimum cache lifetime. GPT-5.6 currently accepts only `30m`."
+          }
+        },
+        "type": "object"
+      },
+      "OpenAiPromptCacheRetention": {
+        "description": "Typed shape of OpenAI's prompt-cache retention hint.",
+        "oneOf": [
+          {
+            "const": "in_memory",
+            "description": "Retain only in memory.",
+            "type": "string"
+          },
+          {
+            "const": "24h",
+            "description": "Retain for 24 hours.",
+            "type": "string"
+          }
+        ]
+      },
+      "OpenAiPromptCacheTtl": {
+        "description": "Minimum lifetime for GPT-5.6 prompt-cache entries.",
+        "enum": [
+          "30m"
+        ],
+        "type": "string"
+      },
+      "OpenAiReasoningContext": {
+        "description": "Which available reasoning items GPT-5.6 may render into the next sample.",
+        "enum": [
+          "auto",
+          "current_turn",
+          "all_turns"
+        ],
+        "type": "string"
+      },
+      "OpenAiReasoningMode": {
+        "description": "GPT-5.6 Responses execution mode.",
+        "enum": [
+          "standard",
+          "pro"
+        ],
+        "type": "string"
+      },
+      "OpenAiTextVerbosity": {
+        "description": "Default level of detail for OpenAI text output.",
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "type": "string"
+      },
+      "OutputSchema": {
+        "description": "Configuration for structured output extraction.\n\nWhen provided to an agent, the agent will perform an extraction turn after\ncompleting the agentic work, forcing the LLM to output validated JSON that\nconforms to the provided schema. [`RunResult::text`] remains the committed\nmain-turn output; extraction populates [`RunResult::structured_output`] on\nsuccess or [`RunResult::extraction_error`] on failure.",
+        "properties": {
+          "compat": {
+            "$ref": "#/$defs/SchemaCompat",
+            "default": "lossy",
+            "description": "Compatibility mode for provider lowering (lossy or strict)"
+          },
+          "format": {
+            "$ref": "#/$defs/SchemaFormat",
+            "default": "meerkat_v1",
+            "description": "Schema format version"
+          },
+          "name": {
+            "description": "Optional name for the schema (used by some providers)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "schema": {
+            "$ref": "#/$defs/MeerkatSchema",
+            "description": "The JSON schema that the output must conform to"
+          },
+          "strict": {
+            "default": false,
+            "description": "Whether to enforce strict schema validation (provider-specific)",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "schema"
+        ],
+        "type": "object"
+      },
       "ProfileId": {
         "description": "Opaque slug identifying an auth profile override on a connection.",
         "type": "string"
@@ -87327,9 +89052,788 @@
         ],
         "type": "string"
       },
+      "ProviderParamsOverride": {
+        "additionalProperties": false,
+        "description": "Typed per-turn provider parameter overrides.\n\nReplaces the legacy untyped `serde_json::Value` bag. Every knob exposed\nby the runtime on a per-turn seam must have a typed field here. Anything\nprovider-specific enough to not fit goes on [`ProviderTag`]; anything\nthat is fundamentally per-binding (not per-turn) lives on the auth /\nbackend profile and never traverses this seam.",
+        "properties": {
+          "max_output_tokens": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "provider_tag": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProviderTag"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reasoning": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ReasoningMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "temperature": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "thinking_budget_tokens": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "top_p": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ProviderTag": {
+        "description": "Provider-specific typed override payload carried on a single turn.\n\nEach provider family gets its own typed variant. Anything that does not\nfit a typed field belongs on the per-binding auth/backend profile, not\non the per-turn override — the per-turn seam carries only scalars the\nruntime can route authoritatively.\n\n`Unknown { bag }` is the typed escape hatch for V3 legacy-row\ndeserialize (see C-TM-V3): the untyped `serde_json::Value` thinking\ncarrier from pre-wave rows projects into `StructuredProviderExtension`\nrather than being silently dropped (persistence-migration.md §3.1,\nadversarial review flaw 5).",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "Per-turn Anthropic-specific knobs carried in `ProviderTag::Anthropic`.",
+            "properties": {
+              "cache_control": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/AnthropicCacheControlPolicy"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Prompt-cache breakpoint policy."
+              },
+              "cache_ttl": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/AnthropicCacheTtl"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Prompt-cache lifetime. Effective only when this profile explicitly\nenables a cache-control policy."
+              },
+              "compaction": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/AnthropicCompactionConfig"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Automatic compaction configuration."
+              },
+              "context": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/AnthropicContextWindow"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Context-window opt-in (1M beta)."
+              },
+              "effort": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/AnthropicEffort"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Response-effort knob."
+              },
+              "inference_geo": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/AnthropicInferenceGeo"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Data-residency override for inference routing."
+              },
+              "provider": {
+                "const": "anthropic",
+                "type": "string"
+              },
+              "structured_output": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/OutputSchema"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Structured-output schema (forces JSON-schema output envelope)."
+              },
+              "supports_temperature_override": {
+                "description": "Internal override: force-enable temperature for this request even\nwhen the model profile says unsupported. Used by proxied /\ncustom deployments.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "thinking": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/AnthropicThinkingConfig"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Extended-thinking configuration."
+              },
+              "thinking_budget_tokens": {
+                "description": "Legacy flat `thinking_budget_tokens` — preserved for V3\npersistence round-trip (single-key legacy projector) and for\ncallers that cannot express the full `thinking` shape.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "top_k": {
+                "description": "Override top-k sampling.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "web_search": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/OpaqueProviderBody"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Provider-native web-search tool body, injected alongside\n`tools` at the provider-runtime boundary."
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Per-turn OpenAI-specific knobs carried in `ProviderTag::OpenAi`.",
+            "properties": {
+              "chat_template_kwargs": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/OpaqueProviderBody"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "OpenAI-compatible endpoints: `chat_template_kwargs` passthrough."
+              },
+              "frequency_penalty": {
+                "description": "Frequency penalty (-2.0 .. 2.0).",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "presence_penalty": {
+                "description": "Presence penalty (-2.0 .. 2.0).",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "prompt_cache_enabled": {
+                "description": "Meerkat-owned prompt-cache enable intent.\n\n`false` is a durable opt-out. On GPT-5.6 it lowers to explicit-only\nmode with no authored breakpoints, which performs no cache reads or\nwrites and incurs no cache-write charges.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "prompt_cache_key": {
+                "description": "OpenAI prompt-cache affinity routing key.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "prompt_cache_options": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/OpenAiPromptCacheOptions"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "GPT-5.6 request-wide prompt-cache policy and minimum TTL."
+              },
+              "prompt_cache_retention": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/OpenAiPromptCacheRetention"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "OpenAI prompt-cache retention hint."
+              },
+              "provider": {
+                "const": "open_ai",
+                "type": "string"
+              },
+              "reasoning": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/OpaqueProviderBody"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "OpenAI-compatible endpoints (DeepSeek / OpenRouter / vLLM):\nfull `reasoning` body forwarded verbatim alongside\n`reasoning_effort`."
+              },
+              "reasoning_context": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/OpenAiReasoningContext"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "GPT-5.6 persisted-reasoning context selection."
+              },
+              "reasoning_effort": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/ReasoningEffort"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Reasoning-effort level for o-series and GPT-5 models."
+              },
+              "reasoning_mode": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/OpenAiReasoningMode"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "GPT-5.6 Responses execution mode (`standard` or `pro`)."
+              },
+              "seed": {
+                "description": "Deterministic-sampling seed.",
+                "format": "int64",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "store": {
+                "description": "Responses API persistence override. Absent means the client sends\n`store: false` by default; callers may explicitly opt in with\n`Some(true)`.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "structured_output": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/OutputSchema"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Structured-output schema (forces `text.format.json_schema`)."
+              },
+              "supports_reasoning_override": {
+                "description": "Internal override: force-enable reasoning payload for this\nrequest (used by client_compatible endpoints).",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "supports_temperature_override": {
+                "description": "Internal override: force-enable temperature for this request.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "text_verbosity": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/OpenAiTextVerbosity"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Default GPT-5.6 text-output detail level."
+              },
+              "thinking": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/OpaqueProviderBody"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "OpenAI-compatible endpoints: vendor-specific `thinking` body\nforwarded verbatim."
+              },
+              "web_search": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/OpaqueProviderBody"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Provider-native web-search tool body, injected alongside `tools`."
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Per-turn Gemini-specific knobs carried in `ProviderTag::Gemini`.",
+            "properties": {
+              "cached_content_name": {
+                "description": "Gemini explicit context-cache resource name.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "candidate_count": {
+                "description": "Number of candidate completions (runtime/persistence knob, not\nread by the Gemini client today — preserved for V3 round-trip).",
+                "format": "uint32",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "google_search": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/OpaqueProviderBody"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Provider-native google_search grounding tool body."
+              },
+              "provider": {
+                "const": "gemini",
+                "type": "string"
+              },
+              "structured_output": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/OutputSchema"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Structured-output schema."
+              },
+              "thinking": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/GeminiThinkingConfig"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Thinking configuration (Gemini 3+ models)."
+              },
+              "thinking_budget": {
+                "description": "Legacy flat `thinking_budget` — preserved for V3 persistence\nround-trip.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "thinking_level": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/GeminiThinkingLevel"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Gemini 3 flat thinking level override."
+              },
+              "top_k": {
+                "description": "Top-K sampling override.",
+                "format": "uint32",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "top_p": {
+                "description": "Top-P (nucleus) sampling override.",
+                "format": "float",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Opaque pass-through for legacy-row knobs that don't (yet) map to a\ntyped variant. Carries the namespaced bag so a later wave can\npromote the structure to a typed variant without losing data.",
+            "properties": {
+              "bag": {
+                "$ref": "#/$defs/StructuredProviderExtension"
+              },
+              "provider": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider",
+              "bag"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "RealmId": {
         "description": "Opaque slug identifying a realm.",
         "type": "string"
+      },
+      "ReasoningEffort": {
+        "description": "Typed projection of OpenAI's reasoning-effort knob.",
+        "enum": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "type": "string"
+      },
+      "ReasoningMode": {
+        "description": "Typed mode for generalized reasoning emission.",
+        "oneOf": [
+          {
+            "const": "emit",
+            "description": "Reasoning output is emitted inline to the caller.",
+            "type": "string"
+          },
+          {
+            "const": "silent",
+            "description": "Reasoning is performed but not emitted.",
+            "type": "string"
+          },
+          {
+            "const": "off",
+            "description": "Reasoning is disabled entirely for this turn.",
+            "type": "string"
+          }
+        ]
+      },
+      "SchemaCompat": {
+        "description": "Compatibility mode for provider lowering.",
+        "enum": [
+          "lossy",
+          "strict"
+        ],
+        "type": "string"
+      },
+      "SchemaFormat": {
+        "description": "Schema format versions supported by Meerkat.",
+        "enum": [
+          "meerkat_v1"
+        ],
+        "type": "string"
+      },
+      "SessionLlmIdentity": {
+        "description": "Canonical durable LLM identity for a session.",
+        "properties": {
+          "auth_binding": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/AuthBindingRef"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Realm-scoped auth binding this session resolves credentials\nthrough. Carried on the identity so mid-session hot-swaps\n(`apply_live_session_llm_identity`) re-resolve against the\nsame realm the session was created with — preventing\ncross-realm credential bleed in multi-tenant setups. Dogma\n§12 (dynamic policy follows dynamic identity): on swap the\nfactory re-enters `ProviderRuntimeRegistry::resolve` against\nthis binding, not a new synthesized env-default realm.\n\nProjection (dogma §1/§13): canonical owner is\n`SessionMetadata.auth_binding`; this field is the\nread/write projection used by hot-swap."
+          },
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider"
+          },
+          "provider_params": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProviderParamsOverride"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Typed provider parameter overrides carried on the durable identity."
+          },
+          "self_hosted_server_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "model",
+          "provider"
+        ],
+        "type": "object"
+      },
+      "StockConsentAssurance": {
+        "description": "The weakest authenticated approver assurance an R3 rule's human consent\naccepts. Ordered by strength: where several R3 rules match one operation,\nthe strongest they state applies. A delegated service credential never\ndecides human consent, whatever a rule states.",
+        "enum": [
+          "device_trusted",
+          "person_authenticated"
+        ],
+        "type": "string"
+      },
+      "StockReviewConfig": {
+        "additionalProperties": false,
+        "description": "The stock governed host's review requirements: owner-selected rules that\nraise the review tier of exact native operation targets above the stock\nrules' own R1, and the explicit model that reviews R2 operations.\n\nA rule only raises a tier. It never allows an operation the stock rules\nrefuse or leave unmapped, and it never lowers the tier another owner\nrequires; the strictest requirement of every matching rule and owner\napplies. Without a reviewer an R2 operation is refused locally with typed\nfeedback; nothing falls back to R1 or to another model.",
+        "properties": {
+          "reviewer": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/StockReviewerSelection"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/$defs/StockReviewRule"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "StockReviewRule": {
+        "additionalProperties": false,
+        "description": "One owner-selected rule: the review tier `target`'s operations require,\nand for R3 the weakest approver assurance its human consent accepts.",
+        "properties": {
+          "consent_assurance": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/StockConsentAssurance"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Required for an R3 rule and refused for an R2 rule."
+          },
+          "target": {
+            "$ref": "#/$defs/StockReviewTarget"
+          },
+          "tier": {
+            "$ref": "#/$defs/StockReviewTier"
+          }
+        },
+        "required": [
+          "target",
+          "tier"
+        ],
+        "type": "object"
+      },
+      "StockReviewTarget": {
+        "description": "An exact native operation target, by the names its owner registers it\nunder, never a model-facing display name. A selector may name a server\nor bundle that is connected or registered only later: nothing is\nresolved or discovered when the configuration loads.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "Every operation of one configured MCP server, by its configured name.",
+            "properties": {
+              "kind": {
+                "const": "mcp_server",
+                "type": "string"
+              },
+              "server": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "server"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "One raw operation of one configured MCP server.",
+            "properties": {
+              "kind": {
+                "const": "mcp_operation",
+                "type": "string"
+              },
+              "operation": {
+                "type": "string"
+              },
+              "server": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "server",
+              "operation"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "One operation of a tool bundle a trusted host registered under its\nstable name.",
+            "properties": {
+              "bundle": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "tool_bundle_operation",
+                "type": "string"
+              },
+              "operation": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "bundle",
+              "operation"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "StockReviewTier": {
+        "description": "A required review tier above the stock rules' own R1.",
+        "enum": [
+          "r2",
+          "r3"
+        ],
+        "type": "string"
+      },
+      "StockReviewerSelection": {
+        "additionalProperties": false,
+        "description": "The explicit model that reviews R2 operations: a session LLM identity\n(model, provider and its configured route or auth binding) and its\noutput budget. There is no default model.",
+        "properties": {
+          "identity": {
+            "$ref": "#/$defs/SessionLlmIdentity",
+            "description": "Read strictly: a misspelled field anywhere in the identity is\nrefused, never dropped."
+          },
+          "max_output_tokens": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "identity",
+          "max_output_tokens"
+        ],
+        "type": "object"
+      },
+      "StructuredProviderExtension": {
+        "description": "Typed non-semantic opaque bag for per-turn provider knobs that cannot be\nfully typed without blocking a wave boundary. Explicitly marked\nnon-semantic and RMAT-exempt.\n\nUse of this type is a deliberate boundary marker: content is passed\nthrough without interpretation. Any consumer that needs to interpret the\ncontent must promote the relevant structure into a proper typed variant\nin its own wave.\n\nRelocated from `meerkat_contracts::wire::runtime` into core so\n`ProviderTag::Unknown { bag }` can name the bag without a cross-crate\ncycle (adversarial review flaw 5). `meerkat-contracts` re-exports this\ntype so the wire path is preserved.",
+        "properties": {
+          "body": {
+            "default": "",
+            "description": "Opaque body. Non-semantic — never pattern matched across the wire.",
+            "type": "string"
+          },
+          "key": {
+            "description": "Opaque key identifying the extension within the namespace.",
+            "type": "string"
+          },
+          "namespace": {
+            "description": "Free-form provider namespace discriminator (e.g. `\"anthropic\"`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "key"
+        ],
+        "type": "object"
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -87758,6 +90262,242 @@
     ],
     "title": "ConnectionTargetErrorKind",
     "type": "string"
+  },
+  "ConsentNoticeKind": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "The recorded consent transition a notice reports.",
+    "enum": [
+      "requested",
+      "approved",
+      "denied",
+      "used",
+      "withdrawn"
+    ],
+    "title": "ConsentNoticeKind",
+    "type": "string"
+  },
+  "ConsentNoticeParams": {
+    "$defs": {
+      "ApprovalActionKind": {
+        "description": "Typed action kind for the proposed action.",
+        "enum": [
+          "shell_command",
+          "file_write",
+          "file_delete",
+          "network_call",
+          "device_control",
+          "tool_call",
+          "other"
+        ],
+        "type": "string"
+      },
+      "ApprovalId": {
+        "description": "Durable approval id.",
+        "type": "string"
+      },
+      "ApprovalProposedAction": {
+        "description": "Action proposed by the requester.",
+        "properties": {
+          "body": true,
+          "kind": {
+            "$ref": "#/$defs/ApprovalActionKind"
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "summary"
+        ],
+        "type": "object"
+      },
+      "ApprovalRisk": {
+        "description": "Risk classification for an approval request.",
+        "enum": [
+          "low",
+          "medium",
+          "high",
+          "critical"
+        ],
+        "type": "string"
+      },
+      "ConsentNoticeKind": {
+        "description": "The recorded consent transition a notice reports.",
+        "enum": [
+          "requested",
+          "approved",
+          "denied",
+          "used",
+          "withdrawn"
+        ],
+        "type": "string"
+      },
+      "ConsentPresentationParams": {
+        "description": "What a `requested` consent notice asks its approver to decide: the\napproval owner's own record of it, as issued. It names the exact action\n(its kind, the tool and the call's arguments), its risk, the account the\noperation acts with and the mandate it runs under (each as the\noperation's owners stated it; absent when they stated none), the weakest\napprover assurance the owner's rule accepts and the approval's expiry. It\nis shown only on the connection that serves the approver, before any\ndecision, and grants nothing.",
+        "properties": {
+          "accepted_assurance": {
+            "$ref": "#/$defs/StockConsentAssurance"
+          },
+          "account": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "action": {
+            "$ref": "#/$defs/ApprovalProposedAction"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "mandate": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "risk": {
+            "$ref": "#/$defs/ApprovalRisk"
+          }
+        },
+        "required": [
+          "action",
+          "risk",
+          "accepted_assurance",
+          "expires_at"
+        ],
+        "type": "object"
+      },
+      "StockConsentAssurance": {
+        "description": "The weakest authenticated approver assurance an R3 rule's human consent\naccepts. Ordered by strength: where several R3 rules match one operation,\nthe strongest they state applies. A delegated service credential never\ndecides human consent, whatever a rule states.",
+        "enum": [
+          "device_trusted",
+          "person_authenticated"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "`approval/consent_notice` parameters: one recorded transition of an R3\nhuman consent approval, delivered to the connection that serves its\napprover after the approval owner released its locks. It names the\napproval and the tool call and grants nothing: an `approved` notice\nexecutes nothing, and only a fresh explicit attempt of the retained call\nspends the consent. A `requested` notice carries the approval's\npresentation.",
+    "properties": {
+      "approval_id": {
+        "$ref": "#/$defs/ApprovalId"
+      },
+      "kind": {
+        "$ref": "#/$defs/ConsentNoticeKind"
+      },
+      "presentation": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ConsentPresentationParams"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "tool_call_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "approval_id",
+      "tool_call_id",
+      "kind"
+    ],
+    "title": "ConsentNoticeParams",
+    "type": "object"
+  },
+  "ConsentPresentationParams": {
+    "$defs": {
+      "ApprovalActionKind": {
+        "description": "Typed action kind for the proposed action.",
+        "enum": [
+          "shell_command",
+          "file_write",
+          "file_delete",
+          "network_call",
+          "device_control",
+          "tool_call",
+          "other"
+        ],
+        "type": "string"
+      },
+      "ApprovalProposedAction": {
+        "description": "Action proposed by the requester.",
+        "properties": {
+          "body": true,
+          "kind": {
+            "$ref": "#/$defs/ApprovalActionKind"
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "summary"
+        ],
+        "type": "object"
+      },
+      "ApprovalRisk": {
+        "description": "Risk classification for an approval request.",
+        "enum": [
+          "low",
+          "medium",
+          "high",
+          "critical"
+        ],
+        "type": "string"
+      },
+      "StockConsentAssurance": {
+        "description": "The weakest authenticated approver assurance an R3 rule's human consent\naccepts. Ordered by strength: where several R3 rules match one operation,\nthe strongest they state applies. A delegated service credential never\ndecides human consent, whatever a rule states.",
+        "enum": [
+          "device_trusted",
+          "person_authenticated"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "What a `requested` consent notice asks its approver to decide: the\napproval owner's own record of it, as issued. It names the exact action\n(its kind, the tool and the call's arguments), its risk, the account the\noperation acts with and the mandate it runs under (each as the\noperation's owners stated it; absent when they stated none), the weakest\napprover assurance the owner's rule accepts and the approval's expiry. It\nis shown only on the connection that serves the approver, before any\ndecision, and grants nothing.",
+    "properties": {
+      "accepted_assurance": {
+        "$ref": "#/$defs/StockConsentAssurance"
+      },
+      "account": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "action": {
+        "$ref": "#/$defs/ApprovalProposedAction"
+      },
+      "expires_at": {
+        "format": "date-time",
+        "type": "string"
+      },
+      "mandate": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "risk": {
+        "$ref": "#/$defs/ApprovalRisk"
+      }
+    },
+    "required": [
+      "action",
+      "risk",
+      "accepted_assurance",
+      "expires_at"
+    ],
+    "title": "ConsentPresentationParams",
+    "type": "object"
   },
   "ContractVersion": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -91958,6 +94698,23 @@
         ],
         "type": "object"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "MeerkatSchema": {
         "description": "A Meerkat-native JSON schema."
       },
@@ -94103,13 +96860,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -94427,6 +97193,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -104927,7 +107704,11 @@
           "interactive_login_required",
           "host_owned_unavailable",
           "io",
-          "other"
+          "other",
+          "credential_access_denied",
+          "credential_interaction_required",
+          "credential_access_pending",
+          "credential_store_unavailable"
         ],
         "type": "string"
       },
@@ -105948,7 +108729,11 @@
           "interactive_login_required",
           "host_owned_unavailable",
           "io",
-          "other"
+          "other",
+          "credential_access_denied",
+          "credential_interaction_required",
+          "credential_access_pending",
+          "credential_store_unavailable"
         ],
         "type": "string"
       },
@@ -106735,7 +109520,11 @@
           "interactive_login_required",
           "host_owned_unavailable",
           "io",
-          "other"
+          "other",
+          "credential_access_denied",
+          "credential_interaction_required",
+          "credential_access_pending",
+          "credential_store_unavailable"
         ],
         "type": "string"
       },
@@ -108113,6 +110902,523 @@
     ],
     "title": "MemberSessionDisposal"
   },
+  "MetaJobCancelAckParams": {
+    "$defs": {
+      "JobAttemptAuthority": {
+        "description": "Host-only write authority. This type must never be embedded in app job\nsummaries or ordinary status responses.",
+        "properties": {
+          "attempt_id": {
+            "type": "string"
+          },
+          "fence": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "job_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "attempt_id",
+          "fence"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "acknowledged_at_ms": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "authority": {
+        "$ref": "#/$defs/JobAttemptAuthority"
+      }
+    },
+    "required": [
+      "authority",
+      "acknowledged_at_ms"
+    ],
+    "title": "MetaJobCancelAckParams",
+    "type": "object"
+  },
+  "MetaJobCheckpointParams": {
+    "$defs": {
+      "JobAttemptAuthority": {
+        "description": "Host-only write authority. This type must never be embedded in app job\nsummaries or ordinary status responses.",
+        "properties": {
+          "attempt_id": {
+            "type": "string"
+          },
+          "fence": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "job_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "attempt_id",
+          "fence"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "authority": {
+        "$ref": "#/$defs/JobAttemptAuthority"
+      },
+      "checkpoint_ref": {
+        "type": "string"
+      },
+      "observed_at_ms": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "authority",
+      "checkpoint_ref",
+      "observed_at_ms"
+    ],
+    "title": "MetaJobCheckpointParams",
+    "type": "object"
+  },
+  "MetaJobCompleteParams": {
+    "$defs": {
+      "JobAttemptAuthority": {
+        "description": "Host-only write authority. This type must never be embedded in app job\nsummaries or ordinary status responses.",
+        "properties": {
+          "attempt_id": {
+            "type": "string"
+          },
+          "fence": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "job_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "attempt_id",
+          "fence"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "authority": {
+        "$ref": "#/$defs/JobAttemptAuthority"
+      },
+      "completed_at_ms": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "result_ref": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "authority",
+      "completed_at_ms"
+    ],
+    "title": "MetaJobCompleteParams",
+    "type": "object"
+  },
+  "MetaJobFailParams": {
+    "$defs": {
+      "JobAttemptAuthority": {
+        "description": "Host-only write authority. This type must never be embedded in app job\nsummaries or ordinary status responses.",
+        "properties": {
+          "attempt_id": {
+            "type": "string"
+          },
+          "fence": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "job_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "attempt_id",
+          "fence"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "authority": {
+        "$ref": "#/$defs/JobAttemptAuthority"
+      },
+      "code": {
+        "type": "string"
+      },
+      "detail_ref": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "failed_at_ms": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "authority",
+      "failed_at_ms",
+      "code"
+    ],
+    "title": "MetaJobFailParams",
+    "type": "object"
+  },
+  "MetaJobHeartbeatParams": {
+    "$defs": {
+      "JobAttemptAuthority": {
+        "description": "Host-only write authority. This type must never be embedded in app job\nsummaries or ordinary status responses.",
+        "properties": {
+          "attempt_id": {
+            "type": "string"
+          },
+          "fence": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "job_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "attempt_id",
+          "fence"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "authority": {
+        "$ref": "#/$defs/JobAttemptAuthority"
+      },
+      "heartbeat_at_ms": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "lease_expires_at_ms": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "authority",
+      "heartbeat_at_ms",
+      "lease_expires_at_ms"
+    ],
+    "title": "MetaJobHeartbeatParams",
+    "type": "object"
+  },
+  "MetaJobMutationResult": {
+    "$defs": {
+      "JobPhase": {
+        "enum": [
+          "unsubmitted",
+          "queued",
+          "claimed",
+          "running",
+          "waiting_external",
+          "loss_observed",
+          "retry_scheduled",
+          "succeeded",
+          "failed",
+          "cancelled",
+          "worker_lost",
+          "needs_attention"
+        ],
+        "type": "string"
+      },
+      "JobProgress": {
+        "properties": {
+          "cursor": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "detail": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "cursor",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "JobRestartClass": {
+        "enum": [
+          "adoptable",
+          "checkpoint_resumable",
+          "replayable",
+          "non_resumable"
+        ],
+        "type": "string"
+      },
+      "JobRunner": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "version"
+        ],
+        "type": "object"
+      },
+      "JobSummary": {
+        "description": "Safe application-facing job projection.",
+        "properties": {
+          "attempt_count": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cancel_requested": {
+            "type": "boolean"
+          },
+          "delivery_backlog": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "phase": {
+            "$ref": "#/$defs/JobPhase"
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/JobProgress"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "restart_class": {
+            "$ref": "#/$defs/JobRestartClass"
+          },
+          "runner": {
+            "$ref": "#/$defs/JobRunner"
+          },
+          "subscription_count": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "terminal_result": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/JobTerminalResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "job_id",
+          "runner",
+          "phase",
+          "restart_class",
+          "attempt_count",
+          "cancel_requested",
+          "subscription_count",
+          "delivery_backlog"
+        ],
+        "type": "object"
+      },
+      "JobTerminalResult": {
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "succeeded",
+                "type": "string"
+              },
+              "result_ref": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "detail_ref": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "kind": {
+                "const": "failed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "cancelled",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "worker_lost",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "needs_attention",
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "job": {
+        "$ref": "#/$defs/JobSummary"
+      }
+    },
+    "required": [
+      "job"
+    ],
+    "title": "JobsGetResult",
+    "type": "object"
+  },
+  "MetaJobProgressParams": {
+    "$defs": {
+      "JobAttemptAuthority": {
+        "description": "Host-only write authority. This type must never be embedded in app job\nsummaries or ordinary status responses.",
+        "properties": {
+          "attempt_id": {
+            "type": "string"
+          },
+          "fence": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "job_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "attempt_id",
+          "fence"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "authority": {
+        "$ref": "#/$defs/JobAttemptAuthority"
+      },
+      "cursor": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "detail": {
+        "type": "string"
+      },
+      "observed_at_ms": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "authority",
+      "cursor",
+      "detail",
+      "observed_at_ms"
+    ],
+    "title": "MetaJobProgressParams",
+    "type": "object"
+  },
   "MobAdoptMemberIdentityDeclarationParams": {
     "$defs": {
       "AuthBindingRef": {
@@ -108236,6 +111542,24 @@
           "sse"
         ],
         "type": "string"
+      },
+      "McpServerAccess": {
+        "additionalProperties": false,
+        "description": "Host access ceiling for one MCP server, enforced by the connection that\ncalls it.\n\nOnly the raw MCP operations in `allowed_operations` may be called. The\nrouter does not offer any other under any name, and the connection\nrefuses any other before anything is sent.\nThe ceiling only narrows access. It does not certify that the listed\noperations are reads: session read-only policy still requires a trusted\nhost declaration for the exact destination and operation. Nothing is\ninferred from operation names or from the server's annotations.",
+        "properties": {
+          "allowed_operations": {
+            "description": "The raw MCP operation names that may be called.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "allowed_operations"
+        ],
+        "type": "object"
       },
       "MeerkatSchema": {
         "description": "A Meerkat-native JSON schema."
@@ -108395,6 +111719,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "args": {
                 "items": {
                   "type": "string"
@@ -108439,6 +111774,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "connect_timeout_secs": {
                 "format": "uint64",
                 "minimum": 0,
@@ -115823,6 +119169,23 @@
         ],
         "type": "object"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "OpenAiAssistantPhase": {
         "description": "Responses assistant-message phase, distinct from reasoning metadata.",
         "enum": [
@@ -116354,13 +119717,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -116629,6 +120001,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -123141,6 +126524,26 @@
             "const": "SESSION_RUNTIME_UNAVAILABLE",
             "description": "Runtime authority is unavailable before a session operation starts.",
             "type": "string"
+          },
+          {
+            "const": "APPROVAL_STORE_UNAVAILABLE",
+            "description": "The approval store committed nothing (unavailable or contended). An\nexplicitly attempted retry through fresh checks is valid.",
+            "type": "string"
+          },
+          {
+            "const": "APPROVAL_CONFLICT",
+            "description": "Another owner of the approval store changed the approval first; it\nis reconciled before reuse.",
+            "type": "string"
+          },
+          {
+            "const": "APPROVAL_COMMIT_UNKNOWN",
+            "description": "The approval store cannot confirm whether the commit happened; the\napproval is reconciled from the store before reuse, never resent.",
+            "type": "string"
+          },
+          {
+            "const": "STALE_DELIVERY_SCOPE",
+            "description": "A scope-bound mob submit named a member session that is no longer the\nmember's current session binding: the session rotated under a still\ncurrent runtime incarnation and fence. Distinct from\n[`Self::StaleFence`] (a superseded incarnation): the recovery is to\nre-capture the delivery scope, not to re-resolve the member.",
+            "type": "string"
           }
         ]
       },
@@ -123733,523 +127136,6 @@
       "wired"
     ],
     "title": "MobWireResult",
-    "type": "object"
-  },
-  "MobkitJobCancelAckParams": {
-    "$defs": {
-      "JobAttemptAuthority": {
-        "description": "Host-only write authority. This type must never be embedded in app job\nsummaries or ordinary status responses.",
-        "properties": {
-          "attempt_id": {
-            "type": "string"
-          },
-          "fence": {
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "job_id": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "job_id",
-          "attempt_id",
-          "fence"
-        ],
-        "type": "object"
-      }
-    },
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "properties": {
-      "acknowledged_at_ms": {
-        "format": "uint64",
-        "minimum": 0,
-        "type": "integer"
-      },
-      "authority": {
-        "$ref": "#/$defs/JobAttemptAuthority"
-      }
-    },
-    "required": [
-      "authority",
-      "acknowledged_at_ms"
-    ],
-    "title": "MobkitJobCancelAckParams",
-    "type": "object"
-  },
-  "MobkitJobCheckpointParams": {
-    "$defs": {
-      "JobAttemptAuthority": {
-        "description": "Host-only write authority. This type must never be embedded in app job\nsummaries or ordinary status responses.",
-        "properties": {
-          "attempt_id": {
-            "type": "string"
-          },
-          "fence": {
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "job_id": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "job_id",
-          "attempt_id",
-          "fence"
-        ],
-        "type": "object"
-      }
-    },
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "properties": {
-      "authority": {
-        "$ref": "#/$defs/JobAttemptAuthority"
-      },
-      "checkpoint_ref": {
-        "type": "string"
-      },
-      "observed_at_ms": {
-        "format": "uint64",
-        "minimum": 0,
-        "type": "integer"
-      }
-    },
-    "required": [
-      "authority",
-      "checkpoint_ref",
-      "observed_at_ms"
-    ],
-    "title": "MobkitJobCheckpointParams",
-    "type": "object"
-  },
-  "MobkitJobCompleteParams": {
-    "$defs": {
-      "JobAttemptAuthority": {
-        "description": "Host-only write authority. This type must never be embedded in app job\nsummaries or ordinary status responses.",
-        "properties": {
-          "attempt_id": {
-            "type": "string"
-          },
-          "fence": {
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "job_id": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "job_id",
-          "attempt_id",
-          "fence"
-        ],
-        "type": "object"
-      }
-    },
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "properties": {
-      "authority": {
-        "$ref": "#/$defs/JobAttemptAuthority"
-      },
-      "completed_at_ms": {
-        "format": "uint64",
-        "minimum": 0,
-        "type": "integer"
-      },
-      "result_ref": {
-        "type": [
-          "string",
-          "null"
-        ]
-      }
-    },
-    "required": [
-      "authority",
-      "completed_at_ms"
-    ],
-    "title": "MobkitJobCompleteParams",
-    "type": "object"
-  },
-  "MobkitJobFailParams": {
-    "$defs": {
-      "JobAttemptAuthority": {
-        "description": "Host-only write authority. This type must never be embedded in app job\nsummaries or ordinary status responses.",
-        "properties": {
-          "attempt_id": {
-            "type": "string"
-          },
-          "fence": {
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "job_id": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "job_id",
-          "attempt_id",
-          "fence"
-        ],
-        "type": "object"
-      }
-    },
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "properties": {
-      "authority": {
-        "$ref": "#/$defs/JobAttemptAuthority"
-      },
-      "code": {
-        "type": "string"
-      },
-      "detail_ref": {
-        "type": [
-          "string",
-          "null"
-        ]
-      },
-      "failed_at_ms": {
-        "format": "uint64",
-        "minimum": 0,
-        "type": "integer"
-      }
-    },
-    "required": [
-      "authority",
-      "failed_at_ms",
-      "code"
-    ],
-    "title": "MobkitJobFailParams",
-    "type": "object"
-  },
-  "MobkitJobHeartbeatParams": {
-    "$defs": {
-      "JobAttemptAuthority": {
-        "description": "Host-only write authority. This type must never be embedded in app job\nsummaries or ordinary status responses.",
-        "properties": {
-          "attempt_id": {
-            "type": "string"
-          },
-          "fence": {
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "job_id": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "job_id",
-          "attempt_id",
-          "fence"
-        ],
-        "type": "object"
-      }
-    },
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "properties": {
-      "authority": {
-        "$ref": "#/$defs/JobAttemptAuthority"
-      },
-      "heartbeat_at_ms": {
-        "format": "uint64",
-        "minimum": 0,
-        "type": "integer"
-      },
-      "lease_expires_at_ms": {
-        "format": "uint64",
-        "minimum": 0,
-        "type": "integer"
-      }
-    },
-    "required": [
-      "authority",
-      "heartbeat_at_ms",
-      "lease_expires_at_ms"
-    ],
-    "title": "MobkitJobHeartbeatParams",
-    "type": "object"
-  },
-  "MobkitJobMutationResult": {
-    "$defs": {
-      "JobPhase": {
-        "enum": [
-          "unsubmitted",
-          "queued",
-          "claimed",
-          "running",
-          "waiting_external",
-          "loss_observed",
-          "retry_scheduled",
-          "succeeded",
-          "failed",
-          "cancelled",
-          "worker_lost",
-          "needs_attention"
-        ],
-        "type": "string"
-      },
-      "JobProgress": {
-        "properties": {
-          "cursor": {
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "detail": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "cursor",
-          "detail"
-        ],
-        "type": "object"
-      },
-      "JobRestartClass": {
-        "enum": [
-          "adoptable",
-          "checkpoint_resumable",
-          "replayable",
-          "non_resumable"
-        ],
-        "type": "string"
-      },
-      "JobRunner": {
-        "properties": {
-          "name": {
-            "type": "string"
-          },
-          "version": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "name",
-          "version"
-        ],
-        "type": "object"
-      },
-      "JobSummary": {
-        "description": "Safe application-facing job projection.",
-        "properties": {
-          "attempt_count": {
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "cancel_requested": {
-            "type": "boolean"
-          },
-          "delivery_backlog": {
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "job_id": {
-            "type": "string"
-          },
-          "phase": {
-            "$ref": "#/$defs/JobPhase"
-          },
-          "progress": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/JobProgress"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "restart_class": {
-            "$ref": "#/$defs/JobRestartClass"
-          },
-          "runner": {
-            "$ref": "#/$defs/JobRunner"
-          },
-          "subscription_count": {
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "terminal_result": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/JobTerminalResult"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          }
-        },
-        "required": [
-          "job_id",
-          "runner",
-          "phase",
-          "restart_class",
-          "attempt_count",
-          "cancel_requested",
-          "subscription_count",
-          "delivery_backlog"
-        ],
-        "type": "object"
-      },
-      "JobTerminalResult": {
-        "oneOf": [
-          {
-            "properties": {
-              "kind": {
-                "const": "succeeded",
-                "type": "string"
-              },
-              "result_ref": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              }
-            },
-            "required": [
-              "kind"
-            ],
-            "type": "object"
-          },
-          {
-            "properties": {
-              "code": {
-                "type": "string"
-              },
-              "detail_ref": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "kind": {
-                "const": "failed",
-                "type": "string"
-              }
-            },
-            "required": [
-              "kind",
-              "code"
-            ],
-            "type": "object"
-          },
-          {
-            "properties": {
-              "kind": {
-                "const": "cancelled",
-                "type": "string"
-              }
-            },
-            "required": [
-              "kind"
-            ],
-            "type": "object"
-          },
-          {
-            "properties": {
-              "kind": {
-                "const": "worker_lost",
-                "type": "string"
-              }
-            },
-            "required": [
-              "kind"
-            ],
-            "type": "object"
-          },
-          {
-            "properties": {
-              "kind": {
-                "const": "needs_attention",
-                "type": "string"
-              },
-              "reason": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "kind",
-              "reason"
-            ],
-            "type": "object"
-          }
-        ]
-      }
-    },
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "properties": {
-      "job": {
-        "$ref": "#/$defs/JobSummary"
-      }
-    },
-    "required": [
-      "job"
-    ],
-    "title": "JobsGetResult",
-    "type": "object"
-  },
-  "MobkitJobProgressParams": {
-    "$defs": {
-      "JobAttemptAuthority": {
-        "description": "Host-only write authority. This type must never be embedded in app job\nsummaries or ordinary status responses.",
-        "properties": {
-          "attempt_id": {
-            "type": "string"
-          },
-          "fence": {
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "job_id": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "job_id",
-          "attempt_id",
-          "fence"
-        ],
-        "type": "object"
-      }
-    },
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "properties": {
-      "authority": {
-        "$ref": "#/$defs/JobAttemptAuthority"
-      },
-      "cursor": {
-        "format": "uint64",
-        "minimum": 0,
-        "type": "integer"
-      },
-      "detail": {
-        "type": "string"
-      },
-      "observed_at_ms": {
-        "format": "uint64",
-        "minimum": 0,
-        "type": "integer"
-      }
-    },
-    "required": [
-      "authority",
-      "cursor",
-      "detail",
-      "observed_at_ms"
-    ],
-    "title": "MobkitJobProgressParams",
     "type": "object"
   },
   "MonitorsStartParams": {
@@ -125618,6 +128504,24 @@
           "sse"
         ],
         "type": "string"
+      },
+      "McpServerAccess": {
+        "additionalProperties": false,
+        "description": "Host access ceiling for one MCP server, enforced by the connection that\ncalls it.\n\nOnly the raw MCP operations in `allowed_operations` may be called. The\nrouter does not offer any other under any name, and the connection\nrefuses any other before anything is sent.\nThe ceiling only narrows access. It does not certify that the listed\noperations are reads: session read-only policy still requires a trusted\nhost declaration for the exact destination and operation. Nothing is\ninferred from operation names or from the server's annotations.",
+        "properties": {
+          "allowed_operations": {
+            "description": "The raw MCP operation names that may be called.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "allowed_operations"
+        ],
+        "type": "object"
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -125626,6 +128530,17 @@
       {
         "additionalProperties": false,
         "properties": {
+          "access": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/McpServerAccess"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+          },
           "args": {
             "items": {
               "type": "string"
@@ -125670,6 +128585,17 @@
       {
         "additionalProperties": false,
         "properties": {
+          "access": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/McpServerAccess"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+          },
           "connect_timeout_secs": {
             "format": "uint64",
             "minimum": 0,
@@ -125972,6 +128898,24 @@
         ],
         "type": "string"
       },
+      "McpServerAccess": {
+        "additionalProperties": false,
+        "description": "Host access ceiling for one MCP server, enforced by the connection that\ncalls it.\n\nOnly the raw MCP operations in `allowed_operations` may be called. The\nrouter does not offer any other under any name, and the connection\nrefuses any other before anything is sent.\nThe ceiling only narrows access. It does not certify that the listed\noperations are reads: session read-only policy still requires a trusted\nhost declaration for the exact destination and operation. Nothing is\ninferred from operation names or from the server's annotations.",
+        "properties": {
+          "allowed_operations": {
+            "description": "The raw MCP operation names that may be called.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "allowed_operations"
+        ],
+        "type": "object"
+      },
       "MeerkatSchema": {
         "description": "A Meerkat-native JSON schema."
       },
@@ -126168,6 +129112,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "args": {
                 "items": {
                   "type": "string"
@@ -126212,6 +129167,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "connect_timeout_secs": {
                 "format": "uint64",
                 "minimum": 0,
@@ -127840,6 +130806,24 @@
         ],
         "type": "string"
       },
+      "McpServerAccess": {
+        "additionalProperties": false,
+        "description": "Host access ceiling for one MCP server, enforced by the connection that\ncalls it.\n\nOnly the raw MCP operations in `allowed_operations` may be called. The\nrouter does not offer any other under any name, and the connection\nrefuses any other before anything is sent.\nThe ceiling only narrows access. It does not certify that the listed\noperations are reads: session read-only policy still requires a trusted\nhost declaration for the exact destination and operation. Nothing is\ninferred from operation names or from the server's annotations.",
+        "properties": {
+          "allowed_operations": {
+            "description": "The raw MCP operation names that may be called.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "allowed_operations"
+        ],
+        "type": "object"
+      },
       "MeerkatSchema": {
         "description": "A Meerkat-native JSON schema."
       },
@@ -127998,6 +130982,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "args": {
                 "items": {
                   "type": "string"
@@ -128042,6 +131037,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "connect_timeout_secs": {
                 "format": "uint64",
                 "minimum": 0,
@@ -129762,12 +132768,41 @@
         ],
         "type": "string"
       },
+      "McpServerAccess": {
+        "additionalProperties": false,
+        "description": "Host access ceiling for one MCP server, enforced by the connection that\ncalls it.\n\nOnly the raw MCP operations in `allowed_operations` may be called. The\nrouter does not offer any other under any name, and the connection\nrefuses any other before anything is sent.\nThe ceiling only narrows access. It does not certify that the listed\noperations are reads: session read-only policy still requires a trusted\nhost declaration for the exact destination and operation. Nothing is\ninferred from operation names or from the server's annotations.",
+        "properties": {
+          "allowed_operations": {
+            "description": "The raw MCP operation names that may be called.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "allowed_operations"
+        ],
+        "type": "object"
+      },
       "PortableMcpDecl": {
         "description": "Portable MCP server declaration (A10).\n\nMirrors `meerkat_core::mcp_config` transports MINUS the secret-bearing\nvalue maps: stdio `env` and HTTP `headers` are structurally absent; only\nthe required key/header NAMES travel, satisfied member-host-side.",
         "oneOf": [
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "args": {
                 "items": {
                   "type": "string"
@@ -129812,6 +132847,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "connect_timeout_secs": {
                 "format": "uint64",
                 "minimum": 0,
@@ -141907,6 +144953,23 @@
         ],
         "type": "string"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "OpenAiAssistantPhase": {
         "description": "Responses assistant-message phase, distinct from reasoning metadata.",
         "enum": [
@@ -142369,13 +145432,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -142644,6 +145716,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -145364,6 +148447,58 @@
           "detail"
         ],
         "type": "object"
+      },
+      {
+        "properties": {
+          "kind": {
+            "const": "credential_access_denied",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "kind": {
+            "const": "credential_interaction_required",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "kind": {
+            "const": "credential_access_pending",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "kind": {
+            "const": "credential_store_unavailable",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "detail"
+        ],
+        "type": "object"
       }
     ],
     "title": "WireAuthError"
@@ -145390,7 +148525,11 @@
               "slot_mode_mismatch",
               "unverified_connector_publication",
               "reauth_required",
-              "configuration_invalid"
+              "configuration_invalid",
+              "credential_access_denied",
+              "credential_interaction_required",
+              "credential_access_pending",
+              "credential_store_unavailable"
             ],
             "type": "string"
           },
@@ -145508,7 +148647,11 @@
               "slot_mode_mismatch",
               "unverified_connector_publication",
               "reauth_required",
-              "configuration_invalid"
+              "configuration_invalid",
+              "credential_access_denied",
+              "credential_interaction_required",
+              "credential_access_pending",
+              "credential_store_unavailable"
             ],
             "type": "string"
           },
@@ -145620,7 +148763,11 @@
           "slot_mode_mismatch",
           "unverified_connector_publication",
           "reauth_required",
-          "configuration_invalid"
+          "configuration_invalid",
+          "credential_access_denied",
+          "credential_interaction_required",
+          "credential_access_pending",
+          "credential_store_unavailable"
         ],
         "type": "string"
       },
@@ -146492,6 +149639,58 @@
               "detail"
             ],
             "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "credential_access_denied",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "credential_interaction_required",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "credential_access_pending",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "credential_store_unavailable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "type": "object"
           }
         ]
       }
@@ -146587,6 +149786,18 @@
         "description": "Opaque slug identifying a binding inside a realm.",
         "type": "string"
       },
+      "CredentialObservation": {
+        "description": "What a non-blocking status read could not observe about a stored\ncredential. A status carries it only when the credential store did not\nanswer, and then the status phase reflects the live lease alone: it is\nnever a statement that the credential is absent.\n\n`not_observed`: no operating-system read was attempted. `owner_busy`: the\ncredential's lifecycle owner was busy, so nothing was read. `pending`: an\nowner-held lookup is in flight. `denied` and `interaction_required`:\nbackend evidence from an earlier lookup. `unavailable`: the store could\nnot answer.",
+        "enum": [
+          "not_observed",
+          "owner_busy",
+          "pending",
+          "denied",
+          "interaction_required",
+          "unavailable"
+        ],
+        "type": "string"
+      },
       "ProfileId": {
         "description": "Opaque slug identifying an auth profile override on a connection.",
         "type": "string"
@@ -146639,6 +149850,17 @@
       },
       "binding_id": {
         "type": "string"
+      },
+      "credential_observation": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/CredentialObservation"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Set when the credential store did not answer this non-blocking status\nread. `state` then reflects the live lease alone and is never a claim\nthat the credential is absent."
       },
       "expires_at": {
         "type": [
@@ -146717,6 +149939,18 @@
         "description": "Opaque slug identifying a binding inside a realm.",
         "type": "string"
       },
+      "CredentialObservation": {
+        "description": "What a non-blocking status read could not observe about a stored\ncredential. A status carries it only when the credential store did not\nanswer, and then the status phase reflects the live lease alone: it is\nnever a statement that the credential is absent.\n\n`not_observed`: no operating-system read was attempted. `owner_busy`: the\ncredential's lifecycle owner was busy, so nothing was read. `pending`: an\nowner-held lookup is in flight. `denied` and `interaction_required`:\nbackend evidence from an earlier lookup. `unavailable`: the store could\nnot answer.",
+        "enum": [
+          "not_observed",
+          "owner_busy",
+          "pending",
+          "denied",
+          "interaction_required",
+          "unavailable"
+        ],
+        "type": "string"
+      },
       "ProfileId": {
         "description": "Opaque slug identifying an auth profile override on a connection.",
         "type": "string"
@@ -146768,6 +150002,17 @@
           },
           "binding_id": {
             "type": "string"
+          },
+          "credential_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/CredentialObservation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Set when the credential store did not answer this non-blocking status\nread. `state` then reflects the live lease alone and is never a claim\nthat the credential is absent."
           },
           "expires_at": {
             "type": [
@@ -147616,6 +150861,13 @@
       "client": {
         "type": "string"
       },
+      "client_auth_profile": {
+        "description": "Id of a client-auth profile the host installed for this issuer and\nclient; omitted for the default public-client forms. Never a secret.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
       "issuer": {
         "type": "string"
       },
@@ -148056,7 +151308,11 @@
           "interactive_login_required",
           "host_owned_unavailable",
           "io",
-          "other"
+          "other",
+          "credential_access_denied",
+          "credential_interaction_required",
+          "credential_access_pending",
+          "credential_store_unavailable"
         ],
         "type": "string"
       },
@@ -152475,6 +155731,23 @@
         ],
         "type": "object"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "MeerkatSchema": {
         "description": "A Meerkat-native JSON schema."
       },
@@ -154595,13 +157868,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -154919,6 +158201,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -157065,6 +160358,23 @@
         ],
         "type": "object"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "OpenAiAssistantPhase": {
         "description": "Responses assistant-message phase, distinct from reasoning metadata.",
         "enum": [
@@ -157596,13 +160906,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -157871,6 +161190,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -161119,7 +164449,11 @@
           "interactive_login_required",
           "host_owned_unavailable",
           "io",
-          "other"
+          "other",
+          "credential_access_denied",
+          "credential_interaction_required",
+          "credential_access_pending",
+          "credential_store_unavailable"
         ],
         "type": "string"
       },
@@ -166137,6 +169471,23 @@
         ],
         "type": "object"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "OpenAiAssistantPhase": {
         "description": "Responses assistant-message phase, distinct from reasoning metadata.",
         "enum": [
@@ -166668,13 +170019,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -166943,6 +170303,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -174067,6 +177438,23 @@
         ],
         "type": "object"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "OpenAiAssistantPhase": {
         "description": "Responses assistant-message phase, distinct from reasoning metadata.",
         "enum": [
@@ -174598,13 +177986,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -174873,6 +178270,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -176917,6 +180325,23 @@
         ],
         "type": "object"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "OpenAiAssistantPhase": {
         "description": "Responses assistant-message phase, distinct from reasoning metadata.",
         "enum": [
@@ -177448,13 +180873,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -177723,6 +181157,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -180227,6 +183672,23 @@
         ],
         "type": "object"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "OpenAiAssistantPhase": {
         "description": "Responses assistant-message phase, distinct from reasoning metadata.",
         "enum": [
@@ -180758,13 +184220,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -181033,6 +184504,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -182570,6 +186052,34 @@
       "watermark"
     ],
     "title": "WireStaleCursorDetail",
+    "type": "object"
+  },
+  "WireStaleDeliveryScopeDetail": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Typed `details` payload for [`ErrorCode::StaleDeliveryScope`]: a\nscope-bound submit named a member session that is no longer the member's\ncurrent session binding. The runtime incarnation and fence were current;\nonly the session moved. Nothing was admitted and nothing was retargeted.",
+    "properties": {
+      "actual_session_id": {
+        "description": "The member's current session binding, when it has one.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "agent_identity": {
+        "description": "The member the scope named.",
+        "type": "string"
+      },
+      "expected_session_id": {
+        "description": "The session the caller's scope pinned.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "agent_identity",
+      "expected_session_id"
+    ],
+    "title": "WireStaleDeliveryScopeDetail",
     "type": "object"
   },
   "WireStaleFenceDetail": {

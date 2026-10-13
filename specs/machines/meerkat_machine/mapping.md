@@ -2414,6 +2414,57 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `BindInputAuthorityStopped`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `BindScopedContextIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `BindScopedContextAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RequireScopedContextIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RequireScopedContextAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RequireScopedContextRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RequireScopedContextRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RequireScopedContextStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireScopedContextIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireScopedContextAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireScopedContextRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireScopedContextRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetireScopedContextStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `BindInputContextTargetIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `BindInputContextTargetAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `BindInputContextTargetRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `BindInputContextTargetRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `BindInputContextTargetStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `ResolveAdmissionPlanRequestedTerminalQueueIdle`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -3081,6 +3132,21 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `SurfaceShutdownRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SurfaceReleaseIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SurfaceReleaseAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SurfaceReleaseRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SurfaceReleaseStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SurfaceReleaseRetired`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `CommitRunningToIdle`
@@ -8335,6 +8401,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `CloseSurfaceConnection`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `SurfaceStageRecorded`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `RejectSurfaceCall`
   - anchors: `meerkat_machine`
   - scenarios: `ops_completion_and_waiters`
@@ -8560,6 +8629,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `current_run_has_pre_run_phase`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `input_context_targets_are_governed`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `input_authority_bindings_have_native_owner`

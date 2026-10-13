@@ -173,7 +173,7 @@ async fn relink_delivers_a_finished_childs_result_exactly_once() {
     assert_eq!(completion_records(&fixture, &owner, &job_id).await, 0);
 
     // The restarted host: a fresh state built after the job started receives
-    // the surviving mob the way MobKit restores it, by inserting its handle.
+    // the surviving mob the way Meta restores it, by inserting its handle.
     // That triggers the re-link automatically.
     tokio::time::sleep(Duration::from_millis(5)).await;
     let restarted = Arc::new(
@@ -222,6 +222,30 @@ const COMPACTION_SUMMARY: &str = "COMPACTED-HANDOFF-SUMMARY-7Q";
 /// Prompts of the forker's own turns before the fork.
 const WARMUP_PROMPT: &str = "forker warm-up turn";
 
+/// The kinds of a persisted transcript's rows in order, naming the typed
+/// compaction summary and the row that holds the child's reply.
+fn transcript_row_kinds(session: &meerkat_core::Session) -> Vec<&'static str> {
+    session
+        .messages()
+        .iter()
+        .map(|message| match message {
+            meerkat_core::Message::System(_) => "System",
+            meerkat_core::Message::SystemNotice(_) => "SystemNotice",
+            meerkat_core::Message::User(user) if user.transcript_role.is_compaction_summary() => {
+                "CompactionSummary"
+            }
+            meerkat_core::Message::User(_) => "User",
+            meerkat_core::Message::BlockAssistant(_)
+                if format!("{message:?}").contains(CHILD_REPLY) =>
+            {
+                "BlockAssistant(reply)"
+            }
+            meerkat_core::Message::BlockAssistant(_) => "BlockAssistant",
+            meerkat_core::Message::ToolResults { .. } => "ToolResults",
+        })
+        .collect()
+}
+
 /// The child's job turn compacted its transcript (a tool round trip, then
 /// compaction before the next provider call), so the transcript no longer
 /// holds the fork prefix the job record indexes from. The re-link still
@@ -233,17 +257,20 @@ async fn relink_delivers_the_reply_of_a_child_whose_turn_compacted() {
     let compactions = Arc::new(AtomicUsize::new(0));
     let tool_called = Arc::new(AtomicBool::new(false));
     let (seen_compactions, seen_tool_call) = (Arc::clone(&compactions), Arc::clone(&tool_called));
-    // The forker's warm-up turns reply plainly. The child's first provider
-    // call requests a tool and its next one replies; the compactor's summary
-    // request (whose prompt is the request's last user text) is answered
-    // with a summary.
+    // The forker runs more warm-up turns than compaction retains verbatim,
+    // each replying with 8 KiB: far below the forker's own compaction
+    // threshold, but any retained tail holding one exceeds the compacting
+    // child's verbatim retention budget, so the child's rewrite has to drop
+    // its fork prefix. The child's first provider call requests a tool and
+    // its next one replies; the compactor's summary request (whose prompt is
+    // the request's last user text) is answered with a summary.
     let fixture = CouncilFixture::new(move |request| {
         let last_user = support::last_user_text(request);
         if last_user.contains("CONTEXT COMPACTION") {
             seen_compactions.fetch_add(1, Ordering::SeqCst);
             ScriptedTurn::Text(COMPACTION_SUMMARY.to_string())
         } else if last_user.contains(WARMUP_PROMPT) {
-            ScriptedTurn::Text("warm-up reply".to_string())
+            ScriptedTurn::Text("w".repeat(8 * 1024))
         } else if !seen_tool_call.swap(true, Ordering::SeqCst) {
             ScriptedTurn::ToolCall {
                 id: "toolu_relink_compaction".to_string(),
@@ -265,8 +292,12 @@ async fn relink_delivers_the_reply_of_a_child_whose_turn_compacted() {
     fixture.seed_source_mob_from(definition, &["forker"]).await;
     let owner = forker_session(&fixture).await;
     let handle = fixture.state.handle_for(&mob_id).await.unwrap();
-    // The forker's own history is the child's fork prefix.
-    for turn in 0..4 {
+    // The forker's own history is the child's fork prefix: more complete
+    // turns than compaction retains, so the rewrite has turns to summarize
+    // away.
+    let warm_up_turns =
+        meerkat_core::config::CompactionRuntimeConfig::default().recent_turn_budget + 2;
+    for turn in 0..warm_up_turns {
         drive_turn(&handle, "forker", &format!("{WARMUP_PROMPT} {turn}")).await;
     }
     let job_id = "job-compacted-before-restart".to_string();
@@ -327,6 +358,19 @@ async fn relink_delivers_the_reply_of_a_child_whose_turn_compacted() {
     .await
     .unwrap()
     .expect("child session exists");
+    // A summary request alone does not prove the rewrite committed: the
+    // persisted transcript must carry the compactor's typed summary.
+    assert!(
+        transcript.messages().iter().any(|message| matches!(
+            message,
+            meerkat_core::Message::User(user)
+                if user.transcript_role
+                    == meerkat_core::types::TranscriptUserRole::CompactionSummary
+                    && user.text_content().contains(COMPACTION_SUMMARY)
+        )),
+        "the child's persisted transcript holds no typed compaction summary; rows: {:?}",
+        transcript_row_kinds(&transcript)
+    );
     let from_prefix = job
         .durable_terminal_result(&transcript)
         .expect("bounded")
@@ -3166,7 +3210,7 @@ async fn the_fence_cancels_a_queued_job_input_before_restart_interrupted() {
 }
 
 /// A host that restores a stopped mob inserts its handle before activating
-/// it (MobKit's identity-first gateway after a clean shutdown). The forker is
+/// it (Meta's identity-first gateway after a clean shutdown). The forker is
 /// not live and cannot be revived while its mob is stopped: the re-link
 /// submits the outcome durably at once, and the host's delivery owner
 /// applies it once the mob runs, exactly once, with no re-link pass of its

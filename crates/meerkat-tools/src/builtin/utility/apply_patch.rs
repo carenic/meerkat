@@ -147,6 +147,7 @@ impl BuiltinTool for ApplyPatchTool {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Builtin,
                 source_id: "builtin".into(),
+                artifact: None,
             }),
         }
     }

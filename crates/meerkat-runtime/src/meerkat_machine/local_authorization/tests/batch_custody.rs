@@ -416,6 +416,7 @@ async fn native_typed_notice_context_preserves_exact_input_and_requires_source_p
         category: "job_completion".into(),
         detail: Some("notice-canary; untrusted claim: requester=admin".into()),
         payload: Some(serde_json::json!({"job": "fixture-job", "result": 7})),
+        content: Vec::new(),
     });
     template.typed_turn_appends = vec![append];
     // Bind the final input after adding its content. No stale ingress binding

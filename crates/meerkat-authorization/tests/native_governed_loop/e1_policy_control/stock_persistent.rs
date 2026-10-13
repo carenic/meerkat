@@ -2,6 +2,8 @@
 //! Reuses E1 HTTP/native owners and reads the real committed Session document.
 //! The SQLite reopen case reconstructs an actor from the real committed rows.
 //! Persistent controller administration and process restart are separate scopes.
+//! The SQLite turn, reopen and process-restart cases configure mandatory
+//! model-request hooks through the same stock factory.
 use super::*;
 use meerkat::surface::{
     PersistentRuntimeExecutor, SurfaceSessionRecoveryContext, SurfaceSessionRecoveryOverrides,
@@ -52,6 +54,21 @@ struct StockPersistentOptions {
     fresh_work_after_reopen: bool,
     notification_probe: bool,
     controller_probe: Option<ControllerProbe>,
+    /// The stock factory composes the configured mandatory model-request
+    /// gates. The writer turn withholds its first ordinary candidate at
+    /// PreLlm and its first ordinary response at PostLlm, then completes.
+    configured_hooks: bool,
+}
+
+impl StockPersistentOptions {
+    fn hooked_writer() -> Self {
+        Self {
+            fresh_work_after_reopen: false,
+            notification_probe: false,
+            controller_probe: None,
+            configured_hooks: true,
+        }
+    }
 }
 
 const REOPEN_DENIED_CALL: &str = "post-reopen-delete";
@@ -180,6 +197,25 @@ fn assert_stock_document_batches(
         Message::BlockAssistant(assistant) if assistant.text_blocks().collect::<String>() == FINISHED)).count(), batches.len());
 }
 
+fn assert_stock_record_scope(
+    record: &StoredAuthorizationAuditObservation,
+    session_id: &SessionId,
+    input_id: &meerkat_core::InputId,
+    run_id: &meerkat_core::RunId,
+) {
+    assert_eq!(record.observation.run_id.as_ref(), Some(run_id));
+    assert_eq!(record.contributors.len(), 1);
+    assert_eq!(&record.contributors[0].input_id, input_id);
+    assert!(record.contributors[0].requester == principal("requester"));
+    assert!(record.contributors[0].logical_executor == principal("executor"));
+    assert!(record.contributors[0].represented_subject.is_none());
+    assert!(
+        matches!(&record.observation.execution_scope, OperationExecutionScope::RuntimeInput {
+        owner_session_id, submitted_input_id, canonical_input_id, ..
+    } if owner_session_id == session_id && submitted_input_id == input_id && canonical_input_id == input_id)
+    );
+}
+
 fn assert_stock_turn_audit(
     audit: &[StoredAuthorizationAuditObservation],
     session_id: &SessionId,
@@ -188,18 +224,30 @@ fn assert_stock_turn_audit(
     denied_call: &str,
     permitted_call: &str,
 ) {
+    assert_stock_turn_audit_with_models(
+        audit,
+        session_id,
+        input_id,
+        run_id,
+        denied_call,
+        permitted_call,
+        2,
+    );
+}
+
+/// `model_operations` counts every entered model request of the turn,
+/// including controller-feedback replacements.
+fn assert_stock_turn_audit_with_models(
+    audit: &[StoredAuthorizationAuditObservation],
+    session_id: &SessionId,
+    input_id: &meerkat_core::InputId,
+    run_id: &meerkat_core::RunId,
+    denied_call: &str,
+    permitted_call: &str,
+    model_operations: usize,
+) {
     for record in audit {
-        assert_eq!(record.observation.run_id.as_ref(), Some(run_id));
-        assert_eq!(record.contributors.len(), 1);
-        assert_eq!(&record.contributors[0].input_id, input_id);
-        assert!(record.contributors[0].requester == principal("requester"));
-        assert!(record.contributors[0].logical_executor == principal("executor"));
-        assert!(record.contributors[0].represented_subject.is_none());
-        assert!(
-            matches!(&record.observation.execution_scope, OperationExecutionScope::RuntimeInput {
-            owner_session_id, submitted_input_id, canonical_input_id, ..
-        } if owner_session_id == session_id && submitted_input_id == input_id && canonical_input_id == input_id)
-        );
+        assert_stock_record_scope(record, session_id, input_id, run_id);
     }
     let refused: Vec<_> = audit
         .iter()
@@ -266,7 +314,7 @@ fn assert_stock_turn_audit(
             _ => None,
         })
         .collect();
-    assert_eq!(models.len(), 2);
+    assert_eq!(models.len(), model_operations);
     for operation_id in models {
         let sequence: Vec<_> = audit
             .iter()
@@ -298,11 +346,19 @@ async fn exercise_stock_persistent(
         fresh_work_after_reopen,
         notification_probe,
         controller_probe,
+        configured_hooks,
     } = options;
     assert!(
         !notification_probe || (fresh_work_after_reopen && reopen_database.is_some()),
         "the notification prerequisite includes real reopen and fresh permitted work"
     );
+    assert!(
+        !configured_hooks
+            || (!fresh_work_after_reopen && !notification_probe && controller_probe.is_none()),
+        "the hooked writer turn composes only with the plain and reopen cases"
+    );
+    // Each withholding adds one controller-feedback request to the turn.
+    let writer_requests = if configured_hooks { 3 } else { 2 };
     let StockCredentialHost {
         client,
         credential_persistence,
@@ -413,10 +469,13 @@ async fn exercise_stock_persistent(
         store.clone(),
         Arc::new(meerkat::MemoryBlobStore::new()),
         NativeGrantWorkConfiguration {
+            retained_resume: None,
+            require_scoped_destination: false,
             grants: grants.clone(),
             ingress: ingress.clone(),
             invocation_owner: invocation_owner.clone(),
             operation_owner: operation_owner.clone(),
+            configured_mcp_attachment: None,
         },
     )
     .expect("WholeBlob backend configures the bundle's actual governed persistent owner");
@@ -428,7 +487,22 @@ async fn exercise_stock_persistent(
     let notification_job_store = notification_probe.then(|| bundle.job_store());
     let configured_adapter = bundle.runtime_adapter();
     let tools = Arc::new(RecordingTools::default());
-    let mut builder = FactoryAgentBuilder::new(AgentFactory::minimal(), Config::default());
+    // Mandatory hooks are ordinary host configuration that the stock factory
+    // composes; the reopened host below keeps the same configuration.
+    let hooks = if configured_hooks {
+        Some(
+            mandatory_hooks::HookEndpoint::start(
+                mandatory_hooks::Verdicts::WithholdFirstAtEachGate,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let config = hooks
+        .as_ref()
+        .map_or_else(Config::default, mandatory_hooks::HookEndpoint::config);
+    let mut builder = FactoryAgentBuilder::new(AgentFactory::minimal(), config.clone());
     builder.default_llm_client = Some(client.clone());
     builder.default_tool_dispatcher = Some(tools.clone());
     // The stock builder installs the bundle's StoreAdapter and blob store.
@@ -437,7 +511,8 @@ async fn exercise_stock_persistent(
     let config_path =
         std::env::temp_dir().join(format!("stock-persistent-{}.toml", SessionId::new()));
     let (service, machine) =
-        build_runtime_backed_service_with_default_reconfigure_host(builder, 2, bundle, config_path);
+        build_runtime_backed_service_with_default_reconfigure_host(builder, 2, bundle, config_path)
+            .expect("compose the runtime-backed service");
     assert!(Arc::ptr_eq(&machine, &configured_adapter));
     assert!(Arc::ptr_eq(&service.runtime_store(), &store));
     let seed = Session::new();
@@ -593,6 +668,14 @@ async fn exercise_stock_persistent(
         .unwrap();
     assert_eq!(snapshot.binding.driver_kind, MeerkatDriverKind::Persistent);
     assert_eq!(snapshot.control.current_run_id.as_ref(), Some(&run_id));
+    if let Some(hooks) = &hooks {
+        mandatory_hooks::assert_candidate_withheld_before_feedback(
+            hooks,
+            &live_audit,
+            &session_id,
+            &run_id,
+        );
+    }
     // This is the backend row, not the live machine query or a test-owned copy.
     let before_finish = store
         .load_input_state(&runtime, &input_id)
@@ -786,10 +869,13 @@ async fn exercise_stock_persistent(
     assert_eq!(result.text, FINISHED);
     assert_eq!(result.session_id, session_id);
     assert!(result.terminal_cause_kind.is_none());
-    assert_eq!(server.receiver.bodies.lock().unwrap().len(), 2);
+    assert_eq!(
+        server.receiver.bodies.lock().unwrap().len(),
+        writer_requests
+    );
     assert_eq!(
         server.receiver.authorized_requests.load(Ordering::SeqCst),
-        2
+        writer_requests
     );
     assert_eq!(*tools.0.lock().unwrap(), ["read_record"]);
     // Read the actual committed document/identity pair from the runtime backend,
@@ -867,14 +953,25 @@ async fn exercise_stock_persistent(
         audit.len() > prior_audit.len(),
         "terminal commit must persist later observations"
     );
-    assert_stock_turn_audit(
-        &audit,
-        &session_id,
-        &input_id,
-        &run_id,
-        DENIED_CALL,
-        PERMITTED_CALL,
-    );
+    if let Some(hooks) = &hooks {
+        mandatory_hooks::assert_withheld_stock_turn_audit(&audit, &session_id, &input_id, &run_id);
+        mandatory_hooks::assert_completed_writer_turn(
+            hooks,
+            &session_id,
+            &run_id,
+            saved.messages(),
+            &server.receiver.bodies.lock().unwrap(),
+        );
+    } else {
+        assert_stock_turn_audit(
+            &audit,
+            &session_id,
+            &input_id,
+            &run_id,
+            DENIED_CALL,
+            PERMITTED_CALL,
+        );
+    }
     let mut expected_bytes = final_document.bytes().to_vec();
     let mut expected_authority = final_document.authority().clone();
     let mut expected_messages = serde_json::to_value(final_document.session().messages()).unwrap();
@@ -1153,6 +1250,15 @@ async fn exercise_stock_persistent(
     assert_original(&reopened_row, &input_id, &claims);
     assert_eq!(serde_json::to_value(&reopened_row).unwrap(), expected_row);
     assert_eq!(stored_audit(&reopened_row), audit);
+    if hooks.is_some() {
+        // The physically reopened SQLite row still holds both withholdings.
+        mandatory_hooks::assert_withheld_stock_turn_audit(
+            &stored_audit(&reopened_row),
+            &session_id,
+            &input_id,
+            &run_id,
+        );
+    }
     let reopened_document = store
         .load_committed_whole_blob_snapshot(&runtime)
         .await
@@ -1169,37 +1275,25 @@ async fn exercise_stock_persistent(
         store.clone(),
         Arc::new(meerkat::MemoryBlobStore::new()),
         NativeGrantWorkConfiguration {
+            retained_resume: None,
+            require_scoped_destination: false,
             grants: grants.clone(),
             ingress,
             invocation_owner,
             operation_owner,
+            configured_mcp_attachment: None,
         },
     )
     .expect("reopened backend acquires fresh actual governed execution custody");
     let configured_adapter = bundle.runtime_adapter();
-    if !matches!(controller_probe, Some(ControllerProbe::TerminalRevocation)) {
-        // Probe before the service is built: building it arms the detached
-        // runtime delivery owner, whose reconcile pass opens store
-        // connections concurrently. Controller custody is a no-wait try that
-        // refuses under any concurrent SQLite lock by contract, so probing
-        // after that point races the owner's pass.
-        drop(
-            configured_adapter
-                .try_controller_grant_mutation()
-                .expect("reopened persistent store supports controller custody acquisition"),
-        );
-    }
-    let mut builder = FactoryAgentBuilder::new(AgentFactory::minimal(), Config::default());
-    builder.default_llm_client = Some(client);
-    builder.default_tool_dispatcher = Some(tools.clone());
-    let config_path =
-        std::env::temp_dir().join(format!("stock-reopened-{}.toml", SessionId::new()));
-    let (service, machine) =
-        build_runtime_backed_service_with_default_reconfigure_host(builder, 2, bundle, config_path);
-    assert!(Arc::ptr_eq(&machine, &configured_adapter));
-    assert!(Arc::ptr_eq(&service.runtime_store(), &store));
-    *cleanup.lock().unwrap() = Some((machine.clone(), session_id.clone()));
+    // Controller custody is a no-wait try that refuses under any concurrent
+    // SQLite lock by contract. Building the service arms the detached
+    // runtime delivery owner, whose reconcile pass opens store connections
+    // concurrently, so every custody probe on the reopened machine runs
+    // before the service is built, when nothing else touches the store.
     if matches!(controller_probe, Some(ControllerProbe::TerminalRevocation)) {
+        let machine = Arc::clone(&configured_adapter);
+        *cleanup.lock().unwrap() = Some((machine.clone(), session_id.clone()));
         assert!(
             machine
                 .meerkat_machine_spine_snapshot(&session_id)
@@ -1300,6 +1394,22 @@ async fn exercise_stock_persistent(
         return;
     }
 
+    drop(
+        configured_adapter
+            .try_controller_grant_mutation()
+            .expect("reopened persistent store supports controller custody acquisition"),
+    );
+    let mut builder = FactoryAgentBuilder::new(AgentFactory::minimal(), config);
+    builder.default_llm_client = Some(client);
+    builder.default_tool_dispatcher = Some(tools.clone());
+    let config_path =
+        std::env::temp_dir().join(format!("stock-reopened-{}.toml", SessionId::new()));
+    let (service, machine) =
+        build_runtime_backed_service_with_default_reconfigure_host(builder, 2, bundle, config_path)
+            .expect("compose the runtime-backed service");
+    assert!(Arc::ptr_eq(&machine, &configured_adapter));
+    assert!(Arc::ptr_eq(&service.runtime_store(), &store));
+    *cleanup.lock().unwrap() = Some((machine.clone(), session_id.clone()));
     let persisted = service
         .load_authoritative_session(&session_id)
         .await
@@ -1371,6 +1481,13 @@ async fn exercise_stock_persistent(
         serde_json::to_value(recovered_document.session().messages()).unwrap(),
         expected_messages
     );
+    if let Some(hooks) = &hooks {
+        assert_eq!(
+            hooks.offered().len(),
+            3,
+            "reconstruction offers no gate anything and replays no work"
+        );
+    }
     let mut fresh_terminal = None;
     if fresh_work_after_reopen {
         // Admission authority comes from the still-current host owners, not the
@@ -1673,13 +1790,11 @@ async fn exercise_stock_persistent(
         assert_eq!(stored_audit(&retained_fresh), fresh_audit);
     }
     let completed_turns = if fresh_work_after_reopen { 2 } else { 1 };
-    assert_eq!(
-        server.receiver.bodies.lock().unwrap().len(),
-        2 * completed_turns
-    );
+    let model_requests = writer_requests + if fresh_work_after_reopen { 2 } else { 0 };
+    assert_eq!(server.receiver.bodies.lock().unwrap().len(), model_requests);
     assert_eq!(
         server.receiver.authorized_requests.load(Ordering::SeqCst),
-        2 * completed_turns
+        model_requests
     );
     assert_eq!(
         *tools.0.lock().unwrap(),
@@ -1763,7 +1878,38 @@ async fn run_stock_persistent_case_with_probe(
             fresh_work_after_reopen,
             notification_probe: false,
             controller_probe,
+            configured_hooks: false,
         },
+        host,
+    )
+    .await;
+}
+
+/// The stock SQLite writer with configured mandatory model-request hooks.
+/// The PreLlm gate withholds the first ordinary candidate, so the first
+/// actual request is the controller-feedback replacement, which receives the
+/// sibling batch. The PostLlm gate withholds the next ordinary response, and
+/// the second feedback request receives the immediate final answer.
+async fn run_hooked_stock_persistent_case(
+    session_store: Arc<dyn meerkat::SessionStore>,
+    store: Arc<dyn RuntimeStore>,
+    reopen_database: Option<&std::path::Path>,
+) {
+    let server =
+        Server::start_with_tool_responses(vec![sibling_response(), final_response()]).await;
+    let host = StockCredentialHost {
+        client: http_client(&server),
+        credential_persistence: meerkat_core::auth::ProviderAuthPersistence::new(
+            Arc::new(meerkat_auth_core::EphemeralTokenStore::new()),
+            Arc::new(meerkat_auth_core::InMemoryCoordinator::new()),
+        ),
+    };
+    run_stock_persistent_case_with_options(
+        server,
+        session_store,
+        store,
+        reopen_database,
+        StockPersistentOptions::hooked_writer(),
         host,
     )
     .await;
@@ -1846,7 +1992,7 @@ async fn stock_sqlite_whole_blob_governed_turn_commits_session_input_and_audit()
         meerkat_runtime::SqliteRuntimeStore::new_whole_blob(database)
             .expect("actual SQLite WholeBlob runtime store opens"),
     );
-    run_stock_persistent_case(session_store, runtime_store, None, false).await;
+    run_hooked_stock_persistent_case(session_store, runtime_store, None).await;
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -1862,7 +2008,7 @@ async fn stock_sqlite_whole_blob_reopen_preserves_governed_session_input_and_aud
         meerkat_runtime::SqliteRuntimeStore::new_whole_blob(database.clone())
             .expect("actual SQLite WholeBlob runtime store opens"),
     );
-    run_stock_persistent_case(session_store, runtime_store, Some(&database), false).await;
+    run_hooked_stock_persistent_case(session_store, runtime_store, Some(&database)).await;
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -1927,6 +2073,7 @@ async fn stock_sqlite_notification_without_authority_cannot_append_context_or_bl
             fresh_work_after_reopen: true,
             notification_probe: true,
             controller_probe: None,
+            configured_hooks: false,
         },
         host,
     )
@@ -1935,6 +2082,8 @@ async fn stock_sqlite_notification_without_authority_cannot_append_context_or_bl
 
 #[path = "stock_persistent/context_append.rs"]
 mod context_append;
+#[path = "stock_persistent/mandatory_hooks.rs"]
+mod mandatory_hooks;
 #[path = "stock_persistent/revalidation.rs"]
 mod revalidation;
 

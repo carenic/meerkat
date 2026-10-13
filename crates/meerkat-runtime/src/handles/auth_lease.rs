@@ -3409,9 +3409,30 @@ mod credential_freshness_audit_tests {
         use meerkat_core::handles::{CredentialUseDisposition, CredentialUseIntent};
 
         let records = Arc::new(Mutex::new(Vec::new()));
-        let subscriber =
-            tracing_subscriber::Registry::default().with(AuditLayer(Arc::clone(&records)));
-        tracing::subscriber::with_default(subscriber, || {
+        let capture = tracing::Dispatch::new(
+            tracing_subscriber::Registry::default().with(AuditLayer(Arc::clone(&records))),
+        );
+        // A second, separately registered Dispatch: with more than one,
+        // tracing computes callsite interest from every registered Dispatch
+        // rather than from the registering thread's current default.
+        let anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
+        // An uncaptured emitter on another key reaches the shared audit
+        // callsite first, and rebuilds interest, under no subscriber.
+        std::thread::spawn(|| {
+            tracing::dispatcher::with_default(&tracing::Dispatch::none(), || {
+                let owner = RuntimeAuthLeaseHandle::new();
+                let key = LeaseKey::new(
+                    meerkat_core::RealmId::parse("managed-current-audit").unwrap(),
+                    meerkat_core::BindingId::parse("uncaptured-owner").unwrap(),
+                    None,
+                );
+                owner.acquire_lease(&key, 1000).unwrap();
+                tracing::callsite::rebuild_interest_cache();
+            });
+        })
+        .join()
+        .expect("uncaptured audit emitter must finish");
+        tracing::dispatcher::with_default(&capture, || {
             let owner = RuntimeAuthLeaseHandle::new();
             let key = LeaseKey::new(
                 meerkat_core::RealmId::parse("managed-current-audit").unwrap(),
@@ -3495,6 +3516,8 @@ mod credential_freshness_audit_tests {
             observed_changes,
             [("Valid", "Expiring"), ("Expiring", "Expired")]
         );
+        drop(anchor);
+        drop(capture);
     }
 }
 

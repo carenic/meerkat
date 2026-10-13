@@ -11,8 +11,7 @@ use crate::generated::protocol_ops_barrier_satisfaction::{
     OpsBarrierSatisfactionObligation, submit_ops_barrier_satisfied,
 };
 use crate::hooks::{
-    HookExecutionReport, HookInvocation, HookLlmRequest, HookLlmResponse, HookPoint, HookToolCall,
-    HookToolResult,
+    HookInvocation, HookLlmRequest, HookLlmResponse, HookPoint, HookToolCall, HookToolResult,
 };
 use crate::image_content::{MissingBlobBehavior, hydrate_messages_for_execution};
 use crate::lifecycle::RunId;
@@ -34,6 +33,7 @@ use serde_json::value::RawValue;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tracing::Instrument as _;
 
 const MAX_REQUEST_ROUTE_STABILIZATION_RETRIES: u8 = 2;
 
@@ -103,7 +103,9 @@ struct LlmRetryRequest<'a> {
 }
 
 enum LlmRetryOutcome {
-    Completed(LlmStreamResult),
+    /// The response and the id of the request authorization that actually
+    /// produced it, after any in-loop recovery replaced the original.
+    Completed(LlmStreamResult, Option<crate::OperationId>),
     /// A fallback target tightened request limits and the ordinary compaction
     /// path committed a rewrite. The caller must rebuild every request-owned
     /// projection from the new canonical session before dispatch.
@@ -118,6 +120,7 @@ fn model_operation_unavailable_notice() -> Message {
             category: "operation_authorization_unavailable".into(),
             detail: None,
             payload: Some(serde_json::json!({"code": "operation_authorization_unavailable"})),
+            content: Vec::new(),
         },
     )
 }
@@ -134,6 +137,7 @@ fn model_operation_review_notice(
             category: "operation_review_required".into(),
             detail: None,
             payload: Some(serde_json::json!({"code": refusal.code(), "review": refusal})),
+            content: Vec::new(),
         },
     )
 }
@@ -146,6 +150,7 @@ fn model_operation_refusal_notice() -> Message {
             category: "operation_refused".into(),
             detail: None,
             payload: Some(serde_json::json!({"code": "operation_refused"})),
+            content: Vec::new(),
         },
     )
 }
@@ -711,6 +716,18 @@ struct CallingLlmTurnCtx<'a> {
     /// persisted.
     reserved_assistant_message: &'a mut Option<crate::types::AssistantMessageId>,
     controller_feedback: &'a mut bool,
+    /// Purpose of the exact model request this provider turn prepares. Kept
+    /// across re-polls and retries of that request, cleared once PostLlm
+    /// accepts its response. Independent of the sticky `controller_feedback`
+    /// routing: a later ordinary request on the controller is `Ordinary`.
+    model_operation: &'a mut Option<crate::hooks::HookModelOperation>,
+    /// The actual candidate operation id reserved with `model_operation`.
+    model_operation_id: &'a mut Option<crate::OperationId>,
+    /// The request that actually produced the current response. Recovery can
+    /// replace the request authorization, so this can differ from the
+    /// candidate id; the original refusal keeps its own id.
+    responding_operation_id: &'a mut Option<crate::OperationId>,
+    model_operation_sequence: &'a mut u64,
     deferred_tool_failure: &'a mut Option<crate::session::DeferredToolBatchFailure>,
     turn_count: u32,
     tool_call_count: u32,
@@ -808,20 +825,33 @@ where
         &self,
         run_id: Option<RunId>,
         usage: crate::authorization::ModelAuthorizationUse,
+        operation_id: crate::OperationId,
     ) -> Option<crate::LlmRequestAuthorization> {
+        let bound_controller = self.bound_controller_client().is_some();
         self.tool_dispatch_context.work_authorization().map(|work| {
             let usage = if usage == crate::authorization::ModelAuthorizationUse::Inference
-                && work.controller_client().is_some_and(|controller| {
-                    self.client.controller_model_selection().as_ref()
-                        == Some(controller.selection())
-                }) {
+                && bound_controller
+            {
                 crate::authorization::ModelAuthorizationUse::ControllerInference
             } else {
                 usage
             };
-            crate::LlmRequestAuthorization::new(work.clone(), crate::OperationId::new(), usage)
+            crate::LlmRequestAuthorization::new(work.clone(), operation_id, usage)
                 .with_coordinates(run_id, None)
         })
+    }
+
+    /// The admitted work's retained, immutable controller client when this
+    /// session's client is exactly that controller selection: the route the
+    /// controller's own requests (and its housekeeping compaction of the same
+    /// context) must use. A fallback wrapper cannot move them elsewhere.
+    fn bound_controller_client(&self) -> Option<Arc<dyn crate::AgentLlmClient>> {
+        let controller = self
+            .tool_dispatch_context
+            .work_authorization()?
+            .controller_client()?;
+        (self.client.controller_model_selection().as_ref() == Some(controller.selection()))
+            .then(|| Arc::clone(controller.client()))
     }
 
     fn prepare_authorized_model_attempt(
@@ -906,9 +936,12 @@ where
         self.session.push(notice.clone());
         Arc::make_mut(messages).push(notice);
         *provider_params = Some(params);
+        // A replacement request is a new operation: the refused original
+        // keeps its own id and its own refusal record.
         *authorization = self.model_request_authorization(
             Some(run_id.clone()),
             crate::authorization::ModelAuthorizationUse::ControllerInference,
+            crate::OperationId::new(),
         );
         *controller_feedback = true;
         true
@@ -952,6 +985,115 @@ where
             baseline,
             outcome,
         })
+    }
+
+    /// The purpose of the request being prepared, minted once per operation
+    /// together with the actual candidate operation id. The id is reserved
+    /// before the pre-hook so a withheld candidate is recorded under its own
+    /// identity; the request carries the same id if it proceeds.
+    fn current_model_operation(
+        ctx: &mut CallingLlmTurnCtx<'_>,
+    ) -> crate::hooks::HookModelOperation {
+        if let Some(operation) = ctx.model_operation.as_ref() {
+            return operation.clone();
+        }
+        *ctx.model_operation_sequence += 1;
+        let operation = crate::hooks::HookModelOperation::Ordinary {
+            sequence: *ctx.model_operation_sequence,
+        };
+        *ctx.model_operation = Some(operation.clone());
+        *ctx.model_operation_id = Some(crate::OperationId::new());
+        operation
+    }
+
+    /// Withhold the current ordinary operation after a mandatory prerequisite
+    /// failed, and make the next request the distinct controller-feedback
+    /// operation that carries the typed result to the admitted controller in
+    /// this run. Returns false, leaving the existing fail-closed path, for a
+    /// feedback request (no recursion), a failure outside the admitted gates,
+    /// or work without a retained controller.
+    ///
+    /// The typed withholding is first staged in the retained work's protected
+    /// custody under `operation_id`, the actual candidate (PreLlm) or the
+    /// actual responding request (PostLlm), before any feedback is attempted,
+    /// so it survives feedback that never runs. A staging failure is local to
+    /// this operation: it stays withheld, is never retried, and the feedback
+    /// reports that its protected record is unavailable, so no audit success
+    /// is claimed. The run, and permitted controller work, continue.
+    fn withhold_for_controller_feedback(
+        &mut self,
+        ctx: &mut CallingLlmTurnCtx<'_>,
+        invocation: &HookInvocation,
+        failure: &super::hook_impl::MandatoryPrerequisiteFailure,
+        operation_id: Option<crate::OperationId>,
+        effect: crate::authorization::MandatoryHookWithheldEffect,
+    ) -> bool {
+        let Some(crate::hooks::HookModelOperation::Ordinary { sequence }) =
+            ctx.model_operation.clone()
+        else {
+            return false;
+        };
+        // Only a gate admission validated for this run may be recovered; an
+        // engine that attested no such gate keeps the fail-closed path.
+        if !self
+            .admitted_hook_topology
+            .admits_controller_feedback(&failure.hook_id, invocation.point)
+        {
+            return false;
+        }
+        let Some(work) = self
+            .tool_dispatch_context
+            .work_authorization()
+            .filter(|work| work.controller_client().is_some())
+            .cloned()
+        else {
+            return false;
+        };
+        let withholding = super::hook_impl::mandatory_hook_withholding(
+            sequence,
+            invocation.point,
+            failure,
+            effect,
+        );
+        // One staging attempt, never retried.
+        let record = match operation_id {
+            Some(operation_id) => work
+                .observe_mandatory_hook_withholding(
+                    operation_id,
+                    Some(ctx.run_id.clone()),
+                    withholding.clone(),
+                )
+                .map_or(super::hook_impl::ProtectedRecord::Unavailable, |()| {
+                    super::hook_impl::ProtectedRecord::Staged
+                }),
+            None => super::hook_impl::ProtectedRecord::Unavailable,
+        };
+        if record == super::hook_impl::ProtectedRecord::Unavailable {
+            tracing::warn!(
+                session_id = %self.session.id(),
+                sequence,
+                "mandatory hook withholding could not be staged in protected custody; the operation stays withheld"
+            );
+        }
+        self.session
+            .push(super::hook_impl::mandatory_prerequisite_notice(
+                invocation,
+                &withholding,
+                record,
+            ));
+        *ctx.model_operation_sequence += 1;
+        // The feedback request is a distinct operation with its own id.
+        *ctx.model_operation_id = Some(crate::OperationId::new());
+        *ctx.model_operation = Some(crate::hooks::HookModelOperation::ControllerFeedback {
+            sequence: *ctx.model_operation_sequence,
+            withheld: crate::hooks::HookWithheldModelOperation {
+                sequence,
+                hook_id: failure.hook_id.clone(),
+                point: invocation.point,
+            },
+        });
+        *ctx.controller_feedback = true;
+        true
     }
 
     fn request_model_profile(
@@ -1538,6 +1680,7 @@ where
                     "active LLM model changed after recoverable provider failure".to_string(),
                 ),
                 payload: Some(payload),
+                content: Vec::new(),
             },
         ));
         next_session.push(notice.clone());
@@ -2544,7 +2687,12 @@ where
                         result.blocks(),
                     ) {
                         if allow_empty_success {
-                            return Ok(LlmRetryOutcome::Completed(result));
+                            return Ok(LlmRetryOutcome::Completed(
+                                result,
+                                authorization
+                                    .as_ref()
+                                    .map(|auth| auth.operation_id().clone()),
+                            ));
                         }
                         let provider = controller
                             .as_ref()
@@ -2576,7 +2724,12 @@ where
                             LlmFailureStep::Fail(error) => return Err(error),
                         }
                     }
-                    return Ok(LlmRetryOutcome::Completed(result));
+                    return Ok(LlmRetryOutcome::Completed(
+                        result,
+                        authorization
+                            .as_ref()
+                            .map(|auth| auth.operation_id().clone()),
+                    ));
                 }
                 Err(error)
                     if error.operation_refusal().is_some()
@@ -3271,29 +3424,60 @@ where
                         });
                         let outcome = match compaction_source {
                             Ok((parent_revision, observation_source)) => {
-                                crate::agent::compact::run_compaction(
-                                    self.client.as_ref(),
-                                    &compactor,
-                                    self.compaction_curator.as_ref(),
-                                    crate::agent::compact::CompactionInvocation {
-                                        authorization: self.model_request_authorization(
-                                            self.tool_dispatch_context.run_id().cloned(),
-                                            crate::authorization::ModelAuthorizationUse::Compaction,
-                                        ),
-                                        model_messages: &model_messages,
-                                        observation_source,
-                                        window: crate::compact::CompactionWindow {
-                                            messages: self.session.messages(),
-                                            last_input_tokens: self.last_input_tokens,
-                                            session_boundary_index: current_boundary_index,
-                                        },
-                                        request_pressure: provider_request_pressure,
-                                        parent_revision,
+                                let invocation = crate::agent::compact::CompactionInvocation {
+                                    authorization: self.model_request_authorization(
+                                        self.tool_dispatch_context.run_id().cloned(),
+                                        crate::authorization::ModelAuthorizationUse::Compaction,
+                                        crate::OperationId::new(),
+                                    ),
+                                    model_messages: &model_messages,
+                                    observation_source,
+                                    window: crate::compact::CompactionWindow {
+                                        messages: self.session.messages(),
+                                        last_input_tokens: self.last_input_tokens,
+                                        session_boundary_index: current_boundary_index,
                                     },
-                                    event_tx,
-                                    &self.event_tap,
-                                )
-                                .await
+                                    request_pressure: provider_request_pressure,
+                                    parent_revision,
+                                };
+                                // The compactor's warnings (a bounded source,
+                                // a rewrite keeping no complete turn) name the
+                                // session they happened in.
+                                let span = tracing::warn_span!(
+                                    "compaction",
+                                    session_id = %self.session.id()
+                                );
+                                // Compaction of the admitted controller's own
+                                // context is its housekeeping: it runs on the
+                                // retained controller client (still authorized
+                                // per request as Compaction). Any other
+                                // compactor route keeps the session client.
+                                match self.bound_controller_client() {
+                                    Some(controller) => {
+                                        crate::agent::compact::run_compaction(
+                                            controller.as_ref(),
+                                            &compactor,
+                                            self.compaction_curator.as_ref(),
+                                            invocation,
+                                            event_tx,
+                                            &self.event_tap,
+                                        )
+                                        .instrument(span)
+                                        .await
+                                    }
+                                    None => {
+                                        crate::agent::compact::run_compaction(
+                                            self.client.as_ref(),
+                                            &compactor,
+                                            self.compaction_curator.as_ref(),
+                                            invocation,
+                                            event_tx,
+                                            &self.event_tap,
+                                        )
+                                        .instrument(span)
+                                        .await
+                                    }
+                                }
                             }
                             Err(error) => {
                                 tracing::warn!(
@@ -3340,6 +3524,7 @@ where
                                     category: "operation_refused".into(),
                                     detail: None,
                                     payload: Some(serde_json::json!({"code": "operation_refused"})),
+                                    content: Vec::new(),
                                 },
                             ));
                         }
@@ -4633,23 +4818,6 @@ where
         Ok(result)
     }
 
-    async fn execute_turn_hooks(
-        &mut self,
-        invocation: HookInvocation,
-        run_id: &RunId,
-        turn_count: u32,
-        event_tx: &Option<mpsc::Sender<AgentEvent>>,
-    ) -> Result<HookExecutionReport, AgentError> {
-        match self.execute_hooks(invocation, event_tx.as_ref()).await {
-            Ok(report) => Ok(report),
-            Err(error) => {
-                self.terminalize_fatal_error(run_id, turn_count, event_tx, &error)
-                    .await?;
-                Err(error)
-            }
-        }
-    }
-
     async fn run_completed_hooks_before_terminal(
         &mut self,
         result: &mut RunResult,
@@ -4707,6 +4875,10 @@ where
         let mut run_has_visible_or_actionable_output = false;
         let mut reserved_assistant_message: Option<crate::types::AssistantMessageId> = None;
         let mut controller_feedback = false;
+        let mut model_operation: Option<crate::hooks::HookModelOperation> = None;
+        let mut model_operation_id: Option<crate::OperationId> = None;
+        let mut responding_operation_id: Option<crate::OperationId> = None;
+        let mut model_operation_sequence = 0_u64;
         let mut deferred_tool_failure = deferred_callback
             .as_ref()
             .map(|value| value.failure.clone());
@@ -4759,12 +4931,11 @@ where
                     "failed to read the pre-run durable visibility parent: {error}"
                 ))
             })?;
-        // Flush any cancel-after-boundary commands left undrained by a prior
-        // run so a stale request never leaks into this fresh run. The producer
-        // end (the requesting surface) cannot reach the agent-owned receiver, so
-        // the staleness reset lives here at the run-start seam — replacing the
-        // previous surface-side `clear` of the shared `AtomicBool` carrier.
-        while self.cancel_after_boundary_rx.try_recv().is_ok() {}
+        // Cancel-after-boundary commands are run-scoped: the loop's first
+        // boundary observation (`observe_cancel_after_boundary_request`) keeps
+        // a command for this exact run, including one dispatched while the run
+        // was staged before this agent claimed it, and discards any command
+        // left by another run, so a stale request never leaks into this run.
 
         // --- Authority lifecycle: consume the generated primitive start ---
         let run_id = if let Some(run_id) = self.started_primitive_run_from_authority()? {
@@ -4792,6 +4963,14 @@ where
         self.latest_run_checkpoint_receipt = None;
         self.runtime_started_run_id = Some(run_id.clone());
         self.tool_dispatch_context.bind_run_id(run_id.clone());
+        // A resumed run takes over the parked consent its staged notice
+        // inputs carry, before its first model call.
+        if let (Some(review), Some(work)) = (
+            self.operation_review.as_ref(),
+            self.tool_dispatch_context.work_authorization(),
+        ) {
+            review.open_consent_for_run(work, &run_id);
+        }
         let _tool_application_observation_run = if self.noncommitting_live_bridge_run {
             None
         } else {
@@ -4927,6 +5106,10 @@ where
                             &mut sticky_fallback_durable_visibility_parent,
                         reserved_assistant_message: &mut reserved_assistant_message,
                         controller_feedback: &mut controller_feedback,
+                        model_operation: &mut model_operation,
+                        model_operation_id: &mut model_operation_id,
+                        responding_operation_id: &mut responding_operation_id,
+                        model_operation_sequence: &mut model_operation_sequence,
                         deferred_tool_failure: &mut deferred_tool_failure,
                         turn_count,
                         tool_call_count,
@@ -5042,6 +5225,9 @@ where
                             .await?;
                         return Err(error);
                     }
+                    // A cancel dispatched while the boundary hooks ran is
+                    // observed before the machine decides the boundary.
+                    self.observe_cancel_after_boundary_request(&run_id)?;
                     let t = self.apply_turn_input(TurnExecutionInput::BoundaryContinue {
                         run_id: run_id.clone(),
                     })?;
@@ -5095,6 +5281,12 @@ where
         match self.refresh_calling_llm_boundary_notices(ctx).await? {
             CallingLlmBoundaryGate::Deferred => return Ok(CallingLlmStep::Repoll),
             CallingLlmBoundaryGate::Proceed => {}
+        }
+        if self.spend_decided_run_consent(ctx).await? {
+            // In-run consent attempts registered asynchronous work with this
+            // turn, which now waits for its barrier operations before the
+            // next model request, exactly as after a tool batch.
+            return Ok(CallingLlmStep::Repoll);
         }
         let tool_defs = self.apply_calling_llm_tool_scope(ctx).await?;
         let prepared = match self.prepare_calling_llm_request(ctx).await? {
@@ -5409,6 +5601,234 @@ where
         }
         Ok(CallingLlmBoundaryGate::Proceed)
     }
+    /// Boundary step 3c: in-run human consent (ADR-001). An authenticated
+    /// decision that reached this still-open run is spent here by the run's
+    /// own owner, before tool capture and request preparation. Only consent
+    /// this run requested itself is examined, so a run that requested none
+    /// pays one empty-set check and never touches the approval owner. Each
+    /// approved candidate gets one fresh retained attempt in this run: the
+    /// exact original call and plan, with this run's work and run, through
+    /// the common fenced entry whose leaf spends the decision once. Nothing
+    /// waits: a held owner defers to the next boundary. The run can still
+    /// close, or be dropped, before or during an attempt; its run scope then
+    /// parks or withdraws what it admitted, and an attempt that entered keeps
+    /// its own outcome. Asynchronous work the attempts started is registered
+    /// with this turn through the turn owner, with its exact refs and wait
+    /// policies, as a tool batch's is; `true` means the turn now waits for
+    /// it and the boundary must repoll.
+    async fn spend_decided_run_consent(
+        &mut self,
+        ctx: &mut CallingLlmTurnCtx<'_>,
+    ) -> Result<bool, AgentError> {
+        // A noncommitting live bridge run executes against a retained
+        // snapshot and never spends consent.
+        if self.noncommitting_live_bridge_run {
+            return Ok(false);
+        }
+        let requested = self.run_consent_attempts.unattempted();
+        if requested.is_empty() {
+            return Ok(false);
+        }
+        let Some(review) = self.operation_review.clone() else {
+            return Ok(false);
+        };
+        let Some(work) = self.tool_dispatch_context.work_authorization().cloned() else {
+            return Ok(false);
+        };
+        let run_id = self.tool_dispatch_context.run_id().cloned();
+        let crate::approval::consent::DecidedConsentScan::Decided(decided) =
+            review.decided_consent_for_run(&work, run_id.as_ref(), &requested)
+        else {
+            return Ok(false);
+        };
+        let mut pending_op_refs = Vec::new();
+        for decided in decided {
+            if self
+                .run_consent_attempts
+                .first_attempt(&decided.approval_id)
+            {
+                pending_op_refs.extend(self.attempt_decided_consent(ctx, &review, decided).await?);
+            }
+        }
+        if pending_op_refs.is_empty() {
+            return Ok(false);
+        }
+        let barrier_operation_ids = pending_op_refs
+            .iter()
+            .filter(|op_ref| op_ref.wait_policy == crate::ops::WaitPolicy::Barrier)
+            .map(|op_ref| op_ref.operation_id.clone())
+            .collect::<Vec<_>>();
+        let has_barrier_ops = !barrier_operation_ids.is_empty();
+        self.apply_turn_input(TurnExecutionInput::RegisterPendingOps {
+            run_id: ctx.run_id.clone(),
+            op_refs: pending_op_refs,
+            barrier_operation_ids,
+            has_barrier_ops,
+        })?;
+        Ok(true)
+    }
+
+    /// One in-run retained attempt of a decided consent, fed back as one
+    /// durable runtime notice correlated with the original call, which keeps
+    /// its one closed result and its one completion event: neither is
+    /// emitted again. Refusals, stale context, unsupported entry and owner
+    /// unavailability are that notice's local feedback, never a boundary
+    /// error. The ordinary post-tool publication gate runs before anything
+    /// result-bearing is published; a withheld result publishes only its
+    /// refusal and drops the attempt's assistant blocks, while entered
+    /// non-transcript effects, asynchronous work and settlement custody
+    /// stand. Returns the attempt's asynchronous work, exactly as it started
+    /// it, for the turn to register.
+    async fn attempt_decided_consent(
+        &mut self,
+        ctx: &mut CallingLlmTurnCtx<'_>,
+        review: &Arc<crate::approval::review::BoundOperationReview>,
+        decided: crate::approval::consent::DecidedConsent,
+    ) -> Result<Vec<crate::ops::AsyncOpRef>, AgentError> {
+        let tool_use_id = decided.tool_call_id.to_string();
+        let tool_name = decided.tool_name.clone().unwrap_or_default();
+        let dispatched = dispatch_retained_consent_boxed(
+            Arc::clone(&self.tools),
+            self.tool_dispatch_context
+                .clone()
+                .with_operation_review(Some(Arc::clone(review))),
+            decided.approval_id.clone(),
+        )
+        .await;
+        let (mut result, mut effects, async_ops) = match dispatched {
+            Ok(mut outcome) => {
+                outcome.clear_terminal_cause();
+                (outcome.result, outcome.session_effects, outcome.async_ops)
+            }
+            Err(error) => (
+                crate::ops::terminal_tool_outcome_for_error(tool_use_id.clone(), error).result,
+                Vec::new(),
+                Vec::new(),
+            ),
+        };
+        result.tool_use_id.clone_from(&tool_use_id);
+        let provenance = self
+            .tools
+            .tools()
+            .iter()
+            .find(|tool| tool.name == tool_name.as_str())
+            .and_then(|tool| tool.provenance.clone());
+        let post_tool_report = self
+            .execute_hooks(
+                HookInvocation {
+                    run_id: None,
+                    point: HookPoint::PostToolExecution,
+                    session_id: self.session.id().clone(),
+                    turn_number: Some(ctx.turn_count),
+                    prompt_input: None,
+                    error_report: None,
+                    error_class: None,
+                    llm_request: None,
+                    llm_response: None,
+                    tool_call: None,
+                    tool_result: Some(
+                        HookToolResult::from_tool_result_with_id(
+                            tool_use_id.clone(),
+                            tool_name,
+                            &result,
+                        )
+                        .with_provenance(provenance),
+                    ),
+                    observation: None,
+                },
+                ctx.event_tx.as_ref(),
+            )
+            .await;
+        let publication_refusal = match post_tool_report {
+            Ok(report) => report.denial(HookPoint::PostToolExecution).map(|denial| {
+                ToolError::HookDenied {
+                    denial: Box::new(crate::hooks::HookDenial {
+                        message: String::from(
+                            "Tool result publication was withheld; this does not undo any entered tool execution.",
+                        ),
+                        payload: None,
+                        ..denial
+                    }),
+                }
+            }),
+            Err(AgentError::HookLaunchRefused {
+                hook_id,
+                reason: crate::hooks::HookFailureReason::ConfinementRefused { refusal },
+            }) => Some(ToolError::HookLaunchRefused {
+                hook_id,
+                point: HookPoint::PostToolExecution,
+                refusal,
+            }),
+            Err(error) => {
+                if crate::session::DeferredHookInfrastructureFailure::from_agent_error(&error)
+                    .is_none()
+                {
+                    self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
+                        .await?;
+                    return Err(error);
+                }
+                // A required post-tool hook failed after the attempt
+                // entered: its publication is withheld, as the attempt's
+                // own local feedback.
+                Some(ToolError::Other(String::from(
+                    "Tool result publication was withheld because a required post-tool hook failed; this does not undo any entered tool execution.",
+                )))
+            }
+        };
+        if let Some(error) = publication_refusal {
+            let settlement_failures = std::mem::take(&mut result.settlement_failures);
+            result = crate::ops::terminal_tool_outcome_for_error(
+                tool_use_id,
+                error.with_settlement_failures(settlement_failures),
+            )
+            .result;
+            effects.retain(|effect| {
+                !matches!(
+                    effect,
+                    crate::ops::SessionEffect::AppendAssistantBlocks { .. }
+                )
+            });
+        }
+        let (assistant_effects, other_effects): (Vec<_>, Vec<_>) =
+            effects.into_iter().partition(|effect| {
+                matches!(
+                    effect,
+                    crate::ops::SessionEffect::AppendAssistantBlocks { .. }
+                )
+            });
+        if !other_effects.is_empty() {
+            self.apply_session_effects(&other_effects, Some(ctx.run_id))?;
+        }
+        let produced_output = !result.is_error
+            || assistant_effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    crate::ops::SessionEffect::AppendAssistantBlocks { blocks }
+                        if crate::types::assistant_blocks_have_visible_or_actionable_output(blocks)
+                )
+            });
+        self.session.push(consent_attempt_notice(&decided, &result));
+        if !assistant_effects.is_empty() {
+            for (effect_message_id, image) in
+                self.apply_session_effects(&assistant_effects, Some(ctx.run_id))?
+            {
+                emit_phase_event!(
+                    self,
+                    ctx,
+                    AgentEvent::AssistantImageAppended {
+                        image,
+                        assistant_message_id: Some(effect_message_id),
+                    }
+                );
+            }
+        }
+        if produced_output {
+            *ctx.run_has_visible_or_actionable_output = true;
+        }
+        self.budget.record_tool_call();
+        ctx.tool_call_count += 1;
+        Ok(async_ops)
+    }
     /// Boundary step 4: apply tool scope staged updates atomically at
     /// the CallingLlm boundary and project the visible tool set.
     async fn apply_calling_llm_tool_scope(
@@ -5719,7 +6139,7 @@ where
             .map_err(|error| AgentError::ConfigError(error.to_string()))?;
 
         let pre_llm_invocation = HookInvocation {
-            run_id: None,
+            run_id: Some(ctx.run_id.clone()),
             point: HookPoint::PreLlmRequest,
             session_id: self.session.id().clone(),
             turn_number: Some(ctx.turn_count),
@@ -5732,6 +6152,7 @@ where
                 provider_params: (!effective_provider_params.is_empty())
                     .then(|| effective_provider_params.clone()),
                 message_count: self.session.messages().len(),
+                operation: Self::current_model_operation(ctx),
             }),
             llm_response: None,
             tool_call: None,
@@ -5739,8 +6160,8 @@ where
             observation: None,
         };
         // Pre-LLM hooks may observe or deny the turn.
-        let pre_llm_report = if in_extraction {
-            match self
+        if in_extraction {
+            let pre_llm_report = match self
                 .execute_hooks(pre_llm_invocation, ctx.event_tx.as_ref())
                 .await
             {
@@ -5757,14 +6178,8 @@ where
                         .await,
                     ));
                 }
-            }
-        } else {
-            self.execute_turn_hooks(pre_llm_invocation, ctx.run_id, ctx.turn_count, ctx.event_tx)
-                .await?
-        };
-
-        if let Some(error) = pre_llm_report.denial_error(HookPoint::PreLlmRequest) {
-            if in_extraction {
+            };
+            if let Some(error) = pre_llm_report.denial_error(HookPoint::PreLlmRequest) {
                 return Ok(CallingLlmGate::Done(
                     self.complete_extraction_failed(
                         ctx.run_id,
@@ -5776,9 +6191,36 @@ where
                     .await,
                 ));
             }
-            self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
-                .await?;
-            return Err(error);
+        } else {
+            let result = self
+                .execute_hooks(pre_llm_invocation.clone(), ctx.event_tx.as_ref())
+                .await;
+            match super::hook_impl::classify_model_request_hooks(result, HookPoint::PreLlmRequest) {
+                Ok(None) => {}
+                Ok(Some(failure)) => {
+                    // Withhold only this model request and hand the typed
+                    // result to the admitted controller in the same run.
+                    let candidate = ctx.model_operation_id.clone();
+                    if self.withhold_for_controller_feedback(
+                        ctx,
+                        &pre_llm_invocation,
+                        &failure,
+                        candidate,
+                        crate::authorization::MandatoryHookWithheldEffect::RequestNotSent,
+                    ) {
+                        return Ok(CallingLlmGate::Repoll);
+                    }
+                    let error = failure.fatal;
+                    self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
+                        .await?;
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
+                        .await?;
+                    return Err(error);
+                }
+            }
         }
 
         // In extraction mode, override tools/temperature/params
@@ -5957,6 +6399,7 @@ where
         };
         let mut request_messages = Arc::new(request_messages);
         let call_tool_defs: Arc<[Arc<ToolDef>]> = call_tool_defs.to_vec().into();
+        // The candidate's own id, reserved before its pre-hook.
         let mut authorization = self.model_request_authorization(
             Some(ctx.run_id.clone()),
             if *ctx.controller_feedback {
@@ -5964,6 +6407,7 @@ where
             } else {
                 crate::authorization::ModelAuthorizationUse::Inference
             },
+            ctx.model_operation_id.clone().unwrap_or_default(),
         );
         let mut provider_params = prepared.typed_provider_params.clone();
         if *ctx.controller_feedback {
@@ -6189,7 +6633,10 @@ where
             })
             .await
         {
-            Ok(LlmRetryOutcome::Completed(result)) => result,
+            Ok(LlmRetryOutcome::Completed(result, responding)) => {
+                *ctx.responding_operation_id = responding;
+                result
+            }
             Ok(LlmRetryOutcome::RepollAfterCompaction) => {
                 return Ok(CallingLlmGate::Repoll);
             }
@@ -6788,14 +7235,14 @@ where
             self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
                 .await?;
             return Err(error);
-        } else if turn_has_visible_or_actionable
-            && assistant_blocks_have_user_visible_output(&assistant_msg.blocks)
-        {
-            *ctx.run_has_visible_or_actionable_output = true;
         }
+        // Credited only once PostLlm accepts the response below: rejected
+        // output is never the run's visible output.
+        let response_is_visible_output = turn_has_visible_or_actionable
+            && assistant_blocks_have_user_visible_output(&assistant_msg.blocks);
 
         let post_llm_invocation = HookInvocation {
-            run_id: None,
+            run_id: Some(ctx.run_id.clone()),
             point: HookPoint::PostLlmResponse,
             session_id: self.session.id().clone(),
             turn_number: Some(ctx.turn_count),
@@ -6828,13 +7275,14 @@ where
                         _ => None,
                     })
                     .collect(),
+                operation: Self::current_model_operation(ctx),
             }),
             tool_call: None,
             tool_result: None,
             observation: None,
         };
-        let post_llm_report = if in_extraction {
-            match self
+        if in_extraction {
+            let post_llm_report = match self
                 .execute_hooks(post_llm_invocation, ctx.event_tx.as_ref())
                 .await
             {
@@ -6851,19 +7299,8 @@ where
                         .await,
                     ));
                 }
-            }
-        } else {
-            self.execute_turn_hooks(
-                post_llm_invocation,
-                ctx.run_id,
-                ctx.turn_count,
-                ctx.event_tx,
-            )
-            .await?
-        };
-
-        if let Some(error) = post_llm_report.denial_error(HookPoint::PostLlmResponse) {
-            if in_extraction {
+            };
+            if let Some(error) = post_llm_report.denial_error(HookPoint::PostLlmResponse) {
                 return Ok(CallingLlmGate::Done(
                     self.complete_extraction_failed(
                         ctx.run_id,
@@ -6875,9 +7312,57 @@ where
                     .await,
                 ));
             }
-            self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
-                .await?;
-            return Err(error);
+        } else {
+            let result = self
+                .execute_hooks(post_llm_invocation.clone(), ctx.event_tx.as_ref())
+                .await;
+            match super::hook_impl::classify_model_request_hooks(result, HookPoint::PostLlmResponse)
+            {
+                Ok(None) => {}
+                Ok(Some(failure)) => {
+                    // The response was already transported, may have streamed
+                    // and may carry provider-native effects. Only its later
+                    // local dispatch and authoritative commit are withheld;
+                    // the rejected body is dropped, never retained.
+                    let effect = super::hook_impl::withheld_after_response(
+                        assistant_msg.tool_calls().count(),
+                        !assistant_text.is_empty(),
+                        post_llm_invocation
+                            .llm_response
+                            .as_ref()
+                            .map_or(&[][..], |response| &response.server_tool_content[..]),
+                    );
+                    // The record names the request that actually produced
+                    // this response, which recovery may have replaced.
+                    let responding = ctx.responding_operation_id.clone();
+                    if self.withhold_for_controller_feedback(
+                        ctx,
+                        &post_llm_invocation,
+                        &failure,
+                        responding,
+                        effect,
+                    ) {
+                        return Ok(CallingLlmGate::Repoll);
+                    }
+                    let error = failure.fatal;
+                    self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
+                        .await?;
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
+                        .await?;
+                    return Err(error);
+                }
+            }
+        }
+        // This operation is answered and accepted; the next request is a new
+        // operation even when controller routing stays sticky.
+        *ctx.model_operation = None;
+        *ctx.model_operation_id = None;
+        *ctx.responding_operation_id = None;
+        if response_is_visible_output {
+            *ctx.run_has_visible_or_actionable_output = true;
         }
 
         if !in_extraction && !assistant_text.is_empty() {
@@ -7150,10 +7635,16 @@ where
                 &visible_tool_names,
                 tc.name.as_str(),
             ) {
-                if matches!(error, ToolError::AccessDenied { .. }) {
+                if matches!(
+                    error,
+                    ToolError::AccessDenied { .. } | ToolError::NotFound { .. }
+                ) {
                     // Visibility refusal is the same per-call outcome as a
-                    // dispatcher access denial. Preserve its id and typed
-                    // cause without entering dispatch or blocking siblings.
+                    // dispatcher access denial, and a call naming a tool absent
+                    // from every catalog is the same per-call outcome as the
+                    // direct external-call runner reports. Each keeps its own
+                    // typed cause and id without entering dispatch or blocking
+                    // siblings.
                     refused_tool_calls.push((tool_index, tc, Err(error), 0));
                     continue;
                 }
@@ -7232,6 +7723,12 @@ where
             let mut tool_session_effects = Vec::new();
             let mut tool_result = match dispatch_result {
                 Ok(mut outcome) => {
+                    if let Some(crate::ops::ToolDispatchTerminalCause::RuntimeToolError { error }) =
+                        outcome.terminal_cause()
+                        && let Some(approval_id) = requested_consent(error)
+                    {
+                        self.run_consent_attempts.requested(approval_id);
+                    }
                     if outcome.terminal_cause().is_some_and(|cause| {
                         cause.kind() == crate::ToolDispatchTerminalErrorKind::OperationObservationUnavailable
                     }) {
@@ -7265,6 +7762,9 @@ where
                     let (error, settlement_failures) = error.into_primary_and_settlement_failures();
                     if matches!(error, ToolError::OperationObservationUnavailable) {
                         deferred_failure.get_or_insert(crate::session::DeferredToolBatchFailureKind::OperationObservationUnavailable);
+                    }
+                    if let Some(approval_id) = requested_consent(&error) {
+                        self.run_consent_attempts.requested(approval_id);
                     }
                     crate::ops::terminal_tool_outcome_for_error(
                         tc.id.clone(),
@@ -7678,6 +8178,9 @@ where
                 .await?;
             return Err(error);
         }
+        // A cancel dispatched while the boundary hooks ran is observed before
+        // the machine decides the boundary.
+        self.observe_cancel_after_boundary_request(ctx.run_id)?;
         let t = self.apply_turn_input(TurnExecutionInput::BoundaryContinue {
             run_id: ctx.run_id.clone(),
         })?;
@@ -8326,6 +8829,84 @@ fn background_job_completion_notice(
         notice.push_str("\nUse shell_job_status to get the full output.");
     }
     notice
+}
+
+/// The consent approval a call's own dispatch committed when it refused the
+/// call for a human decision.
+fn requested_consent(error: &ToolError) -> Option<&crate::ApprovalId> {
+    match error {
+        ToolError::ReviewUnsatisfied {
+            kind: crate::approval::review::ReviewUnsatisfiedKind::HumanConsentRequired,
+            approval_id: Some(approval_id),
+        } => Some(approval_id),
+        _ => None,
+    }
+}
+
+/// The model-facing feedback of one in-run consent attempt: one durable
+/// runtime notice naming the original call and carrying the attempt's final
+/// published result (or its refusal) as typed content. The original call
+/// already holds its local result; this is never a second result for it.
+fn consent_attempt_notice(
+    decided: &crate::approval::consent::DecidedConsent,
+    result: &crate::types::ToolResult,
+) -> Message {
+    let tool = decided.tool_name.as_deref().unwrap_or("tool");
+    let outcome = if result.is_error {
+        "did not complete"
+    } else {
+        "ran"
+    };
+    let mut payload = serde_json::json!({
+        "approval_id": decided.approval_id,
+        "tool_use_id": decided.tool_call_id.as_ref(),
+        "tool_name": decided.tool_name,
+        "is_error": result.is_error,
+    });
+    if !result.settlement_failures.is_empty() {
+        payload["settlement_failures"] = serde_json::json!(result.settlement_failures);
+    }
+    synthetic_notice_block_message(
+        SystemNoticeKind::Generic,
+        format!(
+            "The human-approved {tool} call {} {outcome} after its approval. Its outcome follows; it is not a second result for that call.",
+            decided.tool_call_id
+        ),
+        crate::SystemNoticeBlock::RuntimeNotice {
+            category: "consent_attempt".into(),
+            detail: None,
+            payload: Some(payload),
+            content: result.content.clone(),
+        },
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+type RetainedConsentDispatchFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<crate::ops::ToolDispatchOutcome, ToolError>>
+            + Send
+            + 'static,
+    >,
+>;
+#[cfg(target_arch = "wasm32")]
+type RetainedConsentDispatchFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<crate::ops::ToolDispatchOutcome, ToolError>>
+            + 'static,
+    >,
+>;
+
+/// One decided consent's fresh retained attempt, built and polled in its own
+/// boxed frame (outside the agent run-loop poll frame, like a tool batch).
+fn dispatch_retained_consent_boxed<T: AgentToolDispatcher + ?Sized + 'static>(
+    tools: Arc<T>,
+    context: super::ToolDispatchContext,
+    approval_id: crate::ApprovalId,
+) -> RetainedConsentDispatchFuture {
+    Box::pin(async move {
+        crate::dispatch_retained_consent_attempt(&tools, &context, &approval_id).await
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -10833,6 +11414,14 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl HookEngine for DenySecondRunCompletedHook {
+            fn mandatory_topology(
+                &self,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError>
+            {
+                Ok(crate::hooks::HookMandatoryTopology::none())
+            }
+
             async fn execute(
                 &self,
                 invocation: HookInvocation,
@@ -11848,6 +12437,7 @@ mod tests {
                 provenance: Some(crate::ToolProvenance {
                     kind: crate::ToolSourceKind::Callback,
                     source_id: "test".into(),
+                    artifact: None,
                 }),
             });
             let deferred_two = Arc::new(ToolDef {
@@ -11860,6 +12450,7 @@ mod tests {
                 provenance: Some(crate::ToolProvenance {
                     kind: crate::ToolSourceKind::Callback,
                     source_id: "test".into(),
+                    artifact: None,
                 }),
             });
             let control = Arc::new(ToolDef {
@@ -11883,6 +12474,7 @@ mod tests {
                         crate::ToolProvenance {
                             kind: crate::ToolSourceKind::Callback,
                             source_id: "test".into(),
+                            artifact: None,
                         },
                     ),
                     crate::ToolCatalogEntry::session_deferred(
@@ -11891,6 +12483,7 @@ mod tests {
                         crate::ToolProvenance {
                             kind: crate::ToolSourceKind::Callback,
                             source_id: "test".into(),
+                            artifact: None,
                         },
                     ),
                     crate::ToolCatalogEntry::control_inline(control, true),
@@ -11936,6 +12529,7 @@ mod tests {
                                 last_seen_provenance: Some(crate::ToolProvenance {
                                     kind: crate::ToolSourceKind::Callback,
                                     source_id: "test".into(),
+                                    artifact: None,
                                 }),
                             },
                         )],
@@ -11963,6 +12557,7 @@ mod tests {
                 provenance: Some(crate::ToolProvenance {
                     kind: crate::ToolSourceKind::Callback,
                     source_id: "direct-builder".into(),
+                    artifact: None,
                 }),
             });
             let deferred_two = Arc::new(ToolDef {
@@ -11975,6 +12570,7 @@ mod tests {
                 provenance: Some(crate::ToolProvenance {
                     kind: crate::ToolSourceKind::Callback,
                     source_id: "direct-builder".into(),
+                    artifact: None,
                 }),
             });
 
@@ -11987,6 +12583,7 @@ mod tests {
                         crate::ToolProvenance {
                             kind: crate::ToolSourceKind::Callback,
                             source_id: "direct-builder".into(),
+                            artifact: None,
                         },
                     ),
                     crate::ToolCatalogEntry::session_deferred(
@@ -11995,6 +12592,7 @@ mod tests {
                         crate::ToolProvenance {
                             kind: crate::ToolSourceKind::Callback,
                             source_id: "direct-builder".into(),
+                            artifact: None,
                         },
                     ),
                 ]
@@ -14250,6 +14848,14 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl HookEngine for ObserveRunCompletedHook {
+            fn mandatory_topology(
+                &self,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError>
+            {
+                Ok(crate::hooks::HookMandatoryTopology::none())
+            }
+
             async fn execute(
                 &self,
                 invocation: HookInvocation,
@@ -14317,6 +14923,14 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl HookEngine for DenyRunCompletedHook {
+            fn mandatory_topology(
+                &self,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError>
+            {
+                Ok(crate::hooks::HookMandatoryTopology::none())
+            }
+
             async fn execute(
                 &self,
                 invocation: HookInvocation,
@@ -14433,6 +15047,14 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl HookEngine for PartialStartHook {
+            fn mandatory_topology(
+                &self,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError>
+            {
+                Ok(crate::hooks::HookMandatoryTopology::none())
+            }
+
             fn matching_hooks(
                 &self,
                 invocation: &HookInvocation,
@@ -14538,6 +15160,14 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl HookEngine for RecordingHook {
+            fn mandatory_topology(
+                &self,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError>
+            {
+                Ok(crate::hooks::HookMandatoryTopology::none())
+            }
+
             async fn execute(
                 &self,
                 invocation: HookInvocation,
@@ -14627,6 +15257,7 @@ mod tests {
         let provenance = ToolProvenance {
             kind: ToolSourceKind::Mcp,
             source_id: ToolSourceId::new("test-server"),
+            artifact: None,
         };
         let dispatcher = ProvenanceToolDispatcher {
             tools: vec![Arc::new(ToolDef {
@@ -14738,6 +15369,14 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl HookEngine for TimingOutHook {
+            fn mandatory_topology(
+                &self,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError>
+            {
+                Ok(crate::hooks::HookMandatoryTopology::none())
+            }
+
             fn matching_hooks(
                 &self,
                 invocation: &HookInvocation,
@@ -15204,6 +15843,14 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl HookEngine for DenyTurnBoundaryHook {
+            fn mandatory_topology(
+                &self,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError>
+            {
+                Ok(crate::hooks::HookMandatoryTopology::none())
+            }
+
             async fn execute(
                 &self,
                 invocation: HookInvocation,
@@ -15338,6 +15985,14 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl HookEngine for DenyPostLlmHook {
+            fn mandatory_topology(
+                &self,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError>
+            {
+                Ok(crate::hooks::HookMandatoryTopology::none())
+            }
+
             async fn execute(
                 &self,
                 invocation: HookInvocation,
@@ -16714,6 +17369,14 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl HookEngine for PrerequisiteHook {
+            fn mandatory_topology(
+                &self,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError>
+            {
+                Ok(crate::hooks::HookMandatoryTopology::none())
+            }
+
             async fn execute(
                 &self,
                 invocation: HookInvocation,
@@ -16878,6 +17541,7 @@ mod tests {
                     .with_provenance(crate::ToolProvenance {
                         kind: crate::ToolSourceKind::Callback,
                         source_id: "denial-fixture".into(),
+                        artifact: None,
                     }),
                 ),
                 Arc::new(ToolDef::new(
@@ -17218,6 +17882,218 @@ mod tests {
                 None,
             )
             .await;
+        }
+    }
+
+    /// A model call naming a tool absent from every catalog is typed
+    /// operation-local feedback: the permitted sibling still runs, the next
+    /// model turn receives both results in call order, and the run completes.
+    #[tokio::test]
+    async fn missing_tool_call_is_call_local_feedback_and_run_continues() {
+        struct RecordingDispatcher {
+            tools: Arc<[Arc<ToolDef>]>,
+            dispatched: Mutex<Vec<(String, String)>>,
+        }
+
+        #[async_trait]
+        impl AgentToolDispatcher for RecordingDispatcher {
+            fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+                Arc::clone(&self.tools)
+            }
+
+            async fn dispatch(
+                &self,
+                call: ToolCallView<'_>,
+            ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
+                self.dispatched
+                    .lock()
+                    .unwrap()
+                    .push((call.id.to_string(), call.name.to_string()));
+                Ok(crate::ops::ToolDispatchOutcome::from(ToolResult::new(
+                    call.id.to_string(),
+                    "ok".to_string(),
+                    false,
+                )))
+            }
+        }
+
+        struct MissingToolCallClient {
+            call_count: Mutex<u32>,
+            missing_first: bool,
+            observed_messages: Mutex<Vec<Vec<Message>>>,
+        }
+
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+        impl AgentLlmClient for MissingToolCallClient {
+            async fn stream_response(
+                &self,
+                messages: &[Message],
+                tools: &[Arc<ToolDef>],
+                _max_tokens: u32,
+                _temperature: Option<f32>,
+                _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+            ) -> Result<super::LlmStreamResult, AgentError> {
+                assert!(
+                    tools.iter().all(|tool| tool.name != "sentinel_write"),
+                    "the missing tool is never offered"
+                );
+                self.observed_messages
+                    .lock()
+                    .unwrap()
+                    .push(messages.to_vec());
+                let mut calls = self.call_count.lock().unwrap();
+                let response = if *calls == 0 {
+                    let mut blocks = vec![
+                        AssistantBlock::ToolUse {
+                            id: "call-missing".to_string(),
+                            name: "sentinel_write".into(),
+                            args: serde_json::value::RawValue::from_string("{}".to_string())
+                                .expect("static raw value should parse"),
+                            meta: None,
+                        },
+                        AssistantBlock::ToolUse {
+                            id: "call-open".to_string(),
+                            name: "open_tool".into(),
+                            args: serde_json::value::RawValue::from_string("{}".to_string())
+                                .expect("static raw value should parse"),
+                            meta: None,
+                        },
+                    ];
+                    if !self.missing_first {
+                        blocks.reverse();
+                    }
+                    super::LlmStreamResult::new(
+                        blocks,
+                        StopReason::ToolUse,
+                        normalized_test_usage(self, Usage::default()),
+                    )
+                } else {
+                    super::LlmStreamResult::new(
+                        vec![AssistantBlock::Text {
+                            text: "done".to_string(),
+                            meta: None,
+                        }],
+                        StopReason::EndTurn,
+                        normalized_test_usage(self, Usage::default()),
+                    )
+                };
+                *calls += 1;
+                Ok(response)
+            }
+
+            fn provider(&self) -> crate::provider::Provider {
+                crate::provider::Provider::Other
+            }
+
+            fn model(&self) -> &'static str {
+                "mock-model"
+            }
+        }
+
+        for missing_first in [true, false] {
+            let tools = Arc::new(RecordingDispatcher {
+                tools: Arc::from([Arc::new(ToolDef::new(
+                    "open_tool",
+                    "permitted sibling",
+                    serde_json::json!({ "type": "object" }),
+                ))]),
+                dispatched: Mutex::new(Vec::new()),
+            });
+            let client = Arc::new(MissingToolCallClient {
+                call_count: Mutex::new(0),
+                missing_first,
+                observed_messages: Mutex::new(Vec::new()),
+            });
+            let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+                .with_tool_visibility_owner(explicit_test_visibility_owner())
+                .build_standalone(client.clone(), tools.clone(), Arc::new(NoopStore))
+                .await;
+
+            let (tx, mut rx) = mpsc::channel(64);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                agent.run_with_events("call both tools".to_string().into(), tx),
+            )
+            .await
+            .expect("run must complete promptly after the missing-tool call")
+            .expect("a missing-tool call must not abandon the turn");
+
+            assert_eq!(result.turns, 2);
+            assert_eq!(result.text, "done");
+            assert_eq!(*client.call_count.lock().unwrap(), 2);
+            assert_eq!(
+                *tools.dispatched.lock().unwrap(),
+                [("call-open".to_string(), "open_tool".to_string())],
+                "only the permitted sibling enters dispatch"
+            );
+
+            let expected_ids = if missing_first {
+                ["call-missing", "call-open"]
+            } else {
+                ["call-open", "call-missing"]
+            };
+            let observations = client.observed_messages.lock().unwrap();
+            let follow_up_results = observations[1]
+                .iter()
+                .filter_map(|message| match message {
+                    Message::ToolResults { results, .. } => Some(results),
+                    _ => None,
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                follow_up_results
+                    .iter()
+                    .map(|result| result.tool_use_id.as_str())
+                    .collect::<Vec<_>>(),
+                expected_ids,
+                "the next model request receives both results in call order"
+            );
+            for result in follow_up_results {
+                if result.tool_use_id == "call-missing" {
+                    let expected = crate::ops::terminal_tool_outcome_for_error(
+                        "call-missing",
+                        ToolError::not_found("sentinel_write"),
+                    );
+                    assert!(result.is_error);
+                    assert_eq!(result.content, expected.result.content);
+                    let payload: serde_json::Value =
+                        serde_json::from_str(&crate::types::text_content(&result.content))
+                            .expect("missing-tool feedback uses the canonical JSON envelope");
+                    assert_eq!(
+                        payload["error"], "tool_not_found",
+                        "a missing tool is not relabelled as an authorization denial"
+                    );
+                } else {
+                    assert!(!result.is_error);
+                    assert_eq!(crate::types::text_content(&result.content), "ok");
+                }
+            }
+            drop(observations);
+
+            let mut missing_started = false;
+            let mut result_ids = Vec::new();
+            let mut run_completed = false;
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    crate::event::AgentEvent::ToolExecutionStarted { id, .. } => {
+                        missing_started |= id == "call-missing";
+                    }
+                    crate::event::AgentEvent::ToolResultReceived { id, is_error, .. } => {
+                        assert_eq!(is_error, id == "call-missing");
+                        result_ids.push(id);
+                    }
+                    crate::event::AgentEvent::RunFailed { .. } => {
+                        panic!("a missing-tool call must not emit RunFailed");
+                    }
+                    crate::event::AgentEvent::RunCompleted { .. } => run_completed = true,
+                    _ => {}
+                }
+            }
+            assert!(!missing_started, "the missing tool never starts execution");
+            assert_eq!(result_ids, expected_ids);
+            assert!(run_completed);
         }
     }
 
@@ -17945,6 +18821,14 @@ mod tests {
 
         #[async_trait]
         impl HookEngine for Guardrail {
+            fn mandatory_topology(
+                &self,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError>
+            {
+                Ok(crate::hooks::HookMandatoryTopology::none())
+            }
+
             async fn execute(
                 &self,
                 invocation: HookInvocation,
@@ -19183,6 +20067,14 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl HookEngine for RecordingPostToolHook {
+            fn mandatory_topology(
+                &self,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError>
+            {
+                Ok(crate::hooks::HookMandatoryTopology::none())
+            }
+
             async fn execute(
                 &self,
                 invocation: HookInvocation,
@@ -19850,6 +20742,7 @@ mod tests {
                                     last_seen_provenance: Some(crate::ToolProvenance {
                                         kind: crate::ToolSourceKind::Callback,
                                         source_id: "test".into(),
+                                        artifact: None,
                                     }),
                                 },
                             )],
@@ -19880,6 +20773,14 @@ mod tests {
 
         #[async_trait]
         impl HookEngine for Guardrail {
+            fn mandatory_topology(
+                &self,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError>
+            {
+                Ok(crate::hooks::HookMandatoryTopology::none())
+            }
+
             async fn execute(
                 &self,
                 invocation: HookInvocation,
@@ -20815,6 +21716,7 @@ mod tests {
                         provenance: Some(crate::ToolProvenance {
                             kind: crate::ToolSourceKind::Callback,
                             source_id: (*name).into(),
+                            artifact: None,
                         }),
                     })
                 })
@@ -21615,6 +22517,14 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl HookEngine for RequestBoundaryCancelHook {
+            fn mandatory_topology(
+                &self,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError>
+            {
+                Ok(crate::hooks::HookMandatoryTopology::none())
+            }
+
             async fn execute(
                 &self,
                 invocation: HookInvocation,
@@ -21687,6 +22597,676 @@ mod tests {
                 "cancelled boundary must not emit RunCompleted"
             );
         }
+    }
+
+    /// A dispatcher with one ordinary tool that counts its calls.
+    struct OkDispatcher {
+        tools: Arc<[Arc<ToolDef>]>,
+        dispatched: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl AgentToolDispatcher for OkDispatcher {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            Arc::clone(&self.tools)
+        }
+
+        async fn dispatch(
+            &self,
+            call: ToolCallView<'_>,
+        ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
+            *self.dispatched.lock().unwrap() += 1;
+            Ok(crate::ops::ToolDispatchOutcome::from(ToolResult::new(
+                call.id.to_string(),
+                "ok".to_string(),
+                false,
+            )))
+        }
+    }
+
+    struct ToolThenTextClient {
+        calls: Mutex<u32>,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentLlmClient for ToolThenTextClient {
+        async fn stream_response(
+            &self,
+            _messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<super::LlmStreamResult, AgentError> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            Ok(if *calls == 1 {
+                super::LlmStreamResult::new(
+                    vec![AssistantBlock::ToolUse {
+                        id: "call-tool".to_string(),
+                        name: "real_tool".into(),
+                        args: serde_json::value::RawValue::from_string("{}".to_string())
+                            .expect("static raw value should parse"),
+                        meta: None,
+                    }],
+                    StopReason::ToolUse,
+                    normalized_test_usage(self, Usage::default()),
+                )
+            } else {
+                super::LlmStreamResult::new(
+                    vec![AssistantBlock::Text {
+                        text: "done".to_string(),
+                        meta: None,
+                    }],
+                    StopReason::EndTurn,
+                    normalized_test_usage(self, Usage::default()),
+                )
+            })
+        }
+
+        fn provider(&self) -> crate::provider::Provider {
+            crate::provider::Provider::Other
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+    }
+
+    /// A staged run with one ordinary tool and its scripted client.
+    async fn boundary_cancel_agent() -> (
+        crate::agent::Agent<ToolThenTextClient, OkDispatcher, NoopStore>,
+        Arc<ToolThenTextClient>,
+        Arc<OkDispatcher>,
+        RunId,
+    ) {
+        let tools = Arc::new(OkDispatcher {
+            tools: Arc::from([Arc::new(ToolDef::new(
+                "real_tool",
+                "an ordinary tool",
+                serde_json::json!({ "type": "object" }),
+            ))]),
+            dispatched: Mutex::new(0),
+        });
+        let client = Arc::new(ToolThenTextClient {
+            calls: Mutex::new(0),
+        });
+        let agent = with_test_turn_state_handle(AgentBuilder::new())
+            .with_tool_visibility_owner(explicit_test_visibility_owner())
+            .build_standalone(client.clone(), tools.clone(), Arc::new(NoopStore))
+            .await;
+        let run_id = RunId::new();
+        agent
+            .turn_state_handle
+            .as_deref()
+            .expect("test agent should have a turn-state handle")
+            .start_conversation_run(
+                run_id.clone(),
+                TurnPrimitiveKind::ConversationTurn,
+                ContentShape::Conversation,
+                false,
+                false,
+                0,
+            )
+            .expect("stage the exact run for run_loop to apply");
+        (agent, client, tools, run_id)
+    }
+
+    /// #1471: a cancel-after-boundary command for a run dispatched while the
+    /// run was staged, before the agent claimed it, is not discarded at run
+    /// start: the run ends at its first boundary and the model is not called
+    /// after the tool batch. A command for another run is still discarded.
+    #[tokio::test]
+    async fn a_cancel_dispatched_while_the_run_was_staged_ends_it_at_its_first_boundary() {
+        use crate::agent::CancelAfterBoundaryCommand;
+
+        let (mut agent, client, tools, run_id) = boundary_cancel_agent().await;
+        let sender = agent.cancel_after_boundary_handle();
+        sender
+            .send(CancelAfterBoundaryCommand::for_run(RunId::new()))
+            .expect("a stale command for another run");
+        sender
+            .send(CancelAfterBoundaryCommand::for_run(run_id))
+            .expect("the staged run's command");
+
+        let (tx, _rx) = mpsc::channel::<crate::event::AgentEvent>(64);
+        let error = agent
+            .run_with_events("prompt".to_string().into(), tx)
+            .await
+            .expect_err("the staged run's cancel must cancel it");
+        assert!(matches!(error, AgentError::Cancelled), "{error:?}");
+        assert_eq!(*tools.dispatched.lock().unwrap(), 1, "the tool batch ran");
+        assert_eq!(
+            *client.calls.lock().unwrap(),
+            1,
+            "the model is not called again after the cancelled boundary"
+        );
+    }
+
+    /// A command for another run alone never cancels this one.
+    #[tokio::test]
+    async fn a_cancel_for_another_run_never_cancels_this_one() {
+        use crate::agent::CancelAfterBoundaryCommand;
+
+        let (mut agent, client, _tools, _run_id) = boundary_cancel_agent().await;
+        agent
+            .cancel_after_boundary_handle()
+            .send(CancelAfterBoundaryCommand::for_run(RunId::new()))
+            .expect("a stale command for another run");
+        let (tx, _rx) = mpsc::channel::<crate::event::AgentEvent>(64);
+        let result = agent
+            .run_with_events("prompt".to_string().into(), tx)
+            .await
+            .expect("a stale command does not cancel this run");
+        assert_eq!(result.text, "done");
+        assert_eq!(*client.calls.lock().unwrap(), 2);
+    }
+
+    /// A cancel requested while a tool batch runs ends the run at the
+    /// post-tool boundary, as at the text boundary: the turn is cancelled and
+    /// the model is not called again.
+    #[tokio::test]
+    async fn post_tool_boundary_cancel_ends_the_run_without_another_model_call() {
+        use crate::agent::{CancelAfterBoundaryCommand, CancelAfterBoundarySender};
+        use crate::hooks::{
+            HookEngine, HookEngineError, HookExecutionReport, HookInvocation, HookPoint,
+        };
+
+        struct RequestBoundaryCancelHook {
+            sender: CancelAfterBoundarySender,
+            expected_run_id: RunId,
+        }
+
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+        impl HookEngine for RequestBoundaryCancelHook {
+            fn mandatory_topology(
+                &self,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError>
+            {
+                Ok(crate::hooks::HookMandatoryTopology::none())
+            }
+
+            async fn execute(
+                &self,
+                invocation: HookInvocation,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<HookExecutionReport, HookEngineError> {
+                if invocation.point == HookPoint::PostToolExecution {
+                    self.sender
+                        .send(CancelAfterBoundaryCommand::for_run(
+                            self.expected_run_id.clone(),
+                        ))
+                        .expect("agent must retain the cancel-after-boundary receiver");
+                }
+                Ok(HookExecutionReport::empty())
+            }
+        }
+
+        let (mut agent, client, tools, expected_run_id) = boundary_cancel_agent().await;
+        agent.hook_engine = Some(Arc::new(RequestBoundaryCancelHook {
+            sender: agent.cancel_after_boundary_handle(),
+            expected_run_id,
+        }));
+
+        let (tx, _rx) = mpsc::channel::<crate::event::AgentEvent>(64);
+        let error = agent
+            .run_with_events("prompt".to_string().into(), tx)
+            .await
+            .expect_err("a cancel at the post-tool boundary must cancel the run");
+        assert!(
+            matches!(error, AgentError::Cancelled),
+            "unexpected post-tool boundary cancellation result: {error:?}"
+        );
+        assert_eq!(*tools.dispatched.lock().unwrap(), 1, "the tool batch ran");
+        assert_eq!(
+            *client.calls.lock().unwrap(),
+            1,
+            "the model is not called again after the cancelled boundary"
+        );
+        let snapshot = agent
+            .execution_snapshot()
+            .expect("snapshot projects")
+            .expect("test turn-state handle should expose a snapshot");
+        assert_eq!(snapshot.turn_phase, crate::TurnPhase::Cancelled);
+        assert_eq!(
+            snapshot.terminal_outcome,
+            crate::TurnTerminalOutcome::Cancelled
+        );
+    }
+
+    /// An ops registry whose barrier waits are already satisfied, so a turn
+    /// passes through WaitingForOps to its tool boundary.
+    struct BarrierReadyRegistry {
+        cursor: std::sync::atomic::AtomicU64,
+        advance_failures_remaining: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BarrierReadyRegistry {
+        fn new() -> Self {
+            Self {
+                cursor: std::sync::atomic::AtomicU64::new(0),
+                advance_failures_remaining: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn cursor(&self) -> u64 {
+            self.cursor.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::ops_lifecycle::OpsLifecycleRegistry for BarrierReadyRegistry {
+        fn register_operation(
+            &self,
+            _spec: crate::ops_lifecycle::OperationSpec,
+        ) -> Result<(), crate::ops_lifecycle::OpsLifecycleError> {
+            unreachable!("completion delivery test does not register operations")
+        }
+
+        fn provisioning_succeeded(
+            &self,
+            _id: &crate::ops::OperationId,
+        ) -> Result<(), crate::ops_lifecycle::OpsLifecycleError> {
+            unreachable!("completion delivery test does not provision operations")
+        }
+
+        fn provisioning_failed(
+            &self,
+            _id: &crate::ops::OperationId,
+            _error: String,
+        ) -> Result<(), crate::ops_lifecycle::OpsLifecycleError> {
+            unreachable!("completion delivery test does not provision operations")
+        }
+
+        fn peer_ready(
+            &self,
+            _id: &crate::ops::OperationId,
+            _peer: crate::ops_lifecycle::OperationPeerHandle,
+        ) -> Result<(), crate::ops_lifecycle::OpsLifecycleError> {
+            unreachable!("completion delivery test does not publish peers")
+        }
+
+        fn register_watcher(
+            &self,
+            _id: &crate::ops::OperationId,
+        ) -> Result<
+            crate::ops_lifecycle::OperationCompletionWatch,
+            crate::ops_lifecycle::OpsLifecycleError,
+        > {
+            unreachable!("completion delivery test does not watch operations")
+        }
+
+        fn report_progress(
+            &self,
+            _id: &crate::ops::OperationId,
+            _update: crate::ops_lifecycle::OperationProgressUpdate,
+        ) -> Result<(), crate::ops_lifecycle::OpsLifecycleError> {
+            unreachable!("completion delivery test does not report progress")
+        }
+
+        fn complete_operation(
+            &self,
+            _id: &crate::ops::OperationId,
+            _result: crate::ops::OperationResult,
+        ) -> Result<(), crate::ops_lifecycle::OpsLifecycleError> {
+            unreachable!("completion delivery test does not complete through the registry")
+        }
+
+        fn fail_operation(
+            &self,
+            _id: &crate::ops::OperationId,
+            _error: String,
+        ) -> Result<(), crate::ops_lifecycle::OpsLifecycleError> {
+            unreachable!("completion delivery test does not fail operations")
+        }
+
+        fn abort_provisioning(
+            &self,
+            _id: &crate::ops::OperationId,
+            _reason: Option<String>,
+        ) -> Result<(), crate::ops_lifecycle::OpsLifecycleError> {
+            unreachable!("completion delivery test does not abort operations")
+        }
+
+        fn cancel_operation(
+            &self,
+            _id: &crate::ops::OperationId,
+            _reason: Option<String>,
+        ) -> Result<(), crate::ops_lifecycle::OpsLifecycleError> {
+            unreachable!("completion delivery test does not cancel operations")
+        }
+
+        fn request_retire(
+            &self,
+            _id: &crate::ops::OperationId,
+        ) -> Result<(), crate::ops_lifecycle::OpsLifecycleError> {
+            unreachable!("completion delivery test does not retire operations")
+        }
+
+        fn mark_retired(
+            &self,
+            _id: &crate::ops::OperationId,
+        ) -> Result<(), crate::ops_lifecycle::OpsLifecycleError> {
+            unreachable!("completion delivery test does not retire operations")
+        }
+
+        fn snapshot(
+            &self,
+            _id: &crate::ops::OperationId,
+        ) -> Result<
+            Option<crate::ops_lifecycle::OperationLifecycleSnapshot>,
+            crate::ops_lifecycle::OpsLifecycleError,
+        > {
+            unreachable!("completion delivery test does not snapshot operations")
+        }
+
+        fn list_operations(
+            &self,
+        ) -> Result<
+            Vec<crate::ops_lifecycle::OperationLifecycleSnapshot>,
+            crate::ops_lifecycle::OpsLifecycleError,
+        > {
+            unreachable!("completion delivery test does not list operations")
+        }
+
+        fn terminate_owner(
+            &self,
+            _reason: String,
+        ) -> Result<(), crate::ops_lifecycle::OpsLifecycleError> {
+            unreachable!("completion delivery test does not terminate owners")
+        }
+
+        fn classify_operation_completion_wake(
+            &self,
+            _id: &crate::ops::OperationId,
+            _kind: crate::ops_lifecycle::OperationKind,
+        ) -> Result<
+            crate::ops_lifecycle::OperationCompletionWakeClass,
+            crate::ops_lifecycle::OpsLifecycleError,
+        > {
+            Ok(crate::ops_lifecycle::OperationCompletionWakeClass::Wake)
+        }
+
+        fn completion_cursor(
+            &self,
+            _consumer: crate::ops_lifecycle::CompletionCursorConsumer,
+        ) -> Result<Option<u64>, crate::ops_lifecycle::OpsLifecycleError> {
+            Ok(Some(self.cursor()))
+        }
+
+        fn advance_completion_cursor(
+            &self,
+            _consumer: crate::ops_lifecycle::CompletionCursorConsumer,
+            cursor: u64,
+            _projection: Option<&crate::runtime_epoch::EpochCursorState>,
+        ) -> Result<u64, crate::ops_lifecycle::OpsLifecycleError> {
+            if self
+                .advance_failures_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Err(crate::ops_lifecycle::OpsLifecycleError::Internal(
+                    "injected completion cursor refusal".to_string(),
+                ));
+            }
+            self.cursor
+                .store(cursor, std::sync::atomic::Ordering::SeqCst);
+            Ok(cursor)
+        }
+        fn wait_all(
+            &self,
+            run_id: &RunId,
+            ids: &[crate::ops::OperationId],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            crate::ops_lifecycle::WaitAllResult,
+                            crate::ops_lifecycle::OpsLifecycleError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(std::future::ready(Ok(
+                crate::ops_lifecycle::WaitAllResult {
+                    outcomes: Vec::new(),
+                    satisfied: crate::ops_lifecycle::WaitAllSatisfied {
+                        wait_request_id: crate::lifecycle::WaitRequestId::new(),
+                        run_id: run_id.clone(),
+                        operation_ids: ids.to_vec(),
+                    },
+                },
+            )))
+        }
+    }
+
+    /// A dispatcher whose one tool returns its result plus a barrier op, so the
+    /// turn takes the WaitingForOps path to its tool boundary.
+    struct BarrierOkDispatcher {
+        tools: Arc<[Arc<ToolDef>]>,
+    }
+
+    #[async_trait]
+    impl AgentToolDispatcher for BarrierOkDispatcher {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            Arc::clone(&self.tools)
+        }
+
+        async fn dispatch(
+            &self,
+            call: ToolCallView<'_>,
+        ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
+            let mut outcome = crate::ops::ToolDispatchOutcome::sync_result(ToolResult::new(
+                call.id.to_string(),
+                "queued".to_string(),
+                false,
+            ));
+            outcome.async_ops.push(crate::ops::AsyncOpRef::barrier(
+                crate::ops::OperationId::new(),
+            ));
+            Ok(outcome)
+        }
+    }
+
+    /// The WaitingForOps twin of `boundary_cancel_agent`: a staged run whose
+    /// tool batch registers a barrier op that is already satisfied.
+    async fn barrier_boundary_cancel_agent() -> (
+        crate::agent::Agent<ToolThenTextClient, BarrierOkDispatcher, NoopStore>,
+        Arc<ToolThenTextClient>,
+        RunId,
+    ) {
+        let tools = Arc::new(BarrierOkDispatcher {
+            tools: Arc::from([Arc::new(ToolDef::new(
+                "real_tool",
+                "a tool that queues a barrier op",
+                serde_json::json!({ "type": "object" }),
+            ))]),
+        });
+        let client = Arc::new(ToolThenTextClient {
+            calls: Mutex::new(0),
+        });
+        let agent = with_test_turn_state_handle(
+            AgentBuilder::new().with_ops_lifecycle(Arc::new(BarrierReadyRegistry::new())),
+        )
+        .with_tool_visibility_owner(explicit_test_visibility_owner())
+        .build_standalone(client.clone(), tools, Arc::new(NoopStore))
+        .await;
+        let run_id = RunId::new();
+        agent
+            .turn_state_handle
+            .as_deref()
+            .expect("test agent should have a turn-state handle")
+            .start_conversation_run(
+                run_id.clone(),
+                TurnPrimitiveKind::ConversationTurn,
+                ContentShape::Conversation,
+                false,
+                false,
+                0,
+            )
+            .expect("stage the exact run for run_loop to apply");
+        (agent, client, run_id)
+    }
+
+    /// The WaitingForOps path observes a cancel requested during its
+    /// turn-boundary hooks before the machine decides that boundary.
+    #[tokio::test]
+    async fn a_cancel_during_waiting_for_ops_boundary_hooks_ends_the_run_at_that_boundary() {
+        let (mut agent, client, run_id) = barrier_boundary_cancel_agent().await;
+        let hook = Arc::new(CancelAtHookPoint {
+            point: crate::hooks::HookPoint::TurnBoundary,
+            sender: agent.cancel_after_boundary_handle(),
+            cancel_run_id: Some(run_id),
+            invoked: Mutex::new(0),
+        });
+        agent.hook_engine = Some(hook.clone());
+
+        let (tx, _rx) = mpsc::channel::<crate::event::AgentEvent>(64);
+        let error = agent
+            .run_with_events("prompt".to_string().into(), tx)
+            .await
+            .expect_err("a cancel during the boundary hooks must cancel the run");
+        assert!(matches!(error, AgentError::Cancelled), "{error:?}");
+        assert_eq!(*hook.invoked.lock().unwrap(), 1, "one boundary drained");
+        assert_eq!(
+            *client.calls.lock().unwrap(),
+            1,
+            "the model is not called again after the cancelled boundary"
+        );
+        let snapshot = agent
+            .execution_snapshot()
+            .expect("snapshot projects")
+            .expect("test turn-state handle should expose a snapshot");
+        assert_eq!(snapshot.turn_phase, crate::TurnPhase::Cancelled);
+    }
+
+    /// The same WaitingForOps boundary hooks without a Stop continue the run.
+    #[tokio::test]
+    async fn waiting_for_ops_boundary_hooks_without_a_cancel_continue_the_run() {
+        let (mut agent, client, _run_id) = barrier_boundary_cancel_agent().await;
+        let hook = Arc::new(CancelAtHookPoint {
+            point: crate::hooks::HookPoint::TurnBoundary,
+            sender: agent.cancel_after_boundary_handle(),
+            cancel_run_id: None,
+            invoked: Mutex::new(0),
+        });
+        agent.hook_engine = Some(hook.clone());
+
+        let (tx, _rx) = mpsc::channel::<crate::event::AgentEvent>(64);
+        let result = agent
+            .run_with_events("prompt".to_string().into(), tx)
+            .await
+            .expect("boundary hooks without a cancel do not end the run");
+        assert_eq!(result.text, "done");
+        assert!(*hook.invoked.lock().unwrap() >= 1, "the boundary hooks ran");
+        assert_eq!(*client.calls.lock().unwrap(), 2);
+    }
+
+    /// Runs at one hook point and, when given a run, requests that run's
+    /// cancel-after-boundary there.
+    struct CancelAtHookPoint {
+        point: crate::hooks::HookPoint,
+        sender: crate::agent::CancelAfterBoundarySender,
+        cancel_run_id: Option<RunId>,
+        invoked: Mutex<u32>,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl crate::hooks::HookEngine for CancelAtHookPoint {
+        fn mandatory_topology(
+            &self,
+            _overrides: Option<&crate::config::HookRunOverrides>,
+        ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError> {
+            Ok(crate::hooks::HookMandatoryTopology::none())
+        }
+
+        async fn execute(
+            &self,
+            invocation: crate::hooks::HookInvocation,
+            _overrides: Option<&crate::config::HookRunOverrides>,
+        ) -> Result<crate::hooks::HookExecutionReport, crate::hooks::HookEngineError> {
+            if invocation.point == self.point {
+                *self.invoked.lock().unwrap() += 1;
+                if let Some(run_id) = &self.cancel_run_id {
+                    self.sender
+                        .send(crate::agent::CancelAfterBoundaryCommand::for_run(
+                            run_id.clone(),
+                        ))
+                        .expect("agent must retain the cancel-after-boundary receiver");
+                }
+            }
+            Ok(crate::hooks::HookExecutionReport::empty())
+        }
+    }
+
+    /// A cancel requested while the turn-boundary hooks drain is observed
+    /// before the machine decides that boundary: the run is cancelled there
+    /// and the model is not called again.
+    #[tokio::test]
+    async fn a_cancel_requested_during_turn_boundary_hooks_ends_the_run_at_that_boundary() {
+        let (mut agent, client, tools, run_id) = boundary_cancel_agent().await;
+        let hook = Arc::new(CancelAtHookPoint {
+            point: crate::hooks::HookPoint::TurnBoundary,
+            sender: agent.cancel_after_boundary_handle(),
+            cancel_run_id: Some(run_id),
+            invoked: Mutex::new(0),
+        });
+        agent.hook_engine = Some(hook.clone());
+
+        let (tx, _rx) = mpsc::channel::<crate::event::AgentEvent>(64);
+        let error = agent
+            .run_with_events("prompt".to_string().into(), tx)
+            .await
+            .expect_err("a cancel during the boundary hooks must cancel the run");
+        assert!(matches!(error, AgentError::Cancelled), "{error:?}");
+        assert_eq!(*hook.invoked.lock().unwrap(), 1, "one boundary drained");
+        assert_eq!(*tools.dispatched.lock().unwrap(), 1, "the tool batch ran");
+        assert_eq!(
+            *client.calls.lock().unwrap(),
+            1,
+            "the model is not called again after the cancelled boundary"
+        );
+        let snapshot = agent
+            .execution_snapshot()
+            .expect("snapshot projects")
+            .expect("test turn-state handle should expose a snapshot");
+        assert_eq!(snapshot.turn_phase, crate::TurnPhase::Cancelled);
+        assert_eq!(
+            snapshot.terminal_outcome,
+            crate::TurnTerminalOutcome::Cancelled
+        );
+    }
+
+    /// The same boundary hooks without a Stop leave the run to continue to
+    /// the model and complete normally.
+    #[tokio::test]
+    async fn turn_boundary_hooks_without_a_cancel_continue_the_run() {
+        let (mut agent, client, tools, _run_id) = boundary_cancel_agent().await;
+        let hook = Arc::new(CancelAtHookPoint {
+            point: crate::hooks::HookPoint::TurnBoundary,
+            sender: agent.cancel_after_boundary_handle(),
+            cancel_run_id: None,
+            invoked: Mutex::new(0),
+        });
+        agent.hook_engine = Some(hook.clone());
+
+        let (tx, _rx) = mpsc::channel::<crate::event::AgentEvent>(64);
+        let result = agent
+            .run_with_events("prompt".to_string().into(), tx)
+            .await
+            .expect("boundary hooks without a cancel do not end the run");
+        assert_eq!(result.text, "done");
+        assert!(*hook.invoked.lock().unwrap() >= 1, "the boundary hooks ran");
+        assert_eq!(*tools.dispatched.lock().unwrap(), 1);
+        assert_eq!(*client.calls.lock().unwrap(), 2);
     }
 
     #[tokio::test]
@@ -27270,6 +28850,14 @@ mod tests {
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
         impl HookEngine for DenySecondBoundary {
+            fn mandatory_topology(
+                &self,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError>
+            {
+                Ok(crate::hooks::HookMandatoryTopology::none())
+            }
+
             async fn execute(
                 &self,
                 invocation: HookInvocation,
@@ -28874,6 +30462,7 @@ mod tests {
             unavailable: bool,
             preparations: AtomicUsize,
             attempts: AtomicUsize,
+            ids: Mutex<Vec<crate::OperationId>>,
         }
 
         impl RefusedAlternate {
@@ -28944,7 +30533,12 @@ mod tests {
                     provider_params.is_none(),
                     "exercise bare refusal without hosted params"
                 );
-                assert!(authorization.unwrap().usage() == ModelAuthorizationUse::Inference);
+                let authorization = authorization.unwrap();
+                assert!(authorization.usage() == ModelAuthorizationUse::Inference);
+                self.ids
+                    .lock()
+                    .unwrap()
+                    .push(authorization.operation_id().clone());
                 self.preparations.fetch_add(1, Ordering::Relaxed);
                 if matches!(self.boundary, RefusalBoundary::Prepare) {
                     Err(self.refusal())
@@ -28991,6 +30585,7 @@ mod tests {
                         unavailable: false,
                         preparations: AtomicUsize::new(0),
                         attempts: AtomicUsize::new(0),
+                        ids: Mutex::new(Vec::new()),
                     });
                     let controller = Arc::new(FixtureClient {
                         requests: Mutex::new(Vec::new()),
@@ -29064,6 +30659,622 @@ mod tests {
             }
         }
 
+        /// A PreLlm gate fixture. It denies every ordinary request and,
+        /// when `deny_feedback` is set, the feedback request it attests it
+        /// does not govern too. `attest` controls whether it states the gate.
+        struct DenyModelRequests {
+            seen: Mutex<Vec<crate::hooks::HookModelOperation>>,
+            point: crate::hooks::HookPoint,
+            attest: bool,
+            deny_feedback: bool,
+        }
+
+        impl DenyModelRequests {
+            fn new(attest: bool, deny_feedback: bool) -> Arc<Self> {
+                Self::at(
+                    crate::hooks::HookPoint::PreLlmRequest,
+                    attest,
+                    deny_feedback,
+                )
+            }
+
+            fn at(point: crate::hooks::HookPoint, attest: bool, deny_feedback: bool) -> Arc<Self> {
+                Arc::new(Self {
+                    seen: Mutex::new(Vec::new()),
+                    point,
+                    attest,
+                    deny_feedback,
+                })
+            }
+
+            fn seen(&self) -> Vec<crate::hooks::HookModelOperation> {
+                self.seen.lock().unwrap().clone()
+            }
+        }
+
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+        impl crate::hooks::HookEngine for DenyModelRequests {
+            fn mandatory_topology(
+                &self,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError>
+            {
+                if !self.attest {
+                    return Ok(crate::hooks::HookMandatoryTopology::none());
+                }
+                Ok(crate::hooks::HookMandatoryTopology::from_entries([
+                    &crate::config::HookEntryConfig {
+                        id: crate::hooks::HookId::new("deny-model-requests"),
+                        point: self.point,
+                        capability: crate::hooks::HookCapability::Guardrail,
+                        model_operations: crate::hooks::HookModelOperationScope::OrdinaryOnly,
+                        ..Default::default()
+                    },
+                ]))
+            }
+
+            async fn execute(
+                &self,
+                invocation: crate::hooks::HookInvocation,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<crate::hooks::HookExecutionReport, crate::hooks::HookEngineError>
+            {
+                if invocation.point != self.point {
+                    return Ok(crate::hooks::HookExecutionReport::empty());
+                }
+                let operation = invocation.model_operation().cloned().unwrap();
+                let feedback = matches!(
+                    operation,
+                    crate::hooks::HookModelOperation::ControllerFeedback { .. }
+                );
+                self.seen.lock().unwrap().push(operation);
+                if feedback && !self.deny_feedback {
+                    return Ok(crate::hooks::HookExecutionReport::empty());
+                }
+                Ok(crate::hooks::HookExecutionReport {
+                    decision: Some(crate::hooks::HookDecision::Deny {
+                        hook_id: crate::hooks::HookId::new("deny-model-requests"),
+                        reason_code: crate::hooks::HookReasonCode::PolicyViolation,
+                        message: "denied".to_string(),
+                        payload: None,
+                    }),
+                    ..crate::hooks::HookExecutionReport::empty()
+                })
+            }
+        }
+
+        /// The fixture policy as protected custody: records prepared
+        /// operation ids and staged mandatory-hook withholdings, and can fail
+        /// the sink or refuse controller preparation.
+        struct RecordingAudit {
+            inner: FixturePolicy,
+            prepared: Mutex<Vec<(crate::OperationId, Option<ModelAuthorizationUse>)>>,
+            withheld: Mutex<Vec<crate::authorization::MandatoryHookWithholdingRecord>>,
+            /// How many of the next withholding appends fail.
+            fail_appends: AtomicUsize,
+            refuse_controller: bool,
+        }
+
+        impl RecordingAudit {
+            fn new(fail_appends: usize, refuse_controller: bool) -> Arc<Self> {
+                Arc::new(Self {
+                    inner: FixturePolicy {
+                        hosted_denials: AtomicUsize::new(0),
+                        compaction_denials: AtomicUsize::new(0),
+                    },
+                    prepared: Mutex::new(Vec::new()),
+                    withheld: Mutex::new(Vec::new()),
+                    fail_appends: AtomicUsize::new(fail_appends),
+                    refuse_controller,
+                })
+            }
+
+            fn withheld(&self) -> Vec<crate::authorization::MandatoryHookWithholdingRecord> {
+                self.withheld.lock().unwrap().clone()
+            }
+
+            fn controller_ids(&self) -> Vec<crate::OperationId> {
+                self.prepared
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, usage)| *usage == Some(ModelAuthorizationUse::ControllerInference))
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            }
+        }
+
+        impl WorkAuthorization for RecordingAudit {
+            fn controller_model_selection(&self) -> Option<crate::ControllerModelSelection> {
+                Some(fixture_controller_selection())
+            }
+
+            fn prepare(
+                &self,
+                binding: &PreparedAuthorizationBinding,
+            ) -> Result<Arc<dyn PreparedOperationAuthorization>, crate::OperationAuthorizationError>
+            {
+                let usage = match &binding.facts().operation {
+                    AuthorizationOperation::Model(model) => Some(model.usage),
+                    _ => None,
+                };
+                self.prepared
+                    .lock()
+                    .unwrap()
+                    .push((binding.facts().operation_id.clone(), usage));
+                if self.refuse_controller
+                    && usage == Some(ModelAuthorizationUse::ControllerInference)
+                {
+                    return Err(OperationRefused::new(OperationRefusalKind::Denied).into());
+                }
+                self.inner.prepare(binding)
+            }
+
+            fn observe_mandatory_hook_withholding(
+                &self,
+                record: &crate::authorization::MandatoryHookWithholdingRecord,
+            ) -> Result<(), crate::authorization::OperationObservationError> {
+                if self
+                    .fail_appends
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return Err(crate::authorization::OperationObservationError);
+                }
+                self.withheld.lock().unwrap().push(record.clone());
+                Ok(())
+            }
+        }
+
+        #[tokio::test]
+        async fn pre_llm_withholding_is_recorded_under_the_candidate_before_feedback() {
+            let audit = RecordingAudit::new(0, false);
+            let engine = DenyModelRequests::new(true, false);
+            let run = run_with_gate_and_audit(engine, false, None, audit.clone()).await;
+            run.result.expect("the controller completes after feedback");
+
+            let withheld = audit.withheld();
+            assert_eq!(withheld.len(), 1, "one record per withheld operation");
+            let record = &withheld[0];
+            let facts = record.withholding();
+            assert_eq!(facts.sequence, 1);
+            assert_eq!(facts.point, crate::hooks::HookPoint::PreLlmRequest);
+            assert_eq!(
+                facts.hook_id,
+                Some(crate::hooks::HookId::new("deny-model-requests"))
+            );
+            assert_eq!(
+                facts.cause,
+                crate::authorization::MandatoryHookCause::Denied {
+                    reason_code: crate::hooks::HookReasonCode::PolicyViolation,
+                }
+            );
+            assert_eq!(
+                facts.effect,
+                crate::authorization::MandatoryHookWithheldEffect::RequestNotSent
+            );
+            assert!(record.run_id().is_some(), "the actual run is recorded");
+            // The withheld candidate was never prepared; the feedback request
+            // is a distinct operation with its own real preparation.
+            let prepared: Vec<_> = audit
+                .prepared
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect();
+            assert!(!prepared.contains(record.operation_id()));
+            let controller = audit.controller_ids();
+            assert_eq!(controller.len(), 1);
+            assert_ne!(&controller[0], record.operation_id());
+        }
+
+        #[tokio::test]
+        async fn the_withholding_record_survives_feedback_that_cannot_run() {
+            // Feedback denied by its own gate (a misbehaving engine).
+            let audit = RecordingAudit::new(0, false);
+            let run = run_with_gate_and_audit(
+                DenyModelRequests::new(true, true),
+                false,
+                None,
+                audit.clone(),
+            )
+            .await;
+            assert!(run.result.is_err());
+            assert_eq!(audit.withheld().len(), 1);
+            assert!(audit.controller_ids().is_empty(), "feedback never prepared");
+
+            // Feedback refused at its own authorization.
+            let audit = RecordingAudit::new(0, true);
+            let run = run_with_gate_and_audit(
+                DenyModelRequests::new(true, false),
+                false,
+                None,
+                audit.clone(),
+            )
+            .await;
+            assert!(
+                run.result.is_err(),
+                "refused feedback is not recovered again"
+            );
+            let withheld = audit.withheld();
+            assert_eq!(withheld.len(), 1, "staged before feedback was attempted");
+            assert_eq!(
+                withheld[0].withholding().effect,
+                crate::authorization::MandatoryHookWithheldEffect::RequestNotSent
+            );
+        }
+
+        #[tokio::test]
+        async fn a_one_shot_withholding_append_failure_stays_local_to_its_operation() {
+            // The first append fails once; custody and controller preparation
+            // are otherwise healthy. Every ordinary request is denied, so the
+            // run withholds operation 1 (append fails) and operation 3 (append
+            // succeeds), and the controller's permitted work completes.
+            let audit = RecordingAudit::new(1, false);
+            let engine = DenyModelRequests::new(true, false);
+            let run = run_with_gate_and_audit(engine.clone(), true, None, audit.clone()).await;
+            let result = run
+                .result
+                .expect("an isolated append failure does not end the run");
+            assert_eq!(result.text, "continued after local feedback");
+
+            // No false audit success: only the later withholding is recorded.
+            let withheld = audit.withheld();
+            assert_eq!(withheld.len(), 1);
+            assert_eq!(withheld[0].withholding().sequence, 3);
+            // No retry of the withheld candidate and no repeated append: the
+            // gate saw each operation once, and only feedback was prepared.
+            assert_eq!(
+                engine
+                    .seen()
+                    .iter()
+                    .map(crate::hooks::HookModelOperation::sequence)
+                    .collect::<Vec<_>>(),
+                [1, 2, 3, 4]
+            );
+            assert_eq!(audit.controller_ids().len(), 2);
+            assert_eq!(run.controller.requests.lock().unwrap().len(), 2);
+            // The feedback reports the record status truthfully.
+            let records: Vec<_> = run
+                .agent
+                .session()
+                .messages()
+                .iter()
+                .filter_map(|message| match message {
+                    Message::SystemNotice(notice) => {
+                        notice.blocks.iter().find_map(|block| match block {
+                            crate::types::SystemNoticeBlock::RuntimeNotice {
+                                category,
+                                payload: Some(payload),
+                                ..
+                            } if category == "mandatory_hook_prerequisite_failed" => {
+                                Some(payload["protected_record"].clone())
+                            }
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                records,
+                [
+                    serde_json::json!("unavailable"),
+                    serde_json::json!("staged")
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn post_llm_withholding_names_the_replacement_request_that_responded() {
+            // The ordinary route is refused at preparation, local recovery
+            // sends a replacement request to the controller, and PostLlm then
+            // rejects that response.
+            let alternate = Arc::new(RefusedAlternate {
+                boundary: RefusalBoundary::Prepare,
+                kind: OperationRefusalKind::Denied,
+                unavailable: false,
+                preparations: AtomicUsize::new(0),
+                attempts: AtomicUsize::new(0),
+                ids: Mutex::new(Vec::new()),
+            });
+            let controller = Arc::new(FixtureClient {
+                requests: Mutex::new(Vec::new()),
+                tool_first: true,
+                authorizations: Mutex::new(Vec::new()),
+                hosted_default: false,
+            });
+            let audit = RecordingAudit::new(0, false);
+            let engine =
+                DenyModelRequests::at(crate::hooks::HookPoint::PostLlmResponse, true, false);
+            let mut agent = with_test_turn_state_handle(
+                AgentBuilder::new()
+                    .model("alternate-model")
+                    .with_hook_engine(engine.clone()),
+            )
+            .build_standalone(
+                alternate.clone(),
+                Arc::new(IndeterminateDispatcher),
+                Arc::new(NoopStore),
+            )
+            .await;
+            let (tx, _rx) = mpsc::channel(128);
+            agent
+                .run_with_events_and_work_authorization(
+                    "attempt the requested action".to_string().into(),
+                    vec![],
+                    vec![],
+                    None,
+                    tx,
+                    Some(work(audit.clone(), controller.clone())),
+                )
+                .await
+                .expect("the controller completes after feedback");
+
+            let refused_original = alternate.ids.lock().unwrap().clone();
+            assert_eq!(refused_original.len(), 1);
+            let controller_ids = audit.controller_ids();
+            assert_eq!(
+                controller_ids.len(),
+                2,
+                "replacement response, then feedback"
+            );
+            let withheld = audit.withheld();
+            assert_eq!(withheld.len(), 1);
+            let record = &withheld[0];
+            assert_eq!(
+                record.operation_id(),
+                &controller_ids[0],
+                "the record names the request that actually responded"
+            );
+            assert_ne!(record.operation_id(), &refused_original[0]);
+            assert_eq!(record.withholding().sequence, 1);
+            assert_eq!(
+                record.withholding().effect,
+                crate::authorization::MandatoryHookWithheldEffect::LocalDispatchAndCommitWithheld {
+                    local_tool_calls: 1,
+                    text_output_produced: false,
+                    provider_native_tools: vec![],
+                    provider_native_tools_total: 0,
+                    provider_native_tools_omitted: 0,
+                }
+            );
+        }
+
+        struct GateRun {
+            agent: crate::agent::Agent<FixtureClient, IndeterminateDispatcher, NoopStore>,
+            controller: Arc<FixtureClient>,
+            result: Result<crate::types::RunResult, AgentError>,
+        }
+
+        async fn run_with_gate(
+            engine: Arc<DenyModelRequests>,
+            tool_first: bool,
+            max_turns: Option<u32>,
+        ) -> GateRun {
+            run_with_gate_and_audit(engine, tool_first, max_turns, RecordingAudit::new(0, false))
+                .await
+        }
+
+        async fn run_with_gate_and_audit(
+            engine: Arc<DenyModelRequests>,
+            tool_first: bool,
+            max_turns: Option<u32>,
+            policy: Arc<RecordingAudit>,
+        ) -> GateRun {
+            let controller = Arc::new(FixtureClient {
+                requests: Mutex::new(Vec::new()),
+                tool_first,
+                authorizations: Mutex::new(Vec::new()),
+                hosted_default: false,
+            });
+            let mut agent = with_test_turn_state_handle(
+                AgentBuilder::new()
+                    .model("fixture-model")
+                    .with_hook_engine(engine),
+            )
+            .build_standalone(
+                controller.clone(),
+                Arc::new(IndeterminateDispatcher),
+                Arc::new(NoopStore),
+            )
+            .await;
+            if max_turns.is_some() {
+                agent.config.max_turns = max_turns;
+            }
+            let (tx, _rx) = mpsc::channel(128);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                agent.run_with_events_and_work_authorization(
+                    "attempt the requested action".to_string().into(),
+                    vec![],
+                    vec![],
+                    None,
+                    tx,
+                    Some(work(policy, controller.clone())),
+                ),
+            )
+            .await
+            .expect("a denying gate cannot keep the run looping");
+            GateRun {
+                agent,
+                controller,
+                result,
+            }
+        }
+
+        fn prerequisite_notices(
+            agent: &crate::agent::Agent<FixtureClient, IndeterminateDispatcher, NoopStore>,
+        ) -> usize {
+            agent
+                .session()
+                .messages()
+                .iter()
+                .filter(|message| {
+                    serde_json::to_string(message)
+                        .unwrap()
+                        .contains("mandatory_hook_prerequisite_failed")
+                })
+                .count()
+        }
+
+        #[tokio::test]
+        async fn mandatory_prerequisite_feedback_is_never_recursive() {
+            let engine = DenyModelRequests::new(true, true);
+            let run = run_with_gate(engine.clone(), false, None).await;
+            let error = run
+                .result
+                .expect_err("a denied feedback request takes the fail-closed path");
+
+            assert!(matches!(
+                error,
+                AgentError::HookDenied {
+                    point: crate::hooks::HookPoint::PreLlmRequest,
+                    ..
+                }
+            ));
+            // One feedback opportunity for the withheld ordinary operation,
+            // and none for the feedback request itself.
+            let seen = engine.seen();
+            assert_eq!(seen.len(), 2);
+            assert_eq!(
+                seen[0],
+                crate::hooks::HookModelOperation::Ordinary { sequence: 1 }
+            );
+            assert!(matches!(
+                &seen[1],
+                crate::hooks::HookModelOperation::ControllerFeedback { sequence: 2, withheld }
+                    if withheld.sequence == 1
+            ));
+            assert!(run.controller.requests.lock().unwrap().is_empty());
+            assert_eq!(prerequisite_notices(&run.agent), 1);
+        }
+
+        #[tokio::test]
+        async fn a_mandatory_run_override_without_an_engine_is_rejected_before_entry() {
+            let controller = Arc::new(FixtureClient {
+                requests: Mutex::new(Vec::new()),
+                tool_first: false,
+                authorizations: Mutex::new(Vec::new()),
+                hosted_default: false,
+            });
+            let policy = Arc::new(FixturePolicy {
+                hosted_denials: AtomicUsize::new(0),
+                compaction_denials: AtomicUsize::new(0),
+            });
+            let mut agent = with_test_turn_state_handle(
+                AgentBuilder::new()
+                    .model("fixture-model")
+                    .with_hook_run_overrides(crate::config::HookRunOverrides {
+                        entries: vec![crate::config::HookEntryConfig {
+                            id: crate::hooks::HookId::new("override-gate"),
+                            point: crate::hooks::HookPoint::PreLlmRequest,
+                            capability: crate::hooks::HookCapability::Guardrail,
+                            model_operations: crate::hooks::HookModelOperationScope::OrdinaryOnly,
+                            ..Default::default()
+                        }],
+                        disable: vec![],
+                    }),
+            )
+            .build_standalone(
+                controller.clone(),
+                Arc::new(IndeterminateDispatcher),
+                Arc::new(NoopStore),
+            )
+            .await;
+            let before = agent.session().messages().len();
+            let (tx, mut rx) = mpsc::channel(128);
+            let error = agent
+                .run_with_events_and_work_authorization(
+                    "attempt the requested action".to_string().into(),
+                    vec![],
+                    vec![],
+                    None,
+                    tx,
+                    Some(work(policy, controller.clone())),
+                )
+                .await
+                .expect_err("nothing would execute this mandatory override");
+
+            assert!(matches!(
+                error,
+                AgentError::HookConfigInvalid { ref reason } if reason.contains("no hook engine")
+            ));
+            assert!(rx.try_recv().is_err(), "nothing was published");
+            assert_eq!(agent.session().messages().len(), before, "no user append");
+            assert!(controller.requests.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_denial_outside_the_admitted_topology_stays_fail_closed() {
+            // The engine attests no gate, so admission records none and its
+            // denial is not recovered through controller feedback.
+            let engine = DenyModelRequests::new(false, true);
+            let run = run_with_gate(engine.clone(), false, None).await;
+            let error = run
+                .result
+                .expect_err("an unattested denial keeps the fail-closed path");
+
+            assert!(matches!(
+                error,
+                AgentError::HookDenied {
+                    point: crate::hooks::HookPoint::PreLlmRequest,
+                    ..
+                }
+            ));
+            assert_eq!(
+                engine.seen(),
+                [crate::hooks::HookModelOperation::Ordinary { sequence: 1 }]
+            );
+            assert!(run.controller.requests.lock().unwrap().is_empty());
+            assert_eq!(prerequisite_notices(&run.agent), 0);
+        }
+
+        #[tokio::test]
+        async fn an_always_denying_gate_is_bounded_by_the_turn_limit() {
+            // Each withheld operation is followed by one accepted feedback
+            // request, which either ends the run or advances a turn, and every
+            // re-poll passes the loop-top turn and budget checks.
+            let engine = DenyModelRequests::new(true, false);
+            let run = run_with_gate(engine.clone(), true, Some(1)).await;
+            assert!(
+                matches!(
+                    &run.result,
+                    Err(AgentError::TerminalFailure {
+                        cause_kind:
+                            crate::turn_execution_authority::TurnTerminalCauseKind::TurnLimitReached,
+                        ..
+                    })
+                ),
+                "the ordinary turn limit ends the cycle: {:?}",
+                run.result.as_ref().err()
+            );
+            assert_eq!(run.controller.requests.lock().unwrap().len(), 1);
+            assert_eq!(prerequisite_notices(&run.agent), 1);
+            assert_eq!(engine.seen().len(), 2);
+
+            // Without the cap the same gate withholds each ordinary step once
+            // and the run completes after the controller stops calling tools.
+            let engine = DenyModelRequests::new(true, false);
+            let run = run_with_gate(engine.clone(), true, None).await;
+            let result = run.result.expect("the controller completes the run");
+            assert_eq!(result.text, "continued after local feedback");
+            assert_eq!(run.controller.requests.lock().unwrap().len(), 2);
+            assert_eq!(prerequisite_notices(&run.agent), 2);
+            assert_eq!(
+                engine
+                    .seen()
+                    .iter()
+                    .map(crate::hooks::HookModelOperation::sequence)
+                    .collect::<Vec<_>>(),
+                [1, 2, 3, 4]
+            );
+        }
+
         struct UnavailableController;
         impl WorkAuthorization for UnavailableController {
             fn controller_model_selection(&self) -> Option<crate::ControllerModelSelection> {
@@ -29093,6 +31304,7 @@ mod tests {
                         unavailable: true,
                         preparations: AtomicUsize::new(0),
                         attempts: AtomicUsize::new(0),
+                        ids: Mutex::new(Vec::new()),
                     });
                     let controller = Arc::new(FixtureClient {
                         requests: Mutex::new(Vec::new()),
@@ -29508,6 +31720,147 @@ mod tests {
             assert!(request.contains("first retained input"));
             assert!(request.contains("operation_refused"));
             assert_completed_without_failure(&mut rx);
+        }
+
+        /// The admitted controller client, distinct from the session client
+        /// but of the same selection: it records the compaction requests it
+        /// receives and serves everything else through its own fixture client.
+        struct ControllerProbe {
+            inner: Arc<FixtureClient>,
+            compactions: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl AgentLlmClient for ControllerProbe {
+            fn controller_model_selection(&self) -> Option<crate::ControllerModelSelection> {
+                Some(fixture_controller_selection())
+            }
+
+            fn prepare_request_attempt_authorized(
+                self: Arc<Self>,
+                messages: Arc<Vec<Message>>,
+                tools: Arc<[Arc<ToolDef>]>,
+                max_tokens: u32,
+                temperature: Option<f32>,
+                provider_params: Option<ProviderParamsOverride>,
+                authorization: Option<crate::LlmRequestAuthorization>,
+            ) -> Result<Arc<dyn AgentLlmRequestAttempt>, AgentError> {
+                Arc::clone(&self.inner).prepare_request_attempt_authorized(
+                    messages,
+                    tools,
+                    max_tokens,
+                    temperature,
+                    provider_params,
+                    authorization,
+                )
+            }
+
+            async fn stream_response(
+                &self,
+                _messages: &[Message],
+                _tools: &[Arc<ToolDef>],
+                _max_tokens: u32,
+                _temperature: Option<f32>,
+                _provider_params: Option<&ProviderParamsOverride>,
+            ) -> Result<crate::LlmStreamResult, AgentError> {
+                panic!("governed execution must not use the raw provider path")
+            }
+
+            async fn stream_response_authorized(
+                &self,
+                messages: &[Message],
+                tools: &[Arc<ToolDef>],
+                max_tokens: u32,
+                temperature: Option<f32>,
+                provider_params: Option<&ProviderParamsOverride>,
+                authorization: Option<crate::LlmRequestAuthorization>,
+            ) -> Result<crate::LlmStreamResult, AgentError> {
+                self.compactions.fetch_add(1, Ordering::Relaxed);
+                self.inner
+                    .stream_response_authorized(
+                        messages,
+                        tools,
+                        max_tokens,
+                        temperature,
+                        provider_params,
+                        authorization,
+                    )
+                    .await
+            }
+
+            fn provider(&self) -> crate::Provider {
+                crate::Provider::OpenAI
+            }
+            fn model(&self) -> &'static str {
+                "fixture-model"
+            }
+        }
+
+        /// Compaction of the admitted controller's own context runs on the
+        /// retained controller client (still authorized per request as
+        /// Compaction), never on a different session client of the same
+        /// selection; a refusal still leaves history and continuation intact.
+        #[tokio::test]
+        async fn controller_compaction_runs_on_the_retained_controller_client() {
+            let fixture = || {
+                Arc::new(FixtureClient {
+                    requests: Mutex::new(Vec::new()),
+                    tool_first: false,
+                    authorizations: Mutex::new(Vec::new()),
+                    hosted_default: false,
+                })
+            };
+            let session_client = fixture();
+            let controller = Arc::new(ControllerProbe {
+                inner: fixture(),
+                compactions: AtomicUsize::new(0),
+            });
+            let policy = Arc::new(FixturePolicy {
+                hosted_denials: AtomicUsize::new(0),
+                compaction_denials: AtomicUsize::new(0),
+            });
+            let mut agent = with_test_turn_state_handle(AgentBuilder::new().model("fixture-model"))
+                .compactor(Arc::new(TrackingCompactor::new(Some(1))))
+                .build_standalone(
+                    session_client.clone(),
+                    Arc::new(NoTools),
+                    Arc::new(NoopStore),
+                )
+                .await;
+            let context = WorkAuthorizationContext::new(
+                policy.clone(),
+                crate::exact_operation::OperationExecutionScope::Domain,
+            )
+            .with_controller_client(crate::ControllerModelClient::new(
+                fixture_controller_selection(),
+                controller.clone(),
+            ))
+            .unwrap();
+            for input in ["first retained input", "second input"] {
+                let (tx, mut rx) = mpsc::channel(128);
+                agent
+                    .run_with_events_and_work_authorization(
+                        input.to_string().into(),
+                        vec![],
+                        vec![],
+                        None,
+                        tx,
+                        Some(context.clone()),
+                    )
+                    .await
+                    .expect("governed run");
+                assert_completed_without_failure(&mut rx);
+            }
+            assert_eq!(
+                controller.compactions.load(Ordering::Relaxed),
+                1,
+                "the compaction request reached the retained controller client"
+            );
+            assert_eq!(policy.compaction_denials.load(Ordering::Relaxed), 1);
+            assert!(
+                session_client.requests.lock().unwrap().is_empty(),
+                "nothing of the controller's work entered the session client"
+            );
         }
 
         mod observation_infrastructure_tool_siblings {

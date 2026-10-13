@@ -36,8 +36,67 @@ pub(crate) struct AuditedWorkAuthorization {
 }
 
 impl WorkAuthorization for AuditedWorkAuthorization {
+    fn run_if_current_within(
+        &self,
+        binding: &PreparedAuthorizationBinding,
+        prepared: Option<&meerkat_core::authorization::OperationValidity>,
+        further: &(dyn std::any::Any + Send + Sync),
+        operation: &mut dyn FnMut(),
+    ) -> Result<(), OperationAuthorizationError> {
+        self.inner
+            .run_if_current_within(binding, prepared, further, operation)
+    }
+
+    fn validate_child_issuance(
+        &self,
+        further: &(dyn std::any::Any + Send + Sync),
+        intent: &(dyn std::any::Any + Send + Sync),
+    ) -> Result<(), OperationAuthorizationError> {
+        self.inner.validate_child_issuance(further, intent)
+    }
+
+    fn issue_child_if_current_within(
+        &self,
+        binding: &PreparedAuthorizationBinding,
+        prepared: Option<&meerkat_core::authorization::OperationValidity>,
+        further: &(dyn std::any::Any + Send + Sync),
+        intent: &(dyn std::any::Any + Send + Sync),
+        entered_tier: meerkat_core::authorization::OperationReviewTier,
+    ) -> Result<Box<dyn std::any::Any + Send>, OperationAuthorizationError> {
+        self.inner
+            .issue_child_if_current_within(binding, prepared, further, intent, entered_tier)
+    }
+
+    fn review_operation_context(
+        &self,
+        binding: &PreparedAuthorizationBinding,
+    ) -> Result<
+        meerkat_core::authorization::ReviewOperationContextResolution,
+        OperationAuthorizationError,
+    > {
+        self.inner.review_operation_context(binding)
+    }
+
     fn controller_model_selection(&self) -> Option<meerkat_core::ControllerModelSelection> {
         self.inner.controller_model_selection()
+    }
+
+    /// Append to the same row-bound sink as every prepared observation. No
+    /// policy read, preparation or clock: the fact is historical.
+    fn observe_mandatory_hook_withholding(
+        &self,
+        record: &meerkat_core::authorization::MandatoryHookWithholdingRecord,
+    ) -> Result<(), OperationObservationError> {
+        self.sink.append(AuthorizationAuditObservation {
+            operation_id: record.operation_id().clone(),
+            execution_scope: record.execution_scope().clone(),
+            run_id: record.run_id().cloned(),
+            context_revision: None,
+            review_attribution: None,
+            observation: AuditObservation::MandatoryHookWithheld {
+                withholding: record.withholding().clone(),
+            },
+        })
     }
 
     fn prepare(
@@ -105,10 +164,13 @@ impl WorkAuthorization for AuditedWorkAuthorization {
                 };
                 match result {
                     Ok(inner) => {
+                        let selected = self.associations.first().and_then(|association| {
+                            association.candidate().controller_model.as_ref()
+                        });
                         let controller = matches!(&binding.facts().operation,
-                    AuthorizationOperation::Model(facts) if facts.usage == ModelAuthorizationUse::ControllerInference);
+                    AuthorizationOperation::Model(facts) if crate::work::controller_route(facts, selected));
                         let operation = !matches!(&binding.facts().operation,
-                    AuthorizationOperation::Model(facts) if facts.usage == ModelAuthorizationUse::ControllerInference && facts.hosted_capabilities.is_empty());
+                    AuthorizationOperation::Model(facts) if crate::work::controller_route(facts, selected) && facts.hosted_capabilities.is_empty());
                         let policy = AuditPolicyRead {
                             publication_sequence: revision.ok_or_else(denied)?,
                             observed_at_ms: now.unix_ms,
@@ -190,6 +252,10 @@ impl PreparedOperationAuthorization for AuditedPrepared {
 
     fn review_tier(&self) -> meerkat_core::authorization::OperationReviewTier {
         self.inner.review_tier()
+    }
+
+    fn validity(&self) -> Option<meerkat_core::authorization::OperationValidity> {
+        self.inner.validity()
     }
 
     fn check_current(

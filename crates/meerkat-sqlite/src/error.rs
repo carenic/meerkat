@@ -291,6 +291,28 @@ pub enum SqliteStoreError {
     /// operations did not drain within the deadline.)
     #[error("maintenance fence is held for `{path}`; storage is under offline maintenance")]
     MaintenanceFenceHeld { path: PathBuf },
+
+    /// An administrative open could not read this process's expected current
+    /// catalog for `domain`. Nothing was read from or written to the database
+    /// by the check. The cause says why; neither is momentary contention.
+    #[error("current schema catalog for domain `{domain}` is not available: {cause}")]
+    CurrentCatalogUnavailable {
+        domain: String,
+        cause: CurrentCatalogUnavailability,
+    },
+}
+
+/// Why the expected current catalog was not available. The cache is a leaf
+/// lock that is waited for, so contention is never a cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CurrentCatalogUnavailability {
+    /// No ordinary open in this process has prepared this domain's catalog.
+    /// Preparation belongs to store setup, not to the administrative path.
+    #[error("the catalog was never prepared in this process")]
+    NotPrepared,
+    /// The process catalog cache lock is poisoned.
+    #[error("the catalog cache is poisoned")]
+    Poisoned,
 }
 
 /// Storage-level classification of a SQLite error.

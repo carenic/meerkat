@@ -59,7 +59,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::error::{BridgeEligibility, SqliteStoreError};
+use crate::error::{BridgeEligibility, CurrentCatalogUnavailability, SqliteStoreError};
 
 const CREATE_LEDGER_SQL: &str = "CREATE TABLE IF NOT EXISTS main.meerkat_schema (
     domain TEXT PRIMARY KEY,
@@ -542,12 +542,13 @@ pub fn preflight_schema_eligibility(
     Ok(())
 }
 
-/// Check an already installed current schema without building the
-/// expected-catalog cache. It waits for that cache's leaf mutex (held only for
-/// one map lookup or insert; callers may already hold native custody and an
-/// open `BEGIN IMMEDIATE` outside it) and still refuses when the expected
-/// catalog is unbuilt or missing. Ordinary store open prepares that immutable
-/// catalog. This administrative path never migrates or adopts older records.
+/// Check an already installed current schema against the expected catalog
+/// this process prepared, without building it. Ordinary store open prepares
+/// that immutable catalog; a catalog not prepared (or a poisoned cache) is
+/// refused. The check waits for the expected-catalog cache mutex, a leaf
+/// lock: no other lock is acquired while its guard is held, so callers may
+/// already hold native custody or a BEGIN IMMEDIATE transaction outside it.
+/// This administrative path never migrates or adopts older records.
 pub fn try_preflight_current_schema(
     conn: &Connection,
     domain: &SchemaDomain,
@@ -571,29 +572,19 @@ pub fn try_preflight_current_schema(
             });
         }
     }
-    let unavailable = || {
-        SqliteStoreError::Io(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            "current schema catalog is not ready without waiting",
-        ))
-    };
-    let cache = EXPECTED_CURRENT_CATALOGS.get().ok_or_else(unavailable)?;
-    // A process-global leaf lock: held only for one map lookup or insert
-    // (the expected catalog is built outside it), and no other lock is
-    // acquired while it is held. Callers may hold native custody and an open
-    // transaction outside it. Refusing on its contention made online
-    // administration fail whenever any other store in the process opened.
-    let expected = cache
-        .lock()
-        .map_err(|_| unavailable())?
-        .get(&current_catalog_cache_key(domain))
-        .cloned()
-        .ok_or_else(unavailable)?
-        .map_err(|detail| SqliteStoreError::SchemaFingerprintMismatch {
-            domain: domain.name.to_string(),
-            version: supported,
-            detail,
-        })?;
+    let expected = try_cached_current_catalog(
+        EXPECTED_CURRENT_CATALOGS.get(),
+        &current_catalog_cache_key(domain),
+    )
+    .map_err(|cause| SqliteStoreError::CurrentCatalogUnavailable {
+        domain: domain.name.to_string(),
+        cause,
+    })?
+    .map_err(|detail| SqliteStoreError::SchemaFingerprintMismatch {
+        domain: domain.name.to_string(),
+        version: supported,
+        detail,
+    })?;
     let actual = compact_catalog_fingerprint(conn, domain, domain.owned_objects);
     if actual.as_ref().is_ok_and(|actual| actual == &expected) {
         return Ok(());
@@ -1217,8 +1208,33 @@ fn domain_catalog_fingerprint(
     Ok(DomainCatalogFingerprint { names, objects })
 }
 
-static EXPECTED_CURRENT_CATALOGS: OnceLock<Mutex<BTreeMap<String, Result<String, String>>>> =
-    OnceLock::new();
+type CurrentCatalogCache = Mutex<BTreeMap<String, Result<String, String>>>;
+
+static EXPECTED_CURRENT_CATALOGS: OnceLock<CurrentCatalogCache> = OnceLock::new();
+
+/// Read one prepared expected catalog, keeping absent preparation and poison
+/// apart.
+///
+/// The cache mutex is a process-global leaf lock: it is held only for one map
+/// lookup or insert (the expected catalog is built outside it) and no other
+/// lock is acquired while its guard is held, so callers may already hold
+/// native custody or a BEGIN IMMEDIATE transaction outside it. Waiting for it cannot invert a
+/// lock order, while refusing on contention made online administration fail
+/// whenever another store in the process was opening. It still refuses an
+/// unbuilt or missing catalog.
+fn try_cached_current_catalog(
+    cache: Option<&CurrentCatalogCache>,
+    key: &str,
+) -> Result<Result<String, String>, CurrentCatalogUnavailability> {
+    let cache = cache.ok_or(CurrentCatalogUnavailability::NotPrepared)?;
+    let entries = cache
+        .lock()
+        .map_err(|_| CurrentCatalogUnavailability::Poisoned)?;
+    entries
+        .get(key)
+        .cloned()
+        .ok_or(CurrentCatalogUnavailability::NotPrepared)
+}
 
 /// Verify a current row against the exact catalog built by the current
 /// initializer. The expected side is process-global pure code-derived state;
@@ -2109,6 +2125,38 @@ fn read_version(conn: &Connection, domain: &str) -> Result<Option<i64>, SqliteSt
 mod tests {
     use super::*;
     use crate::profile::{ConnectionProfile, open};
+
+    #[test]
+    fn catalog_lookup_keeps_unprepared_and_poisoned_apart() {
+        assert_eq!(
+            try_cached_current_catalog(None, "domain"),
+            Err(CurrentCatalogUnavailability::NotPrepared)
+        );
+        let cache = CurrentCatalogCache::default();
+        assert_eq!(
+            try_cached_current_catalog(Some(&cache), "domain"),
+            Err(CurrentCatalogUnavailability::NotPrepared)
+        );
+        cache
+            .lock()
+            .unwrap()
+            .insert("domain".to_string(), Ok("catalog".to_string()));
+        assert_eq!(
+            try_cached_current_catalog(Some(&cache), "domain"),
+            Ok(Ok("catalog".to_string()))
+        );
+        let poisoned = std::sync::Arc::new(CurrentCatalogCache::default());
+        let holder = std::sync::Arc::clone(&poisoned);
+        let _ = std::thread::spawn(move || {
+            let _held = holder.lock().unwrap();
+            panic!("poison the catalog cache");
+        })
+        .join();
+        assert_eq!(
+            try_cached_current_catalog(Some(&poisoned), "domain"),
+            Err(CurrentCatalogUnavailability::Poisoned)
+        );
+    }
 
     fn create_t1(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
         tx.execute_batch("CREATE TABLE IF NOT EXISTS t1 (x INTEGER)")

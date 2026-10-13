@@ -114,6 +114,7 @@ mod tests {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Callback,
                 source_id: format!("parent:{name}").into(),
+                artifact: None,
             }),
         })
     }

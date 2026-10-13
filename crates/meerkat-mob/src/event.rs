@@ -71,6 +71,18 @@ pub struct NewMobEvent {
     pub(crate) kind: MobEventKind,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl NewMobEvent {
+    /// Test support: a durable event to inject into a mob store.
+    pub fn for_test(mob_id: MobId, kind: MobEventKind) -> Self {
+        Self {
+            mob_id,
+            timestamp: None,
+            kind,
+        }
+    }
+}
+
 /// Backend-neutral transport reference to a mob member.
 ///
 /// Identity (`AgentIdentity`, machine-owned bindings) and transport
@@ -931,6 +943,17 @@ pub enum MobEventKind {
     SupervisorEscalationFailed {
         run_id: RunId,
         step_id: StepId,
+        reason: String,
+    },
+    /// An orchestrator resume notification that a cold resume handed to the
+    /// actor's lifecycle owner did not deliver.
+    ///
+    /// Diagnostic only: the mob keeps running and its phase is unchanged.
+    /// `member_id` and `session_id` name the exact notification target the
+    /// resume planned; `reason` is the delivery failure.
+    OrchestratorResumeNotificationFailed {
+        member_id: AgentIdentity,
+        session_id: SessionId,
         reason: String,
     },
     /// Dispatcher-owned projection of a successful operator mutation/control action.
@@ -1907,6 +1930,11 @@ mod tests {
             run_id,
             step_id,
             reason: "no active supervisor member for role 'auditor'".to_string(),
+        });
+        roundtrip(&MobEventKind::OrchestratorResumeNotificationFailed {
+            member_id: AgentIdentity::from("lead-1"),
+            session_id: SessionId::new(),
+            reason: "start_turn failed".to_string(),
         });
     }
 

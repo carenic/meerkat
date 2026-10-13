@@ -171,7 +171,7 @@ Available skills (depends on your environment):
 | `rct-methodology` | RCT development methodology |
 | `rust-cicd-pipeline` | Rust CI/CD pipeline setup |
 | `skill-creator` | Guide for creating new skills |
-| `mobkit-platform` | MobKit platform patterns |
+| `meta-platform` | Meta platform patterns |
 
 ## Session Continuation
 

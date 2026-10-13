@@ -290,7 +290,7 @@ pub async fn handle_call(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -337,19 +337,22 @@ mod tests {
     fn test_runtime(temp: &TempDir) -> Arc<SessionRuntime> {
         let factory = AgentFactory::new(temp.path().join("sessions"));
         let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
-        Arc::new(SessionRuntime::new(
-            factory,
-            Config::default(),
-            10,
-            PersistenceBundle::new_with_schedule_store(
-                store,
-                Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
-                memory_blob_store(),
-                Arc::new(MemoryScheduleStore::new()),
+        Arc::new(
+            SessionRuntime::new(
+                factory,
+                Config::default(),
+                10,
+                PersistenceBundle::new_with_schedule_store(
+                    store,
+                    Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+                    memory_blob_store(),
+                    Arc::new(MemoryScheduleStore::new()),
+                )
+                .unwrap(),
+                crate::router::NotificationSink::noop(),
             )
-            .unwrap(),
-            crate::router::NotificationSink::noop(),
-        ))
+            .expect("compose the RPC session runtime"),
+        )
     }
 
     async fn wait_for_missing_target_misfire(

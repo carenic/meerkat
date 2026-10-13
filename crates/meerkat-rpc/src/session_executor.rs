@@ -74,6 +74,29 @@ impl CoreExecutorPublicationHandle for RpcRuntimePublicationHandle {
         );
         current.publish_interaction_terminals(events).await
     }
+
+    /// The current capability's actor; the refresh callback replaces it only
+    /// under the attachment's mutation fence and its turn boundary.
+    fn actor_identity(&self) -> Option<meerkat_core::lifecycle::CoreExecutorActorIdentity> {
+        self.current
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .actor_identity()
+    }
+
+    fn turn_finalization_boundary(
+        &self,
+    ) -> Option<Arc<dyn CoreExecutorTurnFinalizationBoundaryHandle>> {
+        self.snapshot().turn_finalization_boundary()
+    }
+
+    async fn pin_actor_controller_under_turn_boundary(
+        &self,
+    ) -> Result<meerkat_core::ControllerModelClient, CoreExecutorError> {
+        self.snapshot()
+            .pin_actor_controller_under_turn_boundary()
+            .await
+    }
 }
 
 /// Implements `CoreExecutor` by delegating to the runtime-owned apply path.
@@ -515,6 +538,30 @@ impl CoreExecutorPublicationHandle for MobRpcRuntimePublicationHandle {
     > {
         self.session_service
             .publish_interaction_terminals_for_actor(&self.actor_witness, events)
+            .await
+            .map_err(CoreExecutorError::apply_failed_from_session_error)
+    }
+
+    fn actor_identity(&self) -> Option<meerkat_core::lifecycle::CoreExecutorActorIdentity> {
+        Some(self.actor_witness.executor_actor_identity())
+    }
+
+    /// The member service's own boundary of this actor's session, the
+    /// endpoint the member executor's runtime loop holds across each turn.
+    fn turn_finalization_boundary(
+        &self,
+    ) -> Option<Arc<dyn CoreExecutorTurnFinalizationBoundaryHandle>> {
+        Some(Arc::new(MobRpcRuntimeTurnFinalizationBoundaryHandle {
+            session_service: Arc::clone(&self.session_service),
+            session_id: self.actor_witness.session_id().clone(),
+        }))
+    }
+
+    async fn pin_actor_controller_under_turn_boundary(
+        &self,
+    ) -> Result<meerkat_core::ControllerModelClient, CoreExecutorError> {
+        self.session_service
+            .pin_controller_client_under_runtime_turn_boundary(&self.actor_witness)
             .await
             .map_err(CoreExecutorError::apply_failed_from_session_error)
     }
@@ -990,14 +1037,17 @@ mod persistent_cleanup_tests {
             Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(meerkat_store::MemoryBlobStore::new());
-        let runtime = Arc::new(SessionRuntime::new(
-            AgentFactory::new(temp.path().join("sessions")),
-            Config::default(),
-            2,
-            PersistenceBundle::new(session_store, runtime_store, blob_store)
-                .expect("construct runtime authority"),
-            NotificationSink::noop(),
-        ));
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                AgentFactory::new(temp.path().join("sessions")),
+                Config::default(),
+                2,
+                PersistenceBundle::new(session_store, runtime_store, blob_store)
+                    .expect("construct runtime authority"),
+                NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
         let service = runtime.persistent_service();
         let slot = meerkat::LiveSessionActorWitnessSlot::default();
         let admission = service
@@ -1382,14 +1432,17 @@ mod tests {
             Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(meerkat_store::MemoryBlobStore::new());
-        let runtime = Arc::new(SessionRuntime::new(
-            meerkat::AgentFactory::new(temp.path().join("sessions")),
-            meerkat::Config::default(),
-            2,
-            meerkat::PersistenceBundle::new(session_store, runtime_store, blob_store)
-                .expect("construct runtime authority"),
-            NotificationSink::noop(),
-        ));
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                meerkat::AgentFactory::new(temp.path().join("sessions")),
+                meerkat::Config::default(),
+                2,
+                meerkat::PersistenceBundle::new(session_store, runtime_store, blob_store)
+                    .expect("construct runtime authority"),
+                NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
         let service = runtime.persistent_service();
         let slot = meerkat::LiveSessionActorWitnessSlot::default();
         let admission = service

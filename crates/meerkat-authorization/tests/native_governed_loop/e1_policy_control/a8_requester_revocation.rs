@@ -533,10 +533,13 @@ async fn exercise_a8(server: &Server, barrier: &Arc<EntryBarrier>) {
     let machine = Arc::new(
         MeerkatMachine::ephemeral()
             .with_local_grant_authorization(NativeGrantWorkConfiguration {
+                retained_resume: None,
+                require_scoped_destination: false,
                 grants: grants.clone(),
                 ingress,
                 invocation_owner: Arc::new(InvocationOwner),
                 operation_owner: policy.clone(),
+                configured_mcp_attachment: None,
             })
             .unwrap(),
     );

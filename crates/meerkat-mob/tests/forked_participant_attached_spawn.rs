@@ -256,7 +256,7 @@ async fn attached_spawn_seats_a_branch_after_the_source_member_is_gone() {
 /// Regression (identity confusion, council participant path): a
 /// capability-attached participant seated with its source's build
 /// inheritance (the temporary-council seating) carries the source's
-/// application labels, never the labels that name the source. MobKit keeps
+/// application labels, never the labels that name the source. Meta keeps
 /// its durable identity in the source's roster `agent_identity`; a
 /// participant that inherited it claimed to be its source in the roster, its
 /// `MemberSpawned` event and `list_members`.
@@ -382,7 +382,7 @@ async fn attached_participant_never_inherits_the_source_member_naming_labels() {
 }
 
 /// A host spawn customizer that rewrites every capability-attached
-/// participant's build inputs, the way MobKit's memory customizer wraps a
+/// participant's build inputs, the way Meta's memory customizer wraps a
 /// member's overlay in a recorder bound to the member's own identity: it drops
 /// the overlay and replaces the labels and the application context.
 struct ParticipantRewritingCustomizer;

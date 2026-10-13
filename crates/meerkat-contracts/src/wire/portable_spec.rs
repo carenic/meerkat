@@ -181,6 +181,12 @@ pub enum PortableMcpDecl {
         /// Explicit raw operation -> exposed name, with no credential values.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         tool_names: BTreeMap<String, String>,
+        /// Exact access ceiling: only these raw operations may be called.
+        /// `None` means no ceiling. Omitted when `None`, so a profile without
+        /// one keeps its digest-covered bytes, and a host too old to know the
+        /// field rejects it (`deny_unknown_fields`) instead of widening.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        access: Option<meerkat_core::McpServerAccess>,
     },
     Http {
         url: String,
@@ -199,6 +205,12 @@ pub enum PortableMcpDecl {
         /// Explicit raw operation -> exposed name, with no credential values.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         tool_names: BTreeMap<String, String>,
+        /// Exact access ceiling: only these raw operations may be called.
+        /// `None` means no ceiling. Omitted when `None`, so a profile without
+        /// one keeps its digest-covered bytes, and a host too old to know the
+        /// field rejects it (`deny_unknown_fields`) instead of widening.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        access: Option<meerkat_core::McpServerAccess>,
     },
 }
 
@@ -211,6 +223,7 @@ impl std::fmt::Debug for PortableMcpDecl {
                 required_env_keys,
                 connect_timeout_secs,
                 tool_names,
+                access,
             } => f
                 .debug_struct("Stdio")
                 .field("command", command)
@@ -218,6 +231,7 @@ impl std::fmt::Debug for PortableMcpDecl {
                 .field("required_env_keys", required_env_keys)
                 .field("connect_timeout_secs", connect_timeout_secs)
                 .field("tool_names", tool_names)
+                .field("access", access)
                 .finish(),
             Self::Http {
                 url,
@@ -226,6 +240,7 @@ impl std::fmt::Debug for PortableMcpDecl {
                 required_header_names,
                 connect_timeout_secs,
                 tool_names,
+                access,
             } => f
                 .debug_struct("Http")
                 .field("url", url)
@@ -237,6 +252,7 @@ impl std::fmt::Debug for PortableMcpDecl {
                 .field("required_header_names", required_header_names)
                 .field("connect_timeout_secs", connect_timeout_secs)
                 .field("tool_names", tool_names)
+                .field("access", access)
                 .finish(),
         }
     }
@@ -471,6 +487,7 @@ pub(crate) fn sample_portable_member_spec() -> PortableMemberSpec {
                         required_env_keys: vec!["DOCS_TOKEN".to_string()],
                         connect_timeout_secs: Some(10),
                         tool_names: BTreeMap::new(),
+                        access: None,
                     },
                 )]),
                 non_portable_disabled: vec![WireNonPortableResourceKind::RustBundles],
@@ -690,6 +707,7 @@ mod tests {
                 required_header_names: vec!["authorization".to_string()],
                 connect_timeout_secs: Some(23),
                 tool_names: BTreeMap::new(),
+                access: None,
             }
         );
 
@@ -707,6 +725,7 @@ mod tests {
                 required_header_names: Vec::new(),
                 connect_timeout_secs: None,
                 tool_names: BTreeMap::new(),
+                access: None,
             }
         );
     }

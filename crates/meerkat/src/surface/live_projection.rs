@@ -968,7 +968,7 @@ mod tests {
     use meerkat_core::live_adapter::LiveAdapterObservation;
     use meerkat_core::service::{DeferredPromptPolicy, InitialTurnPolicy, SessionBuildOptions};
 
-    /// `rkat mob host` and MobKit's voice product apply live observations
+    /// `rkat mob host` and Meta's voice product apply live observations
     /// through [`ServiceLiveProjection`], not the RPC sink. Ordinary realtime
     /// speech applied through it must commit a `block_assistant` row whose
     /// `realtime_origin` names this session, the channel the speech streamed
@@ -988,7 +988,8 @@ mod tests {
         let mut builder = crate::FactoryAgentBuilder::new(factory, crate::Config::default());
         builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
         let (service, runtime) =
-            crate::surface::build_runtime_backed_service(builder, 4, persistence);
+            crate::surface::build_runtime_backed_service(builder, 4, persistence)
+                .expect("compose the runtime-backed service");
         let service = Arc::new(service);
         let session = crate::Session::new();
         let session_id = session.id().clone();

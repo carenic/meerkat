@@ -60,6 +60,11 @@ meerkat-providers = { workspace = true, default-features = false, features = [
     "refresh-file-lock",
 ] }
 reqwest = { workspace = true }
+# Governed realm composition (`governed_realm`), with `local-authorization`.
+meerkat-authorization = { workspace = true, optional = true }
+meerkat-authorization-contracts = { workspace = true, optional = true }
+# A governed realm reads its own config document's MCP installations.
+toml = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio_with_wasm = { workspace = true }
@@ -131,6 +136,10 @@ meerkat = { path = ".", features = [
 # meerkat-mob and meerkat-mcp-server depend on us, not the other way around.
 # Binaries (rkat, meerkat-rest) depend on them directly.
 
+[target.'cfg(unix)'.dependencies]
+# The stock governed host authenticates the local operator by its OS user.
+nix = { workspace = true, optional = true }
+
 [target.'cfg(unix)'.dev-dependencies]
 nix = { workspace = true }
 
@@ -138,7 +147,13 @@ nix = { workspace = true }
 default = ["anthropic", "openai", "gemini", "copilot"]
 integration-real-tests = []
 # Opt-in local governed authorization on the actual runtime owner.
-local-authorization = ["meerkat-runtime/local-authorization"]
+local-authorization = [
+    "meerkat-runtime/local-authorization",
+    "dep:meerkat-authorization",
+    "dep:meerkat-authorization-contracts",
+    "dep:nix",
+    "dep:toml",
+]
 
 # LLM providers
 anthropic = ["meerkat-client/anthropic", "dep:meerkat-anthropic", "meerkat-providers/anthropic"]
@@ -254,6 +269,11 @@ test-realtime-fixtures = [
 # (`meerkat::test_fixtures::mcp_oauth`). Test-support only. Weak forwarding keeps
 # this fixture feature from independently activating the optional MCP client.
 test-mcp-oauth-fixtures = ["meerkat-mcp?/test-support"]
+# Instance-targeted fault seams for downstream failure controls: the runtime
+# store's scripted acknowledgement loss and the stock originals ledger's
+# promotion fault. Test-support only: enable it under [dev-dependencies] so
+# normal builds compile the seams out.
+test-support = ["meerkat-runtime/test-support"]
 
 [package.metadata.cargo-machete]
 ignored = ["which"]  # dev-dependency used in e2e tests

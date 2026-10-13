@@ -94,8 +94,12 @@ impl std::fmt::Debug for LocalPolicyAllowance {
 /// an agent holding another user's delegation is not sufficient. For controller
 /// inference, resolve the separate controller lineage and its actual model route.
 /// Provider-hosted capabilities additionally require ordinary operation grants;
-/// a controller grant cannot authorize an enabled hosted tool. Compaction and
-/// live operations continue to require ordinary operation authority in this slice.
+/// a controller grant cannot authorize an enabled hosted tool. Compaction of
+/// the admitted controller's own context, on exactly the admitted controller
+/// selection with no hosted capability and no live channel, is the
+/// controller's housekeeping and resolves the controller lineage like
+/// controller inference. Compaction on any other route and live operations
+/// require ordinary operation authority.
 /// Every owner must allow;
 /// deny or missing authority refuses only the affected operation. Historical
 /// source observations in the association are audit data, never current access.
@@ -126,6 +130,32 @@ pub trait LocalWorkPolicy: Send + Sync {
         now_ms: u64,
     ) -> Result<LocalPolicyAllowance, meerkat_core::OperationAuthorizationError> {
         self.evaluate(association, binding, now_ms)
+    }
+
+    /// This policy as the native grant-backed owner, when it is one.
+    fn grant_backed(
+        self: std::sync::Arc<Self>,
+    ) -> Option<std::sync::Arc<crate::grant_policy::GrantBackedWorkPolicy>> {
+        None
+    }
+
+    /// Passive review material for this exact prepared operation: the action
+    /// account the owner actually selected and the current mandate, read in
+    /// the same publication as every other owner fact. Called only after R1
+    /// is ruled out, never on R1. Fail closed: this default is `Unavailable`,
+    /// so an R2/R3 operation of a policy that does not implement it settles
+    /// as context unavailable. Only explicit implementations answer
+    /// `NotApplicable`, for material that is genuinely inapplicable.
+    fn review_context(
+        &self,
+        _association: &InputAuthorityAssociation,
+        _binding: &PreparedAuthorizationBinding,
+        _now_ms: u64,
+    ) -> Result<
+        meerkat_core::authorization::ReviewOperationContextResolution,
+        meerkat_core::OperationAuthorizationError,
+    > {
+        Err(meerkat_core::OperationAuthorizationError::Unavailable)
     }
 }
 

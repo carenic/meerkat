@@ -18,7 +18,9 @@ class PublishMobKitDocsWorkflowTests(unittest.TestCase):
 
     def test_mirrors_main_on_docs_push_manual_dispatch_and_nightly_catch_up(self) -> None:
         self.assertIn("repository_dispatch:", self.workflow)
-        self.assertIn("types: [mobkit-docs-updated]", self.workflow)
+        # Meta 0.9 dispatches meta-docs-updated; earlier releases dispatch
+        # mobkit-docs-updated. Both must keep mirroring.
+        self.assertIn("types: [mobkit-docs-updated, meta-docs-updated]", self.workflow)
         self.assertIn("workflow_dispatch:", self.workflow)
         self.assertIn("source_sha:", self.workflow)
         self.assertIn("schedule:", self.workflow)
@@ -30,8 +32,8 @@ class PublishMobKitDocsWorkflowTests(unittest.TestCase):
         self.assertNotIn("verify-published-registries.py", self.workflow)
 
     def test_only_commits_on_mobkit_main_can_be_mirrored(self) -> None:
-        self.assertIn("repository: lukacf/meerkat-mobkit", self.workflow)
-        self.assertIn("ref: main", self.workflow[self.workflow.index("repository: lukacf/meerkat-mobkit"):])
+        self.assertIn("repository: lukacf/meerkat-meta", self.workflow)
+        self.assertIn("ref: main", self.workflow[self.workflow.index("repository: lukacf/meerkat-meta"):])
         verify = self.workflow.index("Resolve and verify the source commit")
         generate = self.workflow.index("scripts/sync-mobkit-docs.py _mobkit")
         self.assertLess(verify, generate)
@@ -120,7 +122,10 @@ class PublishMobKitDocsWorkflowTests(unittest.TestCase):
             self.skipTest("PyYAML is not installed")
         parsed = yaml.safe_load(self.workflow)
         triggers = parsed[True]
-        self.assertEqual(triggers["repository_dispatch"]["types"], ["mobkit-docs-updated"])
+        self.assertEqual(
+            triggers["repository_dispatch"]["types"],
+            ["mobkit-docs-updated", "meta-docs-updated"],
+        )
         self.assertIn("source_sha", triggers["workflow_dispatch"]["inputs"])
         self.assertFalse(triggers["workflow_dispatch"]["inputs"]["source_sha"]["required"])
         self.assertEqual(len(triggers["schedule"]), 1)

@@ -377,38 +377,40 @@ async fn relink_mob_fork_children_where(
         };
         children.push((entry.agent_identity.clone(), job, owner));
     }
-    // Each child settles on its own task: observing a member waits for its
-    // turn boundary, so one busy child must not hold up the others.
-    let tasks = children.into_iter().map(|(child, job, owner)| {
-        let service = Arc::clone(&service);
-        let delivery = delivery.clone();
-        let mob_id = mob_id.clone();
-        let handle = handle.clone();
-        tokio::spawn(async move {
-            let action = relink_owned_child(
-                service,
-                &delivery,
-                &mob_id,
-                &handle,
-                &child,
-                &job,
-                owner,
-                COMMIT_PENDING_CEILING,
-            )
-            .await;
-            ForkRelinkReport {
-                mob_id,
-                child,
-                job_id: job.job_id.clone(),
-                action,
+    // The children settle concurrently: observing a member waits for its
+    // turn boundary, so one busy child must not hold up the others. They run
+    // inside this pass's own task, not on tasks of their own, so a
+    // stand-down that aborts the pass has stopped every child's settlement
+    // once the pass is dropped.
+    let tasks = children
+        .into_iter()
+        .map(|(child, job, owner)| {
+            let service = Arc::clone(&service);
+            let delivery = delivery.clone();
+            let mob_id = mob_id.clone();
+            let handle = handle.clone();
+            async move {
+                let action = relink_owned_child(
+                    service,
+                    &delivery,
+                    &mob_id,
+                    &handle,
+                    &child,
+                    &job,
+                    owner,
+                    COMMIT_PENDING_CEILING,
+                )
+                .await;
+                ForkRelinkReport {
+                    mob_id,
+                    child,
+                    job_id: job.job_id.clone(),
+                    action,
+                }
             }
         })
-    });
-    futures::future::join_all(tasks)
-        .await
-        .into_iter()
-        .filter_map(Result::ok)
-        .collect()
+        .collect::<Vec<_>>();
+    futures::future::join_all(tasks).await
 }
 
 /// Who receives a fork job's outcome. Resolved from the job's owner session

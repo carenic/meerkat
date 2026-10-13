@@ -371,6 +371,9 @@ pub(crate) struct MobMemberMachineProjection {
 pub(super) struct SubmitWorkPayload {
     pub runtime_id: AgentRuntimeId,
     pub fence_token: FenceToken,
+    /// Member session a scope-bound submit was captured against; validated
+    /// by generated SubmitWork authority (`StaleSessionBinding`).
+    pub expected_session_id: Option<SessionId>,
     pub work_ref: WorkRef,
     pub content: ContentInput,
     pub origin: WorkOrigin,
@@ -403,6 +406,21 @@ pub(super) struct SubmitWorkPayload {
     pub llm_identity_applied_tx: Option<super::handle::MemberTurnLlmIdentityAppliedSender>,
     pub ack_mode: crate::mob_machine::SubmitWorkAckMode,
     pub content_attribution: crate::mob_machine::WorkContentAttribution,
+    /// A caller-bound governed input realized for this work exactly as
+    /// bound, in place of a turn built from `content`. Shell dispatch
+    /// carrier only: the MobMachine admits the same identity facts as for
+    /// any external work, and the member's native admission alone decides
+    /// the input.
+    pub governed_input: Option<Box<GovernedInputDelivery>>,
+}
+
+/// A caller-bound governed input and the channel that forwards the member
+/// session's canonical admission of it back to the caller.
+#[derive(Debug)]
+pub(super) struct GovernedInputDelivery {
+    pub(super) input: meerkat_runtime::Input,
+    pub(super) admission_tx: super::handle::MemberInputAdmissionSender,
+    pub(super) custody: Option<super::handle::GovernedInputCustody>,
 }
 
 // ---------------------------------------------------------------------------
@@ -656,6 +674,10 @@ pub(super) enum MobCommand {
         spawn_source: super::handle::SpawnSource,
         owner_bridge_session_id: Option<SessionId>,
         ops_registry: Option<Arc<dyn meerkat_core::ops_lifecycle::OpsLifecycleRegistry>>,
+        /// Hold the member at its producer hold point for the caller
+        /// ([`super::handle::MobHandle::spawn_held_until`]), within the
+        /// setup's bound.
+        held: Option<super::held_spawn::HeldSpawnRequest>,
         reply_tx: oneshot::Sender<Result<super::handle::MemberSpawnReceipt, MobError>>,
     },
     SpawnProvisioned {
@@ -1679,12 +1701,31 @@ pub(super) enum MobCommand {
     CrashStopPreservingDurableWorkForTest {
         reply_tx: oneshot::Sender<Result<(), MobError>>,
     },
+    /// Test-support-only: move a member's session binding under its current
+    /// runtime id through the generated `RecoverMemberSessionBinding` signal,
+    /// the same authority path a snapshotless session-head repair takes.
+    #[cfg(any(test, feature = "test-support"))]
+    RebindMemberSessionForTest {
+        agent_identity: AgentIdentity,
+        session_id: SessionId,
+        reply_tx: oneshot::Sender<Result<(), MobError>>,
+    },
     /// Read the current lifecycle phase directly from the DSL authority.
     /// Routes through the command channel so the actor returns the single
     /// canonical DSL-authority value; there is no atomic shadow (dogma #1,
     /// #13, #17).
     QueryPhase {
         reply_tx: oneshot::Sender<Result<MobState, MobError>>,
+    },
+    /// Close admission if the mob is idle (D67). Decided on the serialized
+    /// admission path in the same step that closes.
+    CloseIfIdle {
+        reply_tx: oneshot::Sender<Result<super::admission_close::CloseIfIdleOutcome, MobError>>,
+    },
+    /// Close admission unconditionally into the same Closing state (D67).
+    CloseAdmission {
+        reason: super::admission_close::MobAdmissionCloseReason,
+        reply_tx: oneshot::Sender<Result<Option<super::admission_close::MobBusy>, MobError>>,
     },
 }
 
@@ -1920,7 +1961,11 @@ impl MobCommand {
             Self::CrashStopPreservingDurableWorkForTest { .. } => {
                 ShutdownAnswerClass::CallerRequest
             }
+            #[cfg(any(test, feature = "test-support"))]
+            Self::RebindMemberSessionForTest { .. } => ShutdownAnswerClass::CallerRequest,
             Self::QueryPhase { .. } => ShutdownAnswerClass::CallerRequest,
+            Self::CloseIfIdle { .. } => ShutdownAnswerClass::CallerRequest,
+            Self::CloseAdmission { .. } => ShutdownAnswerClass::CallerRequest,
         }
     }
 
@@ -2124,7 +2169,11 @@ impl MobCommand {
             Self::CrashStopPreservingDurableWorkForTest { .. } => {
                 "CrashStopPreservingDurableWorkForTest"
             }
+            #[cfg(any(test, feature = "test-support"))]
+            Self::RebindMemberSessionForTest { .. } => "RebindMemberSessionForTest",
             Self::QueryPhase { .. } => "QueryPhase",
+            Self::CloseIfIdle { .. } => "CloseIfIdle",
+            Self::CloseAdmission { .. } => "CloseAdmission",
         }
     }
 }

@@ -86,7 +86,9 @@ use crate::temporary_council::TemporaryCouncilId;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use meerkat_core::SessionId;
-use meerkat_sqlite::watch::{SqliteChangeWatch, SqliteWatchControl, SqliteWatchTick};
+use meerkat_sqlite::watch::{
+    SqliteChangeWatch, SqliteWatchControl, SqliteWatchJoin, SqliteWatchStopHandle, SqliteWatchTick,
+};
 use rusqlite::{
     Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
@@ -94,6 +96,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -2498,63 +2501,184 @@ where
 // SqliteMobStores — unified handle (stores only the path)
 // ---------------------------------------------------------------------------
 
-static SQLITE_EVENT_BUSES: OnceLock<Mutex<HashMap<PathBuf, Weak<SqliteMobEventBus>>>> =
+/// One observer per canonical database path in this process. The registry
+/// holds observers weakly: it never keeps one alive.
+static SQLITE_EVENT_BUSES: OnceLock<Mutex<HashMap<PathBuf, Weak<SqliteMobEventCatchUp>>>> =
     OnceLock::new();
 
-fn sqlite_event_buses() -> &'static Mutex<HashMap<PathBuf, Weak<SqliteMobEventBus>>> {
+fn sqlite_event_buses() -> &'static Mutex<HashMap<PathBuf, Weak<SqliteMobEventCatchUp>>> {
     SQLITE_EVENT_BUSES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn sqlite_event_bus_for_path(path: PathBuf) -> Result<Arc<SqliteMobEventBus>, MobStoreError> {
-    let mut buses = lock_unpoisoned(sqlite_event_buses());
-    if let Some(bus) = buses.get(&path).and_then(Weak::upgrade) {
-        return Ok(bus);
+    let (bus, returned_workers) = attach_sqlite_event_bus(path)?;
+    // Watch workers of this observer that already returned: joining them,
+    // outside every lock, never waits.
+    for mut watch in returned_workers {
+        let _ = watch.stop_and_join();
     }
-
-    let bus = SqliteMobEventBus::new(path.clone())?;
-    buses.insert(path, Arc::downgrade(&bus));
     Ok(bus)
 }
 
-struct SqliteMobEventBus {
+fn attach_sqlite_event_bus(
     path: PathBuf,
-    event_tx: broadcast::Sender<MobEvent>,
-    latest_broadcast_cursor: Mutex<u64>,
-    catch_up_lock: Mutex<()>,
-    watcher: Mutex<Option<SqliteChangeWatch>>,
+) -> Result<(Arc<SqliteMobEventBus>, Vec<SqliteChangeWatch>), MobStoreError> {
+    let mut buses = lock_unpoisoned(sqlite_event_buses());
+    if let Some(catch_up) = buses.get(&path).and_then(Weak::upgrade) {
+        if let Some(bus) = catch_up.live_owner() {
+            return Ok((bus, Vec::new()));
+        }
+        if !catch_up.is_closed() {
+            // The last owner dropped while a watch worker may still be
+            // finishing a tick: keep this observer (its cursor, subscribers
+            // and the worker's join custody) and attach a new owner to it.
+            return Ok(SqliteMobEventBus::attach(catch_up));
+        }
+        // An observer drain closed this one: attach a replacement instead of
+        // reopening a drained observer.
+    }
+
+    let catch_up = Arc::new(SqliteMobEventCatchUp::new(path.clone())?);
+    buses.insert(path, Arc::downgrade(&catch_up));
+    Ok(SqliteMobEventBus::attach(catch_up))
+}
+
+/// A logical owner of one database's event observer: what stores, storage
+/// bundles and handles hold.
+///
+/// Ownership graph: owners hold the [`SqliteMobEventCatchUp`] strongly, and so
+/// does each watch worker's tick closure for the life of its thread; the
+/// catch-up state holds the join custody of its watches; the registry holds
+/// it weakly. No worker ever holds an owner, so an owner is never dropped on
+/// a worker thread, and `Arc::strong_count` of the owner counts owner handles
+/// only. Dropping the last owner requests its watch's stop and never blocks:
+/// the catch-up state, and with it the joinable worker, stays reachable until
+/// the worker returns.
+struct SqliteMobEventBus {
+    catch_up: Arc<SqliteMobEventCatchUp>,
+    /// Stops this owner's own watch; never joins.
+    watch_stop: Option<SqliteWatchStopHandle>,
     definition_resume_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl std::fmt::Debug for SqliteMobEventBus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteMobEventBus")
-            .field("path", &self.path)
+            .field("path", &self.catch_up.path)
             .finish()
     }
 }
 
 impl SqliteMobEventBus {
-    fn new(path: PathBuf) -> Result<Arc<Self>, MobStoreError> {
+    /// A new owner of `catch_up` with its own watch, plus watches of this
+    /// observer whose workers already returned (the caller joins them outside
+    /// every lock). Called under the registry lock.
+    fn attach(catch_up: Arc<SqliteMobEventCatchUp>) -> (Arc<Self>, Vec<SqliteChangeWatch>) {
+        let (watch_stop, returned_workers) = catch_up.start_external_watch();
+        let bus = Arc::new(Self {
+            catch_up,
+            watch_stop,
+            definition_resume_gate: Arc::new(tokio::sync::RwLock::new(())),
+        });
+        *lock_unpoisoned(&bus.catch_up.owner) = Arc::downgrade(&bus);
+        (bus, returned_workers)
+    }
+
+    fn subscribe(&self) -> super::MobEventReceiver {
+        self.catch_up.event_tx.subscribe()
+    }
+
+    fn publish_committed(&self, event: MobEvent) {
+        self.catch_up
+            .publish_committed_batch(std::slice::from_ref(&event));
+    }
+
+    fn publish_committed_batch(&self, events: &[MobEvent]) {
+        self.catch_up.publish_committed_batch(events);
+    }
+}
+
+impl Drop for SqliteMobEventBus {
+    fn drop(&mut self) {
+        // The last logical owner is gone: ask its watch worker to return. The
+        // worker's join custody stays with the catch-up state.
+        if let Some(watch_stop) = &self.watch_stop {
+            watch_stop.request_stop();
+        }
+    }
+}
+
+/// The catch-up state of one database's event observer: what a watch
+/// worker's tick closure holds. See [`SqliteMobEventBus`] for the ownership
+/// graph.
+struct SqliteMobEventCatchUp {
+    path: PathBuf,
+    event_tx: broadcast::Sender<MobEvent>,
+    latest_broadcast_cursor: Mutex<u64>,
+    /// Serializes catch-up reads; an observer drain waits on it for the one
+    /// in flight.
+    catch_up_lock: Mutex<()>,
+    /// Set by an observer drain under the registry lock: no owner attaches
+    /// to this state again and no catch-up opens the database again.
+    closed: AtomicBool,
+    /// The current logical owner, if one is alive.
+    owner: Mutex<Weak<SqliteMobEventBus>>,
+    /// Join custody of every watch started for this state and not joined.
+    custody: Mutex<WatchCustody>,
+    #[cfg(test)]
+    test_hooks: Mutex<CatchUpTestHooks>,
+}
+
+/// Join custody of one observer's watches.
+#[derive(Default)]
+struct WatchCustody {
+    /// Watches no drain has taken.
+    watches: Vec<SqliteChangeWatch>,
+    /// Worker threads of watches a drain has taken and is still joining. They
+    /// stay visible here, so a drain running on one of those threads knows it
+    /// must neither wait nor join.
+    joining: Vec<std::thread::ThreadId>,
+}
+
+/// One-shot test seams, each taken by the first event that reaches it.
+#[cfg(test)]
+#[derive(Default)]
+struct CatchUpTestHooks {
+    /// Runs on a watch worker at the start of a tick, outside every lock.
+    tick: Option<Box<dyn FnOnce() + Send>>,
+    /// Runs inside a catch-up, under the catch-up lock, after the existence
+    /// precheck.
+    in_catch_up: Option<Box<dyn FnOnce(&Path) + Send>>,
+    /// Signalled when an observer drain has closed this state.
+    drain_closed: Option<std::sync::mpsc::Sender<()>>,
+    /// Signalled when an observer drain off the watch workers has taken the
+    /// watches into its join custody, before it waits for a catch-up.
+    custody_taken: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl SqliteMobEventCatchUp {
+    fn new(path: PathBuf) -> Result<Self, MobStoreError> {
         let latest_cursor = latest_event_cursor_sync(&path)?;
         let (event_tx, _event_rx) = broadcast::channel(EVENT_SUBSCRIPTION_CHANNEL_CAPACITY);
-        let bus = Arc::new(Self {
+        Ok(Self {
             path,
             event_tx,
             latest_broadcast_cursor: Mutex::new(latest_cursor),
             catch_up_lock: Mutex::new(()),
-            watcher: Mutex::new(None),
-            definition_resume_gate: Arc::new(tokio::sync::RwLock::new(())),
-        });
-        bus.start_external_watch();
-        Ok(bus)
+            closed: AtomicBool::new(false),
+            owner: Mutex::new(Weak::new()),
+            custody: Mutex::new(WatchCustody::default()),
+            #[cfg(test)]
+            test_hooks: Mutex::new(CatchUpTestHooks::default()),
+        })
     }
 
-    fn subscribe(&self) -> super::MobEventReceiver {
-        self.event_tx.subscribe()
+    fn live_owner(&self) -> Option<Arc<SqliteMobEventBus>> {
+        lock_unpoisoned(&self.owner).upgrade()
     }
 
-    fn publish_committed(&self, event: MobEvent) {
-        self.publish_committed_batch(std::slice::from_ref(&event));
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     fn publish_committed_batch(&self, events: &[MobEvent]) {
@@ -2593,6 +2717,11 @@ impl SqliteMobEventBus {
 
     fn publish_available_from_storage(&self) -> Result<(), MobStoreError> {
         let _catch_up_guard = lock_unpoisoned(&self.catch_up_lock);
+        if self.is_closed() {
+            // An observer drain closed this observer: no catch-up opens the
+            // database again.
+            return Ok(());
+        }
         if !self.path.try_exists().map_err(se)? {
             // A successful mob destroy removes the SQLite database while
             // existing handle clones may still keep this event bus alive. The
@@ -2600,7 +2729,12 @@ impl SqliteMobEventBus {
             // because opening SQLite would create a fresh empty database.
             return Ok(());
         }
+        #[cfg(test)]
+        self.run_in_catch_up_test_hook();
         loop {
+            if self.is_closed() {
+                return Ok(());
+            }
             let after_cursor = *lock_unpoisoned(&self.latest_broadcast_cursor);
             let batch = match poll_events_sync(&self.path, after_cursor, EVENT_WATCH_CATCH_UP_LIMIT)
             {
@@ -2627,25 +2761,30 @@ impl SqliteMobEventBus {
         }
     }
 
-    fn start_external_watch(self: &Arc<Self>) {
-        let thread_bus = Arc::downgrade(self);
+    /// Start a watch whose ticks catch this state up and keep its join
+    /// custody. Returns the handle that stops it, and the watches whose
+    /// workers already returned, taken out of custody for the caller to join
+    /// outside every lock.
+    fn start_external_watch(
+        self: &Arc<Self>,
+    ) -> (Option<SqliteWatchStopHandle>, Vec<SqliteChangeWatch>) {
+        let catch_up = Arc::clone(self);
         let watch = meerkat_sqlite::watch::start_sqlite_change_watch(
             &self.path,
             "sqlite-mob-event-watch",
             Duration::from_millis(EVENT_WATCH_SAFETY_SWEEP_MS),
             move |tick| {
-                let Some(bus) = thread_bus.upgrade() else {
-                    return SqliteWatchControl::Stop;
-                };
-                if tick == SqliteWatchTick::Sweep && bus.event_tx.receiver_count() == 0 {
+                #[cfg(test)]
+                catch_up.run_tick_test_hook();
+                if tick == SqliteWatchTick::Sweep && catch_up.event_tx.receiver_count() == 0 {
                     return SqliteWatchControl::Handled;
                 }
-                match bus.publish_available_from_storage() {
+                match catch_up.publish_available_from_storage() {
                     Ok(()) => SqliteWatchControl::Handled,
                     Err(error) => {
                         tracing::warn!(
                             error = %error,
-                            path = %bus.path.display(),
+                            path = %catch_up.path.display(),
                             "sqlite mob event watch catch-up failed",
                         );
                         SqliteWatchControl::Failed
@@ -2654,14 +2793,218 @@ impl SqliteMobEventBus {
             },
         );
         match watch {
-            Ok(watch) => *lock_unpoisoned(&self.watcher) = Some(watch),
-            Err(error) => tracing::warn!(
-                error = %error,
-                path = %self.path.display(),
-                "failed to start the sqlite mob event watch",
-            ),
+            Ok(watch) => {
+                let watch_stop = watch.stop_handle();
+                let mut custody = lock_unpoisoned(&self.custody);
+                // A worker that already returned runs no tick again; its
+                // watch leaves custody here so its notifications stop too.
+                let (returned_workers, running): (Vec<_>, Vec<_>) =
+                    std::mem::take(&mut custody.watches)
+                        .into_iter()
+                        .partition(SqliteChangeWatch::is_finished);
+                custody.watches = running;
+                custody.watches.push(watch);
+                (Some(watch_stop), returned_workers)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    path = %self.path.display(),
+                    "failed to start the sqlite mob event watch",
+                );
+                (None, Vec::new())
+            }
         }
     }
+
+    /// Drain this closed observer: wait out an in-flight catch-up, then join
+    /// every watch worker it can. Holds no registry, catch-up or custody lock
+    /// across a wait or a join, and never waits on a watch worker thread.
+    fn drain(&self, key: &Path) -> SqliteMobObserverDrainReport {
+        #[cfg(test)]
+        self.signal_drain_closed_test_hook();
+        let mut report = SqliteMobObserverDrainReport {
+            catch_up_settled: false,
+            joined_workers: 0,
+            panicked_workers: 0,
+            unjoined_workers: 0,
+            joining_elsewhere: 0,
+            replacement_registered: false,
+        };
+        let current = std::thread::current().id();
+        let taken = {
+            let mut custody = lock_unpoisoned(&self.custody);
+            report.joining_elsewhere = custody.joining.len();
+            if custody.joining.contains(&current)
+                || custody
+                    .watches
+                    .iter()
+                    .any(SqliteChangeWatch::on_worker_thread)
+            {
+                // This thread is a watch worker, one in custody or one another
+                // drain is joining. It may be inside a catch-up that holds the
+                // lock, and a thread cannot join itself, so waiting or joining
+                // here could deadlock. Request every stop and leave the
+                // custody where it is, for a drain from another thread.
+                for watch in &custody.watches {
+                    watch.request_stop();
+                }
+                report.unjoined_workers = custody.watches.len();
+                None
+            } else {
+                let watches = std::mem::take(&mut custody.watches);
+                custody.joining.extend(
+                    watches
+                        .iter()
+                        .filter_map(SqliteChangeWatch::worker_thread_id),
+                );
+                Some(watches)
+            }
+        };
+        if let Some(watches) = taken {
+            #[cfg(test)]
+            self.signal_custody_taken_test_hook();
+            // Every later catch-up sees `closed`; this waits out the one in
+            // flight, whose read connection closes inside the lock.
+            drop(lock_unpoisoned(&self.catch_up_lock));
+            report.catch_up_settled = true;
+            for mut watch in watches {
+                let worker = watch.worker_thread_id();
+                let outcome = watch.stop_and_join();
+                let mut custody = lock_unpoisoned(&self.custody);
+                if let Some(worker) = worker
+                    && let Some(index) = custody.joining.iter().position(|id| *id == worker)
+                {
+                    custody.joining.swap_remove(index);
+                }
+                match outcome {
+                    SqliteWatchJoin::Joined => report.joined_workers += 1,
+                    SqliteWatchJoin::JoinedAfterPanic => {
+                        report.joined_workers += 1;
+                        report.panicked_workers += 1;
+                    }
+                    // Unreachable off the worker threads; the custody stays
+                    // all the same.
+                    SqliteWatchJoin::UnjoinedOnWorkerThread => {
+                        report.unjoined_workers += 1;
+                        custody.watches.push(watch);
+                    }
+                }
+            }
+        }
+        report.replacement_registered = lock_unpoisoned(sqlite_event_buses())
+            .get(key)
+            .and_then(Weak::upgrade)
+            .is_some_and(|registered| !std::ptr::eq(Arc::as_ptr(&registered), self));
+        report
+    }
+}
+
+#[cfg(test)]
+impl SqliteMobEventCatchUp {
+    fn run_tick_test_hook(&self) {
+        let hook = lock_unpoisoned(&self.test_hooks).tick.take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn run_in_catch_up_test_hook(&self) {
+        let hook = lock_unpoisoned(&self.test_hooks).in_catch_up.take();
+        if let Some(hook) = hook {
+            hook(&self.path);
+        }
+    }
+
+    fn signal_drain_closed_test_hook(&self) {
+        let signal = lock_unpoisoned(&self.test_hooks).drain_closed.take();
+        if let Some(signal) = signal {
+            let _ = signal.send(());
+        }
+    }
+
+    fn signal_custody_taken_test_hook(&self) {
+        let signal = lock_unpoisoned(&self.test_hooks).custody_taken.take();
+        if let Some(signal) = signal {
+            let _ = signal.send(());
+        }
+    }
+}
+
+/// What [`SqliteMobStores::drain_observers`] did for one database path in this
+/// process.
+///
+/// Its scope is the path's event observer only: the cross-process change
+/// watch, its worker threads, and its catch-up reads. It says nothing about
+/// operations through store handles (guarded writers, unguarded reads, or
+/// blocking work whose awaiting future was cancelled), other processes, or
+/// openers that attach a new observer later. It is never a statement that
+/// the database or its directory may be deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum SqliteMobObserverDrain {
+    /// No observer state was live in this process under the path's resolved
+    /// identity (its canonical path, or the exact registered key when the
+    /// path no longer resolves). A watch worker releases that state only as
+    /// it returns, so none can still run a tick; such a worker was never
+    /// joined.
+    NotFound,
+    /// The observer was found and closed: from then on no owner attaches to
+    /// it and no catch-up of it opens the database. The report says what was
+    /// waited for and joined, and what was not.
+    Closed(SqliteMobObserverDrainReport),
+}
+
+/// What a drain of a found observer settled, and what it left open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqliteMobObserverDrainReport {
+    /// The drain waited out any catch-up read in flight, from any thread.
+    /// False when the drain ran on a watch worker thread, where it cannot
+    /// wait.
+    pub catch_up_settled: bool,
+    /// Watch workers this drain joined after they returned, including those
+    /// whose tick panicked.
+    pub joined_workers: usize,
+    /// Of `joined_workers`, those whose tick panicked.
+    pub panicked_workers: usize,
+    /// Workers this drain did not join because it ran on a watch worker
+    /// thread. Their stop is requested and their join custody stays with
+    /// the observer; a drain from another thread joins them.
+    pub unjoined_workers: usize,
+    /// Workers a concurrent drain had already taken and was still joining.
+    /// A drain on one of those workers' threads returns at once with
+    /// `catch_up_settled` false.
+    pub joining_elsewhere: usize,
+    /// A different observer was registered for the path when the drain
+    /// finished: an opener attached after this drain closed the old one.
+    /// This drain does not cover it.
+    pub replacement_registered: bool,
+}
+
+/// Why [`SqliteMobStores::drain_observers`] refused. A refusal closes, stops
+/// and drains nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SqliteMobObserverDrainRefused {
+    /// Logical owners of the observer are alive in this process: stores,
+    /// storage bundles, handles or runtimes opened on the path, including
+    /// read-only use. They keep observing.
+    #[error("{owner_handles} owner handle(s) still observe this mob database")]
+    OtherOwners {
+        /// Live owner handles at the time of the refusal.
+        owner_handles: usize,
+    },
+    /// The path could not be resolved to the canonical identity observers
+    /// are registered under, and it is not itself a registered key. Whether
+    /// an observer of that database is live is unknown, never assumed
+    /// absent.
+    #[error(
+        "cannot resolve this path to the identity its observer is registered under ({kind}); \
+         whether an observer is live is unknown"
+    )]
+    UnresolvedPath {
+        /// Why the path did not resolve.
+        kind: std::io::ErrorKind,
+    },
 }
 
 /// Shared bundle that produces event/run/spec stores all pointing to the same db file.
@@ -2687,6 +3030,66 @@ impl SqliteMobStores {
         })
     }
 
+    /// Drain this process's event observer of the mob database at `path`:
+    /// its cross-process change watch and that watch's catch-up reads.
+    ///
+    /// While any logical owner of the observer is alive in this process
+    /// (stores, storage bundles, handles or runtimes opened on the path,
+    /// including read-only use), it refuses and closes, stops and drains
+    /// nothing: those owners keep observing. Otherwise it closes the
+    /// observer, under the registry lock, so no owner attaches to it again
+    /// (an opener from then on gets a replacement observer, which the report
+    /// names), waits out a catch-up read in flight on any thread, and joins
+    /// every watch worker, waiting for a tick that is running. It holds no
+    /// registry, catch-up or custody lock across that wait or a join.
+    ///
+    /// Blocking and unbounded by design: it waits as long as a running
+    /// catch-up read or tick runs. From async code run it on a blocking
+    /// thread; cancelling the future that awaits that thread neither cancels
+    /// nor settles the drain. On a watch worker thread, including one that
+    /// a concurrent drain is joining, it neither waits nor joins, and its
+    /// report says so.
+    ///
+    /// The result is scoped to that observer; see [`SqliteMobObserverDrain`].
+    /// It never states that the database or its directory may be deleted:
+    /// store operations through any handle, other processes and later
+    /// openers are outside it. When `path` no longer resolves and is not
+    /// itself the registered key, it refuses with
+    /// [`SqliteMobObserverDrainRefused::UnresolvedPath`] instead of reading
+    /// the miss as a missing observer.
+    pub fn drain_observers(
+        path: impl AsRef<Path>,
+    ) -> Result<SqliteMobObserverDrain, SqliteMobObserverDrainRefused> {
+        let path = path.as_ref();
+        let resolved = std::fs::canonicalize(path);
+        let (catch_up, key) = {
+            let buses = lock_unpoisoned(sqlite_event_buses());
+            // `open` registers observers under the canonical path. Without
+            // resolution only an exact registered key identifies one; any
+            // other spelling leaves it unknown whether one is live.
+            let key = match resolved {
+                Ok(canonical) => canonical,
+                Err(_) if buses.contains_key(path) => path.to_path_buf(),
+                Err(error) => {
+                    return Err(SqliteMobObserverDrainRefused::UnresolvedPath {
+                        kind: error.kind(),
+                    });
+                }
+            };
+            let Some(catch_up) = buses.get(&key).and_then(Weak::upgrade) else {
+                return Ok(SqliteMobObserverDrain::NotFound);
+            };
+            if let Some(owner) = catch_up.live_owner() {
+                // The count includes the upgrade just taken.
+                let owner_handles = Arc::strong_count(&owner).saturating_sub(1);
+                return Err(SqliteMobObserverDrainRefused::OtherOwners { owner_handles });
+            }
+            catch_up.closed.store(true, Ordering::Release);
+            (catch_up, key)
+        };
+        Ok(SqliteMobObserverDrain::Closed(catch_up.drain(&key)))
+    }
+
     pub fn event_store(&self) -> SqliteMobEventStore {
         SqliteMobEventStore {
             path: self.path.clone(),
@@ -2697,18 +3100,21 @@ impl SqliteMobStores {
     pub fn run_store(&self) -> SqliteMobRunStore {
         SqliteMobRunStore {
             path: self.path.clone(),
+            event_bus: Arc::clone(&self.event_bus),
         }
     }
 
     pub fn spec_store(&self) -> SqliteMobSpecStore {
         SqliteMobSpecStore {
             path: self.path.clone(),
+            _owner: Arc::clone(&self.event_bus),
         }
     }
 
     pub fn runtime_metadata_store(&self) -> SqliteMobRuntimeMetadataStore {
         SqliteMobRuntimeMetadataStore {
             path: self.path.clone(),
+            _owner: Arc::clone(&self.event_bus),
         }
     }
 
@@ -2716,6 +3122,7 @@ impl SqliteMobStores {
     pub fn forked_participant_store(&self) -> SqliteForkedParticipantStore {
         SqliteForkedParticipantStore {
             path: self.path.clone(),
+            _owner: Some(Arc::clone(&self.event_bus)),
         }
     }
 
@@ -2745,6 +3152,7 @@ impl SqliteMobStores {
         SqliteMobIdentityStatusStore {
             path: self.path.clone(),
             store_instance_id: self.identity_store_instance_id.clone(),
+            _owner: Arc::clone(&self.event_bus),
         }
     }
 
@@ -2755,6 +3163,7 @@ impl SqliteMobStores {
     pub fn realm_profile_store(&self) -> SqliteRealmProfileStore {
         SqliteRealmProfileStore {
             path: self.path.clone(),
+            _owner: Some(Arc::clone(&self.event_bus)),
         }
     }
 }
@@ -2900,6 +3309,9 @@ impl SqliteMobIdentityStore {
 pub struct SqliteMobIdentityStatusStore {
     path: PathBuf,
     store_instance_id: String,
+    /// Owns the database's observer while this handle lives, so an observer
+    /// drain counts this public reader.
+    _owner: Arc<SqliteMobEventBus>,
 }
 
 fn sqlite_identity_write_error(error: rusqlite::Error, context: &str) -> MobStoreError {
@@ -5253,6 +5665,9 @@ impl MobIdentityStatusStore for SqliteMobIdentityStatusStore {
 #[derive(Clone)]
 pub struct SqliteMobRuntimeMetadataStore {
     path: PathBuf,
+    /// Owns the database's observer while this handle lives, so an observer
+    /// drain counts this public reader.
+    _owner: Arc<SqliteMobEventBus>,
 }
 
 impl std::fmt::Debug for SqliteMobRuntimeMetadataStore {
@@ -8377,6 +8792,10 @@ fn set_next_cursor(conn: &Connection, value: u64) -> Result<(), MobStoreError> {
 #[derive(Clone)]
 pub struct SqliteMobRunStore {
     path: PathBuf,
+    /// The bus terminal flow events are published on, kept from the bundle
+    /// that made this store: a terminal CAS never attaches or creates an
+    /// observer of its own.
+    event_bus: Arc<SqliteMobEventBus>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -8860,7 +9279,7 @@ impl MobRunStore for SqliteMobRunStore {
         let terminality_run_id = run_id.clone();
         let expected_flow_state = expected_flow_state.clone();
         let next_flow_state = next_flow_state.clone();
-        let event_bus = sqlite_event_bus_for_path(self.path.clone())?;
+        let event_bus = Arc::clone(&self.event_bus);
         let stored = run_sqlite_task(move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
@@ -9428,6 +9847,9 @@ impl MobRunStore for SqliteMobRunStore {
 #[derive(Clone)]
 pub struct SqliteMobSpecStore {
     path: PathBuf,
+    /// Owns the database's observer while this handle lives, so an observer
+    /// drain counts this public reader.
+    _owner: Arc<SqliteMobEventBus>,
 }
 
 impl std::fmt::Debug for SqliteMobSpecStore {
@@ -9597,6 +10019,10 @@ impl MobSpecStore for SqliteMobSpecStore {
 /// connection is retained.
 pub struct SqliteForkedParticipantStore {
     path: PathBuf,
+    /// Owns the database's observer while this handle lives, so an observer
+    /// drain counts this public reader.
+    /// None for a standalone capability database, which has no observer.
+    _owner: Option<Arc<SqliteMobEventBus>>,
 }
 
 impl std::fmt::Debug for SqliteForkedParticipantStore {
@@ -9618,6 +10044,7 @@ impl SqliteForkedParticipantStore {
         let _conn = open_connection(&path)?;
         Ok(Self {
             path: std::fs::canonicalize(&path).map_err(se)?,
+            _owner: None,
         })
     }
 }
@@ -10092,6 +10519,10 @@ impl TemporaryCouncilStore for SqliteTemporaryCouncilStore {
 
 pub struct SqliteRealmProfileStore {
     path: PathBuf,
+    /// Owns the database's observer while this handle lives, so an observer
+    /// drain counts this public reader.
+    /// None for a standalone realm profile database, which has no observer.
+    _owner: Option<Arc<SqliteMobEventBus>>,
 }
 
 impl SqliteRealmProfileStore {
@@ -10105,6 +10536,7 @@ impl SqliteRealmProfileStore {
         drop(conn);
         Ok(Self {
             path: db_path.to_path_buf(),
+            _owner: None,
         })
     }
 }
@@ -10383,6 +10815,7 @@ mod tests {
     };
     use meerkat_core::ops::OperationId;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
 
     #[derive(Debug)]
     struct TestIdentityClock {
@@ -11594,7 +12027,11 @@ mod tests {
             "test setup should remove the database before watcher catch-up"
         );
 
-        stores.event_bus.publish_available_from_storage().unwrap();
+        stores
+            .event_bus
+            .catch_up
+            .publish_available_from_storage()
+            .unwrap();
         assert!(
             !path.exists(),
             "watcher catch-up must not recreate intentionally deleted mob storage"
@@ -11618,6 +12055,427 @@ mod tests {
             !path.exists(),
             "passive catch-up must not recreate a database deleted after its preflight check: {error}"
         );
+    }
+
+    const OBSERVER_HANG_GUARD: Duration = Duration::from_secs(10);
+
+    fn closed_report(
+        catch_up_settled: bool,
+        joined_workers: usize,
+        unjoined_workers: usize,
+        replacement_registered: bool,
+    ) -> SqliteMobObserverDrain {
+        SqliteMobObserverDrain::Closed(SqliteMobObserverDrainReport {
+            catch_up_settled,
+            joined_workers,
+            panicked_workers: 0,
+            unjoined_workers,
+            joining_elsewhere: 0,
+            replacement_registered,
+        })
+    }
+
+    /// The observer state registered for `path`. Holding it is not ownership,
+    /// but it keeps the state (and its workers' join custody) reachable.
+    fn registered_catch_up(path: &Path) -> Arc<SqliteMobEventCatchUp> {
+        let key = std::fs::canonicalize(path).unwrap();
+        lock_unpoisoned(sqlite_event_buses())
+            .get(&key)
+            .and_then(Weak::upgrade)
+            .expect("an observer is registered for the path")
+    }
+
+    /// Commit one event through a raw writer connection, as another process
+    /// would: only the observer's watch can notice it.
+    fn raw_append(path: &Path, cursor: u64) {
+        let stored = MobEvent {
+            cursor,
+            timestamp: Utc::now(),
+            mob_id: MobId::from("mob"),
+            kind: MobEventKind::MobCompleted,
+        };
+        let encoded = encode_stored_mob_event(&stored).unwrap();
+        let mut conn = open_connection(path).unwrap();
+        let tx = begin_immediate(&mut conn).unwrap();
+        tx.execute(
+            "INSERT INTO mob_events (cursor, event_json) VALUES (?1, ?2)",
+            params![cursor_to_i64(cursor).unwrap(), encoded],
+        )
+        .unwrap();
+        set_next_cursor(&tx, cursor.saturating_add(1)).unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// A catch-up held mid-flight with its read connection open.
+    struct HeldCatchUp {
+        entered: mpsc::Receiver<()>,
+        release: mpsc::Sender<()>,
+        /// Set once the held catch-up closed its read connection.
+        finished: Arc<AtomicBool>,
+    }
+
+    fn hold_next_catch_up(catch_up: &SqliteMobEventCatchUp) -> HeldCatchUp {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let finished = Arc::new(AtomicBool::new(false));
+        let hook_finished = Arc::clone(&finished);
+        lock_unpoisoned(&catch_up.test_hooks).in_catch_up = Some(Box::new(move |path: &Path| {
+            let conn = open_existing_read_connection(path).expect("catch-up read connection");
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+            drop(conn);
+            hook_finished.store(true, Ordering::SeqCst);
+        }));
+        HeldCatchUp {
+            entered: entered_rx,
+            release: release_tx,
+            finished,
+        }
+    }
+
+    fn signal_drain_closed(catch_up: &SqliteMobEventCatchUp) -> mpsc::Receiver<()> {
+        let (closed_tx, closed_rx) = mpsc::channel();
+        lock_unpoisoned(&catch_up.test_hooks).drain_closed = Some(closed_tx);
+        closed_rx
+    }
+
+    #[test]
+    fn observer_drain_waits_for_a_held_catch_up_and_joins_its_worker() {
+        let (dir, path) = temp_db_path();
+        let stores = SqliteMobStores::open(&path).unwrap();
+        let closed = signal_drain_closed(&stores.event_bus.catch_up);
+        let held = hold_next_catch_up(&stores.event_bus.catch_up);
+        raw_append(&path, 1);
+        held.entered
+            .recv_timeout(OBSERVER_HANG_GUARD)
+            .expect("the watch catch-up is held with its read connection open");
+
+        // The last logical owner drops while its worker is mid-catch-up: that
+        // only requests the stop, on this thread, without waiting.
+        drop(stores);
+        let drain_path = path.clone();
+        let drain = std::thread::spawn(move || SqliteMobStores::drain_observers(&drain_path));
+        closed
+            .recv_timeout(OBSERVER_HANG_GUARD)
+            .expect("the drain closed the observer");
+        held.release.send(()).unwrap();
+        let outcome = drain.join().unwrap().expect("no owner remains");
+
+        assert!(
+            held.finished.load(Ordering::SeqCst),
+            "the drain returned before the held catch-up closed its read connection"
+        );
+        assert_eq!(outcome, closed_report(true, 1, 0, false));
+        // Nothing of the observer runs any more, and this test holds no other
+        // handle or operation on the directory: it goes at once, no retry.
+        std::fs::remove_dir_all(dir.path()).unwrap();
+        assert!(!dir.path().exists());
+    }
+
+    #[tokio::test]
+    async fn observer_drain_refuses_while_public_reader_handles_own_the_observer() {
+        let (_dir, path) = temp_db_path();
+        // Public reader handles on one path: a storage bundle, an event store
+        // and a run store, which keeps the bus its terminal CAS publishes on.
+        let storage = crate::MobStorage::persistent(&path).unwrap();
+        let reader = SqliteMobStores::open(&path).unwrap();
+        let event_reader = reader.event_store();
+        let run_store = reader.run_store();
+        // A path-only public reader counts as an owner too.
+        let spec_reader = reader.spec_store();
+        drop(reader);
+
+        let refused = SqliteMobStores::drain_observers(&path)
+            .expect_err("live reader handles own the observer");
+        assert!(
+            matches!(
+                refused,
+                SqliteMobObserverDrainRefused::OtherOwners { owner_handles } if owner_handles >= 3
+            ),
+            "{refused:?}"
+        );
+
+        // The refusal closed and stopped nothing: a reader still observes a
+        // commit made by another writer.
+        assert!(!registered_catch_up(&path).is_closed());
+        let mut rx = event_reader.subscribe().unwrap();
+        raw_append(&path, 1);
+        let observed = tokio::time::timeout(
+            Duration::from_millis(EVENT_WATCH_SAFETY_SWEEP_MS.saturating_mul(2)),
+            rx.recv(),
+        )
+        .await
+        .expect("the reader still observes cross-writer commits")
+        .expect("subscription stays open");
+        assert_eq!(observed.cursor, 1);
+
+        // The run store and the path-only reader still own the observer.
+        drop(storage);
+        drop(event_reader);
+        assert_eq!(
+            SqliteMobStores::drain_observers(&path),
+            Err(SqliteMobObserverDrainRefused::OtherOwners { owner_handles: 2 })
+        );
+        assert!(spec_reader.get_spec(&MobId::from("absent")).await.is_ok());
+        drop(spec_reader);
+        assert_eq!(
+            SqliteMobStores::drain_observers(&path),
+            Err(SqliteMobObserverDrainRefused::OtherOwners { owner_handles: 1 })
+        );
+
+        let catch_up = registered_catch_up(&path);
+        drop(run_store);
+        let drain_path = path.clone();
+        let outcome = std::thread::spawn(move || SqliteMobStores::drain_observers(&drain_path))
+            .join()
+            .unwrap();
+        assert_eq!(outcome, Ok(closed_report(true, 1, 0, false)));
+        drop(catch_up);
+    }
+
+    #[test]
+    fn observer_drain_on_its_own_watch_worker_stays_unjoined_and_keeps_custody() {
+        let (_dir, path) = temp_db_path();
+        let stores = SqliteMobStores::open(&path).unwrap();
+        let catch_up = Arc::clone(&stores.event_bus.catch_up);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let hook_path = path.clone();
+        lock_unpoisoned(&catch_up.test_hooks).tick = Some(Box::new(move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+            let _ = outcome_tx.send(SqliteMobStores::drain_observers(&hook_path));
+        }));
+        raw_append(&path, 1);
+        entered_rx
+            .recv_timeout(OBSERVER_HANG_GUARD)
+            .expect("a watch tick is held");
+        drop(stores);
+        release_tx.send(()).unwrap();
+
+        let on_worker = outcome_rx
+            .recv_timeout(OBSERVER_HANG_GUARD)
+            .expect("the drain on the worker thread returns")
+            .expect("no owner remains");
+        assert_eq!(
+            on_worker,
+            closed_report(false, 0, 1, false),
+            "a drain on the worker can neither wait nor join, and must say so"
+        );
+
+        // The worker's join custody survived the self-stop: a drain from this
+        // thread joins it instead of finding nothing to join.
+        assert_eq!(
+            SqliteMobStores::drain_observers(&path),
+            Ok(closed_report(true, 1, 0, false))
+        );
+        drop(catch_up);
+    }
+
+    #[tokio::test]
+    async fn an_opener_during_an_observer_drain_gets_a_replacement_the_report_names() {
+        let (_dir, path) = temp_db_path();
+        let stores = SqliteMobStores::open(&path).unwrap();
+        let closed = signal_drain_closed(&stores.event_bus.catch_up);
+        let held = hold_next_catch_up(&stores.event_bus.catch_up);
+        raw_append(&path, 1);
+        held.entered
+            .recv_timeout(OBSERVER_HANG_GUARD)
+            .expect("the watch catch-up is held");
+        drop(stores);
+        let drain_path = path.clone();
+        let drain = std::thread::spawn(move || SqliteMobStores::drain_observers(&drain_path));
+        closed
+            .recv_timeout(OBSERVER_HANG_GUARD)
+            .expect("the drain closed the observer");
+
+        // The gap: the old observer is closed and its catch-up still runs. An
+        // opener now attaches a replacement observer, never the closed one.
+        let opener = SqliteMobStores::open(&path).unwrap();
+        assert!(!opener.event_bus.catch_up.is_closed());
+        held.release.send(()).unwrap();
+        let outcome = drain
+            .join()
+            .unwrap()
+            .expect("no owner of the closed observer remained");
+        assert_eq!(outcome, closed_report(true, 1, 0, true));
+
+        // The replacement observes on its own, and it is a live owner the
+        // closed observer's drain never touched.
+        let mut rx = opener.event_store().subscribe().unwrap();
+        raw_append(&path, 2);
+        let observed = tokio::time::timeout(
+            Duration::from_millis(EVENT_WATCH_SAFETY_SWEEP_MS.saturating_mul(2)),
+            rx.recv(),
+        )
+        .await
+        .expect("the replacement observes cross-writer commits")
+        .expect("subscription stays open");
+        assert_eq!(observed.cursor, 2);
+        assert_eq!(
+            SqliteMobStores::drain_observers(&path),
+            Err(SqliteMobObserverDrainRefused::OtherOwners { owner_handles: 1 })
+        );
+    }
+
+    // Multi-threaded: this test blocks its own thread while the spawned read
+    // must still be polled into its blocking work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observer_drain_does_not_cover_a_cancelled_unguarded_read() {
+        let (_dir, path) = temp_db_path();
+        let stores = SqliteMobStores::open(&path).unwrap();
+        let catch_up = Arc::clone(&stores.event_bus.catch_up);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel();
+        let read_path = path.clone();
+        // An unguarded store read whose awaiting future is cancelled: the
+        // blocking work keeps running with its connection.
+        let read = tokio::spawn(run_sqlite_task(move || {
+            let conn = open_existing_read_connection(&read_path)?;
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+            let events = poll_events_from_connection(&conn, 0, 10);
+            drop(conn);
+            let _ = done_tx.send(());
+            events
+        }));
+        entered_rx
+            .recv_timeout(OBSERVER_HANG_GUARD)
+            .expect("the read holds its connection");
+        read.abort();
+        assert!(read.await.unwrap_err().is_cancelled());
+
+        drop(stores);
+        let (drain_tx, drain_rx) = mpsc::channel();
+        let drain_path = path.clone();
+        std::thread::spawn(move || {
+            let _ = drain_tx.send(SqliteMobStores::drain_observers(&drain_path));
+        });
+        let outcome = drain_rx
+            .recv_timeout(OBSERVER_HANG_GUARD)
+            .expect("the drain never waits for store reads");
+        assert_eq!(outcome, Ok(closed_report(true, 1, 0, false)));
+        assert!(
+            done_rx.try_recv().is_err(),
+            "the cancelled read still holds its connection: the drain's scope ends at the observer"
+        );
+
+        release_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(OBSERVER_HANG_GUARD)
+            .expect("the released read finishes on its own");
+        drop(catch_up);
+    }
+
+    #[test]
+    fn a_drain_on_a_worker_that_another_drain_is_joining_returns_without_waiting() {
+        let (_dir, path) = temp_db_path();
+        let stores = SqliteMobStores::open(&path).unwrap();
+        let catch_up = Arc::clone(&stores.event_bus.catch_up);
+        let (taken_tx, taken_rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (worker_drain_tx, worker_drain_rx) = mpsc::channel();
+        let hook_path = path.clone();
+        {
+            let mut hooks = lock_unpoisoned(&catch_up.test_hooks);
+            hooks.custody_taken = Some(taken_tx);
+            // The worker W holds the catch-up lock in here; on `go` it drains
+            // its own observer.
+            hooks.in_catch_up = Some(Box::new(move |_path: &Path| {
+                let _ = entered_tx.send(());
+                let _ = go_rx.recv();
+                let _ = worker_drain_tx.send(SqliteMobStores::drain_observers(&hook_path));
+            }));
+        }
+        raw_append(&path, 1);
+        entered_rx
+            .recv_timeout(OBSERVER_HANG_GUARD)
+            .expect("the worker holds the catch-up lock");
+        drop(stores);
+
+        // Drain A, off the workers, takes W's watch into its join custody,
+        // then waits for W's catch-up.
+        let drain_path = path.clone();
+        let drain_a = std::thread::spawn(move || SqliteMobStores::drain_observers(&drain_path));
+        taken_rx
+            .recv_timeout(OBSERVER_HANG_GUARD)
+            .expect("drain A took the watch custody");
+
+        // Drain B runs on W itself, inside the catch-up lock: it must return
+        // at once, unjoined, naming the drain that is joining W.
+        go_tx.send(()).unwrap();
+        let on_worker = worker_drain_rx
+            .recv_timeout(OBSERVER_HANG_GUARD)
+            .expect("a drain on a watch worker returns without waiting");
+        assert_eq!(
+            on_worker,
+            Ok(SqliteMobObserverDrain::Closed(
+                SqliteMobObserverDrainReport {
+                    catch_up_settled: false,
+                    joined_workers: 0,
+                    panicked_workers: 0,
+                    unjoined_workers: 0,
+                    joining_elsewhere: 1,
+                    replacement_registered: false,
+                }
+            ))
+        );
+
+        // W's tick then finishes, and drain A really joins it.
+        assert_eq!(
+            drain_a.join().unwrap(),
+            Ok(closed_report(true, 1, 0, false))
+        );
+        drop(catch_up);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observer_drain_never_reads_an_unresolvable_alias_as_not_found() {
+        let (dir, path) = temp_db_path();
+        let alias_dir = dir.path().join("alias");
+        std::os::unix::fs::symlink(dir.path(), &alias_dir).unwrap();
+        let alias = alias_dir.join("mob.db");
+        // Opened through the alias, the observer registers its canonical path.
+        let stores = SqliteMobStores::open(&alias).unwrap();
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        let catch_up = registered_catch_up(&canonical);
+
+        // The alias stops resolving while the canonical observer is held.
+        std::fs::remove_file(&alias_dir).unwrap();
+        let refused = SqliteMobStores::drain_observers(&alias)
+            .expect_err("an unresolvable alias never reads as a missing observer");
+        assert!(
+            !matches!(refused, SqliteMobObserverDrainRefused::OtherOwners { .. }),
+            "{refused:?}"
+        );
+        assert!(
+            refused.to_string().contains("resolve"),
+            "the refusal names the unresolved path: {refused}"
+        );
+        // The canonical spelling still names the held observer.
+        assert_eq!(
+            SqliteMobStores::drain_observers(&canonical),
+            Err(SqliteMobObserverDrainRefused::OtherOwners { owner_handles: 1 })
+        );
+
+        // An exact registered key stays usable when resolution fails: the
+        // database files themselves are gone.
+        drop(stores);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = canonical.as_os_str().to_os_string();
+            file.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(file));
+        }
+        assert!(std::fs::canonicalize(&canonical).is_err());
+        assert_eq!(
+            SqliteMobStores::drain_observers(&canonical),
+            Ok(closed_report(true, 1, 0, false))
+        );
+        drop(catch_up);
     }
 
     #[tokio::test]

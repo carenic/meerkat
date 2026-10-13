@@ -404,6 +404,13 @@ pub struct ProvisionMemberRequest {
     /// token and returns the exact retirement fence.
     pub(crate) direct_member_incarnation:
         Option<super::bridge_protocol::BridgeDirectMemberIncarnation>,
+    /// A held setup's bound ([`MobProvisioner::provision_member_held`]): the
+    /// caller's setup deadline and the caller's loss, `None` for every other
+    /// provision. The provisioner checks it, deadline first, after each
+    /// unbounded step before the hold point and before the next effect; a
+    /// step stopped there awaits the cleanup of what it holds and fails
+    /// typed. It coordinates cancellation only and never supplies authority.
+    pub(crate) held_bound: Option<super::held_spawn::HeldProvisionBound>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1389,7 +1396,13 @@ pub(super) fn classify_stop_member_cancel(
 ) -> Result<super::stop_report::MemberStopRun, meerkat_runtime::RuntimeDriverError> {
     use super::stop_report::MemberStopRun;
     match cancelled {
-        Ok(true) => Ok(MemberStopRun::CancelledAtBoundary { run_id }),
+        // The runtime accepted and recorded the cancel for the exact run; an
+        // outcome-unknown error is a live-delivery failure after that, and
+        // the recorded cancel still ends the run at its next boundary.
+        Ok(true)
+        | Err(meerkat_runtime::RuntimeDriverError::InterruptDispatchOutcomeUnknown { .. }) => {
+            Ok(MemberStopRun::CancelledAtBoundary { run_id })
+        }
         Ok(false) => Ok(MemberStopRun::RunEndedBeforeCancel { run_id }),
         // The run's attachment was replaced or the runtime left Running
         // between the hold and the cancel: the run is over.
@@ -1470,6 +1483,20 @@ pub trait MobProvisioner: Send + Sync {
         &self,
         req: ProvisionMemberRequest,
     ) -> Result<MemberSpawnReceipt, MobError>;
+
+    /// Provision a fresh member and hold it before its publication: its
+    /// agent finished under its host's selection and its built surface
+    /// verified, its actor not yet serving. See [`HeldMemberProvision`]. A
+    /// provisioner that cannot hold its members refuses.
+    #[cfg(feature = "runtime-adapter")]
+    async fn provision_member_held(
+        &self,
+        _req: ProvisionMemberRequest,
+    ) -> Result<HeldMemberProvision, MobError> {
+        Err(MobError::HeldProvisionUnsupported {
+            reason: "this provisioner cannot hold a member before its publication".into(),
+        })
+    }
 
     #[cfg(feature = "runtime-adapter")]
     async fn provision_member_from_reload_claim(
@@ -1815,6 +1842,27 @@ pub trait MobProvisioner: Send + Sync {
         Err(MobError::UnsupportedForMode {
             mode: crate::MobRuntimeMode::AutonomousHost,
             reason: "host human input is not supported by this provisioner".to_string(),
+        })
+    }
+    /// Admit an already-bound governed input to the member's session
+    /// through native admission, exactly as bound. The mob never builds,
+    /// rebinds or alters it; refusal stays the runtime's typed verdict.
+    /// Returns the session's canonical admission unchanged. A supplied
+    /// `custody` is handed to that native admission, which settles it; an
+    /// implementation that does not attempt admission drops it, settling
+    /// `NotAdmitted`.
+    #[cfg(feature = "runtime-adapter")]
+    async fn admit_governed_input(
+        &self,
+        member_ref: &MemberRef,
+        input: meerkat_runtime::Input,
+        completion_tx: super::handle::ExactTurnCompletionSender,
+        custody: Option<super::handle::GovernedInputCustody>,
+    ) -> Result<super::handle::MemberInputAdmission, MobError> {
+        let _ = (member_ref, input, completion_tx, custody);
+        Err(MobError::UnsupportedForMode {
+            mode: crate::MobRuntimeMode::TurnDriven,
+            reason: "governed input is not supported by this provisioner".to_string(),
         })
     }
     async fn admit_turn_for_operation(
@@ -2189,6 +2237,9 @@ pub struct SessionBackend {
     // on a cheap clone of this backend. `None` on the shared instance: the
     // ordinary `provision_member` contract records nothing.
     settlement_ledger: Option<Arc<ProvisionSettlementLedger>>,
+    // Optional host selection of each member's scoped destination; the
+    // backend installs it on the member's exact registration.
+    member_runtime_registration_hook: Option<Arc<dyn super::MemberRuntimeRegistrationHook>>,
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -2236,6 +2287,56 @@ type ReloadWarmClaimTestHook = (oneshot::Sender<()>, oneshot::Receiver<()>);
 #[cfg(all(test, feature = "runtime-adapter"))]
 static RELOAD_WARM_CLAIM_TEST_HOOKS: std::sync::LazyLock<
     StdMutex<HashMap<SessionId, ReloadWarmClaimTestHook>>,
+> = std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Test seam: parks a held setup's owned create right before it awaits its
+/// prepared registration witness, so a test can end the setup's bound during
+/// that wait. Inert unless armed for the session.
+#[cfg(all(test, feature = "runtime-adapter"))]
+static OWNED_CREATE_REGISTRATION_WITNESS_TEST_HOOKS: std::sync::LazyLock<
+    StdMutex<HashMap<SessionId, ReloadWarmClaimTestHook>>,
+> = std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Test seam: the owned create's abort, after it ran, reports a failure for
+/// the armed session, so a test can observe how a stopped create keeps an
+/// unconfirmed cleanup. Inert unless armed for the session.
+#[cfg(all(test, feature = "runtime-adapter"))]
+static OWNED_CREATE_ABORT_FAILURE_TEST_HOOKS: std::sync::LazyLock<
+    StdMutex<std::collections::HashSet<SessionId>>,
+> = std::sync::LazyLock::new(|| StdMutex::new(std::collections::HashSet::new()));
+
+#[cfg(all(test, feature = "runtime-adapter"))]
+pub(super) fn arm_owned_create_before_registration_witness_for_test(
+    session_id: SessionId,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    assert!(
+        OWNED_CREATE_REGISTRATION_WITNESS_TEST_HOOKS
+            .lock()
+            .expect("owned create registration witness hook")
+            .insert(session_id, (entered_tx, release_rx))
+            .is_none()
+    );
+    (entered_rx, release_tx)
+}
+
+#[cfg(all(test, feature = "runtime-adapter"))]
+pub(super) fn arm_owned_create_abort_failure_for_test(session_id: SessionId) {
+    assert!(
+        OWNED_CREATE_ABORT_FAILURE_TEST_HOOKS
+            .lock()
+            .expect("owned create abort failure hook")
+            .insert(session_id)
+    );
+}
+
+/// Fault seam: runs in a held member's final serving commit, right after its
+/// actor's liveness was read, so a test can complete a competing service
+/// discard inside that interval.
+#[cfg(all(test, feature = "runtime-adapter"))]
+pub(super) static HELD_FINAL_COMMIT_TEST_HOOKS: std::sync::LazyLock<
+    StdMutex<HashMap<SessionId, Box<dyn FnOnce() + Send>>>,
 > = std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 #[cfg(all(test, feature = "runtime-adapter"))]
@@ -5476,7 +5577,23 @@ impl SessionBackend {
             composition_signal_dispatcher: None,
             disposal,
             settlement_ledger: None,
+            member_runtime_registration_hook: None,
         }
+    }
+
+    pub fn with_member_runtime_registration_hook(
+        mut self,
+        hook: Arc<dyn super::MemberRuntimeRegistrationHook>,
+    ) -> Self {
+        self.member_runtime_registration_hook = Some(hook);
+        self
+    }
+
+    fn registration_composition(&self) -> super::registration_hook::MemberRegistrationComposition {
+        self.runtime_adapter
+            .as_ref()
+            .zip(self.member_runtime_registration_hook.as_ref())
+            .map(|(machine, hook)| (Arc::clone(machine), Arc::clone(hook)))
     }
 
     /// A cheap clone of this backend scoped to ONE provisioning attempt's
@@ -6039,10 +6156,13 @@ impl SessionBackend {
             completion_tx,
             llm_identity_applied_tx,
             meerkat_runtime::accept::InputReplayPolicy::KeyOnly,
+            None,
         )
         .await
+        .map(drop)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn admit_runtime_input_with_replay_policy(
         &self,
         session_id: &SessionId,
@@ -6051,7 +6171,8 @@ impl SessionBackend {
         completion_tx: Option<super::handle::ExactTurnCompletionSender>,
         llm_identity_applied_tx: Option<super::handle::MemberTurnLlmIdentityAppliedSender>,
         replay_policy: meerkat_runtime::accept::InputReplayPolicy,
-    ) -> Result<(), MobError> {
+        custody: Option<super::handle::GovernedInputCustody>,
+    ) -> Result<Option<super::handle::MemberInputAdmission>, MobError> {
         let adapter = self.runtime_adapter.as_ref().ok_or_else(|| {
             MobError::Internal(format!(
                 "runtime-backed turn requested without runtime adapter: {session_id}"
@@ -6087,13 +6208,28 @@ impl SessionBackend {
                 queued_event_tx,
                 llm_identity_applied_tx,
             )?;
-            let accept_result = adapter
-                .accept_input_with_completion_for_attachment_and_replay_policy(
-                    state.witness(),
-                    input,
-                    replay_policy,
-                )
-                .await;
+            // A host's custody is handed to native admission here, which
+            // alone settles it from this point.
+            let accept_result =
+                match custody.and_then(super::handle::GovernedInputCustody::into_native) {
+                    Some(custody) => adapter
+                        .accept_input_with_completion_for_attachment_and_replay_policy_with_custody(
+                            state.witness(),
+                            input,
+                            replay_policy,
+                            custody,
+                        )
+                        .await,
+                    None => {
+                        adapter
+                            .accept_input_with_completion_for_attachment_and_replay_policy(
+                                state.witness(),
+                                input,
+                                replay_policy,
+                            )
+                            .await
+                    }
+                };
 
             let (outcome, handle) = match accept_result {
                 Ok(result) => result,
@@ -6110,11 +6246,43 @@ impl SessionBackend {
                             session_id: session_id.clone(),
                             input_id: existing_id,
                         },
+                        // The native owner's admission verdict on this input
+                        // stays typed.
+                        error @ (meerkat_runtime::RuntimeDriverError::InputRefused { .. }
+                        | meerkat_runtime::RuntimeDriverError::ControllerReadinessUnavailable {
+                            ..
+                        }
+                        | meerkat_runtime::RuntimeDriverError::ValidationFailed { .. }
+                        | meerkat_runtime::RuntimeDriverError::RetainedResumeRefused {
+                            ..
+                        }) => MobError::MemberInputRefused {
+                            session_id: session_id.clone(),
+                            error,
+                        },
                         other => MobError::Internal(other.to_string()),
                     });
                 }
             };
             let owns_committed_parent_projection = outcome.is_accepted();
+            // The session's canonical admission, forwarded unchanged to a
+            // governed caller.
+            let admission = match &outcome {
+                meerkat_runtime::AcceptOutcome::Accepted { input_id, .. } => {
+                    Some(super::handle::MemberInputAdmission {
+                        session_id: session_id.clone(),
+                        input_id: input_id.clone(),
+                        deduplicated: false,
+                    })
+                }
+                meerkat_runtime::AcceptOutcome::Deduplicated { existing_id, .. } => {
+                    Some(super::handle::MemberInputAdmission {
+                        session_id: session_id.clone(),
+                        input_id: existing_id.clone(),
+                        deduplicated: true,
+                    })
+                }
+                _ => None,
+            };
 
             if let Some(queued_context) = queued_context.as_mut() {
                 let canonical_input_id = match &outcome {
@@ -6142,7 +6310,7 @@ impl SessionBackend {
                 drop(queued_context);
                 if replay_policy == meerkat_runtime::accept::InputReplayPolicy::ExactPrompt {
                     if completion_tx.is_none() && deferred_delivery.is_none() {
-                        return Ok(());
+                        return Ok(admission);
                     }
                     let input_id = match &outcome {
                         meerkat_runtime::AcceptOutcome::Accepted { input_id, .. } => input_id,
@@ -6183,7 +6351,7 @@ impl SessionBackend {
                             }
                         }));
                     }
-                    return Ok(());
+                    return Ok(admission);
                 }
                 if let Some(delivery) = deferred_delivery {
                     delivery.release(DeferredTurnEventOutcome::Succeeded);
@@ -6196,7 +6364,7 @@ impl SessionBackend {
                         ),
                     }));
                 }
-                return Ok(());
+                return Ok(admission);
             };
 
             let completion_session_id = session_id.clone();
@@ -6228,7 +6396,7 @@ impl SessionBackend {
                 }
             });
 
-            Ok(())
+            Ok(admission)
         }
     }
 }
@@ -7035,6 +7203,10 @@ struct AttachedSessionActorRecoveryContext {
     route: super::session_service::SessionActorMaterializationRoute,
     actor_witness_slot: meerkat_session::LiveSessionActorWitnessSlot,
     req: meerkat_core::service::CreateSessionRequest,
+    surface_check: Option<(
+        Arc<dyn super::MemberRuntimeRegistrationHook>,
+        super::MemberRuntimeBuildIdentity,
+    )>,
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -7050,6 +7222,7 @@ async fn create_attached_session_actor_recovery_owned(
         route,
         actor_witness_slot,
         req,
+        surface_check,
     } = context;
     boundary.require_session(&session_id)?;
     if prepared.witness().session_id() != &session_id || state.witness() != prepared.witness() {
@@ -7124,10 +7297,21 @@ async fn create_attached_session_actor_recovery_owned(
                         return;
                     }
                 };
-                let publication = match state.replace_actor_witness(
-                    prepared.witness(),
-                    actor_witness.clone(),
-                ) {
+                let verified = match &surface_check {
+                    Some((hook, identity)) => {
+                        super::registration_hook::verify_member_surface(
+                            hook.as_ref(),
+                            session_service.as_ref(),
+                            &session_id,
+                            identity,
+                        )
+                        .await
+                    }
+                    None => Ok(()),
+                };
+                let publication = match verified.and_then(|()| {
+                    state.replace_actor_witness(prepared.witness(), actor_witness.clone())
+                }) {
                     Err(error) => Err(error),
                     Ok(()) => {
                         let publication_handle: Arc<dyn CoreExecutorPublicationHandle> =
@@ -7206,6 +7390,10 @@ pub(super) struct PreparedServiceActorTransaction {
     // the teardown reacquires that boundary. Until every one of them settles,
     // this transaction has released nothing.
     pending_attachment_teardowns: PendingAttachmentTeardowns,
+    // The selection the member's host made from its prepared surface, which
+    // its agent was finished under; recorded by the member's tool-surface
+    // gate during actor creation.
+    surface_selection: super::registration_hook::MemberSurfaceSelectionSlot,
     armed: bool,
 }
 
@@ -7236,8 +7424,38 @@ impl PreparedServiceActorTransaction {
             committed_runtime_attachment: None,
             settlement_ledger: None,
             pending_attachment_teardowns: PendingAttachmentTeardowns::new(),
+            surface_selection: Default::default(),
             armed: true,
         })
+    }
+
+    /// The selection this member's agent was finished under, once its
+    /// construction has been finished through its host's gate.
+    pub(super) fn finished_surface_selection(&self) -> Option<meerkat_core::ToolSurfaceSelection> {
+        self.surface_selection.selection()
+    }
+
+    /// The controller route of this transaction's exact live actor, from the
+    /// client that actor actually pinned, observed under the
+    /// turn-finalization boundary this transaction owns (never reacquired).
+    /// The transaction is held exclusively for the query and is otherwise
+    /// unchanged; only the observation leaves. A lost or replaced actor is
+    /// an error.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) async fn controller_route(
+        &mut self,
+    ) -> Result<super::session_service::ControllerRouteObservation, MobError> {
+        self.boundary()?;
+        let actor = self.actor_witness()?;
+        self.session_service
+            .controller_route_under_runtime_turn_boundary(&actor)
+            .await
+            .map_err(|error| {
+                MobError::Internal(format!(
+                    "member '{}' lost its actor before its controller route was observed: {error}",
+                    self.session_id
+                ))
+            })
     }
 
     /// Attach the caller's per-attempt settlement ledger. Transactions built
@@ -7343,10 +7561,18 @@ impl PreparedServiceActorTransaction {
     /// caller disappears, the owned task finishes every possibly detached
     /// durable write before exact volatile cleanup. A completed durable create
     /// remains discoverable and may be explicitly resumed.
+    ///
+    /// A held setup's `held_bound` is observed in this task too: after its
+    /// registration witness wait, after each host registration hook returns,
+    /// and before the actor is created. A setup stopped there is aborted
+    /// below like a failed create (awaited) and keeps its typed failure with
+    /// that abort's cleanup outcome.
     pub(super) async fn create_owned_with_route(
         self,
         req: meerkat_core::service::CreateSessionRequest,
         route: super::session_service::SessionActorMaterializationRoute,
+        registration_composition: super::registration_hook::MemberRegistrationComposition,
+        held_bound: Option<super::held_spawn::HeldProvisionBound>,
     ) -> Result<(meerkat_core::RunResult, Self), MobError> {
         let cleanup_spawner = self.cleanup_spawner.clone();
         let session_id = self.session_id.clone();
@@ -7355,15 +7581,114 @@ impl PreparedServiceActorTransaction {
         cleanup_spawner.spawn_detached(async move {
             let mut transaction = self;
             let revivable = route.is_revivable();
-            let create_result =
-                super::session_service::execute_session_actor_materialization_under_runtime_turn_boundary(
-                    transaction.session_service.as_ref(),
-                    req,
-                    route,
-                    transaction.actor_witness_slot(),
-                )
+            let create_result = {
+                let transaction = &mut transaction;
+                let result_tx = &result_tx;
+                async move {
+                    let held_stop = || {
+                        held_bound
+                            .as_ref()
+                            .and_then(super::held_spawn::HeldProvisionBound::ended_failure)
+                    };
+                    let mut surface_check = None;
+                    if let Some((machine, hook)) = registration_composition {
+                        #[cfg(test)]
+                        {
+                            let hook = OWNED_CREATE_REGISTRATION_WITNESS_TEST_HOOKS
+                                .lock()
+                                .expect("owned create registration witness hook")
+                                .remove(&transaction.session_id);
+                            if let Some((entered_tx, release_rx)) = hook {
+                                let _ = entered_tx.send(());
+                                let _ = release_rx.await;
+                            }
+                        }
+                        let registration = transaction
+                            .prepared()?
+                            .registration_witness()
+                            .await
+                            .ok_or_else(|| {
+                                MobError::Internal(
+                                    "member destination install lost the exact prepared registration"
+                                        .into(),
+                                )
+                            })?;
+                        // The witness waits for the session's mutation gate. A
+                        // held setup whose bound ended meanwhile stops before
+                        // the host's destination callback starts.
+                        if let Some(stop) = held_stop() {
+                            return Err(stop);
+                        }
+                        let identity = super::registration_hook::install_selected_destination(
+                            &machine,
+                            hook.as_ref(),
+                            &registration,
+                            &req,
+                        )
+                        .await?;
+                        if let Some(stop) = held_stop() {
+                            return Err(stop);
+                        }
+                        // The agent the registration acts as is bound before
+                        // its agent and configured servers are built.
+                        super::registration_hook::install_selected_agent_mandate(
+                            &machine,
+                            hook.as_ref(),
+                            &registration,
+                            &identity,
+                        )
+                        .await?;
+                        if let Some(stop) = held_stop() {
+                            return Err(stop);
+                        }
+                        super::registration_hook::install_member_surface_gate(
+                            &machine,
+                            Arc::clone(&hook),
+                            &registration,
+                            &identity,
+                            Some(transaction.surface_selection.clone()),
+                        )
+                        .await?;
+                        surface_check = Some((hook, identity));
+                        if result_tx.is_closed() {
+                            return Err(MobError::Internal(
+                                "member destination observer cancelled before actor creation"
+                                    .into(),
+                            ));
+                        }
+                    }
+                    if let Some(stop) = held_stop() {
+                        return Err(stop);
+                    }
+                    let created = super::session_service::execute_session_actor_materialization_under_runtime_turn_boundary(
+                        transaction.session_service.as_ref(),
+                        req,
+                        route,
+                        transaction.actor_witness_slot(),
+                    )
+                    .await
+                    .map_err(MobError::SessionError)?;
+                    // The member is built but not yet published, and its
+                    // first turn is deferred: the host checks the actual
+                    // surface before anything can use it. This check
+                    // completes the actor creation entered above, under the
+                    // same owner: it settles that entered creation (a
+                    // refusal discards the created actor through the abort
+                    // below) and is not a fresh admission, so no held bound
+                    // is checked between the creation and it.
+                    if let Some((hook, identity)) = surface_check {
+                        super::registration_hook::verify_member_surface(
+                            hook.as_ref(),
+                            transaction.session_service.as_ref(),
+                            &created.session_id,
+                            &identity,
+                        )
+                        .await?;
+                    }
+                    Ok(created)
+                }
                 .await
-                .map_err(MobError::SessionError);
+            };
             let create_result = match create_result {
                 Ok(result) if revivable => transaction
                     .commit_revivable_session_lifecycle()
@@ -7396,12 +7721,39 @@ impl PreparedServiceActorTransaction {
                     // failure until the exact witnessed actor and Prepared+B
                     // materialization have been cleaned up.
                     let cleanup = transaction.abort().await;
-                    let error = match cleanup {
+                    #[cfg(test)]
+                    let cleanup = if OWNED_CREATE_ABORT_FAILURE_TEST_HOOKS
+                        .lock()
+                        .expect("owned create abort failure hook")
+                        .remove(&session_id)
+                    {
+                        cleanup.and(Err(MobError::Internal(
+                            "test-forced owned create abort failure".into(),
+                        )))
+                    } else {
+                        cleanup
+                    };
+                    let error = match (materialization_error, cleanup) {
                         // Preserve the service's typed build failure once
                         // exact volatile cleanup is proven. Callers can then
                         // project the class without parsing display text.
-                        Ok(()) => materialization_error,
-                        Err(cleanup_error) => {
+                        (materialization_error, Ok(())) => materialization_error,
+                        // A held setup stopped at its bound carries no build
+                        // diagnostics: it keeps its typed failure, with the
+                        // abort's cleanup error in it.
+                        (MobError::HeldSpawnExpired { member, cleanup: None }, Err(cleanup_error)) => {
+                            MobError::HeldSpawnExpired {
+                                member,
+                                cleanup: Some(Box::new(cleanup_error)),
+                            }
+                        }
+                        (MobError::HeldSpawnAborted { member, cleanup: None }, Err(cleanup_error)) => {
+                            MobError::HeldSpawnAborted {
+                                member,
+                                cleanup: Some(Box::new(cleanup_error)),
+                            }
+                        }
+                        (materialization_error, Err(cleanup_error)) => {
                             // Build diagnostics may contain host-local command
                             // stderr or backend detail. Keep both diagnostics
                             // in the owning host log; callers get only a
@@ -7482,6 +7834,7 @@ impl PreparedServiceActorTransaction {
         runtime_sessions: Arc<RwLock<HashMap<SessionId, Arc<RuntimeSessionState>>>>,
         missing_live_revival: bool,
         prepared_operation: super::ops_adapter::PreparedMemberProvisionOperation,
+        held: bool,
     ) -> Result<
         (
             Arc<RuntimeSessionState>,
@@ -7501,6 +7854,8 @@ impl PreparedServiceActorTransaction {
             let mut teardowns = PendingAttachmentTeardowns::new();
             let commit_result = async {
                 let actor_witness = transaction.actor_witness()?;
+                let published_actor = actor_witness.clone();
+                let served_actor = actor_witness.clone();
                 let session_service = Arc::clone(&transaction.session_service);
                 // B has been held since before machine preparation, so an old
                 // attachment's cleanup cannot mutate this slot while we select
@@ -7549,6 +7904,32 @@ impl PreparedServiceActorTransaction {
                             boundary,
                             &mut teardowns,
                             move |_| {
+                                // A member held before its publication may
+                                // have been closed through its session service
+                                // meanwhile. Its registry revokes the actor's
+                                // incarnation before removing or replacing it
+                                // (a public discard revokes first), so a
+                                // revoked incarnation observed here, at the
+                                // final serving commit under M, refuses the
+                                // member before it serves. This is an early
+                                // observation, not a lock: a close that revokes
+                                // after it is caught by the check once the
+                                // commit has returned, below.
+                                if held && !published_actor.is_live() {
+                                    return Err(MobError::Internal(format!(
+                                        "member '{}' was closed before its publication",
+                                        published_actor.session_id()
+                                    )));
+                                }
+                                #[cfg(test)]
+                                if held
+                                    && let Some(hook) = HELD_FINAL_COMMIT_TEST_HOOKS
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .remove(published_actor.session_id())
+                                {
+                                    hook();
+                                }
                                 let committed = prepared_operation.commit()?;
                                 *callback_slot
                                     .lock()
@@ -7570,6 +7951,18 @@ impl PreparedServiceActorTransaction {
                 // mismatch must retire this exact incarnation.
                 transaction.committed_runtime_attachment =
                     Some((Arc::clone(&adapter), Arc::clone(&committed_state)));
+                // A held member's actor must have stayed live through its
+                // serving commit. Revocation is one-way, so an actor still
+                // live now was live for the whole commit; one revoked by a
+                // competing service close is refused here, and the error path
+                // retires the exact attachment just committed and rolls back
+                // its operation instead of returning a stale receipt.
+                if held && !served_actor.is_live() {
+                    return Err(MobError::Internal(format!(
+                        "member '{}' was closed during its publication",
+                        served_actor.session_id()
+                    )));
+                }
                 let committed_operation = committed_operation_slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -11003,13 +11396,15 @@ impl CoreExecutorBoundaryHandle for MobSessionRuntimeBoundaryHandle {
             .await
             .or_else(|err| match err {
                 // The runtime dispatches this only for its exact current run,
-                // after marking that run's turn `cancel_after_boundary` in the
-                // machine-owned turn state the agent reads at its boundary
-                // (#1471). A session that has not claimed the turn yet answers
-                // NotRunning, but the cancel is already recorded and ends the
-                // turn at its first boundary: Ok is the truth, not a cancel
-                // that went nowhere. A run that ended first is refused by the
-                // runtime's exact-run check before this handle is called.
+                // after the generated `CancelAfterBoundaryForRun` transition
+                // recorded that run's turn `cancel_after_boundary` in the
+                // machine-owned turn state the agent reads at its boundary,
+                // atomically with admitting this dispatch (#1471). A session
+                // that has not claimed the turn yet answers NotRunning, but the
+                // cancel is already recorded and ends the turn at its first
+                // boundary: Ok is the truth, not a cancel that went nowhere. A
+                // run that ended first is refused by that transition before
+                // this handle is called.
                 SessionError::NotRunning { .. } => Ok(()),
                 err => Err(err),
             })
@@ -11298,6 +11693,32 @@ impl CoreExecutorPublicationHandle for MobSessionTerminalPublicationHandle {
     > {
         self.session_service
             .publish_interaction_terminals_for_actor(&self.actor_witness, events)
+            .await
+            .map_err(CoreExecutorError::apply_failed_from_session_error)
+    }
+
+    fn actor_identity(&self) -> Option<meerkat_core::lifecycle::CoreExecutorActorIdentity> {
+        Some(self.actor_witness.executor_actor_identity())
+    }
+
+    /// The member service's own boundary of this actor's session, the
+    /// endpoint the member executor's runtime loop holds across each turn.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn turn_finalization_boundary(
+        &self,
+    ) -> Option<Arc<dyn CoreExecutorTurnFinalizationBoundaryHandle>> {
+        Some(Arc::new(MobSessionTurnFinalizationBoundaryHandle {
+            session_service: Arc::clone(&self.session_service),
+            bridge_session_id: self.actor_witness.session_id().clone(),
+        }))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn pin_actor_controller_under_turn_boundary(
+        &self,
+    ) -> Result<meerkat_core::ControllerModelClient, CoreExecutorError> {
+        self.session_service
+            .pin_controller_client_under_runtime_turn_boundary(&self.actor_witness)
             .await
             .map_err(CoreExecutorError::apply_failed_from_session_error)
     }
@@ -11675,169 +12096,23 @@ impl CoreExecutor for MobSessionRuntimeExecutor {
 }
 
 #[cfg(feature = "runtime-adapter")]
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-impl MobProvisioner for SessionBackend {
-    fn composition_signal_dispatcher(
-        &self,
-    ) -> Option<meerkat_runtime::meerkat_machine::MeerkatCompositionSignalDispatcher> {
-        self.composition_signal_dispatcher.clone()
-    }
-    async fn record_reload_publication(
-        &self,
-        member_ref: &MemberRef,
-        successor: &meerkat_runtime::RuntimeSessionRegistrationWitness,
-        publication: ResumedMemberRollbackAuthority,
-    ) -> Result<(), MobError> {
-        let session_id = Self::require_session(member_ref, "retain reload publication for")?;
-        let custody = self
-            .reload_registrations
-            .lock()
-            .await
-            .get(&session_id)
-            .cloned()
-            .ok_or_else(|| {
-                MobError::Internal("reload publication lost its custody owner".to_string())
-            })?;
-        let mut owned = custody.lock().await;
-        if !matches!(&owned.phase, ReloadRegistrationPhase::Restoring(expected) if expected == successor)
-        {
-            return Err(MobError::Internal(
-                "reload publication has stale restoration custody".to_string(),
-            ));
-        }
-        owned.phase = ReloadRegistrationPhase::Published {
-            successor: successor.clone(),
-            publication,
-        };
-        Ok(())
-    }
-
-    async fn finish_reload_restoration(
-        &self,
-        member_ref: &MemberRef,
-        successor: &meerkat_runtime::RuntimeSessionRegistrationWitness,
-    ) -> Result<(), MobError> {
-        let session_id = Self::require_session(member_ref, "settle reload restoration for")?;
-        let Some(custody) = self
-            .reload_registrations
-            .lock()
-            .await
-            .get(&session_id)
-            .cloned()
-        else {
-            return Ok(());
-        };
-        let owned = custody.lock().await;
-        let current = match &owned.phase {
-            ReloadRegistrationPhase::Restoring(expected)
-            | ReloadRegistrationPhase::Published {
-                successor: expected,
-                ..
-            } => expected == successor,
-            _ => false,
-        };
-        if !current {
-            return Err(MobError::Internal(
-                "reload settlement has stale restoration custody".to_string(),
-            ));
-        }
-        self.remove_reload_custody(&session_id, &custody).await;
-        Ok(())
-    }
-
-    async fn provision_member_from_reload_claim(
-        &self,
-        req: ProvisionMemberRequest,
-        prepared: PreparedSessionMaterialization,
-    ) -> Result<MemberSpawnReceipt, MobError> {
-        let session_id = prepared.session_id().clone();
-        let transfer = Arc::new(Mutex::new(Some(prepared)));
-        let mut scoped = self.clone();
-        scoped.reload_materialization_claim = Some(Arc::clone(&transfer));
-        #[cfg(test)]
-        let cleanup_hook = RELOAD_UNUSED_CLAIM_TEST_HOOKS
-            .lock()
-            .expect("unused claim hook")
-            .remove(&session_id);
-        #[cfg(test)]
-        let req = {
-            let mut req = req;
-            if cleanup_hook.is_some() {
-                // Fail the real initial validator after transfer, before consume.
-                req.session_origin = ProvisionSessionOrigin::Fresh;
-            }
-            req
-        };
-        let result = scoped.provision_member(req).await;
-        let unused = transfer.lock().await.take();
-        if let Some(mut prepared) = unused {
-            #[cfg(test)]
-            if let Some((entered, release)) = cleanup_hook {
-                let _ = entered.send(());
-                let _ = release.await;
-            }
-            // The provisioning future has returned and released B. Do not
-            // hold the transfer-slot mutex across exact runtime rollback.
-            if let Err(error) = prepared.rollback_now().await {
-                let detail = format!("unused reload claim cleanup remains pending: {error}");
-                let failure = ProvisionAttemptFailure::retained_without_custody(
-                    MobError::MemberReloadRefused {
-                        session_id: session_id.clone(),
-                        reason: detail.clone(),
-                    },
-                );
-                let custody = self
-                    .reload_registrations
-                    .lock()
-                    .await
-                    .get(&session_id)
-                    .cloned()
-                    .ok_or_else(|| MobError::MemberReloadRefused {
-                        session_id: session_id.clone(),
-                        reason: format!("{detail}; restoration custody owner is unavailable"),
-                    })?;
-                let mut owned = custody.lock().await;
-                let ReloadRegistrationPhase::Restoring(successor) = &owned.phase else {
-                    return Err(MobError::MemberReloadRefused {
-                        session_id,
-                        reason: format!("{detail}; restoration phase changed"),
-                    });
-                };
-                owned.phase = ReloadRegistrationPhase::ClaimCleanup {
-                    successor: successor.clone(),
-                    retained: Arc::new(Mutex::new(Some(RetainedReloadClaimCleanup {
-                        prepared,
-                        failure,
-                    }))),
-                };
-                return Err(MobError::MemberReloadRefused {
-                    session_id,
-                    reason: detail,
-                });
-            }
-        }
-        result
-    }
-
-    fn supports_member_turn_llm_reconfigure(&self, member_ref: &MemberRef) -> bool {
-        matches!(member_ref, MemberRef::Session { .. })
-            && self.session_service.supports_runtime_turn_apply()
-            && self
-                .runtime_adapter
-                .as_ref()
-                .is_some_and(|adapter| adapter.has_session_llm_reconfigure_host())
-    }
-
-    async fn provision_member(
+impl SessionBackend {
+    /// Provision a member up to (not including) its publication: the
+    /// saga of [`MobProvisioner::provision_member`] through actor creation
+    /// and final built-surface verification. The returned owner finishes
+    /// it.
+    async fn provision_member_until_created(
         &self,
         mut req: ProvisionMemberRequest,
-    ) -> Result<MemberSpawnReceipt, MobError> {
+    ) -> Result<ProvisionFinish, MobError> {
         // Every cancellation-sensitive resource below is represented by an
         // exact RAII lease. Keep the saga in the caller task so a successful
         // receipt can never be detached and dropped without publishing its
         // rollback capability to the owning PendingProvision.
         let backend = self;
+        // A held setup's bound, checked after each unbounded step below and
+        // before the next effect.
+        let held_bound = req.held_bound.take();
         // Members build in the mob realm, and the factory refuses WorkGraph
         // tools whose namespace grant names any other realm. The host's
         // default dispatcher is scoped to the host realm, so every member
@@ -11854,7 +12129,7 @@ impl MobProvisioner for SessionBackend {
                 workgraph.clone(),
             )));
         }
-        let mut session_origin = req.session_origin;
+        let session_origin = req.session_origin;
         let mut requested_materialization = match session_origin {
             ProvisionSessionOrigin::Fresh => {
                 if req.authorized_resume.is_some() {
@@ -11963,12 +12238,21 @@ impl MobProvisioner for SessionBackend {
             None
         };
         let mut prepared_ops_binding: Option<(SessionId, Arc<dyn OpsLifecycleRegistry>)> = None;
+        if backend.member_runtime_registration_hook.is_some() && backend.runtime_adapter.is_none() {
+            return Err(MobError::Internal(
+                "member registration hook requires the canonical runtime adapter".into(),
+            ));
+        }
         let mut prepared_materialization: Option<PreparedSessionMaterialization> = None;
         let mut attached_actor_recovery: Option<(
             PreparedAttachedSessionActorRecovery,
             Arc<RuntimeSessionState>,
         )> = None;
         let mut recovered_attached_state: Option<Arc<RuntimeSessionState>> = None;
+        let mut attached_surface_check: Option<(
+            Arc<dyn super::MemberRuntimeRegistrationHook>,
+            super::MemberRuntimeBuildIdentity,
+        )> = None;
         let mut materialization_turn_boundary: Option<RuntimeTurnFinalizationBoundaryLease> = None;
         let actor_witness_slot = meerkat_session::LiveSessionActorWitnessSlot::default();
         let pre_registered_bridge_session_id = if let Some(adapter) = &backend.runtime_adapter {
@@ -11989,6 +12273,30 @@ impl MobProvisioner for SessionBackend {
                     }
                     id
                 });
+            // A missing-live revival rebuilds the actor on this same
+            // registration. An ordinary exit of its removed predecessor joins
+            // the release of that predecessor's MCP router lineages. Join it
+            // here, with no boundary held; the exact attachment is then
+            // re-read and revalidated under B below, before M. The join is
+            // not a cleanup receipt: an aborted or panicked predecessor drops
+            // its router without releasing its lineages and the join reports
+            // no failure, so the surface's lineage fence, not this join, is
+            // what keeps the rebuilt actor's own staging and connection safe.
+            // A rebuild after such an abnormal exit is unqualified: it does
+            // not claim the predecessor's cleanup completed.
+            if missing_live_revival {
+                backend
+                    .session_service
+                    .await_removed_actor_exit(&member_bridge_session_id)
+                    .await;
+            }
+            // A held setup whose bound already ended does not wait for B.
+            if let Some(stop) = held_bound
+                .as_ref()
+                .and_then(super::held_spawn::HeldProvisionBound::ended_failure)
+            {
+                return Err(stop);
+            }
             // Global order is B -> M -> R. Acquire the stable service boundary
             // before asking the machine to mint the exact materialization
             // claim, and retain it through actor creation, attachment commit,
@@ -12000,6 +12308,15 @@ impl MobProvisioner for SessionBackend {
                 )
                 .await?,
             );
+            // The acquisition is not raced; once it returns, a held setup's
+            // bound is checked before anything is prepared under B, which this
+            // return releases.
+            if let Some(stop) = held_bound
+                .as_ref()
+                .and_then(super::held_spawn::HeldProvisionBound::ended_failure)
+            {
+                return Err(stop);
+            }
             // MobMachine::Spawn routes the authoritative member runtime id
             // and fence token after the bridge session exists. This call only
             // needs the session-local handle bundle for AgentFactory.
@@ -12036,9 +12353,50 @@ impl MobProvisioner for SessionBackend {
                         "missing-live actor recovery for '{member_bridge_session_id}' found stale attachment-local mob state; explicit resume is required"
                     )));
                 }
-                let prepared = adapter
-                    .prepare_attached_session_actor_recovery(&witness)
-                    .await
+                let prepared = if let Some(hook) = backend.member_runtime_registration_hook.as_ref() {
+                    // The member's installed destination is checked against
+                    // the host's current expectation inside the same
+                    // preparation that recovers the actor, under the gate
+                    // its lease retains.
+                    let registration = adapter
+                        .current_session_registration_witness(&member_bridge_session_id)
+                        .await
+                        .ok_or_else(|| {
+                            MobError::Internal(format!(
+                                "actor-only recovery for '{member_bridge_session_id}' lost its registration"
+                            ))
+                        })?;
+                    let (expected, identity) = super::registration_hook::expected_target(
+                        hook.as_ref(),
+                        &registration,
+                        &req.create_session,
+                    )
+                    .await?;
+                    let expected_mandate = hook.expected_agent_mandate(&identity).await?;
+                    // The recovered construction is selected by its host
+                    // like a new member's.
+                    super::registration_hook::install_member_surface_gate(
+                        adapter,
+                        Arc::clone(hook),
+                        &registration,
+                        &identity,
+                        None,
+                    )
+                    .await?;
+                    attached_surface_check = Some((Arc::clone(hook), identity));
+                    adapter
+                        .prepare_attached_session_actor_recovery_in_scope(
+                            &registration,
+                            &witness,
+                            &expected,
+                            expected_mandate.as_ref(),
+                        )
+                        .await
+                } else {
+                    adapter
+                        .prepare_attached_session_actor_recovery(&witness)
+                        .await
+                }
                     .map_err(|error| {
                         MobError::Internal(format!(
                             "prepare exact attached actor recovery for '{member_bridge_session_id}' failed: {error}"
@@ -12233,6 +12591,19 @@ impl MobProvisioner for SessionBackend {
                 return Err(error);
             }
         }
+        // The last check before the owned create: a held setup whose bound
+        // ended while B, the preparation or the revalidation were awaited
+        // aborts the transaction that owns them (awaited, not itself bounded)
+        // and keeps that abort's outcome.
+        if let Some(bound) = held_bound.as_ref()
+            && let Some(end) = bound.ended()
+        {
+            let cleanup = match actor_transaction.take() {
+                Some(transaction) => transaction.abort().await.err().map(Box::new),
+                None => None,
+            };
+            return Err(bound.failure(end, cleanup));
+        }
         let reviving_retired_session = actor_materialization_route.is_revivable();
         let create_result: Result<meerkat_core::RunResult, MobError> = if let Some((
             prepared,
@@ -12263,6 +12634,7 @@ impl MobProvisioner for SessionBackend {
                             route: actor_materialization_route,
                             actor_witness_slot: actor_witness_slot.clone(),
                             req: req.create_session,
+                            surface_check: attached_surface_check.take(),
                         },
                     )
                 })
@@ -12272,7 +12644,12 @@ impl MobProvisioner for SessionBackend {
             }
         } else if let Some(transaction) = actor_transaction.take() {
             match meerkat_runtime::stack_relief::box_in_own_frame(|| {
-                transaction.create_owned_with_route(req.create_session, actor_materialization_route)
+                transaction.create_owned_with_route(
+                    req.create_session,
+                    actor_materialization_route,
+                    backend.registration_composition(),
+                    held_bound.clone(),
+                )
             })
             .await
             {
@@ -12325,10 +12702,103 @@ impl MobProvisioner for SessionBackend {
             }
             return Err(mismatch);
         }
+        Ok(ProvisionFinish {
+            backend: backend.clone(),
+            created_bridge_session_id,
+            pre_registered: pre_registered_bridge_session_id.is_some(),
+            reviving_retired_session,
+            session_origin,
+            owner_bridge_session_id: req.owner_bridge_session_id,
+            ops_registry: req.ops_registry,
+            generated_self_owned_operation_owner: req.generated_self_owned_operation_owner,
+            prepared_ops_binding,
+            superseded_ops_binding,
+            missing_live_revival,
+            peer_name: req.peer_name,
+            recovered_attached_state,
+            actor_transaction,
+            held: false,
+        })
+    }
+
+    /// [`MobProvisioner::provision_member_held`] for a fresh runtime-backed
+    /// member whose host selects its registration (see
+    /// [`HeldMemberProvision`]). Every other provision is refused: attached
+    /// recovery, revival and resume keep their existing one-step paths.
+    pub(super) async fn provision_member_held(
+        &self,
+        req: ProvisionMemberRequest,
+    ) -> Result<HeldMemberProvision, MobError> {
+        if req.session_origin != ProvisionSessionOrigin::Fresh
+            || req.runtime_revival_intent != RuntimeRevivalIntent::None
+            || !matches!(req.binding, RuntimeBinding::Session)
+            || self.runtime_adapter.is_none()
+            || self.member_runtime_registration_hook.is_none()
+            || self.reload_materialization_claim.is_some()
+        {
+            return Err(MobError::HeldProvisionUnsupported {
+                reason: "a held provision needs a fresh runtime-backed member whose host selects its registration"
+                    .into(),
+            });
+        }
+        let finish = self.provision_member_until_created(req).await?;
+        HeldMemberProvision::hold(finish).await
+    }
+}
+
+/// Everything a provisioned member's publication still needs, owned
+/// between its creation and its publication: the exact actor transaction
+/// (B, the exact materialization claim, the actor and its cleanup) and the
+/// remaining request inputs.
+#[cfg(feature = "runtime-adapter")]
+struct ProvisionFinish {
+    backend: SessionBackend,
+    created_bridge_session_id: SessionId,
+    pre_registered: bool,
+    reviving_retired_session: bool,
+    session_origin: ProvisionSessionOrigin,
+    owner_bridge_session_id: Option<SessionId>,
+    ops_registry: Option<Arc<dyn OpsLifecycleRegistry>>,
+    generated_self_owned_operation_owner: Option<SessionId>,
+    prepared_ops_binding: Option<(SessionId, Arc<dyn OpsLifecycleRegistry>)>,
+    superseded_ops_binding: Option<super::ops_adapter::SessionOpsBindingWitness>,
+    missing_live_revival: bool,
+    peer_name: String,
+    recovered_attached_state: Option<Arc<RuntimeSessionState>>,
+    actor_transaction: Option<PreparedServiceActorTransaction>,
+    /// Held before its publication (see [`HeldMemberProvision`]).
+    held: bool,
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl ProvisionFinish {
+    /// Publish the provisioned member: bind its operation owner, prepare its
+    /// provision operation and commit its attachment and operation together,
+    /// then return its receipt. On failure the exact actor transaction is
+    /// aborted and awaited.
+    async fn finish(self) -> Result<MemberSpawnReceipt, MobError> {
+        let ProvisionFinish {
+            backend,
+            created_bridge_session_id,
+            pre_registered,
+            reviving_retired_session,
+            mut session_origin,
+            owner_bridge_session_id,
+            ops_registry,
+            generated_self_owned_operation_owner,
+            prepared_ops_binding,
+            superseded_ops_binding,
+            missing_live_revival,
+            peer_name,
+            mut recovered_attached_state,
+            mut actor_transaction,
+            held,
+        } = self;
+        let backend = &backend;
         let finalize_result = async {
         // Runtime-backed paths retain the exact prepared materialization for
         // the subsequent attachment transaction.
-        if pre_registered_bridge_session_id.is_some() {
+        if pre_registered {
             if reviving_retired_session {
                 // The typed actor transaction has already crossed both
                 // machine-owned lifecycle boundaries while it retained
@@ -12348,9 +12818,9 @@ impl MobProvisioner for SessionBackend {
             );
         }
         match (
-            req.owner_bridge_session_id,
-            req.ops_registry,
-            req.generated_self_owned_operation_owner,
+            owner_bridge_session_id,
+            ops_registry,
+            generated_self_owned_operation_owner,
         ) {
             (Some(owner_bridge_session_id), Some(registry), None) => {
                 tracing::debug!(
@@ -12446,12 +12916,12 @@ impl MobProvisioner for SessionBackend {
         }
         tracing::debug!(
             bridge_session_id = %created_bridge_session_id,
-            peer_name = %req.peer_name,
+            peer_name = %peer_name,
             "SessionBackend::provision_member marking member provisioned"
         );
         let prepared_operation = backend
             .ops_adapter
-            .prepare_member_provision_operation(&created_bridge_session_id, &req.peer_name)
+            .prepare_member_provision_operation(&created_bridge_session_id, &peer_name)
             .await?;
         let exact_operation_id = prepared_operation.operation_id().clone();
         if let Some(ledger) = backend.settlement_ledger.as_ref() {
@@ -12491,6 +12961,7 @@ impl MobProvisioner for SessionBackend {
                         Arc::clone(&backend.runtime_sessions),
                         missing_live_revival,
                         prepared_operation,
+                        held,
                     )
                     .await?;
                 actor_transaction = Some(transaction);
@@ -12533,6 +13004,289 @@ impl MobProvisioner for SessionBackend {
             return Err(error);
         }
         finalize_result
+    }
+}
+
+/// One fresh member, provisioned and held before its publication.
+///
+/// Its agent is built and finished, under the selection its host made from
+/// the member's actual prepared surface; its built surface has been verified.
+/// Its actor exists but does not serve: its runtime attachment is not
+/// committed, so input may queue but nothing executes. The holder owns the
+/// member's exact actor transaction (its turn-finalization boundary, exact
+/// materialization claim, actor and cleanup) and nothing else.
+///
+/// [`Self::publish`] resumes the member's existing publication: the final
+/// native attachment and operation commit, which also refuses the member if
+/// its actor's incarnation was observed revoked there (a close that lands
+/// after that commit is an ordinary close of a published member). [`Self::abort`] settles it instead,
+/// awaited; dropping it hands the same cleanup to its owner task without
+/// awaiting it. Each held member publishes or aborts on its own: nothing
+/// makes a set of them publish atomically.
+#[cfg(feature = "runtime-adapter")]
+pub struct HeldMemberProvision {
+    finish: ProvisionFinish,
+    member_ref: MemberRef,
+    selection: meerkat_core::ToolSurfaceSelection,
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl std::fmt::Debug for HeldMemberProvision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldMemberProvision")
+            .field("member_ref", &self.member_ref)
+            .field("selection", &self.selection)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl HeldMemberProvision {
+    async fn hold(mut finish: ProvisionFinish) -> Result<Self, MobError> {
+        finish.held = true;
+        let selection = finish
+            .actor_transaction
+            .as_ref()
+            .and_then(PreparedServiceActorTransaction::finished_surface_selection);
+        let Some(selection) = selection else {
+            let refusal = MobError::Internal(
+                "a held member must be finished under its host's surface selection".into(),
+            );
+            if let Some(transaction) = finish.actor_transaction
+                && let Err(cleanup_error) = transaction.abort().await
+            {
+                return Err(MobError::Internal(format!(
+                    "{refusal}; exact actor/materialization cleanup failed: {cleanup_error}"
+                )));
+            }
+            return Err(refusal);
+        };
+        let member_ref =
+            MemberRef::from_bridge_session_id(finish.created_bridge_session_id.clone());
+        Ok(Self {
+            finish,
+            member_ref,
+            selection,
+        })
+    }
+
+    /// The held member.
+    pub fn member_ref(&self) -> &MemberRef {
+        &self.member_ref
+    }
+
+    /// The selection the member's agent was finished under: the host's
+    /// resolved binding and the member's actual prepared surface it was made
+    /// from.
+    pub fn finished_surface(&self) -> &meerkat_core::ToolSurfaceSelection {
+        &self.selection
+    }
+
+    /// The held member's controller route, observed from the exact client its
+    /// actor pinned, under the turn-finalization boundary this hold owns
+    /// (never reacquired); the same actor and client then publish. Only the
+    /// observation leaves. It owns no cleanup: a caller that bounds it by its
+    /// setup deadline drops it and then awaits [`Self::abort`]. A lost or
+    /// replaced actor is an error.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn controller_route(
+        &mut self,
+    ) -> Result<super::session_service::ControllerRouteObservation, MobError> {
+        match self.finish.actor_transaction.as_mut() {
+            Some(transaction) => transaction.controller_route().await,
+            None => Err(MobError::Internal(format!(
+                "held member {:?} lost its actor transaction",
+                self.member_ref
+            ))),
+        }
+    }
+
+    /// Publish the member through its existing attachment and operation
+    /// commit. On refusal (including a member whose actor was closed while it
+    /// was held) its exact cleanup is awaited before the error returns.
+    pub async fn publish(self) -> Result<MemberSpawnReceipt, MobError> {
+        self.finish.finish().await
+    }
+
+    /// Settle the held member without publishing it, awaited.
+    pub async fn abort(self) -> Result<(), MobError> {
+        match self.finish.actor_transaction {
+            Some(transaction) => transaction.abort().await,
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(feature = "runtime-adapter")]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl MobProvisioner for SessionBackend {
+    fn composition_signal_dispatcher(
+        &self,
+    ) -> Option<meerkat_runtime::meerkat_machine::MeerkatCompositionSignalDispatcher> {
+        self.composition_signal_dispatcher.clone()
+    }
+    async fn record_reload_publication(
+        &self,
+        member_ref: &MemberRef,
+        successor: &meerkat_runtime::RuntimeSessionRegistrationWitness,
+        publication: ResumedMemberRollbackAuthority,
+    ) -> Result<(), MobError> {
+        let session_id = Self::require_session(member_ref, "retain reload publication for")?;
+        let custody = self
+            .reload_registrations
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| {
+                MobError::Internal("reload publication lost its custody owner".to_string())
+            })?;
+        let mut owned = custody.lock().await;
+        if !matches!(&owned.phase, ReloadRegistrationPhase::Restoring(expected) if expected == successor)
+        {
+            return Err(MobError::Internal(
+                "reload publication has stale restoration custody".to_string(),
+            ));
+        }
+        owned.phase = ReloadRegistrationPhase::Published {
+            successor: successor.clone(),
+            publication,
+        };
+        Ok(())
+    }
+
+    async fn finish_reload_restoration(
+        &self,
+        member_ref: &MemberRef,
+        successor: &meerkat_runtime::RuntimeSessionRegistrationWitness,
+    ) -> Result<(), MobError> {
+        let session_id = Self::require_session(member_ref, "settle reload restoration for")?;
+        let Some(custody) = self
+            .reload_registrations
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let owned = custody.lock().await;
+        let current = match &owned.phase {
+            ReloadRegistrationPhase::Restoring(expected)
+            | ReloadRegistrationPhase::Published {
+                successor: expected,
+                ..
+            } => expected == successor,
+            _ => false,
+        };
+        if !current {
+            return Err(MobError::Internal(
+                "reload settlement has stale restoration custody".to_string(),
+            ));
+        }
+        self.remove_reload_custody(&session_id, &custody).await;
+        Ok(())
+    }
+
+    async fn provision_member_from_reload_claim(
+        &self,
+        req: ProvisionMemberRequest,
+        prepared: PreparedSessionMaterialization,
+    ) -> Result<MemberSpawnReceipt, MobError> {
+        let session_id = prepared.session_id().clone();
+        let transfer = Arc::new(Mutex::new(Some(prepared)));
+        let mut scoped = self.clone();
+        scoped.reload_materialization_claim = Some(Arc::clone(&transfer));
+        #[cfg(test)]
+        let cleanup_hook = RELOAD_UNUSED_CLAIM_TEST_HOOKS
+            .lock()
+            .expect("unused claim hook")
+            .remove(&session_id);
+        #[cfg(test)]
+        let req = {
+            let mut req = req;
+            if cleanup_hook.is_some() {
+                // Fail the real initial validator after transfer, before consume.
+                req.session_origin = ProvisionSessionOrigin::Fresh;
+            }
+            req
+        };
+        let result = scoped.provision_member(req).await;
+        let unused = transfer.lock().await.take();
+        if let Some(mut prepared) = unused {
+            #[cfg(test)]
+            if let Some((entered, release)) = cleanup_hook {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+            // The provisioning future has returned and released B. Do not
+            // hold the transfer-slot mutex across exact runtime rollback.
+            if let Err(error) = prepared.rollback_now().await {
+                let detail = format!("unused reload claim cleanup remains pending: {error}");
+                let failure = ProvisionAttemptFailure::retained_without_custody(
+                    MobError::MemberReloadRefused {
+                        session_id: session_id.clone(),
+                        reason: detail.clone(),
+                    },
+                );
+                let custody = self
+                    .reload_registrations
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .cloned()
+                    .ok_or_else(|| MobError::MemberReloadRefused {
+                        session_id: session_id.clone(),
+                        reason: format!("{detail}; restoration custody owner is unavailable"),
+                    })?;
+                let mut owned = custody.lock().await;
+                let ReloadRegistrationPhase::Restoring(successor) = &owned.phase else {
+                    return Err(MobError::MemberReloadRefused {
+                        session_id,
+                        reason: format!("{detail}; restoration phase changed"),
+                    });
+                };
+                owned.phase = ReloadRegistrationPhase::ClaimCleanup {
+                    successor: successor.clone(),
+                    retained: Arc::new(Mutex::new(Some(RetainedReloadClaimCleanup {
+                        prepared,
+                        failure,
+                    }))),
+                };
+                return Err(MobError::MemberReloadRefused {
+                    session_id,
+                    reason: detail,
+                });
+            }
+        }
+        result
+    }
+
+    fn supports_member_turn_llm_reconfigure(&self, member_ref: &MemberRef) -> bool {
+        matches!(member_ref, MemberRef::Session { .. })
+            && self.session_service.supports_runtime_turn_apply()
+            && self
+                .runtime_adapter
+                .as_ref()
+                .is_some_and(|adapter| adapter.has_session_llm_reconfigure_host())
+    }
+
+    async fn provision_member(
+        &self,
+        req: ProvisionMemberRequest,
+    ) -> Result<MemberSpawnReceipt, MobError> {
+        self.provision_member_until_created(req)
+            .await?
+            .finish()
+            .await
+    }
+
+    async fn provision_member_held(
+        &self,
+        req: ProvisionMemberRequest,
+    ) -> Result<HeldMemberProvision, MobError> {
+        SessionBackend::provision_member_held(self, req).await
     }
 
     /// Settled variant of [`Self::provision_member`].
@@ -13158,8 +13912,44 @@ impl MobProvisioner for SessionBackend {
             completion_tx,
             None,
             meerkat_runtime::accept::InputReplayPolicy::ExactPrompt,
+            None,
         )
         .await
+        .map(drop)
+    }
+
+    #[cfg(feature = "runtime-adapter")]
+    async fn admit_governed_input(
+        &self,
+        member_ref: &MemberRef,
+        input: meerkat_runtime::Input,
+        completion_tx: super::handle::ExactTurnCompletionSender,
+        custody: Option<super::handle::GovernedInputCustody>,
+    ) -> Result<super::handle::MemberInputAdmission, MobError> {
+        let session_id = Self::require_session(member_ref, "admit governed input")?;
+        if self.runtime_adapter.is_none() {
+            return Err(MobError::UnsupportedForMode {
+                mode: crate::MobRuntimeMode::TurnDriven,
+                reason: "governed input requires a runtime-backed member".to_string(),
+            });
+        }
+        // A retry must be the exact original: the replay digest and the
+        // exact prompt decide replay versus conflict.
+        self.admit_runtime_input_with_replay_policy(
+            &session_id,
+            input,
+            None,
+            Some(completion_tx),
+            None,
+            meerkat_runtime::accept::InputReplayPolicy::ExactPrompt,
+            custody,
+        )
+        .await?
+        .ok_or_else(|| {
+            MobError::Internal(format!(
+                "governed input admission returned no canonical input: {session_id}"
+            ))
+        })
     }
 
     async fn admit_turn_for_operation(
@@ -13996,6 +14786,14 @@ impl MultiBackendProvisioner {
     /// bound operation identity.
     pub(super) fn session_ops_adapter(&self) -> Arc<super::ops_adapter::MobOpsAdapter> {
         self.session.session_ops_adapter()
+    }
+
+    pub fn with_member_runtime_registration_hook(
+        mut self,
+        hook: Arc<dyn super::MemberRuntimeRegistrationHook>,
+    ) -> Self {
+        self.session = self.session.with_member_runtime_registration_hook(hook);
+        self
     }
 
     pub(super) fn with_composition_signal_dispatcher(
@@ -15609,6 +16407,20 @@ impl MobProvisioner for MultiBackendProvisioner {
         }
     }
 
+    #[cfg(feature = "runtime-adapter")]
+    async fn provision_member_held(
+        &self,
+        mut req: ProvisionMemberRequest,
+    ) -> Result<HeldMemberProvision, MobError> {
+        if !matches!(req.binding, RuntimeBinding::Session) {
+            return Err(MobError::HeldProvisionUnsupported {
+                reason: "only a session-bound member can be held before its publication".into(),
+            });
+        }
+        req.direct_member_incarnation = None;
+        self.session.provision_member_held(req).await
+    }
+
     async fn provision_member(
         &self,
         mut req: ProvisionMemberRequest,
@@ -15630,6 +16442,7 @@ impl MobProvisioner for MultiBackendProvisioner {
                             .generated_self_owned_operation_owner,
                         runtime_revival_intent: req.runtime_revival_intent,
                         direct_member_incarnation: None,
+                        held_bound: req.held_bound,
                     })
                 })
                 .await
@@ -17468,6 +18281,27 @@ impl MobProvisioner for MultiBackendProvisioner {
             MemberRef::BackendPeer { .. } => Err(MobError::UnsupportedForMode {
                 mode: crate::MobRuntimeMode::AutonomousHost,
                 reason: "host human input requires a local session-backed member".to_string(),
+            }),
+        }
+    }
+
+    #[cfg(feature = "runtime-adapter")]
+    async fn admit_governed_input(
+        &self,
+        member_ref: &MemberRef,
+        input: meerkat_runtime::Input,
+        completion_tx: super::handle::ExactTurnCompletionSender,
+        custody: Option<super::handle::GovernedInputCustody>,
+    ) -> Result<super::handle::MemberInputAdmission, MobError> {
+        match member_ref {
+            MemberRef::Session { .. } => {
+                self.session
+                    .admit_governed_input(member_ref, input, completion_tx, custody)
+                    .await
+            }
+            MemberRef::BackendPeer { .. } => Err(MobError::UnsupportedForMode {
+                mode: crate::MobRuntimeMode::TurnDriven,
+                reason: "governed input requires a local session-backed member".to_string(),
             }),
         }
     }

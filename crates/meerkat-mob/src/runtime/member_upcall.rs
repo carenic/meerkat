@@ -190,6 +190,30 @@ pub(crate) enum UpcallToolErrorClass {
     HookLaunchRefused,
 }
 
+/// `review_unsatisfied` data: the legacy scalar kind, or the canonical object
+/// carrying the approval owner's reference. The scalar never yields a
+/// reference; nothing is inferred from the message, name or call id.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+enum UpcallReviewUnsatisfied {
+    Kind(meerkat_core::ReviewUnsatisfiedKind),
+    Referenced {
+        kind: meerkat_core::ReviewUnsatisfiedKind,
+        #[serde(default)]
+        approval_id: Option<meerkat_core::ApprovalId>,
+    },
+}
+
+impl UpcallReviewUnsatisfied {
+    fn into_tool_error(self) -> ToolError {
+        let (kind, approval_id) = match self {
+            Self::Kind(kind) => (kind, None),
+            Self::Referenced { kind, approval_id } => (kind, approval_id),
+        };
+        ToolError::ReviewUnsatisfied { kind, approval_id }
+    }
+}
+
 /// Typed error payload: enough atoms to reconstruct the exact `ToolError`
 /// variant on the member side (T-4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,13 +388,20 @@ impl UpcallToolOutcome {
                 data: None,
                 settlement_failures: Vec::new(),
             },
-            ToolError::ReviewUnsatisfied { kind } => UpcallToolError {
+            // Kind-only stays the legacy scalar; an owner reference rides
+            // in the canonical `{kind, approval_id}` object.
+            ToolError::ReviewUnsatisfied { kind, approval_id } => UpcallToolError {
                 class: UpcallToolErrorClass::ReviewUnsatisfied,
                 message: kind.to_string(),
                 name: None,
                 timeout_ms: None,
                 unavailable_reason: None,
-                data: serde_json::to_value(kind).ok(),
+                data: match approval_id {
+                    None => serde_json::to_value(kind).ok(),
+                    Some(approval_id) => {
+                        Some(serde_json::json!({ "kind": kind, "approval_id": approval_id }))
+                    }
+                },
                 settlement_failures: Vec::new(),
             },
             ToolError::ReviewUnavailable { kind } => UpcallToolError {
@@ -572,8 +603,8 @@ impl UpcallToolError {
             // the unavailable infrastructure class, never an allow.
             UpcallToolErrorClass::ReviewUnsatisfied => self
                 .data
-                .and_then(|data| serde_json::from_value(data).ok())
-                .map(|kind| ToolError::ReviewUnsatisfied { kind })
+                .and_then(|data| serde_json::from_value::<UpcallReviewUnsatisfied>(data).ok())
+                .map(UpcallReviewUnsatisfied::into_tool_error)
                 .unwrap_or(ToolError::ReviewUnavailable {
                     kind: meerkat_core::approval::review::ReviewUnavailableKind::OwnerUnavailable,
                 }),
@@ -622,6 +653,7 @@ fn tool_def(name: &str, description: &str, input_schema: serde_json::Value) -> A
         provenance: Some(ToolProvenance {
             kind: ToolSourceKind::Mob,
             source_id: "mob".into(),
+            artifact: None,
         }),
     })
 }
@@ -1925,6 +1957,84 @@ mod tests {
             assert!(error.structured_data().is_none());
             assert!(!error.to_string().contains("private hook diagnostic"));
         }
+    }
+
+    #[test]
+    fn review_unsatisfied_upcall_preserves_approval_reference_in_canonical_payload() {
+        let approval_id = "b6503200-06b6-4157-afc0-2a3c8d124178";
+        let data = json!({
+            "kind": "human_consent_required",
+            "approval_id": approval_id,
+        });
+        let encoded = json!({
+            "kind": "tool_error",
+            "class": "review_unsatisfied",
+            "message": "human consent required",
+            "data": data.clone(),
+        });
+        let wire = WireOpaqueJson::from_value(&encoded);
+        let received: UpcallToolOutcome = serde_json::from_value(wire.to_value().unwrap()).unwrap();
+        let error = received
+            .into_dispatch_outcome("reviewed-call", "spawn_member")
+            .expect_err("unsatisfied review remains a local tool refusal");
+        assert_eq!(error.error_code(), "review_unsatisfied");
+        assert_eq!(error.structured_data(), Some(data.clone()));
+        let payload = error.to_error_payload();
+        assert_eq!(payload["error"], "review_unsatisfied");
+        assert_eq!(payload["data"], data);
+
+        // The owner's reference survives both codec directions.
+        let forwarded = UpcallToolOutcome::from_tool_error(&error);
+        let encoded_again = serde_json::to_value(&forwarded).unwrap();
+        assert_eq!(encoded_again["class"], "review_unsatisfied");
+        assert_eq!(encoded_again["data"], data);
+        let wire_again = WireOpaqueJson::from_value(&encoded_again);
+        let received_again: UpcallToolOutcome =
+            serde_json::from_value(wire_again.to_value().unwrap()).unwrap();
+        let error_again = received_again
+            .into_dispatch_outcome("reviewed-call", "spawn_member")
+            .expect_err("forwarded review refusal must not become success");
+        assert_eq!(error_again.to_error_payload(), payload);
+        let outcome =
+            meerkat_core::ops::terminal_tool_outcome_for_error("reviewed-call", error_again);
+        assert!(outcome.result.is_error);
+        let transcript: serde_json::Value =
+            serde_json::from_str(&outcome.result.text_content()).unwrap();
+        assert_eq!(transcript, payload);
+    }
+
+    #[test]
+    fn legacy_scalar_review_unsatisfied_upcall_does_not_infer_approval_reference() {
+        let diagnostic_id = "b6503200-06b6-4157-afc0-2a3c8d124178";
+        let encoded = json!({
+            "kind": "tool_error",
+            "class": "review_unsatisfied",
+            "message": format!("human consent required; approval {diagnostic_id}"),
+            "name": diagnostic_id,
+            "data": "human_consent_required",
+        });
+        let wire = WireOpaqueJson::from_value(&encoded);
+        let received: UpcallToolOutcome = serde_json::from_value(wire.to_value().unwrap()).unwrap();
+        let error = received
+            .into_dispatch_outcome(diagnostic_id, diagnostic_id)
+            .expect_err("legacy scalar review refusal remains accepted");
+        assert_eq!(error.error_code(), "review_unsatisfied");
+        let expected_data = json!({"kind": "human_consent_required"});
+        assert_eq!(error.structured_data(), Some(expected_data.clone()));
+        let payload = error.to_error_payload();
+        assert_eq!(payload["error"], "review_unsatisfied");
+        assert_eq!(payload["data"], expected_data);
+        assert!(payload["data"].get("approval_id").is_none());
+
+        let forwarded = UpcallToolOutcome::from_tool_error(&error);
+        let wire_again = WireOpaqueJson::from_value(&serde_json::to_value(&forwarded).unwrap());
+        let received_again: UpcallToolOutcome =
+            serde_json::from_value(wire_again.to_value().unwrap()).unwrap();
+        let error_again = received_again
+            .into_dispatch_outcome(diagnostic_id, diagnostic_id)
+            .unwrap_err();
+        assert_eq!(error_again.to_error_payload(), payload);
+        assert!(!error_again.to_transcript_content().contains(diagnostic_id));
     }
 
     #[test]

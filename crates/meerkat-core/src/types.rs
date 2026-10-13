@@ -2385,8 +2385,15 @@ pub enum SystemNoticeBlock {
         category: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// Persisted with the notice; never sent to the model.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         payload: Option<Value>,
+        /// Typed content the model receives after the detail (for example
+        /// the published result of a later attempt correlated with an
+        /// earlier call). It is stored, hydrated, replayed and lowered as
+        /// comms and external-event notice content is.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        content: Vec<ContentBlock>,
     },
     /// A tool process of an earlier run was settled by the host's
     /// process-custody recovery after the host stopped abruptly. When the run
@@ -2488,6 +2495,8 @@ enum SystemNoticeBlockKnown {
         detail: Option<String>,
         #[serde(default, deserialize_with = "deserialize_present_json_value")]
         payload: Option<Value>,
+        #[serde(default)]
+        content: Vec<ContentBlock>,
     },
     ToolProcessInterrupted {
         run_id: crate::lifecycle::RunId,
@@ -2599,10 +2608,12 @@ impl From<SystemNoticeBlockKnown> for SystemNoticeBlock {
                 category,
                 detail,
                 payload,
+                content,
             } => Self::RuntimeNotice {
                 category,
                 detail,
                 payload,
+                content,
             },
             SystemNoticeBlockKnown::ToolProcessInterrupted {
                 run_id,
@@ -2835,6 +2846,22 @@ impl SystemNoticeBlock {
                 }
                 lines.join("\n")
             }
+            Self::RuntimeNotice {
+                detail, content, ..
+            } => {
+                // The text-only projection: the detail, then the text of each
+                // typed content block in order. Providers instead send the
+                // lead text and lower the content itself, in order, after it
+                // (see `SystemNoticeMessage::model_projection_lead_text`).
+                let mut lines: Vec<String> = detail.iter().cloned().collect();
+                for block in content {
+                    let text = block.text_projection();
+                    if !text.trim().is_empty() {
+                        lines.push(text.into_owned());
+                    }
+                }
+                lines.join("\n")
+            }
             Self::ToolConfig { payload } => {
                 format!("Tool configuration changed: {}", payload.status_text())
             }
@@ -2892,6 +2919,33 @@ impl SystemNoticeBlock {
                 }
             }
             _ => self.summary().unwrap_or_default().to_string(),
+        }
+    }
+
+    /// Whether this block's typed content is lowered after the notice text in
+    /// its own order, each block once: a runtime notice's content, and the
+    /// blocks of a comms response, whose text names the request and its
+    /// result but not its body. Otherwise the content's text is part of the
+    /// notice text and only its media follows it.
+    #[must_use]
+    pub fn content_follows_notice_text(&self) -> bool {
+        match self {
+            Self::RuntimeNotice { .. } => true,
+            Self::Comms { kind, .. } => matches!(
+                kind,
+                CommsNoticeKind::ResponseProgress | CommsNoticeKind::ResponseTerminal
+            ),
+            _ => false,
+        }
+    }
+
+    /// This block's text before typed content that lowers in its own order
+    /// after the notice text: a runtime notice's detail alone (its content
+    /// follows, block by block); every other block's whole projection.
+    fn model_projection_lead_text(&self) -> String {
+        match self {
+            Self::RuntimeNotice { detail, .. } => detail.clone().unwrap_or_default(),
+            _ => self.model_projection_text(),
         }
     }
 }
@@ -3004,7 +3058,8 @@ impl SystemNoticeMessage {
     pub fn has_images(&self) -> bool {
         self.blocks.iter().any(|block| match block {
             SystemNoticeBlock::Comms { content, .. }
-            | SystemNoticeBlock::ExternalEvent { content, .. } => has_images(content),
+            | SystemNoticeBlock::ExternalEvent { content, .. }
+            | SystemNoticeBlock::RuntimeNotice { content, .. } => has_images(content),
             _ => false,
         })
     }
@@ -3107,12 +3162,27 @@ impl SystemNoticeMessage {
     /// The projection is not the transcript contract and must not be persisted
     /// as user-authored content.
     pub fn model_projection_text(&self) -> String {
+        self.joined_projection(SystemNoticeBlock::model_projection_text)
+    }
+
+    /// The notice text a provider sends before the typed content it lowers
+    /// in order: the body and each block's projection, where a runtime
+    /// notice contributes only its detail. That notice's content follows,
+    /// block by block in its own order, each lowered once through the
+    /// provider's own content lowering. Text-only consumers use
+    /// [`Self::model_projection_text`], which carries the content's text in
+    /// place.
+    pub fn model_projection_lead_text(&self) -> String {
+        self.joined_projection(SystemNoticeBlock::model_projection_lead_text)
+    }
+
+    fn joined_projection(&self, project: impl Fn(&SystemNoticeBlock) -> String) -> String {
         let mut parts = Vec::new();
         if let Some(body) = self.body.as_deref().filter(|body| !body.trim().is_empty()) {
             parts.push(body.to_string());
         }
         for block in &self.blocks {
-            let projection = block.model_projection_text();
+            let projection = project(block);
             if !projection.trim().is_empty() {
                 parts.push(projection);
             }
@@ -3941,6 +4011,186 @@ pub enum ToolSourceKind {
 pub struct ToolProvenance {
     pub kind: ToolSourceKind,
     pub source_id: ToolSourceId,
+    /// The installed artifact this tool's implementation came from, set only
+    /// after its host verified the reference against the artifacts it
+    /// installed. Attribution, never authority: nothing grants or refuses a
+    /// call by it, and a tool's name never implies one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ToolArtifactRef>,
+}
+
+impl ToolProvenance {
+    pub fn new(kind: ToolSourceKind, source_id: impl Into<ToolSourceId>) -> Self {
+        Self {
+            kind,
+            source_id: source_id.into(),
+            artifact: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_artifact(mut self, artifact: ToolArtifactRef) -> Self {
+        self.artifact = Some(artifact);
+        self
+    }
+
+    /// Whether both name the same source (`kind` and `source_id`). Tool
+    /// visibility identity is the source: the artifact is attribution, not
+    /// part of which tool a visibility witness names. Native tool identity
+    /// and installed-surface checks keep full equality.
+    pub fn same_source(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.source_id == other.source_id
+    }
+}
+
+/// Upper bound on each part of a [`ToolArtifactRef`], in bytes.
+pub const TOOL_ARTIFACT_REF_PART_MAX_BYTES: usize = 256;
+
+/// An installed artifact (an extension package, a plugin manifest) named by
+/// its host: an opaque artifact id and the digest the host installed. Both
+/// parts are opaque to Meerkat.
+///
+/// An association records which installed artifact the host says a tool's
+/// handler came from, checked only against the host's own installed set. It
+/// is not proof of the executable bytes or the semantics of the handler that
+/// actually runs, and it is not invocation authority: nothing grants or
+/// refuses a call by it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct ToolArtifactRef {
+    artifact_id: String,
+    digest: String,
+}
+
+/// Why a [`ToolArtifactRef`] part is not accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ToolArtifactRefError {
+    #[error("tool artifact {0} must not be empty")]
+    Empty(ToolArtifactRefPart),
+    #[error("tool artifact {0} exceeds {TOOL_ARTIFACT_REF_PART_MAX_BYTES} bytes")]
+    TooLong(ToolArtifactRefPart),
+    #[error("tool artifact {0} must not contain whitespace or control characters")]
+    InvalidCharacter(ToolArtifactRefPart),
+}
+
+/// The part of a [`ToolArtifactRef`] an error names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolArtifactRefPart {
+    ArtifactId,
+    Digest,
+}
+
+impl fmt::Display for ToolArtifactRefPart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ArtifactId => "id",
+            Self::Digest => "digest",
+        })
+    }
+}
+
+impl ToolArtifactRef {
+    pub fn new(
+        artifact_id: impl Into<String>,
+        digest: impl Into<String>,
+    ) -> Result<Self, ToolArtifactRefError> {
+        let artifact_id = artifact_id.into();
+        let digest = digest.into();
+        Self::check(&artifact_id, ToolArtifactRefPart::ArtifactId)?;
+        Self::check(&digest, ToolArtifactRefPart::Digest)?;
+        Ok(Self {
+            artifact_id,
+            digest,
+        })
+    }
+
+    fn check(part: &str, which: ToolArtifactRefPart) -> Result<(), ToolArtifactRefError> {
+        if part.is_empty() {
+            return Err(ToolArtifactRefError::Empty(which));
+        }
+        if part.len() > TOOL_ARTIFACT_REF_PART_MAX_BYTES {
+            return Err(ToolArtifactRefError::TooLong(which));
+        }
+        if part.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(ToolArtifactRefError::InvalidCharacter(which));
+        }
+        Ok(())
+    }
+
+    pub fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+}
+
+/// Why a build's callback tools were refused for their artifact references.
+/// A build refusal, never a tool result: the build fails before any of its
+/// callback tools is published.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum ToolArtifactRefusal {
+    /// The tool names an artifact the host did not install.
+    #[error(
+        "tool_artifact_refused: tool `{tool}` names artifact `{artifact_id}`, which the host did not install"
+    )]
+    UnknownArtifact { tool: String, artifact_id: String },
+    /// The tool names an installed artifact with a different digest.
+    #[error(
+        "tool_artifact_refused: tool `{tool}` names artifact `{artifact_id}` with digest `{declared}`, but the installed digest is `{installed}`"
+    )]
+    DigestMismatch {
+        tool: String,
+        artifact_id: String,
+        declared: String,
+        installed: String,
+    },
+    /// The host selected installed artifacts, and this callback tool names
+    /// none.
+    #[error(
+        "tool_artifact_refused: the host selected installed artifacts and callback tool `{tool}` names none"
+    )]
+    Unassociated { tool: String },
+    /// The tool names an artifact, but the host selected no installed
+    /// artifacts to verify it against.
+    #[error(
+        "tool_artifact_refused: tool `{tool}` names artifact `{artifact_id}`, but the host selected no installed artifacts"
+    )]
+    NoInstalledArtifacts { tool: String, artifact_id: String },
+    /// The build declares two callback tools with this name.
+    #[error("tool_artifact_refused: the build declares callback tool `{tool}` more than once")]
+    DuplicateTool { tool: String },
+}
+
+impl ToolArtifactRefusal {
+    /// The stable kind name of this refusal. It prefixes the display text;
+    /// in a build error that text is display only, and structured error
+    /// data (where a surface emits it) carries it as `kind`.
+    pub const KIND: &'static str = "tool_artifact_refused";
+
+    pub fn tool(&self) -> &str {
+        match self {
+            Self::UnknownArtifact { tool, .. }
+            | Self::DigestMismatch { tool, .. }
+            | Self::Unassociated { tool }
+            | Self::NoInstalledArtifacts { tool, .. }
+            | Self::DuplicateTool { tool } => tool,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolArtifactRef {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            artifact_id: String,
+            digest: String,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(wire.artifact_id, wire.digest).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Canonical typed source identifier for tool provenance.

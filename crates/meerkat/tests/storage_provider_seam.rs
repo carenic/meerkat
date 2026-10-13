@@ -79,7 +79,9 @@ async fn memory_realm_is_declared_ephemeral_not_silently_nonpersistent() {
     );
 }
 
-fn memory_store_set() -> RealmStoreSet {
+/// `store_path` must be a per-test directory: bundle assembly opens the
+/// persistent approval store (`approvals.json`) under it.
+fn memory_store_set(store_path: &std::path::Path) -> RealmStoreSet {
     RealmStoreSet {
         session_store: Arc::new(meerkat_store::MemoryStore::new()),
         runtime_store: Arc::new(meerkat_runtime::store::InMemoryRuntimeStore::new()),
@@ -88,7 +90,7 @@ fn memory_store_set() -> RealmStoreSet {
         job_store: Arc::new(meerkat_jobs::MemoryDetachedJobStore::new()),
         blob_store: Arc::new(meerkat_store::MemoryBlobStore::new()),
         artifact_store: Arc::new(meerkat_store::MemoryArtifactStore::new()),
-        store_path: std::path::PathBuf::from("."),
+        store_path: store_path.to_path_buf(),
         projection_root: None,
         durability: [
             "sessions",
@@ -122,7 +124,7 @@ impl RealmStorageProvider for LayoutCapturingProvider {
 
     async fn open(&self, ctx: &RealmOpenContext) -> Result<RealmStoreSet, PersistenceError> {
         *self.seen_layout.lock().expect("mutex") = ctx.layout.clone();
-        Ok(memory_store_set())
+        Ok(memory_store_set(&ctx.paths.root))
     }
 }
 
@@ -262,7 +264,7 @@ impl RealmStorageProvider for UndeclaredEphemeralProvider {
         "undeclared-ephemeral"
     }
 
-    async fn open(&self, _ctx: &RealmOpenContext) -> Result<RealmStoreSet, PersistenceError> {
+    async fn open(&self, ctx: &RealmOpenContext) -> Result<RealmStoreSet, PersistenceError> {
         // Complete declarations for every slot — but blobs resolves
         // non-persistent WITHOUT a declaration: the exact silent-fallback
         // class the rule refuses.
@@ -291,7 +293,7 @@ impl RealmStorageProvider for UndeclaredEphemeralProvider {
             job_store: Arc::new(meerkat_jobs::MemoryDetachedJobStore::new()),
             blob_store: Arc::new(meerkat_store::MemoryBlobStore::new()),
             artifact_store: Arc::new(meerkat_store::MemoryArtifactStore::new()),
-            store_path: std::path::PathBuf::from("."),
+            store_path: ctx.paths.root.clone(),
             projection_root: None,
             durability,
         })
@@ -327,6 +329,7 @@ fn omitted_durability_declarations_are_refused() {
         "created_at": "0",
     }))
     .expect("manifest");
+    let store_dir = tempfile::tempdir().expect("tempdir");
     let set = RealmStoreSet {
         session_store: Arc::new(meerkat_store::MemoryStore::new()),
         runtime_store: Arc::new(meerkat_runtime::store::InMemoryRuntimeStore::new()),
@@ -335,7 +338,7 @@ fn omitted_durability_declarations_are_refused() {
         job_store: Arc::new(meerkat_jobs::MemoryDetachedJobStore::new()),
         blob_store: Arc::new(meerkat_store::MemoryBlobStore::new()),
         artifact_store: Arc::new(meerkat_store::MemoryArtifactStore::new()),
-        store_path: std::path::PathBuf::from("."),
+        store_path: store_dir.path().to_path_buf(),
         projection_root: None,
         durability: Vec::new(),
     };
@@ -349,7 +352,8 @@ fn omitted_durability_declarations_are_refused() {
 
 #[test]
 fn jobs_durability_declaration_is_required_fail_closed() {
-    let mut set = memory_store_set();
+    let store_dir = tempfile::tempdir().expect("tempdir");
+    let mut set = memory_store_set(store_dir.path());
     set.durability
         .retain(|declaration| declaration.domain != "jobs");
     let err = enforce_fail_closed_durability(&set, &[])
@@ -373,6 +377,7 @@ fn manifest_ephemeral_declaration_admits_the_slot() {
     });
     let manifest: meerkat_store::RealmManifest =
         serde_json::from_value(manifest_json).expect("manifest");
+    let store_dir = tempfile::tempdir().expect("tempdir");
     let set = RealmStoreSet {
         session_store: Arc::new(meerkat_store::MemoryStore::new()),
         runtime_store: Arc::new(meerkat_runtime::store::InMemoryRuntimeStore::new()),
@@ -381,7 +386,7 @@ fn manifest_ephemeral_declaration_admits_the_slot() {
         job_store: Arc::new(meerkat_jobs::MemoryDetachedJobStore::new()),
         blob_store: Arc::new(meerkat_store::MemoryBlobStore::new()),
         artifact_store: Arc::new(meerkat_store::MemoryArtifactStore::new()),
-        store_path: std::path::PathBuf::from("."),
+        store_path: store_dir.path().to_path_buf(),
         projection_root: None,
         durability: {
             let mut declarations = vec![DurabilityDeclaration::durable(
@@ -431,7 +436,7 @@ impl RealmStorageProvider for FakeRemoteProvider {
         "fake-remote"
     }
 
-    async fn open(&self, _ctx: &RealmOpenContext) -> Result<RealmStoreSet, PersistenceError> {
+    async fn open(&self, ctx: &RealmOpenContext) -> Result<RealmStoreSet, PersistenceError> {
         Ok(RealmStoreSet {
             session_store: Arc::new(meerkat_store::MemoryStore::new()),
             runtime_store: Arc::new(meerkat_runtime::store::InMemoryRuntimeStore::new()),
@@ -440,7 +445,7 @@ impl RealmStorageProvider for FakeRemoteProvider {
             job_store: Arc::new(meerkat_jobs::MemoryDetachedJobStore::new()),
             blob_store: Arc::new(meerkat_store::MemoryBlobStore::new()),
             artifact_store: Arc::new(meerkat_store::MemoryArtifactStore::new()),
-            store_path: std::path::PathBuf::from("."),
+            store_path: ctx.paths.root.clone(),
             projection_root: None,
             durability: [
                 "sessions",

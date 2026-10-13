@@ -145,6 +145,23 @@ pub trait DetachedJobStore: Send + Sync {
 
     async fn get(&self, job_id: &JobId) -> Result<Option<StoredJob>, DetachedJobError>;
 
+    /// Read the job admitted under one exact realm-scoped submission key.
+    ///
+    /// This is a read of the store's own unique submission index, never a
+    /// scan. It lets a submitter that a store refused with
+    /// [`DetachedJobError::SubmissionConflict`] inspect the authoritative
+    /// admitted job instead of guessing its identity. The default fails
+    /// closed.
+    async fn get_by_submission_key(
+        &self,
+        _realm_id: &str,
+        _submission_key: &JobSubmissionKey,
+    ) -> Result<Option<StoredJob>, DetachedJobError> {
+        Err(DetachedJobError::Store(
+            "detached-job store does not support submission-key reads".into(),
+        ))
+    }
+
     async fn compare_and_swap(
         &self,
         expected_revision: u64,
@@ -386,6 +403,22 @@ impl DetachedJobStore for MemoryDetachedJobStore {
 
     async fn get(&self, job_id: &JobId) -> Result<Option<StoredJob>, DetachedJobError> {
         Ok(self.inner.read().await.jobs.get(job_id).cloned())
+    }
+
+    async fn get_by_submission_key(
+        &self,
+        realm_id: &str,
+        submission_key: &JobSubmissionKey,
+    ) -> Result<Option<StoredJob>, DetachedJobError> {
+        let guard = self.inner.read().await;
+        let index_key = (realm_id.to_string(), submission_key.clone());
+        let Some(job_id) = guard.submission_index.get(&index_key) else {
+            return Ok(None);
+        };
+        let job = guard.jobs.get(job_id).ok_or_else(|| {
+            DetachedJobError::Store(format!("submission index points to missing job {job_id}"))
+        })?;
+        Ok(Some(job.clone()))
     }
 
     async fn compare_and_swap(

@@ -19,6 +19,44 @@ use crate::block_assembler::BlockAssembler;
 use crate::error::LlmError;
 use crate::types::{LlmClient, LlmDoneOutcome, LlmEvent, LlmRequest, PreparedLlmRequest};
 
+/// A run event channel bound once, after the adapter was built.
+///
+/// A controller prepared before its session exists keeps its exact adapters;
+/// the session's own channel reaches them through this slot when the prepared
+/// controller is consumed. Clones share the slot. The first bind wins and a
+/// later bind is refused, so the bound channel never changes.
+#[derive(Clone, Default)]
+pub struct LateEventChannel(Arc<std::sync::OnceLock<mpsc::Sender<AgentEvent>>>);
+
+impl LateEventChannel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bind `event_tx` once. `false` when a channel was already bound; the
+    /// first one stays.
+    pub fn bind(&self, event_tx: mpsc::Sender<AgentEvent>) -> bool {
+        self.0.set(event_tx).is_ok()
+    }
+
+    /// Whether a channel has been bound.
+    pub fn is_bound(&self) -> bool {
+        self.0.get().is_some()
+    }
+
+    fn get(&self) -> Option<&mpsc::Sender<AgentEvent>> {
+        self.0.get()
+    }
+}
+
+impl std::fmt::Debug for LateEventChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LateEventChannel")
+            .field("bound", &self.is_bound())
+            .finish()
+    }
+}
+
 /// Shared adapter for streaming LLM clients.
 #[derive(Clone)]
 pub struct LlmClientAdapter {
@@ -32,6 +70,9 @@ pub struct LlmClientAdapter {
     provider: Provider,
     /// Optional channel to emit streaming text deltas.
     event_tx: Option<mpsc::Sender<AgentEvent>>,
+    /// The run channel bound after construction, used only when `event_tx`
+    /// is absent.
+    late_event_tx: Option<LateEventChannel>,
     /// Default typed per-request provider-specific knobs. Overridden on
     /// a per-call basis when [`AgentLlmClient::stream_response`] is
     /// invoked with `Some(provider_params)`.
@@ -127,6 +168,7 @@ impl LlmClientAdapter {
             model,
             provider,
             event_tx,
+            late_event_tx: None,
             provider_params: None,
             event_tap: meerkat_core::new_event_tap(),
             operation_observation_events_only: false,
@@ -156,6 +198,20 @@ impl LlmClientAdapter {
         Ok(Self::new_bound(client, model, provider, Some(event_tx)))
     }
 
+    /// Create an identity-bound adapter whose run channel is bound later,
+    /// once, through `late_event_tx` (see [`LateEventChannel`]).
+    pub fn try_with_late_event_channel_for_provider_identity(
+        client: Arc<dyn LlmClient>,
+        model: String,
+        provider: Provider,
+        late_event_tx: LateEventChannel,
+    ) -> Result<Self, LlmError> {
+        Self::validate_provider_binding(client.provider(), provider, &model)?;
+        let mut adapter = Self::new_bound(client, model, provider, None);
+        adapter.late_event_tx = Some(late_event_tx);
+        Ok(adapter)
+    }
+
     /// Publish one live event to the interaction tap (best effort) and then
     /// to the run's event channel, in that order, like the agent loop does.
     async fn publish(&self, event: AgentEvent) {
@@ -165,7 +221,11 @@ impl LlmClientAdapter {
             return;
         }
         meerkat_core::tap_try_send(&self.event_tap, &event);
-        if let Some(ref tx) = self.event_tx {
+        let event_tx = self
+            .event_tx
+            .as_ref()
+            .or_else(|| self.late_event_tx.as_ref().and_then(LateEventChannel::get));
+        if let Some(tx) = event_tx {
             let _ = tx.send(event).await;
         }
     }
@@ -1410,6 +1470,72 @@ mod tests {
             event_kinds_and_ids(&tapped),
             expected,
             "interaction taps see the same stamped live events, server tool content included"
+        );
+        Ok(())
+    }
+
+    /// A run channel bound after the adapter was built: before it is bound
+    /// the adapter's live events reach only the interaction tap; it binds
+    /// once, every clone of the adapter then publishes to it, and a second
+    /// bind is refused without replacing it.
+    #[tokio::test]
+    async fn late_event_channel_binds_once_for_every_clone() -> Result<(), String> {
+        let (tap_tx, mut tap_rx) = mpsc::channel(64);
+        let tap = meerkat_core::new_event_tap();
+        *tap.lock() = Some(meerkat_core::EventTapState {
+            tx: tap_tx,
+            truncated: AtomicBool::new(false),
+        });
+        let late = LateEventChannel::new();
+        let adapter = LlmClientAdapter::try_with_late_event_channel_for_provider_identity(
+            Arc::new(ScriptedClient {
+                events: message_scoped_script(),
+            }),
+            "claude-sonnet-4-5".to_string(),
+            Provider::Anthropic,
+            late.clone(),
+        )
+        .map_err(|error| error.to_string())?
+        .with_event_tap(tap);
+        let id = scripted_message_id()?;
+        let run = |adapter: LlmClientAdapter| async move {
+            Arc::new(adapter)
+                .prepare_request_attempt(
+                    Arc::new(vec![Message::User(UserMessage::text("hello"))]),
+                    Arc::from([]),
+                    1024,
+                    None,
+                    None,
+                )
+                .map_err(|error| error.to_string())?
+                .stream_response(id)
+                .await
+                .map(drop)
+                .map_err(|error| error.to_string())
+        };
+
+        run(adapter.clone()).await?;
+        let unbound = std::iter::from_fn(|| tap_rx.try_recv().ok()).count();
+        assert_eq!(unbound, 7, "an unbound adapter still feeds the tap");
+        assert!(!late.is_bound());
+
+        let (tx, mut rx) = mpsc::channel(64);
+        assert!(late.bind(tx), "the first bind wins");
+        let (other_tx, mut other_rx) = mpsc::channel(64);
+        assert!(!late.bind(other_tx), "a second bind is refused");
+
+        run(adapter).await?;
+        let channel = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        let tapped = std::iter::from_fn(|| tap_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            channel.len(),
+            7,
+            "the bound channel receives every live event"
+        );
+        assert_eq!(event_kinds_and_ids(&channel), event_kinds_and_ids(&tapped));
+        assert!(
+            other_rx.try_recv().is_err(),
+            "the refused channel never receives"
         );
         Ok(())
     }

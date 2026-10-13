@@ -1129,7 +1129,8 @@ fn collect_message_blob_refs(message: &Message, refs: &mut Vec<BlobId>) {
             for block in &notice.blocks {
                 match block {
                     SystemNoticeBlock::Comms { content, .. }
-                    | SystemNoticeBlock::ExternalEvent { content, .. } => {
+                    | SystemNoticeBlock::ExternalEvent { content, .. }
+                    | SystemNoticeBlock::RuntimeNotice { content, .. } => {
                         collect_content_block_blob_refs(content, refs);
                     }
                     _ => {}

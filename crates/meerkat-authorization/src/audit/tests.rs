@@ -351,3 +351,83 @@ fn authorization_unavailable_survives_publication_change_and_is_observed() {
         }
     }
 }
+
+/// The audit-only withholding path appends the typed record to the same
+/// row-bound sink, under the work context's own scope, without any policy
+/// read, clock or preparation.
+#[test]
+fn mandatory_hook_withholding_reaches_the_sink_without_policy_or_preparation() {
+    struct FailingClock;
+    impl LocalAuthorizationClock for FailingClock {
+        fn now(
+            &self,
+        ) -> Result<crate::work::LocalAuthorizationTime, crate::clock::LocalClockError> {
+            Err(crate::clock::LocalClockError::Unavailable)
+        }
+    }
+    struct UnenteredPolicy;
+    impl WorkAuthorization for UnenteredPolicy {
+        #[allow(clippy::panic)] // Entering this policy is the failing test sentinel.
+        fn prepare(
+            &self,
+            _: &PreparedAuthorizationBinding,
+        ) -> Result<Arc<dyn PreparedOperationAuthorization>, OperationAuthorizationError> {
+            panic!("recording a hook withholding must not prepare an operation")
+        }
+    }
+    #[derive(Default)]
+    struct Sink(std::sync::Mutex<Vec<AuthorizationAuditObservation>>);
+    impl AuthorizationAuditSink for Sink {
+        fn append(
+            &self,
+            observation: AuthorizationAuditObservation,
+        ) -> Result<(), OperationObservationError> {
+            self.0.lock().expect("observations").push(observation);
+            Ok(())
+        }
+    }
+    let sink = Arc::new(Sink::default());
+    let audited = AuditedWorkAuthorization {
+        inner: Arc::new(UnenteredPolicy),
+        associations: Vec::new().into(),
+        publication: LocalAuthorizationPublication::new(),
+        clock: Arc::new(FailingClock),
+        sink: sink.clone(),
+    };
+    let context = meerkat_core::WorkAuthorizationContext::new(
+        Arc::new(audited),
+        OperationExecutionScope::Domain,
+    );
+    let candidate = OperationId::new();
+    let run = meerkat_core::RunId::new();
+    let withholding = meerkat_core::MandatoryHookWithholding {
+        sequence: 1,
+        hook_id: Some(meerkat_core::HookId::new("gate")),
+        hook_id_omitted: false,
+        point: meerkat_core::HookPoint::PreLlmRequest,
+        cause: meerkat_core::MandatoryHookCause::LaunchRefused {
+            refusal: meerkat_core::confinement::ConfinementRefusal::BackendUnavailable,
+        },
+        effect: meerkat_core::MandatoryHookWithheldEffect::RequestNotSent,
+    };
+    context
+        .observe_mandatory_hook_withholding(
+            candidate.clone(),
+            Some(run.clone()),
+            withholding.clone(),
+        )
+        .expect("protected custody accepts the record");
+    let events = sink.0.lock().expect("observations");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].operation_id, candidate);
+    assert_eq!(events[0].run_id, Some(run));
+    assert_eq!(events[0].execution_scope, OperationExecutionScope::Domain);
+    assert!(matches!(
+        &events[0].observation,
+        AuditObservation::MandatoryHookWithheld { withholding: recorded } if *recorded == withholding
+    ));
+    assert_eq!(
+        events[0].safe_projection(),
+        meerkat_authorization_contracts::audit::SafeAuditObservation::MandatoryHookWithheld
+    );
+}

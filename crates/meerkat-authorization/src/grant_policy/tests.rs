@@ -4,6 +4,8 @@
 #![allow(clippy::expect_used)]
 
 mod audit;
+mod connector_approval;
+mod targeted;
 mod tool_application;
 
 use std::sync::Mutex;
@@ -23,8 +25,9 @@ use meerkat_authorization_contracts::work_association::{
     QualifiedIngressNamespace,
 };
 use meerkat_core::authorization::{
-    ModelAuthorizationFacts, OperationAuthorizationFacts, OwnerQualifiedTarget,
-    SourceAuthorizationFacts, SourceAuthorizationTarget, SourceAuthorizationUse,
+    ModelAuthorizationFacts, ModelAuthorizationUse, OperationAuthorizationFacts,
+    OwnerQualifiedTarget, SourceAuthorizationFacts, SourceAuthorizationTarget,
+    SourceAuthorizationUse,
 };
 use meerkat_core::connection::{AuthCredentialIdentity, RealmId};
 use meerkat_core::time_compat::Instant;
@@ -583,15 +586,37 @@ fn controller_and_hosted_capability_use_independent_correlated_grants() {
             LocalPolicyPurpose::Operation
         ]
     );
-    // Ordinary inference, compaction and live cannot borrow controller grants.
+    // Ordinary inference and live cannot borrow controller grants.
     for usage in [
         ModelAuthorizationUse::Inference,
-        ModelAuthorizationUse::Compaction,
         ModelAuthorizationUse::Live,
     ] {
         let ordinary = bind(AuthorizationOperation::Model(model(usage, vec![])));
         assert!(context.authorization().prepare(&ordinary).is_err());
     }
+    // Compaction of the controller's own context on exactly the admitted
+    // controller route is the controller's housekeeping, decided under C.
+    owner.calls.lock().expect("calls").clear();
+    let housekeeping = bind(AuthorizationOperation::Model(model(
+        ModelAuthorizationUse::Compaction,
+        vec![],
+    )));
+    assert!(context.authorization().prepare(&housekeeping).is_ok());
+    assert_eq!(
+        *owner.calls.lock().expect("calls"),
+        vec![LocalPolicyPurpose::Controller]
+    );
+    // A Compaction label on another route borrows nothing from the
+    // controller.
+    let mut elsewhere = model(ModelAuthorizationUse::Compaction, vec![]);
+    elsewhere.endpoint = "https://other.invalid/v1/responses".into();
+    assert!(
+        context
+            .authorization()
+            .prepare(&bind(AuthorizationOperation::Model(elsewhere)))
+            .is_err()
+    );
+
     // Ordinary authority expires, but a bare controller can still return feedback.
     fixture.clock.0.store(300, Ordering::SeqCst);
     assert!(prepared_hosted.check_current(&hosted).is_err());

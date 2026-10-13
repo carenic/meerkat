@@ -905,6 +905,106 @@ mod tests {
         );
     }
 
+    /// An exact MCP access ceiling survives the real desired-material seal
+    /// and the recovery compiler: the selected operations stay callable, an
+    /// extra raw operation stays refused, and the ceiling is digest-covered.
+    #[tokio::test]
+    async fn sealed_desired_member_keeps_exact_mcp_access_through_recovery() {
+        let identity = AgentIdentity::from("worker-a");
+        let mut server = meerkat_core::mcp_config::McpServerConfig::streamable_http(
+            "docs",
+            "https://mcp.example.invalid/mcp",
+            std::collections::HashMap::new(),
+        );
+        server.tool_names =
+            std::collections::BTreeMap::from([("read".to_string(), "docs_read".to_string())]);
+        server.access = Some(meerkat_core::McpServerAccess::allowing(["read", "list"]));
+        let mut profile = worker_profile();
+        profile.tools.mcp_servers = vec![server.clone()];
+        let definition = definition();
+        let declaration = IdentityProfileMemberDeclaration {
+            profile_name: ProfileName::from("worker"),
+            profile_override: None,
+            model_override: None,
+            external_addressable_override: None,
+            context: None,
+            labels: None,
+            additional_instructions: None,
+            system_prompt_override: Some(PortableSystemPrompt::Disable),
+            tool_access_policy: None,
+            auth_binding: None,
+            budget_limits: None,
+            runtime_mode: Some(meerkat_contracts::wire::WireMobRuntimeMode::TurnDriven),
+            required_env_keys: Vec::new(),
+            required_local_callback_tools: Vec::new(),
+            execution: DesiredExecution::ControllingSession,
+        };
+        let material = compile_desired_member_material(CompileDesiredMemberMaterialParams {
+            agent_identity: &identity,
+            declaration: &declaration,
+            resolved_profile: Some(&profile),
+            definition: &definition,
+            base_prompt: None,
+            non_portable_disabled: Vec::new(),
+        })
+        .await
+        .expect("a valid ceiling seals");
+        material.validate().expect("sealed material round-trips");
+
+        let session_id = meerkat_core::SessionId::new();
+        let session = crate::identity::DesiredSessionTarget {
+            session_id: session_id.clone(),
+            lineage_id: meerkat_core::SessionLineageId::for_session(&session_id),
+            lineage_generation: meerkat_core::SessionGeneration::INITIAL,
+            authority_policy: crate::identity::DesiredSessionAuthorityPolicy::CreateIfAbsent,
+        };
+        let intent_for = |material| crate::identity::IdentityIntent::Present {
+            identity: identity.clone(),
+            session: session.clone(),
+            member: Box::new(crate::identity::DesiredMemberSpec {
+                material,
+                initial_delivery: None,
+            }),
+            wiring_custody: crate::identity::IdentityWiringCustody::IdentityOwned,
+            owned_wiring: Default::default(),
+        };
+        let mut widened = material.clone();
+        match widened.profile.tools.mcp_servers.get_mut("docs") {
+            Some(meerkat_contracts::wire::PortableMcpDecl::Http { access, .. }) => {
+                *access = Some(meerkat_core::McpServerAccess::allowing([
+                    "read", "list", "write",
+                ]));
+            }
+            other => panic!("expected the sealed HTTP declaration, got {other:?}"),
+        }
+        assert_ne!(
+            intent_for(material.clone()).digest().unwrap(),
+            intent_for(widened).digest().unwrap(),
+            "the access ceiling is covered by the intent digest"
+        );
+
+        let member = crate::identity::DesiredMemberSpec {
+            material,
+            initial_delivery: None,
+        };
+        let recovered = spawn_spec_from_desired_member(&identity, &session, &member)
+            .expect("the sealed member recovers");
+        let recovered_profile = recovered.override_profile.expect("recovered profile");
+        let recovered_server = recovered_profile
+            .tools
+            .mcp_servers
+            .iter()
+            .find(|candidate| candidate.name == "docs")
+            .expect("recovered MCP server");
+        assert_eq!(recovered_server, &server);
+        assert!(recovered_server.permits_operation("read"));
+        assert!(recovered_server.permits_operation("list"));
+        assert!(
+            !recovered_server.permits_operation("write"),
+            "an extra raw operation stays refused after recovery"
+        );
+    }
+
     #[tokio::test]
     async fn desired_material_compiler_seals_overrides_and_canonical_callback_tools() {
         let identity = AgentIdentity::from("worker-a");

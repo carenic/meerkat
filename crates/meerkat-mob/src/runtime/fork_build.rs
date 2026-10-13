@@ -281,7 +281,7 @@ pub struct ForkBuildInheritance {
 
 impl ForkBuildInheritance {
     /// `labels` are the source's roster labels. The standard mob member
-    /// labels among them are dropped here: they name the source (in MobKit,
+    /// labels among them are dropped here: they name the source (in Meta,
     /// `agent_identity` is the source's durable identity), so a child that
     /// inherited them would claim to be its source. `external_tools` is the
     /// source's retained overlay, from `external_tools_origin`.
@@ -1201,7 +1201,7 @@ mod tests {
         assert!(spec.fork_source.is_some());
     }
 
-    /// Regression (identity confusion): MobKit stamps its durable identity
+    /// Regression (identity confusion): Meta stamps its durable identity
     /// into a member's roster labels (`agent_identity: "domain:calendar"`,
     /// `profile_name`), and meerkat's standard labels name a member too. A
     /// fork child that inherited them claimed its source's identity.

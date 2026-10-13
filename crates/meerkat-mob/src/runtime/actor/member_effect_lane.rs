@@ -18,6 +18,10 @@
 //! stale-incarnation detection before commit, panic/abort capture routed to a
 //! caller-declared unsettled commit, lifecycle drain, and teardown.
 //!
+//! Deferral and currentness are two sets. A ticket defers the controls of
+//! every member it fences plus every member its caller parks without
+//! fencing; the commit's currentness verdict reads the fences only.
+//!
 //! What the lane deliberately does NOT own: what the effects mean. It never
 //! inspects the payload and never invents a compensation — the caller's
 //! commit object is the only authority over its own ledger.
@@ -295,7 +299,8 @@ pub(in crate::runtime) struct MemberEffectRequest {
     /// Stable lane name for tracing and typed uncertainty reasons.
     pub(in crate::runtime) context: &'static str,
     /// Fences this work asserts. Every entry is explicit — an absent member
-    /// is `ExpectedAbsent`, never a dropped element.
+    /// is `ExpectedAbsent`, never a dropped element. Each fenced member's
+    /// controls are also deferred while the ticket is owned.
     pub(in crate::runtime) members: Vec<MemberFence>,
     /// Off-actor effects. Must own everything they touch.
     pub(in crate::runtime) effects: MemberEffectFuture,
@@ -313,6 +318,9 @@ pub(in crate::runtime) struct MemberEffectRequest {
 pub(in crate::runtime) struct QueuedMemberEffect {
     ticket: MemberEffectTicket,
     request: MemberEffectRequest,
+    /// Carried unchanged to [`MemberEffectInflight::parked`]; an unstarted
+    /// request parks nothing yet.
+    parked: Vec<AgentIdentity>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -332,7 +340,12 @@ pub(in crate::runtime) struct MemberEffectCompletion {
 
 pub(in crate::runtime) struct MemberEffectInflight {
     context: &'static str,
+    /// Asserted at commit, and deferred while the ticket is owned.
     members: Vec<MemberFence>,
+    /// Deferred while the ticket is owned (in flight or retained), never
+    /// asserted at commit: a parked member's roster change does not make
+    /// this ticket's commit non-current.
+    parked: Vec<AgentIdentity>,
     unsettled_commit: Option<Box<dyn MemberEffectCommit>>,
     /// A task for this exact ticket is live. Orphan proof is per ticket, not
     /// "the JoinSet snapshot looked empty".
@@ -341,6 +354,17 @@ pub(in crate::runtime) struct MemberEffectInflight {
     /// barrier reports its reason, and its retry object is resumed by
     /// `retry_retained_member_effects`.
     retention: Option<MemberEffectRetention>,
+}
+
+impl MemberEffectInflight {
+    /// The members whose lifecycle/membership controls this ticket defers:
+    /// every fenced member, then every parked member.
+    fn deferred_members(&self) -> impl Iterator<Item = &AgentIdentity> {
+        self.members
+            .iter()
+            .map(MemberFence::identity)
+            .chain(&self.parked)
+    }
 }
 
 struct RetainedMemberEffects<'a>(&'a BTreeMap<MemberEffectTicket, MemberEffectInflight>);
@@ -400,10 +424,13 @@ impl MobActor {
             return 0;
         }
         let mut started = 0;
-        while let Some(QueuedMemberEffect { ticket, request }) =
-            self.member_effect_queued.owned().pop_front()
+        while let Some(QueuedMemberEffect {
+            ticket,
+            request,
+            parked,
+        }) = self.member_effect_queued.owned().pop_front()
         {
-            self.start_member_effect(ticket, request);
+            self.start_member_effect(ticket, request, parked);
             started += 1;
         }
         started += self.start_graph_gated_wiring_dispatches();
@@ -414,6 +441,19 @@ impl MobActor {
         &mut self,
         request: MemberEffectRequest,
     ) -> MemberEffectTicket {
+        self.dispatch_member_effect_parking(request, Vec::new())
+    }
+
+    /// [`Self::dispatch_member_effect`] that also defers the
+    /// lifecycle/membership controls of `parked` while the ticket is owned,
+    /// without fencing them: their roster changes never make this effect's
+    /// commit non-current. For a caller whose commit asserts fewer members
+    /// than its controls must stay serialized against.
+    pub(in crate::runtime) fn dispatch_member_effect_parking(
+        &mut self,
+        request: MemberEffectRequest,
+        parked: Vec<AgentIdentity>,
+    ) -> MemberEffectTicket {
         let ticket = self.next_member_effect_ticket();
         if self.member_effect_shutdown || self.member_effect_start_is_gated() {
             // Preserve the owned request; start nothing. Custody stays with
@@ -421,16 +461,21 @@ impl MobActor {
             // the same path answers it through its unsettled commit.
             self.member_effect_queued
                 .owned()
-                .push_back(QueuedMemberEffect { ticket, request });
+                .push_back(QueuedMemberEffect {
+                    ticket,
+                    request,
+                    parked,
+                });
             return ticket;
         }
-        self.start_member_effect(ticket, request)
+        self.start_member_effect(ticket, request, parked)
     }
 
     fn start_member_effect(
         &mut self,
         ticket: MemberEffectTicket,
         request: MemberEffectRequest,
+        parked: Vec<AgentIdentity>,
     ) -> MemberEffectTicket {
         let MemberEffectRequest {
             context,
@@ -443,6 +488,7 @@ impl MobActor {
             MemberEffectInflight {
                 context,
                 members,
+                parked,
                 unsettled_commit: Some(unsettled_commit),
                 running: true,
                 retention: None,
@@ -514,7 +560,8 @@ impl MobActor {
         }
     }
 
-    /// Members with an owned detached effect IN FLIGHT right now.
+    /// Members whose controls an owned detached effect defers right now: the
+    /// fenced and parked members of every ticket in flight or retained.
     ///
     /// Queued-but-unstarted requests are deliberately excluded: they have no
     /// effect to protect, and counting them would fence member controls (and
@@ -526,9 +573,8 @@ impl MobActor {
         self.member_effect_inflight.read(|inflight| {
             inflight.values().any(|inflight| {
                 inflight
-                    .members
-                    .iter()
-                    .any(|fence| fence.identity() == identity)
+                    .deferred_members()
+                    .any(|deferred| deferred == identity)
             })
         })
     }
@@ -650,19 +696,16 @@ impl MobActor {
         self.member_effect_custody_barrier()
     }
 
-    /// Report each member whose effect custody survived teardown.
+    /// Report each member whose effect custody survived teardown: every
+    /// member a retained ticket still defers.
     fn record_retained_member_effect_custody_for_shutdown(&mut self) {
         let retained = self.member_effect_inflight.read(|inflight| {
             inflight
                 .values()
                 .flat_map(|effect| {
-                    effect.members.iter().map(move |fence| {
-                        let identity = match fence {
-                            MemberFence::Exact(fence) => fence.identity.clone(),
-                            MemberFence::ExpectedAbsent(identity) => identity.clone(),
-                        };
-                        (identity, effect.context)
-                    })
+                    effect
+                        .deferred_members()
+                        .map(move |identity| (identity.clone(), effect.context))
                 })
                 .collect::<Vec<_>>()
         });
@@ -906,7 +949,12 @@ impl MobActor {
     /// uncertainty beyond "this never started".
     async fn resolve_queued_member_effects(&mut self, reason: &'static str) {
         let queued = std::mem::take(self.member_effect_queued.owned());
-        for QueuedMemberEffect { ticket, request } in queued {
+        for QueuedMemberEffect {
+            ticket,
+            request,
+            parked,
+        } in queued
+        {
             tracing::warn!(
                 mob_id = %self.definition.id,
                 %ticket,
@@ -940,6 +988,7 @@ impl MobActor {
                     MemberEffectInflight {
                         context: request.context,
                         members: request.members,
+                        parked,
                         unsettled_commit: None,
                         running: false,
                         retention: Some(retention),

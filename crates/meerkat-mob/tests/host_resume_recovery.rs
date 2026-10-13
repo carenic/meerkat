@@ -174,7 +174,7 @@ async fn assert_controlling_restart_republishes_placed_member_peer_id(stopped: b
         Some(spawned_peer_id),
         "the restored placed member must publish its durable peer id"
     );
-    // MobKit-style member_peer_info after restart: the same key, decodable to
+    // Meta-style member_peer_info after restart: the same key, decodable to
     // the same peer id.
     assert_eq!(
         restored.transport_public_key(),

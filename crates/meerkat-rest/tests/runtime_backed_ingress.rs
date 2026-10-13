@@ -135,6 +135,7 @@ async fn runtime_backed_external_events_stay_queued_without_waking_idle_sessions
         store_path.join("config_state.json"),
     ));
     let state = AppState {
+        connector_client_auth_profiles: Vec::new(),
         store_path: store_path.clone(),
         max_tokens: config.agent.resolved_max_tokens_per_turn(),
         rest_host: config.rest.host.clone().into(),

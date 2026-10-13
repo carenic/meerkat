@@ -323,10 +323,49 @@ describe("recursive generated history validation", () => {
         kind: "mcp",
         blocks: [{ type: "mcp", pending_sources: [42] }],
       },
+      ...[
+        { type: "image", media_type: "image/png" },
+        { type: "image", media_type: "image/png", source: "inline" },
+        { type: "image", media_type: "image/png", source: "blob" },
+        { type: "image", media_type: "image/png", source: "uri", uri: "gs://b/i.png" },
+        { type: "video", media_type: "video/mp4", duration_ms: 42 },
+        { type: "video", media_type: "video/mp4", duration_ms: 42, source: "uri" },
+        { type: "video", media_type: "video/mp4", duration_ms: 42, source: "inline" },
+      ].map((media) => ({
+        role: "system_notice",
+        created_at: "now",
+        kind: "generic",
+        blocks: [{ type: "runtime_notice", category: "consent_attempt", content: [media] }],
+      })),
     ];
     for (const message of malformed) {
       assert.throws(() => parseHistoryMessage(message), /Invalid session history response/);
     }
+  });
+
+  it("accepts runtime-notice content media that names its source and payload", () => {
+    const content = [
+      { type: "text", text: "result" },
+      { type: "image", media_type: "image/png", source: "inline", data: "aW1n" },
+      { type: "image", media_type: "image/png", source: "blob", blob_id: "sha256:abc" },
+      {
+        type: "video",
+        media_type: "video/mp4",
+        duration_ms: 42,
+        source: "uri",
+        uri: "gs://bucket/clip.mp4",
+      },
+      { type: "video", media_type: "video/mp4", duration_ms: 42, source: "inline", data: "dmlk" },
+      { type: "structured", data: null },
+    ];
+    const history = parseHistoryMessage({
+      role: "system_notice",
+      created_at: "2026-07-11T12:00:00Z",
+      kind: "generic",
+      blocks: [{ type: "runtime_notice", category: "consent_attempt", content }],
+    });
+    assert.equal(history.messages.length, 1);
+    assert.deepEqual(history.messages[0].raw.blocks[0].content, content);
   });
 
   it("rejects malformed nested assistant blocks and tool results", () => {

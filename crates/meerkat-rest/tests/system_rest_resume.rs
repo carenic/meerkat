@@ -86,6 +86,7 @@ async fn inner_test_rest_resume_metadata() {
     ));
 
     let state_run = AppState {
+        connector_client_auth_profiles: Vec::new(),
         store_path: store_path.clone(),
         max_tokens: config.agent.resolved_max_tokens_per_turn(),
         rest_host: config.rest.host.clone().into(),
@@ -244,6 +245,7 @@ async fn inner_test_rest_resume_metadata() {
     ));
 
     let state_resume = AppState {
+        connector_client_auth_profiles: Vec::new(),
         store_path: store_path.clone(),
         max_tokens: 7,
         rest_host: config.rest.host.clone().into(),

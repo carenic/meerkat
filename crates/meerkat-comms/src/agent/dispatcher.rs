@@ -145,6 +145,7 @@ pub fn comms_tool_defs() -> Vec<Arc<ToolDef>> {
                 provenance: Some(ToolProvenance {
                     kind: ToolSourceKind::Comms,
                     source_id: "comms".into(),
+                    artifact: None,
                 }),
             })
         })
@@ -757,6 +758,7 @@ mod tests {
                 provenance: Some(ToolProvenance {
                     kind: ToolSourceKind::Callback,
                     source_id: "inner-duplicate".into(),
+                    artifact: None,
                 }),
             });
             let detached = meerkat_core::DetachedToolExecutionPolicy::new(
@@ -812,6 +814,7 @@ mod tests {
                 meerkat_core::types::ToolProvenance {
                     kind: meerkat_core::types::ToolSourceKind::Callback,
                     source_id: "secret_lookup".into(),
+                    artifact: None,
                 },
             )]
             .into()

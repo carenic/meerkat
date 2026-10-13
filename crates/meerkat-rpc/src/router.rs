@@ -160,17 +160,21 @@ pub fn compose_rpc_mob_state(
         .metadata()
         .and_then(|metadata| metadata.resolved_paths)
         .map(|paths| PathBuf::from(paths.root));
+    // Both providers hold the runtime weakly, as the detached owner host
+    // below does: the runtime owns this mob state, and the state can outlive
+    // the runtime's slots wherever something else keeps it.
     let llm_provider: Arc<dyn Fn() -> Option<Arc<dyn meerkat_client::LlmClient>> + Send + Sync> =
         Arc::new({
-            let runtime = Arc::clone(runtime);
-            move || runtime.default_llm_client()
+            let runtime = Arc::downgrade(runtime);
+            move || runtime.upgrade()?.default_llm_client()
         });
     let callback_tools_provider: Arc<
         dyn Fn() -> Option<Arc<dyn AgentToolDispatcher>> + Send + Sync,
     > = Arc::new({
-        let runtime = Arc::clone(runtime);
+        let runtime = Arc::downgrade(runtime);
         move || {
             runtime
+                .upgrade()?
                 .callback_tool_dispatcher(vec![])
                 .map(|dispatcher| Arc::new(dispatcher) as Arc<dyn AgentToolDispatcher>)
         }
@@ -298,6 +302,19 @@ impl NotificationSink {
     pub fn noop() -> Self {
         let (tx, _rx) = mpsc::channel(1);
         Self { tx }
+    }
+
+    /// Emit one notification of `method` with `params`, best effort and
+    /// without waiting: a full channel or a closed transport drops it.
+    /// Returns whether the notification was queued on the connection.
+    pub(crate) fn emit_notification<T: Serialize>(&self, method: &str, params: &T) -> bool {
+        match RpcNotification::try_new(method, params) {
+            Ok(notification) => self.tx.try_send(notification).is_ok(),
+            Err(error) => {
+                tracing::warn!(error = %error, method, "dropping notification at outbound RPC admission");
+                false
+            }
+        }
     }
 
     /// Emit an agent event as a JSON-RPC notification.
@@ -1266,6 +1283,10 @@ impl RoutedRpcResponse {
 }
 
 /// Dispatches incoming JSON-RPC requests to the appropriate handler.
+/// The host-only native consent decision method, reachable only through
+/// [`MethodRouter::dispatch_with_consent_event`].
+pub const CONSENT_DECIDE_METHOD: &str = "approval/consent_decide";
+
 #[derive(Clone)]
 pub struct MethodRouter {
     #[cfg(feature = "local-authorization")]
@@ -1426,6 +1447,15 @@ impl MethodRouter {
             .map_err(|()| crate::governed_jsonl::unsupported())?;
         self.governed_connection = Some(connection);
         Ok(self)
+    }
+
+    /// The connection this router serves closed: its governed connection's
+    /// pipe-lifetime facts (the pipe's consent scope) end here.
+    #[cfg(feature = "local-authorization")]
+    pub(crate) fn close_governed_connection(&self) {
+        if let Some(connection) = &self.governed_connection {
+            connection.close();
+        }
     }
 
     fn attach_live_host(&mut self, host: Arc<meerkat_live::LiveAdapterHost>) {
@@ -2066,6 +2096,52 @@ impl MethodRouter {
         }
     }
 
+    /// Dispatch one native consent decision whose human event the embedding
+    /// host's trusted transport adapter authenticated.
+    ///
+    /// This is the only entry to [`CONSENT_DECIDE_METHOD`]: plain dispatch
+    /// has no route for it, so caller JSON, an audit actor string or a
+    /// lifecycle request context can never decide native consent. The
+    /// request names the approval and decision and must equal what the event
+    /// binds; the event alone supplies the approver, its authentication
+    /// scope and the reason. The decision is recorded by this runtime's
+    /// approval service, which must be the service the host gave its
+    /// operation review composition: only the issuing owner holds the
+    /// candidate.
+    pub async fn dispatch_with_consent_event(
+        &self,
+        request: RpcRequest,
+        event: meerkat_core::approval::consent::AuthenticatedConsentEvent,
+    ) -> RpcResponse {
+        let id = request.id.clone();
+        // The same envelope check as plain dispatch, before any handler: an
+        // unsupported JSON-RPC version never reaches consent mutation.
+        if !request.has_supported_version() {
+            return RpcResponse::error(
+                id,
+                error::INVALID_REQUEST,
+                format!(
+                    "Unsupported JSON-RPC version: expected \"{}\", got \"{}\"",
+                    crate::protocol::JSONRPC_VERSION,
+                    request.jsonrpc
+                ),
+            );
+        }
+        if request.method != CONSENT_DECIDE_METHOD {
+            return RpcResponse::error(
+                id,
+                error::METHOD_NOT_FOUND,
+                format!("an authenticated consent event only decides {CONSENT_DECIDE_METHOD}"),
+            );
+        }
+        handlers::approval::handle_consent_decide(
+            id,
+            request.params.as_deref(),
+            self.runtime.clone(),
+            event,
+        )
+    }
+
     /// Dispatch a request to the appropriate handler.
     ///
     /// Returns `None` for notifications (requests without an id) that do not
@@ -2351,22 +2427,22 @@ impl MethodRouter {
             "jobs/unsubscribe" => {
                 routed_arm(|| handlers::jobs::handle_unsubscribe(id, params, &self.runtime)).await
             }
-            "mobkit/jobs/heartbeat" => {
+            "meta/jobs/heartbeat" => {
                 routed_arm(|| handlers::jobs::handle_heartbeat(id, params, &self.runtime)).await
             }
-            "mobkit/jobs/progress" => {
+            "meta/jobs/progress" => {
                 routed_arm(|| handlers::jobs::handle_progress(id, params, &self.runtime)).await
             }
-            "mobkit/jobs/checkpoint" => {
+            "meta/jobs/checkpoint" => {
                 routed_arm(|| handlers::jobs::handle_checkpoint(id, params, &self.runtime)).await
             }
-            "mobkit/jobs/complete" => {
+            "meta/jobs/complete" => {
                 routed_arm(|| handlers::jobs::handle_complete(id, params, &self.runtime)).await
             }
-            "mobkit/jobs/fail" => {
+            "meta/jobs/fail" => {
                 routed_arm(|| handlers::jobs::handle_fail(id, params, &self.runtime)).await
             }
-            "mobkit/jobs/cancel_ack" => {
+            "meta/jobs/cancel_ack" => {
                 routed_arm(|| handlers::jobs::handle_cancel_ack(id, params, &self.runtime)).await
             }
             "schedule/create" => {
@@ -3233,6 +3309,7 @@ impl MethodRouter {
                     provenance: Some(meerkat_core::types::ToolProvenance {
                         kind: meerkat_core::types::ToolSourceKind::Callback,
                         source_id: "callback".into(),
+                        artifact: None,
                     }),
                     ..new_tool.into()
                 };
@@ -5668,7 +5745,8 @@ mod tests {
             10,
             runtime_backed_persistence(store),
             NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
         runtime.set_default_llm_client(Some(Arc::new(MockLlmClient::anthropic())));
         runtime.set_config_runtime(Arc::new(ConfigRuntime::new(
             Arc::clone(&config_store),
@@ -5700,7 +5778,8 @@ mod tests {
             max_sessions,
             runtime_backed_persistence(store),
             NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
         let config_store: Arc<dyn ConfigStore> =
             Arc::new(MemoryConfigStore::new(config, meerkat_models::canonical()));
         runtime.set_default_llm_client(Some(Arc::new(MockLlmClient::anthropic())));
@@ -6279,7 +6358,7 @@ mod tests {
                 meerkat::ExecutionIntentId::from_string("intent-rpc").unwrap(),
                 meerkat::InteractionLineageId::from_string("lineage-rpc").unwrap(),
                 meerkat::ToolIdentity::new("scan", "v1").unwrap(),
-                meerkat::RunnerIdentity::new("mobkit.callback", "v1").unwrap(),
+                meerkat::RunnerIdentity::new("meta.callback", "v1").unwrap(),
                 meerkat::RestartClass::NonResumable,
                 meerkat::CanonicalArgumentsHash::new("sha256:args").unwrap(),
                 meerkat::JobSubmissionKey::new("rpc-job").unwrap(),
@@ -6293,7 +6372,7 @@ mod tests {
                 meerkat::ExecutionIntentId::from_string("intent-other").unwrap(),
                 meerkat::InteractionLineageId::from_string("lineage-other").unwrap(),
                 meerkat::ToolIdentity::new("scan", "v1").unwrap(),
-                meerkat::RunnerIdentity::new("mobkit.callback", "v1").unwrap(),
+                meerkat::RunnerIdentity::new("meta.callback", "v1").unwrap(),
                 meerkat::RestartClass::NonResumable,
                 meerkat::CanonicalArgumentsHash::new("sha256:other").unwrap(),
                 meerkat::JobSubmissionKey::new("rpc-job-other").unwrap(),
@@ -6408,6 +6487,478 @@ mod tests {
         assert_eq!(fetched["status"], "approved");
     }
 
+    async fn pending_runtime_approval(router: &MethodRouter) -> String {
+        let created = router
+            .dispatch(make_request(
+                "approval/request",
+                serde_json::json!({
+                    "requester": "human:alice",
+                    "owner": {"owner_type": "runtime"},
+                    "resource": {"kind": "runtime", "id": "local"},
+                    "proposed_action": {"kind": "other", "summary": "manual gate"},
+                    "risk": "medium",
+                    "allowed_decisions": ["approve", "deny"]
+                }),
+            ))
+            .await
+            .expect("request response");
+        result_value(&created)["approval_id"]
+            .as_str()
+            .expect("approval id")
+            .to_string()
+    }
+
+    async fn approval_status(router: &MethodRouter, approval_id: &str) -> serde_json::Value {
+        let fetched = router
+            .dispatch(make_request(
+                "approval/get",
+                serde_json::json!({"approval_id": approval_id}),
+            ))
+            .await
+            .expect("get response");
+        result_value(&fetched)["status"].clone()
+    }
+
+    /// An event the host adapter authenticated: the human, its login and
+    /// the exact approval and decision it made.
+    fn consent_event(
+        approval_id: &str,
+        decision: meerkat_core::ApprovalDecision,
+    ) -> meerkat_core::approval::consent::AuthenticatedConsentEvent {
+        use meerkat_core::approval::consent::{
+            AuthenticatedApprover, AuthenticatedConsentDecision, AuthenticatedConsentEvent,
+            HostAuthenticationScope,
+        };
+        let approver = AuthenticatedApprover::new(
+            meerkat_core::PrincipalRef::in_domain(
+                meerkat_core::PrincipalKind::Human,
+                "lead-1",
+                meerkat_core::TrustDomainId::new("team").expect("domain"),
+            )
+            .expect("principal"),
+            meerkat_core::ApprovalAssurance::PersonAuthenticated,
+        )
+        .expect("qualified approver")
+        .with_authentication_scope(HostAuthenticationScope::new("login-1"));
+        AuthenticatedConsentEvent::new(
+            approval_id.parse().expect("approval id"),
+            AuthenticatedConsentDecision {
+                approver,
+                decision,
+                reason: None,
+            },
+        )
+    }
+
+    /// Plain dispatch has no route to the consent decision method: caller
+    /// JSON cannot decide native consent, and nothing changes.
+    #[tokio::test]
+    async fn plain_dispatch_cannot_decide_native_consent() {
+        let (router, _rx) = test_router().await;
+        let approval_id = pending_runtime_approval(&router).await;
+        let refused = router
+            .dispatch(make_request(
+                CONSENT_DECIDE_METHOD,
+                serde_json::json!({"approval_id": approval_id, "decision": "approve"}),
+            ))
+            .await
+            .expect("consent decide response");
+        assert_eq!(
+            refused.error.as_ref().map(|error| error.code),
+            Some(error::METHOD_NOT_FOUND)
+        );
+        assert!(refused.result.is_none());
+        assert_eq!(approval_status(&router, &approval_id).await, "pending");
+    }
+
+    /// An authenticated event decides only the request it binds: another
+    /// decision, another approval or another method is refused before the
+    /// approval owner is asked, and nothing changes.
+    #[tokio::test]
+    async fn a_consent_event_decides_only_the_request_it_binds() {
+        let (router, _rx) = test_router().await;
+        let approval_id = pending_runtime_approval(&router).await;
+        let other_id = pending_runtime_approval(&router).await;
+        let approve = || consent_event(&approval_id, meerkat_core::ApprovalDecision::Approve);
+        for (method, params, code) in [
+            (
+                CONSENT_DECIDE_METHOD,
+                serde_json::json!({"approval_id": approval_id, "decision": "deny"}),
+                error::INVALID_PARAMS,
+            ),
+            (
+                CONSENT_DECIDE_METHOD,
+                serde_json::json!({"approval_id": other_id, "decision": "approve"}),
+                error::INVALID_PARAMS,
+            ),
+            (
+                "approval/decide",
+                serde_json::json!({"approval_id": approval_id, "decision": "approve"}),
+                error::METHOD_NOT_FOUND,
+            ),
+        ] {
+            let refused = router
+                .dispatch_with_consent_event(make_request(method, params.clone()), approve())
+                .await;
+            assert_eq!(
+                refused.error.as_ref().map(|error| error.code),
+                Some(code),
+                "{method} {params}"
+            );
+        }
+        let mut wrong_version = make_request(
+            CONSENT_DECIDE_METHOD,
+            serde_json::json!({"approval_id": approval_id, "decision": "approve"}),
+        );
+        wrong_version.jsonrpc = "1.0".to_string();
+        let refused = router
+            .dispatch_with_consent_event(wrong_version, approve())
+            .await;
+        assert_eq!(
+            refused.error.as_ref().map(|error| error.code),
+            Some(error::INVALID_REQUEST),
+            "an unsupported envelope version is refused before the handler"
+        );
+        assert_eq!(approval_status(&router, &approval_id).await, "pending");
+        assert_eq!(approval_status(&router, &other_id).await, "pending");
+    }
+
+    /// Request parameters never carry authority, even beside an
+    /// authenticated event: an approver, actor, assurance, login or reason
+    /// field is an invalid parameter, not an identity.
+    #[tokio::test]
+    async fn consent_decide_params_cannot_carry_authority() {
+        let (router, _rx) = test_router().await;
+        let approval_id = pending_runtime_approval(&router).await;
+        for smuggled in [
+            serde_json::json!({"actor": "human:bob"}),
+            serde_json::json!({"approver": {"principal": "human:bob", "assurance": "person_authenticated"}}),
+            serde_json::json!({"assurance": "person_authenticated"}),
+            serde_json::json!({"authentication_scope": "login-2"}),
+            serde_json::json!({"reason": "approved by bob"}),
+        ] {
+            let mut params = serde_json::json!({"approval_id": approval_id, "decision": "approve"});
+            for (key, value) in smuggled.as_object().expect("object") {
+                params[key] = value.clone();
+            }
+            let refused = router
+                .dispatch_with_consent_event(
+                    make_request(CONSENT_DECIDE_METHOD, params),
+                    consent_event(&approval_id, meerkat_core::ApprovalDecision::Approve),
+                )
+                .await;
+            assert_eq!(
+                refused.error.as_ref().map(|error| error.code),
+                Some(error::INVALID_PARAMS),
+                "{smuggled}"
+            );
+        }
+        assert_eq!(approval_status(&router, &approval_id).await, "pending");
+    }
+
+    /// A matching event reaches the runtime's approval owner, which decides
+    /// only consent it issued and holds: an ordinary approval has no consent
+    /// candidate, so the owner refuses and the approval stays pending. A
+    /// native R3 candidate retained by that same approval service is
+    /// approved by the event, which executes nothing; one explicit retained
+    /// attempt then enters exactly once, and a reuse or a second decision is
+    /// refused without entering.
+    ///
+    /// Its scope is the router's composition with the approval owner. The
+    /// candidate is dispatched under the default `ToolDispatchContext`,
+    /// which carries no session or run identity, and its work and approver
+    /// eligibility are trusted fixtures; the event is built here, as an
+    /// authenticated host would supply it. It is not a runtime-admitted run,
+    /// a stock authorization-policy test or a host-authentication test.
+    #[tokio::test]
+    async fn a_matching_consent_event_reaches_the_approval_owner() {
+        let (router, _rx) = test_router().await;
+        let approval_id = pending_runtime_approval(&router).await;
+        let refused = router
+            .dispatch_with_consent_event(
+                make_request(
+                    CONSENT_DECIDE_METHOD,
+                    serde_json::json!({"approval_id": approval_id, "decision": "approve"}),
+                ),
+                consent_event(&approval_id, meerkat_core::ApprovalDecision::Approve),
+            )
+            .await;
+        let error = refused.error.as_ref().expect("refused by the owner");
+        assert_eq!(error.code, error::INVALID_PARAMS);
+        assert!(error.message.contains("consent"), "{}", error.message);
+        assert_eq!(approval_status(&router, &approval_id).await, "pending");
+
+        // The positive native route, on the router's own approval service,
+        // with trusted fixture work and eligibility and no session or run.
+        let route = Arc::new(TeamConsentRoute::default());
+        let review = Arc::new(
+            meerkat_core::approval::review::BoundOperationReview::new(
+                Arc::new(NoModelReview),
+                router.runtime.approval_service(),
+                Duration::from_secs(30),
+            )
+            .with_human_consent(route.clone(), Duration::from_secs(4 * 60 * 60)),
+        );
+        let context = meerkat_core::ToolDispatchContext::default()
+            .with_work_authorization(Some(meerkat_core::WorkAuthorizationContext::new(
+                Arc::new(ConsentRequiredWork),
+                meerkat_core::OperationExecutionScope::Domain,
+            )))
+            .with_operation_review(Some(review));
+        let effect = Arc::new(ConsentedRecordWrite::default());
+        let args = RawValue::from_string(r#"{"namespace":"private"}"#.to_string()).expect("args");
+        let call = ToolCallView {
+            id: "call-r3",
+            name: "write_record",
+            args: &args,
+        };
+        let plan = meerkat_core::resolve_tool_execution_plan_fenced(
+            &effect,
+            call,
+            &context,
+            &meerkat_core::ToolExecutionResolutionContext::new(
+                meerkat_core::ToolDeadlineChain::new(vec![
+                    meerkat_core::ToolDeadlineContributor::finite(
+                        meerkat_core::ToolDeadlineOwner::DirectCaller,
+                        Duration::from_secs(600),
+                    ),
+                ])
+                .expect("finite caller deadline"),
+            ),
+        )
+        .expect("plan");
+        let settled =
+            meerkat_core::dispatch_tool_execution_plan_fenced(&effect, call, &context, &plan).await;
+        let consent_id = route.requested();
+        assert_eq!(
+            settled.err(),
+            Some(ToolError::ReviewUnsatisfied {
+                kind: meerkat_core::ReviewUnsatisfiedKind::HumanConsentRequired,
+                approval_id: Some(consent_id.clone()),
+            }),
+            "the R3 call settles locally with its one consent approval"
+        );
+        assert_eq!(
+            approval_status(&router, &consent_id.to_string()).await,
+            "pending"
+        );
+        assert_eq!(effect.entered(), 0);
+
+        let decide = || {
+            router.dispatch_with_consent_event(
+                make_request(
+                    CONSENT_DECIDE_METHOD,
+                    serde_json::json!({"approval_id": consent_id.to_string(), "decision": "approve"}),
+                ),
+                consent_event(
+                    &consent_id.to_string(),
+                    meerkat_core::ApprovalDecision::Approve,
+                ),
+            )
+        };
+        let decided = decide().await;
+        assert!(decided.error.is_none(), "{:?}", decided.error);
+        assert_eq!(result_value(&decided)["status"], "approved");
+        assert_eq!(effect.entered(), 0, "the decision itself executes nothing");
+
+        meerkat_core::dispatch_retained_consent_attempt(&effect, &context, &consent_id)
+            .await
+            .expect("the explicit retained attempt enters");
+        assert_eq!(effect.entered(), 1, "exactly once");
+        assert!(
+            meerkat_core::dispatch_retained_consent_attempt(&effect, &context, &consent_id)
+                .await
+                .is_err(),
+            "a reuse of the spent consent is refused"
+        );
+        assert!(
+            decide().await.error.is_some(),
+            "the decided approval cannot be decided again"
+        );
+        assert_eq!(effect.entered(), 1, "and neither enters");
+    }
+
+    /// R3 work for one tool: each prepared decision requires human consent,
+    /// stays current, and names no review material.
+    struct ConsentRequiredWork;
+
+    struct ConsentRequiredDecision;
+
+    impl meerkat_core::authorization::PreparedOperationAuthorization for ConsentRequiredDecision {
+        fn review_tier(&self) -> meerkat_core::authorization::OperationReviewTier {
+            meerkat_core::authorization::OperationReviewTier::R3
+        }
+
+        fn check_current(
+            &self,
+            _binding: &meerkat_core::authorization::PreparedAuthorizationBinding,
+        ) -> Result<(), meerkat_core::OperationAuthorizationError> {
+            Ok(())
+        }
+    }
+
+    impl meerkat_core::authorization::WorkAuthorization for ConsentRequiredWork {
+        fn prepare(
+            &self,
+            _binding: &meerkat_core::authorization::PreparedAuthorizationBinding,
+        ) -> Result<
+            Arc<dyn meerkat_core::authorization::PreparedOperationAuthorization>,
+            meerkat_core::OperationAuthorizationError,
+        > {
+            Ok(Arc::new(ConsentRequiredDecision))
+        }
+
+        fn review_operation_context(
+            &self,
+            _binding: &meerkat_core::authorization::PreparedAuthorizationBinding,
+        ) -> Result<
+            meerkat_core::authorization::ReviewOperationContextResolution,
+            meerkat_core::OperationAuthorizationError,
+        > {
+            Ok(meerkat_core::authorization::ReviewOperationContextResolution::NotApplicable)
+        }
+    }
+
+    /// R3 is never model-reviewed.
+    struct NoModelReview;
+
+    #[async_trait]
+    impl meerkat_core::approval::review::OperationReviewer for NoModelReview {
+        async fn review(
+            &self,
+            _candidate: &meerkat_core::approval::review::ReviewCandidate<'_>,
+        ) -> Result<
+            meerkat_core::approval::review::ReviewVerdict,
+            meerkat_core::approval::review::ReviewerFailure,
+        > {
+            Err(meerkat_core::approval::review::ReviewerFailure::Unavailable)
+        }
+    }
+
+    /// The host's human route: its eligibility owner publishes every change
+    /// through one local authorization publication and lets `lead-1`
+    /// decide; its notices tell the host which approval was requested.
+    struct TeamConsentRoute {
+        publication: meerkat_authorization::publication::LocalAuthorizationPublication,
+        eligible: Vec<String>,
+        notices: StdMutex<
+            Vec<(
+                meerkat_core::ApprovalId,
+                meerkat_core::approval::consent::ConsentNoticeKind,
+            )>,
+        >,
+    }
+
+    impl Default for TeamConsentRoute {
+        fn default() -> Self {
+            Self {
+                publication: meerkat_authorization::publication::LocalAuthorizationPublication::new(
+                ),
+                eligible: vec!["lead-1".to_string()],
+                notices: StdMutex::default(),
+            }
+        }
+    }
+
+    impl TeamConsentRoute {
+        /// The approval the last notice requested.
+        fn requested(&self) -> meerkat_core::ApprovalId {
+            let notices = self.notices.lock().expect("notices");
+            let (approval_id, kind) = notices.last().cloned().expect("a requested notice");
+            assert_eq!(
+                kind,
+                meerkat_core::approval::consent::ConsentNoticeKind::Requested
+            );
+            approval_id
+        }
+    }
+
+    impl meerkat_core::approval::consent::HumanConsentRoute for TeamConsentRoute {
+        fn present(
+            &self,
+            _candidate: &meerkat_core::approval::consent::ConsentPresentationCandidate<'_>,
+        ) -> Result<
+            meerkat_core::approval::consent::ConsentPresentation,
+            meerkat_core::approval::consent::ConsentRouteUnavailable,
+        > {
+            Ok(meerkat_core::approval::consent::ConsentPresentation {
+                requester: meerkat_core::ApprovalPrincipalId::new("human:child")
+                    .expect("principal"),
+                risk: meerkat_core::ApprovalRisk::High,
+                metadata: meerkat_core::SurfaceMetadata::default(),
+            })
+        }
+
+        fn eligibility(
+            &self,
+            approver: &meerkat_core::approval::consent::AuthenticatedApprover,
+            _approval: &meerkat_core::ApprovalRecord,
+        ) -> Result<
+            Arc<dyn meerkat_core::approval::consent::ConsentEligibility>,
+            meerkat_core::approval::consent::ConsentIneligible,
+        > {
+            let approver = approver.principal().id.as_str();
+            meerkat_authorization::publication::PublishedConsentEligibility::observe(
+                &self.publication,
+                || self.eligible.iter().any(|eligible| eligible == approver),
+            )
+        }
+
+        fn notice(&self, notice: meerkat_core::approval::consent::ConsentNotice) {
+            self.notices
+                .lock()
+                .expect("notices")
+                .push((notice.approval_id, notice.kind));
+        }
+    }
+
+    /// The consented effect: spends the retained review once at its entry,
+    /// immediately before its counted body.
+    #[derive(Default)]
+    struct ConsentedRecordWrite {
+        entered: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ConsentedRecordWrite {
+        fn entered(&self) -> usize {
+            self.entered.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl meerkat_core::AgentToolDispatcher for ConsentedRecordWrite {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            Arc::from([Arc::new(ToolDef::new(
+                "write_record",
+                "fixture record write",
+                serde_json::json!({"type": "object"}),
+            ))])
+        }
+
+        fn review_entry_support(
+            &self,
+            _tool_name: &str,
+        ) -> meerkat_core::approval::review::ReviewEntrySupport {
+            meerkat_core::approval::review::ReviewEntrySupport::ConsumesAtEntry
+        }
+
+        async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
+            self.dispatch_with_context(call, &meerkat_core::ToolDispatchContext::default())
+                .await
+        }
+
+        async fn dispatch_with_context(
+            &self,
+            call: ToolCallView<'_>,
+            context: &meerkat_core::ToolDispatchContext,
+        ) -> Result<ToolDispatchOutcome, ToolError> {
+            let _entered = context.enter_reviewed_effect(call, None)?;
+            self.entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(meerkat_core::ToolResult::new(call.id.into(), "written".into(), false).into())
+        }
+    }
+
     #[tokio::test]
     async fn approval_decide_rejects_duplicate_decisions() {
         let (router, _rx) = test_router().await;
@@ -6499,7 +7050,8 @@ mod tests {
             10,
             runtime_backed_persistence(store),
             NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
         let config_store: Arc<dyn ConfigStore> =
             Arc::new(MemoryConfigStore::new(config, meerkat_models::canonical()));
         runtime.set_default_llm_client(Some(llm_client));
@@ -6537,7 +7089,8 @@ mod tests {
             10,
             runtime_backed_persistence(store),
             NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
         let config_store: Arc<dyn ConfigStore> =
             Arc::new(MemoryConfigStore::new(config, meerkat_models::canonical()));
         runtime.set_default_llm_client(Some(llm_client));
@@ -6579,7 +7132,8 @@ mod tests {
             10,
             persistence,
             NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
         let config_store: Arc<dyn ConfigStore> =
             Arc::new(MemoryConfigStore::new(config, meerkat_models::canonical()));
         runtime.set_default_llm_client(Some(Arc::new(MockLlmClient::anthropic())));
@@ -6634,7 +7188,8 @@ mod tests {
             10,
             runtime_backed_persistence(store),
             NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
         assert_eq!(
             runtime.workgraph_store().kind(),
             meerkat::WorkGraphStoreKind::Disabled
@@ -6687,7 +7242,8 @@ mod tests {
             10,
             runtime_backed_persistence(store),
             NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
         let config_store: Arc<dyn ConfigStore> =
             Arc::new(MemoryConfigStore::new(config, meerkat_models::canonical()));
         runtime.set_default_llm_client(Some(Arc::new(MockLlmClient::anthropic())));
@@ -6841,7 +7397,8 @@ mod tests {
             10,
             runtime_backed_persistence(store),
             NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
         let config_store: Arc<dyn ConfigStore> =
             Arc::new(MemoryConfigStore::new(config, meerkat_models::canonical()));
         runtime.set_default_llm_client(Some(Arc::new(MockLlmClient::anthropic())));
@@ -9988,8 +10545,10 @@ mod tests {
     #[cfg(feature = "mob")]
     #[tokio::test]
     async fn mob_send_route_is_unavailable_while_archive_retirement_is_in_flight() {
+        // The injected archive delay runs after the member turns retiring; it
+        // keeps that window observable under load.
         let (router, _notif_rx) = test_router_with_mob_state(
-            meerkat_mob_mcp::MobMcpState::new_in_memory_with_archive_delay(250),
+            meerkat_mob_mcp::MobMcpState::new_in_memory_with_archive_delay(2_000),
         )
         .await;
 
@@ -10045,17 +10604,43 @@ mod tests {
             })
         };
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let members_resp = router
-            .dispatch(make_request(
-                "mob/members",
-                serde_json::json!({ "mob_id": &mob_id }),
-            ))
-            .await
-            .unwrap();
-        let members_value = result_value(&members_resp);
-        let members = members_value["members"].as_array().expect("members array");
+        // The archive's read-only owner checks and roster scan precede the
+        // retire transition, so wait for the published retiring state rather
+        // than a fixed delay; the archive must still be in flight then.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let members = loop {
+            assert!(
+                !archive.is_finished(),
+                "archive completed before retirement was observed: {:?}",
+                archive.await
+            );
+            let members_resp = router
+                .dispatch(make_request(
+                    "mob/members",
+                    serde_json::json!({ "mob_id": &mob_id }),
+                ))
+                .await
+                .unwrap();
+            let members = result_value(&members_resp)["members"]
+                .as_array()
+                .expect("members array")
+                .clone();
+            if members
+                .first()
+                .is_some_and(|member| member["status"] == "retiring")
+            {
+                break members;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "retirement was not observed within 10 s: {members:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        assert!(
+            !archive.is_finished(),
+            "archive must still be in flight when retirement is observed"
+        );
         assert_eq!(members.len(), 1, "retiring member should remain observable");
         assert_eq!(members[0]["agent_identity"], "lead-1");
         assert_eq!(members[0]["status"], "retiring");
@@ -14166,6 +14751,8 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
             // advertises a method it cannot dispatch and the live-webrtc
             // lane (with state wired above) covers it.
             live_webrtc_enabled: cfg!(feature = "live-webrtc"),
+            // The plain router never emits consent notices.
+            consent_enabled: false,
         };
         let mut id = 0_i64;
         for method in meerkat_contracts::rpc_method_names(options) {

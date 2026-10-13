@@ -186,7 +186,7 @@ temporary `MobDefinition`, derives stable branch identities, and starts the
 council. How the sealed result reaches the caller depends on the host:
 
 - **Detached (hosts that outlive the call).** A host with a runtime adapter
-  (the JSON-RPC, REST, and MCP servers, MobKit), `rkat run --keep-alive`, and
+  (the JSON-RPC, REST, and MCP servers, Meta), `rkat run --keep-alive`, and
   `rkat mob deploy --surface rpc` can deliver a completion after the call
   returns, provided the convener can be made live again to receive it: it is
   a mob member, or the host installs a `DetachedOwnerHost` (the JSON-RPC host

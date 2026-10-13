@@ -202,7 +202,7 @@ need the unbounded verification set.
 
 Pull-request CI is `.github/workflows/ci.yml`. It runs on pull requests,
 pushes to `main` and to `release/**` integration branches, and manual
-dispatches (any other branch head runs once, through its pull request), entirely with Cargo on GitHub-hosted `ubuntu-latest` runners
+dispatches (any other branch head runs once, through its pull request), entirely with Cargo on GitHub-hosted `ubuntu-24.04` runners
 (4 vCPU), and it is sized to a 25-minute lane execution budget. Compiled
 objects are cached by sccache (content-addressed, shared by every lane and
 readable from `main` by every pull request); rust-cache holds only the
@@ -220,7 +220,7 @@ the exact-tree attestation; nightly and the release tag carry the rest):
 | `fmt-governance`: fmt, docs, semver self-test, version parity, lock consistency, release config, lane and path classifier self-tests, ripgrep tombstone scans (legacy surface, session-control routes, deprecated backend) | yes | yes | - | - |
 | `ratchets`: schema/SDK/RPC/REST freshness when contract paths changed; machine and protocol drift when machine authority changed; machine poster coverage and freshness when machine authority or a poster input (`scripts/machine-posters-changed`) changed | yes | yes | - | - |
 | `clippy` per shard of every changed package: `--no-deps --all-targets --all-features -D warnings` | yes | yes | whole workspace (`make lint`) | Bazel clippy lanes |
-| `unit` per shard: `nextest --lib --bins --profile ci-pr` for changed packages outside the meerkat-mob compile chain | yes | - | `make test-unit` | Bazel unit lanes |
+| `unit` per shard: `nextest --lib --bins --profile ci-pr` for changed packages outside the meerkat-mob compile chain, plus meerkat-rpc's default-feature row (its MCP restart controls) when meerkat-rpc or one of its trigger packages changed (`PR_UNIT_CHAIN_EXCEPTIONS` in `scripts/ci-cargo-lanes.mjs`) | yes | - | `make test-unit` | Bazel unit lanes |
 | `main-unit` per shard: `nextest --lib --bins` over the whole workspace, including the meerkat-mob chain (mob, mob-adaptive, mob-mcp, mob-pack, rpc, rest, mcp-server, rkat, web-runtime, integration-tests, machine-codegen: the crates whose unit-lane build graph contains mob) | deferred | yes | `make test-unit` | Bazel unit lanes |
 | `integration` per suite: `nextest -p <package> --test '*'` (the crate's `tests/*.rs` binaries) for each `INTEGRATION_SUITES` entry in `scripts/ci-cargo-lanes.mjs` whose trigger packages changed: `meerkat-runtime` (machine schema/DSL/kernel crates, runtime) `meerkat-machine-codegen` (the same plus `meerkat-mob` and codegen), and `xtask` with `machine-authority` (xtask, or any `.github/workflows/` edit, since its tests pin the workflows) | when triggered | when triggered | `make test-int` | Bazel integration lanes |
 | `closure-check`: `cargo check --all-features` (lib and bin targets) over the reverse-dependency closure | yes | yes | - | - |
@@ -273,8 +273,9 @@ every unit lane that ever exceeded the budget compiled `meerkat-mob`'s 442k
 lines, either as its own lane (16 min compile plus 4.5 min of tests) or as a
 dependent crate rebuilding mob under its own feature unification (rkat, rpc:
 17 min). The chain is computed from cargo metadata, and the classifier's cost
-model (`1 + (lines + 8000 x dependency closure) / 35000` minutes, 16-minute
-ceiling per pull-request unit lane) is asserted by the self-test for every
+model (`1 + (lines + 8000 x dependency closure) / 35000` minutes, with a
+17-minute surrogate packing cap per pull-request unit lane; the cap is a
+model threshold, not a measured timing) is asserted by the self-test for every
 other crate. Clippy of a changed mob-chain crate still runs in the pull
 request (12 min measured for mob itself). A red `push: main` run shows as a
 failed `CI gate` check on the main commit and blocks the release gate
@@ -400,7 +401,7 @@ demand (`.github/workflows/nightly.yml`) on GitHub-hosted runners:
 - clippy across all targets and all features for the whole workspace
 - feature-matrix lint and tests, minimal-feature and surface-modularity tests
 - `e2e-system`, the full Web SDK and WASM browser contract suites, release
-  packaging dry-runs, the security audit, and the MobKit docs mirror lag
+  packaging dry-runs, the security audit, and the Meta docs mirror lag
 - the whole BuildBuddy/Bazel graph (`buildbuddy.yml` in `full-fresh` mode):
   prebuild, fmt/static, the native nextest lanes, governance
   (seam-inventory, rmat-audit, machine authority), SDK suites, wasm-check,

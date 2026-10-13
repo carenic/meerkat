@@ -158,6 +158,19 @@ pub(crate) enum InteractionTerminalCandidate {
     },
 }
 
+impl InteractionTerminalCandidate {
+    /// Whether this candidate carries a result payload (a run result or
+    /// callback arguments).
+    pub(crate) fn carries_result_payload(&self) -> bool {
+        matches!(
+            self,
+            Self::RunResult { .. }
+                | Self::CallbackPending { .. }
+                | Self::CallbackBatchPending { .. }
+        )
+    }
+}
+
 /// Exact generated-machine facts recoverable from one validated durable
 /// terminal candidate. This is deliberately closed: ordinary completion
 /// candidates carry no terminal facts, cancellation carries only its outcome,
@@ -1240,6 +1253,55 @@ impl PublishedDirectedTerminalBinding {
 }
 
 impl StoredInputState {
+    /// Whether this row carries its run's result payload (a result or
+    /// callback arguments) in its terminal completion or directed outbox.
+    pub(crate) fn carries_result_payload(&self) -> bool {
+        let completion = self.state.terminal_completion.as_ref();
+        completion
+            .and_then(|completion| completion.outcome.as_ref())
+            .is_some_and(crate::completion::CompletionOutcome::carries_result_payload)
+            || completion
+                .and_then(|completion| completion.candidate.as_ref())
+                .is_some_and(InteractionTerminalCandidate::carries_result_payload)
+            || self
+                .state
+                .interaction_terminal_outbox
+                .as_ref()
+                .and_then(|outbox| outbox.released_0831_candidate.as_ref())
+                .is_some_and(InteractionTerminalCandidate::carries_result_payload)
+    }
+
+    /// Drop the result payload from a copy released to a public reader that
+    /// may not receive it. Every body-free lifecycle fact stays: phase,
+    /// terminal, receipt identity and digests, history and the destination
+    /// witness. Never applied to a row that is stored or compared.
+    pub(crate) fn withhold_result_payload(&mut self) {
+        if let Some(completion) = self.state.terminal_completion.as_mut() {
+            if completion
+                .outcome
+                .as_ref()
+                .is_some_and(crate::completion::CompletionOutcome::carries_result_payload)
+            {
+                completion.outcome = None;
+            }
+            if completion
+                .candidate
+                .as_ref()
+                .is_some_and(InteractionTerminalCandidate::carries_result_payload)
+            {
+                completion.candidate = None;
+            }
+        }
+        if let Some(outbox) = self.state.interaction_terminal_outbox.as_mut()
+            && outbox
+                .released_0831_candidate
+                .as_ref()
+                .is_some_and(InteractionTerminalCandidate::carries_result_payload)
+        {
+            outbox.released_0831_candidate = None;
+        }
+    }
+
     /// A freshly accepted row for `input` carrying the replay witnesses its
     /// native admission records (idempotency key, exact prompt and event
     /// identities, retained authority), for host test doubles that stand in
@@ -1861,6 +1923,36 @@ impl ExternalEventReplayIdentity {
     }
 }
 
+/// The scoped destination an input was admitted under: the original
+/// destination witness its row keeps for result disclosure. It is not an
+/// authority and grants nothing; it only names what the input was admitted
+/// for.
+///
+/// `Unrecorded` (the serde default) is a row written before admissions
+/// recorded this, or by a path that does not: it never means the input was
+/// unscoped.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScopedDestinationWitness {
+    #[default]
+    Unrecorded,
+    /// Admitted while the session document had never served a scoped
+    /// destination.
+    NeverScoped,
+    /// Admitted under the exact destination binding (an opaque digest of the
+    /// canonical target).
+    Bound { binding: String },
+    /// Admitted without a destination on a session document that serves (or
+    /// requires) one.
+    Unbound,
+}
+
+impl ScopedDestinationWitness {
+    pub fn is_unrecorded(&self) -> bool {
+        matches!(self, Self::Unrecorded)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct InputState {
     /// Actual selected client custody. Never encoded by StoredInputState; a
@@ -1905,6 +1997,10 @@ pub struct InputState {
     /// Exact directed-terminal retry carrier, when this input came from the
     /// tracked cross-host flow lane.
     pub(crate) interaction_terminal_outbox: Option<InteractionTerminalOutbox>,
+    /// The scoped destination this input was admitted under, as the machine
+    /// recorded it. Decides disclosure of its result to later readers; never
+    /// an authority.
+    pub scoped_destination: ScopedDestinationWitness,
     /// Original ingress material retained only while crash redelivery,
     /// durable-tail attribution, or directed-terminal materialization may
     /// still need it. Authoritative terminal commits retire this payload
@@ -1940,6 +2036,7 @@ impl InputState {
             terminal_completion: None,
             terminal_completion_unavailable: false,
             interaction_terminal_outbox: None,
+            scoped_destination: ScopedDestinationWitness::Unrecorded,
             persisted_input: None,
             created_at: now,
         }
@@ -2014,6 +2111,11 @@ struct InputStateSerde {
     terminal_completion_unavailable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     interaction_terminal_outbox: Option<InteractionTerminalOutbox>,
+    #[serde(
+        default,
+        skip_serializing_if = "ScopedDestinationWitness::is_unrecorded"
+    )]
+    scoped_destination: ScopedDestinationWitness,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     persisted_input: Option<Input>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2064,6 +2166,7 @@ impl Serialize for StoredInputState {
             terminal_completion: self.state.terminal_completion.clone(),
             terminal_completion_unavailable: self.state.terminal_completion_unavailable,
             interaction_terminal_outbox: self.state.interaction_terminal_outbox.clone(),
+            scoped_destination: self.state.scoped_destination.clone(),
             persisted_input: self.state.persisted_input.clone(),
             last_run_id: self.seed.last_run_id.clone(),
             last_boundary_sequence: self.seed.last_boundary_sequence,
@@ -2100,6 +2203,13 @@ impl<'de> Deserialize<'de> for StoredInputState {
         {
             return Err(<D::Error as serde::de::Error>::custom(
                 "stored input state before v5 cannot carry compact directed attribution",
+            ));
+        }
+        if observed_stored_input_state_version < 6
+            && helper.authorization_audit.has_mandatory_hook_withholding()
+        {
+            return Err(<D::Error as serde::de::Error>::custom(
+                "stored input state before v6 cannot carry a mandatory hook withholding record",
             ));
         }
         if observed_stored_input_state_version == 3 && helper.interaction_terminal_outbox.is_some()
@@ -2186,6 +2296,7 @@ impl<'de> Deserialize<'de> for StoredInputState {
             terminal_completion: helper.terminal_completion,
             terminal_completion_unavailable,
             interaction_terminal_outbox: helper.interaction_terminal_outbox,
+            scoped_destination: helper.scoped_destination,
             persisted_input: helper.persisted_input,
             created_at: helper.created_at,
         };
@@ -3036,11 +3147,11 @@ mod tests {
     fn stored_input_state_unknown_versions_still_fail_closed() {
         let mut fixture =
             serde_json::to_value(StoredInputState::new_accepted(InputId::new())).unwrap();
-        for rejected in [2, 6] {
+        for rejected in [2, 7] {
             fixture["stored_input_state_version"] = serde_json::json!(rejected);
             let error = serde_json::from_value::<StoredInputState>(fixture.clone())
                 .expect_err("unknown historical and future versions must fail closed");
-            assert!(error.to_string().contains("expected current 5"));
+            assert!(error.to_string().contains("expected current 6"));
         }
 
         // 0.8.10 accepted still-retained v3 input rows lazily, so a supported

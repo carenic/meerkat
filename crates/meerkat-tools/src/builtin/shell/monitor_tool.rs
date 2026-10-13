@@ -248,6 +248,7 @@ impl BuiltinTool for MonitorStartTool {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Shell,
                 source_id: "monitor_start".into(),
+                artifact: None,
             }),
         }
     }

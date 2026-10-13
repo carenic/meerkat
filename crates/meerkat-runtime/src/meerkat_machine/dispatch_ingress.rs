@@ -250,24 +250,37 @@ impl MeerkatMachine {
         input_id: &InputId,
         reason: String,
     ) -> Result<(), RuntimeDriverError> {
+        let mut runless_terminal = self.runless_terminal_announcement();
         let candidate_owner_input_id = self
             .commit_failed_accepted_input_terminal(driver, input_id, &reason)
             .await?;
+        runless_terminal.owe();
         let dispatch = match (
             candidate_owner_input_id.as_ref(),
             publication_handle.clone(),
         ) {
             (Some(_), Some(publication_handle)) => {
-                Some(self.prepare_runless_terminal_publication_dispatch(
+                match self.prepare_runless_terminal_publication_dispatch(
                     driver,
                     completions,
                     mutation_gate,
                     publication_handle,
-                )?)
+                ) {
+                    Ok(dispatch) => Some(dispatch),
+                    Err(error) => {
+                        // The abandoned input is told after M is released.
+                        drop(held_mutation_gate);
+                        return Err(error);
+                    }
+                }
             }
             _ => None,
         };
         drop(held_mutation_gate);
+        // The abandoned input's terminal is durable and M is released: tell
+        // the host before publication, whose failure leaves it terminal all
+        // the same.
+        runless_terminal.release();
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         let result = if let Some((result_rx, start_tx)) = dispatch {
             if let Some(start_tx) = start_tx {
@@ -1299,17 +1312,21 @@ impl MeerkatMachine {
     }
 
     /// Wake terminal-receipt waiters parked on the queued input this committed
-    /// admission's generated plan coalesced or superseded.
+    /// admission's generated plan coalesced or superseded, and owe
+    /// `runless_terminal` its terminal.
     ///
     /// Neither transition stages a terminal-completion receipt or resolves a
     /// completion waiter, so this commit is the only boundary that can wake
     /// them. The wake carries no fact and decides nothing: a woken wait
     /// re-reads the machine-owned lifecycle. Callers hold (or have released)
-    /// the driver lock the commit took, keeping the driver-then-registry order.
+    /// the driver lock the commit took, keeping the driver-then-registry order,
+    /// and took `runless_terminal` before their native locks, so that it tells
+    /// the host only after them.
     pub(super) async fn wake_displaced_input_observers(
         completions: &SharedCompletionRegistry,
         displaced_input_id: Option<InputId>,
         outcome: &AcceptOutcome,
+        runless_terminal: &mut super::RunlessTerminalAnnouncement,
     ) {
         if let (Some(displaced_input_id), AcceptOutcome::Accepted { .. }) =
             (displaced_input_id, outcome)
@@ -1318,6 +1335,9 @@ impl MeerkatMachine {
                 .lock()
                 .await
                 .wake_receipt_less_terminal_observers([displaced_input_id]);
+            // The admission that superseded or coalesced it is committed, so
+            // the displaced input's terminal is readable.
+            runless_terminal.owe();
         }
     }
 
@@ -1522,6 +1542,12 @@ impl MeerkatMachine {
                 member_residency,
                 expected_attachment,
             } => {
+                // Bound before every native guard of this admission so that it
+                // drops after them: a queued input this admission coalesces or
+                // supersedes is told once they are released, or, when M moves
+                // into the accepted boundary work, by that work once it has
+                // released M.
+                let mut runless_terminal = self.runless_terminal_announcement();
                 let _member_residency_lease = match &member_residency {
                     MemberResidencyExpectation::Unfenced => None,
                     MemberResidencyExpectation::PeerOnly => Some(
@@ -1861,8 +1887,13 @@ impl MeerkatMachine {
                         // fallible DSL publication, or construction of a fallback wake.
                         custody.settle(settlement);
                     }
-                    Self::wake_displaced_input_observers(&completions, displaced_input_id, &result)
-                        .await;
+                    Self::wake_displaced_input_observers(
+                        &completions,
+                        displaced_input_id,
+                        &result,
+                        &mut runless_terminal,
+                    )
+                    .await;
 
                     match &result {
                         AcceptOutcome::Accepted { input_id, seed, .. } => {
@@ -2105,6 +2136,7 @@ impl MeerkatMachine {
                         wake_tx,
                         signal.should_wake(),
                         fallback_wake,
+                        runless_terminal,
                     );
                 } else {
                     fallback_wake.disarm();
@@ -2118,6 +2150,9 @@ impl MeerkatMachine {
                 })
             }
             MeerkatMachineCommand::AcceptWithoutWake { session_id, input } => {
+                // Bound before this admission's gate and driver guards so that
+                // it drops after them (see AcceptWithCompletion).
+                let mut runless_terminal = self.runless_terminal_announcement();
                 let (driver, completions, mutation_gate, publication_handle, post_commit_hooks) = {
                     let sessions = self.sessions.read().await;
                     let entry = sessions
@@ -2221,8 +2256,13 @@ impl MeerkatMachine {
                         Ok(r) => r,
                         Err(err) => return Err(err),
                     };
-                    Self::wake_displaced_input_observers(&completions, displaced_input_id, &result)
-                        .await;
+                    Self::wake_displaced_input_observers(
+                        &completions,
+                        displaced_input_id,
+                        &result,
+                        &mut runless_terminal,
+                    )
+                    .await;
                     if let AcceptOutcome::Rejected { reason } = &result {
                         crate::hook_observation::dispatch_runtime_input_outcome(
                             &post_commit_hooks,

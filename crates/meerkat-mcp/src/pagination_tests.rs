@@ -228,6 +228,8 @@ async fn enumerate(
                 stdio_child: None,
                 session_expiry: Default::default(),
                 oauth_target: None,
+                attempt: None,
+                account: std::sync::Arc::new(meerkat_core::OperationAccount::Unavailable),
             };
             let result = tokio::time::timeout(
                 Duration::from_secs(30),

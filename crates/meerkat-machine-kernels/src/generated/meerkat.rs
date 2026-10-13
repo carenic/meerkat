@@ -13772,6 +13772,12 @@ pub struct State {
     pub turn_tool_overlay_deny_names: std::collections::BTreeSet<ToolName>,
     pub input_authority_bindings: std::collections::BTreeMap<String, String>,
     pub input_authority_batch_keys: std::collections::BTreeMap<String, String>,
+    pub scoped_context_binding: Option<String>,
+    pub scoped_context_scope: Option<String>,
+    pub scoped_context_generation: u64,
+    pub scoped_context_required: bool,
+    pub input_context_targets: std::collections::BTreeMap<String, String>,
+    pub run_context_binding: Option<String>,
     pub authority_staged_run: Option<RunId>,
     pub authority_staged_batch: Option<String>,
     pub input_phases: std::collections::BTreeMap<String, InputPhase>,
@@ -14085,6 +14091,7 @@ pub struct State {
     pub surface_pending_task_sequence: std::collections::BTreeMap<String, u64>,
     pub next_pending_task_sequence: u64,
     pub surface_pending_lineage_sequence: std::collections::BTreeMap<String, u64>,
+    pub surface_active_lineage: std::collections::BTreeMap<String, u64>,
     pub surface_inflight_calls: std::collections::BTreeMap<String, u64>,
     pub surface_last_delta_operation:
         std::collections::BTreeMap<String, ExternalToolSurfaceDeltaOperation>,
@@ -14549,6 +14556,24 @@ impl std::fmt::Debug for State {
                     "<redacted; {} entries>",
                     self.input_authority_batch_keys.len()
                 ),
+            )
+            .field(
+                "scoped_context_binding",
+                &self.scoped_context_binding.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "scoped_context_scope",
+                &self.scoped_context_scope.as_ref().map(|_| "<redacted>"),
+            )
+            .field("scoped_context_generation", &self.scoped_context_generation)
+            .field("scoped_context_required", &self.scoped_context_required)
+            .field(
+                "input_context_targets",
+                &format_args!("<redacted; {} entries>", self.input_context_targets.len()),
+            )
+            .field(
+                "run_context_binding",
+                &self.run_context_binding.as_ref().map(|_| "<redacted>"),
             )
             .field("authority_staged_run", &self.authority_staged_run)
             .field(
@@ -15476,6 +15501,7 @@ impl std::fmt::Debug for State {
                 "surface_pending_lineage_sequence",
                 &self.surface_pending_lineage_sequence,
             )
+            .field("surface_active_lineage", &self.surface_active_lineage)
             .field("surface_inflight_calls", &self.surface_inflight_calls)
             .field(
                 "surface_last_delta_operation",
@@ -16333,6 +16359,40 @@ pub mod inputs {
                 .field("input_id", &self.input_id)
                 .field("authority_binding", &"<redacted>")
                 .field("authority_batch_key", &"<redacted>")
+                .finish()
+        }
+    }
+    #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct BindScopedContext {
+        pub binding: String,
+        pub scope: String,
+        pub generation: u64,
+    }
+    impl std::fmt::Debug for BindScopedContext {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("BindScopedContext")
+                .field("binding", &"<redacted>")
+                .field("scope", &"<redacted>")
+                .field("generation", &self.generation)
+                .finish()
+        }
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RetireScopedContext {
+        pub generation: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RequireScopedContext {}
+    #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct BindInputContextTarget {
+        pub input_id: String,
+        pub target: String,
+    }
+    impl std::fmt::Debug for BindInputContextTarget {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("BindInputContextTarget")
+                .field("input_id", &self.input_id)
+                .field("target", &"<redacted>")
                 .finish()
         }
     }
@@ -18053,6 +18113,11 @@ pub mod inputs {
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct SurfaceShutdown {}
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct SurfaceRelease {
+        pub surface_id: String,
+        pub lineage: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct McpServerConnectPending {
         pub server_id: McpServerId,
     }
@@ -18488,6 +18553,10 @@ pub enum Input {
     JoinLiveBoundaryDurableAppend(inputs::JoinLiveBoundaryDurableAppend),
     ResolveLiveBoundaryDurableAppendJoin(inputs::ResolveLiveBoundaryDurableAppendJoin),
     BindInputAuthority(inputs::BindInputAuthority),
+    BindScopedContext(inputs::BindScopedContext),
+    RetireScopedContext(inputs::RetireScopedContext),
+    RequireScopedContext(inputs::RequireScopedContext),
+    BindInputContextTarget(inputs::BindInputContextTarget),
     ResolveAdmissionPlan(inputs::ResolveAdmissionPlan),
     ResolveAdmissionValidation(inputs::ResolveAdmissionValidation),
     ResolveAdmissionIdempotency(inputs::ResolveAdmissionIdempotency),
@@ -18734,6 +18803,7 @@ pub enum Input {
     SurfaceFinalizeRemovalForced(inputs::SurfaceFinalizeRemovalForced),
     SurfaceSnapshotAligned(inputs::SurfaceSnapshotAligned),
     SurfaceShutdown(inputs::SurfaceShutdown),
+    SurfaceRelease(inputs::SurfaceRelease),
     McpServerConnectPending(inputs::McpServerConnectPending),
     McpServerConnected(inputs::McpServerConnected),
     McpServerFailed(inputs::McpServerFailed),
@@ -18944,6 +19014,10 @@ impl Input {
                 InputKind::ResolveLiveBoundaryDurableAppendJoin
             }
             Self::BindInputAuthority(_) => InputKind::BindInputAuthority,
+            Self::BindScopedContext(_) => InputKind::BindScopedContext,
+            Self::RetireScopedContext(_) => InputKind::RetireScopedContext,
+            Self::RequireScopedContext(_) => InputKind::RequireScopedContext,
+            Self::BindInputContextTarget(_) => InputKind::BindInputContextTarget,
             Self::ResolveAdmissionPlan(_) => InputKind::ResolveAdmissionPlan,
             Self::ResolveAdmissionValidation(_) => InputKind::ResolveAdmissionValidation,
             Self::ResolveAdmissionIdempotency(_) => InputKind::ResolveAdmissionIdempotency,
@@ -19286,6 +19360,7 @@ impl Input {
             Self::SurfaceFinalizeRemovalForced(_) => InputKind::SurfaceFinalizeRemovalForced,
             Self::SurfaceSnapshotAligned(_) => InputKind::SurfaceSnapshotAligned,
             Self::SurfaceShutdown(_) => InputKind::SurfaceShutdown,
+            Self::SurfaceRelease(_) => InputKind::SurfaceRelease,
             Self::McpServerConnectPending(_) => InputKind::McpServerConnectPending,
             Self::McpServerConnected(_) => InputKind::McpServerConnected,
             Self::McpServerFailed(_) => InputKind::McpServerFailed,
@@ -19477,6 +19552,10 @@ pub enum InputKind {
     JoinLiveBoundaryDurableAppend,
     ResolveLiveBoundaryDurableAppendJoin,
     BindInputAuthority,
+    BindScopedContext,
+    RetireScopedContext,
+    RequireScopedContext,
+    BindInputContextTarget,
     ResolveAdmissionPlan,
     ResolveAdmissionValidation,
     ResolveAdmissionIdempotency,
@@ -19715,6 +19794,7 @@ pub enum InputKind {
     SurfaceFinalizeRemovalForced,
     SurfaceSnapshotAligned,
     SurfaceShutdown,
+    SurfaceRelease,
     McpServerConnectPending,
     McpServerConnected,
     McpServerFailed,
@@ -21272,6 +21352,11 @@ pub mod effects {
         pub surface_id: String,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct SurfaceStageRecorded {
+        pub surface_id: String,
+        pub staged_intent_sequence: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RejectSurfaceCall {
         pub surface_id: String,
         pub cause: ExternalToolSurfaceFailureCause,
@@ -21712,6 +21797,7 @@ pub enum Effect {
     RefreshVisibleSurfaceSet(effects::RefreshVisibleSurfaceSet),
     EmitExternalToolDelta(effects::EmitExternalToolDelta),
     CloseSurfaceConnection(effects::CloseSurfaceConnection),
+    SurfaceStageRecorded(effects::SurfaceStageRecorded),
     RejectSurfaceCall(effects::RejectSurfaceCall),
     PublishSupervisorTrustEdge(effects::PublishSupervisorTrustEdge),
     RevokeSupervisorTrustEdge(effects::RevokeSupervisorTrustEdge),
@@ -21971,6 +22057,7 @@ pub enum EffectKind {
     RefreshVisibleSurfaceSet,
     EmitExternalToolDelta,
     CloseSurfaceConnection,
+    SurfaceStageRecorded,
     RejectSurfaceCall,
     PublishSupervisorTrustEdge,
     RevokeSupervisorTrustEdge,
@@ -23196,6 +23283,23 @@ pub enum TransitionId {
     BindInputAuthorityRunning,
     BindInputAuthorityRetired,
     BindInputAuthorityStopped,
+    BindScopedContextIdle,
+    BindScopedContextAttached,
+    RequireScopedContextIdle,
+    RequireScopedContextAttached,
+    RequireScopedContextRunning,
+    RequireScopedContextRetired,
+    RequireScopedContextStopped,
+    RetireScopedContextIdle,
+    RetireScopedContextAttached,
+    RetireScopedContextRunning,
+    RetireScopedContextRetired,
+    RetireScopedContextStopped,
+    BindInputContextTargetIdle,
+    BindInputContextTargetAttached,
+    BindInputContextTargetRunning,
+    BindInputContextTargetRetired,
+    BindInputContextTargetStopped,
     ResolveAdmissionPlanRequestedTerminalQueueIdle,
     ResolveAdmissionPlanRequestedTerminalQueueAttached,
     ResolveAdmissionPlanRequestedTerminalQueueRunning,
@@ -23416,6 +23520,11 @@ pub enum TransitionId {
     SurfaceShutdownIdle,
     SurfaceShutdownAttached,
     SurfaceShutdownRunning,
+    SurfaceReleaseIdle,
+    SurfaceReleaseAttached,
+    SurfaceReleaseRunning,
+    SurfaceReleaseStopped,
+    SurfaceReleaseRetired,
     CommitRunningToIdle,
     CommitRunningToAttached,
     CommitRunningToRetired,
@@ -25177,6 +25286,12 @@ pub fn initial_state() -> State {
         turn_tool_overlay_deny_names: Default::default(),
         input_authority_bindings: Default::default(),
         input_authority_batch_keys: Default::default(),
+        scoped_context_binding: None,
+        scoped_context_scope: None,
+        scoped_context_generation: 0,
+        scoped_context_required: false,
+        input_context_targets: Default::default(),
+        run_context_binding: None,
         authority_staged_run: None,
         authority_staged_batch: None,
         input_phases: Default::default(),
@@ -25440,6 +25555,7 @@ pub fn initial_state() -> State {
         surface_pending_task_sequence: Default::default(),
         next_pending_task_sequence: 0,
         surface_pending_lineage_sequence: Default::default(),
+        surface_active_lineage: Default::default(),
         surface_inflight_calls: Default::default(),
         surface_last_delta_operation: Default::default(),
         surface_last_delta_phase: Default::default(),

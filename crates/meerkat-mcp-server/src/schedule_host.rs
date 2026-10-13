@@ -248,9 +248,10 @@ impl McpScheduleContext {
                 let mcp_adapter = match exact_config.router.clone() {
                     Some(adapter) => adapter,
                     None => self
-                        .seed_realm_mcp_adapter(Arc::clone(
-                            runtime_bindings.external_tool_surface(),
-                        ))
+                        .seed_realm_mcp_adapter(
+                            Arc::clone(runtime_bindings.external_tool_surface()),
+                            runtime_bindings.configured_mcp_attachment().cloned(),
+                        )
                         .await
                         .map_err(|error| crate::ToolCallError::internal(error.to_string()))?,
                 };
@@ -309,6 +310,7 @@ impl McpScheduleContext {
                         }
                     },
                     session_comms_runtime_override: None,
+                    prepared_controller: None,
                     host_prompt_sections: Default::default(),
                     agent_llm_client_decorator: None,
                     override_builtins: meerkat_core::ToolCategoryOverride::Inherit,
@@ -413,6 +415,9 @@ impl McpScheduleContext {
     async fn seed_realm_mcp_adapter(
         &self,
         external_tool_surface: Arc<dyn ExternalToolSurfaceHandle>,
+        configured_authority: Option<
+            Arc<dyn meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority>,
+        >,
     ) -> Result<Arc<McpRouterAdapter>, ScheduleDomainError> {
         let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new_with_surface_handle(
             external_tool_surface,
@@ -424,11 +429,23 @@ impl McpScheduleContext {
         )
         .await?;
 
+        // On a governed runtime each configured server carries the installed
+        // host's authority to its connection's physical entry, before any
+        // spawn or request; a refused one is not connected.
         for config in &server_configs {
-            adapter
-                .stage_add(config.clone())
-                .await
-                .map_err(ScheduleDomainError::Internal)?;
+            match &configured_authority {
+                Some(authority) => adapter
+                    .stage_add_governed(
+                        config.clone(),
+                        meerkat_mcp::ConfiguredMcpEntry::new(Arc::clone(authority), config.clone()),
+                    )
+                    .await
+                    .map_err(ScheduleDomainError::Internal)?,
+                None => adapter
+                    .stage_add(config.clone())
+                    .await
+                    .map_err(ScheduleDomainError::Internal)?,
+            }
         }
         if !server_configs.is_empty() {
             adapter

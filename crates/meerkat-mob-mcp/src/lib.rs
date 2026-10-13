@@ -25,6 +25,7 @@ mod public_mcp;
 pub mod run_accounting;
 #[cfg(not(target_arch = "wasm32"))]
 mod schedule_host;
+mod state_tasks;
 mod surface;
 pub mod temporary_council;
 mod workgraph_flow;
@@ -34,6 +35,8 @@ pub use agent_tools::{
 pub use child_mcp_servers::{ChildMcpServerRegistrationError, ChildMcpServers};
 pub use child_tool_bundles::{ChildToolBundleAvailability, ChildToolBundles};
 pub use child_tool_policy::ChildToolPolicyRefused;
+#[cfg(not(target_arch = "wasm32"))]
+pub use detached_completion_sink::{HostJobSource, HostJobSourceError};
 pub use detached_delivery::{
     DetachedCompletionDelivered, DetachedCompletionError, DetachedDeliveryUnavailable,
     DetachedOwnerError, DetachedOwnerHost, detached_completion_notice,
@@ -129,10 +132,361 @@ use ::tokio::sync::{Mutex, RwLock, mpsc};
 #[cfg(target_arch = "wasm32")]
 use tokio::sync::{Mutex, RwLock, mpsc};
 
+/// What [`MobMcpState::close_admission`] or [`MobMcpState::stand_down`]
+/// could prove before its deadline. Each operation documents what its
+/// [`Self::Clean`] covers: a closed admission is not a drained state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MobStateStandDown {
+    /// Everything the called operation waits for settled: for
+    /// `close_admission`, admission is closed and every managed mob answered
+    /// its close; for `stand_down`, also every task the state owned finished
+    /// and the state is sealed.
+    Clean,
+    /// Something the operation waits for did not settle by the deadline, or
+    /// failed, or cannot be fenced on this target; each reason names it.
+    Unsettled { reasons: Vec<String> },
+}
+
+impl MobStateStandDown {
+    /// Whether the called operation's conditions all settled.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        matches!(self, Self::Clean)
+    }
+}
+
+/// A create parked after its native mob started and before the mob is
+/// inserted into the managed set (test seam).
+#[cfg(test)]
+#[derive(Default)]
+struct InsertHold {
+    reached: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
+}
+
+/// Why a restored child mob is held. Private to this host: surfaces see only
+/// its bounded token, through [`MobError::held_before_activation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+enum ChildMobHoldReason {
+    /// The owner session has no durable authority: neither committed nor
+    /// archived.
+    OwnerAbsent,
+    /// The owner session's durable source could not be observed.
+    OwnerUnobservable(String),
+    /// The owner is archived, but the child's destroy was not admitted.
+    TeardownBlocked(String),
+    /// The child's own history could not be read to tell a recoverable
+    /// destroy from a fresh one.
+    HistoryUnreadable(String),
+}
+
+impl ChildMobHoldReason {
+    fn token(&self) -> &'static str {
+        match self {
+            Self::OwnerAbsent => "owner_absent",
+            Self::OwnerUnobservable(_) => "owner_unobservable",
+            Self::TeardownBlocked(_) => "teardown_blocked",
+            Self::HistoryUnreadable(_) => "history_unreadable",
+        }
+    }
+}
+
+impl std::fmt::Display for ChildMobHoldReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OwnerAbsent => formatter.write_str("owner has no durable authority"),
+            Self::OwnerUnobservable(detail) => {
+                write!(formatter, "owner could not be observed: {detail}")
+            }
+            Self::TeardownBlocked(detail) => {
+                write!(
+                    formatter,
+                    "owner is archived but the destroy was not admitted: {detail}"
+                )
+            }
+            Self::HistoryUnreadable(detail) => {
+                write!(formatter, "the mob's history could not be read: {detail}")
+            }
+        }
+    }
+}
+
+/// A restored child mob held before activation: it has no actor, and its
+/// store is kept exactly as recovered.
+#[derive(Clone)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+struct HeldChildMob {
+    mob_id: MobId,
+    storage_path: PathBuf,
+    owner: SessionId,
+    reason: ChildMobHoldReason,
+}
+
+/// A parked child-teardown preflight (test seam).
+#[cfg(test)]
+#[derive(Default)]
+struct TeardownPreflightHold {
+    reached: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
+}
+
+/// What restore does with one persisted mob, decided before any actor exists.
+#[cfg(not(target_arch = "wasm32"))]
+enum ChildMobRestoreGate {
+    Resume,
+    Teardown { mob_id: MobId, owner: SessionId },
+    Hold(HeldChildMob),
+}
+
 #[derive(Clone)]
 struct ManagedMob {
     handle: MobHandle,
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(dead_code, reason = "read only by the native persistent-storage paths")
+    )]
     storage_path: Option<PathBuf>,
+}
+
+/// The caller a destroy was admitted for. Only an equal caller collects the
+/// destroy's report again or continues the storage cleanup it still owes;
+/// the console and an agent surface never continue each other's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MobDestroyCaller {
+    /// This state's console principal, fixed at construction: the public,
+    /// RPC and council entries and the state's own cleanup paths. It means
+    /// nothing outside the state that recorded it.
+    Console,
+    /// An agent mob tool surface, by the identity its gate admitted: its
+    /// control principal, the bridge session it serves, and the principal
+    /// token of the mob operator authority it presented.
+    Agent {
+        control_principal: MobControlPrincipal,
+        owner_bridge_session_id: SessionId,
+        principal_token: meerkat_core::service::OpaquePrincipalToken,
+    },
+}
+
+/// A mob this state destroyed: its members never serve again. The record
+/// keeps the canonical report of the native destroy and the caller it was
+/// admitted for, with the storage cleanup the destroy still owes.
+#[derive(Debug)]
+pub(crate) struct RetiredMob {
+    caller: MobDestroyCaller,
+    report: meerkat_mob::MobDestroyReport,
+    /// The destroyed mob's database, when it had one.
+    storage: Option<RetiredMobStorage>,
+}
+
+#[derive(Debug)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+struct RetiredMobStorage {
+    path: PathBuf,
+    /// `None` once nothing is owed. Held across a cleanup attempt, so
+    /// attempts run one at a time.
+    owed: Mutex<Option<OwedStorageCleanup>>,
+}
+
+/// The storage cleanup a natively completed destroy still owes, with what
+/// was taken before the destroy started.
+#[derive(Debug)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+struct OwedStorageCleanup {
+    /// What the database path held.
+    before: StorageFileSeen,
+    /// The mob's actor task: the stores it owns drop only once it ends.
+    actor_task: meerkat_mob::MobActorTaskWatch,
+}
+
+/// What a storage path held when it was looked at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+enum StorageFileSeen {
+    Absent,
+    /// A file, with its device and inode where the platform reports them.
+    Present(Option<(u64, u64)>),
+}
+
+impl RetiredMob {
+    /// Whether storage cleanup is still owed; an attempt that is running
+    /// counts as owed.
+    fn cleanup_owed(&self) -> bool {
+        self.storage
+            .as_ref()
+            .is_some_and(|storage| match storage.owed.try_lock() {
+                Ok(owed) => owed.is_some(),
+                Err(_) => true,
+            })
+    }
+
+    /// A copy of the canonical report that names the outstanding cleanup.
+    /// The record keeps the canonical report itself, so a later complete
+    /// answer carries no stale cleanup error.
+    fn report_with_outstanding_cleanup(&self, outstanding: &str) -> meerkat_mob::MobDestroyReport {
+        let mut report = self.report.clone();
+        report
+            .errors
+            .push(format!("storage cleanup outstanding: {outstanding}"));
+        report
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl StorageFileSeen {
+    /// Look at `path` without following a final symlink: removal unlinks
+    /// that entry.
+    async fn look(path: &Path) -> std::io::Result<Self> {
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata) => Ok(Self::Present(Self::identity(&metadata))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::Absent),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(unix)]
+    fn identity(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt as _;
+        Some((metadata.dev(), metadata.ino()))
+    }
+
+    /// No device and inode here: a file present before and after the
+    /// destroy is taken to be the same one.
+    #[cfg(not(unix))]
+    fn identity(_metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+        None
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl OwedStorageCleanup {
+    /// What a destroy will owe the mob's database at `path`, taken before
+    /// the destroy starts, with the mob's actor task.
+    async fn before_destroy(
+        path: &Path,
+        actor_task: meerkat_mob::MobActorTaskWatch,
+    ) -> Result<Self, MobError> {
+        let before = StorageFileSeen::look(path).await.map_err(|error| {
+            MobError::Internal(format!(
+                "mob storage '{}' could not be looked at before destroy: {error}",
+                path.display()
+            ))
+        })?;
+        Ok(Self { before, actor_task })
+    }
+}
+
+/// How a destroy request meets this state's record of the mobs it
+/// destroyed.
+pub(crate) enum RetiredDestroyLookup {
+    /// No destroy under the id still owes its storage cleanup, and the id is
+    /// managed or this state keeps nothing under it for this request: the
+    /// request takes the ordinary path.
+    Ordinary,
+    /// This state destroyed the mob for another caller and still owes its
+    /// storage cleanup, which only that caller continues.
+    OtherCaller,
+    /// This state destroyed the mob for this caller, and still owes its
+    /// storage cleanup or manages no mob under the id again.
+    Caller(Arc<RetiredMob>),
+}
+
+/// An admitted destroy with everything it needs to finish without the
+/// caller that started it.
+struct AdmittedDestroy {
+    mob_id: MobId,
+    caller: MobDestroyCaller,
+    /// The console-bound handle the native destroy rides.
+    bound: MobHandle,
+    /// The destroyed mob instance's actor task. It tells that instance from
+    /// another one registered under the same id meanwhile.
+    actor_task: meerkat_mob::MobActorTaskWatch,
+    storage: Option<RetiredMobStorage>,
+    mobs: Arc<RwLock<BTreeMap<MobId, ManagedMob>>>,
+    retired_mobs: Arc<std::sync::Mutex<BTreeMap<MobId, Arc<RetiredMob>>>>,
+    mob_set_epoch: tokio::sync::watch::Sender<u64>,
+}
+
+impl AdmittedDestroy {
+    /// Run the native destroy, record its canonical report as it replies,
+    /// before any other await, then settle the storage cleanup the destroy
+    /// owes. Run as a task the state owns, a caller cancelled at any point
+    /// loses neither the report nor that cleanup: the same caller collects
+    /// or continues them. A record under the id that still owes its storage
+    /// cleanup is never replaced: this destroy then answers from its own
+    /// record without keeping it.
+    async fn run(self) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
+        let Self {
+            mob_id,
+            caller,
+            bound,
+            actor_task,
+            storage,
+            mobs,
+            retired_mobs,
+            mob_set_epoch,
+        } = self;
+        let destroy_result = bound.destroy().await;
+        // The authority-bound clone retains the SQLite event bus. Release it
+        // before the storage cleanup so this surface owns nothing of the
+        // observer that cleanup drains.
+        drop(bound);
+        let report = match destroy_result {
+            Ok(report) => report,
+            Err(meerkat_mob::MobDestroyError::Incomplete { report }) => {
+                return Err(MobMcpDestroyError::Incomplete { report });
+            }
+            Err(meerkat_mob::MobDestroyError::Mob(error)) => {
+                return Err(MobMcpDestroyError::Mob(error));
+            }
+            Err(other) => {
+                // MobDestroyError is #[non_exhaustive]; future variants we
+                // haven't coded for fall through to a generic internal
+                // error so the caller still gets a readable message.
+                return Err(MobMcpDestroyError::Mob(MobError::Internal(format!(
+                    "mob destroy failed: {other}"
+                ))));
+            }
+        };
+        let retired = Arc::new(RetiredMob {
+            caller,
+            report,
+            storage,
+        });
+        {
+            let mut records = retired_mobs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Replacing a record whose storage cleanup is still owed would
+            // lose that cleanup.
+            if !records
+                .get(&mob_id)
+                .is_some_and(|recorded| recorded.cleanup_owed())
+            {
+                records.insert(mob_id.clone(), Arc::clone(&retired));
+            }
+        }
+        // Remove the managed entry only while it is still the destroyed mob:
+        // a handle registered under the id while the destroy ran is another
+        // mob, which stays managed (and keeps its storage cleanup owed).
+        let removed = {
+            let mut managed = mobs.write().await;
+            if managed
+                .get(&mob_id)
+                .is_some_and(|entry| actor_task.observes(&entry.handle))
+            {
+                managed.remove(&mob_id)
+            } else {
+                None
+            }
+        };
+        if removed.is_some() {
+            mob_set_epoch.send_modify(|epoch| *epoch += 1);
+        }
+        drop(removed);
+        MobMcpState::settle_retired_destroy(&mobs, &mob_id, &retired).await
+    }
 }
 
 /// Structured reports a lifecycle action returns: `destroy` its cleanup
@@ -448,6 +802,8 @@ pub struct MobMcpState {
     default_llm_client: Option<Arc<dyn LlmClient>>,
     default_llm_client_provider: Option<DefaultLlmClientProvider>,
     external_tools_provider: Option<meerkat_mob::ExternalToolsProvider>,
+    /// Host selection of member destinations, inherited by every child mob.
+    member_runtime_registration_hook: Option<Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>>,
     before_activation: std::sync::OnceLock<meerkat_mob::MobBeforeActivation>,
     /// Host bundles; only the child-available ones reach child mob builders.
     child_tool_bundles: ChildToolBundles,
@@ -467,15 +823,30 @@ pub struct MobMcpState {
     /// capability custody under a caller-requested durable root.
     persistent_storage_setup_error: Option<String>,
     mobs: Arc<RwLock<BTreeMap<MobId, ManagedMob>>>,
-    /// Mobs this state destroyed: their members never serve again.
-    retired_mobs: std::sync::Mutex<std::collections::BTreeSet<MobId>>,
+    /// Mobs this state destroyed: their members never serve again. Each
+    /// record keeps the canonical report, the caller the destroy was
+    /// admitted for, and the storage cleanup it still owes.
+    retired_mobs: Arc<std::sync::Mutex<BTreeMap<MobId, Arc<RetiredMob>>>>,
+    /// Restored child mobs held because their owner is unresolved: never
+    /// resumed, so no actor or producer exists for them and nothing in their
+    /// durable state is changed by the hold.
+    held_child_mobs: RwLock<BTreeMap<MobId, HeldChildMob>>,
+    /// Serializes moving a held child out of the hold. Its held row stays
+    /// until the child is registered as managed (or confirmed gone), so a
+    /// cancelled or failed transfer leaves it held, never unaccounted for.
+    #[cfg(not(target_arch = "wasm32"))]
+    held_child_transfer: Mutex<()>,
+    /// Test seam: when set, a child teardown parks right before its WorkGraph
+    /// preflight, so a test can cancel the caller exactly there.
+    #[cfg(test)]
+    teardown_preflight_hold: std::sync::Mutex<Option<Arc<TeardownPreflightHold>>>,
     /// Set once the managed set holds every mob this host will ever have
     /// from before: persistent restore finished, or the host declared its
     /// own restore done ([`MobMcpState::declare_mob_set_restored`]). A mob
     /// outside the set is then gone for good.
     mob_set_restored: std::sync::atomic::AtomicBool,
     /// Bumped whenever the managed-mob handle set gains or loses an entry.
-    /// Interval-free observers (e.g. mobkit's agent-event stream reconcilers)
+    /// Interval-free observers (e.g. meta's agent-event stream reconcilers)
     /// await this instead of polling `mob_handles_snapshot` on a timer. The
     /// value is an opaque epoch, not a count; only "changed" is meaningful.
     mob_set_epoch: tokio::sync::watch::Sender<u64>,
@@ -504,6 +875,14 @@ pub struct MobMcpState {
     /// recovery sweep automatically instead of requiring a caller to run
     /// maintenance by hand.
     self_weak: std::sync::OnceLock<std::sync::Weak<MobMcpState>>,
+    /// Test seam: when set, a create parks after its native mob started and
+    /// before the managed-set insertion.
+    #[cfg(test)]
+    create_insert_hold: std::sync::Mutex<Option<Arc<InsertHold>>>,
+    /// Test seam: when set, a persisted resume parks after its native resume
+    /// and before the managed-set registration.
+    #[cfg(test)]
+    resume_insert_hold: std::sync::Mutex<Option<Arc<InsertHold>>>,
     /// Stable per-process coordinator identity. It is the council claim id, so
     /// a later in-process recovery sweep RENEWS the claim this process already
     /// holds instead of colliding with itself, while a genuinely different
@@ -526,6 +905,9 @@ pub struct MobMcpState {
     /// Set once the automatic post-restore recovery sweep has been scheduled.
     /// Also what keeps the sweep from re-entering `ensure_restored`.
     temporary_council_recovery_scheduled: std::sync::atomic::AtomicBool,
+    /// Every background task this state starts on its own, and whether it
+    /// still admits work; see [`MobMcpState::stand_down`].
+    pub(crate) state_tasks: state_tasks::StateTasks,
     /// Whether this host can deliver a detached tool completion to its
     /// owner session after the tool call returns. Declared by the host;
     /// never inferred.
@@ -541,6 +923,10 @@ pub struct MobMcpState {
     /// the state's life (see [`MobMcpState::bind_continuations`]).
     #[cfg(not(target_arch = "wasm32"))]
     continuation_binding: std::sync::Mutex<Option<meerkat::ContinuationBinding>>,
+    /// The host's own committed-result owner, composed into the job source
+    /// this state binds.
+    #[cfg(not(target_arch = "wasm32"))]
+    host_job_source: Option<HostJobSource>,
     /// When this state was built (Unix ms). Fork children whose job started
     /// earlier belonged to a previous process and are re-linked on restore.
     created_at_ms: u64,
@@ -619,6 +1005,7 @@ impl MobMcpState {
             default_llm_client: None,
             default_llm_client_provider: None,
             external_tools_provider: None,
+            member_runtime_registration_hook: None,
             before_activation: std::sync::OnceLock::new(),
             child_tool_bundles: ChildToolBundles::default(),
             additional_child_tool_bundles: std::sync::OnceLock::new(),
@@ -629,7 +1016,12 @@ impl MobMcpState {
             persistent_storage_root: None,
             persistent_storage_setup_error: None,
             mobs: Arc::new(RwLock::new(BTreeMap::new())),
-            retired_mobs: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            retired_mobs: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            held_child_mobs: RwLock::new(BTreeMap::new()),
+            #[cfg(not(target_arch = "wasm32"))]
+            held_child_transfer: Mutex::new(()),
+            #[cfg(test)]
+            teardown_preflight_hold: std::sync::Mutex::new(None),
             mob_set_restored: std::sync::atomic::AtomicBool::new(false),
             mob_set_epoch: tokio::sync::watch::Sender::new(0),
             implicit_mob_locks: Mutex::new(HashMap::new()),
@@ -648,6 +1040,10 @@ impl MobMcpState {
             ),
             temporary_council_inflight: std::sync::Mutex::new(HashMap::new()),
             self_weak: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            create_insert_hold: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            resume_insert_hold: std::sync::Mutex::new(None),
             coordinator_id: uuid::Uuid::new_v4().simple().to_string(),
             temporary_council_clock_offset_ms: std::sync::atomic::AtomicI64::new(0),
             temporary_council_clock_changes: tokio::sync::watch::channel(0).0,
@@ -657,6 +1053,7 @@ impl MobMcpState {
                     .unwrap_or(30_000),
             ),
             temporary_council_recovery_scheduled: std::sync::atomic::AtomicBool::new(false),
+            state_tasks: state_tasks::StateTasks::new(),
             // Detached delivery needs a runtime to admit completions, so the
             // default follows the runtime's presence: a host built without one
             // is declared unable to deliver, never silently mismatched.
@@ -665,6 +1062,8 @@ impl MobMcpState {
             detached_completions: std::sync::RwLock::new(None),
             #[cfg(not(target_arch = "wasm32"))]
             continuation_binding: std::sync::Mutex::new(None),
+            #[cfg(not(target_arch = "wasm32"))]
+            host_job_source: None,
             created_at_ms: u64::try_from(
                 SystemTime::now()
                     .duration_since(meerkat_core::time_compat::UNIX_EPOCH)
@@ -832,6 +1231,37 @@ impl MobMcpState {
         })
     }
 
+    /// Compose `host` into the job source this state binds, so its committed
+    /// results for exactly those `Host` namespaces are confirmed by the same
+    /// delivery owner as this state's fork_off and council completions. Set
+    /// it before [`Self::bind_continuations`]; a state already bound keeps the
+    /// source it bound.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[must_use]
+    pub fn with_host_job_source(mut self, host: HostJobSource) -> Self {
+        self.host_job_source = Some(host);
+        self
+    }
+
+    /// The continuation owner service this state bound over the host's one
+    /// inbox, with the same address resolver and runtime its fork_off and
+    /// council completions use: the host submits its own retained results
+    /// through it and reads their status. `None` until bound.
+    ///
+    /// This is submission and status access only, not a binding or a drain
+    /// lease: holding it keeps neither this state's continuation binding
+    /// nor the host's delivery owner alive, and it does not retire with
+    /// them. Delivery stays governed by the currently bound job source,
+    /// address resolver and native authorization.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn continuation_service(&self) -> Option<Arc<meerkat::ContinuationOwnerService>> {
+        self.detached_completions
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|sink| Arc::clone(&sink.continuations))
+    }
+
     /// The generation of this state's continuation binding, once bound.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn continuation_binding_generation(
@@ -872,8 +1302,15 @@ impl MobMcpState {
                 mobs: meerkat_mob::continuation::MobContinuationResolver::new(owner.clone()),
                 state: Arc::downgrade(self),
             });
+        // The bound source answers for this state's fork_off and council
+        // jobs and, for exactly its declared namespaces, the host's own.
+        let source: Arc<dyn meerkat::RetainedJobSource> =
+            Arc::new(crate::detached_completion_sink::ComposedJobSource {
+                native: Arc::clone(&owner),
+                host: self.host_job_source.clone(),
+            });
         let binding =
-            bind(Arc::clone(&resolver), owner.clone()).map_err(BindContinuationsError::Binding)?;
+            bind(Arc::clone(&resolver), source).map_err(BindContinuationsError::Binding)?;
         let continuations = Arc::new(meerkat::ContinuationOwnerService::new(
             inbox,
             resolver,
@@ -890,6 +1327,21 @@ impl MobMcpState {
             });
         *held = Some(binding);
         Ok(())
+    }
+
+    /// Start `work` as owned work of this state: a stand-down joins it and
+    /// never aborts it, as it does a council run. Tests only. `false` when
+    /// the state no longer admits owned work; nothing was started then.
+    #[doc(hidden)]
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn spawn_owned_work_for_tests(
+        &self,
+        name: &'static str,
+        work: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        self.state_tasks
+            .spawn(state_tasks::StateTaskKind::Owned, name, work)
+            .is_some()
     }
 
     /// Submit a detached job's outcome through this host's continuation
@@ -957,7 +1409,226 @@ impl MobMcpState {
                 .retired_mobs
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(mob_id)
+                .contains_key(mob_id)
+    }
+
+    /// Whether this state still owes the storage cleanup of a mob it
+    /// destroyed under `mob_id`.
+    fn destroy_cleanup_owed(&self, mob_id: &MobId) -> bool {
+        self.retired_mobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(mob_id)
+            .is_some_and(|retired| retired.cleanup_owed())
+    }
+
+    /// Whether this state still owes the storage cleanup of a mob it
+    /// destroyed whose database is at `path`.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    fn destroy_cleanup_owed_at(&self, path: &Path) -> bool {
+        self.retired_mobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .any(|retired| {
+                retired
+                    .storage
+                    .as_ref()
+                    .is_some_and(|storage| storage.path == path)
+                    && retired.cleanup_owed()
+            })
+    }
+
+    /// The refusal of an id whose destroyed mob's storage cleanup is still
+    /// owed: a mob created or inserted under it would use that storage.
+    fn owed_destroy_cleanup_error(mob_id: &MobId) -> MobError {
+        MobError::Internal(format!(
+            "mob {mob_id} was destroyed and its storage cleanup is still outstanding; \
+             retry that destroy before reusing the id"
+        ))
+    }
+
+    /// How a destroy of `mob_id` by `caller` meets the record of the mobs
+    /// this state destroyed. Synchronous apart from the managed-set read:
+    /// it never asks an actor, so it still answers once the actor exited.
+    ///
+    /// A destroy that still owes its storage cleanup comes first, also while
+    /// another mob is managed under the id: only its own caller continues it,
+    /// and no request destroys that other mob in its place. A record that
+    /// owes nothing answers its caller only while no mob is managed under the
+    /// id; it never shadows a mob managed there.
+    pub(crate) async fn retired_destroy_lookup(
+        &self,
+        mob_id: &MobId,
+        caller: &MobDestroyCaller,
+    ) -> RetiredDestroyLookup {
+        let managed = self.mobs.read().await.contains_key(mob_id);
+        let retired = self
+            .retired_mobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(mob_id)
+            .cloned();
+        match retired {
+            Some(retired) if retired.cleanup_owed() => {
+                if retired.caller == *caller {
+                    RetiredDestroyLookup::Caller(retired)
+                } else {
+                    RetiredDestroyLookup::OtherCaller
+                }
+            }
+            Some(retired) if !managed && retired.caller == *caller => {
+                RetiredDestroyLookup::Caller(retired)
+            }
+            _ => RetiredDestroyLookup::Ordinary,
+        }
+    }
+
+    /// Continue the destroy recorded as `retired` for its own caller: settle
+    /// the storage cleanup it still owes and answer with its report.
+    pub(crate) async fn continue_retired_destroy(
+        &self,
+        mob_id: &MobId,
+        retired: &RetiredMob,
+    ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
+        Self::settle_retired_destroy(&self.mobs, mob_id, retired).await
+    }
+
+    /// Settle what the destroy recorded as `retired` still owes its storage
+    /// and answer with its canonical report: the report itself once nothing
+    /// is owed, otherwise `Incomplete` with a copy that names what is still
+    /// outstanding.
+    async fn settle_retired_destroy(
+        mobs: &RwLock<BTreeMap<MobId, ManagedMob>>,
+        mob_id: &MobId,
+        retired: &RetiredMob,
+    ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
+        match Self::settle_owed_storage_cleanup(mobs, mob_id, retired).await {
+            Ok(()) => Ok(retired.report.clone()),
+            Err(outstanding) => Err(MobMcpDestroyError::Incomplete {
+                report: retired.report_with_outstanding_cleanup(&outstanding),
+            }),
+        }
+    }
+
+    /// One attempt at the storage cleanup a natively completed destroy owes,
+    /// while no other attempt runs. It waits for the mob's actor task to
+    /// end, refuses while a mob is managed under the id again, drains this
+    /// process's observer of the database, and removes the database and its
+    /// sidecars only while the database is the one the mob used. `Err` says
+    /// what is still outstanding; the record keeps everything a later
+    /// attempt needs.
+    ///
+    /// This settles the observer and the files only. A read already entered
+    /// through a handle that was then dropped, an opener that attaches after
+    /// the drain, and other processes stay outside it, so it never states
+    /// that deleting the storage was safe.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn settle_owed_storage_cleanup(
+        mobs: &RwLock<BTreeMap<MobId, ManagedMob>>,
+        mob_id: &MobId,
+        retired: &RetiredMob,
+    ) -> Result<(), String> {
+        let Some(storage) = retired.storage.as_ref() else {
+            return Ok(());
+        };
+        let mut owed = storage.owed.lock().await;
+        let Some(cleanup) = owed.as_mut() else {
+            return Ok(());
+        };
+        match cleanup.actor_task.wait().await {
+            meerkat_mob::MobActorTaskWait::Returned => {}
+            meerkat_mob::MobActorTaskWait::Lost => {
+                return Err(
+                    "the mob's actor task ended without returning, so what it held is not attested"
+                        .to_string(),
+                );
+            }
+            meerkat_mob::MobActorTaskWait::Pending => {
+                return Err("the mob's actor task has not ended".to_string());
+            }
+            _ => return Err("how the mob's actor task ended is not known".to_string()),
+        }
+        if mobs.read().await.contains_key(mob_id) {
+            return Err("a mob is managed under this id again".to_string());
+        }
+        // Only the destroyed mob's own database is drained. Once it is gone
+        // (an earlier attempt removed it), there is no database at the path
+        // to observe, and only leftover sidecars remain.
+        if Self::destroyed_database_at(&storage.path, cleanup.before).await? {
+            let path = storage.path.clone();
+            let drained = tokio::task::spawn_blocking(move || {
+                meerkat_mob::SqliteMobStores::drain_observers(&path)
+            })
+            .await
+            .map_err(|error| format!("the observer drain did not return: {error}"))?;
+            Self::observer_drain_settled(drained)?;
+        }
+        Self::remove_destroyed_storage_files(&storage.path, cleanup.before).await?;
+        *owed = None;
+        Ok(())
+    }
+
+    /// Whether `path` still holds the destroyed mob's database (`Ok(true)`)
+    /// or nothing (`Ok(false)`). Another file there is `Err`: it is never
+    /// drained or removed.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn destroyed_database_at(path: &Path, before: StorageFileSeen) -> Result<bool, String> {
+        let now = StorageFileSeen::look(path).await.map_err(|error| {
+            format!(
+                "mob storage '{}' could not be looked at: {error}",
+                path.display()
+            )
+        })?;
+        match (before, now) {
+            (_, StorageFileSeen::Absent) => Ok(false),
+            (StorageFileSeen::Present(before), StorageFileSeen::Present(now)) if before == now => {
+                Ok(true)
+            }
+            _ => Err(format!(
+                "mob storage '{}' holds a file other than the destroyed mob's database; \
+                 nothing was removed",
+                path.display()
+            )),
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn settle_owed_storage_cleanup(
+        _mobs: &RwLock<BTreeMap<MobId, ManagedMob>>,
+        _mob_id: &MobId,
+        _retired: &RetiredMob,
+    ) -> Result<(), String> {
+        // A destroyed mob owns no storage files on wasm32.
+        Ok(())
+    }
+
+    /// Whether a drain of the destroyed mob's database observer left
+    /// nothing of it running in this process: no observer was live, or it
+    /// was closed with its catch-up settled, every worker joined and no
+    /// replacement attached. Otherwise what is still open.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn observer_drain_settled(
+        drained: Result<
+            meerkat_mob::SqliteMobObserverDrain,
+            meerkat_mob::SqliteMobObserverDrainRefused,
+        >,
+    ) -> Result<(), String> {
+        match drained {
+            Ok(meerkat_mob::SqliteMobObserverDrain::NotFound) => Ok(()),
+            Ok(meerkat_mob::SqliteMobObserverDrain::Closed(report))
+                if report.catch_up_settled
+                    && report.unjoined_workers == 0
+                    && report.joining_elsewhere == 0
+                    && !report.replacement_registered =>
+            {
+                Ok(())
+            }
+            Ok(meerkat_mob::SqliteMobObserverDrain::Closed(report)) => {
+                Err(format!("the observer drain left work open: {report:?}"))
+            }
+            Err(refused) => Err(format!("the observer drain refused: {refused}")),
+        }
     }
 
     /// Whether the managed set holds every mob this host will ever have
@@ -1247,9 +1918,13 @@ impl MobMcpState {
         };
         // Built in its own frame: `tokio::spawn` takes the future by value,
         // so an inline sweep future would transit every caller's debug frame.
-        tokio::spawn(meerkat_runtime::stack_relief::box_in_own_frame(move || {
-            crate::council_relink::restore_sweep(weak)
-        }));
+        let _ = self.state_tasks.spawn(
+            state_tasks::StateTaskKind::Convergent,
+            "temporary council recovery sweep",
+            meerkat_runtime::stack_relief::box_in_own_frame(move || {
+                crate::council_relink::restore_sweep(weak)
+            }),
+        );
     }
 
     /// Override the local capability sweep cadence for deterministic tests.
@@ -1275,8 +1950,10 @@ impl MobMcpState {
                 .store(false, Ordering::SeqCst);
             return;
         };
-        tokio::spawn(meerkat_runtime::stack_relief::box_in_own_frame(
-            move || async move {
+        let _ = self.state_tasks.spawn(
+            state_tasks::StateTaskKind::Periodic,
+            "local forked-participant sweeper",
+            meerkat_runtime::stack_relief::box_in_own_frame(move || async move {
                 loop {
                     let Some(state) = weak.upgrade() else {
                         return;
@@ -1290,8 +1967,8 @@ impl MobMcpState {
                     drop(state);
                     tokio::time::sleep(interval).await;
                 }
-            },
-        ));
+            }),
+        );
     }
 
     async fn sweep_local_forked_participants(&self) {
@@ -1548,6 +2225,17 @@ impl MobMcpState {
         provider: Option<meerkat_mob::ExternalToolsProvider>,
     ) -> Self {
         self.external_tools_provider = provider;
+        self
+    }
+
+    /// Inherit the host's member destination selection into every child mob
+    /// this state creates or restores, so no child member registers without
+    /// its destination installed.
+    pub fn with_member_runtime_registration_hook(
+        mut self,
+        hook: Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>,
+    ) -> Self {
+        self.member_runtime_registration_hook = Some(hook);
         self
     }
 
@@ -1812,6 +2500,9 @@ impl MobMcpState {
         mut builder: MobBuilder,
         scope: child_tool_policy::ChildMobScope,
     ) -> MobBuilder {
+        if let Some(hook) = self.member_runtime_registration_hook.as_ref() {
+            builder = builder.with_member_runtime_registration_hook(Arc::clone(hook));
+        }
         builder = builder
             .with_session_service(self.session_service.clone())
             .allow_ephemeral_sessions(!self.session_service.supports_persistent_sessions())
@@ -1896,13 +2587,7 @@ impl MobMcpState {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let Some(path) = path else { return Ok(()) };
-            let mut paths = Vec::with_capacity(3);
-            paths.push(path.to_path_buf());
-            for suffix in ["-wal", "-shm"] {
-                let mut value = path.as_os_str().to_os_string();
-                value.push(suffix);
-                paths.push(PathBuf::from(value));
-            }
+            let paths = Self::storage_file_paths(path);
 
             for path in &paths {
                 Self::remove_one_storage_file(path).await?;
@@ -1922,6 +2607,59 @@ impl MobMcpState {
                 ))),
             }
         }
+    }
+
+    /// A mob database and its WAL and shared-memory sidecars.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn storage_file_paths(path: &Path) -> [PathBuf; 3] {
+        let sidecar = |suffix: &str| {
+            let mut value = path.as_os_str().to_os_string();
+            value.push(suffix);
+            PathBuf::from(value)
+        };
+        [path.to_path_buf(), sidecar("-wal"), sidecar("-shm")]
+    }
+
+    /// Remove a destroyed mob's database and its sidecars, and verify all
+    /// three are gone. The database is removed only while the file at
+    /// `path` is still the one the mob used (`before`); when the database is
+    /// already gone, only leftover sidecars are removed. When another file
+    /// took the path, nothing is removed.
+    ///
+    /// Looking at the file and unlinking it by path are two steps: a file
+    /// put there in between by a process or opener outside this state is
+    /// not excluded.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn remove_destroyed_storage_files(
+        path: &Path,
+        before: StorageFileSeen,
+    ) -> Result<(), String> {
+        let remove_database = Self::destroyed_database_at(path, before).await?;
+        let paths = Self::storage_file_paths(path);
+        let first = usize::from(!remove_database);
+        for path in &paths[first..] {
+            Self::remove_one_storage_file(path)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        for path in &paths {
+            match tokio::fs::symlink_metadata(path).await {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "mob storage '{}' post-remove verification failed: {error}",
+                        path.display()
+                    ));
+                }
+                Ok(_) => {
+                    return Err(format!(
+                        "mob storage '{}' still exists after removal",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -2001,6 +2739,17 @@ impl MobMcpState {
                 {
                     continue;
                 }
+                // A store this state already registered (an earlier pass of
+                // this scan was cancelled after its owned resume finished)
+                // is the live mob: never resume the exact same store again.
+                if self.registered_store(&path).await {
+                    continue;
+                }
+                // The store of a mob this state destroyed is never resumed
+                // while its cleanup is owed.
+                if self.destroy_cleanup_owed_at(&path) {
+                    continue;
+                }
 
                 let storage = self.bind_realm_profile_store(MobStorage::persistent(&path)?);
                 if storage.is_event_log_empty().await? {
@@ -2010,27 +2759,26 @@ impl MobMcpState {
                     continue;
                 }
 
-                let scope = child_tool_policy::ChildMobScope::default();
-                let handle = self
-                    .configure_builder(MobBuilder::for_resume(storage), scope.clone())
-                    .before_activation(self.restore_scope_hook(scope))
-                    .resume()
-                    .await?;
-                let mob_id = handle.definition().id.clone();
-                match self.mobs.write().await.entry(mob_id.clone()) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(ManagedMob {
-                            handle,
-                            storage_path: Some(path.clone()),
-                        });
-                        self.note_mob_set_changed();
+                // Decide before any actor exists: a child whose owner is
+                // archived is torn down without activation, and one whose
+                // owner is unresolved is held, never resumed.
+                match self.child_mob_restore_gate(&storage, &path).await? {
+                    ChildMobRestoreGate::Resume => {
+                        self.resume_persisted_mob(storage, &path).await?;
                     }
-                    Entry::Occupied(_) => {
-                        let _ = handle.destroy().await;
-                        return Err(MobError::Internal(format!(
-                            "duplicate persisted mob id during restore: {mob_id}"
-                        )));
+                    ChildMobRestoreGate::Teardown { mob_id, owner } => {
+                        if let Err(error) = self
+                            .tear_down_archived_child_mob(storage, &path, mob_id.clone(), owner)
+                            .await
+                        {
+                            tracing::warn!(
+                                mob_id = %mob_id,
+                                error = %error,
+                                "restored child mob of an archived owner was not torn down"
+                            );
+                        }
                     }
+                    ChildMobRestoreGate::Hold(held) => self.hold_child_mob(held).await,
                 }
             }
 
@@ -2041,10 +2789,603 @@ impl MobMcpState {
         }
     }
 
+    /// Stand this state down: close its admission and wait for the work it
+    /// owns, so a host can release what that work writes to (a durable
+    /// child-mob root) in this process.
+    ///
+    /// The state stops admitting mob creates, inserts, restores, council
+    /// runs and new periodic or convergent work, aborts its periodic and
+    /// convergent tasks (sweeps, reconcilers, re-link passes; the next state
+    /// over the same storage redoes them), and waits, until `deadline`, for
+    /// every owned task (council runs, completion custodians, teardown
+    /// handoffs, detached waits) and every admitted caller or detached
+    /// holder (a create already past its admission, a live delegation
+    /// delivery) to finish. Owned work admitted before the close may still
+    /// start its second half while this runs; it is waited for too.
+    /// [`MobStateStandDown::Clean`] then seals the state: it admits nothing
+    /// more. The task set stays in the state, so a concurrent or cancelled
+    /// call never reports clean while work runs, and a later call waits for
+    /// whatever an unsettled one left.
+    ///
+    /// It does not shut down the mobs it manages. A host closes admission
+    /// first ([`Self::close_admission`]), takes its snapshot of the mobs and
+    /// shuts them down, then stands the state down, and finally looks again
+    /// for a mob registered meanwhile by owned work (a child teardown): a
+    /// sealed state adds none.
+    pub async fn stand_down(&self, deadline: std::time::Instant) -> MobStateStandDown {
+        let mut unsettled = self.close_admission_reasons(deadline).await;
+        unsettled.extend(self.state_tasks.stand_down(deadline).await);
+        if unsettled.is_empty() {
+            MobStateStandDown::Clean
+        } else {
+            MobStateStandDown::Unsettled { reasons: unsettled }
+        }
+    }
+
+    /// Close this state's admission and wait, until `deadline`, for the
+    /// callers already admitted (a mob create, insert or restore, or a
+    /// council admission, already past its check) to finish their writes;
+    /// then close the admission of every mob the state manages
+    /// (`MobHandle::close_admission` with
+    /// [`meerkat_mob::MobAdmissionCloseReason::StandDown`]), so each mob's
+    /// actor refuses new members, work, flows and resumes too.
+    ///
+    /// [`MobStateStandDown::Clean`] means no caller admitted before the close
+    /// can still add a mob and every managed mob closed its own admission;
+    /// owned work keeps running until [`Self::stand_down`], which also does
+    /// all of this if it was not called. Idempotent.
+    pub async fn close_admission(&self, deadline: std::time::Instant) -> MobStateStandDown {
+        let unsettled = self.close_admission_reasons(deadline).await;
+        if unsettled.is_empty() {
+            MobStateStandDown::Clean
+        } else {
+            MobStateStandDown::Unsettled { reasons: unsettled }
+        }
+    }
+
+    async fn close_admission_reasons(&self, deadline: std::time::Instant) -> Vec<String> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Admission cannot be fenced on wasm32: never report it closed.
+            let _ = deadline;
+            vec!["state admission cannot be closed on wasm32".to_string()]
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.close_admission_reasons_native(deadline).await
+        }
+    }
+
+    /// Every wait below is bounded by the same `deadline`. A wait that
+    /// misses it is reported and abandoned, never aborted on the other side:
+    /// a close the actor received still takes effect, and a later call
+    /// closes again (the close is idempotent).
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn close_admission_reasons_native(&self, deadline: std::time::Instant) -> Vec<String> {
+        let mut unsettled = self.state_tasks.close_admissions(deadline).await;
+        let deadline = tokio::time::Instant::from_std(deadline);
+        // The state admits no new mob now, and the callers admitted before
+        // the close have inserted theirs (or are reported above): every mob
+        // that can still take work is in this set.
+        let Ok(mobs) = tokio::time::timeout_at(deadline, self.mobs.read()).await else {
+            unsettled.push("managed mobs could not be read before the deadline".to_string());
+            return unsettled;
+        };
+        let handles = mobs
+            .iter()
+            .map(|(mob_id, managed)| (mob_id.clone(), managed.handle.clone()))
+            .collect::<Vec<_>>();
+        drop(mobs);
+        for (mob_id, handle) in handles {
+            let Ok(closed) = tokio::time::timeout_at(
+                deadline,
+                handle.close_admission(meerkat_mob::MobAdmissionCloseReason::StandDown),
+            )
+            .await
+            else {
+                unsettled.push(format!(
+                    "mob {mob_id}: admission close not answered before the deadline"
+                ));
+                continue;
+            };
+            match closed {
+                Ok(busy) => {
+                    if let Some(busy) = busy {
+                        tracing::debug!(mob_id = %mob_id, ?busy, "mob closed its admission with work still in flight");
+                    }
+                }
+                // A stopped actor admits nothing.
+                Err(MobError::ActorCommandChannelClosed | MobError::ActorReplyChannelClosed) => {}
+                Err(error) => {
+                    unsettled.push(format!("mob {mob_id}: admission not closed: {error}"));
+                }
+            }
+        }
+        unsettled
+    }
+
+    fn stood_down_error() -> MobError {
+        MobError::Internal("this mob state has stood down and admits no new work".to_string())
+    }
+
+    /// Admit a caller that may add a mob, held until its insertion is
+    /// done (see [`state_tasks::StateTasks::admit`]).
+    fn admit(&self, name: &'static str) -> Result<state_tasks::StateHold, MobError> {
+        self.state_tasks
+            .admit(name)
+            .ok_or_else(Self::stood_down_error)
+    }
+
+    /// Hold the state for the second half of admitted work, through its
+    /// insertion (see [`state_tasks::StateTasks::hold`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn hold(&self, name: &'static str) -> Result<state_tasks::StateHold, MobError> {
+        self.state_tasks
+            .hold(name)
+            .ok_or_else(Self::stood_down_error)
+    }
+
+    /// Whether a managed mob was registered from exactly the store at
+    /// `path`.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn registered_store(&self, path: &Path) -> bool {
+        self.mobs
+            .read()
+            .await
+            .values()
+            .any(|managed| managed.storage_path.as_deref() == Some(path))
+    }
+
+    /// Resume one persisted mob store and register it as a managed mob.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn resume_persisted_mob(
+        &self,
+        storage: MobStorage,
+        path: &Path,
+    ) -> Result<MobId, MobError> {
+        let hold = self.hold("mob resume")?;
+        // Like a create, the resume runs to its registration as the state's
+        // own task, so a dropped caller cannot leave a resumed actor outside
+        // the managed set.
+        if let Some(state) = self.self_weak.get().and_then(std::sync::Weak::upgrade) {
+            let path = path.to_path_buf();
+            return self
+                .run_admitted_create("mob resume", async move {
+                    let _hold = hold;
+                    state.resume_persisted_mob_held(storage, &path).await
+                })
+                .await;
+        }
+        let _hold = hold;
+        self.resume_persisted_mob_held(storage, path).await
+    }
+
+    /// The body of [`Self::resume_persisted_mob`] under its hold.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn resume_persisted_mob_held(
+        &self,
+        storage: MobStorage,
+        path: &Path,
+    ) -> Result<MobId, MobError> {
+        let scope = child_tool_policy::ChildMobScope::default();
+        let handle = self
+            .configure_builder(MobBuilder::for_resume(storage), scope.clone())
+            .before_activation(self.restore_scope_hook(scope))
+            .resume()
+            .await?;
+        #[cfg(test)]
+        {
+            let hold = self
+                .resume_insert_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(hold) = hold {
+                hold.reached
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                hold.release.notified().await;
+            }
+        }
+        self.register_resumed_mob(handle, path).await
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn register_resumed_mob(
+        &self,
+        handle: MobHandle,
+        path: &Path,
+    ) -> Result<MobId, MobError> {
+        let mob_id = handle.definition().id.clone();
+        match self.mobs.write().await.entry(mob_id.clone()) {
+            Entry::Vacant(_) if self.destroy_cleanup_owed(&mob_id) => {
+                // A destroyed mob's storage cleanup is owed under this id;
+                // that storage is never removed here.
+                let _ = handle.destroy().await;
+                return Err(Self::owed_destroy_cleanup_error(&mob_id));
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(ManagedMob {
+                    handle,
+                    storage_path: Some(path.to_path_buf()),
+                });
+                self.note_mob_set_changed();
+            }
+            Entry::Occupied(_) => {
+                let _ = handle.destroy().await;
+                return Err(MobError::Internal(format!(
+                    "duplicate persisted mob id during restore: {mob_id}"
+                )));
+            }
+        }
+        Ok(mob_id)
+    }
+
+    /// The restore gate of a persisted mob, decided from durable facts before
+    /// any actor exists:
+    /// - a mob that is not a child destroyed with its owner resumes as before;
+    /// - a child whose history leaves a destroy to recover (an admitted
+    ///   destroy or a durable Destroy quiesce) resumes into that recovery,
+    ///   whatever the owner now reads as;
+    /// - a child whose owner is committed resumes as before;
+    /// - a child whose owner is archived is torn down without activation;
+    /// - a child whose owner is absent or cannot be observed, or whose
+    ///   history cannot be read, is held.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn child_mob_restore_gate(
+        &self,
+        storage: &MobStorage,
+        path: &Path,
+    ) -> Result<ChildMobRestoreGate, MobError> {
+        let Some(definition) = storage.created_definition().await? else {
+            return Ok(ChildMobRestoreGate::Resume);
+        };
+        let Some(owner) = storage.owner_bridge_binding().await? else {
+            return Ok(ChildMobRestoreGate::Resume);
+        };
+        if !child_tool_policy::is_child_mob(owner.destroy_on_owner_archive) {
+            return Ok(ChildMobRestoreGate::Resume);
+        }
+        match storage.destroy_recovery_pending().await {
+            Ok(true) => return Ok(ChildMobRestoreGate::Resume),
+            Ok(false) => {}
+            Err(error) => {
+                return Ok(ChildMobRestoreGate::Hold(HeldChildMob {
+                    mob_id: definition.id,
+                    storage_path: path.to_path_buf(),
+                    owner: owner.bridge_session_id,
+                    reason: ChildMobHoldReason::HistoryUnreadable(error.to_string()),
+                }));
+            }
+        }
+        Ok(
+            match self.resolve_child_mob_owner(&owner.bridge_session_id).await {
+                Ok(false) => ChildMobRestoreGate::Resume,
+                Ok(true) => ChildMobRestoreGate::Teardown {
+                    mob_id: definition.id,
+                    owner: owner.bridge_session_id,
+                },
+                Err(reason) => ChildMobRestoreGate::Hold(HeldChildMob {
+                    mob_id: definition.id,
+                    storage_path: path.to_path_buf(),
+                    owner: owner.bridge_session_id,
+                    reason,
+                }),
+            },
+        )
+    }
+
+    /// Resolve a child mob's owner: `Ok(false)` when it is committed,
+    /// `Ok(true)` when it is confirmed archived, otherwise why it does not
+    /// resolve.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn resolve_child_mob_owner(&self, owner: &SessionId) -> Result<bool, ChildMobHoldReason> {
+        match self
+            .session_service
+            .observe_live_durable_source(owner)
+            .await
+        {
+            Ok(meerkat_mob::LiveDurableSourceObservation::Committed { .. }) => Ok(false),
+            Ok(meerkat_mob::LiveDurableSourceObservation::Archived) => Ok(true),
+            Ok(meerkat_mob::LiveDurableSourceObservation::Absent) => {
+                Err(ChildMobHoldReason::OwnerAbsent)
+            }
+            Ok(other) => Err(ChildMobHoldReason::OwnerUnobservable(format!("{other:?}"))),
+            Err(error) => Err(ChildMobHoldReason::OwnerUnobservable(error.to_string())),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn hold_child_mob(&self, held: HeldChildMob) {
+        tracing::warn!(
+            mob_id = %held.mob_id,
+            owner = %held.owner,
+            reason = %held.reason,
+            "holding a restored child mob before activation"
+        );
+        self.held_child_mobs
+            .write()
+            .await
+            .insert(held.mob_id.clone(), held);
+    }
+
+    /// Tear down a persisted child mob without activating it: the actor
+    /// admits the destroy (as the console principal) before any restored work
+    /// starts, then the ordinary destroy envelope runs. A refused admission
+    /// holds the child as `TeardownBlocked`; it admits no fresh destroy, but
+    /// earlier recovery may have written, and an uncertain append error does
+    /// not prove nothing was. A held child's row is replaced only once the
+    /// resumed mob is registered as managed.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn tear_down_archived_child_mob(
+        &self,
+        storage: MobStorage,
+        path: &Path,
+        mob_id: MobId,
+        owner: SessionId,
+    ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
+        // The admission and the transfer to managed custody run detached
+        // when this state is shared, so a cancelled caller cannot strand the
+        // child between them.
+        let custody = match self.self_weak.get().and_then(std::sync::Weak::upgrade) {
+            Some(state) => {
+                let path = path.to_path_buf();
+                let mob_id = mob_id.clone();
+                let handoff = self
+                    .state_tasks
+                    .spawn(
+                        state_tasks::StateTaskKind::Owned,
+                        "child mob teardown handoff",
+                        async move {
+                            state
+                                .admit_child_teardown_into_custody(storage, path, mob_id, owner)
+                                .await
+                        },
+                    )
+                    .ok_or_else(|| MobMcpDestroyError::Mob(Self::stood_down_error()))?;
+                handoff.await.map_err(|_| {
+                    MobMcpDestroyError::Mob(MobError::Internal(
+                        "child mob teardown handoff ended without a result".to_string(),
+                    ))
+                })??
+            }
+            None => {
+                self.admit_child_teardown_into_custody(
+                    storage,
+                    path.to_path_buf(),
+                    mob_id.clone(),
+                    owner,
+                )
+                .await?
+            }
+        };
+        // While `custody` is held, this envelope is the only destroy in
+        // flight; once it is dropped, on any path, the actor's own retry
+        // recovers whatever cleanup remains.
+        let result = self
+            .mob_destroy_unchecked_loaded(&mob_id, MobDestroyCaller::Console)
+            .await;
+        drop(custody);
+        result
+    }
+
+    /// Admit a held or archived child's destroy before it starts and move it
+    /// into managed custody. Its held row is replaced only once the resumed
+    /// mob is registered; a refusal keeps or makes it held.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn admit_child_teardown_into_custody(
+        &self,
+        storage: MobStorage,
+        path: PathBuf,
+        mob_id: MobId,
+        owner: SessionId,
+    ) -> Result<meerkat_mob::runtime::StartAdmittedDestroyCustody, MobMcpDestroyError> {
+        // A teardown is still admitted while a stand-down runs; it is waited
+        // for through the registration below.
+        let _hold = self
+            .hold("child teardown")
+            .map_err(MobMcpDestroyError::Mob)?;
+        let blocked = |error: &MobError| HeldChildMob {
+            mob_id: mob_id.clone(),
+            storage_path: path.clone(),
+            owner: owner.clone(),
+            reason: ChildMobHoldReason::TeardownBlocked(error.to_string()),
+        };
+        #[cfg(test)]
+        {
+            let hold = self
+                .teardown_preflight_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(hold) = hold {
+                hold.reached
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                hold.release.notified().await;
+            }
+        }
+        if let Err(error) = self.workgraph_destroy_preflight(&mob_id).await {
+            self.hold_child_mob(blocked(&error)).await;
+            return Err(MobMcpDestroyError::Mob(error));
+        }
+        let scope = child_tool_policy::ChildMobScope::default();
+        let (custody, custody_watch) = meerkat_mob::runtime::start_admitted_destroy_custody();
+        let resumed = self
+            .configure_builder(MobBuilder::for_resume(storage), scope.clone())
+            .before_activation(self.restore_scope_hook(scope))
+            .admit_destroy_before_start(
+                CommandAuthority::principal(self.console_principal.clone()),
+                custody_watch,
+            )
+            .resume()
+            .await;
+        let handle = match resumed {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.hold_child_mob(blocked(&error)).await;
+                return Err(MobMcpDestroyError::Mob(error));
+            }
+        };
+        self.register_resumed_mob(handle, &path)
+            .await
+            .map_err(MobMcpDestroyError::Mob)?;
+        // Managed custody now holds the child: only now does its hold end.
+        self.held_child_mobs.write().await.remove(&mob_id);
+        Ok(custody)
+    }
+
+    /// The held child mob `mob_id`, as its operational lookup answer.
+    async fn held_child_mob_error(&self, mob_id: &MobId) -> Option<MobError> {
+        self.held_child_mobs.read().await.get(mob_id).map(|held| {
+            MobError::held_before_activation(&held.mob_id, &held.owner, held.reason.token())
+        })
+    }
+
+    /// The restored child mobs held before activation, with their owners.
+    pub async fn held_child_mobs(&self) -> Vec<(MobId, SessionId)> {
+        if !self.ensure_restored_best_effort("held_child_mobs").await {
+            return Vec::new();
+        }
+        self.held_child_mobs
+            .read()
+            .await
+            .values()
+            .map(|held| (held.mob_id.clone(), held.owner.clone()))
+            .collect()
+    }
+
+    /// Operator release of a held child mob whose owner never resolves: tear
+    /// it down without activation, through the same admitted destroy as an
+    /// archived owner. An explicit operator decision; restore never does
+    /// this on its own.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn destroy_held_child_mob(
+        &self,
+        mob_id: &MobId,
+    ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
+        self.ensure_restored()
+            .await
+            .map_err(MobMcpDestroyError::Mob)?;
+        let _transfer = self.held_child_transfer.lock().await;
+        // The held row stays until the teardown registers the child as
+        // managed: a cancelled or failed release leaves it held.
+        let held = self
+            .held_child_mobs
+            .read()
+            .await
+            .get(mob_id)
+            .cloned()
+            .ok_or_else(|| MobMcpDestroyError::Mob(MobError::MobNotFound(mob_id.clone())))?;
+        let storage = self.bind_realm_profile_store(
+            MobStorage::persistent(&held.storage_path).map_err(MobMcpDestroyError::Mob)?,
+        );
+        self.tear_down_archived_child_mob(
+            storage,
+            &held.storage_path,
+            held.mob_id.clone(),
+            held.owner.clone(),
+        )
+        .await
+    }
+
+    /// Re-observe every held child mob: a destroy to recover in its history
+    /// or a committed owner resumes it, an archived owner tears it down without
+    /// activation, anything else keeps it held.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn reobserve_held_child_mobs(&self) -> Vec<MobId> {
+        // A reobservation resumes or tears down held children into the
+        // managed set: a closed state starts none, and one already admitted
+        // is waited for by the close.
+        let Ok(_admission) = self.admit("held child reobservation") else {
+            return Vec::new();
+        };
+        let _transfer = self.held_child_transfer.lock().await;
+        let held = self
+            .held_child_mobs
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut destroyed = Vec::new();
+        for held in held {
+            // A transfer cancelled after registration leaves both rows: the
+            // managed mob owns the child, so only the stale hold is dropped.
+            if self.mobs.read().await.contains_key(&held.mob_id) {
+                self.held_child_mobs.write().await.remove(&held.mob_id);
+                continue;
+            }
+            let storage = match MobStorage::persistent(&held.storage_path) {
+                Ok(storage) => self.bind_realm_profile_store(storage),
+                Err(error) => {
+                    tracing::warn!(mob_id = %held.mob_id, error = %error, "held child mob store could not be reopened");
+                    continue;
+                }
+            };
+            // A store whose destroy already finished elsewhere is swept like
+            // restore sweeps an empty store.
+            if matches!(storage.is_event_log_empty().await, Ok(true)) {
+                drop(storage);
+                self.held_child_mobs.write().await.remove(&held.mob_id);
+                if let Err(error) =
+                    Self::remove_storage_files(Some(held.storage_path.as_path())).await
+                {
+                    tracing::error!(error = %error, "empty held child mob store sweep failed");
+                }
+                destroyed.push(held.mob_id.clone());
+                continue;
+            }
+            let archived = match storage.destroy_recovery_pending().await {
+                Ok(true) => false,
+                Ok(false) => match self.resolve_child_mob_owner(&held.owner).await {
+                    Ok(archived) => archived,
+                    Err(reason) => {
+                        if let Some(entry) =
+                            self.held_child_mobs.write().await.get_mut(&held.mob_id)
+                        {
+                            entry.reason = reason;
+                        }
+                        continue;
+                    }
+                },
+                Err(error) => {
+                    if let Some(entry) = self.held_child_mobs.write().await.get_mut(&held.mob_id) {
+                        entry.reason = ChildMobHoldReason::HistoryUnreadable(error.to_string());
+                    }
+                    continue;
+                }
+            };
+            // The held row stays until the child is registered as managed.
+            if archived {
+                if self
+                    .tear_down_archived_child_mob(
+                        storage,
+                        &held.storage_path,
+                        held.mob_id.clone(),
+                        held.owner.clone(),
+                    )
+                    .await
+                    .is_ok()
+                {
+                    destroyed.push(held.mob_id.clone());
+                }
+            } else {
+                match self.resume_persisted_mob(storage, &held.storage_path).await {
+                    Ok(_) => {
+                        self.held_child_mobs.write().await.remove(&held.mob_id);
+                    }
+                    Err(error) => {
+                        tracing::warn!(mob_id = %held.mob_id, error = %error, "held child mob could not be resumed");
+                    }
+                }
+            }
+        }
+        destroyed
+    }
+
     async fn ensure_restored(&self) -> Result<(), MobError> {
         if self.persistent_storage_root.is_none() {
             // A host may still supply a durable council store without a
-            // persistent root (MobKit does): its councils need the same
+            // persistent root (Meta does): its councils need the same
             // post-restart convergence.
             self.schedule_temporary_council_recovery();
             self.schedule_local_forked_participant_sweeper();
@@ -2058,6 +3399,8 @@ impl MobMcpState {
         {
             let mut restored = self.restore_lock.lock().await;
             if !*restored {
+                // A restore registers mobs: held until it is done.
+                let _admission = self.admit("restore")?;
                 // Built in its own frame: every caller of `ensure_restored`
                 // (each mob verb) would otherwise reserve the restore
                 // future's debug frame even on the already-restored path.
@@ -2094,8 +3437,10 @@ impl MobMcpState {
             return;
         };
         let restored_before_ms = self.created_at_ms;
-        tokio::spawn(meerkat_runtime::stack_relief::box_in_own_frame(
-            move || async move {
+        let _ = self.state_tasks.spawn(
+            state_tasks::StateTaskKind::Convergent,
+            "fork_off re-link pass",
+            meerkat_runtime::stack_relief::box_in_own_frame(move || async move {
                 let Some(state) = weak.upgrade() else {
                     return;
                 };
@@ -2111,8 +3456,8 @@ impl MobMcpState {
                         "fork_off re-link pass handled children from a previous process"
                     );
                 }
-            },
-        ));
+            }),
+        );
     }
 
     async fn ensure_restored_best_effort(&self, action: &str) -> bool {
@@ -2145,6 +3490,35 @@ impl MobMcpState {
     ) -> Result<MobId, MobError> {
         // (b) gate, ADJ-P5-11 (same class as mob_create_definition).
         self.require_console_owner(ControlScope::SendCommand)?;
+        let admission = self.admit("mobpack create")?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(state) = self.self_weak.get().and_then(std::sync::Weak::upgrade) {
+            return self
+                .run_admitted_create("mobpack create", async move {
+                    let _admission = admission;
+                    state
+                        .mob_create_from_mobpack_admitted(
+                            definition,
+                            packed_skills,
+                            source_identity,
+                        )
+                        .await
+                })
+                .await;
+        }
+        let _admission = admission;
+        self.mob_create_from_mobpack_admitted(definition, packed_skills, source_identity)
+            .await
+    }
+
+    /// The body of [`Self::mob_create_from_mobpack`] after its admission,
+    /// through the insertion of the created mob.
+    async fn mob_create_from_mobpack_admitted(
+        &self,
+        definition: MobDefinition,
+        packed_skills: BTreeMap<String, Vec<u8>>,
+        source_identity: meerkat_mob::MobDefinitionSourceIdentity,
+    ) -> Result<MobId, MobError> {
         let mut definition = MobBuilder::lower_mobpack_definition(definition, &packed_skills)?;
         definition.source_identity = Some(source_identity);
         let mob_id = definition.id.clone();
@@ -2160,6 +3534,9 @@ impl MobMcpState {
                 "duplicate mobpack create for mob id '{mob_id}' does not match existing verified pack identity"
             )));
         }
+        if self.destroy_cleanup_owed(&mob_id) {
+            return Err(Self::owed_destroy_cleanup_error(&mob_id));
+        }
         let (storage, storage_path) = self.storage_for_new_mob(&mob_id).await?;
         let handle = self
             .configure_builder(
@@ -2169,6 +3546,18 @@ impl MobMcpState {
             .create()
             .await?;
         match self.mobs.write().await.entry(mob_id.clone()) {
+            Entry::Vacant(_) if self.destroy_cleanup_owed(&mob_id) => {
+                // A destroyed mob's storage cleanup is owed under this id;
+                // that storage is never removed here.
+                if let Err(error) = handle.destroy().await {
+                    tracing::warn!(
+                        mob_id = %mob_id,
+                        error = %error,
+                        "mobpack create refused under an owed destroy cleanup failed"
+                    );
+                }
+                Err(Self::owed_destroy_cleanup_error(&mob_id))
+            }
             Entry::Vacant(entry) => {
                 entry.insert(ManagedMob {
                     handle,
@@ -2216,18 +3605,64 @@ impl MobMcpState {
 
     async fn mob_create_definition_inner(
         &self,
-        mut definition: MobDefinition,
+        definition: MobDefinition,
         owner_bridge_session_authority: Option<(SessionId, bool, bool)>,
     ) -> Result<MobId, MobError> {
         // (b) gate, ADJ-P5-11: no per-mob grant can authorize creating a
         // mob that does not exist yet.
         self.require_console_owner(ControlScope::SendCommand)?;
+        let admission = self.admit("mob create")?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(state) = self.self_weak.get().and_then(std::sync::Weak::upgrade) {
+            return self
+                .run_admitted_create("mob create", async move {
+                    let _admission = admission;
+                    state
+                        .mob_create_definition_admitted(definition, owner_bridge_session_authority)
+                        .await
+                })
+                .await;
+        }
+        let _admission = admission;
+        self.mob_create_definition_admitted(definition, owner_bridge_session_authority)
+            .await
+    }
+
+    /// Run an admitted create, which ends by inserting the mob it built, as
+    /// a task this state owns, and wait for its answer. A caller dropped
+    /// mid-create then cannot leave a created mob outside the managed set,
+    /// where no stand-down would see it: the task finishes the insertion (or
+    /// cleans up a duplicate), and a stand-down waits for it.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn run_admitted_create<F>(&self, name: &'static str, create: F) -> Result<MobId, MobError>
+    where
+        F: std::future::Future<Output = Result<MobId, MobError>> + Send + 'static,
+    {
+        let answer = self
+            .state_tasks
+            .spawn(state_tasks::StateTaskKind::Owned, name, create)
+            .ok_or_else(Self::stood_down_error)?;
+        answer.await.map_err(|_| {
+            MobError::Internal(format!("{name} ended without an answer (it panicked)"))
+        })?
+    }
+
+    /// The body of [`Self::mob_create_definition_inner`] after its
+    /// admission, through the insertion of the created mob.
+    async fn mob_create_definition_admitted(
+        &self,
+        mut definition: MobDefinition,
+        owner_bridge_session_authority: Option<(SessionId, bool, bool)>,
+    ) -> Result<MobId, MobError> {
         self.hydrate_definition_skill_sources(&mut definition)
             .await?;
         let mob_id = definition.id.clone();
         self.ensure_restored().await?;
         if self.mobs.read().await.contains_key(&mob_id) {
             return Err(MobError::Internal(format!("mob already exists: {mob_id}")));
+        }
+        if self.destroy_cleanup_owed(&mob_id) {
+            return Err(Self::owed_destroy_cleanup_error(&mob_id));
         }
         let (storage, storage_path) = self.storage_for_new_mob(&mob_id).await?;
         let child = owner_bridge_session_authority.as_ref().is_some_and(
@@ -2259,7 +3694,32 @@ impl MobMcpState {
             );
         }
         let handle = builder.create().await?;
+        #[cfg(test)]
+        {
+            let hold = self
+                .create_insert_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(hold) = hold {
+                hold.reached
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                hold.release.notified().await;
+            }
+        }
         match self.mobs.write().await.entry(mob_id.clone()) {
+            Entry::Vacant(_) if self.destroy_cleanup_owed(&mob_id) => {
+                // A destroyed mob's storage cleanup is owed under this id;
+                // that storage is never removed here.
+                if let Err(error) = handle.destroy().await {
+                    tracing::warn!(
+                        mob_id = %mob_id,
+                        error = %error,
+                        "mob create refused under an owed destroy cleanup failed"
+                    );
+                }
+                return Err(Self::owed_destroy_cleanup_error(&mob_id));
+            }
             Entry::Vacant(entry) => {
                 entry.insert(ManagedMob {
                     handle,
@@ -2291,16 +3751,38 @@ impl MobMcpState {
     /// state's shared capability custody. Hosts needing shared custody must
     /// compose it with [`MobStorage::with_forked_participant_store`] before
     /// building the handle.
+    ///
+    /// A state that has stood down (or is standing down) refuses the handle
+    /// and logs it; [`Self::try_mob_insert_handle`] returns the refusal.
     pub async fn mob_insert_handle(&self, mob_id: MobId, handle: MobHandle) {
-        self.mobs.write().await.insert(
-            mob_id.clone(),
-            ManagedMob {
-                handle: handle.clone(),
-                storage_path: None,
-            },
-        );
+        if let Err(error) = self.try_mob_insert_handle(mob_id.clone(), handle).await {
+            tracing::error!(mob_id = %mob_id, %error, "mob handle not inserted");
+        }
+    }
+
+    /// [`Self::mob_insert_handle`], refusing with a typed error once a
+    /// stand-down has started.
+    pub async fn try_mob_insert_handle(
+        &self,
+        mob_id: MobId,
+        handle: MobHandle,
+    ) -> Result<(), MobError> {
+        let _admission = self.admit("mob insert")?;
+        {
+            let mut mobs = self.mobs.write().await;
+            if self.destroy_cleanup_owed(&mob_id) {
+                return Err(Self::owed_destroy_cleanup_error(&mob_id));
+            }
+            mobs.insert(
+                mob_id.clone(),
+                ManagedMob {
+                    handle: handle.clone(),
+                    storage_path: None,
+                },
+            );
+        }
         self.note_mob_set_changed();
-        // A host that restores mobs by inserting their handles (MobKit) gets
+        // A host that restores mobs by inserting their handles (Meta) gets
         // the council sweep (when its council store is durable) and the
         // fork_off re-link for each restored mob here.
         self.schedule_temporary_council_recovery();
@@ -2308,27 +3790,32 @@ impl MobMcpState {
             let service = self.session_service.clone();
             let delivery = crate::fork_relink::RelinkDelivery::from_state(self);
             let restored_before_ms = self.created_at_ms;
-            tokio::spawn(async move {
-                // A handle inserted before its mob runs (MobKit restores a
-                // stopped mob and activates it later) cannot serve a forker
-                // yet: its outcome is durable and applied once it can.
-                let reports = crate::fork_relink::relink_mob_fork_children(
-                    service,
-                    delivery,
-                    &mob_id,
-                    &handle,
-                    restored_before_ms,
-                )
-                .await;
-                if !reports.is_empty() {
-                    tracing::info!(
-                        mob_id = %mob_id,
-                        children = reports.len(),
-                        "fork_off re-link handled children from a previous process"
-                    );
-                }
-            });
+            let _ = self.state_tasks.spawn(
+                state_tasks::StateTaskKind::Convergent,
+                "inserted mob fork_off re-link",
+                async move {
+                    // A handle inserted before its mob runs (Meta restores a
+                    // stopped mob and activates it later) cannot serve a forker
+                    // yet: its outcome is durable and applied once it can.
+                    let reports = crate::fork_relink::relink_mob_fork_children(
+                        service,
+                        delivery,
+                        &mob_id,
+                        &handle,
+                        restored_before_ms,
+                    )
+                    .await;
+                    if !reports.is_empty() {
+                        tracing::info!(
+                            mob_id = %mob_id,
+                            children = reports.len(),
+                            "fork_off re-link handled children from a previous process"
+                        );
+                    }
+                },
+            );
         }
+        Ok(())
     }
 
     /// The mobs this state manages, as a live view the re-link reads afresh
@@ -2490,10 +3977,54 @@ impl MobMcpState {
     /// canonical destroy completes. Partial cleanup is surfaced as
     /// [`MobMcpDestroyError::Incomplete`] with the report attached so callers
     /// can retry or inspect the still-retained mob authority.
+    ///
+    /// Once the native destroy completed, this state records its canonical
+    /// report, the caller it was admitted for, and the storage cleanup it
+    /// owes, on a task the state owns: a caller cancelled at any point loses
+    /// none of them. The mob's files are removed only after its actor task
+    /// ended, no handle in this process still owns its database observer,
+    /// that observer drained, and the database at the path is still the
+    /// mob's. Until then the destroy answers `Incomplete` with a copy of the
+    /// report that names what is outstanding, an id under it is not created
+    /// again, and a retry by the same caller continues the cleanup and
+    /// answers the canonical report, also while another mob is managed under
+    /// the id, which the retry never destroys; another caller is refused.
+    /// This settles the observer and the files only: reads already entered,
+    /// openers that attach later and other processes stay outside it, so it
+    /// is no statement that deleting the storage was safe.
     pub async fn mob_destroy(
         &self,
         mob_id: &MobId,
     ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
+        self.mob_destroy_for(mob_id, MobDestroyCaller::Console)
+            .await
+    }
+
+    /// [`Self::mob_destroy`] for `caller`, which the destroy records.
+    pub(crate) async fn mob_destroy_for(
+        &self,
+        mob_id: &MobId,
+        caller: MobDestroyCaller,
+    ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
+        // A destroy this state already admitted and natively completed is
+        // continued for its own caller before the actor-routed admission
+        // below, which cannot admit once the actor has exited. While it owes
+        // its storage cleanup it comes first, also over a mob managed under
+        // the id again, which this request then never destroys.
+        match self.retired_destroy_lookup(mob_id, &caller).await {
+            RetiredDestroyLookup::Ordinary => {}
+            RetiredDestroyLookup::OtherCaller => {
+                return Err(MobMcpDestroyError::Mob(MobError::ScopeDenied(
+                    ScopeDenial {
+                        required: ControlScope::Retire,
+                        presented: BTreeSet::new(),
+                    },
+                )));
+            }
+            RetiredDestroyLookup::Caller(retired) => {
+                return self.continue_retired_destroy(mob_id, &retired).await;
+            }
+        }
         // The implicit-mob guard is a roster/lifecycle projection.  Admit the
         // destructive verb first so an ungranted principal cannot use the
         // guard to distinguish implicit from explicit mobs.
@@ -2506,7 +4037,8 @@ impl MobMcpState {
                     .to_string(),
             )));
         }
-        self.mob_destroy_unchecked(mob_id).await
+        self.ensure_restored().await?;
+        self.mob_destroy_unchecked_loaded(mob_id, caller).await
     }
 
     /// Destroy a mob without the implicit-mob guard.
@@ -2517,18 +4049,18 @@ impl MobMcpState {
         mob_id: &MobId,
     ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
         self.ensure_restored().await?;
-        self.mob_destroy_unchecked_loaded(mob_id).await
+        self.mob_destroy_unchecked_loaded(mob_id, MobDestroyCaller::Console)
+            .await
     }
 
-    async fn mob_destroy_unchecked_loaded(
-        &self,
-        mob_id: &MobId,
-    ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
+    /// A destroy is refused while WorkGraph still holds an active Flow
+    /// binding on the mob.
+    async fn workgraph_destroy_preflight(&self, mob_id: &MobId) -> Result<(), MobError> {
         if let Some(workgraph) = self.workgraph_service.as_ref() {
             let active = workgraph
                 .execution_bindings_for_recovery(None)
                 .await
-                .map_err(|error| MobMcpDestroyError::Mob(MobError::Internal(error.to_string())))?
+                .map_err(|error| MobError::Internal(error.to_string()))?
                 .into_iter()
                 .filter(|binding| {
                     matches!(
@@ -2548,12 +4080,23 @@ impl MobMcpState {
                 })
                 .collect::<Vec<_>>();
             if !active.is_empty() {
-                return Err(MobMcpDestroyError::Mob(MobError::Internal(format!(
+                return Err(MobError::Internal(format!(
                     "mob {mob_id} has active WorkGraph Flow bindings and cannot be destroyed: {}",
                     active.join(", ")
-                ))));
+                )));
             }
         }
+        Ok(())
+    }
+
+    async fn mob_destroy_unchecked_loaded(
+        &self,
+        mob_id: &MobId,
+        caller: MobDestroyCaller,
+    ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
+        self.workgraph_destroy_preflight(mob_id)
+            .await
+            .map_err(MobMcpDestroyError::Mob)?;
         let managed = {
             let mobs = self.mobs.read().await;
             mobs.get(mob_id)
@@ -2561,50 +4104,68 @@ impl MobMcpState {
                 .ok_or_else(|| MobMcpDestroyError::Mob(MobError::MobNotFound(mob_id.clone())))?
         };
 
-        // Destroy rides the console-bound handle so chokepoint (a) sees the
-        // console principal (the raw registry handle would bypass the gate).
-        let bound = managed
-            .handle
-            .clone()
-            .with_command_authority(CommandAuthority::principal(self.console_principal.clone()));
-        let destroy_result = bound.destroy().await;
-        // The authority-bound clone retains the SQLite event bus. Release it
-        // before terminal storage deletion so this surface does not extend a
-        // passive watcher's lifetime across the unlink boundary.
-        drop(bound);
-        match destroy_result {
-            Ok(report) => {
-                let removed = self.mobs.write().await.remove(mob_id);
-                self.retired_mobs
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(mob_id.clone());
-                if removed.is_some() {
-                    self.note_mob_set_changed();
-                }
-                let storage_path = removed
-                    .as_ref()
-                    .and_then(|managed| managed.storage_path.clone())
-                    .or_else(|| managed.storage_path.clone());
-                drop(removed);
-                drop(managed);
-                Self::remove_storage_files(storage_path.as_deref())
+        // What the destroy will owe the mob's database, taken before it
+        // starts: what the path holds, and the actor task whose stores drop
+        // only once it ends. A path that cannot be looked at refuses the
+        // destroy before it starts.
+        let actor_task = managed.handle.actor_task_watch();
+        #[cfg(not(target_arch = "wasm32"))]
+        let storage = match managed.storage_path.clone() {
+            Some(path) => {
+                let owed = OwedStorageCleanup::before_destroy(&path, actor_task.clone())
                     .await
                     .map_err(MobMcpDestroyError::Mob)?;
-                Ok(report)
+                Some(RetiredMobStorage {
+                    path,
+                    owed: Mutex::new(Some(owed)),
+                })
             }
-            Err(meerkat_mob::MobDestroyError::Incomplete { report }) => {
-                Err(MobMcpDestroyError::Incomplete { report })
-            }
-            Err(meerkat_mob::MobDestroyError::Mob(error)) => Err(MobMcpDestroyError::Mob(error)),
-            Err(other) => {
-                // MobDestroyError is #[non_exhaustive]; future variants we
-                // haven't coded for fall through to a generic internal
-                // error so the caller still gets a readable message.
-                Err(MobMcpDestroyError::Mob(MobError::Internal(format!(
-                    "mob destroy failed: {other}"
-                ))))
-            }
+            None => None,
+        };
+        #[cfg(target_arch = "wasm32")]
+        let storage = None;
+        let destroy = AdmittedDestroy {
+            mob_id: mob_id.clone(),
+            caller,
+            // Destroy rides the console-bound handle so chokepoint (a) sees
+            // the console principal (the raw registry handle would bypass the
+            // gate).
+            bound: managed
+                .handle
+                .clone()
+                .with_command_authority(CommandAuthority::principal(
+                    self.console_principal.clone(),
+                )),
+            actor_task,
+            storage,
+            mobs: Arc::clone(&self.mobs),
+            retired_mobs: Arc::clone(&self.retired_mobs),
+            mob_set_epoch: self.mob_set_epoch.clone(),
+        };
+        drop(managed);
+        // The destroy is the state's own task, so its caller holds nothing of
+        // the mob across it and cannot lose its record by being cancelled.
+        // A state that stood down owns no new task: the destroy is refused
+        // before it starts.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let outcome = self
+                .state_tasks
+                .spawn(
+                    state_tasks::StateTaskKind::Owned,
+                    "mob destroy",
+                    destroy.run(),
+                )
+                .ok_or_else(|| MobMcpDestroyError::Mob(Self::stood_down_error()))?;
+            outcome.await.map_err(|_| {
+                MobMcpDestroyError::Mob(MobError::Internal(
+                    "mob destroy ended without an answer (it panicked)".to_string(),
+                ))
+            })?
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            destroy.run().await
         }
     }
 
@@ -3177,7 +4738,7 @@ impl MobMcpState {
     /// Thin wrapper over [`meerkat_mob::MobHandle::submit_work`] for the
     /// mob-surface crate. Finding C4 — the work-lane Rust API
     /// (`submit_work`/`cancel_work`/`cancel_all_work`) was Rust-only;
-    /// this exposes it to RPC/HTTP consumers such as mobkit.
+    /// this exposes it to RPC/HTTP consumers such as meta.
     pub async fn mob_submit_work(
         &self,
         mob_id: &MobId,
@@ -3770,6 +5331,34 @@ impl MobMcpState {
         {
             return None;
         }
+        self.implicit_mob_in_registry(&bridge_session_id).await
+    }
+
+    /// The implicit delegation mob of `bridge_session_id` among the mobs this
+    /// state already manages, without restoring anything: `None` until the
+    /// managed set is complete (the persistent restore finished, or the host
+    /// declared its own restore done).
+    ///
+    /// Agent mob tool construction seeds its implicit-mob hint with this. A
+    /// persisted member is rebuilt, mob tools included, inside the persistent
+    /// restore, which holds the restore lock; a construction-time lookup that
+    /// restored would wait on the restore it is part of. The hint is only a
+    /// hint: every use goes through [`Self::ensure_implicit_mob_for_model`],
+    /// which validates it and otherwise restores and looks the mob up under
+    /// the per-session lock before it would create one.
+    #[doc(hidden)]
+    pub async fn restored_implicit_mob_for_bridge_session(
+        &self,
+        bridge_session_id: &str,
+    ) -> Option<MobId> {
+        let bridge_session_id = SessionId::parse(bridge_session_id).ok()?;
+        if !self.mob_set_complete() {
+            return None;
+        }
+        self.implicit_mob_in_registry(&bridge_session_id).await
+    }
+
+    async fn implicit_mob_in_registry(&self, bridge_session_id: &SessionId) -> Option<MobId> {
         let mobs = self.mobs.read().await;
         mobs.iter()
             .find(|(_, m)| {
@@ -3777,7 +5366,7 @@ impl MobMcpState {
                     .owner_bridge_session_lifecycle_authority()
                     .is_some_and(|authority| {
                         authority.implicit_delegation_mob
-                            && authority.bridge_session_id == bridge_session_id
+                            && authority.bridge_session_id == *bridge_session_id
                     })
             })
             .map(|(id, _)| id.clone())
@@ -4009,13 +5598,14 @@ impl MobMcpState {
         Ok(())
     }
 
-    /// Scavenge orphaned bridge-session-scoped mobs whose owning sessions no
-    /// longer exist.
+    /// Scavenge bridge-session-scoped mobs whose owning session is archived.
     ///
     /// Called during hydration at startup. For each mob marked
-    /// `DestroyOnOwnerArchive`, checks whether the indexed owning bridge session
-    /// still exists. If not, destroys the mob. Returns the list of scavenged
-    /// mob IDs.
+    /// `DestroyOnOwnerArchive`, observes the owning bridge session's durable
+    /// source and destroys the mob only when the owner is confirmed archived.
+    /// An owner with no durable authority (`Absent`) or one that cannot be
+    /// observed is not an archive: the mob is kept as it is. Returns the list
+    /// of scavenged mob IDs.
     #[doc(hidden)]
     pub async fn scavenge_orphaned_bridge_session_scoped_mobs(&self) -> Vec<MobId> {
         if !self
@@ -4034,6 +5624,10 @@ impl MobMcpState {
     }
 
     async fn scavenge_orphaned_bridge_session_scoped_mobs_inner(&self) -> Vec<MobId> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut scavenged = self.reobserve_held_child_mobs().await;
+        #[cfg(target_arch = "wasm32")]
+        let mut scavenged = Vec::new();
         // Collect bridge-session-scoped cleanup candidates under a read lock.
         let candidates: Vec<(MobId, SessionId)> = {
             let mobs = self.mobs.read().await;
@@ -4047,15 +5641,33 @@ impl MobMcpState {
                 .collect()
         };
 
-        let mut scavenged = Vec::new();
         for (mob_id, bridge_session_id) in candidates {
-            let is_orphan = match self.session_service.read(&bridge_session_id).await {
+            // Only a confirmed archive authorizes owner-driven destruction. A
+            // session that reads as not found may merely have no durable
+            // authority yet, and an observation fault proves nothing; both
+            // keep the child.
+            let owner_archived = match self
+                .session_service
+                .observe_live_durable_source(&bridge_session_id)
+                .await
+            {
+                Ok(meerkat_mob::LiveDurableSourceObservation::Archived) => true,
                 Ok(_) => false,
-                Err(SessionError::NotFound { .. }) => true,
-                Err(_) => false, // Unknown error — don't scavenge
+                Err(error) => {
+                    tracing::warn!(
+                        mob_id = %mob_id,
+                        bridge_session_id = %bridge_session_id,
+                        error = %error,
+                        "could not observe the owner of a bridge-session-scoped mob; keeping it"
+                    );
+                    false
+                }
             };
-            if is_orphan {
-                if let Err(error) = self.mob_destroy_unchecked_loaded(&mob_id).await {
+            if owner_archived {
+                if let Err(error) = self
+                    .mob_destroy_unchecked_loaded(&mob_id, MobDestroyCaller::Console)
+                    .await
+                {
                     tracing::warn!(
                         mob_id = %mob_id,
                         bridge_session_id = %bridge_session_id,
@@ -4086,18 +5698,18 @@ impl MobMcpState {
     /// verbs are then gated once, at chokepoint (a), against this principal.
     pub async fn handle_for(&self, mob_id: &MobId) -> Result<MobHandle, MobError> {
         self.ensure_restored().await?;
-        self.mobs
-            .read()
-            .await
-            .get(mob_id)
-            .map(|m| {
-                m.handle
-                    .clone()
-                    .with_command_authority(CommandAuthority::principal(
-                        self.console_principal.clone(),
-                    ))
-            })
-            .ok_or_else(|| MobError::MobNotFound(mob_id.clone()))
+        let handle = self.mobs.read().await.get(mob_id).map(|m| {
+            m.handle
+                .clone()
+                .with_command_authority(CommandAuthority::principal(self.console_principal.clone()))
+        });
+        match handle {
+            Some(handle) => Ok(handle),
+            None => Err(self
+                .held_child_mob_error(mob_id)
+                .await
+                .unwrap_or_else(|| MobError::MobNotFound(mob_id.clone()))),
+        }
     }
 
     /// Resolve a console-bound handle and enter the actor-linearized scope
@@ -4949,6 +6561,8 @@ impl CoreCommsRuntime for LocalCommsRuntime {
 
 struct LocalSessionActor {
     comms: Arc<LocalCommsRuntime>,
+    /// The mob the session was built for, from its typed member binding.
+    mob: Option<MobId>,
     witness: meerkat_session::LiveSessionActorWitness,
     // The lock covers sequence allocation and broadcast send together, so
     // concurrent publishers cannot send allocated sequences out of order.
@@ -5049,6 +6663,10 @@ impl LocalSessionService {
             .and_then(|build| build.resume_session.as_ref())
             .map(|session| session.id().clone())
             .unwrap_or_default();
+        let mob = build
+            .as_ref()
+            .and_then(|build| build.mob_member_binding.as_ref())
+            .map(|binding| MobId::from(binding.mob_id.as_str()));
         let n = self
             .counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5118,6 +6736,7 @@ impl LocalSessionService {
                 sid.clone(),
                 LocalSessionActor {
                     comms,
+                    mob,
                     witness: witness.clone(),
                     next_event_seq: std::sync::Mutex::new(1),
                 },
@@ -5822,8 +7441,17 @@ impl MobSessionService for LocalSessionService {
         )
     }
 
-    async fn session_belongs_to_mob(&self, _session_id: &SessionId, _mob_id: &MobId) -> bool {
-        true
+    /// A live session belongs to the mob its typed member binding named when
+    /// it was built. Several mobs share this service: a session is never
+    /// reported as another mob's, and one built without a member binding is
+    /// no mob's.
+    async fn session_belongs_to_mob(&self, session_id: &SessionId, mob_id: &MobId) -> bool {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .and_then(|actor| actor.mob.as_ref())
+            .is_some_and(|owner| owner == mob_id)
     }
 }
 
@@ -6121,40 +7749,51 @@ impl MobMcpDispatcher {
         let registry_for_task = Arc::clone(&registry);
         let operation_id_for_task = operation_id.clone();
         let mob_id_for_task = mob_id.clone();
-        tokio::spawn(async move {
-            let started = Instant::now();
-            match state
-                .mob_wait_ready(&mob_id_for_task, member_ids, timeout_ms)
-                .await
-            {
-                Ok(members) => {
-                    let content = match serde_json::to_string(&json!({ "members": members })) {
-                        Ok(content) => content,
-                        Err(error) => {
-                            let _ = registry_for_task.fail_operation(
-                                &operation_id_for_task,
-                                format!("encode mob_wait_ready background result: {error}"),
-                            );
-                            return;
-                        }
-                    };
-                    let duration_ms =
-                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    let result = OperationResult {
-                        id: operation_id_for_task.clone(),
-                        content,
-                        is_error: false,
-                        duration_ms,
-                        tokens_used: 0,
-                    };
-                    let _ = registry_for_task.complete_operation(&operation_id_for_task, result);
+        let tasks = Arc::clone(&self.state);
+        let admitted = tasks.state_tasks.spawn(
+            state_tasks::StateTaskKind::Owned,
+            "detached mob_wait_ready",
+            async move {
+                let started = Instant::now();
+                match state
+                    .mob_wait_ready(&mob_id_for_task, member_ids, timeout_ms)
+                    .await
+                {
+                    Ok(members) => {
+                        let content = match serde_json::to_string(&json!({ "members": members })) {
+                            Ok(content) => content,
+                            Err(error) => {
+                                let _ = registry_for_task.fail_operation(
+                                    &operation_id_for_task,
+                                    format!("encode mob_wait_ready background result: {error}"),
+                                );
+                                return;
+                            }
+                        };
+                        let duration_ms =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        let result = OperationResult {
+                            id: operation_id_for_task.clone(),
+                            content,
+                            is_error: false,
+                            duration_ms,
+                            tokens_used: 0,
+                        };
+                        let _ =
+                            registry_for_task.complete_operation(&operation_id_for_task, result);
+                    }
+                    Err(error) => {
+                        let _ = registry_for_task
+                            .fail_operation(&operation_id_for_task, error.to_string());
+                    }
                 }
-                Err(error) => {
-                    let _ =
-                        registry_for_task.fail_operation(&operation_id_for_task, error.to_string());
-                }
-            }
-        });
+            },
+        );
+        if admitted.is_none() {
+            let error = MobMcpState::stood_down_error();
+            let _ = registry.fail_operation(&operation_id, error.to_string());
+            return Some(Err(ToolError::execution_failed(error.to_string())));
+        }
 
         Some(Self::encode_detached_wait_result(
             call,
@@ -6192,6 +7831,7 @@ fn tool(name: &str, description: &str, input_schema: serde_json::Value) -> Arc<T
         provenance: Some(ToolProvenance {
             kind: ToolSourceKind::Mob,
             source_id: "mob".into(),
+            artifact: None,
         }),
     })
 }
@@ -8284,6 +9924,9 @@ mod tests {
         counter: AtomicU64,
         start_turn_delay_ms: AtomicU64,
         start_turn_calls: AtomicU64,
+        /// Sessions created or revived through the actor-slot path, the one
+        /// every member activation takes.
+        session_activations: AtomicU64,
         /// Counting-wrapper guard state: full-document reads through
         /// `load_persisted_session`.
         persisted_full_loads: AtomicU64,
@@ -8298,6 +9941,14 @@ mod tests {
         /// The application tool policy of every build, by session, in order.
         build_policies:
             std::sync::Mutex<Vec<(SessionId, meerkat_core::ApplicationToolPolicyBinding)>>,
+        /// Scripted owner observations: a session listed here answers
+        /// `observe_live_durable_source` with this outcome (an `Err` string is
+        /// a store fault) instead of its projection visibility.
+        scripted_observations: std::sync::Mutex<
+            HashMap<SessionId, Result<meerkat_mob::LiveDurableSourceObservation, String>>,
+        >,
+        /// Archives of these sessions park until their hold is released.
+        archive_holds: std::sync::Mutex<HashMap<SessionId, Arc<InsertHold>>>,
     }
 
     impl MockSessionSvc {
@@ -8312,12 +9963,37 @@ mod tests {
                 counter: AtomicU64::new(0),
                 start_turn_delay_ms: AtomicU64::new(0),
                 start_turn_calls: AtomicU64::new(0),
+                session_activations: AtomicU64::new(0),
                 persisted_full_loads: AtomicU64::new(0),
                 persisted_metadata_loads: AtomicU64::new(0),
                 session_usage: RwLock::new(HashMap::new()),
                 runtime_adapter: Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
                 build_policies: std::sync::Mutex::default(),
+                scripted_observations: std::sync::Mutex::default(),
+                archive_holds: std::sync::Mutex::default(),
             }
+        }
+
+        /// Park every archive of `id` until the returned hold is released.
+        fn hold_archive(&self, id: SessionId) -> Arc<InsertHold> {
+            let hold = Arc::new(InsertHold::default());
+            self.archive_holds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id, Arc::clone(&hold));
+            hold
+        }
+
+        /// Script what `observe_live_durable_source` reports for `id`.
+        fn script_observation(
+            &self,
+            id: &SessionId,
+            outcome: Result<meerkat_mob::LiveDurableSourceObservation, String>,
+        ) {
+            self.scripted_observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id.clone(), outcome);
         }
 
         /// Give one session id a distinct billing total.
@@ -8377,11 +10053,14 @@ mod tests {
                     self.start_turn_delay_ms.load(Ordering::Relaxed),
                 ),
                 start_turn_calls: AtomicU64::new(0),
+                session_activations: AtomicU64::new(0),
                 persisted_full_loads: AtomicU64::new(0),
                 persisted_metadata_loads: AtomicU64::new(0),
                 session_usage: RwLock::new(self.session_usage.read().await.clone()),
                 runtime_adapter: Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
                 build_policies: std::sync::Mutex::new(self.build_policies_snapshot()),
+                scripted_observations: std::sync::Mutex::default(),
+                archive_holds: std::sync::Mutex::default(),
             }
         }
 
@@ -8390,6 +10069,7 @@ mod tests {
             req: CreateSessionRequest,
             actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
         ) -> Result<RunResult, SessionError> {
+            self.session_activations.fetch_add(1, Ordering::Relaxed);
             let build = req.build;
             let mut persisted_session = build
                 .as_ref()
@@ -8588,6 +10268,10 @@ mod tests {
             self.start_turn_delay_ms.store(delay_ms, Ordering::Relaxed);
         }
 
+        fn session_activation_count(&self) -> u64 {
+            self.session_activations.load(Ordering::Relaxed)
+        }
+
         fn start_turn_call_count(&self) -> u64 {
             self.start_turn_calls.load(Ordering::Relaxed)
         }
@@ -8784,6 +10468,17 @@ mod tests {
         }
 
         async fn archive(&self, id: &SessionId) -> Result<(), SessionError> {
+            let hold = self
+                .archive_holds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(id)
+                .cloned();
+            if let Some(hold) = hold {
+                hold.reached
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                hold.release.notified().await;
+            }
             if let Some(reason) = self.archive_failures.read().await.get(id).cloned() {
                 return Err(SessionError::Unsupported(reason));
             }
@@ -8805,6 +10500,12 @@ mod tests {
                 notifier.notify_waiters();
             }
             if removed_live || removed_persisted {
+                // An archived session reports an archive terminal, as the
+                // persistent service does.
+                self.script_observation(
+                    id,
+                    Ok(meerkat_mob::LiveDurableSourceObservation::Archived),
+                );
                 Ok(())
             } else {
                 Err(SessionError::NotFound { id: id.clone() })
@@ -8897,8 +10598,22 @@ mod tests {
             &self,
             session_id: &SessionId,
         ) -> Result<meerkat_mob::LiveDurableSourceObservation, SessionError> {
-            meerkat_mob::observe_live_durable_source_via_projection_visibility(self, session_id)
-                .await
+            let scripted = self
+                .scripted_observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(session_id)
+                .cloned();
+            match scripted {
+                Some(Ok(observation)) => Ok(observation),
+                Some(Err(fault)) => Err(SessionError::Store(fault.into())),
+                None => {
+                    meerkat_mob::observe_live_durable_source_via_projection_visibility(
+                        self, session_id,
+                    )
+                    .await
+                }
+            }
         }
 
         async fn fork_persisted_session_at_turn_boundary(
@@ -9962,7 +11677,7 @@ mod tests {
         );
     }
 
-    /// Counting-wrapper guard (mobkit ask-24 clause 3): the persisted
+    /// Counting-wrapper guard (meta ask-24 clause 3): the persisted
     /// ownership probe reads the metadata seam ONLY — exactly one
     /// metadata-view load and ZERO full session-document loads. Regresses if
     /// `owns_persisted_bridge_session` (or anything on its path) reaches for
@@ -12228,6 +13943,85 @@ mod tests {
         assert_eq!(mobs[0].0, mob_id);
     }
 
+    /// A first access cancelled while its restore's owned resume is parked
+    /// before registration leaves the restore incomplete; the resume then
+    /// registers the mob without its caller, and the next access completes
+    /// the restore around that exact registered store instead of resuming it
+    /// a second time (which the incumbent supervisor would refuse).
+    #[tokio::test]
+    async fn a_restore_cancelled_mid_resume_completes_on_the_next_access() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("construct runtime authority")
+                .with_persistent_storage_root(Some(root.path().to_path_buf())),
+        );
+        let mob_id = state
+            .mob_create_definition(explicit_definition("restore-cancelled"))
+            .await
+            .expect("create explicit mob");
+        state
+            .handle_for(&mob_id)
+            .await
+            .expect("predecessor mob handle")
+            .shutdown()
+            .await
+            .expect("retire the predecessor supervisor route");
+
+        let restored = MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+            .expect("construct runtime authority")
+            .with_persistent_storage_root(Some(root.path().to_path_buf()))
+            .into_shared();
+        let hold = Arc::new(InsertHold::default());
+        *restored
+            .resume_insert_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&hold));
+        let first = {
+            let restored = Arc::clone(&restored);
+            tokio::spawn(async move { restored.mob_list().await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !hold.reached.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the restore's resume reaches its registration seam");
+        first.abort();
+        assert!(
+            first
+                .await
+                .expect_err("the first access was cancelled")
+                .is_cancelled()
+        );
+
+        *restored
+            .resume_insert_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        hold.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !restored.mobs.read().await.contains_key(&mob_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the owned resume registers the mob without its caller");
+
+        let mobs = restored
+            .mob_list()
+            .await
+            .expect("the next access completes the restore");
+        assert_eq!(mobs.len(), 1);
+        assert_eq!(mobs[0].0, mob_id);
+        restored
+            .handle_for(&mob_id)
+            .await
+            .expect("the one restored mob");
+    }
+
     /// A host spawn customizer that widens every member's application tool
     /// policy to Unmanaged, recording each call: the mob, the spawn source,
     /// the member and, on a resume, the session of its resume view.
@@ -12452,6 +14246,955 @@ mod tests {
         (Arc::new(svc.cold_restart().await), mob_id, session)
     }
 
+    fn standing_state() -> Arc<MobMcpState> {
+        let svc = Arc::new(MockSessionSvc::new());
+        MobMcpState::new(svc, meerkat_mob::MobControlPrincipal::Owner)
+            .expect("runtime custody")
+            .into_shared()
+    }
+
+    fn far_deadline() -> std::time::Instant {
+        std::time::Instant::now() + Duration::from_secs(10)
+    }
+
+    /// Owned work is joined, never aborted: a stand-down that cannot wait
+    /// for it reports it unsettled and does not seal; once it finishes, a
+    /// later stand-down is clean and seals the state.
+    #[tokio::test]
+    async fn stand_down_joins_owned_work_and_seals_only_when_it_finished() {
+        let state = standing_state();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (task_release, task_finished) = (Arc::clone(&release), Arc::clone(&finished));
+        state
+            .state_tasks
+            .spawn(
+                state_tasks::StateTaskKind::Owned,
+                "test owned work",
+                async move {
+                    task_release.notified().await;
+                    task_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                },
+            )
+            .expect("an open state admits owned work");
+
+        let early = state
+            .stand_down(std::time::Instant::now() + Duration::from_millis(50))
+            .await;
+        assert!(
+            matches!(&early, MobStateStandDown::Unsettled { reasons } if reasons.iter().any(|reason| reason.contains("test owned work"))),
+            "owned work still running is reported: {early:?}"
+        );
+        assert!(
+            !finished.load(std::sync::atomic::Ordering::SeqCst),
+            "owned work is never aborted"
+        );
+        assert!(
+            state
+                .state_tasks
+                .spawn(
+                    state_tasks::StateTaskKind::Periodic,
+                    "late periodic",
+                    async {}
+                )
+                .is_none(),
+            "a closed state starts no periodic work"
+        );
+
+        release.notify_one();
+        assert_eq!(
+            state.stand_down(far_deadline()).await,
+            MobStateStandDown::Clean
+        );
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            state
+                .state_tasks
+                .spawn(state_tasks::StateTaskKind::Owned, "after seal", async {})
+                .is_none(),
+            "a sealed state admits nothing"
+        );
+        let refused = state
+            .mob_create_definition(explicit_definition("after-stand-down"))
+            .await
+            .expect_err("a stood-down state admits no new mob");
+        assert!(refused.to_string().contains("stood down"), "{refused}");
+    }
+
+    /// Periodic and convergent work is aborted, so it never holds a
+    /// stand-down; owned work started while the stand-down runs (the second
+    /// half of earlier admitted work) is admitted and joined too.
+    #[tokio::test]
+    async fn stand_down_aborts_loops_and_joins_late_owned_work() {
+        let state = standing_state();
+        for kind in [
+            state_tasks::StateTaskKind::Periodic,
+            state_tasks::StateTaskKind::Convergent,
+        ] {
+            state
+                .state_tasks
+                .spawn(kind, "test loop", std::future::pending::<()>())
+                .expect("an open state admits background work");
+        }
+        let release = Arc::new(tokio::sync::Notify::new());
+        let task_release = Arc::clone(&release);
+        state
+            .state_tasks
+            .spawn(
+                state_tasks::StateTaskKind::Owned,
+                "first owned",
+                async move {
+                    task_release.notified().await;
+                },
+            )
+            .expect("owned work admitted");
+
+        let standing = Arc::clone(&state);
+        let stand_down = tokio::spawn(async move { standing.stand_down(far_deadline()).await });
+        // Let the stand-down close admission and start joining.
+        while state.state_tasks.admits_new_work() {
+            tokio::task::yield_now().await;
+        }
+        let late_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let late = Arc::clone(&late_finished);
+        state
+            .state_tasks
+            .spawn(
+                state_tasks::StateTaskKind::Owned,
+                "late owned",
+                async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    late.store(true, std::sync::atomic::Ordering::SeqCst);
+                },
+            )
+            .expect("a closed but unsealed state still admits owned work");
+        release.notify_one();
+        let outcome = stand_down.await.expect("stand-down task");
+        assert_eq!(outcome, MobStateStandDown::Clean);
+        assert!(
+            late_finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the late owned work was joined before the state sealed"
+        );
+    }
+
+    /// The work stays in the state's custody while a stand-down waits for
+    /// it: a stand-down that is cancelled mid-wait, or two that run at once,
+    /// never report clean while owned work runs.
+    #[tokio::test]
+    async fn cancelled_and_concurrent_stand_downs_never_report_clean_early() {
+        let state = standing_state();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let task_release = Arc::clone(&release);
+        state
+            .state_tasks
+            .spawn(
+                state_tasks::StateTaskKind::Owned,
+                "held owned work",
+                async move {
+                    task_release.notified().await;
+                },
+            )
+            .expect("owned work admitted");
+
+        let standing = Arc::clone(&state);
+        let cancelled = tokio::spawn(async move { standing.stand_down(far_deadline()).await });
+        while state.state_tasks.admits_new_work() {
+            tokio::task::yield_now().await;
+        }
+        cancelled.abort();
+        let _ = cancelled.await;
+
+        let short = || std::time::Instant::now() + Duration::from_millis(30);
+        let (first, second) = tokio::join!(state.stand_down(short()), state.stand_down(short()));
+        for outcome in [first, second] {
+            assert!(
+                matches!(&outcome, MobStateStandDown::Unsettled { reasons } if reasons.iter().any(|reason| reason.contains("held owned work"))),
+                "owned work still running is reported by every call: {outcome:?}"
+            );
+        }
+        release.notify_one();
+        assert_eq!(
+            state.stand_down(far_deadline()).await,
+            MobStateStandDown::Clean
+        );
+    }
+
+    /// A caller admitted before the close holds the state through its
+    /// writes: the stand-down waits for it, and no new caller is admitted.
+    #[tokio::test]
+    async fn an_admitted_caller_holds_the_stand_down_until_it_is_done() {
+        let state = standing_state();
+        let mob_id = state
+            .mob_create_definition(explicit_definition("inserted-later"))
+            .await
+            .expect("create a mob whose handle is inserted later");
+        let handle = state.handle_for(&mob_id).await.expect("its handle");
+        let admitted = state
+            .state_tasks
+            .admit("test create")
+            .expect("an open state admits a caller");
+
+        let short = || std::time::Instant::now() + Duration::from_millis(30);
+        let early = state.close_admission(short()).await;
+        assert!(
+            matches!(&early, MobStateStandDown::Unsettled { reasons } if reasons.iter().any(|reason| reason.contains("test create"))),
+            "an admitted caller still writing is reported: {early:?}"
+        );
+        assert!(
+            state.state_tasks.admit("late create").is_none(),
+            "a closed state admits no new caller"
+        );
+        let second_half = state
+            .state_tasks
+            .hold("second half")
+            .expect("a closed but unsealed state still admits the second half");
+        drop(admitted);
+        assert_eq!(
+            state.close_admission(far_deadline()).await,
+            MobStateStandDown::Clean,
+            "admission settles once the admitted caller is done"
+        );
+        let held = state.stand_down(short()).await;
+        assert!(
+            matches!(&held, MobStateStandDown::Unsettled { reasons } if reasons.iter().any(|reason| reason.contains("second half"))),
+            "a second-half hold keeps the stand-down open: {held:?}"
+        );
+        drop(second_half);
+        assert_eq!(
+            state.stand_down(far_deadline()).await,
+            MobStateStandDown::Clean
+        );
+        assert!(
+            state.state_tasks.hold("after seal").is_none(),
+            "a sealed state admits nothing"
+        );
+        let refused = state
+            .try_mob_insert_handle(MobId::from("inserted-after-seal"), handle)
+            .await
+            .expect_err("a sealed state inserts no handle");
+        assert!(refused.to_string().contains("stood down"), "{refused}");
+    }
+
+    /// Closing the state's admission also closes every managed mob's own
+    /// admission (D67), so its actor refuses new work too.
+    #[tokio::test]
+    async fn closing_the_state_closes_each_managed_mob() {
+        let state = standing_state();
+        let mob_id = state
+            .mob_create_definition(explicit_definition("closed-with-the-state"))
+            .await
+            .expect("create a managed mob");
+        let handle = state.handle_for(&mob_id).await.expect("its handle");
+        assert!(handle.admission_closed().borrow().is_none());
+        assert_eq!(
+            state.close_admission(far_deadline()).await,
+            MobStateStandDown::Clean
+        );
+        assert_eq!(
+            *handle.admission_closed().borrow(),
+            Some(meerkat_mob::MobAdmissionCloseReason::StandDown)
+        );
+        assert_eq!(
+            state.stand_down(far_deadline()).await,
+            MobStateStandDown::Clean
+        );
+    }
+
+    /// A create whose caller is cancelled after its native mob started and
+    /// before the managed-set insertion still inserts that mob: the create
+    /// is the state's own task, so no started mob escapes the managed set,
+    /// and a stand-down waits for the insertion.
+    #[tokio::test]
+    async fn a_create_cancelled_at_insertion_still_inserts_its_mob() {
+        let state = standing_state();
+        let hold = Arc::new(InsertHold::default());
+        *state
+            .create_insert_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&hold));
+        let creating = Arc::clone(&state);
+        let caller = tokio::spawn(async move {
+            creating
+                .mob_create_definition(explicit_definition("cancelled-at-insert"))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !hold.reached.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the create reaches the insertion seam");
+        caller.abort();
+        let cancelled = caller.await.expect_err("the caller was cancelled");
+        assert!(cancelled.is_cancelled());
+
+        let early = state
+            .stand_down(std::time::Instant::now() + Duration::from_millis(50))
+            .await;
+        assert!(
+            matches!(&early, MobStateStandDown::Unsettled { reasons } if reasons.iter().any(|reason| reason.contains("mob create"))),
+            "the parked create holds the stand-down: {early:?}"
+        );
+        hold.release.notify_one();
+        assert_eq!(
+            state.stand_down(far_deadline()).await,
+            MobStateStandDown::Clean
+        );
+        assert!(
+            state
+                .mobs
+                .read()
+                .await
+                .contains_key(&MobId::from("cancelled-at-insert")),
+            "the create finished its insertion without its caller"
+        );
+    }
+
+    /// A close that cannot finish by its deadline (the managed set is held)
+    /// reports what it missed instead of waiting; a later close finishes it.
+    #[tokio::test]
+    async fn a_close_that_misses_its_deadline_reports_it() {
+        let state = standing_state();
+        state
+            .mob_create_definition(explicit_definition("close-after-held-map"))
+            .await
+            .expect("create a managed mob");
+        let held = state.mobs.write().await;
+        let missed = state
+            .close_admission(std::time::Instant::now() + Duration::from_millis(50))
+            .await;
+        assert!(
+            matches!(&missed, MobStateStandDown::Unsettled { reasons } if reasons.iter().any(|reason| reason.contains("before the deadline"))),
+            "a held managed set is reported, not waited on: {missed:?}"
+        );
+        drop(held);
+        assert_eq!(
+            state.close_admission(far_deadline()).await,
+            MobStateStandDown::Clean
+        );
+    }
+
+    /// Owned work that ends without finishing (it panicked) loses its
+    /// outcome: no stand-down is clean after it.
+    #[tokio::test]
+    async fn owned_work_that_panicked_keeps_every_stand_down_unsettled() {
+        let state = standing_state();
+        let rx = state
+            .state_tasks
+            .spawn(
+                state_tasks::StateTaskKind::Owned,
+                "panicking owned",
+                async {
+                    panic!("owned work failed");
+                },
+            )
+            .expect("owned work admitted");
+        let _ = rx.await;
+        for _ in 0..2 {
+            let outcome = state.stand_down(far_deadline()).await;
+            assert!(
+                matches!(&outcome, MobStateStandDown::Unsettled { reasons } if reasons.iter().any(|reason| reason.contains("panicking owned"))),
+                "the lost outcome is reported by every call: {outcome:?}"
+            );
+        }
+    }
+
+    /// The state's own background loops (the local forked-participant
+    /// sweeper, scheduled by restore) are tracked and stood down.
+    #[tokio::test]
+    async fn stand_down_stops_the_scheduled_sweeper() {
+        let state = standing_state();
+        state.set_local_forked_participant_sweep_interval(Duration::from_millis(1));
+        state
+            .mob_list()
+            .await
+            .expect("restore schedules the sweeper");
+        assert_eq!(
+            state.stand_down(far_deadline()).await,
+            MobStateStandDown::Clean
+        );
+        // A sealed state schedules nothing again.
+        state.mob_list().await.expect("listing still answers");
+        assert_eq!(
+            state.stand_down(far_deadline()).await,
+            MobStateStandDown::Clean
+        );
+    }
+
+    /// Seat a worker in a child mob owned by a persisted owner session, stop
+    /// the mob, and cold-restart the service. Returns the restarted service,
+    /// the mob, its owner and the worker's bound session.
+    async fn seat_child_worker_then_exit(
+        svc: &Arc<MockSessionSvc>,
+        root: &std::path::Path,
+        mob_name: &str,
+    ) -> (Arc<MockSessionSvc>, MobId, SessionId, SessionId) {
+        let state = Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("runtime custody")
+                .with_persistent_storage_root(Some(root.to_path_buf())),
+        );
+        let owner = SessionId::new();
+        svc.insert_persisted_session(Session::with_id(owner.clone()))
+            .await;
+        let mob_id = state
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition(mob_name),
+                owner.clone(),
+                true,
+                false,
+            )
+            .await
+            .expect("create child mob");
+        let worker = AgentIdentity::from("worker-1");
+        state
+            .mob_spawn(
+                &mob_id,
+                ProfileName::from("worker"),
+                worker.clone(),
+                Some(MobRuntimeMode::TurnDriven),
+                None,
+                None,
+            )
+            .await
+            .expect("spawn worker");
+        let session = state
+            .mob_resolve_bridge_session_id(&mob_id, &worker)
+            .await
+            .expect("resolve bridge session")
+            .expect("worker bridge session");
+        state
+            .handle_for(&mob_id)
+            .await
+            .expect("predecessor mob handle")
+            .shutdown()
+            .await
+            .expect("retire the predecessor supervisor route");
+        (Arc::new(svc.cold_restart().await), mob_id, owner, session)
+    }
+
+    /// The per-mob store databases under a persistent root.
+    fn mob_store_files(root: &std::path::Path) -> usize {
+        std::fs::read_dir(root.join("mobs"))
+            .expect("read the persistent root")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with(MobMcpState::MOB_STORE_FILE_PREFIX) && name.ends_with(".db")
+                })
+            })
+            .count()
+    }
+
+    fn restored_state(svc: &Arc<MockSessionSvc>, root: &std::path::Path) -> Arc<MobMcpState> {
+        Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("runtime custody")
+                .with_persistent_storage_root(Some(root.to_path_buf())),
+        )
+    }
+
+    /// A lookup of a held child mob answers its hold: the runtime-unavailable
+    /// class with the bounded `reason` token, never a missing mob.
+    fn assert_held_before_activation(result: Result<MobHandle, MobError>, reason: &str) {
+        let Err(error) = result else {
+            panic!("a held child mob has no handle");
+        };
+        assert!(error.is_held_before_activation(), "{error}");
+        assert!(!error.is_missing_target(), "{error}");
+        assert_eq!(
+            error.wire_error_code(),
+            Some(meerkat_contracts::ErrorCode::SessionRuntimeUnavailable)
+        );
+        assert_eq!(
+            error
+                .structured_data()
+                .and_then(|data| data
+                    .get("reason")
+                    .and_then(|value| value.as_str().map(str::to_string)))
+                .as_deref(),
+            Some(reason)
+        );
+    }
+
+    /// The single per-mob store database under a persistent root.
+    fn only_mob_store_file(root: &std::path::Path) -> std::path::PathBuf {
+        let mut files = std::fs::read_dir(root.join("mobs"))
+            .expect("read the persistent root")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(MobMcpState::MOB_STORE_FILE_PREFIX)
+                            && name.ends_with(".db")
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 1, "exactly one mob store");
+        files.remove(0)
+    }
+
+    /// A child mob whose owner is committed restores and activates its members.
+    #[tokio::test]
+    async fn restored_child_mob_with_a_committed_owner_activates() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let (svc, mob_id, owner, _worker_session) =
+            seat_child_worker_then_exit(&svc, root.path(), "owner-committed").await;
+        svc.script_observation(
+            &owner,
+            Ok(meerkat_mob::LiveDurableSourceObservation::Committed { revision: None }),
+        );
+        let activations_before = svc.session_activation_count();
+        let restored = restored_state(&svc, root.path());
+        let status = restored
+            .mob_member_status(&mob_id, &AgentIdentity::from("worker-1"))
+            .await
+            .expect("restore member status");
+        assert_eq!(status.status, meerkat_mob::MobMemberStatus::Active);
+        assert!(
+            svc.session_activation_count() > activations_before,
+            "control: an activating restore rebuilds the member session"
+        );
+    }
+
+    /// A child mob whose owner is confirmed archived is torn down at restore
+    /// without activation: its member session is never rebuilt, its storage
+    /// is removed, and it stays gone across another restart.
+    #[tokio::test]
+    async fn restored_child_mob_of_an_archived_owner_is_destroyed() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let (svc, mob_id, owner, _worker_session) =
+            seat_child_worker_then_exit(&svc, root.path(), "owner-archived").await;
+        svc.script_observation(
+            &owner,
+            Ok(meerkat_mob::LiveDurableSourceObservation::Archived),
+        );
+        let activations_before = svc.session_activation_count();
+        let restored = restored_state(&svc, root.path());
+        assert!(
+            matches!(
+                restored.handle_for(&mob_id).await,
+                Err(MobError::MobNotFound(_))
+            ),
+            "the archived owner's child mob is destroyed"
+        );
+        assert!(
+            mob_store_files(root.path()) == 0,
+            "the child mob's storage is removed"
+        );
+        assert_eq!(
+            svc.session_activation_count(),
+            activations_before,
+            "the teardown never activates the member"
+        );
+        let again = restored_state(&Arc::new(svc.cold_restart().await), root.path());
+        assert!(matches!(
+            again.handle_for(&mob_id).await,
+            Err(MobError::MobNotFound(_))
+        ));
+    }
+
+    /// A child mob whose owner has no durable authority (`Absent`) is held:
+    /// never resumed, reported as unresolved rather than gone, its storage
+    /// kept, while the rest of the restore succeeds. Once the owner is
+    /// committed, a scavenger pass resumes it.
+    #[tokio::test]
+    async fn restored_child_mob_of_an_absent_owner_is_held_until_resolved() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let (svc, mob_id, owner, _worker_session) =
+            seat_child_worker_then_exit(&svc, root.path(), "owner-absent").await;
+        svc.script_observation(
+            &owner,
+            Ok(meerkat_mob::LiveDurableSourceObservation::Absent),
+        );
+        let restored = restored_state(&svc, root.path());
+        assert_held_before_activation(restored.handle_for(&mob_id).await, "owner_absent");
+        assert!(
+            restored.mob_list().await.is_ok(),
+            "a held child does not fail the restore"
+        );
+        assert_eq!(restored.held_child_mobs().await.len(), 1);
+        assert_eq!(
+            mob_store_files(root.path()),
+            1,
+            "the held child's storage remains"
+        );
+
+        svc.script_observation(
+            &owner,
+            Ok(meerkat_mob::LiveDurableSourceObservation::Committed { revision: None }),
+        );
+        assert!(
+            restored
+                .scavenge_orphaned_bridge_session_scoped_mobs()
+                .await
+                .is_empty(),
+            "a committed owner destroys nothing"
+        );
+        assert!(restored.held_child_mobs().await.is_empty());
+        let status = restored
+            .mob_member_status(&mob_id, &AgentIdentity::from("worker-1"))
+            .await
+            .expect("the resolved child resumes");
+        assert_eq!(status.status, meerkat_mob::MobMemberStatus::Active);
+    }
+
+    /// A store fault while observing the owner holds the child like an
+    /// absent owner: a fault is never evidence of an archive.
+    #[tokio::test]
+    async fn restored_child_mob_is_held_when_its_owner_cannot_be_observed() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let (svc, mob_id, owner, _worker_session) =
+            seat_child_worker_then_exit(&svc, root.path(), "owner-unreadable").await;
+        svc.script_observation(&owner, Err("owner authority unreadable".to_string()));
+        let restored = restored_state(&svc, root.path());
+        assert_held_before_activation(restored.handle_for(&mob_id).await, "owner_unobservable");
+        assert_eq!(
+            mob_store_files(root.path()),
+            1,
+            "the held child's storage remains"
+        );
+    }
+
+    /// An operator releases a held child whose owner never resolves: it is
+    /// destroyed through the ordinary destroy envelope.
+    #[tokio::test]
+    async fn operator_destroys_a_held_child_mob() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let (svc, mob_id, owner, _worker_session) =
+            seat_child_worker_then_exit(&svc, root.path(), "owner-never-resolves").await;
+        svc.script_observation(
+            &owner,
+            Ok(meerkat_mob::LiveDurableSourceObservation::Absent),
+        );
+        let activations_before = svc.session_activation_count();
+        let restored = restored_state(&svc, root.path());
+        assert_held_before_activation(restored.handle_for(&mob_id).await, "owner_absent");
+
+        // A release cancelled while it holds at its WorkGraph preflight
+        // leaves the child held: typed lookup, storage kept, nothing
+        // activated. (This state is not shared, so the release runs on its
+        // caller; the shared, state-owned handoff is pinned below.)
+        let hold = hold_teardown_preflight(&restored);
+        cancel_at_teardown_preflight(restored.destroy_held_child_mob(&mob_id), &hold).await;
+        release_teardown_preflight(&restored);
+        assert_held_before_activation(restored.handle_for(&mob_id).await, "owner_absent");
+        assert_eq!(
+            mob_store_files(root.path()),
+            1,
+            "a cancelled release keeps storage"
+        );
+        assert_eq!(svc.session_activation_count(), activations_before);
+
+        restored
+            .destroy_held_child_mob(&mob_id)
+            .await
+            .expect("the operator releases the held child");
+        assert!(matches!(
+            restored.handle_for(&mob_id).await,
+            Err(MobError::MobNotFound(_))
+        ));
+        assert!(restored.held_child_mobs().await.is_empty());
+        assert_eq!(
+            mob_store_files(root.path()),
+            0,
+            "the released child's storage is removed"
+        );
+        assert_eq!(
+            svc.session_activation_count(),
+            activations_before,
+            "the operator release never activates the member"
+        );
+    }
+
+    /// On a shared state the held child's release hands over to a task the
+    /// state owns: a caller cancelled at the WorkGraph preflight leaves the
+    /// handoff parked and the stand-down unsettled; once the gate is
+    /// notified, the handoff finishes without its caller and the stand-down
+    /// settles.
+    #[tokio::test]
+    async fn a_cancelled_shared_release_finishes_as_a_state_task() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let (svc, mob_id, owner, _worker_session) =
+            seat_child_worker_then_exit(&svc, root.path(), "shared-release").await;
+        svc.script_observation(
+            &owner,
+            Ok(meerkat_mob::LiveDurableSourceObservation::Absent),
+        );
+        let activations_before = svc.session_activation_count();
+        let restored = MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+            .expect("runtime custody")
+            .with_persistent_storage_root(Some(root.path().to_path_buf()))
+            .into_shared();
+        assert_held_before_activation(restored.handle_for(&mob_id).await, "owner_absent");
+
+        let hold = hold_teardown_preflight(&restored);
+        cancel_at_teardown_preflight(restored.destroy_held_child_mob(&mob_id), &hold).await;
+        let parked = restored
+            .stand_down(std::time::Instant::now() + Duration::from_millis(50))
+            .await;
+        assert!(
+            matches!(&parked, MobStateStandDown::Unsettled { reasons } if reasons.iter().any(|reason| reason.contains("child mob teardown handoff"))),
+            "the parked handoff holds the stand-down: {parked:?}"
+        );
+        assert_eq!(
+            mob_store_files(root.path()),
+            1,
+            "nothing is torn down while the handoff is parked"
+        );
+
+        // Clearing the gate's slot would not wake the parked task: notify it.
+        hold.release.notify_one();
+        assert_eq!(
+            restored.stand_down(far_deadline()).await,
+            MobStateStandDown::Clean
+        );
+        assert!(
+            restored.held_child_mobs().await.is_empty(),
+            "the handoff moved the child into managed custody without its caller"
+        );
+        assert_eq!(svc.session_activation_count(), activations_before);
+    }
+
+    /// A scavenger pass cancelled at its teardown preflight, with the owner
+    /// now archived, leaves the child held; a later pass tears it down.
+    #[tokio::test]
+    async fn cancelled_reobservation_keeps_the_child_held() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let (svc, mob_id, owner, _worker_session) =
+            seat_child_worker_then_exit(&svc, root.path(), "reobserve-cancelled").await;
+        svc.script_observation(
+            &owner,
+            Ok(meerkat_mob::LiveDurableSourceObservation::Absent),
+        );
+        let activations_before = svc.session_activation_count();
+        let restored = restored_state(&svc, root.path());
+        assert_held_before_activation(restored.handle_for(&mob_id).await, "owner_absent");
+
+        svc.script_observation(
+            &owner,
+            Ok(meerkat_mob::LiveDurableSourceObservation::Archived),
+        );
+        let hold = hold_teardown_preflight(&restored);
+        cancel_at_teardown_preflight(
+            restored.scavenge_orphaned_bridge_session_scoped_mobs(),
+            &hold,
+        )
+        .await;
+        release_teardown_preflight(&restored);
+        assert_held_before_activation(restored.handle_for(&mob_id).await, "owner_absent");
+        assert_eq!(
+            mob_store_files(root.path()),
+            1,
+            "a cancelled pass keeps storage"
+        );
+        assert_eq!(svc.session_activation_count(), activations_before);
+
+        assert_eq!(
+            restored
+                .scavenge_orphaned_bridge_session_scoped_mobs()
+                .await,
+            vec![mob_id.clone()],
+            "a later pass tears the child down"
+        );
+        assert!(restored.held_child_mobs().await.is_empty());
+        assert_eq!(mob_store_files(root.path()), 0);
+        assert_eq!(svc.session_activation_count(), activations_before);
+    }
+
+    /// Park every child teardown of `state` right before its WorkGraph
+    /// preflight.
+    fn hold_teardown_preflight(state: &MobMcpState) -> Arc<TeardownPreflightHold> {
+        let hold = Arc::new(TeardownPreflightHold::default());
+        *state
+            .teardown_preflight_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hold.clone());
+        hold
+    }
+
+    fn release_teardown_preflight(state: &MobMcpState) {
+        *state
+            .teardown_preflight_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// Drive `future` until its teardown parks at the preflight, then drop
+    /// it: the caller is cancelled exactly there.
+    async fn cancel_at_teardown_preflight<F: std::future::Future>(
+        future: F,
+        hold: &TeardownPreflightHold,
+    ) {
+        let mut future = std::pin::pin!(future);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !hold.reached.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the teardown reaches its preflight"
+            );
+            tokio::select! {
+                biased;
+                _ = &mut future => panic!("the transfer completed before its preflight"),
+                () = tokio::task::yield_now() => {}
+            }
+        }
+    }
+
+    /// The owner binding survives a reset, as cold resume recovers it: a
+    /// child reset before restart is still held when its owner is absent.
+    #[tokio::test]
+    async fn restored_child_mob_keeps_its_owner_binding_across_a_reset() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = restored_state(&svc, root.path());
+        let owner = SessionId::new();
+        svc.insert_persisted_session(Session::with_id(owner.clone()))
+            .await;
+        let mob_id = state
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition("owner-bound-then-reset"),
+                owner.clone(),
+                true,
+                false,
+            )
+            .await
+            .expect("create child mob");
+        state.mob_reset(&mob_id).await.expect("reset the child mob");
+        state
+            .handle_for(&mob_id)
+            .await
+            .expect("child mob handle")
+            .shutdown()
+            .await
+            .expect("retire the predecessor supervisor route");
+        let svc = Arc::new(svc.cold_restart().await);
+        svc.script_observation(
+            &owner,
+            Ok(meerkat_mob::LiveDurableSourceObservation::Absent),
+        );
+        let restored = restored_state(&svc, root.path());
+        assert_held_before_activation(restored.handle_for(&mob_id).await, "owner_absent");
+    }
+
+    /// A durable destroy admission is recovered whatever the owner reads as:
+    /// with the owner unobservable, the child is not held; it resumes into
+    /// the recovery of its admitted destroy.
+    #[tokio::test]
+    async fn admitted_destroy_recovers_when_the_owner_cannot_be_observed() {
+        use meerkat_mob::MobEventStore as _;
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let (svc, mob_id, owner, _worker_session) =
+            seat_child_worker_then_exit(&svc, root.path(), "admitted-then-unobservable").await;
+        meerkat_mob::SqliteMobStores::open(only_mob_store_file(root.path()))
+            .expect("open the child store")
+            .event_store()
+            .append(meerkat_mob::NewMobEvent::for_test(
+                mob_id.clone(),
+                meerkat_mob::MobEventKind::MobDestroying,
+            ))
+            .await
+            .expect("record an admitted destroy");
+        svc.script_observation(&owner, Err("owner authority unreadable".to_string()));
+        let restored = restored_state(&svc, root.path());
+        let handle = restored
+            .handle_for(&mob_id)
+            .await
+            .expect("an admitted destroy resumes into its recovery, not a hold");
+        assert!(restored.held_child_mobs().await.is_empty());
+        assert_eq!(
+            handle.status().await.expect("recovered status"),
+            meerkat_mob::MobState::Destroyed,
+            "the recovered child's public authority stays closed"
+        );
+    }
+
+    /// A durable Destroy quiesce without `MobDestroying` (a destroy that
+    /// latched but did not finish its admission) is read from history too: it
+    /// resumes into the existing recovered intent, not a hold or a fresh
+    /// admission, even with the owner unobservable.
+    #[tokio::test]
+    async fn durable_destroy_quiesce_recovers_when_the_owner_cannot_be_observed() {
+        use meerkat_mob::MobEventStore as _;
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let (svc, mob_id, owner, _worker_session) =
+            seat_child_worker_then_exit(&svc, root.path(), "quiesced-then-unobservable").await;
+        meerkat_mob::SqliteMobStores::open(only_mob_store_file(root.path()))
+            .expect("open the child store")
+            .event_store()
+            .append(meerkat_mob::NewMobEvent::for_test(
+                mob_id.clone(),
+                meerkat_mob::MobEventKind::PlacedCompletionLifecycleQuiesceStarted {
+                    intent:
+                        meerkat_mob::machines::mob_machine::PlacedCompletionLifecycleIntentKind::Destroy,
+                },
+            ))
+            .await
+            .expect("record a durable Destroy quiesce");
+        svc.script_observation(&owner, Err("owner authority unreadable".to_string()));
+        let restored = restored_state(&svc, root.path());
+        restored
+            .handle_for(&mob_id)
+            .await
+            .expect("a durable Destroy quiesce resumes into its recovery, not a hold");
+        assert!(restored.held_child_mobs().await.is_empty());
+    }
+
+    /// RED control for the old scavenger: an owner that merely has no session
+    /// (read reports `NotFound`, the observation reports `Absent`) is not an
+    /// archived owner. The child mob and an unrelated host mob both stay.
+    #[tokio::test]
+    async fn scavenger_keeps_a_child_whose_owner_session_is_not_found() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let state = Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("construct runtime authority"),
+        );
+        let owner = SessionId::new();
+        let mob_id = state
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition("owner-never-persisted"),
+                owner.clone(),
+                true,
+                false,
+            )
+            .await
+            .expect("create child mob");
+        assert!(
+            matches!(svc.read(&owner).await, Err(SessionError::NotFound { .. })),
+            "the owner session reads as not found"
+        );
+        let host_mob = state
+            .mob_create_definition(explicit_definition("owner-never-persisted-sibling"))
+            .await
+            .expect("create an unrelated host mob");
+        let scavenged = state.scavenge_orphaned_bridge_session_scoped_mobs().await;
+        assert!(
+            scavenged.is_empty(),
+            "a not-found owner is not a confirmed archive"
+        );
+        assert!(
+            state.handle_for(&mob_id).await.is_ok(),
+            "the child mob is not destroyed"
+        );
+        assert!(
+            state.handle_for(&host_mob).await.is_ok(),
+            "the host mob is unaffected"
+        );
+    }
+
     /// #1701: restoring a child mob asks the host customizer for each member's
     /// rebuild through `customize_resume`, with the member's bound session.
     #[tokio::test]
@@ -12585,6 +15328,106 @@ mod tests {
         ] {
             assert!(reason.contains(needle), "{needle} missing from: {reason}");
         }
+    }
+
+    /// The in-memory service shared by every mob of one state reports each
+    /// live session as belonging only to the mob it was built for, so the
+    /// aggregate owner check (owner routing, archive classification) never
+    /// reports another mob's member, or a live session no mob built, as
+    /// mob-owned on that mob's account.
+    #[tokio::test]
+    async fn in_memory_sessions_belong_only_to_their_own_mob() {
+        let state = MobMcpState::new_in_memory();
+        let first = state
+            .mob_create_definition(explicit_definition("ownership-first"))
+            .await
+            .expect("create first mob");
+        let second = state
+            .mob_create_definition(explicit_definition("ownership-second"))
+            .await
+            .expect("create second mob");
+        let worker = AgentIdentity::from("worker-1");
+        for mob_id in [&first, &second] {
+            state
+                .mob_spawn(
+                    mob_id,
+                    ProfileName::from("worker"),
+                    worker.clone(),
+                    Some(MobRuntimeMode::TurnDriven),
+                    None,
+                    None,
+                )
+                .await
+                .expect("spawn worker");
+        }
+        let first_session = state
+            .mob_resolve_bridge_session_id(&first, &worker)
+            .await
+            .expect("resolve first session")
+            .expect("first worker session");
+        let second_session = state
+            .mob_resolve_bridge_session_id(&second, &worker)
+            .await
+            .expect("resolve second session")
+            .expect("second worker session");
+        let service = state.session_service();
+        assert!(service.session_belongs_to_mob(&first_session, &first).await);
+        assert!(
+            !service
+                .session_belongs_to_mob(&first_session, &second)
+                .await
+        );
+        assert!(
+            service
+                .session_belongs_to_mob(&second_session, &second)
+                .await
+        );
+        assert!(
+            !service
+                .session_belongs_to_mob(&second_session, &first)
+                .await
+        );
+        assert!(
+            !service
+                .session_belongs_to_mob(&SessionId::new(), &first)
+                .await,
+            "an unknown session is no mob's"
+        );
+        assert!(
+            state
+                .owns_service_reported_bridge_session(&first_session)
+                .await
+        );
+
+        // A live session no mob built is not mob-owned, although mobs exist.
+        let unbound = Session::new();
+        let unbound_id = unbound.id().clone();
+        service
+            .create_session(CreateSessionRequest {
+                injected_context: Vec::new(),
+                model: "claude-opus-5".into(),
+                prompt: "unbound".into(),
+                system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+                max_tokens: None,
+                event_tx: None,
+                build: Some(meerkat_core::service::SessionBuildOptions {
+                    resume_session: Some(unbound),
+                    ..Default::default()
+                }),
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+                labels: None,
+            })
+            .await
+            .expect("create a live session no mob built");
+        assert!(service.has_live_session(&unbound_id).await.expect("live"));
+        assert!(!service.session_belongs_to_mob(&unbound_id, &first).await);
+        assert!(
+            !state
+                .owns_service_reported_bridge_session(&unbound_id)
+                .await,
+            "a live session no mob built is not reported as mob-owned"
+        );
     }
 
     /// #1701 control: the managed host without a child policy that refuses a
@@ -13043,28 +15886,25 @@ mod tests {
         );
 
         svc.clear_archive_failure(&bridge_session_id).await;
-        let retry_report = state
+        // The retained handle still owns the mob database's observer: the
+        // native destroy completes, and its storage cleanup stays owed.
+        let incomplete = state
             .mob_destroy(&mob_id)
             .await
-            .expect("retry should complete cleanup once archive succeeds");
-        assert!(retry_report.metadata_scrubbed);
-        assert!(retry_report.events_cleared);
-        assert!(retry_report.namespace_cleaned);
+            .expect_err("a retained handle keeps the storage cleanup outstanding");
+        let MobMcpDestroyError::Incomplete { report: annotated } = incomplete else {
+            panic!("only the storage cleanup may be outstanding: {incomplete:?}");
+        };
+        assert!(
+            annotated
+                .errors
+                .iter()
+                .any(|error| error.starts_with("storage cleanup outstanding: ")),
+            "the answer names the outstanding cleanup: {annotated:?}"
+        );
         assert!(
             !svc.session_exists(&bridge_session_id).await,
             "complete retry must actually archive the bridge session before storage removal"
-        );
-        assert!(
-            tokio::fs::metadata(&storage_path).await.is_err(),
-            "complete retry should remove persistent mob db"
-        );
-        retained_handle
-            .poll_events(0, 1)
-            .await
-            .expect_err("terminal retained-handle reads must not recreate removed storage");
-        assert!(
-            tokio::fs::metadata(&storage_path).await.is_err(),
-            "terminal retained-handle reads must leave persistent mob storage absent"
         );
         assert!(
             state
@@ -13074,6 +15914,813 @@ mod tests {
                 .is_empty(),
             "complete retry should remove retry anchor"
         );
+        assert!(
+            tokio::fs::metadata(&storage_path).await.is_ok(),
+            "storage a live handle still owns is kept"
+        );
+        retained_handle
+            .poll_events(0, 1)
+            .await
+            .expect("the retained handle still reads its storage");
+
+        drop(retained_handle);
+        let retry_report = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect("the same caller's retry completes the storage cleanup");
+        assert!(retry_report.metadata_scrubbed);
+        assert!(retry_report.events_cleared);
+        assert!(retry_report.namespace_cleaned);
+        assert!(
+            retry_report.errors.is_empty(),
+            "the canonical report carries no stale cleanup error: {retry_report:?}"
+        );
+        assert!(
+            tokio::fs::metadata(&storage_path).await.is_err(),
+            "complete retry should remove persistent mob db"
+        );
+    }
+
+    /// The mob database path, under a persistent root.
+    fn destroy_test_storage_path(root: &std::path::Path, mob_id: &MobId) -> PathBuf {
+        MobMcpState::persistent_storage_path(&MobMcpState::persistent_mob_root(root), mob_id)
+    }
+
+    /// Which of a mob database and its sidecars exist.
+    fn existing_storage_files(path: &std::path::Path) -> Vec<PathBuf> {
+        MobMcpState::storage_file_paths(path)
+            .into_iter()
+            .filter(|path| std::fs::symlink_metadata(path).is_ok())
+            .collect()
+    }
+
+    fn persistent_destroy_state(
+        svc: &Arc<MockSessionSvc>,
+        root: &std::path::Path,
+    ) -> Arc<MobMcpState> {
+        Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("construct runtime authority")
+                .with_persistent_storage_root(Some(root.to_path_buf())),
+        )
+    }
+
+    /// Generated mob operator authority that manages `mob_id`, with a fresh
+    /// principal token.
+    fn managing_authority(mob_id: &MobId) -> meerkat_core::service::MobToolAuthorityContext {
+        let authority =
+            meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority()
+                .expect("generated create-only mob authority");
+        meerkat_runtime::mob_operator_authority::grant_manage_mob(&authority, mob_id.as_str())
+            .expect("generated managed mob scope")
+    }
+
+    fn destroy_surface(
+        state: &Arc<MobMcpState>,
+        bridge_session: SessionId,
+        authority: meerkat_core::service::MobToolAuthorityContext,
+    ) -> AgentMobToolSurface {
+        AgentMobToolSurface::new_with_effective_authority(
+            Arc::clone(state),
+            None,
+            Arc::new(std::sync::RwLock::new(authority)),
+            "claude-sonnet-4-5".to_string(),
+            bridge_session,
+            None,
+            None,
+            None,
+            meerkat_core::service::MobToolSnapshotContext::Standalone,
+        )
+    }
+
+    async fn dispatch_destroy(
+        surface: &AgentMobToolSurface,
+        mob_id: &MobId,
+    ) -> Result<meerkat_core::ToolDispatchOutcome, ToolError> {
+        let args =
+            serde_json::value::RawValue::from_string(json!({ "mob_id": mob_id }).to_string())
+                .expect("raw args");
+        surface
+            .dispatch(ToolCallView {
+                id: "destroy-call",
+                name: "mob_destroy",
+                args: &args,
+            })
+            .await
+    }
+
+    /// Spawn a worker and park the destroy's archive of its session.
+    async fn spawn_worker_with_held_archive(
+        svc: &MockSessionSvc,
+        state: &MobMcpState,
+        mob_id: &MobId,
+    ) -> (Arc<InsertHold>, meerkat_mob::MobActorTaskWatch) {
+        state
+            .mob_spawn(
+                mob_id,
+                ProfileName::from("worker"),
+                AgentIdentity::from("worker-1"),
+                Some(meerkat_mob::MobRuntimeMode::TurnDriven),
+                None,
+                None,
+            )
+            .await
+            .expect("spawn worker");
+        let handle = state.handle_for(mob_id).await.expect("mob handle");
+        let worker_session = handle
+            .resolve_bridge_session_id(&AgentIdentity::from("worker-1"))
+            .await
+            .expect("worker bridge session");
+        let actor_task = handle.actor_task_watch();
+        drop(handle);
+        (svc.hold_archive(worker_session), actor_task)
+    }
+
+    async fn wait_until_reached(hold: &InsertHold) {
+        while !hold.reached.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The record a destroy left, once it exists.
+    async fn recorded_destroy(state: &MobMcpState, mob_id: &MobId) -> Arc<RetiredMob> {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let recorded = state
+                    .retired_mobs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(mob_id)
+                    .cloned();
+                if let Some(recorded) = recorded {
+                    return recorded;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the admitted destroy records its report without its caller")
+    }
+
+    /// A held public reader of the mob database keeps the destroy's storage
+    /// cleanup outstanding: the destroy answers `Incomplete` with a copy of
+    /// the report naming it, the files and the reader stay, and once the
+    /// reader is gone the same caller's retry removes the files and answers
+    /// the canonical report, again on a later retry.
+    #[tokio::test]
+    async fn a_held_reader_keeps_destroy_storage_cleanup_outstanding_until_the_same_caller_retries()
+    {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let mob_id = state
+            .mob_create_definition(explicit_definition("held-reader-destroy"))
+            .await
+            .expect("create explicit mob");
+        let storage_path = destroy_test_storage_path(root.path(), &mob_id);
+        let reader = MobStorage::persistent(&storage_path).expect("a public reader");
+
+        let payload = json!({ "mob_id": mob_id.to_string(), "action": "destroy" });
+        let error =
+            crate::public_mcp::handle_public_tools_call(&state, "meerkat_mob_lifecycle", &payload)
+                .await
+                .expect_err("the held reader keeps the storage cleanup outstanding");
+        let data = error.data.expect("incomplete destroy data");
+        assert_eq!(data["code"], "mob_destroy_incomplete");
+        assert_eq!(data["retryable"], true);
+        let mut canonical = data["destroy_report"].clone();
+        let outstanding = canonical["errors"]
+            .as_array_mut()
+            .and_then(Vec::pop)
+            .expect("the outstanding cleanup is named");
+        // A report without errors serializes no `errors` field.
+        if canonical["errors"].as_array().is_some_and(Vec::is_empty) {
+            canonical
+                .as_object_mut()
+                .expect("report object")
+                .remove("errors");
+        }
+        assert!(
+            outstanding.as_str().is_some_and(|outstanding| {
+                outstanding.starts_with("storage cleanup outstanding: ")
+                    && outstanding.contains("owner handle")
+            }),
+            "{data}"
+        );
+        assert!(
+            state.mob_list().await.expect("list mobs").is_empty(),
+            "the native destroy completed"
+        );
+        assert!(
+            tokio::fs::metadata(&storage_path).await.is_ok(),
+            "the held reader's database is kept"
+        );
+        reader
+            .is_event_log_empty()
+            .await
+            .expect("the held reader still reads");
+
+        drop(reader);
+        let report = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect("the same caller's retry completes the cleanup");
+        assert_eq!(
+            serde_json::to_value(&report).expect("report json"),
+            canonical,
+            "the retry answers the canonical report, without the cleanup annotation"
+        );
+        assert!(existing_storage_files(&storage_path).is_empty());
+        let again = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect("a later retry by the same caller collects the report again");
+        assert_eq!(
+            serde_json::to_value(&again).expect("report json"),
+            canonical
+        );
+    }
+
+    /// An agent's destroy is continued only by the exact caller it was
+    /// admitted for. A surface with the same control principal and bridge
+    /// session but another mob operator authority is denied, so is one with
+    /// the same authority token on another bridge session, and the console
+    /// never continues an agent's destroy; none of them removes anything.
+    #[tokio::test]
+    async fn an_agent_destroy_continues_only_for_its_exact_admitted_caller() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let mob_id = state
+            .mob_create_definition(explicit_definition("agent-destroy-caller"))
+            .await
+            .expect("create explicit mob");
+        let storage_path = destroy_test_storage_path(root.path(), &mob_id);
+        let bridge_session = SessionId::new();
+        let authority = managing_authority(&mob_id);
+        let admitted = destroy_surface(&state, bridge_session.clone(), authority.clone());
+        let other_authority =
+            destroy_surface(&state, bridge_session.clone(), managing_authority(&mob_id));
+        let other_session = destroy_surface(&state, SessionId::new(), authority);
+        let reader = MobStorage::persistent(&storage_path).expect("a public reader");
+
+        let error = dispatch_destroy(&admitted, &mob_id)
+            .await
+            .expect_err("the held reader keeps the storage cleanup outstanding");
+        let data = error.structured_data().expect("incomplete destroy data");
+        assert_eq!(data["code"], "mob_destroy_incomplete", "{error:?}");
+        drop(reader);
+
+        for (surface, caller) in [
+            (&other_authority, "another mob operator authority"),
+            (&other_session, "another bridge session"),
+        ] {
+            let refused = dispatch_destroy(surface, &mob_id).await.expect_err(caller);
+            assert!(
+                matches!(refused, ToolError::AccessDenied { .. }),
+                "{caller}: {refused:?}"
+            );
+        }
+        let console = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect_err("the console never continues an agent's destroy");
+        assert!(
+            matches!(console, MobMcpDestroyError::Mob(MobError::ScopeDenied(_))),
+            "{console:?}"
+        );
+        assert!(
+            tokio::fs::metadata(&storage_path).await.is_ok(),
+            "a refused caller removes nothing"
+        );
+
+        let completed = dispatch_destroy(&admitted, &mob_id)
+            .await
+            .expect("the exact admitted caller completes the cleanup");
+        let body: serde_json::Value =
+            serde_json::from_str(&completed.result.text_content()).expect("destroy JSON");
+        assert_eq!(body["ok"], true);
+        assert!(
+            body["destroy_report"]["errors"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "the canonical report carries no stale cleanup error: {body}"
+        );
+        assert!(existing_storage_files(&storage_path).is_empty());
+    }
+
+    /// While a destroyed mob's storage cleanup is owed, its id is not
+    /// created again, since a new mob would use that storage; once nothing
+    /// is owed the id is free.
+    #[tokio::test]
+    async fn an_id_whose_destroy_storage_cleanup_is_owed_is_not_created_again() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let mob_id = state
+            .mob_create_definition(explicit_definition("owed-cleanup-id"))
+            .await
+            .expect("create explicit mob");
+        let storage_path = destroy_test_storage_path(root.path(), &mob_id);
+        let reader = MobStorage::persistent(&storage_path).expect("a public reader");
+        state
+            .mob_destroy(&mob_id)
+            .await
+            .expect_err("the held reader keeps the storage cleanup outstanding");
+
+        let refused = state
+            .mob_create_definition(explicit_definition("owed-cleanup-id"))
+            .await
+            .expect_err("the id is refused while its cleanup is owed");
+        assert!(
+            refused
+                .to_string()
+                .contains("storage cleanup is still outstanding"),
+            "{refused}"
+        );
+
+        drop(reader);
+        state
+            .mob_destroy(&mob_id)
+            .await
+            .expect("the same caller's retry completes the cleanup");
+        state
+            .mob_create_definition(explicit_definition("owed-cleanup-id"))
+            .await
+            .expect("the id is free once nothing is owed");
+    }
+
+    /// The caller of an admitted destroy is held back after the native
+    /// destroy replied, and then cancelled. The destroy's record keeps the
+    /// canonical report and its cleanup, which finishes without the caller,
+    /// and the same caller's retry answers that report.
+    #[tokio::test]
+    async fn a_destroy_cancelled_after_the_native_reply_keeps_its_report_and_cleanup() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let mob_id = state
+            .mob_create_definition(explicit_definition("cancelled-after-reply"))
+            .await
+            .expect("create explicit mob");
+        let storage_path = destroy_test_storage_path(root.path(), &mob_id);
+        let (archive, mut actor_task) = spawn_worker_with_held_archive(&svc, &state, &mob_id).await;
+
+        let payload = json!({ "mob_id": mob_id.to_string(), "action": "destroy" });
+        let mut caller = Box::pin(crate::public_mcp::handle_public_tools_call(
+            &state,
+            "meerkat_mob_lifecycle",
+            &payload,
+        ));
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                biased;
+                () = wait_until_reached(&archive) => {}
+                outcome = &mut caller => {
+                    panic!("the destroy answered before it archived its member: {outcome:?}")
+                }
+            }
+        })
+        .await
+        .expect("the native destroy archives its member");
+        // From here the caller is never polled again: the native destroy
+        // replies and its actor exits while the caller's continuation waits,
+        // and then the caller is cancelled.
+        archive.release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), actor_task.wait())
+                .await
+                .expect("the actor task ends"),
+            meerkat_mob::MobActorTaskWait::Returned
+        );
+        drop(caller);
+
+        let recorded = recorded_destroy(&state, &mob_id).await;
+        assert_eq!(recorded.caller, MobDestroyCaller::Console);
+        assert!(
+            recorded.report.metadata_scrubbed && recorded.report.events_cleared,
+            "{:?}",
+            recorded.report
+        );
+        let canonical = serde_json::to_value(&recorded.report).expect("report json");
+
+        let retried =
+            crate::public_mcp::handle_public_tools_call(&state, "meerkat_mob_lifecycle", &payload)
+                .await
+                .expect("the same caller's retry answers the recorded destroy");
+        assert_eq!(retried["ok"], true);
+        assert_eq!(retried["destroy_report"], canonical);
+        assert!(existing_storage_files(&storage_path).is_empty());
+    }
+
+    /// An admitted self-destroy may end the task that asked for it: here the
+    /// requesting agent's task is cancelled while the destroy archives the
+    /// member sessions, as a member's own turn is. The destroy still
+    /// finishes on the state's task, removes the storage without any retry,
+    /// and the same caller collects the canonical report afterwards.
+    #[tokio::test]
+    async fn an_admitted_destroy_that_ends_its_callers_task_still_finishes() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let mob_id = state
+            .mob_create_definition(explicit_definition("self-destroy"))
+            .await
+            .expect("create explicit mob");
+        let storage_path = destroy_test_storage_path(root.path(), &mob_id);
+        let (archive, _actor_task) = spawn_worker_with_held_archive(&svc, &state, &mob_id).await;
+        let surface = Arc::new(destroy_surface(
+            &state,
+            SessionId::new(),
+            managing_authority(&mob_id),
+        ));
+
+        let requester = tokio::spawn({
+            let surface = Arc::clone(&surface);
+            let mob_id = mob_id.clone();
+            async move { dispatch_destroy(&surface, &mob_id).await.map(|_| ()) }
+        });
+        tokio::time::timeout(Duration::from_secs(30), wait_until_reached(&archive))
+            .await
+            .expect("the native destroy archives its member");
+        requester.abort();
+        assert!(
+            requester
+                .await
+                .expect_err("the requesting task ended")
+                .is_cancelled()
+        );
+        archive.release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !existing_storage_files(&storage_path).is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the destroy removes its storage without its caller");
+        let recorded = recorded_destroy(&state, &mob_id).await;
+        assert!(!recorded.cleanup_owed());
+
+        let collected = dispatch_destroy(&surface, &mob_id)
+            .await
+            .expect("the same caller collects the report");
+        let body: serde_json::Value =
+            serde_json::from_str(&collected.result.text_content()).expect("destroy JSON");
+        assert_eq!(body["ok"], true);
+        assert_eq!(
+            body["destroy_report"],
+            serde_json::to_value(&recorded.report).expect("report json")
+        );
+    }
+
+    /// A mob registered under a mob's id while that mob's destroy runs is
+    /// another mob: the destroy removes only the instance it destroyed, the
+    /// registered one stays managed, and the destroyed mob's storage cleanup
+    /// stays owed instead of running under it. A retry continues that owed
+    /// cleanup and never destroys the registered mob, a fresh destroy under
+    /// the id never replaces its record, and once the id is free the retry
+    /// settles it.
+    #[tokio::test]
+    async fn a_mob_registered_under_the_id_during_its_destroy_stays_managed() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let mob_id = state
+            .mob_create_definition(explicit_definition("replaced-during-destroy"))
+            .await
+            .expect("create explicit mob");
+        let storage_path = destroy_test_storage_path(root.path(), &mob_id);
+        let (archive, _actor_task) = spawn_worker_with_held_archive(&svc, &state, &mob_id).await;
+        let elsewhere = Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("construct runtime authority"),
+        );
+        let other_id = elsewhere
+            .mob_create_definition(explicit_definition("registered-instead"))
+            .await
+            .expect("create the other mob");
+        let other = elsewhere
+            .handle_for(&other_id)
+            .await
+            .expect("the other mob's handle");
+
+        let destroying = tokio::spawn({
+            let state = Arc::clone(&state);
+            let mob_id = mob_id.clone();
+            async move { state.mob_destroy(&mob_id).await }
+        });
+        tokio::time::timeout(Duration::from_secs(30), wait_until_reached(&archive))
+            .await
+            .expect("the native destroy archives its member");
+        state
+            .try_mob_insert_handle(mob_id.clone(), other)
+            .await
+            .expect("register another mob under the id");
+        archive.release.notify_one();
+
+        let incomplete = destroying
+            .await
+            .expect("the destroy task joins")
+            .expect_err("the cleanup stays owed while another mob holds the id");
+        let MobMcpDestroyError::Incomplete { report } = incomplete else {
+            panic!("only the storage cleanup may be outstanding: {incomplete:?}");
+        };
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("managed under this id again")),
+            "{report:?}"
+        );
+        let managed = state
+            .handle_for(&mob_id)
+            .await
+            .expect("the registered mob stays managed");
+        assert_eq!(
+            managed.definition().id,
+            other_id,
+            "the registered mob, not the destroyed one"
+        );
+        assert!(
+            tokio::fs::metadata(&storage_path).await.is_ok(),
+            "the destroyed mob's storage is kept while the id is managed"
+        );
+
+        // The destroy's own caller retries while the registered mob holds the
+        // id: the retry continues that exact record, and destroys nothing.
+        let recorded = recorded_destroy(&state, &mob_id).await;
+        let registered_task = managed.actor_task_watch();
+        drop(managed);
+        let retried = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect_err("the retry continues the owed cleanup while another mob holds the id");
+        let MobMcpDestroyError::Incomplete { report } = retried else {
+            panic!("the retry continues the recorded destroy: {retried:?}");
+        };
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("managed under this id again")),
+            "{report:?}"
+        );
+        let still_managed = state
+            .handle_for(&mob_id)
+            .await
+            .expect("the registered mob stays managed after the retry");
+        assert!(
+            registered_task.observes(&still_managed),
+            "the same registered mob, not a destroyed or replaced one"
+        );
+        assert!(
+            !still_managed.actor_command_channel_closed_for_test(),
+            "the registered mob's actor still runs"
+        );
+        drop(still_managed);
+        assert!(
+            tokio::fs::metadata(&storage_path).await.is_ok(),
+            "the destroyed mob's storage is still kept"
+        );
+        let retained = recorded_destroy(&state, &mob_id).await;
+        assert!(
+            Arc::ptr_eq(&retained, &recorded),
+            "the retry keeps the destroy's own record"
+        );
+        assert_eq!(
+            retained
+                .storage
+                .as_ref()
+                .map(|storage| storage.path.as_path()),
+            Some(storage_path.as_path())
+        );
+        assert!(retained.cleanup_owed());
+        let agent = destroy_surface(&state, SessionId::new(), managing_authority(&mob_id));
+        let refused = dispatch_destroy(&agent, &mob_id)
+            .await
+            .expect_err("another caller is refused while the cleanup is owed");
+        assert!(
+            matches!(refused, ToolError::AccessDenied { .. }),
+            "{refused:?}"
+        );
+
+        // A route that destroys without consulting the record (session
+        // cleanup) may destroy the registered mob: that fresh destroy never
+        // replaces the owed record.
+        state
+            .mob_destroy_unchecked(&mob_id)
+            .await
+            .expect("the cleanup route destroys the registered mob");
+        assert!(
+            Arc::ptr_eq(&recorded_destroy(&state, &mob_id).await, &recorded),
+            "a fresh destroy under the id keeps the owed record"
+        );
+        assert!(recorded.cleanup_owed());
+        // With the id free, the original caller's retry settles the cleanup.
+        let settled = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect("the original caller's retry settles the cleanup");
+        assert_eq!(
+            serde_json::to_value(&settled).expect("report json"),
+            serde_json::to_value(&recorded.report).expect("report json")
+        );
+        assert!(!recorded.cleanup_owed());
+        assert!(existing_storage_files(&storage_path).is_empty());
+    }
+
+    /// A denied destroy is typed feedback to its caller: nothing is
+    /// destroyed or recorded, and the caller's task is not ended.
+    #[tokio::test]
+    async fn a_denied_agent_destroy_is_typed_feedback_and_destroys_nothing() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let mob_id = state
+            .mob_create_definition(explicit_definition("denied-destroy"))
+            .await
+            .expect("create explicit mob");
+        let storage_path = destroy_test_storage_path(root.path(), &mob_id);
+        let unscoped = destroy_surface(
+            &state,
+            SessionId::new(),
+            meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority()
+                .expect("generated create-only mob authority"),
+        );
+
+        let denied = dispatch_destroy(&unscoped, &mob_id)
+            .await
+            .expect_err("an agent without the mob's scope is denied");
+        assert!(
+            matches!(denied, ToolError::AccessDenied { .. }),
+            "{denied:?}"
+        );
+        assert!(state.handle_for(&mob_id).await.is_ok(), "the mob is kept");
+        assert!(!state.mob_is_retired(&mob_id).await);
+        assert!(
+            !state
+                .retired_mobs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&mob_id),
+            "a denied destroy records nothing"
+        );
+        assert!(tokio::fs::metadata(&storage_path).await.is_ok());
+    }
+
+    /// A file that took the destroyed database's path while its cleanup was
+    /// owed is never removed: the retry reports it and leaves it in place.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_that_took_the_destroyed_database_path_is_never_removed() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let mob_id = state
+            .mob_create_definition(explicit_definition("replaced-database"))
+            .await
+            .expect("create explicit mob");
+        let storage_path = destroy_test_storage_path(root.path(), &mob_id);
+        let reader = MobStorage::persistent(&storage_path).expect("a public reader");
+        state
+            .mob_destroy(&mob_id)
+            .await
+            .expect_err("the held reader keeps the storage cleanup outstanding");
+        drop(reader);
+        // Renamed over the path, so the replacement never shares the
+        // destroyed database's inode.
+        let staged = storage_path.with_extension("replacement");
+        std::fs::write(&staged, b"another database").expect("stage the replacement");
+        std::fs::rename(&staged, &storage_path).expect("replace the database");
+
+        let incomplete = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect_err("a replaced database keeps the cleanup outstanding");
+        let MobMcpDestroyError::Incomplete { report } = incomplete else {
+            panic!("only the storage cleanup may be outstanding: {incomplete:?}");
+        };
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("other than the destroyed mob's database")),
+            "{report:?}"
+        );
+        assert_eq!(
+            std::fs::read(&storage_path).expect("the replacement is kept"),
+            b"another database"
+        );
+    }
+
+    /// A removal that fails part way (the WAL sidecar is a directory) keeps
+    /// the cleanup owed; the database is gone, and once the obstacle is gone
+    /// the same caller's retry removes the rest and answers the canonical
+    /// report.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_partial_storage_removal_is_finished_by_the_same_callers_retry() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let mob_id = state
+            .mob_create_definition(explicit_definition("partial-removal"))
+            .await
+            .expect("create explicit mob");
+        let storage_path = destroy_test_storage_path(root.path(), &mob_id);
+        let reader = MobStorage::persistent(&storage_path).expect("a public reader");
+        state
+            .mob_destroy(&mob_id)
+            .await
+            .expect_err("the held reader keeps the storage cleanup outstanding");
+        drop(reader);
+        let [_, wal, _] = MobMcpState::storage_file_paths(&storage_path);
+        if wal.exists() {
+            std::fs::remove_file(&wal).expect("clear the WAL sidecar");
+        }
+        std::fs::create_dir(&wal).expect("a directory where the WAL sidecar goes");
+
+        let incomplete = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect_err("the obstacle keeps the cleanup outstanding");
+        let MobMcpDestroyError::Incomplete { report } = incomplete else {
+            panic!("only the storage cleanup may be outstanding: {incomplete:?}");
+        };
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("failed to remove mob storage file")),
+            "{report:?}"
+        );
+        assert!(
+            tokio::fs::metadata(&storage_path).await.is_err(),
+            "the database itself was removed"
+        );
+        assert!(wal.is_dir());
+
+        std::fs::remove_dir(&wal).expect("remove the obstacle");
+        let report = state
+            .mob_destroy(&mob_id)
+            .await
+            .expect("the same caller's retry finishes the removal");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert!(existing_storage_files(&storage_path).is_empty());
+    }
+
+    /// Storage is released only by a drain that left nothing of the
+    /// database's observer in this process: none was live, or it closed with
+    /// its catch-up settled, every worker joined and no replacement
+    /// attached. A refusal or anything left open keeps the cleanup owed.
+    #[test]
+    fn only_a_settled_observer_drain_releases_destroyed_storage() {
+        use meerkat_mob::{
+            SqliteMobObserverDrain as Drain, SqliteMobObserverDrainRefused as Refused,
+            SqliteMobObserverDrainReport as Report,
+        };
+        let settled = Report {
+            catch_up_settled: true,
+            joined_workers: 1,
+            panicked_workers: 0,
+            unjoined_workers: 0,
+            joining_elsewhere: 0,
+            replacement_registered: false,
+        };
+        assert!(MobMcpState::observer_drain_settled(Ok(Drain::NotFound)).is_ok());
+        assert!(MobMcpState::observer_drain_settled(Ok(Drain::Closed(settled))).is_ok());
+        for open in [
+            Report {
+                replacement_registered: true,
+                ..settled
+            },
+            Report {
+                catch_up_settled: false,
+                ..settled
+            },
+            Report {
+                unjoined_workers: 1,
+                ..settled
+            },
+            Report {
+                joining_elsewhere: 1,
+                ..settled
+            },
+        ] {
+            assert!(
+                MobMcpState::observer_drain_settled(Ok(Drain::Closed(open))).is_err(),
+                "{open:?}"
+            );
+        }
+        for refused in [
+            Refused::OtherOwners { owner_handles: 1 },
+            Refused::UnresolvedPath {
+                kind: std::io::ErrorKind::NotFound,
+            },
+        ] {
+            assert!(MobMcpState::observer_drain_settled(Err(refused)).is_err());
+        }
     }
 
     #[tokio::test]

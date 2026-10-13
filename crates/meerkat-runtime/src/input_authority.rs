@@ -18,6 +18,19 @@ use crate::identifiers::{IdempotencyKey, LogicalRuntimeId};
 use crate::input::Input;
 use crate::traits::RuntimeDriverError;
 
+/// The native replay lookup's verdict for one admission of a governed input:
+/// the driver's existing qualified-key lookup and exact replay verification,
+/// resolved before the installed host authenticates the input. The runtime
+/// attaches it to the ingress context it hands to the host; nothing else can,
+/// so a host reads it as the runtime's fact, never as a caller's flag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeReplayLookup {
+    /// No admitted input holds this input's qualified key.
+    FirstAuthentication,
+    /// An admitted input holds the key, and this input is its exact replay.
+    RetainedReplay { existing_id: InputId },
+}
+
 /// Per-submission observation from a trusted native ingress producer.
 ///
 /// Construction is an extension trust boundary, not authentication performed
@@ -33,6 +46,7 @@ pub struct NativeIngressContext {
     realm: meerkat_core::connection::RealmId,
     authentication: meerkat_authorization_contracts::evidence::HistoricalEvidenceRef,
     controller_client: Option<meerkat_core::ControllerModelClient>,
+    replay: Option<NativeReplayLookup>,
 }
 
 impl NativeIngressContext {
@@ -66,7 +80,25 @@ impl NativeIngressContext {
             realm,
             authentication,
             controller_client: None,
+            replay: None,
         })
+    }
+
+    /// The native replay lookup's verdict for the admission the host is
+    /// authenticating, attached by the runtime. `None` when this call is not
+    /// the decisive one: a persistent runtime's pre-admission check, whose
+    /// live state cannot rule out a retained replay that only its durable
+    /// store holds; the decisive admission call carries the verdict.
+    pub fn replay_lookup(&self) -> Option<&NativeReplayLookup> {
+        self.replay.as_ref()
+    }
+
+    /// This observation with the runtime's replay lookup verdict attached.
+    pub(crate) fn with_replay_lookup(&self, replay: Option<NativeReplayLookup>) -> Self {
+        Self {
+            replay,
+            ..self.clone()
+        }
     }
 
     /// Attach the actual immutable child selected by the paired agent factory.
@@ -178,6 +210,43 @@ impl From<NativeAdmissionError> for RuntimeDriverError {
 /// fresh retry authentication observation need not equal the original retained
 /// authentication reference.
 pub trait NativeWorkAuthorizationHost: Send + Sync {
+    /// The authority that decides each configured MCP server of
+    /// `session_id` before discovery, spawn or first use. A saved
+    /// configuration row is not authority. The default refuses every
+    /// configured server as unavailable: an installed host that can
+    /// authorize configured attachments must say so explicitly.
+    fn configured_mcp_attachment(
+        &self,
+        _session_id: &meerkat_core::SessionId,
+    ) -> Arc<dyn meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority> {
+        Arc::new(RefuseConfiguredMcpAttachment)
+    }
+
+    /// [`Self::configured_mcp_attachment`] with the session registration's
+    /// own agent binding: the agent the trusted host bound for this exact
+    /// registration, read when each configured server is decided. An unbound
+    /// registration's [`crate::meerkat_machine::SessionAgentBinding::current`]
+    /// is typed unavailable. The default ignores the binding.
+    fn configured_mcp_attachment_for_agent(
+        &self,
+        session_id: &meerkat_core::SessionId,
+        _agent: crate::meerkat_machine::SessionAgentBinding,
+    ) -> Arc<dyn meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority> {
+        self.configured_mcp_attachment(session_id)
+    }
+
+    /// The per-agent selection conjunct of an MCP attachment control: whether
+    /// the registration's bound agent currently holds a grant for the
+    /// control's own server, through the lineage its mandate selected for
+    /// that server. `None` when this host decides attachments without a
+    /// per-agent mandate, which leaves them unchanged.
+    fn mcp_attachment_agent_selection(
+        &self,
+        _agent: crate::meerkat_machine::SessionAgentBinding,
+    ) -> Option<Arc<dyn meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority>> {
+        None
+    }
+
     /// Compose fresh work authorization for one authenticated tool application
     /// operation. The default deliberately refuses; old run authority is never
     /// an admission source for a new UI action.
@@ -193,6 +262,15 @@ pub trait NativeWorkAuthorizationHost: Send + Sync {
     fn context_control_authorization(
         &self,
         _control: Arc<meerkat_core::service::SystemContextControlRequest>,
+    ) -> Result<WorkAuthorizationContext, meerkat_core::OperationAuthorizationError> {
+        Err(meerkat_core::OperationAuthorizationError::Unavailable)
+    }
+
+    /// Native preparation context for one authenticated MCP attachment
+    /// control over the installed owners. Unsupported hosts fail closed.
+    fn mcp_attachment_authorization(
+        &self,
+        _control: Arc<meerkat_core::mcp_attachment_control::McpAttachmentControlRequest>,
     ) -> Result<WorkAuthorizationContext, meerkat_core::OperationAuthorizationError> {
         Err(meerkat_core::OperationAuthorizationError::Unavailable)
     }
@@ -241,6 +319,15 @@ pub trait NativeWorkAuthorizationHost: Send + Sync {
     /// unavailability `AuthorizationUnavailable`; anything not decidable now
     /// is `Readiness`. The default refuses as unsupported: a host that does
     /// not implement it admits no retained-work resume.
+    /// Whether every governed input must name the session document's bound
+    /// scoped destination (see `MeerkatMachine::bind_scoped_context`). When
+    /// true, governed work is refused until a destination is bound and,
+    /// after a restart, recovered governed work stays queued until the
+    /// registration owner binds its destination again.
+    fn requires_scoped_destination(&self) -> bool {
+        false
+    }
+
     fn authenticate_retained_resume(
         &self,
         runtime_id: &LogicalRuntimeId,
@@ -382,6 +469,58 @@ pub(crate) fn unavailable() -> RuntimeDriverError {
 
 /// Lossless bytes as an opaque String in the generated map. No identity or
 /// authority is inferred from a prefix or parsed back out of this encoding.
+/// Opaque digest of the exact destination (owner, runtime, context,
+/// generation, audience) a retained association names, as the generated
+/// machine records it for scoped document custody. Identity only.
+pub(crate) fn context_target_binding(
+    target: &meerkat_authorization_contracts::work_association::NativeWorkTarget,
+) -> Result<String, RuntimeDriverError> {
+    let bytes = serde_json::to_vec(target).map_err(|_| unavailable())?;
+    let mut digest = Sha256::new();
+    digest.update(b"meerkat.scoped-context-target.v1\0");
+    digest.update(&bytes);
+    Ok(hex(&digest.finalize()))
+}
+
+/// Opaque digest of the stable authenticated scope of a destination (owner,
+/// runtime, context, audience), without its generation. A session document
+/// keeps one scope; a rebind only advances the generation.
+pub(crate) fn context_scope_binding(
+    target: &meerkat_authorization_contracts::work_association::NativeWorkTarget,
+) -> Result<String, RuntimeDriverError> {
+    let bytes = serde_json::to_vec(&(
+        &target.logical_owner,
+        &target.logical_runtime,
+        &target.context,
+        &target.audience,
+    ))
+    .map_err(|_| unavailable())?;
+    let mut digest = Sha256::new();
+    digest.update(b"meerkat.scoped-context-scope.v1\0");
+    digest.update(&bytes);
+    Ok(hex(&digest.finalize()))
+}
+
+/// The destination binding a governed input names: its own association's,
+/// or for a retained resume its canonical original contributor's. `None` for
+/// ungoverned input.
+pub(crate) fn input_context_target(input: &Input) -> Result<Option<String>, RuntimeDriverError> {
+    if let Some(grant) = input.header().retained_resume.as_ref() {
+        let canonical = grant
+            .evidence
+            .contributors
+            .first()
+            .ok_or_else(unavailable)?;
+        return context_target_binding(&canonical.association().candidate().target).map(Some);
+    }
+    input
+        .header()
+        .authority_association
+        .as_ref()
+        .map(|association| context_target_binding(&association.candidate().target))
+        .transpose()
+}
+
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -858,6 +997,16 @@ pub(crate) mod tests {
     pub(crate) fn input(requester: &str) -> Input {
         input_with_controller(requester, controller_selection("controller"))
     }
+    /// The same fixture input under its own controller credential account.
+    /// The credential lifecycle lease is process-wide per credential, so
+    /// fixtures that admit concurrently in one test process must not share
+    /// an account.
+    pub(crate) fn input_for_account(requester: &str, account: &str) -> Input {
+        input_with_controller(
+            requester,
+            controller_selection_for_account("controller", account),
+        )
+    }
     fn input_with_controller(
         requester: &str,
         selection: meerkat_core::ControllerModelSelection,
@@ -994,6 +1143,8 @@ pub(crate) mod tests {
         selection: meerkat_core::ControllerModelSelection,
         retained_resume_verdict:
             std::sync::Mutex<Option<crate::retained_work::RetainedResumeError>>,
+        /// Every replay lookup verdict the host was handed, by input.
+        observed_replay: std::sync::Mutex<Vec<(InputId, Option<NativeReplayLookup>)>>,
     }
     impl TestIngress {
         pub(crate) fn new(authority: meerkat_core::handles::GeneratedAuthLeaseHandle) -> Self {
@@ -1008,7 +1159,7 @@ pub(crate) mod tests {
                 ),
             )
         }
-        fn with_selection(
+        pub(crate) fn with_selection(
             authority: meerkat_core::handles::GeneratedAuthLeaseHandle,
             selection: meerkat_core::ControllerModelSelection,
         ) -> Self {
@@ -1024,7 +1175,17 @@ pub(crate) mod tests {
             Self {
                 selection,
                 retained_resume_verdict: std::sync::Mutex::new(None),
+                observed_replay: std::sync::Mutex::new(Vec::new()),
             }
+        }
+        pub(crate) fn observed_replay(&self, input: &InputId) -> Vec<Option<NativeReplayLookup>> {
+            self.observed_replay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|(id, _)| id == input)
+                .map(|(_, replay)| replay.clone())
+                .collect()
         }
         /// The native owner's current verdict on any retained-work resume
         /// becomes an actual denial.
@@ -1054,10 +1215,14 @@ pub(crate) mod tests {
         fn authenticate_association(
             &self,
             _runtime: &LogicalRuntimeId,
-            _input: &Input,
+            input: &Input,
             ingress: &NativeIngressContext,
             association: &InputAuthorityAssociation,
         ) -> Result<(), NativeAdmissionError> {
+            self.observed_replay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((input.id().clone(), ingress.replay_lookup().cloned()));
             let candidate = association.candidate();
             // A static test host checks actual process principals and its
             // allowed invocation shape. There is no InputId-to-caller registry.
@@ -1259,6 +1424,55 @@ pub(crate) mod tests {
             prompt.injected_context.push("new hidden context".into());
         }
         assert!(verify_retained_replay(&decoded.state, &altered).is_err());
+    }
+
+    /// The driver resolves its native replay lookup before the host
+    /// authenticates, and hands the host the verdict on the ingress context:
+    /// the first admission is a first authentication, and an exact retry
+    /// under a fresh transport authentication is the retained replay of the
+    /// admitted row. The host never decides it from a caller field.
+    #[tokio::test]
+    async fn the_host_is_handed_the_native_replay_lookup_verdict() {
+        let mut driver = driver(true);
+        let original = driver.input("caller-a");
+        let first_id = original.id().clone();
+        let AcceptOutcome::Accepted { state, .. } =
+            driver.accept_input(original.clone()).await.expect("first")
+        else {
+            panic!("first admission");
+        };
+        let first = driver.host.observed_replay(&first_id);
+        assert!(
+            !first.is_empty(),
+            "the host authenticated the first admission"
+        );
+        assert!(
+            first
+                .iter()
+                .all(|replay| replay == &Some(NativeReplayLookup::FirstAuthentication)),
+            "{first:?}"
+        );
+
+        let mut retry = original;
+        retry.header_mut().id = InputId::new();
+        retry.header_mut().timestamp = chrono::Utc::now();
+        let retry = attach_ingress(retry, "caller-a", "new-authentication-observation");
+        let retry_id = retry.id().clone();
+        assert!(matches!(
+            driver.accept_input(retry).await.expect("exact retry"),
+            AcceptOutcome::Deduplicated { .. }
+        ));
+        let replayed = driver.host.observed_replay(&retry_id);
+        assert!(
+            replayed.contains(&Some(NativeReplayLookup::RetainedReplay {
+                existing_id: state.input_id.clone(),
+            })),
+            "{replayed:?}"
+        );
+        assert!(
+            !replayed.contains(&Some(NativeReplayLookup::FirstAuthentication)),
+            "a retained replay is never presented as a first authentication"
+        );
     }
 
     /// #1497 2a-2: a continuation carries no native work binding yet, so a
@@ -1666,6 +1880,20 @@ pub(crate) mod tests {
                 .expect("exact row"),
             vec![a.clone()]
         );
+        // The public identity helper is the minted calculation, also after an
+        // association serde round trip. A match is identity only.
+        let minted = &identity.contributors()[0].association_digest;
+        assert_eq!(
+            &crate::retained_work::retained_association_digest(a.association()).expect("digest"),
+            minted
+        );
+        let round_trip: InputAuthorityAssociation =
+            serde_json::from_slice(&serde_json::to_vec(a.association()).expect("encode"))
+                .expect("decode");
+        assert_eq!(
+            &crate::retained_work::retained_association_digest(&round_trip).expect("digest"),
+            minted
+        );
         let no_binding = |result: Result<Vec<RetainedInputAuthority>, RuntimeDriverError>| {
             matches!(
                 result,
@@ -1688,6 +1916,14 @@ pub(crate) mod tests {
         );
         let other = driver.input("caller-b");
         let other_state = accepted_state(driver.accept_input(other).await.expect("b"));
+        // A changed association does not match the minted digest.
+        assert_ne!(
+            &crate::retained_work::retained_association_digest(
+                own_authority(&other_state).association()
+            )
+            .expect("digest"),
+            minted
+        );
         assert!(
             no_binding(resolve_contributors(
                 &runtime,
@@ -1926,5 +2162,20 @@ mod admission_projection_regressions {
                 reason: crate::traits::ControllerReadinessFailure::PolicyChanged,
             }
         ));
+    }
+}
+
+/// The default configured-attachment authority of an installed host that
+/// does not decide configured MCP servers: every one is unavailable.
+pub struct RefuseConfiguredMcpAttachment;
+
+impl meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority
+    for RefuseConfiguredMcpAttachment
+{
+    fn authorize_configured(
+        &self,
+        _server: &meerkat_core::mcp_config::McpServerConfig,
+    ) -> Result<(), meerkat_core::mcp_attachment::McpAttachmentRefusal> {
+        Err(meerkat_core::mcp_attachment::McpAttachmentRefusal::Unavailable)
     }
 }

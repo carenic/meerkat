@@ -8181,7 +8181,7 @@ ClassifyTurnTimeoutDispositionCanceledDestroyed(timed_out_run_id, retryable) ==
     /\ UnchangedFrame_d3e21fd67cf0c2e1
 
 
-SubmitWorkRunningExternal(agent_identity, agent_runtime_id, fence_token, work_id, origin, content_attribution) ==
+SubmitWorkRunningExternal(agent_identity, agent_runtime_id, fence_token, expected_session_id, work_id, origin, content_attribution) ==
     /\ phase = "Running"
     /\ (placed_completion_lifecycle_quiescing = FALSE)
     /\ (live_runtime_ids # {})
@@ -8190,6 +8190,7 @@ SubmitWorkRunningExternal(agent_identity, agent_runtime_id, fence_token, work_id
     /\ ((IF (agent_runtime_id \in DOMAIN runtime_fence_tokens) THEN Some((IF agent_runtime_id \in DOMAIN runtime_fence_tokens THEN runtime_fence_tokens[agent_runtime_id] ELSE "None")) ELSE None) = Some(fence_token))
     /\ ((IF (agent_identity \in DOMAIN identity_runtime_generations) THEN Some((IF agent_identity \in DOMAIN identity_runtime_generations THEN identity_runtime_generations[agent_identity] ELSE "None")) ELSE None) # None)
     /\ ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) # None)
+    /\ (IF (expected_session_id = None) THEN TRUE ELSE ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) = expected_session_id))
     /\ (IF ((agent_identity \in DOMAIN member_placement) = FALSE) THEN TRUE ELSE mob_machine_placed_carrier_binding_active(member_placement, current_placed_spawn_host_binding_generations, host_bind_phase, host_binding_generations, agent_identity))
     /\ ((IF (agent_runtime_id \in DOMAIN member_state_markers) THEN Some((IF agent_runtime_id \in DOMAIN member_state_markers THEN member_state_markers[agent_runtime_id] ELSE "None")) ELSE None) # Some("Retiring"))
     /\ (origin = "External")
@@ -8199,7 +8200,7 @@ SubmitWorkRunningExternal(agent_identity, agent_runtime_id, fence_token, work_id
     /\ UnchangedFrame_d3e21fd67cf0c2e1
 
 
-SubmitWorkRunningExternalPeerOnly(agent_identity, agent_runtime_id, fence_token, work_id, origin, content_attribution) ==
+SubmitWorkRunningExternalPeerOnly(agent_identity, agent_runtime_id, fence_token, expected_session_id, work_id, origin, content_attribution) ==
     /\ phase = "Running"
     /\ (placed_completion_lifecycle_quiescing = FALSE)
     /\ (live_runtime_ids # {})
@@ -8208,6 +8209,7 @@ SubmitWorkRunningExternalPeerOnly(agent_identity, agent_runtime_id, fence_token,
     /\ ((IF (agent_runtime_id \in DOMAIN runtime_fence_tokens) THEN Some((IF agent_runtime_id \in DOMAIN runtime_fence_tokens THEN runtime_fence_tokens[agent_runtime_id] ELSE "None")) ELSE None) = Some(fence_token))
     /\ ((IF (agent_identity \in DOMAIN identity_runtime_generations) THEN Some((IF agent_identity \in DOMAIN identity_runtime_generations THEN identity_runtime_generations[agent_identity] ELSE "None")) ELSE None) # None)
     /\ ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) = None)
+    /\ (expected_session_id = None)
     /\ ((IF (agent_runtime_id \in DOMAIN member_state_markers) THEN Some((IF agent_runtime_id \in DOMAIN member_state_markers THEN member_state_markers[agent_runtime_id] ELSE "None")) ELSE None) # Some("Retiring"))
     /\ (origin = "External")
     /\ (agent_runtime_id \in externally_addressable_runtime_ids)
@@ -8217,7 +8219,7 @@ SubmitWorkRunningExternalPeerOnly(agent_identity, agent_runtime_id, fence_token,
     /\ UnchangedFrame_d3e21fd67cf0c2e1
 
 
-SubmitWorkRunningInternal(agent_identity, agent_runtime_id, fence_token, work_id, origin, content_attribution) ==
+SubmitWorkRunningInternal(agent_identity, agent_runtime_id, fence_token, expected_session_id, work_id, origin, content_attribution) ==
     /\ phase = "Running"
     /\ (placed_completion_lifecycle_quiescing = FALSE)
     /\ (live_runtime_ids # {})
@@ -8226,6 +8228,7 @@ SubmitWorkRunningInternal(agent_identity, agent_runtime_id, fence_token, work_id
     /\ ((IF (agent_runtime_id \in DOMAIN runtime_fence_tokens) THEN Some((IF agent_runtime_id \in DOMAIN runtime_fence_tokens THEN runtime_fence_tokens[agent_runtime_id] ELSE "None")) ELSE None) = Some(fence_token))
     /\ ((IF (agent_identity \in DOMAIN identity_runtime_generations) THEN Some((IF agent_identity \in DOMAIN identity_runtime_generations THEN identity_runtime_generations[agent_identity] ELSE "None")) ELSE None) # None)
     /\ ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) # None)
+    /\ (IF (expected_session_id = None) THEN TRUE ELSE ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) = expected_session_id))
     /\ (IF ((agent_identity \in DOMAIN member_placement) = FALSE) THEN TRUE ELSE mob_machine_placed_carrier_binding_active(member_placement, current_placed_spawn_host_binding_generations, host_bind_phase, host_binding_generations, agent_identity))
     /\ ((IF (agent_runtime_id \in DOMAIN member_state_markers) THEN Some((IF agent_runtime_id \in DOMAIN member_state_markers THEN member_state_markers[agent_runtime_id] ELSE "None")) ELSE None) # Some("Retiring"))
     /\ (origin = "Internal")
@@ -8234,7 +8237,7 @@ SubmitWorkRunningInternal(agent_identity, agent_runtime_id, fence_token, work_id
     /\ UnchangedFrame_d3e21fd67cf0c2e1
 
 
-SubmitWorkRunningInternalPeerOnly(agent_identity, agent_runtime_id, fence_token, work_id, origin, content_attribution) ==
+SubmitWorkRunningInternalPeerOnly(agent_identity, agent_runtime_id, fence_token, expected_session_id, work_id, origin, content_attribution) ==
     /\ phase = "Running"
     /\ (placed_completion_lifecycle_quiescing = FALSE)
     /\ (live_runtime_ids # {})
@@ -8243,6 +8246,7 @@ SubmitWorkRunningInternalPeerOnly(agent_identity, agent_runtime_id, fence_token,
     /\ ((IF (agent_runtime_id \in DOMAIN runtime_fence_tokens) THEN Some((IF agent_runtime_id \in DOMAIN runtime_fence_tokens THEN runtime_fence_tokens[agent_runtime_id] ELSE "None")) ELSE None) = Some(fence_token))
     /\ ((IF (agent_identity \in DOMAIN identity_runtime_generations) THEN Some((IF agent_identity \in DOMAIN identity_runtime_generations THEN identity_runtime_generations[agent_identity] ELSE "None")) ELSE None) # None)
     /\ ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) = None)
+    /\ (expected_session_id = None)
     /\ ((IF (agent_runtime_id \in DOMAIN member_state_markers) THEN Some((IF agent_runtime_id \in DOMAIN member_state_markers THEN member_state_markers[agent_runtime_id] ELSE "None")) ELSE None) # Some("Retiring"))
     /\ (origin = "Internal")
     /\ (agent_identity \in DOMAIN member_peer_ids)
@@ -8251,28 +8255,28 @@ SubmitWorkRunningInternalPeerOnly(agent_identity, agent_runtime_id, fence_token,
     /\ UnchangedFrame_d3e21fd67cf0c2e1
 
 
-ResolveSubmitWorkRejectionStopped(agent_identity, agent_runtime_id, fence_token, origin) ==
+ResolveSubmitWorkRejectionStopped(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin) ==
     /\ phase = "Stopped"
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_d3e21fd67cf0c2e1
 
 
-ResolveSubmitWorkRejectionCompleted(agent_identity, agent_runtime_id, fence_token, origin) ==
+ResolveSubmitWorkRejectionCompleted(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin) ==
     /\ phase = "Completed"
     /\ phase' = "Completed"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_d3e21fd67cf0c2e1
 
 
-ResolveSubmitWorkRejectionDestroyed(agent_identity, agent_runtime_id, fence_token, origin) ==
+ResolveSubmitWorkRejectionDestroyed(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin) ==
     /\ phase = "Destroyed"
     /\ phase' = "Destroyed"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_d3e21fd67cf0c2e1
 
 
-ResolveSubmitWorkRejectionMemberNotFound(agent_identity, agent_runtime_id, fence_token, origin) ==
+ResolveSubmitWorkRejectionMemberNotFound(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin) ==
     /\ phase = "Running"
     /\ ~((agent_identity \in DOMAIN identity_to_runtime))
     /\ phase' = "Running"
@@ -8280,7 +8284,7 @@ ResolveSubmitWorkRejectionMemberNotFound(agent_identity, agent_runtime_id, fence
     /\ UnchangedFrame_d3e21fd67cf0c2e1
 
 
-ResolveSubmitWorkRejectionCurrentRuntimeNotLive(agent_identity, agent_runtime_id, fence_token, origin) ==
+ResolveSubmitWorkRejectionCurrentRuntimeNotLive(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin) ==
     /\ phase = "Running"
     /\ (agent_identity \in DOMAIN identity_to_runtime)
     /\ ((agent_identity \in DOMAIN identity_to_runtime) /\ ~(((identity_to_runtime)[agent_identity] \in live_runtime_ids)))
@@ -8289,7 +8293,7 @@ ResolveSubmitWorkRejectionCurrentRuntimeNotLive(agent_identity, agent_runtime_id
     /\ UnchangedFrame_d3e21fd67cf0c2e1
 
 
-ResolveSubmitWorkRejectionStaleFenceToken(agent_identity, agent_runtime_id, fence_token, origin) ==
+ResolveSubmitWorkRejectionStaleFenceToken(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin) ==
     /\ phase = "Running"
     /\ (agent_identity \in DOMAIN identity_to_runtime)
     /\ ((agent_identity \in DOMAIN identity_to_runtime) /\ ((identity_to_runtime)[agent_identity] \in live_runtime_ids))
@@ -8299,7 +8303,7 @@ ResolveSubmitWorkRejectionStaleFenceToken(agent_identity, agent_runtime_id, fenc
     /\ UnchangedFrame_d3e21fd67cf0c2e1
 
 
-ResolveSubmitWorkRejectionRetiringAsMemberNotFound(agent_identity, agent_runtime_id, fence_token, origin) ==
+ResolveSubmitWorkRejectionRetiringAsMemberNotFound(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin) ==
     /\ phase = "Running"
     /\ ((IF (agent_identity \in DOMAIN identity_to_runtime) THEN Some((IF agent_identity \in DOMAIN identity_to_runtime THEN identity_to_runtime[agent_identity] ELSE "None")) ELSE None) = Some(agent_runtime_id))
     /\ (agent_runtime_id \in live_runtime_ids)
@@ -8310,7 +8314,7 @@ ResolveSubmitWorkRejectionRetiringAsMemberNotFound(agent_identity, agent_runtime
     /\ UnchangedFrame_d3e21fd67cf0c2e1
 
 
-ResolveSubmitWorkRejectionNotExternallyAddressable(agent_identity, agent_runtime_id, fence_token, origin) ==
+ResolveSubmitWorkRejectionNotExternallyAddressable(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin) ==
     /\ phase = "Running"
     /\ ((IF (agent_identity \in DOMAIN identity_to_runtime) THEN Some((IF agent_identity \in DOMAIN identity_to_runtime THEN identity_to_runtime[agent_identity] ELSE "None")) ELSE None) = Some(agent_runtime_id))
     /\ (agent_runtime_id \in live_runtime_ids)
@@ -8323,7 +8327,7 @@ ResolveSubmitWorkRejectionNotExternallyAddressable(agent_identity, agent_runtime
     /\ UnchangedFrame_d3e21fd67cf0c2e1
 
 
-ResolveSubmitWorkRejectionPeerOnlyNotExternallyAddressable(agent_identity, agent_runtime_id, fence_token, origin) ==
+ResolveSubmitWorkRejectionPeerOnlyNotExternallyAddressable(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin) ==
     /\ phase = "Running"
     /\ ((IF (agent_identity \in DOMAIN identity_to_runtime) THEN Some((IF agent_identity \in DOMAIN identity_to_runtime THEN identity_to_runtime[agent_identity] ELSE "None")) ELSE None) = Some(agent_runtime_id))
     /\ (agent_runtime_id \in live_runtime_ids)
@@ -8332,6 +8336,18 @@ ResolveSubmitWorkRejectionPeerOnlyNotExternallyAddressable(agent_identity, agent
     /\ (origin = "Internal")
     /\ ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) = None)
     /\ ~((agent_identity \in DOMAIN member_peer_ids))
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_d3e21fd67cf0c2e1
+
+
+ResolveSubmitWorkRejectionStaleSessionBinding(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin) ==
+    /\ phase = "Running"
+    /\ ((IF (agent_identity \in DOMAIN identity_to_runtime) THEN Some((IF agent_identity \in DOMAIN identity_to_runtime THEN identity_to_runtime[agent_identity] ELSE "None")) ELSE None) = Some(agent_runtime_id))
+    /\ (agent_runtime_id \in live_runtime_ids)
+    /\ ((IF (agent_runtime_id \in DOMAIN runtime_fence_tokens) THEN Some((IF agent_runtime_id \in DOMAIN runtime_fence_tokens THEN runtime_fence_tokens[agent_runtime_id] ELSE "None")) ELSE None) = Some(fence_token))
+    /\ (expected_session_id # None)
+    /\ ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) # expected_session_id)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_d3e21fd67cf0c2e1
@@ -19413,19 +19429,20 @@ Next ==
     \/ (phase = "Stopped") /\ \E timed_out_run_id \in RunIdValues : ClassifyTurnTimeoutDispositionCanceledStopped(timed_out_run_id, FALSE)
     \/ (phase = "Completed") /\ \E timed_out_run_id \in RunIdValues : ClassifyTurnTimeoutDispositionCanceledCompleted(timed_out_run_id, FALSE)
     \/ (phase = "Destroyed") /\ \E timed_out_run_id \in RunIdValues : ClassifyTurnTimeoutDispositionCanceledDestroyed(timed_out_run_id, FALSE)
-    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E work_id \in WorkIdValues : \E origin \in WorkOriginValues : \E content_attribution \in WorkContentAttributionValues : SubmitWorkRunningExternal(agent_identity, agent_runtime_id, fence_token, work_id, origin, content_attribution)
-    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E work_id \in WorkIdValues : \E origin \in WorkOriginValues : \E content_attribution \in WorkContentAttributionValues : SubmitWorkRunningExternalPeerOnly(agent_identity, agent_runtime_id, fence_token, work_id, origin, content_attribution)
-    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E work_id \in WorkIdValues : \E origin \in WorkOriginValues : \E content_attribution \in WorkContentAttributionValues : SubmitWorkRunningInternal(agent_identity, agent_runtime_id, fence_token, work_id, origin, content_attribution)
-    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E work_id \in WorkIdValues : \E origin \in WorkOriginValues : \E content_attribution \in WorkContentAttributionValues : SubmitWorkRunningInternalPeerOnly(agent_identity, agent_runtime_id, fence_token, work_id, origin, content_attribution)
-    \/ (phase = "Stopped") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionStopped(agent_identity, agent_runtime_id, fence_token, origin)
-    \/ (phase = "Completed") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionCompleted(agent_identity, agent_runtime_id, fence_token, origin)
-    \/ (phase = "Destroyed") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionDestroyed(agent_identity, agent_runtime_id, fence_token, origin)
-    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionMemberNotFound(agent_identity, agent_runtime_id, fence_token, origin)
-    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionCurrentRuntimeNotLive(agent_identity, agent_runtime_id, fence_token, origin)
-    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionStaleFenceToken(agent_identity, agent_runtime_id, fence_token, origin)
-    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionRetiringAsMemberNotFound(agent_identity, agent_runtime_id, fence_token, origin)
-    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionNotExternallyAddressable(agent_identity, agent_runtime_id, fence_token, origin)
-    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionPeerOnlyNotExternallyAddressable(agent_identity, agent_runtime_id, fence_token, origin)
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E expected_session_id \in OptionSessionIdValues : \E work_id \in WorkIdValues : \E origin \in WorkOriginValues : \E content_attribution \in WorkContentAttributionValues : SubmitWorkRunningExternal(agent_identity, agent_runtime_id, fence_token, expected_session_id, work_id, origin, content_attribution)
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E expected_session_id \in OptionSessionIdValues : \E work_id \in WorkIdValues : \E origin \in WorkOriginValues : \E content_attribution \in WorkContentAttributionValues : SubmitWorkRunningExternalPeerOnly(agent_identity, agent_runtime_id, fence_token, expected_session_id, work_id, origin, content_attribution)
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E expected_session_id \in OptionSessionIdValues : \E work_id \in WorkIdValues : \E origin \in WorkOriginValues : \E content_attribution \in WorkContentAttributionValues : SubmitWorkRunningInternal(agent_identity, agent_runtime_id, fence_token, expected_session_id, work_id, origin, content_attribution)
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E expected_session_id \in OptionSessionIdValues : \E work_id \in WorkIdValues : \E origin \in WorkOriginValues : \E content_attribution \in WorkContentAttributionValues : SubmitWorkRunningInternalPeerOnly(agent_identity, agent_runtime_id, fence_token, expected_session_id, work_id, origin, content_attribution)
+    \/ (phase = "Stopped") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E expected_session_id \in OptionSessionIdValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionStopped(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin)
+    \/ (phase = "Completed") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E expected_session_id \in OptionSessionIdValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionCompleted(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin)
+    \/ (phase = "Destroyed") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E expected_session_id \in OptionSessionIdValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionDestroyed(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin)
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E expected_session_id \in OptionSessionIdValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionMemberNotFound(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin)
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E expected_session_id \in OptionSessionIdValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionCurrentRuntimeNotLive(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin)
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E expected_session_id \in OptionSessionIdValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionStaleFenceToken(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin)
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E expected_session_id \in OptionSessionIdValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionRetiringAsMemberNotFound(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin)
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E expected_session_id \in OptionSessionIdValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionNotExternallyAddressable(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin)
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E expected_session_id \in OptionSessionIdValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionPeerOnlyNotExternallyAddressable(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin)
+    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E expected_session_id \in OptionSessionIdValues : \E origin \in WorkOriginValues : ResolveSubmitWorkRejectionStaleSessionBinding(agent_identity, agent_runtime_id, fence_token, expected_session_id, origin)
     \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E session_id \in OptionSessionIdValues : RetireMember(agent_identity, agent_runtime_id, fence_token, session_id)
     \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E session_id \in OptionSessionIdValues : RetireMemberRemote(agent_identity, agent_runtime_id, fence_token, session_id)
     \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : \E agent_runtime_id \in AgentRuntimeIdValues : \E fence_token \in FenceTokenValues : \E session_id \in OptionSessionIdValues : RetireMemberRemoteConfirmedRevoked(agent_identity, agent_runtime_id, fence_token, session_id)

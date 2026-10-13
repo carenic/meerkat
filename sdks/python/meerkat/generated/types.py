@@ -308,6 +308,7 @@ class McpStdioConfig:
     command: str
     args: Optional[list[str]] = None
     env: Optional[dict[str, str]] = None
+    secret_env: Optional[list[str]] = None
 
 
 @dataclass
@@ -728,6 +729,7 @@ agent, tool result, transcript or log."""
     scopes: list[str]
     slot: WireConnectorSlot
     strategy_id: str
+    client_auth_profile: Optional[str] = None
 
 
 @dataclass
@@ -754,7 +756,7 @@ WireScopeEvidence = WireScopeEvidenceTokenEndpointResponse | WireScopeEvidenceRe
 # `error.data.reason`, REST body `reason`. Hosts branch on it, never on the
 # error text. One native mapping (`HostAuthError::reason`) owns it; the
 # existing status codes and RPC error codes are unchanged.
-WireAuthErrorReason = Literal['realm_not_found', 'binding_not_found', 'mcp_server_not_configured', 'account_selection_required', 'unknown_strategy', 'device_poll_in_progress', 'device_code_already_admitted', 'device_expiry_invalid', 'missing_scopes', 'slot_occupied', 'slot_account_mismatch', 'slot_context_mismatch', 'slot_mode_mismatch', 'unverified_connector_publication', 'reauth_required', 'configuration_invalid'] | Literal['invalid_target'] | Literal['binding_invalid'] | Literal['binding_inherited'] | Literal['flow_unsupported'] | Literal['mcp_server_mismatch'] | Literal['attempt_missing'] | Literal['attempt_mismatch'] | Literal['account_mismatch'] | Literal['credential_mismatch'] | Literal['verification_unavailable'] | Literal['authorization_required'] | Literal['callback_unavailable'] | Literal['upstream_failure'] | Literal['infrastructure']
+WireAuthErrorReason = Literal['realm_not_found', 'binding_not_found', 'mcp_server_not_configured', 'account_selection_required', 'unknown_strategy', 'device_poll_in_progress', 'device_code_already_admitted', 'device_expiry_invalid', 'missing_scopes', 'slot_occupied', 'slot_account_mismatch', 'slot_context_mismatch', 'slot_mode_mismatch', 'unverified_connector_publication', 'reauth_required', 'configuration_invalid', 'credential_access_denied', 'credential_interaction_required', 'credential_access_pending', 'credential_store_unavailable'] | Literal['invalid_target'] | Literal['binding_invalid'] | Literal['binding_inherited'] | Literal['flow_unsupported'] | Literal['mcp_server_mismatch'] | Literal['attempt_missing'] | Literal['attempt_mismatch'] | Literal['account_mismatch'] | Literal['credential_mismatch'] | Literal['verification_unavailable'] | Literal['authorization_required'] | Literal['callback_unavailable'] | Literal['upstream_failure'] | Literal['infrastructure']
 
 @dataclass
 class WireAuthErrorData:
@@ -768,6 +770,9 @@ class WireAuthErrorBody:
     error: str
     reason: WireAuthErrorReason
 
+
+# The recorded consent transition a notice reports.
+ConsentNoticeKind = Literal['requested', 'approved', 'denied', 'used', 'withdrawn']
 
 # Wire payload for InstructionActivationDisposition.
 InstructionActivationDisposition = Any
@@ -1003,6 +1008,7 @@ class WireAuthStatusResultAuthStatusDetail(TypedDict, total=False):
     auth_binding: Required[WireAuthBindingRef]
     auth_method: Required[str]
     binding_id: Required[str]
+    credential_observation: NotRequired[Optional[Literal['not_observed', 'owner_busy', 'pending', 'denied', 'interaction_required', 'unavailable']]]
     expires_at: NotRequired[Optional[str]]
     has_refresh_token: Required[bool]
     last_refresh_at: NotRequired[Optional[str]]
@@ -1090,6 +1096,7 @@ class ApprovalRecord:
     risk: Literal['low', 'medium', 'high', 'critical']
     status: Literal['pending', 'approved', 'denied', 'expired', 'cancelled']
     updated_at: str
+    consent: Optional[dict[str, Any]] = None
     decision: Optional[dict[str, Any]] = None
     expires_at: Optional[str] = None
     request_body: Optional[Any] = None
@@ -1188,6 +1195,39 @@ class BlobPayload:
     blob_id: BlobId
     data: str
     media_type: str
+
+
+@dataclass
+class ConsentNoticeParams:
+    """`approval/consent_notice` parameters: one recorded transition of an R3
+human consent approval, delivered to the connection that serves its
+approver after the approval owner released its locks. It names the
+approval and the tool call and grants nothing: an `approved` notice
+executes nothing, and only a fresh explicit attempt of the retained call
+spends the consent. A `requested` notice carries the approval's
+presentation."""
+    approval_id: str
+    kind: ConsentNoticeKind
+    tool_call_id: str
+    presentation: Optional[dict[str, Any]] = None
+
+
+@dataclass
+class ConsentPresentationParams:
+    """What a `requested` consent notice asks its approver to decide: the
+approval owner's own record of it, as issued. It names the exact action
+(its kind, the tool and the call's arguments), its risk, the account the
+operation acts with and the mandate it runs under (each as the
+operation's owners stated it; absent when they stated none), the weakest
+approver assurance the owner's rule accepts and the approval's expiry. It
+is shown only on the connection that serves the approver, before any
+decision, and grants nothing."""
+    accepted_assurance: Literal['device_trusted', 'person_authenticated']
+    action: dict[str, Any]
+    expires_at: str
+    risk: Literal['low', 'medium', 'high', 'critical']
+    account: Optional[str] = None
+    mandate: Optional[str] = None
 
 
 @dataclass
@@ -2045,31 +2085,31 @@ class JobsUnsubscribeResult:
 
 
 @dataclass
-class MobkitJobCancelAckParams:
-    """Wire payload for MobkitJobCancelAckParams."""
+class MetaJobCancelAckParams:
+    """Wire payload for MetaJobCancelAckParams."""
     acknowledged_at_ms: int
     authority: JobAttemptAuthority
 
 
 @dataclass
-class MobkitJobCheckpointParams:
-    """Wire payload for MobkitJobCheckpointParams."""
+class MetaJobCheckpointParams:
+    """Wire payload for MetaJobCheckpointParams."""
     authority: JobAttemptAuthority
     checkpoint_ref: str
     observed_at_ms: int
 
 
 @dataclass
-class MobkitJobCompleteParams:
-    """Wire payload for MobkitJobCompleteParams."""
+class MetaJobCompleteParams:
+    """Wire payload for MetaJobCompleteParams."""
     authority: JobAttemptAuthority
     completed_at_ms: int
     result_ref: Optional[str] = None
 
 
 @dataclass
-class MobkitJobFailParams:
-    """Wire payload for MobkitJobFailParams."""
+class MetaJobFailParams:
+    """Wire payload for MetaJobFailParams."""
     authority: JobAttemptAuthority
     code: str
     failed_at_ms: int
@@ -2077,22 +2117,22 @@ class MobkitJobFailParams:
 
 
 @dataclass
-class MobkitJobHeartbeatParams:
-    """Wire payload for MobkitJobHeartbeatParams."""
+class MetaJobHeartbeatParams:
+    """Wire payload for MetaJobHeartbeatParams."""
     authority: JobAttemptAuthority
     heartbeat_at_ms: int
     lease_expires_at_ms: int
 
 
 @dataclass
-class MobkitJobMutationResult:
-    """Wire payload for MobkitJobMutationResult."""
+class MetaJobMutationResult:
+    """Wire payload for MetaJobMutationResult."""
     job: JobSummary
 
 
 @dataclass
-class MobkitJobProgressParams:
-    """Wire payload for MobkitJobProgressParams."""
+class MetaJobProgressParams:
+    """Wire payload for MetaJobProgressParams."""
     authority: JobAttemptAuthority
     cursor: int
     detail: str
@@ -4841,7 +4881,7 @@ WireFlowTurnOutcome = Literal['run_completed'] | Literal['extraction_succeeded']
 
 # Stable discriminant for [`AuthError`]. Used in serialized error summaries
 # and for SDK-facing wire codes.
-AuthErrorKind = Literal['missing_secret', 'unsupported_combination', 'missing_required_metadata', 'workspace_mismatch', 'stale_credential', 'refresh_required', 'lease_absent', 'user_reauth_required', 'expired', 'refresh_failed', 'resolve_required', 'interactive_login_required', 'host_owned_unavailable', 'io', 'other']
+AuthErrorKind = Literal['missing_secret', 'unsupported_combination', 'missing_required_metadata', 'workspace_mismatch', 'stale_credential', 'refresh_required', 'lease_absent', 'user_reauth_required', 'expired', 'refresh_failed', 'resolve_required', 'interactive_login_required', 'host_owned_unavailable', 'io', 'other', 'credential_access_denied', 'credential_interaction_required', 'credential_access_pending', 'credential_store_unavailable']
 
 # Wire projection of `meerkat_core::connection::ConnectionTargetError`'s
 # variant set (closed; kinds only — the parameters stay in the diagnostic
@@ -4898,6 +4938,10 @@ ExternalToolDeltaPhase = Literal['pending', 'applied', 'draining', 'forced', 'fa
 # credential path, gate token, or secret-bearing command line in this error.
 ConfinementRefusal = Literal['invalid_requirement', 'invalid_launch', 'unsupported_requirement', 'backend_unavailable', 'preparation_failed']
 
+# The typed outcome a resumed session's recorded MCP attachment reports on
+# the wire when restore did not simply re-stage it.
+McpAttachmentRestoreWireOutcome = Literal['suppressed', 'retired', 'rebound', 'account_changed', 'denied', 'unavailable', 'not_current', 'review_required', 'mismatch', 'stage_failed', 'renewal_required']
+
 # Structured status data for live tool configuration change notifications.
 class ToolConfigChangeStatusBoundaryApplied(TypedDict, total=False):
     base_changed: Required[bool]
@@ -4920,6 +4964,7 @@ class ToolConfigChangeStatusExternalToolDelta(TypedDict, total=False):
     detail: NotRequired[Optional[str]]
     kind: Required[Literal['external_tool_delta']]
     phase: Required[ExternalToolDeltaPhase]
+    restore: NotRequired[Optional[McpAttachmentRestoreWireOutcome]]
 
 ToolConfigChangeStatus = ToolConfigChangeStatusBoundaryApplied | ToolConfigChangeStatusDeferredCatalogDelta | ToolConfigChangeStatusWarningFailedClosed | ToolConfigChangeStatusExternalToolDelta
 
@@ -6422,6 +6467,7 @@ binding directly."""
     realm_id: str
     state: Literal['valid', 'expiring', 'expired', 'reauth_required', 'refresh_failed'] | Literal['released'] | Literal['absent'] | Literal['missing_credential']
     account_id: Optional[str] = None
+    credential_observation: Optional[Literal['not_observed', 'owner_busy', 'pending', 'denied', 'interaction_required', 'unavailable']] = None
     expires_at: Optional[str] = None
     last_refresh_at: Optional[str] = None
 
@@ -6480,7 +6526,20 @@ class WireAuthErrorOther(TypedDict, total=False):
     detail: Required[str]
     kind: Required[Literal['other']]
 
-WireAuthError = WireAuthErrorMissingSecret | WireAuthErrorUnsupportedCombination | WireAuthErrorMissingRequiredMetadata | WireAuthErrorWorkspaceMismatch | WireAuthErrorExpired | WireAuthErrorStaleCredential | WireAuthErrorRefreshRequired | WireAuthErrorLeaseAbsent | WireAuthErrorUserReauthRequired | WireAuthErrorRefreshFailed | WireAuthErrorResolveRequired | WireAuthErrorInteractiveLoginRequired | WireAuthErrorHostOwnedUnavailable | WireAuthErrorIo | WireAuthErrorOther
+class WireAuthErrorCredentialAccessDenied(TypedDict, total=False):
+    kind: Required[Literal['credential_access_denied']]
+
+class WireAuthErrorCredentialInteractionRequired(TypedDict, total=False):
+    kind: Required[Literal['credential_interaction_required']]
+
+class WireAuthErrorCredentialAccessPending(TypedDict, total=False):
+    kind: Required[Literal['credential_access_pending']]
+
+class WireAuthErrorCredentialStoreUnavailable(TypedDict, total=False):
+    detail: Required[str]
+    kind: Required[Literal['credential_store_unavailable']]
+
+WireAuthError = WireAuthErrorMissingSecret | WireAuthErrorUnsupportedCombination | WireAuthErrorMissingRequiredMetadata | WireAuthErrorWorkspaceMismatch | WireAuthErrorExpired | WireAuthErrorStaleCredential | WireAuthErrorRefreshRequired | WireAuthErrorLeaseAbsent | WireAuthErrorUserReauthRequired | WireAuthErrorRefreshFailed | WireAuthErrorResolveRequired | WireAuthErrorInteractiveLoginRequired | WireAuthErrorHostOwnedUnavailable | WireAuthErrorIo | WireAuthErrorOther | WireAuthErrorCredentialAccessDenied | WireAuthErrorCredentialInteractionRequired | WireAuthErrorCredentialAccessPending | WireAuthErrorCredentialStoreUnavailable
 
 # Wire-safe content block (no `source_path` — internal only).
 class WireContentBlockText(TypedDict, total=False):
@@ -7046,6 +7105,7 @@ MeerkatSchema = Any
 # value maps: stdio `env` and HTTP `headers` are structurally absent; only
 # the required key/header NAMES travel, satisfied member-host-side.
 class PortableMcpDeclStdio(TypedDict, total=False):
+    access: NotRequired[Optional[dict[str, list[str]]]]
     args: NotRequired[list[str]]
     command: Required[str]
     connect_timeout_secs: NotRequired[Optional[int]]
@@ -7054,6 +7114,7 @@ class PortableMcpDeclStdio(TypedDict, total=False):
     transport: Required[Literal['stdio']]
 
 class PortableMcpDeclHttp(TypedDict, total=False):
+    access: NotRequired[Optional[dict[str, list[str]]]]
     connect_timeout_secs: NotRequired[Optional[int]]
     http_transport: NotRequired[Optional[McpHttpTransport]]
     oauth_account: NotRequired[Optional[str]]
@@ -7846,6 +7907,7 @@ class SystemNoticeBlockAuth(TypedDict, total=False):
 
 class SystemNoticeBlockRuntimeNotice(TypedDict, total=False):
     category: Required[str]
+    content: NotRequired[list[ContentBlock]]
     detail: NotRequired[Optional[str]]
     payload: NotRequired[Any]
     type: Required[Literal['runtime_notice']]

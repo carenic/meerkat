@@ -77,6 +77,7 @@ pub fn workgraph_attention_turn_append(
                     projection.binding_id, projection.work_ref.item_id, projection.mode
                 )),
                 payload: None,
+                content: Vec::new(),
             }],
         },
     }
@@ -261,6 +262,7 @@ impl AgentToolDispatcher for WorkGraphToolSurface {
                         tool.provenance.clone().unwrap_or_else(|| ToolProvenance {
                             kind: ToolSourceKind::WorkGraph,
                             source_id: "workgraph".into(),
+                            artifact: None,
                         }),
                     )
                 } else {
@@ -423,6 +425,7 @@ fn tool_defs_from_values(tools: Vec<Value>) -> Arc<[Arc<ToolDef>]> {
                 provenance: Some(ToolProvenance {
                     kind: ToolSourceKind::WorkGraph,
                     source_id: "workgraph".into(),
+                    artifact: None,
                 }),
             })
         })

@@ -101,6 +101,8 @@ struct PausedReviewer {
     verdict: ReviewVerdict,
     fate: Arc<ReviewerFate>,
     on_return: Mutex<Option<OwnerEdit>>,
+    /// The owner material each review actually received.
+    seen_contexts: Mutex<Vec<Option<(String, String)>>>,
     never_returns: bool,
     /// Return after exactly this virtual delay instead of waiting for release.
     returns_after: Option<Duration>,
@@ -115,6 +117,7 @@ impl PausedReviewer {
             verdict,
             fate: Arc::new(ReviewerFate::default()),
             on_return: Mutex::new(None),
+            seen_contexts: Mutex::new(Vec::new()),
             never_returns: false,
             returns_after: None,
         }
@@ -157,6 +160,15 @@ impl OperationReviewer for PausedReviewer {
             candidate.facts().operation,
             AuthorizationOperation::Tool(_)
         ));
+        self.seen_contexts
+            .lock()
+            .expect("seen contexts")
+            .push(candidate.operation_context().map(|context| {
+                (
+                    context.action_account().unwrap_or_default().to_owned(),
+                    context.mandate().unwrap_or_default().to_owned(),
+                )
+            }));
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.entered.notify_one();
         if self.never_returns {
@@ -386,6 +398,16 @@ struct EntryHookDecision {
 }
 
 impl WorkAuthorization for EntryHookWork {
+    fn review_operation_context(
+        &self,
+        binding: &meerkat_core::authorization::PreparedAuthorizationBinding,
+    ) -> Result<
+        meerkat_core::authorization::ReviewOperationContextResolution,
+        meerkat_core::OperationAuthorizationError,
+    > {
+        self.inner.review_operation_context(binding)
+    }
+
     fn controller_model_selection(&self) -> Option<meerkat_core::ControllerModelSelection> {
         self.inner.controller_model_selection()
     }
@@ -499,7 +521,7 @@ fn assert_unsatisfied(
     expected: ReviewUnsatisfiedKind,
 ) {
     assert!(
-        matches!(&result, Err(ToolError::ReviewUnsatisfied { kind }) if *kind == expected),
+        matches!(&result, Err(ToolError::ReviewUnsatisfied { kind, .. }) if *kind == expected),
         "expected local review_unsatisfied {expected:?}, got {result:?}"
     );
 }
@@ -750,22 +772,33 @@ mod approval_owner_lock {
             self.inner.load_all()
         }
 
-        fn put(&self, record: &ApprovalRecord) -> Result<(), ApprovalStoreError> {
+        fn get(
+            &self,
+            approval_id: &meerkat_core::ApprovalId,
+        ) -> Result<Option<ApprovalRecord>, ApprovalStoreError> {
+            self.inner.get(approval_id)
+        }
+
+        fn put_if_current(
+            &self,
+            expected: Option<&ApprovalRecord>,
+            record: &ApprovalRecord,
+        ) -> Result<(), ApprovalStoreError> {
             if record.status == ApprovalStatus::Approved {
                 // ApprovalService::decide holds its actual state write lock
                 // throughout this store callback. Review consumption shares it.
                 self.entered.send(()).map_err(|error| {
-                    ApprovalStoreError::Backend(format!("store entry signal: {error}"))
+                    ApprovalStoreError::NotCommitted(format!("store entry signal: {error}"))
                 })?;
                 self.release
                     .lock()
                     .expect("store release")
                     .recv_timeout(BOUND)
                     .map_err(|error| {
-                        ApprovalStoreError::Backend(format!("store release: {error}"))
+                        ApprovalStoreError::NotCommitted(format!("store release: {error}"))
                     })?;
             }
-            self.inner.put(record)
+            self.inner.put_if_current(expected, record)
         }
 
         fn is_persistent(&self) -> bool {
@@ -795,6 +828,16 @@ mod approval_owner_lock {
     }
 
     impl WorkAuthorization for ObservedWork {
+        fn review_operation_context(
+            &self,
+            binding: &meerkat_core::authorization::PreparedAuthorizationBinding,
+        ) -> Result<
+            meerkat_core::authorization::ReviewOperationContextResolution,
+            meerkat_core::OperationAuthorizationError,
+        > {
+            self.inner.review_operation_context(binding)
+        }
+
         fn controller_model_selection(&self) -> Option<meerkat_core::ControllerModelSelection> {
             self.inner.controller_model_selection()
         }
@@ -1022,6 +1065,7 @@ mod approval_owner_lock {
                         &result,
                         Err(ToolError::ReviewUnsatisfied {
                             kind: ReviewUnsatisfiedKind::ContextChanged,
+                            ..
                         } | ToolError::ReviewUnavailable {
                             kind: ReviewUnavailableKind::OwnerUnavailable,
                         })
@@ -1124,6 +1168,168 @@ async fn changed_review_context_retires_only_that_operation_and_sibling_enters()
         vec![pending(), retired(ReviewRetirementReason::ContextChanged)]
     );
     world.observer.single_attempt();
+}
+
+fn held(account: &str, mandate: &str) -> ReviewMaterial {
+    ReviewMaterial::Held {
+        account: account.to_owned(),
+        mandate: mandate.to_owned(),
+    }
+}
+
+fn pair(account: &str, mandate: &str) -> Option<(String, String)> {
+    Some((account.to_owned(), mandate.to_owned()))
+}
+
+#[tokio::test]
+async fn changed_owner_material_rejects_the_stale_allow_and_a_fresh_attempt_reviews_it() {
+    let work = reviewed_work(OperationReviewTier::R2);
+    work.set_review_material(held("account-a", "mandate-a"));
+    let world = ReviewWorld::new();
+    let body = Arc::new(RecordingDispatcher::default());
+    let leaf = ReviewedLeaf::new(Arc::clone(&body));
+    let context = world.context(&work);
+    let reviewed = reviewed_call("reviewed");
+    let sibling = sibling_call("sibling");
+
+    let controller = async {
+        world.reviewer.wait_entered().await;
+        wait_for_body(&body, "sibling").await;
+        // Same permission and the same R2 tier; only the owner material moves.
+        work.set_review_material(held("account-b", "mandate-b"));
+        world.reviewer.release.notify_one();
+    };
+    let (reviewed_result, sibling_result, ()) = tokio::join!(
+        fenced(&leaf, &reviewed, &context),
+        fenced(&leaf, &sibling, &context),
+        controller
+    );
+    assert_unsatisfied(reviewed_result, ReviewUnsatisfiedKind::ContextChanged);
+    assert!(!sibling_result.expect("permitted sibling").result.is_error);
+    assert_eq!(
+        body_ids(&body),
+        vec!["sibling".to_string()],
+        "no stale entry"
+    );
+
+    let fresh = reviewed_call("fresh");
+    let release = async {
+        world.reviewer.wait_entered().await;
+        world.reviewer.release.notify_one();
+    };
+    let (fresh_result, ()) = tokio::join!(fenced(&leaf, &fresh, &context), release);
+    assert!(!fresh_result.expect("fresh attempt").result.is_error);
+    assert_eq!(
+        body_ids(&body),
+        vec!["sibling".to_string(), "fresh".to_string()],
+        "the fresh attempt enters once"
+    );
+    assert_eq!(
+        *world.reviewer.seen_contexts.lock().expect("seen contexts"),
+        vec![
+            pair("account-a", "mandate-a"),
+            pair("account-b", "mandate-b")
+        ],
+        "each attempt reviews the material current at its own preparation"
+    );
+    assert_eq!(
+        work.review_context_calls(),
+        2,
+        "read once per reviewed attempt and never for the R1 sibling"
+    );
+}
+
+#[tokio::test]
+async fn work_owner_without_the_context_read_fails_closed_before_any_attempt() {
+    let work = reviewed_work(OperationReviewTier::R2);
+    let world = ReviewWorld::new();
+    let body = Arc::new(RecordingDispatcher::default());
+    let leaf = ReviewedLeaf::new(Arc::clone(&body));
+    let context = ToolDispatchContext::default()
+        .with_work_authorization(Some(work.inheriting_context()))
+        .with_operation_review(Some(world.review.clone()));
+    assert_unavailable(
+        fenced(&leaf, &reviewed_call("reviewed"), &context).await,
+        ReviewUnavailableKind::ContextUnavailable,
+    );
+    assert_eq!(
+        world.reviewer.calls.load(Ordering::SeqCst),
+        0,
+        "no reviewer call"
+    );
+    assert!(world.observer.statuses().is_empty(), "no review attempt");
+    assert!(body_ids(&body).is_empty(), "no target entry");
+    fenced(&leaf, &sibling_call("sibling"), &context)
+        .await
+        .expect("permitted R1 sibling enters");
+    assert_eq!(body_ids(&body), vec!["sibling".to_string()]);
+    assert_eq!(
+        work.review_context_calls(),
+        0,
+        "the inner owner is never asked"
+    );
+}
+
+#[tokio::test]
+async fn review_context_outcomes_are_typed_before_any_attempt() {
+    // Required but missing material is unavailable, never not-applicable; a
+    // deliberate denial stays a refusal; an explicit not-applicable reviews
+    // with no material. A permitted sibling enters in every case.
+    for material in [
+        ReviewMaterial::RequiredButMissing,
+        ReviewMaterial::Denied,
+        ReviewMaterial::NotApplicable,
+    ] {
+        let work = reviewed_work(OperationReviewTier::R2);
+        work.set_review_material(material.clone());
+        let world = ReviewWorld::new();
+        let body = Arc::new(RecordingDispatcher::default());
+        let leaf = ReviewedLeaf::new(Arc::clone(&body));
+        let context = world.context(&work);
+        let reviewed = reviewed_call("reviewed");
+        let release = async {
+            if matches!(material, ReviewMaterial::NotApplicable) {
+                world.reviewer.wait_entered().await;
+                world.reviewer.release.notify_one();
+            }
+        };
+        let (result, ()) = tokio::join!(fenced(&leaf, &reviewed, &context), release);
+        match material {
+            ReviewMaterial::RequiredButMissing => {
+                assert_unavailable(result, ReviewUnavailableKind::ContextUnavailable);
+            }
+            ReviewMaterial::Denied => assert!(
+                matches!(&result, Err(ToolError::AuthorizationRefused { refusal })
+                    if refusal.kind() == OperationRefusalKind::Denied),
+                "{result:?}"
+            ),
+            ReviewMaterial::NotApplicable => {
+                assert!(!result.expect("reviewed allow").result.is_error);
+            }
+            ReviewMaterial::Held { .. } => unreachable!("not exercised here"),
+        }
+        let failed = !matches!(material, ReviewMaterial::NotApplicable);
+        if failed {
+            assert_eq!(world.reviewer.calls.load(Ordering::SeqCst), 0);
+            assert!(world.observer.statuses().is_empty(), "no review attempt");
+            assert!(body_ids(&body).is_empty(), "no reviewed entry");
+        } else {
+            assert_eq!(
+                *world.reviewer.seen_contexts.lock().expect("seen contexts"),
+                vec![None]
+            );
+            assert_eq!(body_ids(&body), vec!["reviewed".to_string()]);
+        }
+        fenced(&leaf, &sibling_call("sibling"), &context)
+            .await
+            .expect("permitted sibling enters");
+        assert!(body_ids(&body).contains(&"sibling".to_string()));
+        assert_eq!(
+            work.review_context_calls(),
+            1,
+            "once, never for the sibling"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1757,7 +1963,11 @@ async fn factory_review_denial_and_escalation_preserve_goal_sibling_and_model_co
         assert!(reviewed.is_error);
         assert_eq!(
             reviewed_text,
-            ToolError::ReviewUnsatisfied { kind: expected }.to_transcript_content(),
+            ToolError::ReviewUnsatisfied {
+                kind: expected,
+                approval_id: None,
+            }
+            .to_transcript_content(),
             "review feedback must retain its type instead of claiming native permission denial"
         );
         assert!(!result_text(&results, "sibling").0.is_error);
@@ -2142,6 +2352,7 @@ mod entered_worker_cancellation {
                 late_entry,
                 Some(Err(ToolError::ReviewUnsatisfied {
                     kind: ReviewUnsatisfiedKind::AlreadyConsumed,
+                    ..
                 } | ToolError::ReviewUnavailable {
                     kind: ReviewUnavailableKind::DispatchEnded,
                 }))

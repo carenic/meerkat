@@ -122,6 +122,8 @@ async fn exercise_revalidated_stock_persistent(server: &Server, cleanup: &Cleanu
         store.clone(),
         Arc::new(meerkat::MemoryBlobStore::new()),
         NativeGrantWorkConfiguration {
+            retained_resume: None,
+            require_scoped_destination: false,
             grants: grants.clone(),
             ingress,
             invocation_owner: Arc::new(InvocationOwner),
@@ -129,6 +131,7 @@ async fn exercise_revalidated_stock_persistent(server: &Server, cleanup: &Cleanu
                 selection: selected.clone(),
                 endpoint: format!("{}/v1/messages", server.base_url),
             }),
+            configured_mcp_attachment: None,
         },
     )
     .expect("accepted candidate configures the bundle's actual persistent owner");
@@ -148,7 +151,8 @@ async fn exercise_revalidated_stock_persistent(server: &Server, cleanup: &Cleanu
     let config_path =
         std::env::temp_dir().join(format!("stock-persistent-{}.toml", SessionId::new()));
     let (service, machine) =
-        build_runtime_backed_service_with_default_reconfigure_host(builder, 2, bundle, config_path);
+        build_runtime_backed_service_with_default_reconfigure_host(builder, 2, bundle, config_path)
+            .expect("compose the runtime-backed service");
     assert!(Arc::ptr_eq(&machine, &configured_adapter));
     assert!(Arc::ptr_eq(&service.runtime_store(), &store));
     *cleanup.lock().unwrap() = Some((machine.clone(), session_id.clone()));

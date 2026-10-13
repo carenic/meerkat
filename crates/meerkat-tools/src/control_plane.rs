@@ -12,6 +12,7 @@ use meerkat_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::schema::schema_for;
@@ -20,6 +21,7 @@ use meerkat_core::tool_catalog::{
     TOOL_CATALOG_LOAD_NAME as LOAD_TOOL_NAME, TOOL_CATALOG_SEARCH_NAME as SEARCH_TOOL_NAME,
 };
 const CONTROL_SOURCE_ID: &str = "control_plane";
+static NEXT_CATALOG_CONTROL_AUTHORITY_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Typed refusal raised when the deferred tool-load control plane has no
 /// [`ToolScope`] bound.
@@ -151,6 +153,10 @@ pub struct CatalogControlDispatcher {
     session_dispatcher: Arc<dyn AgentToolDispatcher>,
     visibility_provider: Arc<CatalogControlVisibilityProvider>,
     tools: Arc<[Arc<ToolDef>]>,
+    /// This instance's ephemeral execution owner identity: it binds the
+    /// session dispatcher and visibility provider it retains, so a plan
+    /// resolved by another instance never dispatches here.
+    execution_authority_id: u64,
 }
 
 impl CatalogControlDispatcher {
@@ -186,7 +192,43 @@ impl CatalogControlDispatcher {
             session_dispatcher,
             visibility_provider,
             tools: vec![Arc::new(search_tool_def()), Arc::new(load_tool_def())].into(),
+            execution_authority_id: NEXT_CATALOG_CONTROL_AUTHORITY_ID
+                .fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    fn execution_authority_key(&self) -> String {
+        format!("tool-catalog-control:{}", self.execution_authority_id)
+    }
+
+    fn catalog_operation(tool_name: &str) -> Option<meerkat_core::CatalogOperation> {
+        match tool_name {
+            SEARCH_TOOL_NAME => Some(meerkat_core::CatalogOperation::Search),
+            LOAD_TOOL_NAME => Some(meerkat_core::CatalogOperation::Load),
+            _ => None,
+        }
+    }
+
+    /// The plan was resolved by this instance for exactly this catalog
+    /// operation, and its binding is still current.
+    fn owner_witness_matches(
+        &self,
+        call: ToolCallView<'_>,
+        plan: &meerkat_core::ResolvedToolExecutionPlan,
+    ) -> bool {
+        let Some(operation) = Self::catalog_operation(call.name) else {
+            return false;
+        };
+        let Ok(live) = self.execution_binding_fingerprint(call.name) else {
+            return false;
+        };
+        plan.owner_witness(&self.execution_authority_key())
+            .is_some_and(|witness| {
+                witness.owner_key() == call.name
+                    && witness.binding_fingerprint() == &live
+                    && witness.operation_target()
+                        == Some(&meerkat_core::ToolOperationTarget::CatalogControl { operation })
+            })
     }
 
     fn exact_session_catalog(&self) -> Option<Arc<[ToolCatalogEntry]>> {
@@ -530,6 +572,26 @@ impl AgentToolDispatcher for CatalogControlDispatcher {
             .into()
     }
 
+    fn execution_binding_fingerprint(
+        &self,
+        tool_name: &str,
+    ) -> Result<
+        meerkat_core::EphemeralToolBindingFingerprint,
+        meerkat_core::ToolExecutionResolutionError,
+    > {
+        let catalog = self.tool_catalog();
+        let entry = catalog
+            .iter()
+            .find(|entry| entry.tool.name == tool_name)
+            .ok_or_else(|| meerkat_core::ToolExecutionResolutionError::NotFound {
+                tool_name: tool_name.to_string(),
+            })?;
+        Ok(
+            meerkat_core::ephemeral_tool_catalog_binding_fingerprint(entry)
+                .with_live_authority(self.execution_authority_id as usize, 0),
+        )
+    }
+
     fn resolve_execution_plan(
         &self,
         call: ToolCallView<'_>,
@@ -550,10 +612,51 @@ impl AgentToolDispatcher for CatalogControlDispatcher {
                 reason,
             });
         }
+        let operation = Self::catalog_operation(call.name).ok_or_else(|| {
+            meerkat_core::ToolExecutionResolutionError::NotFound {
+                tool_name: call.name.to_string(),
+            }
+        })?;
+        // The typed catalog fact, produced and revalidated at dispatch only
+        // by this owner: the operation policy owner classifies catalog reads
+        // from it, never from a name.
+        let witness = meerkat_core::ToolExecutionOwnerWitness::new(
+            self.execution_authority_key(),
+            call.name,
+            self.execution_binding_fingerprint(call.name)?,
+        )?
+        .with_operation_target(meerkat_core::ToolOperationTarget::CatalogControl { operation });
         entry
             .execution
-            .resolve_default(resolution_context.deadlines().clone())
-            .map_err(Into::into)
+            .resolve_default(resolution_context.deadlines().clone())?
+            .with_owner_witness(witness)
+    }
+
+    /// A resolved plan runs only when this instance resolved it for exactly
+    /// this catalog operation; the inherited Fast lowering validates no
+    /// leaf owner.
+    async fn dispatch_resolved_with_context(
+        &self,
+        call: ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+        plan: &meerkat_core::ResolvedToolExecutionPlan,
+    ) -> Result<ToolDispatchOutcome, ToolError> {
+        if !self.owner_witness_matches(call, plan) {
+            return Err(ToolError::unavailable(
+                call.name,
+                meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
+            ));
+        }
+        match plan.mode() {
+            meerkat_core::ToolExecutionMode::Fast => {
+                self.dispatch_with_context(call, context).await
+            }
+            meerkat_core::ToolExecutionMode::Streaming
+            | meerkat_core::ToolExecutionMode::Detached => Err(ToolError::unavailable(
+                call.name,
+                meerkat_core::ToolUnavailableReason::ExecutionModeOwnerUnavailable,
+            )),
+        }
     }
 
     async fn dispatch(&self, call: ToolCallView<'_>) -> Result<ToolDispatchOutcome, ToolError> {
@@ -677,6 +780,7 @@ fn control_provenance() -> Option<ToolProvenance> {
     Some(ToolProvenance {
         kind: ToolSourceKind::Builtin,
         source_id: CONTROL_SOURCE_ID.into(),
+        artifact: None,
     })
 }
 
@@ -812,6 +916,7 @@ mod tests {
         ToolProvenance {
             kind: ToolSourceKind::Callback,
             source_id: source_id.into(),
+            artifact: None,
         }
     }
 
@@ -880,6 +985,42 @@ mod tests {
             meerkat_core::ToolExecutionMode::Fast,
             "control arguments must not be interpreted by the hybrid session resolver"
         );
+        // The plan carries this owner's typed catalog target, the only
+        // classification an operation policy owner may use.
+        let targets: Vec<_> = control_plan
+            .owner_witnesses()
+            .iter()
+            .filter_map(|witness| witness.operation_target())
+            .collect();
+        assert_eq!(
+            targets,
+            vec![&meerkat_core::ToolOperationTarget::CatalogControl {
+                operation: meerkat_core::CatalogOperation::Load,
+            }]
+        );
+        let search_plan = control
+            .resolve_execution_plan(
+                ToolCallView {
+                    id: "control-search-plan",
+                    name: SEARCH_TOOL_NAME,
+                    args: raw.as_ref(),
+                },
+                &meerkat_core::ToolDispatchContext::default(),
+                &resolution,
+            )
+            .expect("control-owned search should resolve locally");
+        let search_targets: Vec<_> = search_plan
+            .owner_witnesses()
+            .iter()
+            .filter_map(|witness| witness.operation_target())
+            .collect();
+        assert_eq!(
+            search_targets,
+            vec![&meerkat_core::ToolOperationTarget::CatalogControl {
+                operation: meerkat_core::CatalogOperation::Search,
+            }],
+            "a search is never tagged as a load"
+        );
 
         let session_error = control
             .resolve_execution_plan(
@@ -898,6 +1039,144 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn catalog_plans_dispatch_only_through_their_resolving_instance_and_operation() {
+        let deferred = session_tool("deferred_tool", "Deferred tool");
+        let tools: Arc<[Arc<ToolDef>]> = vec![Arc::clone(&deferred)].into();
+        let session: Arc<dyn AgentToolDispatcher> = Arc::new(ExactCatalogDispatcher {
+            tools: Arc::clone(&tools),
+            catalog: vec![ToolCatalogEntry::session_deferred(
+                Arc::clone(&deferred),
+                true,
+                callback_provenance("test"),
+            )]
+            .into(),
+            pending_sources: Arc::from([]),
+            may_require_control_plane: false,
+        });
+        let visibility_provider = Arc::new(CatalogControlVisibilityProvider::new());
+        visibility_provider.set_scope(generated_visibility_scope(
+            Arc::clone(&tools),
+            tools.iter().map(|tool| tool.name.clone()).collect(),
+        ));
+        let control = Arc::new(CatalogControlDispatcher::new(
+            Arc::clone(&session),
+            Arc::clone(&visibility_provider),
+        ));
+        // An equal second instance over the same composition.
+        let other = CatalogControlDispatcher::new(Arc::clone(&session), visibility_provider);
+        // The factory's composition: session tools, then the control plane.
+        let root: Arc<dyn AgentToolDispatcher> =
+            Arc::new(meerkat_core::DynamicToolComposite::new(vec![
+                Arc::clone(&session),
+                control.clone() as Arc<dyn AgentToolDispatcher>,
+            ]));
+        let context = meerkat_core::ToolDispatchContext::default();
+        let resolution = meerkat_core::ToolExecutionResolutionContext::new(
+            meerkat_core::ToolDeadlineChain::new(vec![
+                meerkat_core::ToolDeadlineContributor::finite(
+                    meerkat_core::ToolDeadlineOwner::CoreToolDispatch,
+                    std::time::Duration::from_secs(600),
+                ),
+            ])
+            .expect("deadline chain"),
+        );
+        let search = search_call(SEARCH_TOOL_NAME, json!({"query": "deferred"}));
+        let load = search_call(LOAD_TOOL_NAME, json!({"names": ["deferred_tool"]}));
+        let resolve = |call| {
+            meerkat_core::resolve_tool_execution_plan_fenced(&root, call, &context, &resolution)
+                .expect("root plan")
+        };
+        let catalog_targets = |plan: &meerkat_core::ResolvedToolExecutionPlan| {
+            plan.owner_witnesses()
+                .iter()
+                .filter_map(|witness| witness.operation_target().cloned())
+                .collect::<Vec<_>>()
+        };
+
+        // Genuine search and load, routed through the gateway and the root
+        // fence, carry exactly their own operation and execute.
+        let search_plan = resolve(search);
+        assert_eq!(
+            catalog_targets(&search_plan),
+            vec![meerkat_core::ToolOperationTarget::CatalogControl {
+                operation: meerkat_core::CatalogOperation::Search,
+            }]
+        );
+        let found = meerkat_core::dispatch_tool_execution_plan_fenced(
+            &root,
+            search,
+            &context,
+            &search_plan,
+        )
+        .await
+        .expect("genuine search");
+        assert!(found.session_effects.is_empty());
+        let load_plan = resolve(load);
+        assert_eq!(
+            catalog_targets(&load_plan),
+            vec![meerkat_core::ToolOperationTarget::CatalogControl {
+                operation: meerkat_core::CatalogOperation::Load,
+            }]
+        );
+        let loaded =
+            meerkat_core::dispatch_tool_execution_plan_fenced(&root, load, &context, &load_plan)
+                .await
+                .expect("genuine load");
+        assert!(matches!(
+            loaded.session_effects.as_slice(),
+            [SessionEffect::RequestDeferredTools { .. }]
+        ));
+
+        let owner_changed =
+            |result: Result<ToolDispatchOutcome, ToolError>, name: &str, label: &str| {
+                assert_eq!(
+                    result.expect_err(label),
+                    ToolError::unavailable(
+                        name,
+                        meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
+                    ),
+                    "{label}"
+                );
+            };
+        // A plan resolved by another instance never dispatches here.
+        owner_changed(
+            other
+                .dispatch_resolved_with_context(load, &context, &load_plan)
+                .await,
+            LOAD_TOOL_NAME,
+            "load plan on a second instance",
+        );
+        // A search plan cannot run as a load (no load effect), nor the
+        // reverse.
+        owner_changed(
+            control
+                .dispatch_resolved_with_context(load, &context, &search_plan)
+                .await,
+            LOAD_TOOL_NAME,
+            "load call with a search plan",
+        );
+        owner_changed(
+            control
+                .dispatch_resolved_with_context(search, &context, &load_plan)
+                .await,
+            SEARCH_TOOL_NAME,
+            "search call with a load plan",
+        );
+        // A plan without this owner's witness is refused.
+        let bare = ToolCatalogEntry::control_inline(Arc::new(load_tool_def()), true)
+            .execution
+            .resolve_default(resolution.deadlines().clone())
+            .expect("bare plan");
+        owner_changed(
+            control
+                .dispatch_resolved_with_context(load, &context, &bare)
+                .await,
+            LOAD_TOOL_NAME,
+            "load without a witness",
+        );
+    }
+
     fn session_tool(name: &str, description: &str) -> Arc<ToolDef> {
         Arc::new(ToolDef {
             audience: Default::default(),
@@ -907,6 +1186,7 @@ mod tests {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Callback,
                 source_id: "test".into(),
+                artifact: None,
             }),
         })
     }

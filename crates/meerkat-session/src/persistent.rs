@@ -7437,6 +7437,92 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         self.inner.live_session_llm_identity(id).await
     }
 
+    /// Attach one reviewed MCP server to the current member, under the
+    /// caller's exact actor turn-boundary lease (B), taken by value.
+    ///
+    /// The recovery gate (R) is taken after B, as every same-session
+    /// mutation does; under both the exact actor's channel is selected and
+    /// its witness checked, and the actor compares the same witness again
+    /// before any effect. A detached task then owns B, R and the command's
+    /// settlement, so a caller that stops waiting cannot release the fence
+    /// against discard or replacement while an admitted attachment can
+    /// still persist or stage. The member's own router stages the server
+    /// with its native prepared control and applies it now; a persisted
+    /// write, when requested, is the control's separate decision under the
+    /// config lock, and a refused write stages nothing.
+    pub async fn attach_live_mcp_server(
+        &self,
+        lease: LiveSessionActorTurnBoundaryLease,
+        attachment: meerkat_core::mcp_attachment::LiveMcpAttachment,
+    ) -> Result<
+        meerkat_core::mcp_attachment::LiveMcpAttachmentReceipt,
+        meerkat_core::mcp_attachment::LiveMcpAttachError,
+    > {
+        use meerkat_core::mcp_attachment::{LiveMcpAttachError, McpAttachmentRefusal};
+        let recovery_guard = self
+            .recovery_gate_for_session(lease.session_id())
+            .await
+            .lock_owned()
+            .await;
+        let inner = Arc::clone(&self.inner);
+        let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _recovery_guard = recovery_guard;
+            let outcome = inner
+                .attach_live_mcp_server_for_actor(lease.witness(), attachment)
+                .await;
+            drop(lease);
+            let _ = outcome_tx.send(outcome);
+        });
+        outcome_rx.await.unwrap_or(Err(LiveMcpAttachError::Refused(
+            McpAttachmentRefusal::Unavailable,
+        )))
+    }
+
+    /// [`attach_live_mcp_server`](Self::attach_live_mcp_server) for an
+    /// external host caller between turns that holds no lease: the turn
+    /// boundary is only tried, never waited for. A held boundary refuses at
+    /// once with
+    /// [`Busy`](meerkat_core::mcp_attachment::LiveMcpAttachError::Busy):
+    /// nothing was attached. `Busy` grants no permission, and whether to try
+    /// again is for the caller's owner to decide; it is neither an
+    /// instruction to retry nor a promise of automatic retry. `Busy` proves a
+    /// held boundary, not necessarily an active turn. Current-turn attachment
+    /// is not implemented: an in-turn caller (a tool inside the member's own
+    /// turn) always gets `Busy` and never waits on itself.
+    pub async fn try_attach_live_mcp_server(
+        &self,
+        id: &SessionId,
+        attachment: meerkat_core::mcp_attachment::LiveMcpAttachment,
+    ) -> Result<
+        meerkat_core::mcp_attachment::LiveMcpAttachmentReceipt,
+        meerkat_core::mcp_attachment::LiveMcpAttachError,
+    > {
+        use meerkat_core::mcp_attachment::{LiveMcpAttachError, McpAttachmentRefusal};
+        let Ok(turn_finalization_guard) = self
+            .turn_finalization_gate_for_session(id)
+            .await
+            .try_lock_owned()
+        else {
+            return Err(LiveMcpAttachError::Busy);
+        };
+        let witness =
+            self.inner
+                .live_session_actor_witness(id)
+                .await
+                .ok_or(LiveMcpAttachError::Refused(
+                    McpAttachmentRefusal::NotCurrent,
+                ))?;
+        self.attach_live_mcp_server(
+            LiveSessionActorTurnBoundaryLease {
+                witness,
+                _turn_finalization_guard: turn_finalization_guard,
+            },
+            attachment,
+        )
+        .await
+    }
+
     /// Live presence for the realtime open path, without an actor command.
     ///
     /// The channel mint needs exactly two facts before it can proceed: a live
@@ -7727,6 +7813,48 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         let _application_lifecycle = self.inner.reserve_tool_application_lifecycle(id).await?;
         let _recovery_guard = self.recovery_gate_for_session(id).await.lock_owned().await;
         self.discard_live_session_unfenced(id).await
+    }
+
+    /// Apply one change to a live session's durable MCP attachment intents
+    /// and persist it, or discard the live session when persistence fails.
+    ///
+    /// Once the mutation guards are held, a detached task owns them together
+    /// with the actor mutation and its persist-or-discard settlement, so
+    /// caller cancellation cannot leave a live mutation unpersisted. (The
+    /// `SessionService` method is not offered here for that reason: it could
+    /// not own the settlement.)
+    pub async fn update_session_mcp_attachment_intent_owned(
+        self: Arc<Self>,
+        id: &SessionId,
+        mutation: meerkat_core::McpAttachmentIntentMutation,
+    ) -> Result<meerkat_core::McpAttachmentIntentRecorded, SessionError> {
+        let mutation_guard = self.live_persist_mutation_guard(id).await?;
+        let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+        let owner = Arc::clone(&self);
+        let session_id = id.clone();
+        tokio::spawn(async move {
+            let _mutation_guard = mutation_guard;
+            let outcome = async {
+                let recorded = owner
+                    .inner
+                    .update_session_mcp_attachment_intent(&session_id, mutation)
+                    .await?;
+                if recorded.changed {
+                    owner
+                        .persist_full_session_or_discard_live(&session_id)
+                        .await?;
+                }
+                Ok(recorded)
+            }
+            .await;
+            let _ = outcome_tx.send(outcome);
+        });
+        match outcome_rx.await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(SessionError::Agent(AgentError::InternalError(format!(
+                "MCP attachment intent update for session {id} ended without reporting an outcome"
+            )))),
+        }
     }
 
     /// Durably commit one model-routing terminal before converging the live actor.
@@ -15773,10 +15901,12 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// typed `TranscriptRevisionConflict`. The read then re-observes the
     /// now-current authority within the same counted budget as every other
     /// observation racing a head-canonical writer, rereading the full
-    /// authoritative base each time. It never waits for a turn or a lock, so a
-    /// caller that holds the turn-finalization boundary may use it, and it
-    /// never serves any head other than the one the store issued for that
-    /// attempt. A conflict on every attempt surfaces unchanged: stale or
+    /// authoritative base each time. The retry adds no wait on the
+    /// turn-finalization boundary (the audited store reads it repeats keep
+    /// their own storage locking), so a caller that holds that boundary may
+    /// use it, and it never serves any head other than the one the store
+    /// issued for that attempt. The budget counts attempts, not wall-clock
+    /// time. A conflict on every attempt surfaces unchanged: stale or
     /// contradictory authority still fails closed.
     pub async fn load_authoritative_session(
         &self,
@@ -20649,8 +20779,107 @@ mod tests {
         pending_head_canonical_boundary: Option<PreparedHeadCanonicalRuntimeBoundary>,
     }
 
+    /// A test's hold on the live MCP attachment of one session's dummy
+    /// agents: each attach counts its entry, waits for a release when gated,
+    /// then counts its completion. A session with no probe refuses as
+    /// unsupported, like a builder with no live attachment surface.
+    struct AttachProbe {
+        entered: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+        gated: AtomicBool,
+        completed: AtomicUsize,
+    }
+
+    impl Default for AttachProbe {
+        fn default() -> Self {
+            Self {
+                entered: tokio::sync::Semaphore::new(0),
+                release: tokio::sync::Semaphore::new(0),
+                gated: AtomicBool::new(false),
+                completed: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    fn attach_probes()
+    -> &'static std::sync::Mutex<std::collections::HashMap<SessionId, Arc<AttachProbe>>> {
+        static PROBES: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<SessionId, Arc<AttachProbe>>>,
+        > = std::sync::OnceLock::new();
+        PROBES.get_or_init(Default::default)
+    }
+
+    fn probe_attach(session_id: &SessionId, gated: bool) -> Arc<AttachProbe> {
+        let probe = Arc::new(AttachProbe::default());
+        probe.gated.store(gated, Ordering::SeqCst);
+        attach_probes()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.clone(), Arc::clone(&probe));
+        probe
+    }
+
+    /// The dummy agent stages an attachment without connecting anything, so
+    /// the attempt in its receipt never leaves `Pending`.
+    struct DummyAttachAttemptObserver;
+
+    #[async_trait::async_trait]
+    impl meerkat_core::mcp_attachment::McpAttachmentAttemptObserver for DummyAttachAttemptObserver {
+        async fn observe(
+            &self,
+            _tool: &str,
+        ) -> meerkat_core::mcp_attachment::McpAttachmentReadiness {
+            meerkat_core::mcp_attachment::McpAttachmentReadiness::Pending
+        }
+
+        async fn wait(
+            &self,
+            _tool: &str,
+            _timeout: std::time::Duration,
+        ) -> meerkat_core::mcp_attachment::McpAttachmentReadiness {
+            meerkat_core::mcp_attachment::McpAttachmentReadiness::Pending
+        }
+    }
+
     #[async_trait::async_trait]
     impl SessionAgent for DummyAgent {
+        async fn attach_mcp_server(
+            &mut self,
+            attachment: meerkat_core::mcp_attachment::LiveMcpAttachment,
+        ) -> Result<
+            meerkat_core::mcp_attachment::LiveMcpAttachmentReceipt,
+            meerkat_core::mcp_attachment::LiveMcpAttachError,
+        > {
+            let probe = attach_probes()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&self.session_id())
+                .cloned();
+            let Some(probe) = probe else {
+                return Err(meerkat_core::mcp_attachment::LiveMcpAttachError::Unsupported);
+            };
+            probe.entered.add_permits(1);
+            if probe.gated.load(Ordering::SeqCst) {
+                probe
+                    .release
+                    .acquire()
+                    .await
+                    .expect("the release gate is never closed")
+                    .forget();
+            }
+            probe.completed.fetch_add(1, Ordering::SeqCst);
+            Ok(meerkat_core::mcp_attachment::LiveMcpAttachmentReceipt {
+                outcome: meerkat_core::mcp_attachment::McpAttachmentOutcome {
+                    persisted: false,
+                    staged: true,
+                },
+                attempt: meerkat_core::mcp_attachment::McpAttachmentAttempt::new(
+                    attachment.server.name,
+                    Arc::new(DummyAttachAttemptObserver),
+                ),
+            })
+        }
+
         async fn run_with_events(
             &mut self,
             prompt: meerkat_core::types::ContentInput,
@@ -20933,6 +21162,27 @@ mod tests {
                         "failed to update dummy mob authority context: {err}"
                     ))
                 })
+        }
+
+        fn apply_mcp_attachment_intent(
+            &mut self,
+            mutation: meerkat_core::McpAttachmentIntentMutation,
+        ) -> Result<meerkat_core::McpAttachmentIntentRecorded, meerkat_core::error::AgentError>
+        {
+            let mut session = match self.session.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if session.build_state().is_none() {
+                session
+                    .set_build_state(meerkat_core::SessionBuildState::default())
+                    .map_err(|err| {
+                        meerkat_core::error::AgentError::InternalError(err.to_string())
+                    })?;
+            }
+            session
+                .apply_mcp_attachment_intent_mutation(mutation)
+                .map_err(meerkat_core::error::AgentError::InternalError)
         }
 
         fn append_system_messages(
@@ -22661,6 +22911,7 @@ mod tests {
             last_seen_provenance: Some(meerkat_core::ToolProvenance {
                 kind: meerkat_core::ToolSourceKind::Callback,
                 source_id: tool_name.to_string().into(),
+                artifact: None,
             }),
         }
     }
@@ -34525,6 +34776,107 @@ mod tests {
         }
     }
 
+    fn suppressed_docs_intent(
+        session: &Session,
+    ) -> Option<meerkat_core::McpAttachmentIntentDisposition> {
+        session.build_state().and_then(|state| {
+            state
+                .mcp_attachment_intents
+                .iter()
+                .find(|intent| intent.descriptor.server_name == "docs")
+                .map(|intent| intent.disposition)
+        })
+    }
+
+    /// A queued MCP attachment intent change stays owned through its durable
+    /// settlement when the caller is dropped mid-save: the live session never
+    /// holds a change that durable authority lacks once the commit lands.
+    #[tokio::test]
+    async fn mcp_attachment_intent_change_settles_durably_after_caller_cancellation() {
+        use meerkat_core::{
+            McpAttachmentDescriptorIdentity, McpAttachmentIntentMutation, McpAttachmentTarget,
+        };
+        for profile in TerminalCommitProfile::ALL {
+            let fixture = CancellableTerminalCommitFixture::new(profile).await;
+            let update = |mutation: McpAttachmentIntentMutation| {
+                let service = Arc::clone(&fixture.service);
+                let session_id = fixture.session_id.clone();
+                async move {
+                    service
+                        .update_session_mcp_attachment_intent_owned(&session_id, mutation)
+                        .await
+                }
+            };
+            update(McpAttachmentIntentMutation::Request {
+                descriptor: McpAttachmentDescriptorIdentity {
+                    server_name: "docs".to_string(),
+                    target: McpAttachmentTarget::Http {
+                        location: "https://docs.example/mcp".to_string(),
+                        withheld: false,
+                        binding: None,
+                    },
+                    oauth_account: None,
+                    oauth_account_selection: None,
+                    connector_account: None,
+                },
+            })
+            .await
+            .expect("record the request");
+            assert_eq!(
+                suppressed_docs_intent(&fixture.durable_body().await),
+                Some(meerkat_core::McpAttachmentIntentDisposition::Requested),
+                "{profile:?}: the request is durable before the test begins"
+            );
+
+            fixture.gate.pause();
+            let mut suppress = Box::pin(update(McpAttachmentIntentMutation::SuppressByLogout {
+                server_name: "docs".to_string(),
+            }));
+            tokio::select! {
+                outcome = &mut suppress => unreachable!(
+                    "{profile:?}: the change cannot settle while its save is paused: {outcome:?}"
+                ),
+                () = fixture.gate.entered() => {}
+            }
+            // The caller goes away while the save is in flight.
+            drop(suppress);
+            fixture.gate.release();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let durable = fixture
+                    .service
+                    .load_committed_runtime_session_for_body(
+                        &fixture.session_id,
+                        "mcp intent cancellation poll",
+                    )
+                    .await
+                    .ok()
+                    .flatten();
+                if durable.as_ref().and_then(suppressed_docs_intent)
+                    == Some(meerkat_core::McpAttachmentIntentDisposition::SuppressedByLogout)
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{profile:?}: the abandoned change was applied live but never settled durably"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let live = fixture
+                .service
+                .export_session_with_labels(&fixture.session_id)
+                .await
+                .expect("live session stays");
+            assert_eq!(
+                suppressed_docs_intent(&live),
+                suppressed_docs_intent(&fixture.durable_body().await),
+                "{profile:?}: live and durable intents agree after settlement"
+            );
+        }
+    }
+
     /// Dropping the caller after the durable commit but before actor sync cannot
     /// lose the terminal or admit a second identity rotation.
     #[tokio::test]
@@ -40695,6 +41047,444 @@ mod tests {
         );
     }
 
+    /// The live MCP attachment entry reaches only the exact current actor:
+    /// the current actor's own agent answers (this dummy agent has no live
+    /// attachment surface); a member whose turn boundary is held refuses a
+    /// lease-free call at once as Busy instead of waiting on itself; and the
+    /// lease of an actor discarded meanwhile refuses as not current.
+    #[tokio::test]
+    async fn live_mcp_attachment_reaches_only_the_exact_actor_and_never_waits_on_itself() {
+        use meerkat_core::mcp_attachment::{
+            LiveMcpAttachError, LiveMcpAttachment, McpAttachmentAuthority, McpAttachmentRefusal,
+        };
+        use meerkat_core::mcp_config::{McpScope, McpServerConfig};
+
+        struct Control(McpServerConfig);
+        impl McpAttachmentAuthority for Control {
+            fn server(&self) -> &McpServerConfig {
+                &self.0
+            }
+            fn authorize_apply(&self) -> Result<(), McpAttachmentRefusal> {
+                Ok(())
+            }
+            fn authorize_persist(&self, _: McpScope) -> Result<(), McpAttachmentRefusal> {
+                Err(McpAttachmentRefusal::Denied)
+            }
+        }
+        let attachment = || {
+            let server = McpServerConfig::stdio(
+                "first",
+                "true",
+                Vec::new(),
+                std::collections::HashMap::new(),
+            );
+            LiveMcpAttachment {
+                control: Arc::new(Control(server.clone())),
+                server,
+                persist: None,
+            }
+        };
+
+        let service = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            Arc::new(MemoryStore::new()),
+            Arc::new(InMemoryRuntimeStore::new()),
+            memory_blob_store(),
+        );
+        let actor_slot = LiveSessionActorWitnessSlot::default();
+        let admission = service
+            .reserve_create_session_admission()
+            .await
+            .expect("reserve admission");
+        let session_id = service
+            .create_session_with_reserved_admission_and_actor_witness(
+                create_request_with_metadata("member", InitialTurnPolicy::Defer),
+                admission,
+                &actor_slot,
+            )
+            .await
+            .expect("create member")
+            .session_id;
+        let actor = actor_slot.witness().expect("exact witness");
+
+        let lease = service
+            .acquire_live_session_actor_turn_boundary_lease_exact(&actor)
+            .await
+            .expect("boundary")
+            .expect("exact actor");
+        assert_eq!(
+            service
+                .attach_live_mcp_server(lease, attachment())
+                .await
+                .map(|receipt| receipt.outcome),
+            Err(LiveMcpAttachError::Unsupported),
+            "the exact current actor's own agent answered"
+        );
+
+        let held = service
+            .acquire_live_session_actor_turn_boundary_lease(&session_id)
+            .await
+            .expect("hold the turn boundary");
+        let busy = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            service.try_attach_live_mcp_server(&session_id, attachment()),
+        )
+        .await
+        .expect("a lease-free call never waits on a held boundary");
+        assert_eq!(
+            busy.map(|receipt| receipt.outcome),
+            Err(LiveMcpAttachError::Busy)
+        );
+
+        assert!(
+            service
+                .discard_live_session_actor(&held)
+                .await
+                .expect("discard the exact actor")
+        );
+        assert_eq!(
+            service
+                .attach_live_mcp_server(held, attachment())
+                .await
+                .map(|receipt| receipt.outcome),
+            Err(LiveMcpAttachError::Refused(
+                McpAttachmentRefusal::NotCurrent
+            )),
+            "a discarded actor's lease reaches nothing"
+        );
+    }
+
+    fn live_mcp_race_attachment() -> meerkat_core::mcp_attachment::LiveMcpAttachment {
+        use meerkat_core::mcp_attachment::{McpAttachmentAuthority, McpAttachmentRefusal};
+        use meerkat_core::mcp_config::{McpScope, McpServerConfig};
+
+        struct Control(McpServerConfig);
+        impl McpAttachmentAuthority for Control {
+            fn server(&self) -> &McpServerConfig {
+                &self.0
+            }
+            fn authorize_apply(&self) -> Result<(), McpAttachmentRefusal> {
+                Ok(())
+            }
+            fn authorize_persist(&self, _: McpScope) -> Result<(), McpAttachmentRefusal> {
+                Err(McpAttachmentRefusal::Denied)
+            }
+        }
+        let server = McpServerConfig::stdio(
+            "raced",
+            "true",
+            Vec::new(),
+            std::collections::HashMap::new(),
+        );
+        meerkat_core::mcp_attachment::LiveMcpAttachment {
+            control: Arc::new(Control(server.clone())),
+            server,
+            persist: None,
+        }
+    }
+
+    async fn live_mcp_race_member(
+        service: &PersistentSessionService<DummyBuilder>,
+    ) -> (SessionId, LiveSessionActorWitness) {
+        let slot = LiveSessionActorWitnessSlot::default();
+        let admission = service
+            .reserve_create_session_admission()
+            .await
+            .expect("reserve admission");
+        let session_id = service
+            .create_session_with_reserved_admission_and_actor_witness(
+                create_request_with_metadata("member", InitialTurnPolicy::Defer),
+                admission,
+                &slot,
+            )
+            .await
+            .expect("create member")
+            .session_id;
+        (session_id, slot.witness().expect("exact witness"))
+    }
+
+    fn live_mcp_race_service() -> Arc<PersistentSessionService<DummyBuilder>> {
+        Arc::new(PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            Arc::new(MemoryStore::new()),
+            Arc::new(InMemoryRuntimeStore::new()),
+            memory_blob_store(),
+        ))
+    }
+
+    /// Effect entry: while the member's agent is inside the attachment
+    /// effect, the consumed turn boundary and the recovery gate are both
+    /// held, so a lease-free attach is Busy and no recovery can interleave;
+    /// both are released only when the effect settles.
+    #[tokio::test]
+    async fn live_mcp_attachment_holds_boundary_and_recovery_through_the_effect() {
+        use meerkat_core::mcp_attachment::{LiveMcpAttachError, McpAttachmentOutcome};
+        let service = live_mcp_race_service();
+        let (session_id, actor) = live_mcp_race_member(&service).await;
+        let probe = probe_attach(&session_id, true);
+
+        let lease = service
+            .acquire_live_session_actor_turn_boundary_lease_exact(&actor)
+            .await
+            .expect("boundary")
+            .expect("exact actor");
+        let attaching = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .attach_live_mcp_server(lease, live_mcp_race_attachment())
+                    .await
+            }
+        });
+        probe.entered.acquire().await.expect("entered").forget();
+
+        assert_eq!(
+            service
+                .try_attach_live_mcp_server(&session_id, live_mcp_race_attachment())
+                .await
+                .map(|receipt| receipt.outcome),
+            Err(LiveMcpAttachError::Busy),
+            "the effect still holds the turn boundary"
+        );
+        assert!(
+            service
+                .recovery_gate_for_session(&session_id)
+                .await
+                .try_lock()
+                .is_err(),
+            "the effect still holds the recovery gate"
+        );
+
+        probe.release.add_permits(1);
+        assert_eq!(
+            attaching
+                .await
+                .expect("attach task")
+                .map(|receipt| receipt.outcome),
+            Ok(McpAttachmentOutcome {
+                persisted: false,
+                staged: true,
+            })
+        );
+        assert!(
+            service
+                .recovery_gate_for_session(&session_id)
+                .await
+                .try_lock()
+                .is_ok(),
+            "the recovery gate is free once the effect settled"
+        );
+        probe.gated.store(false, Ordering::SeqCst);
+        assert!(
+            service
+                .try_attach_live_mcp_server(&session_id, live_mcp_race_attachment())
+                .await
+                .is_ok(),
+            "the boundary is free again"
+        );
+    }
+
+    /// Waiter cancel: a caller that goes away while the effect runs does not
+    /// release the boundary or the recovery gate early; the effect runs to
+    /// its end under them, exactly once, and only then are they released.
+    #[tokio::test]
+    async fn a_cancelled_attach_waiter_keeps_custody_until_the_effect_settles() {
+        use meerkat_core::mcp_attachment::LiveMcpAttachError;
+        let service = live_mcp_race_service();
+        let (session_id, actor) = live_mcp_race_member(&service).await;
+        let probe = probe_attach(&session_id, true);
+
+        let lease = service
+            .acquire_live_session_actor_turn_boundary_lease_exact(&actor)
+            .await
+            .expect("boundary")
+            .expect("exact actor");
+        let waiter = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .attach_live_mcp_server(lease, live_mcp_race_attachment())
+                    .await
+            }
+        });
+        probe.entered.acquire().await.expect("entered").forget();
+        waiter.abort();
+        assert!(waiter.await.is_err(), "the waiter is gone");
+
+        assert_eq!(
+            service
+                .try_attach_live_mcp_server(&session_id, live_mcp_race_attachment())
+                .await
+                .map(|receipt| receipt.outcome),
+            Err(LiveMcpAttachError::Busy),
+            "the boundary stays held after the waiter left"
+        );
+        assert!(
+            service
+                .recovery_gate_for_session(&session_id)
+                .await
+                .try_lock()
+                .is_err(),
+            "the recovery gate stays held after the waiter left"
+        );
+        assert_eq!(probe.completed.load(Ordering::SeqCst), 0);
+
+        probe.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if probe.completed.load(Ordering::SeqCst) == 1
+                    && service
+                        .recovery_gate_for_session(&session_id)
+                        .await
+                        .try_lock()
+                        .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the effect settles once and releases its custody");
+        assert_eq!(probe.completed.load(Ordering::SeqCst), 1, "exactly once");
+    }
+
+    /// Discard and redrive: a discard of the attaching actor waits behind
+    /// the running effect instead of interleaving with it; after the discard
+    /// and a redrive of the same session, the predecessor's witness reaches
+    /// nothing and a new attachment reaches only the successor.
+    ///
+    /// Abnormal loss is distinct and not exercised here: losing the detached
+    /// effect task's channel answers `Refused(Unavailable)`, while losing the
+    /// inner actor's reply (or a command buffered at shutdown) answers
+    /// `Refused(NotCurrent)`.
+    #[tokio::test]
+    async fn a_discard_waits_for_the_attachment_and_a_redrive_admits_only_the_successor() {
+        use meerkat_core::mcp_attachment::McpAttachmentOutcome;
+        let service = live_mcp_race_service();
+        let (session_id, actor_a) = live_mcp_race_member(&service).await;
+        let probe = probe_attach(&session_id, true);
+        let session = service
+            .export_live_session(&session_id)
+            .await
+            .expect("export for the redrive");
+
+        let lease = service
+            .acquire_live_session_actor_turn_boundary_lease_exact(&actor_a)
+            .await
+            .expect("boundary")
+            .expect("exact actor");
+        let attaching = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .attach_live_mcp_server(lease, live_mcp_race_attachment())
+                    .await
+            }
+        });
+        probe.entered.acquire().await.expect("entered").forget();
+
+        // The discard's own boundary acquisition is actually polled, and is
+        // still pending after repeated polls while the effect is held: an
+        // acknowledgement from the acquisition itself, not an inference from
+        // an unscheduled task.
+        let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
+        let discarding = tokio::spawn({
+            let service = Arc::clone(&service);
+            let actor_a = actor_a.clone();
+            async move {
+                let acquire =
+                    service.acquire_live_session_actor_turn_boundary_lease_exact(&actor_a);
+                tokio::pin!(acquire);
+                let mut pending_polls = 0usize;
+                let acquired = loop {
+                    match futures::poll!(acquire.as_mut()) {
+                        std::task::Poll::Ready(acquired) => break Some(acquired),
+                        std::task::Poll::Pending if pending_polls == 50 => break None,
+                        std::task::Poll::Pending => {
+                            pending_polls += 1;
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                };
+                let _ = polled_tx.send(acquired.is_none());
+                let acquired = match acquired {
+                    Some(acquired) => acquired,
+                    None => acquire.await,
+                };
+                let boundary = acquired
+                    .expect("boundary")
+                    .expect("actor A is still current when the effect settles");
+                service
+                    .discard_live_session_actor(&boundary)
+                    .await
+                    .expect("discard actor A")
+            }
+        });
+        assert!(
+            polled_rx
+                .await
+                .expect("the discard reported its acquisition"),
+            "the discard's boundary acquisition stays pending behind the running effect"
+        );
+        assert_eq!(probe.completed.load(Ordering::SeqCst), 0);
+
+        probe.release.add_permits(1);
+        assert_eq!(
+            attaching
+                .await
+                .expect("attach task")
+                .map(|receipt| receipt.outcome),
+            Ok(McpAttachmentOutcome {
+                persisted: false,
+                staged: true,
+            }),
+            "the effect settled on actor A before the discard"
+        );
+        assert!(discarding.await.expect("discard task"), "actor A discarded");
+
+        let slot = LiveSessionActorWitnessSlot::default();
+        let admission = service
+            .reserve_create_session_admission()
+            .await
+            .expect("reserve redrive admission");
+        service
+            .create_session_with_reserved_admission_and_actor_witness(
+                resume_request(session),
+                admission,
+                &slot,
+            )
+            .await
+            .expect("redrive the same session");
+        let actor_b = slot.witness().expect("successor witness");
+        assert_ne!(actor_a, actor_b);
+
+        assert!(
+            service
+                .acquire_live_session_actor_turn_boundary_lease_exact(&actor_a)
+                .await
+                .expect("boundary")
+                .is_none(),
+            "the predecessor's witness reaches no actor"
+        );
+        probe.gated.store(false, Ordering::SeqCst);
+        let lease_b = service
+            .acquire_live_session_actor_turn_boundary_lease_exact(&actor_b)
+            .await
+            .expect("boundary")
+            .expect("successor is exact");
+        assert!(
+            service
+                .attach_live_mcp_server(lease_b, live_mcp_race_attachment())
+                .await
+                .is_ok(),
+            "the successor's own agent attaches"
+        );
+        assert_eq!(probe.completed.load(Ordering::SeqCst), 2);
+    }
+
     #[tokio::test]
     async fn exact_terminal_batch_rejects_predecessor_actor_and_publishes_through_successor() {
         use futures::StreamExt;
@@ -43432,6 +44222,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl meerkat_core::HookEngine for LateReadyFactEngine {
+        fn mandatory_topology(
+            &self,
+            _overrides: Option<&meerkat_core::HookRunOverrides>,
+        ) -> Result<meerkat_core::HookMandatoryTopology, meerkat_core::HookEngineError> {
+            Ok(meerkat_core::HookMandatoryTopology::none())
+        }
+
         async fn execute(
             &self,
             invocation: meerkat_core::HookInvocation,

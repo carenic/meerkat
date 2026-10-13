@@ -39,6 +39,30 @@ fn runtime_actor_future(
     Box::pin(actor.run(command_rx))
 }
 
+/// Publishes how the actor task ended: `Returned` once the actor future
+/// returned, `Lost` when the task ends any other way (a panic or an abort
+/// drops this guard without the future returning).
+struct ActorTaskEndGuard {
+    observations: Option<Arc<super::MemberLifecycleObservations>>,
+}
+
+impl ActorTaskEndGuard {
+    /// The actor future returned.
+    fn returned(mut self) {
+        if let Some(observations) = self.observations.take() {
+            observations.record_actor_task_end(super::ActorTaskEnd::Returned);
+        }
+    }
+}
+
+impl Drop for ActorTaskEndGuard {
+    fn drop(&mut self) {
+        if let Some(observations) = self.observations.take() {
+            observations.record_actor_task_end(super::ActorTaskEnd::Lost);
+        }
+    }
+}
+
 fn placed_orchestrator_resume_notification_is_non_gating(error: &MobError) -> bool {
     // This turn is informational and runs before the restored controller has
     // re-probed placed hosts. Any well-formed terminal response from the
@@ -326,19 +350,15 @@ pub(super) async fn realize_planned_orchestrator_resume_notification(
     Ok(())
 }
 
-pub(super) async fn realize_orchestrator_resume_notification(
-    definition: &MobDefinition,
-    orchestrator_entry: &RosterEntry,
-    session_service: &dyn MobSessionService,
-    provisioner: &dyn MobProvisioner,
-    dsl_authority: &crate::machines::mob_machine::MobMachineAuthority,
-) -> Result<(), MobError> {
-    let Some(plan) =
-        plan_orchestrator_resume_notification(definition, orchestrator_entry, dsl_authority)?
-    else {
-        return Ok(());
-    };
-    realize_planned_orchestrator_resume_notification(plan, session_service, provisioner).await
+impl OrchestratorResumeNotification {
+    /// Whether realizing this notification completes without waiting on the
+    /// orchestrator's turn: a local AutonomousHost notification is a queued
+    /// injection. A local TurnDriven or placed notification runs the
+    /// orchestrator's whole turn.
+    fn realizes_without_a_turn(&self) -> bool {
+        self.placed_turn_context.is_none()
+            && self.runtime_mode == crate::MobRuntimeMode::AutonomousHost
+    }
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -507,8 +527,12 @@ pub(super) fn recovered_peer_only_overlay_allows_trust_reconcile(
 /// can execute. The read-only handle exposes no actor commands. Use the hook
 /// to bind host services; an error aborts startup.
 ///
-/// Hosts must discard bindings if a later bootstrap step fails. No hook runs
-/// unless one was explicitly installed with [`MobBuilder::before_activation`].
+/// A later bootstrap failure is not proof that the mob never ran: keep a
+/// binding unless that mob's non-activation is positively proven (a restore
+/// gate that held or tore it down before any actor existed, or a refusal
+/// reported before its actor started). A resume error or a failed destroy
+/// does not prove it. No hook runs unless one was explicitly installed with
+/// [`MobBuilder::before_activation`].
 #[cfg(not(target_arch = "wasm32"))]
 pub type MobBeforeActivation = Arc<
     dyn Fn(
@@ -528,6 +552,35 @@ pub type MobBeforeActivation = Arc<
         + Sync,
 >;
 
+/// The caller's custody of a destroy admitted before start (see
+/// [`MobBuilder::admit_destroy_before_start`]). While it is held, the
+/// resumed actor does not start its automatic destroy retry, so the caller's
+/// own destroy is the only one in flight. Dropping it on any path (success,
+/// error or cancellation) hands any remaining cleanup to that retry.
+#[doc(hidden)]
+pub struct StartAdmittedDestroyCustody {
+    _release: tokio::sync::oneshot::Sender<()>,
+}
+
+/// The actor-side end of a [`StartAdmittedDestroyCustody`].
+#[doc(hidden)]
+pub struct StartAdmittedDestroyCustodyWatch {
+    released: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// A custody pair for [`MobBuilder::admit_destroy_before_start`].
+#[doc(hidden)]
+pub fn start_admitted_destroy_custody() -> (
+    StartAdmittedDestroyCustody,
+    StartAdmittedDestroyCustodyWatch,
+) {
+    let (release, released) = tokio::sync::oneshot::channel();
+    (
+        StartAdmittedDestroyCustody { _release: release },
+        StartAdmittedDestroyCustodyWatch { released },
+    )
+}
+
 /// Builder for creating or resuming a mob.
 pub struct MobBuilder {
     mode: BuilderMode,
@@ -536,6 +589,8 @@ pub struct MobBuilder {
     session_service: Option<Arc<dyn MobSessionService>>,
     #[cfg(feature = "runtime-adapter")]
     runtime_adapter: RuntimeAdapterOption,
+    #[cfg(feature = "runtime-adapter")]
+    member_runtime_registration_hook: Option<Arc<dyn super::MemberRuntimeRegistrationHook>>,
     workgraph_service: Option<meerkat::WorkGraphService>,
     allow_ephemeral_sessions: bool,
     notify_orchestrator_on_resume: bool,
@@ -578,6 +633,12 @@ pub struct MobBuilder {
         AgentIdentity,
         std::collections::BTreeSet<super::stop_report::HostRunStartHoldReason>,
     >,
+    /// Admit the resumed mob's destroy before any restored work starts; see
+    /// [`MobBuilder::admit_destroy_before_start`].
+    start_destroy_admission: Option<(
+        crate::control_policy::CommandAuthority,
+        StartAdmittedDestroyCustodyWatch,
+    )>,
 }
 
 enum BuilderMode {
@@ -2754,6 +2815,34 @@ fn recover_owner_bridge_session_authority_from_history(
         }
     }
     Ok(())
+}
+
+/// The owner bridge-session binding cold resume recovers from `events`, one
+/// mob's whole history, validated exactly as resume validates it: definition
+/// epochs, then every `MobOwnerBridgeSessionBound` in order, applied to fresh
+/// machine authority, so a binding survives `MobReset` and a conflicting
+/// duplicate is refused. Reads only; nothing is built or written.
+pub(crate) fn owner_bridge_binding_from_history(
+    events: &[crate::event::MobEvent],
+) -> Result<Option<super::handle::OwnerBridgeSessionLifecycleAuthority>, MobError> {
+    let mut authority = seed_mob_authority();
+    recover_definition_epoch_from_history(&mut authority, events)?;
+    recover_owner_bridge_session_authority_from_history(&mut authority, events)?;
+    let state = authority.state();
+    let Some(bridge_session_id) = state.owner_bridge_session_id.as_ref() else {
+        return Ok(None);
+    };
+    let bridge_session_id = SessionId::parse(&bridge_session_id.0).map_err(|error| {
+        MobError::Internal(format!(
+            "recovered owner bridge session id '{}' is invalid: {error}",
+            bridge_session_id.0
+        ))
+    })?;
+    Ok(Some(super::handle::OwnerBridgeSessionLifecycleAuthority {
+        bridge_session_id,
+        destroy_on_owner_archive: state.owner_bridge_destroy_on_archive,
+        implicit_delegation_mob: state.implicit_delegation_mob,
+    }))
 }
 
 /// Replay typed durable mob events as recovery inputs to generated MobMachine
@@ -5456,8 +5545,17 @@ async fn recover_placed_completion_outcome_custody(
             )?;
         }
     }
+    Ok(recovered_lifecycle_quiesce_intent(events))
+}
+
+/// The placed-completion lifecycle intent one mob's history leaves durable:
+/// the last `PlacedCompletionLifecycleQuiesceStarted` that no
+/// `PlacedCompletionLifecycleQuiesceEnded` or `MobReset` closed.
+pub(crate) fn recovered_lifecycle_quiesce_intent(
+    events: &[crate::event::MobEvent],
+) -> Option<mob_dsl::PlacedCompletionLifecycleIntentKind> {
     let mut quiescing = None;
-    for event in events.iter() {
+    for event in events {
         match event.kind {
             MobEventKind::PlacedCompletionLifecycleQuiesceStarted { intent } => {
                 quiescing = Some(intent);
@@ -5468,7 +5566,7 @@ async fn recover_placed_completion_outcome_custody(
             _ => {}
         }
     }
-    Ok(quiescing)
+    quiescing
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -6790,6 +6888,8 @@ impl MobBuilder {
             session_service: None,
             #[cfg(feature = "runtime-adapter")]
             runtime_adapter: None,
+            #[cfg(feature = "runtime-adapter")]
+            member_runtime_registration_hook: None,
             workgraph_service: None,
             allow_ephemeral_sessions: false,
             notify_orchestrator_on_resume: true,
@@ -6805,6 +6905,7 @@ impl MobBuilder {
             controlling_acceptor: None,
             member_live_host: None,
             restored_member_run_start_holds: BTreeMap::new(),
+            start_destroy_admission: None,
         }
     }
 
@@ -6869,6 +6970,8 @@ impl MobBuilder {
             session_service: None,
             #[cfg(feature = "runtime-adapter")]
             runtime_adapter: None,
+            #[cfg(feature = "runtime-adapter")]
+            member_runtime_registration_hook: None,
             workgraph_service: None,
             allow_ephemeral_sessions: false,
             notify_orchestrator_on_resume: true,
@@ -6884,6 +6987,7 @@ impl MobBuilder {
             controlling_acceptor: None,
             member_live_host: None,
             restored_member_run_start_holds: BTreeMap::new(),
+            start_destroy_admission: None,
         }
     }
 
@@ -6931,6 +7035,19 @@ impl MobBuilder {
     #[cfg(feature = "runtime-adapter")]
     pub fn with_runtime_adapter(mut self, adapter: Arc<meerkat_runtime::MeerkatMachine>) -> Self {
         self.runtime_adapter = Some(adapter);
+        self
+    }
+
+    /// Install the host's selection of each member's scoped destination. The
+    /// mob installs the selected destination on the member's exact native
+    /// registration before its actor exists; a configured hook requires the
+    /// canonical runtime adapter.
+    #[cfg(feature = "runtime-adapter")]
+    pub fn with_member_runtime_registration_hook(
+        mut self,
+        hook: Arc<dyn super::MemberRuntimeRegistrationHook>,
+    ) -> Self {
+        self.member_runtime_registration_hook = Some(hook);
         self
     }
 
@@ -6982,12 +7099,39 @@ impl MobBuilder {
     }
 
     /// Register a named Rust tool bundle for profile `tools.rust_bundles` wiring.
+    /// Its operations' account is unavailable to review; a host that knows it
+    /// declares it with [`Self::register_tool_bundle_with_account`].
     pub fn register_tool_bundle(
-        mut self,
+        self,
         name: impl Into<String>,
         dispatcher: Arc<dyn AgentToolDispatcher>,
     ) -> Self {
-        self.tool_bundles.insert(name.into(), dispatcher);
+        self.register_tool_bundle_with_account(
+            name,
+            meerkat_core::OperationAccount::Unavailable,
+            dispatcher,
+        )
+    }
+
+    /// Register a named Rust tool bundle whose operations act with `account`,
+    /// as this registering host declares it: an account it selected, or
+    /// that they act with none. Review and consent state it for each of the
+    /// bundle's operations; nothing infers it from the bundle's name, tools
+    /// or credentials.
+    pub fn register_tool_bundle_with_account(
+        mut self,
+        name: impl Into<String>,
+        account: meerkat_core::OperationAccount,
+        dispatcher: Arc<dyn AgentToolDispatcher>,
+    ) -> Self {
+        // The registration owns the bundle's operations: its wrapper produces
+        // and revalidates each plan's typed bundle operation target.
+        let name = name.into();
+        let registered: Arc<dyn AgentToolDispatcher> = Arc::new(
+            meerkat_core::RegisteredToolBundleDispatcher::new(name.clone(), dispatcher)
+                .with_account(account),
+        );
+        self.tool_bundles.insert(name, registered);
         self
     }
 
@@ -7086,6 +7230,26 @@ impl MobBuilder {
         self
     }
 
+    /// Resume this mob only to tear it down. Before any restored work
+    /// starts (member reconciliation, autonomous loops, recovery workers,
+    /// reconcilers, the actor loop), the actor admits the destroy through
+    /// the same path a `Destroy` command from `authority` takes, up to its
+    /// durable `MobDestroying` marker. A refusal fails the resume and admits
+    /// no fresh destroy; earlier resume recovery may still have written, and
+    /// an uncertain append error does not prove nothing was. After success the
+    /// mob starts as the recovery of an admitted destroy, and the caller
+    /// drives the destroy itself: the automatic destroy retry waits until the
+    /// caller drops the [`StartAdmittedDestroyCustody`] paired with `custody`.
+    #[doc(hidden)]
+    pub fn admit_destroy_before_start(
+        mut self,
+        authority: crate::control_policy::CommandAuthority,
+        custody: StartAdmittedDestroyCustodyWatch,
+    ) -> Self {
+        self.start_destroy_admission = Some((authority, custody));
+        self
+    }
+
     /// Create the mob: emit MobCreated event, start the actor, return handle.
     #[cfg(feature = "runtime-adapter")]
     pub async fn create(self) -> Result<MobHandle, MobError> {
@@ -7107,6 +7271,8 @@ impl MobBuilder {
                 session_service,
                 #[cfg(feature = "runtime-adapter")]
                 runtime_adapter,
+                #[cfg(feature = "runtime-adapter")]
+                member_runtime_registration_hook,
                 workgraph_service,
                 allow_ephemeral_sessions,
                 notify_orchestrator_on_resume,
@@ -7123,6 +7289,8 @@ impl MobBuilder {
                 member_live_host,
                 // A created mob has no restored members to hold.
                 restored_member_run_start_holds: _,
+                // Nor a restored destroy to admit.
+                start_destroy_admission: _,
             } = builder;
             #[cfg(not(feature = "runtime-adapter"))]
             let runtime_adapter: RuntimeAdapterOption = None;
@@ -7294,6 +7462,7 @@ impl MobBuilder {
                 supervisor_bridge,
                 session_service,
                 runtime_adapter,
+                member_runtime_registration_hook,
                 workgraph_service,
                 tool_bundles,
                 default_llm_client,
@@ -7346,6 +7515,8 @@ impl MobBuilder {
             session_service,
             #[cfg(feature = "runtime-adapter")]
             runtime_adapter,
+            #[cfg(feature = "runtime-adapter")]
+            member_runtime_registration_hook,
             workgraph_service,
             allow_ephemeral_sessions,
             notify_orchestrator_on_resume,
@@ -7361,6 +7532,7 @@ impl MobBuilder {
             controlling_acceptor,
             member_live_host,
             restored_member_run_start_holds,
+            start_destroy_admission,
         } = self;
         #[cfg(not(feature = "runtime-adapter"))]
         let runtime_adapter: RuntimeAdapterOption = None;
@@ -7643,17 +7815,19 @@ impl MobBuilder {
             // recovered runtime. Placed-carrier cleanup, Running reconciliation,
             // and the eventual actor must never materialize through temporary
             // provisioners that the actor cannot subsequently observe.
-            let runtime_provisioner = Arc::new(
-                MultiBackendProvisioner::new(
-                    session_service.clone(),
-                    runtime_adapter.clone(),
-                    workgraph_service.clone(),
-                    definition.backend.external.clone(),
-                    Arc::clone(&supervisor_bridge),
-                )
-                .with_binding_persistence(definition.id.clone(), storage.runtime_metadata.clone())
-                .with_composition_signal_dispatcher(composition_signal_dispatcher),
-            );
+            let runtime_provisioner = MultiBackendProvisioner::new(
+                session_service.clone(),
+                runtime_adapter.clone(),
+                workgraph_service.clone(),
+                definition.backend.external.clone(),
+                Arc::clone(&supervisor_bridge),
+            )
+            .with_binding_persistence(definition.id.clone(), storage.runtime_metadata.clone())
+            .with_composition_signal_dispatcher(composition_signal_dispatcher);
+            let runtime_provisioner = Arc::new(match member_runtime_registration_hook.clone() {
+                Some(hook) => runtime_provisioner.with_member_runtime_registration_hook(hook),
+                None => runtime_provisioner,
+            });
             drive_recovered_placed_carrier_cleanup(
                 initial_dsl_authority.as_mut(),
                 &storage.runtime_metadata,
@@ -7733,6 +7907,7 @@ impl MobBuilder {
             if resumed_state == MobState::Running
                 && recovered_completion_lifecycle_intent.is_none()
                 && !super::actor::lifecycle_origin_fenced(initial_dsl_authority.state())
+                && start_destroy_admission.is_none()
                 && runtime_adapter.is_none()
             {
                 if let Some(entry) = roster.list().find(|entry| {
@@ -7828,6 +8003,11 @@ impl MobBuilder {
                 // handle: restored members' tools keep this handle, and a
                 // durable fork through any of them reads the same overlays.
                 per_spawn_external_tools: Arc::clone(&per_spawn_external_tools),
+                // The preview only serves the pre-activation read hook: it
+                // owns nothing and observes an admission that is still open.
+                public_owner: None,
+                ownership: super::admission_close::MobOwnership::new(),
+                admission_closed_rx: tokio::sync::watch::channel(None).1,
             };
             // session_service is still live here (not consumed until start_runtime_with_components)
             if let Some(hook) = before_activation {
@@ -7857,11 +8037,18 @@ impl MobBuilder {
             }
             let mut per_spawn_external_tools_seed = super::fork_build::RetainedOverlays::default();
             let mut recovered_direct_member_adoption_pending = false;
+            let mut deferred_orchestrator_resume_notifications = Vec::new();
+            // A resume that only tears the mob down reconciles no member: its
+            // destroy is admitted before the actor starts any work.
             if resumed_state == MobState::Running
                 && recovered_completion_lifecycle_intent.is_none()
                 && !super::actor::lifecycle_origin_fenced(wiring.dsl_authority.state())
+                && start_destroy_admission.is_none()
             {
-                recovered_direct_member_adoption_pending = Self::reconcile_resume(
+                (
+                    recovered_direct_member_adoption_pending,
+                    deferred_orchestrator_resume_notifications,
+                ) = Self::reconcile_resume(
                     &definition,
                     repaired_epoch_events,
                     &mut roster,
@@ -8067,6 +8254,7 @@ impl MobBuilder {
                 storage.forked_participants.clone(),
                 notify_orchestrator_on_resume,
                 recovered_direct_member_adoption_pending,
+                deferred_orchestrator_resume_notifications,
                 per_spawn_external_tools,
                 retired_event_index,
                 retirement_started_event_index,
@@ -8090,6 +8278,7 @@ impl MobBuilder {
                 // Cold resume already bound the preview handle before any
                 // member registration or reconciliation could execute work.
                 None,
+                start_destroy_admission,
             )
             .await
         }
@@ -8601,7 +8790,7 @@ impl MobBuilder {
         realm_profile_store: Option<Arc<dyn crate::store::RealmProfileStore>>,
         runtime_metadata: Arc<dyn crate::store::MobRuntimeMetadataStore>,
         per_spawn_external_tools_seed: &mut super::fork_build::RetainedOverlays,
-    ) -> Result<bool, MobError> {
+    ) -> Result<(bool, Vec<OrchestratorResumeNotification>), MobError> {
         let recovered_direct_member_adoption_pending = runtime_metadata
             .list_external_binding_overlays(&definition.id)
             .await?
@@ -9261,6 +9450,7 @@ impl MobBuilder {
                             generated_self_owned_operation_owner,
                         ),
                         runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+                        held_bound: None,
                     })
                     .await
                 {
@@ -9420,6 +9610,7 @@ impl MobBuilder {
                 ops_registry: None,
                 generated_self_owned_operation_owner: None,
                 runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+                held_bound: None,
             };
             let admitted_bridge_session_id =
                 super::actor::admit_bridge_session_for_spawn(&mut provision_request.create_session);
@@ -9709,6 +9900,7 @@ impl MobBuilder {
             &tool_handle.restore_diagnostics,
         )
         .await?;
+        let mut deferred_orchestrator_resume_notifications = Vec::new();
         if notify_orchestrator_on_resume && let Some(orchestrator) = &definition.orchestrator {
             let orchestrator_entries = dsl_authority
                 .state()
@@ -9726,17 +9918,36 @@ impl MobBuilder {
                 })
                 .collect::<Result<Vec<_>, MobError>>()?;
             for orchestrator_entry in orchestrator_entries {
-                realize_orchestrator_resume_notification(
+                // Planned now, so a typed planning failure still fails the
+                // resume. A notification that runs the orchestrator's turn is
+                // not awaited here: its model and tool work may need the very
+                // restore this resume is part of (a mob tool that lists or
+                // restores mobs). The actor's lifecycle owner holds it from
+                // actor startup, like every orchestrator lifecycle delivery.
+                let Some(plan) = plan_orchestrator_resume_notification(
                     definition,
                     &orchestrator_entry,
-                    session_service.as_ref(),
-                    provisioner,
                     dsl_authority,
-                )
-                .await?;
+                )?
+                else {
+                    continue;
+                };
+                if plan.realizes_without_a_turn() {
+                    realize_planned_orchestrator_resume_notification(
+                        plan,
+                        session_service.as_ref(),
+                        provisioner,
+                    )
+                    .await?;
+                } else {
+                    deferred_orchestrator_resume_notifications.push(plan);
+                }
             }
         }
-        Ok(recovered_direct_member_adoption_pending)
+        Ok((
+            recovered_direct_member_adoption_pending,
+            deferred_orchestrator_resume_notifications,
+        ))
     }
 
     #[cfg(feature = "runtime-adapter")]
@@ -9757,6 +9968,7 @@ impl MobBuilder {
         supervisor_bridge: Arc<MobSupervisorBridge>,
         session_service: Arc<dyn MobSessionService>,
         runtime_adapter: RuntimeAdapterOption,
+        member_runtime_registration_hook: Option<Arc<dyn super::MemberRuntimeRegistrationHook>>,
         workgraph_service: Option<meerkat::WorkGraphService>,
         tool_bundles: BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
         default_llm_client: Option<Arc<dyn LlmClient>>,
@@ -9798,17 +10010,19 @@ impl MobBuilder {
             let (command_tx, command_rx) = mpsc::channel(MOB_COMMAND_CHANNEL_CAPACITY);
             let (composition_binding, composition_signal_dispatcher) =
                 super::composition::binding_for_actor(&runtime_adapter, command_tx.clone());
-            let provisioner = Arc::new(
-                MultiBackendProvisioner::new(
-                    session_service.clone(),
-                    runtime_adapter.clone(),
-                    workgraph_service,
-                    definition.backend.external.clone(),
-                    Arc::clone(&supervisor_bridge),
-                )
-                .with_binding_persistence(definition.id.clone(), runtime_metadata.clone())
-                .with_composition_signal_dispatcher(composition_signal_dispatcher),
-            );
+            let provisioner = MultiBackendProvisioner::new(
+                session_service.clone(),
+                runtime_adapter.clone(),
+                workgraph_service,
+                definition.backend.external.clone(),
+                Arc::clone(&supervisor_bridge),
+            )
+            .with_binding_persistence(definition.id.clone(), runtime_metadata.clone())
+            .with_composition_signal_dispatcher(composition_signal_dispatcher);
+            let provisioner = Arc::new(match member_runtime_registration_hook {
+                Some(hook) => provisioner.with_member_runtime_registration_hook(hook),
+                None => provisioner,
+            });
             let session_ops_adapter = provisioner.session_ops_adapter();
             let provisioner: Arc<dyn MobProvisioner> = provisioner;
             let roster = Arc::new(RwLock::new(RosterAuthority::from_roster(initial_roster)));
@@ -9860,6 +10074,7 @@ impl MobBuilder {
                 forked_participant_store,
                 notify_orchestrator_on_resume,
                 false,
+                Vec::new(),
                 Arc::default(),
                 HashSet::new(),
                 HashSet::new(),
@@ -9877,6 +10092,7 @@ impl MobBuilder {
                 controlling_acceptor,
                 member_live_host,
                 before_activation,
+                None,
             )
             .await
         })
@@ -9907,6 +10123,7 @@ impl MobBuilder {
         forked_participant_store: Option<Arc<dyn crate::store::ForkedParticipantStore>>,
         notify_orchestrator_on_resume: bool,
         recovered_direct_member_adoption_pending: bool,
+        deferred_orchestrator_resume_notifications: Vec<OrchestratorResumeNotification>,
         per_spawn_external_tools: super::handle::PerSpawnExternalTools,
         retired_event_index: HashSet<String>,
         retirement_started_event_index: HashSet<String>,
@@ -9926,6 +10143,10 @@ impl MobBuilder {
         controlling_acceptor: Option<ControllingAcceptorConfig>,
         member_live_host: Option<Arc<dyn meerkat_runtime::member_live::MemberLiveHost>>,
         before_activation: Option<MobBeforeActivation>,
+        start_destroy_admission: Option<(
+            crate::control_policy::CommandAuthority,
+            StartAdmittedDestroyCustodyWatch,
+        )>,
     ) -> RuntimeStartFuture {
         Box::pin(async move {
             // Recover the actor-local idempotency index from durable public events
@@ -9967,6 +10188,11 @@ impl MobBuilder {
             // call before any DSL transition returns the right answer.
             phase_watch_tx_actor.send_replace(wiring_public_phase);
             let phase_watch_rx = phase_watch_tx_actor.subscribe();
+            // D67: the launched handle is built without the public-owner
+            // token, so every clone the actor wiring below takes is
+            // non-owning; the token is attached only to the returned handle.
+            let ownership = super::admission_close::MobOwnership::new();
+            let (admission_closed_tx, admission_closed_rx) = tokio::sync::watch::channel(None);
             let handle = MobHandle {
                 // Explicit launch-site mint (A16): the launching process IS the
                 // owning operator — not ambient inference (gotcha #19).
@@ -9993,6 +10219,9 @@ impl MobBuilder {
                 member_admission_backlog: Arc::clone(&member_admission_backlog),
                 lifecycle_observations: Arc::clone(&lifecycle_observations),
                 per_spawn_external_tools: Arc::clone(&per_spawn_external_tools),
+                public_owner: None,
+                ownership: Arc::clone(&ownership),
+                admission_closed_rx,
             };
             if let Some(hook) = before_activation {
                 hook(handle.read_handle()).await?;
@@ -10001,7 +10230,7 @@ impl MobBuilder {
             // `start_runtime` from `definition.limits.max_orphaned_turns`); the
             // executor no longer holds a shell-side budget.
             let actor_flow_executor =
-                ActorFlowTurnExecutor::new(handle.clone(), provisioner.clone());
+                ActorFlowTurnExecutor::new(handle.non_owning(), provisioner.clone());
             // Phase 6 (§7.4): the member event pump manager — one detached
             // `PollMemberEvents` loop per placed member, durable cursors in the
             // runtime metadata store (DEC-P6E-9/10/11).
@@ -10010,7 +10239,7 @@ impl MobBuilder {
                 supervisor_bridge.clone(),
                 runtime_metadata.clone(),
                 Arc::new(super::event_pump::HandleHostRuntimeIncarnationObserver {
-                    handle: handle.clone(),
+                    handle: handle.non_owning(),
                 }),
             ));
             member_event_pumps
@@ -10024,12 +10253,12 @@ impl MobBuilder {
                 .install_outcome_sink(actor_flow_executor.remote_flow_ticket_registry());
             member_event_pumps.install_obligation_probe(Arc::new(
                 super::event_pump::HandleObligationProbe {
-                    handle: handle.clone(),
+                    handle: handle.non_owning(),
                 },
             ));
             actor_flow_executor.install_remote_turn_obligation_pump(Arc::new(
                 super::event_pump::HandleObligationPump {
-                    handle: handle.clone(),
+                    handle: handle.non_owning(),
                 },
             ));
             // The actor holds the SAME registry Arc for member-lifetime
@@ -10058,7 +10287,7 @@ impl MobBuilder {
             let has_orchestrator = definition.orchestrator.is_some();
             let flow_engine = FlowEngine::new(
                 flow_executor,
-                handle.clone(),
+                handle.non_owning(),
                 run_store.clone(),
                 events.clone(),
                 topology_service,
@@ -10080,7 +10309,7 @@ impl MobBuilder {
             // the supervisor bridge runtime's inbox.
             #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
             let upcall_responder = Some(super::upcall_responder::spawn_upcall_responder(
-                handle.clone(),
+                handle.non_owning(),
                 runtime_metadata.clone(),
             ));
 
@@ -10157,6 +10386,11 @@ impl MobBuilder {
                 pending_autonomous_stop_controls: VecDeque::new(),
                 retained_actor_completions: VecDeque::new(),
                 shutdown_exit: None,
+                admission_closed: None,
+                admission_closed_tx,
+                ownership,
+                public_owner_released: false,
+                public_owner_release_backlog: 0,
                 autonomous_stop_interrupt_cursor: 0,
                 next_spawn_ticket: 0,
                 // ADJ-8 (multi-host fence reseed): the shell fence counter must
@@ -10304,6 +10538,24 @@ impl MobBuilder {
             };
             #[cfg(target_arch = "wasm32")]
             let _ = controlling_acceptor;
+            // A teardown-only resume admits its destroy here: after the actor
+            // exists and before any recovery worker, reconciler or the actor
+            // loop starts. Every decision below then reads an admitted
+            // destroy, exactly as it does on the recovery of one.
+            let (start_destroy_authority, start_destroy_custody) = match start_destroy_admission {
+                Some((authority, custody)) => (Some(authority), Some(custody)),
+                None => (None, None),
+            };
+            if let Some(authority) = start_destroy_authority.as_ref()
+                && let Err(error) = Box::pin(actor.admit_destroy_before_start(authority)).await
+            {
+                return Err(match error {
+                    super::handle::MobDestroyError::Mob(error) => error,
+                    other => MobError::Internal(format!(
+                        "destroy admission before start failed: {other}"
+                    )),
+                });
+            }
             // A17 recovery trigger (DEC-P6E-11): obligations survive via event
             // replay, subscriptions do not — re-derive pending remote-turn
             // obligations from recovered machine state and keep their members'
@@ -10400,7 +10652,7 @@ impl MobBuilder {
             // Register them before moving the actor into its run loop so every
             // terminal path can abort and join them before command-channel closure.
             if !recovered_obligations.is_empty() {
-                let pump_handle = handle.clone();
+                let pump_handle = handle.non_owning();
                 actor.actor_io_tasks.spawn(async move {
                     #[cfg(test)]
                     let _startup_worker_guard = ActorOwnedStartupWorkerGuard::new(actor_runtime_id);
@@ -10418,7 +10670,7 @@ impl MobBuilder {
             }
             if !resume_destroy_cleanup {
                 for host_id in recovered_host_revocations {
-                    let revoke_handle = handle.clone();
+                    let revoke_handle = handle.non_owning();
                     actor.actor_io_tasks.spawn(async move {
                     #[cfg(test)]
                     let _startup_worker_guard = ActorOwnedStartupWorkerGuard::new(actor_runtime_id);
@@ -10446,7 +10698,7 @@ impl MobBuilder {
                 }
             }
             for identity in recovered_retirements {
-                let retire_handle = handle.clone();
+                let retire_handle = handle.non_owning();
                 actor.actor_io_tasks.spawn(async move {
                     #[cfg(test)]
                     let _startup_worker_guard = ActorOwnedStartupWorkerGuard::new(actor_runtime_id);
@@ -10454,10 +10706,16 @@ impl MobBuilder {
                 });
             }
             if resume_destroy_cleanup {
-                let destroy_handle = handle.clone();
+                let destroy_handle = handle.non_owning();
                 actor.actor_io_tasks.spawn(async move {
                 #[cfg(test)]
                 let _startup_worker_guard = ActorOwnedStartupWorkerGuard::new(actor_runtime_id);
+                // A destroy admitted before start is driven by its caller
+                // while the caller holds its custody; the retry takes over
+                // whatever remains once that custody is released.
+                if let Some(custody) = start_destroy_custody {
+                    let _ = custody.released.await;
+                }
                 let mut retry_delay = std::time::Duration::from_millis(25);
                 loop {
                     match destroy_handle.destroy().await {
@@ -10481,7 +10739,7 @@ impl MobBuilder {
                 }
             });
             } else if let Some(intent) = recovered_lifecycle_retry_intent {
-                let lifecycle_handle = handle.clone();
+                let lifecycle_handle = handle.non_owning();
                 actor.actor_io_tasks.spawn(async move {
                     #[cfg(test)]
                     let _startup_worker_guard = ActorOwnedStartupWorkerGuard::new(actor_runtime_id);
@@ -10492,7 +10750,7 @@ impl MobBuilder {
                 let completion_reconciler_task =
                     super::placed_completion_reconciler::PlacedCompletionReconciler::run_owned(
                         handle.mob_id().clone(),
-                        handle.clone(),
+                        handle.non_owning(),
                         completion_reconciler_provisioner,
                     );
                 actor.actor_io_tasks.spawn(async move {
@@ -10503,7 +10761,7 @@ impl MobBuilder {
                 let kickoff_reconciler_task =
                     super::placed_kickoff_reconciler::PlacedKickoffReconciler::run_owned(
                         handle.mob_id().clone(),
-                        handle.clone(),
+                        handle.non_owning(),
                         kickoff_reconciler_provisioner,
                         kickoff_reconciler_metadata,
                     );
@@ -10526,7 +10784,7 @@ impl MobBuilder {
                 let reconciler_task =
                     super::remote_turn_reconciler::RemoteTurnIntentReconciler::run_owned(
                         handle.mob_id().clone(),
-                        handle.clone(),
+                        handle.non_owning(),
                         intent_reconciler_provisioner,
                         intent_reconciler_tickets,
                         recovered_remote_intent_runs,
@@ -10538,9 +10796,59 @@ impl MobBuilder {
                     reconciler_task.await;
                 });
             }
-            tokio::spawn(runtime_actor_future(actor, command_rx));
+            // Resume notifications that run an orchestrator turn, planned by
+            // the resume reconcile: the actor's lifecycle owner holds each one
+            // from here, joins it, and surfaces its typed failure like every
+            // other orchestrator lifecycle delivery.
+            // A delivery failure is also recorded as a mob event naming the
+            // planned target, so a host observes it through the ordinary
+            // event channel after the resume has returned.
+            for plan in deferred_orchestrator_resume_notifications {
+                let session_service = Arc::clone(&actor.session_service);
+                let provisioner = Arc::clone(&actor.provisioner);
+                let emitter = super::events::MobEventEmitter::new(
+                    Arc::clone(&actor.events),
+                    actor.definition.id.clone(),
+                );
+                actor.lifecycle_tasks.spawn(async move {
+                    let member_id = plan.member_id.clone();
+                    let session_id = plan.bridge_session_id.clone();
+                    let outcome = realize_planned_orchestrator_resume_notification(
+                        plan,
+                        session_service.as_ref(),
+                        provisioner.as_ref(),
+                    )
+                    .await;
+                    if let Err(error) = &outcome
+                        && let Err(record_error) = emitter
+                            .orchestrator_resume_notification_failed(
+                                member_id.clone(),
+                                session_id,
+                                error.to_string(),
+                            )
+                            .await
+                    {
+                        tracing::warn!(
+                            member_id = %member_id,
+                            error = %error,
+                            record_error = %record_error,
+                            "orchestrator resume notification failure could not be recorded"
+                        );
+                    }
+                    outcome
+                });
+            }
+            let actor_task_end = ActorTaskEndGuard {
+                observations: Some(Arc::clone(&handle.lifecycle_observations)),
+            };
+            tokio::spawn(async move {
+                runtime_actor_future(actor, command_rx).await;
+                // The actor future returned: the actor, and every store
+                // handle it owned, has dropped.
+                actor_task_end.returned();
+            });
 
-            Ok(handle)
+            Ok(handle.with_root_owner())
         })
     }
 }

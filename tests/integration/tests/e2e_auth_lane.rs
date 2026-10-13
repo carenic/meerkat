@@ -567,7 +567,8 @@ impl AuthHarness {
             )
             .expect("construct runtime authority"),
             NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
         runtime.set_config_runtime(Arc::new(ConfigRuntime::new(
             config_store.clone(),
             temp.path().join("config_state.json"),
@@ -605,6 +606,7 @@ fn openai_oauth_config() -> Config {
         binding: BTreeMap::new(),
         default_binding: Some(BINDING_ID.to_string()),
         parent: None,
+        connector_client: Default::default(),
     };
     section.backend.insert(
         "chatgpt_backend".to_string(),

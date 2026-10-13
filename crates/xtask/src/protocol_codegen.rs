@@ -3475,7 +3475,11 @@ pub(crate) fn encode_marker_value(marker: DurableAuthLifecycleMarker) -> serde_j
     map.insert(FIELD_AUTHORITY.to_string(), serde_json::Value::String(AUTHORITY.to_string()));
     map.insert(FIELD_PROTOCOL.to_string(), serde_json::Value::String(PROTOCOL.to_string()));
     map.insert(FIELD_REALM.to_string(), serde_json::Value::String(marker.token_key.realm().as_str().to_string()));
-    match marker.token_key.credential_identity() {
+    // Only a credential key has a lifecycle; any other key kind has no marker.
+    let Some(identity) = marker.token_key.credential_identity() else {
+        return serde_json::Value::Null;
+    };
+    match identity {
         crate::AuthCredentialIdentity::Binding(binding) => {
             map.insert(FIELD_CREDENTIAL_KIND.to_string(), serde_json::Value::String("binding".to_string()));
             map.insert(FIELD_BINDING.to_string(), serde_json::Value::String(binding.binding.as_str().to_string()));
@@ -3793,7 +3797,7 @@ fn generate_approval_lifecycle_authority(machine: &MachineSchema) -> Result<Stri
     )?;
     writeln!(
         &mut out,
-        "#![allow(clippy::bool_comparison, clippy::field_reassign_with_default, clippy::never_loop, clippy::nonminimal_bool, clippy::partialeq_to_none, clippy::redundant_clone)]"
+        "#![allow(clippy::bool_comparison, clippy::field_reassign_with_default, clippy::never_loop, clippy::nonminimal_bool, clippy::partialeq_to_none, clippy::redundant_clone, clippy::too_many_arguments)]"
     )?;
     writeln!(&mut out)?;
     writeln!(

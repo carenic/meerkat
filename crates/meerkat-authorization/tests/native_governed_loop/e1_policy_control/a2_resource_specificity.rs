@@ -537,6 +537,8 @@ async fn exercise_a2(server: &Server, order: Order) {
     let machine = Arc::new(
         MeerkatMachine::ephemeral()
             .with_local_grant_authorization(NativeGrantWorkConfiguration {
+                retained_resume: None,
+                require_scoped_destination: false,
                 grants,
                 ingress,
                 invocation_owner: Arc::new(InvocationOwner),
@@ -547,6 +549,7 @@ async fn exercise_a2(server: &Server, order: Order) {
                     },
                     application: application.clone(),
                 }),
+                configured_mcp_attachment: None,
             })
             .unwrap(),
     );

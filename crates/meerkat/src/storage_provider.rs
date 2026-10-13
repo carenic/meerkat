@@ -5,7 +5,7 @@
 //! from what the provider returns. The seam is **store-only** by design:
 //! putting mob stores in the result would create the dependency cycle
 //! `meerkat → meerkat-mob → meerkat` (mob depends on this facade), so mob
-//! storage stays mob-owned and higher layers (mobkit's composite provider)
+//! storage stays mob-owned and higher layers (meta's composite provider)
 //! compose their own stores next to a [`RealmStorageProvider`].
 //!
 //! Bootstrap convergence:

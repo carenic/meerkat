@@ -527,6 +527,7 @@ pub fn resolve_effective_turn_config(
         auto_compact_threshold_override: None,
         compaction_curator_override: None,
         session_comms_runtime_override: None,
+        prepared_controller: None,
         host_prompt_sections: Default::default(),
         output_schema: overrides
             .output_schema
@@ -832,6 +833,8 @@ mod tests {
                     ),
                 ),
                 call_timeout_override: CallTimeoutOverride::Value(Duration::from_secs(42)),
+                mcp_attachment_intents: Vec::new(),
+                mcp_attachment_intent_revision: 0,
             })
             .expect("session build state");
         let mut deferred = SessionDeferredTurnState::default();

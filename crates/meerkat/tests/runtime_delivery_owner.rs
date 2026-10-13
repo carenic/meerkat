@@ -1,18 +1,22 @@
 #![allow(clippy::expect_used, clippy::panic)]
 //! The library delivery owner applies durable job deliveries on typed wakes
 //! only: a reconcile pass at arming, then job outbox commits, runtime delivery
-//! commits, and attachment commits. No pass ever runs on a timer.
+//! commits, and attachment commits. No pass ever runs on a timer. A host's
+//! owed continuations are projected in rounds, one page per pass, that only a
+//! reconcile or a source change starts.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use meerkat::{
-    AttemptClaim, CanonicalArgumentsHash, DetachedJobService, InteractionLineageId,
-    JobDeliveryApplication, JobDeliveryApplyError, JobDeliverySink, JobId, JobResultRef, JobSpec,
-    JobSubmissionKey, MemoryDetachedJobStore, RestartClass, RunnerHandleRef, RunnerIdentity,
-    RuntimeDeliveryHost, RuntimeDeliveryOwner, RuntimeDeliveryPass, SessionId, ToolIdentity,
-    WorkerId,
+    AttemptClaim, CanonicalArgumentsHash, ContinuationDelivery, ContinuationDeliverySink,
+    ContinuationHandling, ContinuationKey, ContinuationOwner, ContinuationOwnerService,
+    ContinuationProducer, ContinuationResultRef, ContinuationStatus, DetachedJobService,
+    InteractionLineageId, JobDeliveryApplication, JobDeliveryApplyError, JobDeliverySink, JobId,
+    JobResultRef, JobSpec, JobSubmissionKey, MemoryDetachedJobStore, OwedContinuationCursor,
+    OwedContinuationProjection, RestartClass, RunnerHandleRef, RunnerIdentity, RuntimeDeliveryHost,
+    RuntimeDeliveryOwner, RuntimeDeliveryPass, SessionId, ToolIdentity, WorkerId,
 };
 use meerkat_runtime::{
     InMemoryRuntimeStore, RuntimeDeliveryInbox, RuntimeDeliveryOwnerAlreadyArmed,
@@ -639,4 +643,745 @@ async fn a_producer_jobs_notification_is_applied_while_its_terminal_is_not() {
         vec![job],
         "the notification reached the sink once; the producer-applied terminal never did"
     );
+}
+
+/// Admits every continuation it is handed, recording the session and the
+/// admission key.
+#[derive(Default)]
+struct AdmittingSink {
+    admitted: std::sync::Mutex<Vec<(SessionId, String)>>,
+}
+
+impl AdmittingSink {
+    fn admitted(&self) -> Vec<(SessionId, String)> {
+        self.admitted.lock().expect("admission lock").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl ContinuationDeliverySink for AdmittingSink {
+    async fn admit(
+        &self,
+        session: &SessionId,
+        input: meerkat_runtime::Input,
+    ) -> Result<meerkat_core::lifecycle::InputId, String> {
+        let admission_key = input
+            .header()
+            .idempotency_key
+            .as_ref()
+            .expect("continuations are keyed")
+            .to_string();
+        self.admitted
+            .lock()
+            .expect("admission lock")
+            .push((session.clone(), admission_key));
+        Ok(input.id().clone())
+    }
+
+    async fn admitted_input(
+        &self,
+        _session: &SessionId,
+        _admission_key: &str,
+    ) -> Result<Option<meerkat_runtime::input_state::StoredInputState>, String> {
+        Ok(None)
+    }
+}
+
+type PageHook = Box<dyn FnOnce(&OwingHost) + Send>;
+
+/// Owes one continuation per key to its session and commits them as
+/// continuation rows, through a continuation owner service over the owner's
+/// inbox, at most `page` obligations a page, in key order. An obligation
+/// stays owed after its row is committed (its admission is never recorded
+/// here), so every round visits every key again.
+struct OwingHost {
+    owner: ContinuationOwner,
+    owed: std::sync::Mutex<Vec<String>>,
+    page: usize,
+    /// While set, the enumeration cannot be read.
+    unavailable: std::sync::atomic::AtomicBool,
+    continuations: ContinuationOwnerService,
+    committed: std::sync::Mutex<HashSet<String>>,
+    /// Every page asked: where it started, and the keys it visited.
+    pages: std::sync::Mutex<Vec<(Option<String>, Vec<String>)>>,
+    /// Runs once, at the end of the next page.
+    after_page: std::sync::Mutex<Option<PageHook>>,
+    /// The source's own change signal, as an approval owner announces its
+    /// consent notice obligations.
+    announcer: watch::Sender<u64>,
+    sink: Arc<AdmittingSink>,
+    jobs: Arc<RecordingSink>,
+}
+
+impl OwingHost {
+    fn new(fixture: &Fixture, session_id: &SessionId, page: usize) -> Arc<Self> {
+        Arc::new(Self {
+            owner: ContinuationOwner::Session {
+                session_id: session_id.clone(),
+            },
+            owed: std::sync::Mutex::default(),
+            page,
+            unavailable: std::sync::atomic::AtomicBool::new(false),
+            continuations: ContinuationOwnerService::new(
+                fixture.inbox.clone(),
+                Arc::new(meerkat::SessionAddressResolver),
+                Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
+            ),
+            committed: std::sync::Mutex::default(),
+            pages: std::sync::Mutex::default(),
+            after_page: std::sync::Mutex::default(),
+            announcer: watch::Sender::new(0),
+            sink: Arc::new(AdmittingSink::default()),
+            jobs: fixture.sink.clone(),
+        })
+    }
+
+    fn owe(&self, key: &str) {
+        self.owed.lock().expect("owed lock").push(key.to_string());
+    }
+
+    /// The source announces a change of what it owes.
+    fn announce(&self) {
+        self.announcer
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
+    fn set_unavailable(&self, unavailable: bool) {
+        self.unavailable
+            .store(unavailable, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn after_next_page(&self, hook: impl FnOnce(&Self) + Send + 'static) {
+        *self.after_page.lock().expect("hook lock") = Some(Box::new(hook));
+    }
+
+    fn pages(&self) -> Vec<(Option<String>, Vec<String>)> {
+        self.pages.lock().expect("page lock").clone()
+    }
+
+    async fn status(&self, key: &str) -> ContinuationStatus {
+        self.continuations
+            .continuation_status(&self.owner, &ContinuationKey::new(key).expect("key"))
+            .await
+            .expect("status")
+    }
+}
+
+fn owed_delivery(key: &str) -> ContinuationDelivery {
+    ContinuationDelivery {
+        key: ContinuationKey::new(key).expect("key"),
+        result: ContinuationResultRef {
+            producer: ContinuationProducer::Host {
+                namespace: "owed".to_string(),
+            },
+            producer_id: key.to_string(),
+            result_digest: format!("digest-{key}"),
+            summary: None,
+        },
+        body: format!("owed {key}").into(),
+        handling: ContinuationHandling::Queue,
+    }
+}
+
+/// A page as [`OwingHost::pages`] records it.
+fn page(after: Option<&str>, keys: &[&str]) -> (Option<String>, Vec<String>) {
+    (
+        after.map(str::to_string),
+        keys.iter().map(|key| (*key).to_string()).collect(),
+    )
+}
+
+#[async_trait::async_trait]
+impl RuntimeDeliveryHost for OwingHost {
+    async fn delivery_route(&self, _session_id: &SessionId) -> Option<meerkat::DeliveryRoute> {
+        Some(meerkat::DeliveryRoute::ServedHere(self.jobs.clone()))
+    }
+
+    async fn claim_cold_delivery(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<Result<meerkat_runtime::HostingClaim, meerkat_runtime::HostingRefused>> {
+        Some(meerkat_runtime::grant_session_hosting(
+            &meerkat_runtime::HostingCapability::ProcessLocal,
+            &meerkat_runtime::HostingOwner::mint(),
+            session_id,
+        ))
+    }
+
+    async fn continuation_sink(
+        &self,
+        _session_id: &SessionId,
+    ) -> Option<Arc<dyn ContinuationDeliverySink>> {
+        Some(self.sink.clone())
+    }
+
+    fn projects_owed_continuations(&self) -> bool {
+        true
+    }
+
+    fn subscribe_owed_continuation_changes(&self) -> Option<watch::Receiver<u64>> {
+        Some(self.announcer.subscribe())
+    }
+
+    async fn project_owed_continuations(
+        &self,
+        after: Option<&OwedContinuationCursor>,
+        limit: usize,
+    ) -> OwedContinuationProjection {
+        let after = after.map(|after| after.as_str().to_string());
+        let mut projection = OwedContinuationProjection::default();
+        let mut visited = Vec::new();
+        if self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
+            projection
+                .failures
+                .push("the owed enumeration is unavailable".to_string());
+        } else {
+            let mut owed = self.owed.lock().expect("owed lock").clone();
+            owed.sort();
+            visited = owed
+                .iter()
+                .filter(|key| after.as_ref().is_none_or(|after| *key > after))
+                .take(limit.min(self.page))
+                .cloned()
+                .collect();
+            for key in &visited {
+                match self
+                    .continuations
+                    .submit(&self.owner, owed_delivery(key), 1)
+                    .await
+                {
+                    Ok(_) => {
+                        if self
+                            .committed
+                            .lock()
+                            .expect("commit lock")
+                            .insert(key.clone())
+                        {
+                            projection.committed += 1;
+                        }
+                    }
+                    Err(error) => projection.failures.push(format!("{key}: {error}")),
+                }
+            }
+            projection.next = visited
+                .last()
+                .filter(|last| owed.iter().any(|key| key > *last))
+                .map(|last| OwedContinuationCursor::new(last.clone()));
+        }
+        self.pages.lock().expect("page lock").push((after, visited));
+        let hook = self.after_page.lock().expect("hook lock").take();
+        if let Some(hook) = hook {
+            hook(self);
+        }
+        projection
+    }
+}
+
+/// With nothing blocked, a source change projects an obligation committed
+/// after arming, and the row it commits drains in the same pass. The round
+/// ends there: the obligation stays owed, and no pass runs without a wake.
+#[tokio::test(start_paused = true)]
+async fn a_source_change_projects_an_owed_continuation_that_drains_in_the_same_pass() {
+    let fixture = Fixture::new();
+    let session_id = SessionId::new();
+    let host = OwingHost::new(&fixture, &session_id, 8);
+    let (sources, source_changes) = watch::channel(0_u64);
+    let handle = fixture
+        .owner()
+        .with_source_changes(source_changes)
+        .arm(host.clone())
+        .expect("arm owner");
+    let mut passes = handle.subscribe_passes();
+    let reconciled = wait_for_pass(&mut passes, "the reconcile pass", |pass| {
+        pass.generation >= 1
+    })
+    .await;
+    assert_eq!(
+        (reconciled.owed_projected, reconciled.applied),
+        (0, 0),
+        "nothing was owed at arming"
+    );
+    assert!(reconciled.blocked_runtimes.is_empty());
+    assert_eq!(
+        host.pages(),
+        vec![page(None, &[])],
+        "the arming reconcile asked one page"
+    );
+
+    host.owe("notice-1");
+    sources.send_modify(|revision| *revision += 1);
+    let delivered = wait_for_pass(&mut passes, "the source change pass", |pass| {
+        pass.generation >= 2
+    })
+    .await;
+    assert_eq!(
+        (
+            delivered.generation,
+            delivered.owed_projected,
+            delivered.applied
+        ),
+        (2, 1, 1),
+        "one pass projected the obligation and drained its row"
+    );
+    assert!(delivered.failures.is_empty(), "{delivered:?}");
+    match host.status("notice-1").await {
+        ContinuationStatus::Applied { session, .. } => assert_eq!(session, session_id),
+        other => panic!("the notice was not admitted: {other:?}"),
+    }
+    assert_eq!(host.sink.admitted().len(), 1);
+
+    let settled = passes.borrow_and_update().generation;
+    idle_for_an_hour().await;
+    assert!(
+        !passes.has_changed().expect("owner pass channel open"),
+        "no pass ran without a wake (still at generation {settled})"
+    );
+    assert_eq!(host.pages().len(), 2, "one page per round");
+}
+
+/// More obligations than a page: the round goes on, a page per pass, until
+/// its enumeration ends, and every row drains in the pass that committed it.
+/// The round ends there although every obligation stays owed; a later source
+/// change runs one new round, which commits nothing new.
+#[tokio::test(start_paused = true)]
+async fn owed_continuations_past_one_page_are_all_delivered_by_one_finite_round() {
+    let fixture = Fixture::new();
+    let session_id = SessionId::new();
+    let host = OwingHost::new(&fixture, &session_id, 2);
+    let keys = ["owed-1", "owed-2", "owed-3", "owed-4", "owed-5"];
+    for key in keys {
+        host.owe(key);
+    }
+    let (sources, source_changes) = watch::channel(0_u64);
+    let handle = fixture
+        .owner()
+        .with_source_changes(source_changes)
+        .arm(host.clone())
+        .expect("arm owner");
+    let mut passes = handle.subscribe_passes();
+    let last_page = wait_for_pass(&mut passes, "the arming round's last page", |pass| {
+        pass.generation >= 3
+    })
+    .await;
+    assert_eq!(
+        host.pages(),
+        vec![
+            page(None, &["owed-1", "owed-2"]),
+            page(Some("owed-2"), &["owed-3", "owed-4"]),
+            page(Some("owed-4"), &["owed-5"]),
+        ],
+        "one page per pass, each after the last"
+    );
+    assert_eq!(
+        (
+            last_page.generation,
+            last_page.owed_projected,
+            last_page.applied
+        ),
+        (3, 1, 1),
+        "the last page's row drained in its own pass"
+    );
+    for key in keys {
+        assert!(
+            matches!(host.status(key).await, ContinuationStatus::Applied { .. }),
+            "{key} was not admitted"
+        );
+    }
+    assert_eq!(host.sink.admitted().len(), keys.len());
+
+    passes.borrow_and_update();
+    idle_for_an_hour().await;
+    assert!(
+        !passes.has_changed().expect("owner pass channel open"),
+        "the round ended with its enumeration, though every obligation stays owed"
+    );
+    assert_eq!(host.pages().len(), 3);
+
+    sources.send_modify(|revision| *revision += 1);
+    let repeated = wait_for_pass(&mut passes, "the second round's last page", |pass| {
+        pass.generation >= 6
+    })
+    .await;
+    assert_eq!(
+        (
+            repeated.generation,
+            repeated.owed_projected,
+            repeated.applied
+        ),
+        (6, 0, 0),
+        "the new round visited every page again and committed nothing new"
+    );
+    assert_eq!(host.pages().len(), 6);
+    assert_eq!(
+        host.sink.admitted().len(),
+        keys.len(),
+        "nothing was admitted twice"
+    );
+    passes.borrow_and_update();
+    idle_for_an_hour().await;
+    assert!(!passes.has_changed().expect("owner pass channel open"));
+}
+
+/// An obligation committed while a round runs, before the round's cursor, is
+/// announced by a source change: one more round follows the running one,
+/// from the first page, and projects it.
+#[tokio::test(start_paused = true)]
+async fn an_obligation_committed_behind_a_running_round_gets_one_more_round() {
+    let fixture = Fixture::new();
+    let session_id = SessionId::new();
+    let host = OwingHost::new(&fixture, &session_id, 1);
+    host.owe("owed-2");
+    host.owe("owed-3");
+    let (sources, source_changes) = watch::channel(0_u64);
+    let sources = Arc::new(sources);
+    let announce = Arc::clone(&sources);
+    host.after_next_page(move |host| {
+        host.owe("owed-1");
+        announce.send_modify(|revision| *revision += 1);
+    });
+    let handle = fixture
+        .owner()
+        .with_source_changes(source_changes)
+        .arm(host.clone())
+        .expect("arm owner");
+    let mut passes = handle.subscribe_passes();
+    wait_for_pass(&mut passes, "the second round's last page", |pass| {
+        pass.generation >= 5
+    })
+    .await;
+    assert_eq!(
+        host.pages(),
+        vec![
+            page(None, &["owed-2"]),
+            page(Some("owed-2"), &["owed-3"]),
+            page(None, &["owed-1"]),
+            page(Some("owed-1"), &["owed-2"]),
+            page(Some("owed-2"), &["owed-3"]),
+        ],
+        "the running round finished, then one more round ran from the first page"
+    );
+    for key in ["owed-1", "owed-2", "owed-3"] {
+        assert!(
+            matches!(host.status(key).await, ContinuationStatus::Applied { .. }),
+            "{key} was not admitted"
+        );
+    }
+    passes.borrow_and_update();
+    idle_for_an_hour().await;
+    assert!(!passes.has_changed().expect("owner pass channel open"));
+    assert_eq!(host.pages().len(), 5);
+}
+
+/// Run settlements fire on every runtime loop iteration: they never start a
+/// round of owed continuations, which only a reconcile or a source change
+/// does.
+#[tokio::test]
+async fn a_run_settlement_never_starts_a_round_of_owed_continuations() {
+    let fixture = Fixture::new();
+    let session_id = SessionId::new();
+    let host = OwingHost::new(&fixture, &session_id, 8);
+    let (settlements, run_settlements) = watch::channel(0_u64);
+    let (sources, source_changes) = watch::channel(0_u64);
+    let handle = fixture
+        .owner()
+        .with_run_settlements(run_settlements)
+        .with_source_changes(source_changes)
+        .arm(host.clone())
+        .expect("arm owner");
+    let mut passes = handle.subscribe_passes();
+    wait_for_pass(&mut passes, "the reconcile pass", |pass| {
+        pass.generation >= 1
+    })
+    .await;
+    passes.borrow_and_update();
+
+    host.owe("unannounced");
+    for _ in 0..8 {
+        settlements.send_modify(|generation| *generation += 1);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+    assert_eq!(host.pages().len(), 1, "no settlement asked for a page");
+    assert!(
+        !passes.has_changed().expect("owner pass channel open"),
+        "and none ran a pass"
+    );
+
+    sources.send_modify(|revision| *revision += 1);
+    let announced = wait_for_pass(&mut passes, "the source change pass", |pass| {
+        pass.generation >= 2
+    })
+    .await;
+    assert_eq!(
+        (
+            announced.generation,
+            announced.owed_projected,
+            announced.applied
+        ),
+        (2, 1, 1)
+    );
+}
+
+/// An enumeration that cannot be read ends its round with the failure
+/// reported. It is never retried in a loop: it stays owed to the next wake,
+/// whatever signal that is.
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_owed_enumeration_is_retried_on_the_next_wake_never_in_a_loop() {
+    let fixture = Fixture::new();
+    let session_id = SessionId::new();
+    let host = OwingHost::new(&fixture, &session_id, 8);
+    host.owe("owed-1");
+    host.set_unavailable(true);
+    let (settlements, run_settlements) = watch::channel(0_u64);
+    let handle = fixture
+        .owner()
+        .with_run_settlements(run_settlements)
+        .arm(host.clone())
+        .expect("arm owner");
+    let mut passes = handle.subscribe_passes();
+    let failed = wait_for_pass(&mut passes, "the reconcile pass", |pass| {
+        pass.generation >= 1
+    })
+    .await;
+    assert_eq!(
+        failed.failures,
+        vec!["the owed enumeration is unavailable".to_string()]
+    );
+    assert_eq!(failed.owed_projected, 0);
+
+    passes.borrow_and_update();
+    idle_for_an_hour().await;
+    assert!(
+        !passes.has_changed().expect("owner pass channel open"),
+        "the failure is not retried in a loop"
+    );
+    assert_eq!(host.pages().len(), 1);
+
+    host.set_unavailable(false);
+    // Any wake retries it: here a run settlement, which on its own never
+    // starts a round.
+    settlements.send_modify(|generation| *generation += 1);
+    let retried = wait_for_pass(&mut passes, "the retry pass", |pass| pass.generation >= 2).await;
+    assert_eq!((retried.owed_projected, retried.applied), (1, 1));
+    assert!(retried.failures.is_empty(), "{retried:?}");
+    assert!(matches!(
+        host.status("owed-1").await,
+        ContinuationStatus::Applied { .. }
+    ));
+}
+
+/// A host that owes no continuations keeps the old path: a source change
+/// with nothing blocked runs no pass.
+#[tokio::test]
+async fn a_source_change_with_nothing_blocked_runs_no_pass_for_a_host_owing_nothing() {
+    let fixture = Fixture::new();
+    let (sources, source_changes) = watch::channel(0_u64);
+    let handle = fixture
+        .owner()
+        .with_source_changes(source_changes)
+        .arm(fixture.host())
+        .expect("arm owner");
+    let mut passes = handle.subscribe_passes();
+    wait_for_pass(&mut passes, "the reconcile pass", |pass| {
+        pass.generation >= 1
+    })
+    .await;
+    passes.borrow_and_update();
+
+    for _ in 0..8 {
+        sources.send_modify(|revision| *revision += 1);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+    let session_id = SessionId::new();
+    let job = completed_job(&fixture.jobs, "default", session_id, "after-source-changes").await;
+    wait_for_applied(&fixture.sink, &job, &mut passes).await;
+    assert_eq!(
+        passes.borrow().generation,
+        2,
+        "the source changes ran no pass; the commit ran the second"
+    );
+}
+
+/// A prompt that stays queued on a session no executor serves.
+fn queued_prompt() -> meerkat_runtime::input::Input {
+    use meerkat_runtime::input::{
+        Input, InputDurability, InputHeader, InputOrigin, InputVisibility, PromptInput,
+    };
+    Input::Prompt(PromptInput {
+        injected_context: Vec::new(),
+        header: InputHeader {
+            ingress_context: None,
+            retained_resume: None,
+            authority_association: None,
+            id: meerkat_core::lifecycle::InputId::new(),
+            timestamp: chrono::Utc::now(),
+            source: InputOrigin::Operator,
+            durability: InputDurability::Durable,
+            visibility: InputVisibility::default(),
+            idempotency_key: None,
+            supersession_key: None,
+            correlation_id: None,
+        },
+        content: "queued until cancelled".into(),
+        typed_turn_appends: Vec::new(),
+        turn_metadata: None,
+    })
+}
+
+/// A runtime's runless input terminal reaches the owner's next round through
+/// its continuation bindings' source-change hint, with no reconcile and no
+/// injected tick: cancelling a queued input projects an obligation the source
+/// owes but nothing announced. Run settlements and attachments are not
+/// subscribed here, so the hint is the only wake.
+#[tokio::test]
+async fn a_runless_input_terminal_starts_a_round_through_the_continuation_bindings() {
+    use meerkat_runtime::SessionServiceRuntimeExt;
+
+    let fixture = Fixture::new();
+    let host = OwingHost::new(&fixture, &SessionId::new(), 8);
+    let bindings = Arc::new(meerkat::ContinuationHostBindings::default());
+    let runtime = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
+    bindings.announce_runless_input_terminals_of(&runtime);
+    let handle = fixture
+        .owner()
+        .with_source_changes(bindings.subscribe_source_changes())
+        .arm(host.clone())
+        .expect("arm owner");
+    let mut passes = handle.subscribe_passes();
+    wait_for_pass(&mut passes, "the arming round", |pass| pass.generation >= 1).await;
+    assert_eq!(host.pages(), vec![page(None, &[])], "the arming round");
+
+    let session_id = SessionId::new();
+    runtime
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+    let input = queued_prompt();
+    let input_id = input.id().clone();
+    assert!(
+        runtime
+            .accept_input(&session_id, input)
+            .await
+            .expect("accept the input")
+            .is_accepted()
+    );
+    host.owe("notice-1");
+
+    assert!(
+        runtime
+            .cancel_input_if_present(&session_id, &input_id, "the notice input ended")
+            .await
+            .expect("cancel the queued input"),
+        "the queued input is observed"
+    );
+    let projected = wait_for_pass(&mut passes, "the round the terminal starts", |pass| {
+        pass.generation >= 2
+    })
+    .await;
+    assert_eq!(projected.owed_projected, 1, "{projected:?}");
+    assert_eq!(
+        host.pages(),
+        vec![page(None, &[]), page(None, &["notice-1"])],
+        "the terminal started one new round"
+    );
+}
+
+/// A persistence bundle announces its runtime's runless input terminals on
+/// its own continuation bindings, so every delivery owner it composes hears
+/// them.
+#[cfg(feature = "session-store")]
+#[tokio::test]
+async fn a_persistence_bundle_announces_its_runtime_runless_input_terminals() {
+    use meerkat_runtime::SessionServiceRuntimeExt;
+
+    let bundle = meerkat::PersistenceBundle::new(
+        Arc::new(meerkat_store::MemoryStore::new()) as Arc<dyn meerkat::SessionStore>,
+        Arc::new(InMemoryRuntimeStore::new()) as Arc<dyn meerkat_runtime::RuntimeStore>,
+        Arc::new(meerkat::MemoryBlobStore::new()),
+    )
+    .expect("persistence bundle");
+    let source_changes = bundle.continuation_bindings().subscribe_source_changes();
+    let before = *source_changes.borrow();
+    let runtime = bundle.runtime_adapter();
+    let session_id = SessionId::new();
+    runtime
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+    let input = queued_prompt();
+    let input_id = input.id().clone();
+    assert!(
+        runtime
+            .accept_input(&session_id, input)
+            .await
+            .expect("accept the input")
+            .is_accepted()
+    );
+    assert_eq!(
+        *source_changes.borrow(),
+        before,
+        "an admission that displaces nothing announces nothing"
+    );
+
+    assert!(
+        runtime
+            .cancel_input_if_present(&session_id, &input_id, "the notice input ended")
+            .await
+            .expect("cancel the queued input"),
+        "the queued input is observed"
+    );
+    assert_eq!(
+        *source_changes.borrow(),
+        before + 1,
+        "the bundle's bindings heard the terminal once"
+    );
+}
+
+/// The owing source's own signal: an obligation it commits after the owner
+/// armed and then announces is projected by exactly one round, with no
+/// reconcile and no bindings source change, and an unannounced one waits.
+#[tokio::test(start_paused = true)]
+async fn an_owed_change_the_source_announces_runs_exactly_one_round() {
+    let fixture = Fixture::new();
+    let session_id = SessionId::new();
+    let host = OwingHost::new(&fixture, &session_id, 8);
+    let handle = fixture.owner().arm(host.clone()).expect("arm owner");
+    let mut passes = handle.subscribe_passes();
+    wait_for_pass(&mut passes, "the arming round", |pass| pass.generation >= 1).await;
+    assert_eq!(host.pages(), vec![page(None, &[])], "the arming round");
+
+    host.owe("notice-1");
+    idle_for_an_hour().await;
+    assert_eq!(
+        host.pages().len(),
+        1,
+        "an obligation the source has not announced waits"
+    );
+
+    host.announce();
+    let projected = wait_for_pass(&mut passes, "the announced round", |pass| {
+        pass.generation >= 2
+    })
+    .await;
+    assert_eq!(
+        (projected.owed_projected, projected.applied),
+        (1, 1),
+        "{projected:?}"
+    );
+    assert_eq!(
+        host.pages(),
+        vec![page(None, &[]), page(None, &["notice-1"])],
+        "the announcement started one round"
+    );
+
+    let settled = passes.borrow_and_update().generation;
+    idle_for_an_hour().await;
+    assert!(
+        !passes.has_changed().expect("owner pass channel open"),
+        "exactly one round ran (still at generation {settled})"
+    );
+    assert_eq!(host.pages().len(), 2, "exactly one round");
 }

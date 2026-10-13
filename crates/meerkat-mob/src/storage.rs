@@ -291,6 +291,54 @@ impl MobStorage {
             .map(|snapshot| snapshot.definition))
     }
 
+    /// Read the owner bridge-session binding this persistent mob records,
+    /// without building a runtime: the binding cold resume recovers from the
+    /// mob's whole event history, validated by the same recovery (it survives
+    /// `MobReset`; a conflicting duplicate is an error). `None` when the mob
+    /// has no owner binding or no definition.
+    pub async fn owner_bridge_binding(
+        &self,
+    ) -> Result<Option<crate::runtime::OwnerBridgeSessionLifecycleAuthority>, MobError> {
+        let events = self.events.replay_all().await?;
+        let Some(snapshot) = Self::current_definition_snapshot_for_log(&events)? else {
+            return Ok(None);
+        };
+        let mob_events = events
+            .into_iter()
+            .filter(|event| event.mob_id == snapshot.definition.id)
+            .collect::<Vec<_>>();
+        crate::runtime::owner_bridge_binding_from_history(&mob_events)
+    }
+
+    /// Whether this persistent mob's history leaves a destroy to recover: a
+    /// `MobDestroying` or `MobDestroyStorageFinalizing` in the current epoch,
+    /// or a durable Destroy quiesce intent that no quiesce end or `MobReset`
+    /// closed. Its next resume is the existing destroy recovery, never a fresh
+    /// destroy admission.
+    pub async fn destroy_recovery_pending(&self) -> Result<bool, MobError> {
+        let events = self.events.replay_all().await?;
+        let Some(snapshot) = Self::current_definition_snapshot_for_log(&events)? else {
+            return Ok(false);
+        };
+        let mob_events = events
+            .into_iter()
+            .filter(|event| event.mob_id == snapshot.definition.id)
+            .collect::<Vec<_>>();
+        let epoch_start = mob_events
+            .iter()
+            .rposition(|event| matches!(event.kind, MobEventKind::MobReset))
+            .map_or(0, |position| position + 1);
+        let destroy_admitted = mob_events[epoch_start..].iter().any(|event| {
+            matches!(
+                event.kind,
+                MobEventKind::MobDestroying | MobEventKind::MobDestroyStorageFinalizing
+            )
+        });
+        Ok(destroy_admitted
+            || crate::runtime::recovered_lifecycle_quiesce_intent(&mob_events)
+                == Some(crate::machines::mob_machine::PlacedCompletionLifecycleIntentKind::Destroy))
+    }
+
     /// Read the canonical definition together with its sealed resume precondition.
     pub async fn created_definition_snapshot(
         &self,

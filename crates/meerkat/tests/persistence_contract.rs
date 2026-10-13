@@ -219,6 +219,7 @@ mod tests {
         ToolProvenance {
             kind: ToolSourceKind::Callback,
             source_id: "deferred-catalog".into(),
+            artifact: None,
         }
     }
 
@@ -312,7 +313,8 @@ mod tests {
             PersistenceBundle::new(store, runtime_store, Arc::new(MemoryBlobStore::new()))
                 .expect("construct runtime authority");
         let (service, runtime_adapter) =
-            meerkat::surface::build_runtime_backed_service(builder, 4, persistence);
+            meerkat::surface::build_runtime_backed_service(builder, 4, persistence)
+                .expect("compose the runtime-backed service");
         (Arc::new(service), runtime_adapter)
     }
 
@@ -335,7 +337,8 @@ mod tests {
         )]);
         config.realm.insert("default".to_string(), section);
 
-        let service = build_persistent_service(factory, config, 4, persistence);
+        let service = build_persistent_service(factory, config, 4, persistence)
+            .expect("compose the persistent service");
         let created = service
             .create_session(create_request("memory persistence contract"))
             .await
@@ -386,9 +389,11 @@ mod tests {
             config.clone(),
             4,
             persistence.clone(),
-        );
+        )
+        .expect("compose the persistent service");
         let (service_b, adapter_b) =
-            build_persistent_service_with_runtime_adapter(factory_b, config, 4, persistence);
+            build_persistent_service_with_runtime_adapter(factory_b, config, 4, persistence)
+                .expect("compose the persistent service");
 
         assert!(
             Arc::ptr_eq(&adapter_a, &adapter_b),

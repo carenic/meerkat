@@ -100,10 +100,53 @@ pub struct RealmManifest {
     /// here is a startup error (fail-closed durability).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ephemeral_domains: Vec<String>,
+    /// Governance posture the operator selected for this realm with
+    /// [`govern_realm_in`]. `None` is an ungoverned realm. Only format
+    /// [`GOVERNED_MANIFEST_FORMAT`] manifests carry it, so a binary that
+    /// predates the field refuses the realm typed instead of opening it
+    /// ungoverned. See [`RealmGovernance`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance: Option<RealmGovernance>,
 }
 
 /// Newest manifest format this binary understands.
-pub const SUPPORTED_MANIFEST_FORMAT: u32 = 2;
+pub const SUPPORTED_MANIFEST_FORMAT: u32 = 3;
+
+/// The manifest format that carries a realm's governance posture. Readers
+/// from rkat 0.8.4 on refuse newer formats typed
+/// ([`StoreError::ManifestFromTheFuture`]), so they refuse a governed realm
+/// rather than open it ungoverned. Binaries older than 0.8.4 do not check
+/// the format and are outside this guarantee.
+pub const GOVERNED_MANIFEST_FORMAT: u32 = 3;
+
+/// A realm's durable governance posture.
+///
+/// It is selected only by the operator or trusted host through
+/// [`govern_realm_in`], persisted in the realm manifest, and read back by
+/// every opener. It is never inferred from the presence or absence of a
+/// grant-owner store, never set by a run option, and never downgraded by an
+/// opener: this crate offers no operation that removes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RealmGovernance {
+    /// Every opener must compose the realm under native governance. An
+    /// opener that cannot do so refuses; it never falls back to ungoverned
+    /// work.
+    Governed,
+}
+
+/// What a realm's manifest says about its posture, read without creating
+/// or repairing anything ([`read_realm_posture_in`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealmPosture {
+    /// No manifest exists yet: the realm has not been materialized, so no
+    /// posture has been selected for it.
+    NotMaterialized,
+    /// The manifest selects no governance.
+    Ungoverned,
+    /// The manifest selects [`RealmGovernance::Governed`].
+    Governed,
+}
 
 fn default_manifest_format() -> u32 {
     1
@@ -127,6 +170,8 @@ struct PersistedRealmManifest {
     pub provider: Option<String>,
     #[serde(default)]
     pub ephemeral_domains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance: Option<RealmGovernance>,
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +381,18 @@ fn default_realms_root() -> PathBuf {
 /// (Canonical copy lives in `meerkat_core::runtime_bootstrap`; re-exported
 /// here for compatibility.)
 pub use meerkat_core::sanitize_realm_id;
+
+/// Location of a realm's durable grant-owner store, relative to the realm
+/// root. The realm's grant owner is restored from it when the trusted host
+/// selects governance; its presence never selects a posture. It is never
+/// re-issued from configuration at boot, and its absence or a failed restore
+/// never selects an ungoverned fallback.
+pub const GRANT_OWNER_STORE_RELATIVE_PATH: &str = "authorization/grant-owner.jsonl";
+
+/// The durable grant-owner store of the realm rooted at `realm_root`.
+pub fn grant_owner_store_path(realm_root: &Path) -> PathBuf {
+    realm_root.join(GRANT_OWNER_STORE_RELATIVE_PATH)
+}
 
 pub fn realm_paths_in(realms_root: &Path, realm_id: &str) -> RealmPaths {
     let safe = sanitize_realm_id(realm_id);
@@ -703,8 +760,10 @@ pub async fn ensure_realm_manifest_pin_in(
     let manifest = ExternalRealmManifest {
         realm: requested_realm,
         provider: provider.to_string(),
-        manifest_format: SUPPORTED_MANIFEST_FORMAT,
+        // Provider pins need format 2; governance is selected separately.
+        manifest_format: 2,
         ephemeral_domains: Vec::new(),
+        governance: None,
         created_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -719,6 +778,7 @@ pub async fn ensure_realm_manifest_pin_in(
         manifest_format: manifest.manifest_format,
         provider: Some(provider.to_string()),
         ephemeral_domains: manifest.ephemeral_domains.clone(),
+        governance: None,
     };
     write_persisted_manifest_atomically(&paths, &persisted).await?;
     Ok(RealmManifestPin::External(manifest))
@@ -1117,6 +1177,7 @@ async fn create_or_read_manifest_under_lock(
         manifest_format: default_manifest_format(),
         provider: None,
         ephemeral_domains: Vec::new(),
+        governance: None,
     };
 
     write_manifest_atomically(paths, &manifest).await?;
@@ -1220,6 +1281,8 @@ pub struct ExternalRealmManifest {
     pub manifest_format: u32,
     pub ephemeral_domains: Vec<String>,
     pub created_at: String,
+    /// See [`RealmManifest::governance`].
+    pub governance: Option<RealmGovernance>,
 }
 
 impl RealmManifestPin {
@@ -1241,6 +1304,14 @@ impl RealmManifestPin {
         match self {
             Self::Builtin(_) => None,
             Self::External(manifest) => Some(&manifest.provider),
+        }
+    }
+
+    /// The operator-selected governance posture, if any.
+    pub fn governance(&self) -> Option<RealmGovernance> {
+        match self {
+            Self::Builtin(manifest) => manifest.governance,
+            Self::External(manifest) => manifest.governance,
         }
     }
 
@@ -1278,6 +1349,33 @@ fn parse_manifest_pin_bytes(bytes: &[u8]) -> Result<RealmManifestPin, StoreError
             supported: SUPPORTED_MANIFEST_FORMAT,
         });
     }
+    // Governance and its format travel together: a governed manifest of an
+    // older format, or a governed-format manifest without a posture, is
+    // inconsistent and refused rather than read as either posture.
+    match (
+        persisted.governance,
+        persisted.manifest_format >= GOVERNED_MANIFEST_FORMAT,
+    ) {
+        (Some(_), true) | (None, false) => {}
+        (Some(_), false) => {
+            return Err(StoreError::InvalidRealmGovernance {
+                realm_id: persisted.realm_id.clone(),
+                detail: format!(
+                    "governance is recorded in a format {} manifest",
+                    persisted.manifest_format
+                ),
+            });
+        }
+        (None, true) => {
+            return Err(StoreError::InvalidRealmGovernance {
+                realm_id: persisted.realm_id.clone(),
+                detail: format!(
+                    "format {} manifest records no governance",
+                    persisted.manifest_format
+                ),
+            });
+        }
+    }
     let realm = meerkat_core::RealmId::parse(&persisted.realm_id)
         .map_err(|_| StoreError::InvalidRealmSlug(persisted.realm_id.clone()))?;
     if let Some(provider) = persisted
@@ -1291,6 +1389,7 @@ fn parse_manifest_pin_bytes(bytes: &[u8]) -> Result<RealmManifestPin, StoreError
             manifest_format: persisted.manifest_format,
             ephemeral_domains: persisted.ephemeral_domains,
             created_at: persisted.created_at,
+            governance: persisted.governance,
         }));
     }
     let backend = parse_realm_backend(&persisted.realm_id, &persisted.backend)?;
@@ -1302,7 +1401,108 @@ fn parse_manifest_pin_bytes(bytes: &[u8]) -> Result<RealmManifestPin, StoreError
         manifest_format: persisted.manifest_format,
         provider: None,
         ephemeral_domains: persisted.ephemeral_domains,
+        governance: persisted.governance,
     }))
+}
+
+/// Read a realm's governance posture from its manifest without creating,
+/// repairing or rewriting anything.
+///
+/// Fail closed: only an absent manifest is [`RealmPosture::NotMaterialized`].
+/// An unreadable, corrupt, future-format or inconsistent manifest is an
+/// error, never an ungoverned answer. A manifest pinned to an external
+/// storage provider still reports its posture.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn read_realm_posture_in(
+    realms_root: &Path,
+    realm_id: &str,
+) -> Result<RealmPosture, StoreError> {
+    let requested_realm = meerkat_core::RealmId::parse(realm_id)
+        .map_err(|_| StoreError::InvalidRealmSlug(realm_id.to_string()))?;
+    let paths = realm_paths_in(realms_root, realm_id);
+    let bytes = match tokio::fs::read(&paths.manifest_path).await {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RealmPosture::NotMaterialized);
+        }
+        Err(err) => return Err(StoreError::Io(err)),
+    };
+    let pin = parse_manifest_pin_bytes(&bytes)?;
+    if *pin.realm() != requested_realm {
+        return Err(StoreError::RealmIdentityMismatch {
+            requested: requested_realm.as_str().to_string(),
+            existing: pin.realm().as_str().to_string(),
+        });
+    }
+    Ok(match pin.governance() {
+        Some(RealmGovernance::Governed) => RealmPosture::Governed,
+        None => RealmPosture::Ungoverned,
+    })
+}
+
+/// Select governance for an existing realm. This is the explicit operator
+/// or trusted-host act; nothing else writes the posture.
+///
+/// Under the realm's manifest lock it rereads the manifest, keeps every other
+/// field (backend, provider pin, origin, creation time, ephemeral domains),
+/// records [`RealmGovernance::Governed`] at [`GOVERNED_MANIFEST_FORMAT`],
+/// and replaces the file atomically (synced file, rename, synced directory).
+/// Selecting it again is a no-op. A realm that has not been materialized is
+/// refused ([`StoreError::RealmNotMaterialized`]); an unreadable manifest is
+/// refused unchanged.
+///
+/// This writes only the manifest. Idle custody, the realm lease and grant
+/// owner provisioning are the caller's; whichever order it chooses, the
+/// posture is never inferred from the grant-owner store, so a crash between
+/// the steps leaves either a governed realm without an owner (which refuses
+/// work) or an ungoverned realm with an unused store.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn govern_realm_in(
+    realms_root: &Path,
+    realm_id: &str,
+) -> Result<RealmManifestPin, StoreError> {
+    let requested_realm = meerkat_core::RealmId::parse(realm_id)
+        .map_err(|_| StoreError::InvalidRealmSlug(realm_id.to_string()))?;
+    let paths = realm_paths_in(realms_root, realm_id);
+    if !tokio::fs::try_exists(&paths.manifest_path)
+        .await
+        .map_err(StoreError::Io)?
+    {
+        return Err(StoreError::RealmNotMaterialized {
+            realm_id: realm_id.to_string(),
+        });
+    }
+    let lock_path = paths.root.join(".realm_manifest.lock");
+    let _lock = ManifestLockGuard::acquire(&lock_path, realm_id).await?;
+    let bytes = match tokio::fs::read(&paths.manifest_path).await {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StoreError::RealmNotMaterialized {
+                realm_id: realm_id.to_string(),
+            });
+        }
+        Err(err) => return Err(StoreError::Io(err)),
+    };
+    // Validate fully (format ceiling, identity, governance consistency)
+    // before rewriting the raw record.
+    let pin = parse_manifest_pin_bytes(&bytes)?;
+    if *pin.realm() != requested_realm {
+        return Err(StoreError::RealmIdentityMismatch {
+            requested: requested_realm.as_str().to_string(),
+            existing: pin.realm().as_str().to_string(),
+        });
+    }
+    if pin.governance() == Some(RealmGovernance::Governed) {
+        return Ok(pin);
+    }
+    let mut persisted: PersistedRealmManifest =
+        serde_json::from_slice(&bytes).map_err(StoreError::Serialization)?;
+    persisted.governance = Some(RealmGovernance::Governed);
+    persisted.manifest_format = persisted.manifest_format.max(GOVERNED_MANIFEST_FORMAT);
+    let payload = serde_json::to_vec_pretty(&persisted).map_err(StoreError::Serialization)?;
+    let governed = parse_manifest_pin_bytes(&payload)?;
+    write_manifest_payload_atomically(&paths, payload).await?;
+    Ok(governed)
 }
 
 fn parse_manifest_bytes(bytes: &[u8]) -> Result<RealmManifest, StoreError> {
@@ -1422,6 +1622,7 @@ mod tests {
             manifest_format: 1,
             provider: None,
             ephemeral_domains: Vec::new(),
+            governance: None,
         };
         let json = serde_json::to_value(&manifest).expect("serialize");
         let object = json.as_object().expect("object");
@@ -1429,6 +1630,7 @@ mod tests {
         assert!(!object.contains_key("manifest_format"), "{json}");
         assert!(!object.contains_key("provider"), "{json}");
         assert!(!object.contains_key("ephemeral_domains"), "{json}");
+        assert!(!object.contains_key("governance"), "{json}");
     }
 
     #[test]
@@ -2221,6 +2423,201 @@ mod tests {
             "lease file remained after guard drop: {}",
             lease_path.display()
         );
+    }
+
+    async fn raw_manifest(realms_root: &Path, realm_id: &str) -> serde_json::Value {
+        let bytes = tokio::fs::read(realm_paths_in(realms_root, realm_id).manifest_path)
+            .await
+            .expect("manifest");
+        serde_json::from_slice(&bytes).expect("json")
+    }
+
+    #[tokio::test]
+    async fn governance_is_selected_explicitly_and_read_back_by_every_reader() {
+        let temp = tempfile::tempdir().unwrap();
+        let realms_root = temp.path().join("realms");
+        let realm_id = "governed";
+
+        assert_eq!(
+            read_realm_posture_in(&realms_root, realm_id).await.unwrap(),
+            RealmPosture::NotMaterialized
+        );
+        assert!(matches!(
+            govern_realm_in(&realms_root, realm_id).await,
+            Err(StoreError::RealmNotMaterialized { .. })
+        ));
+        assert!(
+            !tokio::fs::try_exists(realm_paths_in(&realms_root, realm_id).manifest_path)
+                .await
+                .unwrap(),
+            "selecting governance never creates a realm"
+        );
+
+        let created = ensure_realm_manifest_in(
+            &realms_root,
+            realm_id,
+            Some(supported_backend()),
+            Some(RealmOrigin::Explicit),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.governance, None);
+        assert_eq!(
+            read_realm_posture_in(&realms_root, realm_id).await.unwrap(),
+            RealmPosture::Ungoverned
+        );
+        // A grant-owner store never selects a posture.
+        let store = realm_paths_in(&realms_root, realm_id)
+            .root
+            .join("authorization/grant-owner.jsonl");
+        tokio::fs::create_dir_all(store.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&store, b"{}\n").await.unwrap();
+        assert_eq!(
+            read_realm_posture_in(&realms_root, realm_id).await.unwrap(),
+            RealmPosture::Ungoverned
+        );
+
+        let governed = govern_realm_in(&realms_root, realm_id).await.unwrap();
+        assert_eq!(governed.governance(), Some(RealmGovernance::Governed));
+        let raw = raw_manifest(&realms_root, realm_id).await;
+        assert_eq!(raw["governance"], "governed");
+        assert_eq!(raw["manifest_format"], GOVERNED_MANIFEST_FORMAT);
+        assert_eq!(raw["backend"], supported_backend().as_str());
+        assert_eq!(raw["created_at"], created.created_at.as_str());
+
+        // Every reader carries it; reopening never downgrades it.
+        assert_eq!(
+            read_realm_posture_in(&realms_root, realm_id).await.unwrap(),
+            RealmPosture::Governed
+        );
+        let reopened = ensure_realm_manifest_in(&realms_root, realm_id, None, None)
+            .await
+            .unwrap();
+        assert_eq!(reopened.governance, Some(RealmGovernance::Governed));
+        assert_eq!(reopened.backend, created.backend);
+        assert_eq!(
+            read_realm_manifest_pin(&realm_paths_in(&realms_root, realm_id).manifest_path)
+                .unwrap()
+                .governance(),
+            Some(RealmGovernance::Governed)
+        );
+        assert_eq!(
+            raw_manifest(&realms_root, realm_id).await,
+            raw,
+            "opening rewrites nothing"
+        );
+
+        // Selecting it again is a no-op.
+        govern_realm_in(&realms_root, realm_id).await.unwrap();
+        assert_eq!(raw_manifest(&realms_root, realm_id).await, raw);
+    }
+
+    #[tokio::test]
+    async fn an_older_reader_refuses_a_governed_realm_typed() {
+        let temp = tempfile::tempdir().unwrap();
+        let realms_root = temp.path().join("realms");
+        let realm_id = "older-reader";
+        ensure_realm_manifest_in(&realms_root, realm_id, Some(supported_backend()), None)
+            .await
+            .unwrap();
+        govern_realm_in(&realms_root, realm_id).await.unwrap();
+        // A format-2 reader (the previous SUPPORTED_MANIFEST_FORMAT) applies
+        // the same ceiling check every reader since rkat 0.8.4 has.
+        let raw = raw_manifest(&realms_root, realm_id).await;
+        let found = raw["manifest_format"].as_u64().unwrap();
+        assert!(found > 2, "a format-2 reader refuses format {found}");
+    }
+
+    #[tokio::test]
+    async fn unknown_or_inconsistent_posture_is_refused_never_ungoverned() {
+        let temp = tempfile::tempdir().unwrap();
+        let realms_root = temp.path().join("realms");
+        let realm_id = "refused";
+        let paths = realm_paths_in(&realms_root, realm_id);
+        tokio::fs::create_dir_all(&paths.root).await.unwrap();
+        let write = |value: serde_json::Value| {
+            let path = paths.manifest_path.clone();
+            async move { tokio::fs::write(path, value.to_string()).await.unwrap() }
+        };
+
+        write(serde_json::json!({
+            "realm_id": realm_id, "backend": "sqlite", "created_at": "0",
+            "manifest_format": 3, "governance": "something_newer",
+        }))
+        .await;
+        assert!(matches!(
+            read_realm_posture_in(&realms_root, realm_id).await,
+            Err(StoreError::Serialization(_))
+        ));
+        write(serde_json::json!({
+            "realm_id": realm_id, "backend": "sqlite", "created_at": "0",
+            "manifest_format": 2, "governance": "governed",
+        }))
+        .await;
+        assert!(matches!(
+            read_realm_posture_in(&realms_root, realm_id).await,
+            Err(StoreError::InvalidRealmGovernance { .. })
+        ));
+        write(serde_json::json!({
+            "realm_id": realm_id, "backend": "sqlite", "created_at": "0",
+            "manifest_format": 3,
+        }))
+        .await;
+        assert!(matches!(
+            read_realm_posture_in(&realms_root, realm_id).await,
+            Err(StoreError::InvalidRealmGovernance { .. })
+        ));
+        write(serde_json::json!({
+            "realm_id": realm_id, "backend": "sqlite", "created_at": "0",
+            "manifest_format": SUPPORTED_MANIFEST_FORMAT + 1, "governance": "governed",
+        }))
+        .await;
+        assert!(matches!(
+            read_realm_posture_in(&realms_root, realm_id).await,
+            Err(StoreError::ManifestFromTheFuture { .. })
+        ));
+        assert!(matches!(
+            govern_realm_in(&realms_root, realm_id).await,
+            Err(StoreError::ManifestFromTheFuture { .. })
+        ));
+        tokio::fs::write(&paths.manifest_path, b"{ not json")
+            .await
+            .unwrap();
+        assert!(read_realm_posture_in(&realms_root, realm_id).await.is_err());
+        assert!(govern_realm_in(&realms_root, realm_id).await.is_err());
+        assert_eq!(
+            tokio::fs::read(&paths.manifest_path).await.unwrap(),
+            b"{ not json",
+            "a refused selection leaves the manifest unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_external_provider_realm_keeps_its_pin_when_governed() {
+        let temp = tempfile::tempdir().unwrap();
+        let realms_root = temp.path().join("realms");
+        let realm_id = "provider-governed";
+        let pin =
+            ensure_realm_manifest_pin_in(&realms_root, realm_id, Some("bigquery"), None, None)
+                .await
+                .unwrap();
+        assert_eq!(pin.governance(), None);
+        let governed = govern_realm_in(&realms_root, realm_id).await.unwrap();
+        assert_eq!(governed.provider_name(), Some("bigquery"));
+        assert_eq!(governed.governance(), Some(RealmGovernance::Governed));
+        let reopened =
+            ensure_realm_manifest_pin_in(&realms_root, realm_id, Some("bigquery"), None, None)
+                .await
+                .unwrap();
+        assert_eq!(reopened.governance(), Some(RealmGovernance::Governed));
+        assert_eq!(
+            read_realm_posture_in(&realms_root, realm_id).await.unwrap(),
+            RealmPosture::Governed
+        );
+        let raw = raw_manifest(&realms_root, realm_id).await;
+        assert_eq!(raw["backend"], "external:bigquery");
     }
 }
 

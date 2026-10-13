@@ -86,6 +86,18 @@ fn refused_root_and_duplicate_issue_preserve_existing_stamp_and_rows() {
             None,
             ExecutionRestrictions::unrestricted()
         ),
+        Err(GrantRefusal::Duplicate)
+    ));
+    assert_eq!(before.check_current(), Ok(()));
+    // A caller who may not issue learns nothing about retained ids.
+    assert!(matches!(
+        owner.issue_root(
+            &who("intruder"),
+            id("existing"),
+            who("holder"),
+            None,
+            ExecutionRestrictions::unrestricted()
+        ),
         Err(GrantRefusal::Denied)
     ));
     assert_eq!(before.check_current(), Ok(()));
@@ -272,4 +284,214 @@ fn mutation_panic_never_keeps_a_successfully_current_stamp() {
         owner.publication.observe(|| ()),
         Err(PublicationError::Unavailable)
     ));
+}
+
+#[test]
+fn issued_reference_is_the_retained_reference_or_none() {
+    let owner = authority(Arc::new(Clock));
+    let issued = issue(&owner, "existing");
+    let before = stamp(&owner);
+    assert_eq!(
+        owner.issued_reference(&id("existing")),
+        Ok(Some(issued.clone()))
+    );
+    assert_eq!(owner.issued_reference(&id("absent")), Ok(None));
+    // A read: nothing is published.
+    assert_eq!(before.check_current(), Ok(()));
+    // A revoked grant keeps its issued reference.
+    owner
+        .revoke(&who("root"), &issued, &mut IsolatedGrantTestCustody)
+        .expect("revoke");
+    assert_eq!(owner.issued_reference(&id("existing")), Ok(Some(issued)));
+}
+
+#[test]
+fn a_child_under_a_used_id_is_a_duplicate_only_for_its_issuer() {
+    let owner = authority(Arc::new(Clock));
+    let parent = issue(&owner, "parent");
+    let child = owner
+        .issue_child(
+            &who("holder"),
+            &parent,
+            id("child"),
+            who("executor"),
+            ExecutionRestrictions::unrestricted(),
+        )
+        .expect("child");
+    let before = stamp(&owner);
+    for used in ["child", "parent"] {
+        assert!(matches!(
+            owner.issue_child(
+                &who("holder"),
+                &parent,
+                id(used),
+                who("executor"),
+                ExecutionRestrictions::unrestricted(),
+            ),
+            Err(GrantRefusal::Duplicate)
+        ));
+        assert!(matches!(
+            owner.issue_child(
+                &who("intruder"),
+                &parent,
+                id(used),
+                who("executor"),
+                ExecutionRestrictions::unrestricted(),
+            ),
+            Err(GrantRefusal::Denied)
+        ));
+    }
+    assert_eq!(before.check_current(), Ok(()));
+    assert_eq!(owner.issued_reference(&id("child")), Ok(Some(child)));
+}
+
+#[test]
+fn an_intruder_revoke_is_denied_even_while_the_reservation_is_busy() {
+    let owner = authority(Arc::new(Clock));
+    let parent = issue(&owner, "parent");
+    let child = owner
+        .issue_child(
+            &who("holder"),
+            &parent,
+            id("child"),
+            who("executor"),
+            ExecutionRestrictions::unrestricted(),
+        )
+        .expect("child");
+    let busy = owner
+        .publication
+        .reserve_owner_change()
+        .expect("hold the reservation");
+    for grant in [&parent, &child] {
+        assert_eq!(
+            owner.revoke(&who("intruder"), grant, &mut IsolatedGrantTestCustody),
+            Err(GrantRefusal::Denied)
+        );
+    }
+    // Authorized callers (the root, the child's issuer) meet the busy
+    // reservation: unavailable, nothing changed.
+    assert_eq!(
+        owner.revoke(&who("root"), &parent, &mut IsolatedGrantTestCustody),
+        Err(GrantRefusal::Unavailable)
+    );
+    assert_eq!(
+        owner.revoke(&who("holder"), &child, &mut IsolatedGrantTestCustody),
+        Err(GrantRefusal::Unavailable)
+    );
+    drop(busy);
+    owner
+        .revoke(&who("holder"), &child, &mut IsolatedGrantTestCustody)
+        .expect("the issuer revokes once the reservation is free");
+    assert_eq!(
+        owner.revoke(&who("intruder"), &parent, &mut IsolatedGrantTestCustody),
+        Err(GrantRefusal::Denied)
+    );
+}
+
+fn revoked(owner: &LocalGrantAuthority, grant: &GrantLineageRef) -> bool {
+    owner
+        .owner
+        .lock()
+        .expect("owner")
+        .state()
+        .revoked
+        .contains(&grant.grant_id)
+}
+
+fn revision(owner: &LocalGrantAuthority) -> u64 {
+    owner.owner.lock().expect("owner").state().revision
+}
+
+#[test]
+fn an_expected_revoke_after_a_published_owner_change_is_refused_unchanged() {
+    let owner = authority(Arc::new(Clock));
+    let grant = issue(&owner, "grant");
+    // The caller checks its view, then a real owner change on the same
+    // publication completes before the caller revokes.
+    let checked = stamp(&owner);
+    let _other = issue(&owner, "other");
+    let after_change = stamp(&owner);
+    let before = revision(&owner);
+    assert_eq!(
+        owner.revoke_expecting(
+            &who("root"),
+            &grant,
+            &checked,
+            &mut IsolatedGrantTestCustody
+        ),
+        Err(ExpectedRevokeRefusal::NotCurrent)
+    );
+    assert!(!revoked(&owner, &grant), "the grant stays live");
+    assert_eq!(revision(&owner), before, "no owner change");
+    assert_eq!(after_change.check_current(), Ok(()), "nothing published");
+}
+
+#[test]
+fn an_expected_revoke_refuses_a_current_stamp_of_an_unrelated_publication() {
+    let owner = authority(Arc::new(Clock));
+    let grant = issue(&owner, "grant");
+    let own = stamp(&owner);
+    let unrelated = LocalAuthorizationPublication::new();
+    let ((), foreign) = unrelated.observe(|| ()).expect("unrelated stamp");
+    assert_eq!(foreign.check_current(), Ok(()), "current on its own");
+    let before = revision(&owner);
+    assert_eq!(
+        owner.revoke_expecting(
+            &who("root"),
+            &grant,
+            &foreign,
+            &mut IsolatedGrantTestCustody
+        ),
+        Err(ExpectedRevokeRefusal::NotCurrent)
+    );
+    assert!(!revoked(&owner, &grant), "the grant stays live");
+    assert_eq!(revision(&owner), before, "no owner change");
+    assert_eq!(own.check_current(), Ok(()), "nothing published");
+}
+
+#[test]
+fn an_expected_revoke_with_a_current_stamp_revokes_exactly_once() {
+    let owner = authority(Arc::new(Clock));
+    let grant = issue(&owner, "grant");
+    let current = stamp(&owner);
+    // Every refusal of `revoke` keeps its meaning; nothing is published.
+    assert_eq!(
+        owner.revoke_expecting(
+            &who("intruder"),
+            &grant,
+            &current,
+            &mut IsolatedGrantTestCustody
+        ),
+        Err(ExpectedRevokeRefusal::Grant(GrantRefusal::Denied))
+    );
+    assert_eq!(current.check_current(), Ok(()));
+    let before = revision(&owner);
+    owner
+        .revoke_expecting(
+            &who("root"),
+            &grant,
+            &current,
+            &mut IsolatedGrantTestCustody,
+        )
+        .expect("a current stamp of this publication revokes");
+    assert!(revoked(&owner, &grant));
+    assert_eq!(revision(&owner), before + 1, "one owner change");
+    let after = stamp(&owner);
+    assert_eq!(
+        after.observation_sequence(),
+        current.observation_sequence() + 2,
+        "published once"
+    );
+    // The checked stamp is now stale and cannot revoke again.
+    assert_eq!(
+        owner.revoke_expecting(
+            &who("root"),
+            &grant,
+            &current,
+            &mut IsolatedGrantTestCustody
+        ),
+        Err(ExpectedRevokeRefusal::NotCurrent)
+    );
+    assert_eq!(revision(&owner), before + 1);
+    assert_eq!(after.check_current(), Ok(()), "nothing published again");
 }

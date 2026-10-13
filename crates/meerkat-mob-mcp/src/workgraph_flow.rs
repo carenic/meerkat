@@ -309,9 +309,21 @@ impl MobMcpState {
                 tracing::warn!("WorkGraph Flow reconciler could not start outside a Tokio runtime");
                 return;
             };
-            runtime.spawn(async move {
-                Self::run_workgraph_flow_reconciler(weak).await;
-            });
+            let _guard = runtime.enter();
+            if self
+                .state_tasks
+                .spawn(
+                    crate::state_tasks::StateTaskKind::Periodic,
+                    "WorkGraph Flow reconciler",
+                    async move {
+                        Self::run_workgraph_flow_reconciler(weak).await;
+                    },
+                )
+                .is_none()
+            {
+                self.workgraph_flow_reconciler_started
+                    .store(false, Ordering::Release);
+            }
         }
         #[cfg(target_arch = "wasm32")]
         tokio::spawn(async move {

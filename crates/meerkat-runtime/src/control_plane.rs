@@ -79,6 +79,7 @@ impl RunlessTerminalConvergenceError {
             | RuntimeDriverError::InputIdempotencyConflict { .. }
             | RuntimeDriverError::RecoveryCorruption { .. }
             | RuntimeDriverError::InputTerminalWithoutReceipt { .. }
+            | RuntimeDriverError::ScopedResultWithheld { .. }
             | RuntimeDriverError::HostingClaimInvariantViolated { .. }
             | RuntimeDriverError::RecoveryRepairBlocked { .. }) => Self::Corrupt { context, error },
             error @ (RuntimeDriverError::ControllerReadinessUnavailable { .. }
@@ -90,6 +91,7 @@ impl RunlessTerminalConvergenceError {
             | RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. }
             | RuntimeDriverError::InterruptDispatchPanicked { .. }
             | RuntimeDriverError::RecoveryBackoff { .. }
+            | RuntimeDriverError::ConsentOwnerLossUnsettled { .. }
             | RuntimeDriverError::MaterializationRegistrationOwned { .. }
             | RuntimeDriverError::Internal(_)) => Self::Retryable { context, error },
         }
@@ -644,11 +646,13 @@ pub(crate) async fn has_committed_runless_recovery_carrier(
 }
 
 /// Canonical terminalization for an async stop after the executor has accepted
-/// the stop control command.
+/// the stop control command. A successful machine stop owes `runless_terminal`
+/// the inputs it terminalized.
 pub(crate) async fn terminalize_async_stop_once(
     driver: &SharedDriver,
     completions: Option<&SharedCompletionRegistry>,
     publication_handle: Option<&dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
+    runless_terminal: &mut crate::meerkat_machine::RunlessTerminalAnnouncement,
 ) -> Result<(), RuntimeDriverError> {
     let (completion_input_ids, candidate_owner_input_id, termination_reason) = {
         let mut driver = driver.lock().await;
@@ -663,11 +667,14 @@ pub(crate) async fn terminalize_async_stop_once(
         // is different: Destroy already committed the absorbing DSL terminal
         // while the executor stop hook was in flight, and the machine
         // intentionally has no RuntimeExecutorExited transition from it.
-        if driver.runtime_state() != crate::RuntimeState::Destroyed
-            && let Err(error) = machine_stop_runtime(&mut driver).await
-        {
-            driver.rollback_prepared_runless_interaction_terminal_outboxes(prepared);
-            return Err(error);
+        if driver.runtime_state() != crate::RuntimeState::Destroyed {
+            if let Err(error) = machine_stop_runtime(&mut driver).await {
+                driver.rollback_prepared_runless_interaction_terminal_outboxes(prepared);
+                return Err(error);
+            }
+            if !completion_input_ids.is_empty() {
+                runless_terminal.owe();
+            }
         }
         let candidate_owner_input_id =
             crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
@@ -801,7 +808,11 @@ fn retry_delay_before_deadline(
 /// detaching this exact transaction ensures such cancellation cannot interrupt
 /// an in-memory lifecycle mutation before its persistence await, a nondirected
 /// waiter-only handoff, or a directed receipt/waiter convergence retry.
-pub(crate) async fn terminalize_async_stop(
+///
+/// Tells `runless_terminal` once a successful machine stop has terminalized
+/// inputs and released the driver, from the detached transaction itself, so a
+/// cancelled caller cannot lose it. Every stop terminalization tells.
+pub(crate) async fn terminalize_async_stop_announcing(
     driver: &SharedDriver,
     completions: Option<&SharedCompletionRegistry>,
     publication_handle: Option<
@@ -810,6 +821,7 @@ pub(crate) async fn terminalize_async_stop(
     turn_finalization_guard: Option<
         Box<dyn meerkat_core::lifecycle::CoreExecutorTurnFinalizationGuard>,
     >,
+    runless_terminal: crate::meerkat_machine::RunlessTerminalAnnouncement,
 ) -> Result<
     Option<Box<dyn meerkat_core::lifecycle::CoreExecutorTurnFinalizationGuard>>,
     RuntimeDriverError,
@@ -817,6 +829,7 @@ pub(crate) async fn terminalize_async_stop(
     let driver = driver.clone();
     let completions = completions.cloned();
     let terminalization = crate::tokio::spawn(async move {
+        let mut runless_terminal = runless_terminal;
         // This is the exact guard acquired by RuntimeLoop before accepting the
         // Stop effect. The independently owned transaction returns it to a live
         // caller for cleanup, while forced outer-loop cancellation leaves it in
@@ -832,11 +845,16 @@ pub(crate) async fn terminalize_async_stop(
                     &driver,
                     completions.as_ref(),
                     publication_handle.as_deref(),
+                    &mut runless_terminal,
                 )
                 .await
             }
             Err(error) => Err(error.into_driver_error()),
         };
+        // The stopped inputs' terminals are durable and the driver is
+        // released: tell the host before convergence, whose failure leaves
+        // them terminal all the same.
+        runless_terminal.release();
         let result = converge_committed_runless_runtime_terminations(
             &driver,
             completions.as_ref(),
@@ -922,6 +940,7 @@ pub(crate) async fn apply_runtime_loop_executor_effect(
     turn_finalization_guard: Option<
         Box<dyn meerkat_core::lifecycle::CoreExecutorTurnFinalizationGuard>,
     >,
+    runless_terminal: crate::meerkat_machine::RunlessTerminalAnnouncement,
 ) -> Result<RuntimeLoopEffectOutcome, RuntimeLoopEffectFailure> {
     match effect.into_inner() {
         RuntimeEffectInner::CancelAfterBoundary { reason } => {
@@ -946,11 +965,12 @@ pub(crate) async fn apply_runtime_loop_executor_effect(
                 });
             }
             let publication_handle = executor.publication_handle();
-            let _turn_finalization_guard = terminalize_async_stop(
+            let _turn_finalization_guard = terminalize_async_stop_announcing(
                 driver,
                 completions,
                 publication_handle,
                 turn_finalization_guard,
+                runless_terminal,
             )
             .await
             .map_err(|error| RuntimeLoopEffectFailure {
@@ -967,8 +987,9 @@ pub(crate) async fn apply_runtime_loop_executor_effect(
 /// Distinguishes the three terminal shapes a drain can produce so the loop
 /// driver never conflates a closed effect channel with an applied stop:
 /// channel closure must still route through the canonical stop/terminalize
-/// path (StopRuntimeExecutor + [`terminalize_async_stop`] + waiter resolution)
-/// instead of silently exiting as if a stop effect had already been applied.
+/// path (StopRuntimeExecutor + [`terminalize_async_stop_announcing`] + waiter
+/// resolution) instead of silently exiting as if a stop effect had already
+/// been applied.
 #[derive(Debug)]
 pub(crate) enum EffectDrainOutcome {
     /// A stop effect was received but NOT applied. The caller drops its
@@ -1346,6 +1367,7 @@ mod tests {
                 &mut executor,
                 runtime_effect(RuntimeEffectKind::StopRuntimeExecutor, "stop"),
                 None,
+                crate::meerkat_machine::RunlessTerminalAnnouncement::default(),
             )
             .await
         });
@@ -1565,6 +1587,7 @@ mod tests {
                 &mut executor,
                 runtime_effect(RuntimeEffectKind::StopRuntimeExecutor, "stop"),
                 Some(turn_guard),
+                crate::meerkat_machine::RunlessTerminalAnnouncement::default(),
             )
             .await
         });
@@ -1890,6 +1913,7 @@ mod tests {
             &mut executor,
             runtime_effect(RuntimeEffectKind::StopRuntimeExecutor, "stop"),
             None,
+            crate::meerkat_machine::RunlessTerminalAnnouncement::default(),
         )
         .await
         .expect("terminal handoff must not invoke external cleanup inline");
@@ -1973,10 +1997,16 @@ mod tests {
                 0,
                 "the drain must never apply the stop itself"
             );
-            let outcome =
-                apply_runtime_loop_executor_effect(&driver, None, &mut executor, effect, None)
-                    .await
-                    .expect("runtime-loop handoff applies the pending stop guard-free");
+            let outcome = apply_runtime_loop_executor_effect(
+                &driver,
+                None,
+                &mut executor,
+                effect,
+                None,
+                crate::meerkat_machine::RunlessTerminalAnnouncement::default(),
+            )
+            .await
+            .expect("runtime-loop handoff applies the pending stop guard-free");
             assert_eq!(
                 outcome,
                 RuntimeLoopEffectOutcome::StopTerminalizedNeedsExternalCleanup

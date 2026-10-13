@@ -27,6 +27,7 @@ from .types import (  # noqa: F401
     LiveBridgeEffectKind,
     LiveBridgeEffectOutcome,
     LiveChannelId,
+    McpAttachmentRestoreWireOutcome,
     MeerkatSchema,
     OperationId,
     PeerId,

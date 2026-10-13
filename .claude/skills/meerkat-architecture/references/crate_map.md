@@ -181,7 +181,7 @@ profiles; the in-repo stores run the same suite in
 
 | Trait | Purpose | Implementors |
 |-------|---------|-------------|
-| `RealmStorageProvider` | One provider supplies all durable stores for a realm (`open(RealmOpenContext) → RealmStoreSet` with per-slot `DurabilityDeclaration`s over the seven required domains; optional `migrator()` hook) | `DiskStorageProvider` (crates/meerkat/src/storage_provider.rs); downstream remote/mobkit providers |
+| `RealmStorageProvider` | One provider supplies all durable stores for a realm (`open(RealmOpenContext) → RealmStoreSet` with per-slot `DurabilityDeclaration`s over the seven required domains; optional `migrator()` hook) | `DiskStorageProvider` (crates/meerkat/src/storage_provider.rs); downstream remote/meta providers |
 
 ### Mob traits (defined in meerkat-mob)
 
@@ -229,7 +229,7 @@ profiles; the in-repo stores run the same suite in
 | `CompletionFeed` | Trait for monotonic completion event log — meerkat-core |
 | `CompletionEntry` | Single completion event in the feed — meerkat-core |
 
-### 0.7.12 additions (PR #821, MobKit upstream asks)
+### 0.7.12 additions (PR #821, Meta upstream asks)
 
 | Type | Purpose |
 |------|---------|

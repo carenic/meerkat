@@ -27,8 +27,8 @@ pub enum ChildToolPolicyRefused {
         "this host runs a tool-policy registry and no child application tool policy is \
          configured, so members of a mob created with mob_create, and delegate helpers, would \
          run outside the host's tool policy. Configure one with \
-         MobMcpState::with_child_application_tool_policy(binding) (MobKit hosts: the \
-         `child_application_tool_policy` init parameter, proposed for MobKit 0.8.46), or \
+         MobMcpState::with_child_application_tool_policy(binding) (Meta hosts: the \
+         `child_application_tool_policy` init parameter, proposed for Meta 0.8.46), or \
          explicitly choose ApplicationToolPolicyBinding::Unmanaged ({{\"kind\":\"unmanaged\"}}) \
          to allow unconstrained child members"
     )]

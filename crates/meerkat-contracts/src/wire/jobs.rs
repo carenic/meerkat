@@ -437,7 +437,7 @@ pub struct CallbackJobReconcileResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct MobkitJobHeartbeatParams {
+pub struct MetaJobHeartbeatParams {
     pub authority: JobAttemptAuthority,
     pub heartbeat_at_ms: u64,
     pub lease_expires_at_ms: u64,
@@ -445,7 +445,7 @@ pub struct MobkitJobHeartbeatParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct MobkitJobProgressParams {
+pub struct MetaJobProgressParams {
     pub authority: JobAttemptAuthority,
     pub cursor: u64,
     pub detail: String,
@@ -454,7 +454,7 @@ pub struct MobkitJobProgressParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct MobkitJobCheckpointParams {
+pub struct MetaJobCheckpointParams {
     pub authority: JobAttemptAuthority,
     pub checkpoint_ref: String,
     pub observed_at_ms: u64,
@@ -462,7 +462,7 @@ pub struct MobkitJobCheckpointParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct MobkitJobCompleteParams {
+pub struct MetaJobCompleteParams {
     pub authority: JobAttemptAuthority,
     pub completed_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -471,7 +471,7 @@ pub struct MobkitJobCompleteParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct MobkitJobFailParams {
+pub struct MetaJobFailParams {
     pub authority: JobAttemptAuthority,
     pub failed_at_ms: u64,
     pub code: String,
@@ -481,9 +481,9 @@ pub struct MobkitJobFailParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct MobkitJobCancelAckParams {
+pub struct MetaJobCancelAckParams {
     pub authority: JobAttemptAuthority,
     pub acknowledged_at_ms: u64,
 }
 
-pub type MobkitJobMutationResult = JobsGetResult;
+pub type MetaJobMutationResult = JobsGetResult;

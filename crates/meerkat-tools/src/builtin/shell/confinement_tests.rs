@@ -462,7 +462,13 @@ async fn recovered_monitor_refusal_remains_typed_at_each_recovery_tool_owner() {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "integration-real-tests"))]
+// macOS runs these with `integration-real-tests`. Linux compiles them in every
+// run and ignores them, and `make test-mcp-confinement-positive` selects them
+// on an eligible host, where a backend refusal fails.
+#[cfg(any(
+    all(target_os = "macos", feature = "integration-real-tests"),
+    target_os = "linux"
+))]
 mod platform {
     use super::*;
 
@@ -519,6 +525,10 @@ mod platform {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "Linux positive confinement acceptance lane; requires an eligible host"
+    )]
     async fn required_confinement_foreground_denied_syscall_then_next_command_succeeds() {
         let fixture = JobsFixture::new();
         let outside = fixture._root.path().join("outside");
@@ -554,6 +564,10 @@ mod platform {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "Linux positive confinement acceptance lane; requires an eligible host"
+    )]
     async fn required_confinement_background_has_exact_environment_and_denied_write() {
         let fixture = JobsFixture::new();
         let outside = fixture._root.path().join("outside");
@@ -586,6 +600,10 @@ mod platform {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "Linux positive confinement acceptance lane; requires an eligible host"
+    )]
     async fn required_confinement_bound_custody_records_target_and_settles_denied_write() {
         use super::super::{ProcessCustody, ProcessCustodyScope};
 
@@ -715,6 +733,10 @@ mod platform {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "Linux positive confinement acceptance lane; requires an eligible host"
+    )]
     async fn required_confinement_recovered_monitor_keeps_private_variables_without_ambient_env() {
         let fixture = JobsFixture::new();
         let outside = fixture._root.path().join("outside");

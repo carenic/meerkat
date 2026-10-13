@@ -106,7 +106,7 @@ uuid = { workspace = true }
 url = { workspace = true }
 
 [features]
-default = ["anthropic", "openai", "openai-realtime", "gemini", "copilot", "jsonl-store", "memory-store", "session-store", "skills", "comms", "mcp", "schedule", "workgraph", "mob", "rpc-surface"]
+default = ["anthropic", "openai", "openai-realtime", "gemini", "copilot", "jsonl-store", "memory-store", "session-store", "skills", "comms", "mcp", "schedule", "workgraph", "mob", "rpc-surface", "local-authorization"]
 
 # LLM providers (forwarded to facade)
 anthropic = ["meerkat/anthropic"]
@@ -137,6 +137,8 @@ jsonl-store = ["meerkat/jsonl-store"]
 
 # Session capabilities (forwarded to facade)
 session-store = ["meerkat/session-store"]
+# Governed realms: the stock host composition and `rkat realm govern`.
+local-authorization = ["session-store", "meerkat/local-authorization"]
 session-compaction = ["meerkat/session-compaction"]
 # Enables both the memory backend capability and memory_search/session wiring.
 memory-store = ["meerkat/memory-store", "memory-store-session"]

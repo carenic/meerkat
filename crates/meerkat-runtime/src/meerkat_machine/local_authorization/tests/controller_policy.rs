@@ -139,9 +139,20 @@ struct Fixture {
     policy: Arc<GrantBackedWorkPolicy>,
     account: Arc<AccountPolicy>,
     publication: LocalAuthorizationPublication,
+    grants: Arc<meerkat_authorization::grants::LocalGrantAuthority>,
     _vault: EphemeralTokenStore,
 }
 async fn fixture() -> Fixture {
+    fixture_with(|_, _| {}).await
+}
+/// The fixture, with `adjust` applied to the prompt's claims (given the
+/// actual grant owner) before the prompt is staged.
+async fn fixture_with(
+    adjust: impl FnOnce(
+        &mut meerkat_authorization_contracts::work_association::InputAuthorityAssociationCandidate,
+        &meerkat_authorization::grants::LocalGrantAuthority,
+    ),
+) -> Fixture {
     let (mut configuration, mut prompt, _, publication) = mutable_controller_configuration(true);
     let mut candidate = prompt
         .header()
@@ -150,6 +161,10 @@ async fn fixture() -> Fixture {
         .expect("claim")
         .candidate()
         .clone();
+    // The account owner's domain is the fixture's controller grant owner,
+    // read before `adjust` may change the claimed controller lineage.
+    let controller_root = candidate.controller_grant_lineage[0].root_authority.clone();
+    adjust(&mut candidate, &configuration.grants);
     let old = candidate.controller_model.as_ref().expect("selected child");
     let credential =
         meerkat_core::AuthCredentialIdentity::Account(meerkat_core::CredentialAccountRef {
@@ -180,15 +195,7 @@ async fn fixture() -> Fixture {
             ordinary_tool: true,
         }),
         domain: ResourceDomain {
-            authority: prompt
-                .header()
-                .authority_association
-                .as_ref()
-                .expect("claim")
-                .candidate()
-                .controller_grant_lineage[0]
-                .root_authority
-                .clone(),
+            authority: controller_root,
             namespace: "test-source".into(),
         },
         executor: prompt
@@ -202,6 +209,7 @@ async fn fixture() -> Fixture {
         commits: AtomicUsize::new(0),
     });
     configuration.operation_owner = account.clone();
+    let grants = configuration.grants.clone();
     let policy = Arc::new(GrantBackedWorkPolicy::new(
         configuration.grants.clone(),
         configuration.invocation_owner.clone(),
@@ -225,6 +233,7 @@ async fn fixture() -> Fixture {
         policy,
         account,
         publication,
+        grants,
         _vault: vault,
     }
 }
@@ -620,4 +629,257 @@ async fn unavailable_proposed_policy_preserves_actual_state_publication_and_cont
         .check_current()
         .expect("no publication on unavailable proposal");
     check.current().expect("existing controller remains usable");
+}
+
+/// A source owner holding no originals: this fixture's work names none.
+struct NoOriginals;
+impl crate::meerkat_machine::AuthenticatedOriginalSource for NoOriginals {
+    fn authenticated_original(
+        &self,
+        _: &crate::input_authority::NativeIngressContext,
+        _: &meerkat_authorization_contracts::work_association::QualifiedIngressNamespace,
+        _: &meerkat_authorization_contracts::work_association::OriginalWorkRef,
+    ) -> Result<
+        Option<crate::meerkat_machine::AuthenticatedOriginal>,
+        meerkat_core::authorization::ControllerReadinessFailure,
+    > {
+        Ok(None)
+    }
+
+    fn retained_original(
+        &self,
+        _: &meerkat_authorization_contracts::work_association::QualifiedIngressNamespace,
+        _: &meerkat_authorization_contracts::work_association::OriginalWorkRef,
+    ) -> Result<
+        Option<meerkat_authorization_contracts::work_association::WorkAuthorityBasis>,
+        meerkat_core::authorization::ControllerReadinessFailure,
+    > {
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn unfinished_work_references_every_selected_target_lineage_read_only() {
+    use meerkat_authorization_contracts::work_association::{
+        GrantTarget, TargetGrantLineage, WorkAuthorityBasis,
+    };
+    let mut selected = None;
+    let mut unused = None;
+    let fixture = fixture_with(|candidate, grants| {
+        let root = candidate.controller_grant_lineage[0].root_authority.clone();
+        let issue = |name: &str| {
+            grants
+                .issue_root(
+                    &root,
+                    EvidenceId::new(name).expect("id"),
+                    candidate.logical_executor.clone(),
+                    None,
+                    ExecutionRestrictions::unrestricted(),
+                )
+                .expect("target grant")
+        };
+        let target = issue("alpha-leaf");
+        unused = Some(issue("unused-leaf"));
+        // No optional base: admission needs no target or base lineage.
+        candidate.authority_basis = WorkAuthorityBasis::TargetedGrantLineages {
+            base: None,
+            targets: vec![TargetGrantLineage {
+                target: GrantTarget::McpServer {
+                    server: "alpha".into(),
+                },
+                lineage: vec![target.clone()],
+            }],
+        };
+        selected = Some(target);
+    })
+    .await;
+    let selected = selected.expect("selected");
+    let unused = unused.expect("unused");
+    let claims = fixture
+        .prompt
+        .header()
+        .authority_association
+        .as_ref()
+        .expect("claim")
+        .candidate()
+        .clone();
+    let controller = claims.controller_grant_lineage[0].clone();
+    let root = controller.root_authority.clone();
+    let driver = Arc::clone(
+        &fixture
+            .machine
+            .sessions
+            .read()
+            .await
+            .get(&fixture.session)
+            .expect("session")
+            .driver,
+    );
+    {
+        let mut locked = driver.lock().await;
+        let DriverEntry::Ephemeral(driver) = &mut *locked else {
+            panic!("storeless")
+        };
+        driver.set_executor_work_authorization_support(true);
+        assert!(
+            driver
+                .accept_input(fixture.prompt.clone())
+                .await
+                .expect("actual accepted queued work")
+                .is_accepted()
+        );
+    }
+    {
+        let mut custody = fixture
+            .machine
+            .try_controller_grant_mutation()
+            .expect("custody");
+        assert_eq!(
+            custody.unfinished_work_references_grant(&selected, &NoOriginals),
+            Ok(true)
+        );
+        assert_eq!(
+            custody.unfinished_work_references_grant(&controller, &NoOriginals),
+            Ok(true)
+        );
+        assert_eq!(
+            custody.unfinished_work_references_grant(&unused, &NoOriginals),
+            Ok(false)
+        );
+        let mut called = false;
+        assert_eq!(
+            custody.revoke_if_unreferenced(&selected, &NoOriginals, |_| called = true),
+            Ok(None),
+            "a lineage held by unfinished work is not cleaned up"
+        );
+        assert!(!called);
+    }
+    // A busy native owner is unavailable, never "unreferenced".
+    {
+        let _held = driver.lock().await;
+        assert!(matches!(
+            fixture.machine.try_controller_grant_mutation(),
+            Err(ControllerCustodyRefusal::Unavailable)
+        ));
+    }
+    {
+        let mut locked = driver.lock().await;
+        let DriverEntry::Ephemeral(driver) = &mut *locked else {
+            panic!("storeless")
+        };
+        driver
+            .abandon_all_non_terminal(crate::input_state::InputAbandonReason::Stopped)
+            .expect("abandon queued work");
+    }
+    let mut custody = fixture
+        .machine
+        .try_controller_grant_mutation()
+        .expect("custody");
+    assert_eq!(
+        custody.unfinished_work_references_grant(&selected, &NoOriginals),
+        Ok(false)
+    );
+    let revoked = custody
+        .revoke_if_unreferenced(&selected, &NoOriginals, |custody| {
+            fixture.grants.revoke(&root, &selected, custody)
+        })
+        .expect("custody held");
+    assert_eq!(revoked, Some(Ok(())));
+    drop(custody);
+    assert!(
+        fixture
+            .grants
+            .resolve_lineage(
+                std::slice::from_ref(&selected),
+                &claims.logical_executor,
+                None,
+            )
+            .is_err(),
+        "the superseded lineage was revoked under the same custody"
+    );
+}
+
+/// Controller-only work (a targeted selection of nothing) is admitted on its
+/// valid controller lineage and runs its controller; with that controller
+/// lineage revoked it is refused at admission.
+#[tokio::test]
+async fn controller_only_work_runs_on_its_controller_lineage_alone() {
+    use meerkat_authorization_contracts::grant_mutation::ControllerGrantMutationCustody;
+    use meerkat_authorization_contracts::work_association::WorkAuthorityBasis;
+    let controller_only = || WorkAuthorityBasis::TargetedGrantLineages {
+        base: None,
+        targets: Vec::new(),
+    };
+
+    let fixture = fixture_with(|candidate, _| candidate.authority_basis = controller_only()).await;
+    let (_, run, context) =
+        stage_controller_input(&fixture.machine, &fixture.session, fixture.prompt.clone()).await;
+    PreparedOperationCheck::prepare(context.clone(), plain_controller_binding(&context, &run))
+        .expect("the controller runs on its own lineage")
+        .current()
+        .expect("current");
+
+    struct Unreferenced;
+    impl ControllerGrantMutationCustody for Unreferenced {
+        fn with_unreferenced_controller_grant<T, E>(
+            &mut self,
+            _: &meerkat_authorization_contracts::work_association::GrantLineageRef,
+            mutate: impl FnOnce() -> Result<T, E>,
+        ) -> Result<Result<T, E>, ControllerCustodyRefusal> {
+            Ok(mutate())
+        }
+    }
+    let revoked = fixture_with(|candidate, grants| {
+        candidate.authority_basis = controller_only();
+        let controller = candidate.controller_grant_lineage[0].clone();
+        grants
+            .revoke(&controller.root_authority, &controller, &mut Unreferenced)
+            .expect("controller lineage revoked before admission");
+    })
+    .await;
+    let driver = Arc::clone(
+        &revoked
+            .machine
+            .sessions
+            .read()
+            .await
+            .get(&revoked.session)
+            .expect("session")
+            .driver,
+    );
+    let mut locked = driver.lock().await;
+    let DriverEntry::Ephemeral(driver) = &mut *locked else {
+        panic!("storeless")
+    };
+    driver.set_executor_work_authorization_support(true);
+    assert!(
+        driver.accept_input(revoked.prompt.clone()).await.is_err(),
+        "controller-only work with a revoked controller lineage is refused"
+    );
+    drop(locked);
+
+    let missing = fixture_with(|candidate, _| {
+        candidate.authority_basis = controller_only();
+        candidate.controller_grant_lineage = Vec::new();
+    })
+    .await;
+    let driver = Arc::clone(
+        &missing
+            .machine
+            .sessions
+            .read()
+            .await
+            .get(&missing.session)
+            .expect("session")
+            .driver,
+    );
+    let mut locked = driver.lock().await;
+    let DriverEntry::Ephemeral(driver) = &mut *locked else {
+        panic!("storeless")
+    };
+    driver.set_executor_work_authorization_support(true);
+    assert!(
+        driver.accept_input(missing.prompt.clone()).await.is_err(),
+        "controller-only work with no controller lineage is refused"
+    );
 }

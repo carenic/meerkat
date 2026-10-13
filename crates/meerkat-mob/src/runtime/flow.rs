@@ -183,6 +183,12 @@ impl FlowEngine {
                     match root_phase {
                         FlowFrameTerminalPhase::Failed => {
                             let machine_state = self.handle.query_machine_state().await?;
+                            // Every terminal step is projected before any
+                            // supervisory effect runs. A failed escalation or
+                            // reset used to end this pass early, and
+                            // TerminalizeFailed then recorded every later step
+                            // Canceled, without its ledger row or event.
+                            let mut escalations = Vec::new();
                             for projection_record in frame_outcome.step_projections.values() {
                                 let step_id = &projection_record.step_id;
                                 let step_status = frame_step_projection_status_from_machine(
@@ -248,14 +254,48 @@ impl FlowEngine {
                                     )
                                     .await?
                                 {
-                                    let supervisor =
-                                        Supervisor::new(self.handle.clone(), self.emitter.clone());
-                                    let reason = reason.as_deref().unwrap_or("frame step failed");
+                                    escalations.push((step_id, reason));
+                                }
+                            }
+                            // Then every escalation MobMachine emitted is carried
+                            // out in projection order, each followed by the
+                            // reset as before. A failed one no longer drops the
+                            // ones after it; the first failure stays the run's
+                            // reported failure, terminalized by the actor as
+                            // before.
+                            let supervisor =
+                                Supervisor::new(self.handle.clone(), self.emitter.clone());
+                            let mut supervisory_failure = None;
+                            for (step_id, reason) in escalations {
+                                let reason = reason.as_deref().unwrap_or("frame step failed");
+                                let outcome = async {
                                     supervisor
                                         .escalate(&config, &run_id, step_id, reason)
                                         .await?;
-                                    supervisor.force_reset().await?;
+                                    supervisor.force_reset().await
                                 }
+                                .await;
+                                match outcome {
+                                    Ok(()) => {}
+                                    // Cancellation is the run's own terminal
+                                    // class; the cancel path owns it.
+                                    Err(error @ MobError::RunCanceled(_)) => return Err(error),
+                                    Err(error) => {
+                                        tracing::error!(
+                                            run_id = %run_id,
+                                            step_id = %step_id,
+                                            error = %error,
+                                            "supervisor escalation for a failed root frame could \
+                                             not be carried out"
+                                        );
+                                        if supervisory_failure.is_none() {
+                                            supervisory_failure = Some(error);
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(error) = supervisory_failure {
+                                return Err(error);
                             }
                             return self
                                 .fail_run(

@@ -12,6 +12,7 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
 
+from .consent import CONSENT_NOTICE_NOTIFICATION
 from .event_envelope import parse_agent_event_envelope
 from .errors import MeerkatError, meerkat_error_from_jsonrpc_code
 from .events import Event, TextDelta
@@ -119,6 +120,9 @@ class _StdoutDispatcher:
         # Channel-scoped ``live/*`` notifications (no session_id) go here,
         # never into a session event queue.
         self._live_notification_sink: Callable[[str, Any], None] | None = None
+        # ``approval/consent_notice`` (no session_id) goes here, never into a
+        # session event queue.
+        self._consent_notice_sink: Callable[[Any], None] | None = None
         self._stdin_writer: asyncio.StreamWriter | None = None  # set on connect
         # Permanent transport-failed state: once the read loop classifies the
         # stream as untrustworthy (corrupted frame) or closed, later requests
@@ -183,6 +187,10 @@ class _StdoutDispatcher:
     def set_live_notification_sink(self, sink: Callable[[str, Any], None]) -> None:
         """Route ``live/*`` notifications to ``sink(method, params)``."""
         self._live_notification_sink = sink
+
+    def set_consent_notice_sink(self, sink: Callable[[Any], None]) -> None:
+        """Route ``approval/consent_notice`` notifications to ``sink(params)``."""
+        self._consent_notice_sink = sink
 
     def set_tool_handler(self, handler: Any) -> None:
         """Set the tool registry for handling callback tool requests."""
@@ -303,6 +311,10 @@ class _StdoutDispatcher:
                 if method.startswith("live/"):
                     if self._live_notification_sink is not None:
                         self._live_notification_sink(method, params)
+                    continue
+                if method == CONSENT_NOTICE_NOTIFICATION:
+                    if self._consent_notice_sink is not None:
+                        self._consent_notice_sink(params)
                     continue
                 if method in {"session/stream_event", "mob/stream_event"}:
                     stream_id = str(params.get("stream_id", ""))

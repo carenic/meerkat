@@ -212,6 +212,17 @@ impl AdmittedWorkPolicyOwner for InvocationOwner {
             expires_at_ms: now_ms + 60_000,
         })
     }
+
+    /// This configured entitlement holds no mandate text: explicitly not
+    /// applicable.
+    fn review_mandate(
+        &self,
+        _: &InputAuthorityAssociation,
+        _: &PreparedAuthorizationBinding,
+        _: u64,
+    ) -> Result<Option<String>, meerkat_core::OperationAuthorizationError> {
+        Ok(None)
+    }
 }
 
 #[derive(Deserialize)]
@@ -462,7 +473,9 @@ impl LlmClient for ScriptedProvider {
                 assert!(
                     feedback
                         .text_content()
-                        .contains("operation unavailable under current authorization")
+                        .contains("operation unavailable under current authorization"),
+                    "{}",
+                    feedback.text_content()
                 );
                 Box::pin(futures::stream::iter(tool_events(
                     PERMITTED_CALL,
@@ -606,10 +619,13 @@ async fn generated_grant_denial_reaches_controller_and_permitted_tool_finishes_s
     let machine = Arc::new(
         MeerkatMachine::ephemeral()
             .with_local_grant_authorization(NativeGrantWorkConfiguration {
+                retained_resume: None,
+                require_scoped_destination: false,
                 grants,
                 ingress,
                 invocation_owner: Arc::new(InvocationOwner),
                 operation_owner: Arc::new(RecordOwner),
+                configured_mcp_attachment: None,
             })
             .expect("exclusive actual native host setup"),
     );
@@ -797,3 +813,13 @@ mod e1_policy_control;
 
 #[path = "native_governed_loop/e3_tool_settlement.rs"]
 mod e3_tool_settlement;
+
+#[path = "native_governed_loop/s3_scoped_context.rs"]
+mod s3_scoped_context;
+
+#[path = "native_governed_loop/s1_scoped_original.rs"]
+mod s1_scoped_original;
+
+#[cfg(unix)]
+#[path = "native_governed_loop/connector_call_context.rs"]
+mod connector_call_context;

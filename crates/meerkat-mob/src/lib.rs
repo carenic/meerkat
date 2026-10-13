@@ -222,6 +222,10 @@ pub use machines::mob_host_binding_authority::{
     canonical_mob_host_binding_authority_runtime_internal_input_variant_manifest,
 };
 
+/// The field types of [`MemberDestinationSelection`], so a host can build a
+/// selection without depending on the authorization contracts crate itself.
+#[cfg(feature = "runtime-adapter")]
+pub use meerkat_authorization_contracts::{constraints::AudienceRef, evidence::EvidenceId};
 pub use profile::{
     Profile, ProfileBinding, ProfileSource, ResumeOverrideField, SpawnTooling, ToolConfig,
     UnsupportedProfileKey,
@@ -235,11 +239,14 @@ pub use run::{
     mob_machine_run_public_result_class, mob_machine_run_status_is_terminal,
     mob_machine_step_status_is_terminal,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use runtime::ControllerRouteObservation;
 #[cfg(all(feature = "runtime-adapter", any(test, feature = "test-support")))]
 #[doc(hidden)]
 pub use runtime::DeliveryInputSettleTestRelease;
 #[cfg(not(target_arch = "wasm32"))]
 pub use runtime::FactoryChainSpawnBasePromptSource;
+pub use runtime::HeldSpawnDeadline;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 pub use runtime::MemberInstructionActivationError;
 pub use runtime::RestoreIncompatible;
@@ -287,21 +294,22 @@ pub use runtime::{
     DurableBoundedWorkState, ExternalPeerBindingSpec, FlowRunHandle, FlowRunWaitError,
     FlowTargetProvisioner, ForkBuildInheritance, ForkChildRun, ForkChildRunOutcome, ForkJobBinding,
     ForkJobRecord, ForkJobTerminalError, ForkMemberAtTurnBoundary, ForkMemberBoundedRunOutcome,
-    ForkMemberResult, ForkOverlayOrigin, HELPER_RESULT_TRUNCATION_MARKER, HelperOptions,
-    HelperResult, HostBindReport, HostBindRequest, HostCapabilityReport, HostRevokeReport,
-    IdentityLocalExternalToolsError, IdentityLocalExternalToolsProvider,
+    ForkMemberResult, ForkOverlayOrigin, GovernedInputCustody, HELPER_RESULT_TRUNCATION_MARKER,
+    HelperOptions, HelperResult, HostBindReport, HostBindRequest, HostCapabilityReport,
+    HostRevokeReport, IdentityLocalExternalToolsError, IdentityLocalExternalToolsProvider,
     IdentityLocalMaterializationKey, InitializeAdaptiveRunRequest, LiveDelegationTerminalEvidence,
     LiveDurableSourceObservation, MEMBER_ADMISSION_LANE_CAPACITY, MEMBER_RELOAD_TOTAL_TIMEOUT,
     MemberAdmissionBacklogGauge, MemberAdmissionBacklogSnapshot, MemberBoundedTurnResult,
-    MemberDeliveryReceipt, MemberHandle, MemberHistoryPageDomain, MemberLiveStatusDomain,
-    MemberPreviewUnavailable, MemberReloadDisposition, MemberReloadOutcome, MemberRespawnReceipt,
-    MemberRunState, MemberSessionActivity, MemberShutdownOutcome, MemberStatusSessionView,
-    MemberStatusViewSource, MemberTargetAbsence, MemberTurnEventSender, MemberTurnHandle,
-    MemberTurnOptions, MobBuilder, MobDestroyError, MobDestroyReport, MobEventRouterConfig,
-    MobEventRouterHandle, MobEventsSubscription, MobEventsSubscriptionConfig, MobHandle,
-    MobMachineStateChanges, MobMemberEndpointOwner, MobMemberEndpointStatus, MobMemberPeerEndpoint,
-    MobMemberSnapshot, MobMemberStatus, MobPeerConnectivitySnapshot, MobRespawnError,
-    MobSessionService, MobShutdownReport, MobSpawnManyFailure, MobState, MobUnreachablePeer,
+    MemberDeliveryReceipt, MemberHandle, MemberHistoryPageDomain, MemberInputAdmission,
+    MemberLiveStatusDomain, MemberPreviewUnavailable, MemberReloadDisposition, MemberReloadOutcome,
+    MemberRespawnReceipt, MemberRunState, MemberSessionActivity, MemberShutdownOutcome,
+    MemberStatusSessionView, MemberStatusViewSource, MemberTargetAbsence, MemberTurnEventSender,
+    MemberTurnHandle, MemberTurnOptions, MobActorTaskWait, MobActorTaskWatch, MobBuilder,
+    MobDestroyError, MobDestroyReport, MobEventRouterConfig, MobEventRouterHandle,
+    MobEventsSubscription, MobEventsSubscriptionConfig, MobHandle, MobMachineStateChanges,
+    MobMemberEndpointOwner, MobMemberEndpointStatus, MobMemberPeerEndpoint, MobMemberSnapshot,
+    MobMemberStatus, MobPeerConnectivitySnapshot, MobRespawnError, MobSessionService,
+    MobShutdownReport, MobSpawnManyFailure, MobState, MobUnreachablePeer,
     MobWireMembersBatchReport, OwnedMemberTargetAdmission, PeerMessageReceipt, PeerTarget,
     PreviousMemberCleanupReport, ResumeRejectionKind, ResumeSessionLoad, ResumeVerdictTerminality,
     ResumedMemberView, RetirementSettlement, RetirementSettlementWatch, RetirementStage,
@@ -315,6 +323,7 @@ pub use runtime::{
     observe_live_durable_source_via_projection_visibility, observe_member_status_view_via_read,
     profile_to_wire, render_bounded_delegation_task, stored_realm_profile_to_wire,
 };
+pub use runtime::{CloseIfIdleOutcome, MobAdmissionCloseReason, MobBusy};
 #[cfg(feature = "openai-live")]
 pub use runtime::{
     DEFAULT_LIVE_BRIDGE_OUTPUT_BYTES, DurableMemberLiveBridgeOperationExecutor,
@@ -329,6 +338,10 @@ pub use runtime::{
     DeliveryTerminalWait, DeliveryTerminalWaitError, DeliveryTerminalWaitReport,
     DeliveryUnknownCause,
 };
+pub use runtime::{
+    DeliveryScopeDecodeError, MEMBER_DELIVERY_SCOPE_VERSION, MemberDeliveryScope,
+    ScopedRecoveryUnresolved, ScopedWorkRecovery, ScopedWorkState, WorkAdmissionStage,
+};
 pub use runtime::{FlowFrameKernel, FlowFrameMutator};
 pub use runtime::{
     FlowTurnExecutor, FlowTurnFailureDisposition, FlowTurnOutcome, FlowTurnTicket,
@@ -338,8 +351,14 @@ pub use runtime::{
 #[doc(hidden)]
 pub use runtime::{
     ForkSupervisorExitForTest, IdentityRecoveryFailStopPoint, MemberStatusDeadlineTestObservation,
-    arm_identity_recovery_fail_stop_for_test, member_operator_tool_defs_for_test,
-    member_status_deadline_after_snapshot_wait_for_test,
+    MemberTurnAdmissionTestStage, arm_identity_recovery_fail_stop_for_test,
+    member_operator_tool_defs_for_test, member_status_deadline_after_snapshot_wait_for_test,
+};
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+pub use runtime::{HeldSpawn, HeldSpawnSettlement, HeldSpawnStart, abort_all_held};
+#[cfg(feature = "runtime-adapter")]
+pub use runtime::{
+    MemberDestinationSelection, MemberRuntimeBuildIdentity, MemberRuntimeRegistrationHook,
 };
 pub use runtime::{MobBeforeActivation, MobReadHandle};
 pub use runtime::{MobpackCallableConfig, MobpackRunOutcome, MobpackRunSpec};
@@ -364,8 +383,9 @@ pub use store::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use store::{
-    SqliteMobEventStore, SqliteMobRunStore, SqliteMobRuntimeMetadataStore, SqliteMobSpecStore,
-    SqliteMobStores, SqliteRealmProfileStore,
+    SqliteMobEventStore, SqliteMobObserverDrain, SqliteMobObserverDrainRefused,
+    SqliteMobObserverDrainReport, SqliteMobRunStore, SqliteMobRuntimeMetadataStore,
+    SqliteMobSpecStore, SqliteMobStores, SqliteRealmProfileStore,
 };
 pub use validate::{
     Diagnostic, DiagnosticCode, DiagnosticSeverity, partition_diagnostics, validate_definition,

@@ -132,6 +132,9 @@ impl MobCommand {
             // continuity, so it carries the same destructive-class scope.
             | Self::ReloadMemberRegistration { .. }
             | Self::Stop { .. }
+            // Closing admission is a mob-lifecycle mutation like Stop.
+            | Self::CloseIfIdle { .. }
+            | Self::CloseAdmission { .. }
             | Self::ResumeLifecycle { .. }
             | Self::Complete { .. }
             | Self::Destroy { .. }
@@ -266,7 +269,8 @@ impl MobCommand {
             Self::KickoffOutcomeResolved { .. } => None,
 
             #[cfg(any(test, feature = "test-support"))]
-            Self::CrashStopPreservingDurableWorkForTest { .. } => None,
+            Self::CrashStopPreservingDurableWorkForTest { .. }
+            | Self::RebindMemberSessionForTest { .. } => None,
 
             #[cfg(test)]
             Self::AuthorizeMemberTrustCleanupForTest { .. }
@@ -297,6 +301,56 @@ impl MobCommand {
     /// `None`-classified internal command before the scope classification
     /// early return, so Result-bearing internal arms preserve that typed
     /// failure and only truly reply-less variants log-drop.
+    /// Whether the Closing admission state (D67) refuses this command: it
+    /// would create a member, start or resume member work, revive the mob, or
+    /// widen its topology. Teardown (Stop, Shutdown, Destroy, Complete,
+    /// retirement), cancellation, reads, grants and every actor completion
+    /// stay admitted, so a closed mob can still be observed and torn down.
+    /// Classified over the exhaustive [`Self::required_control_scope`], so a
+    /// new command is classified with its scope.
+    pub(super) fn refused_while_admission_closed(&self) -> bool {
+        match self.required_control_scope() {
+            Some(ControlScope::SendCommand) => !matches!(
+                self,
+                // Settles an existing objective; starts nothing.
+                Self::ConcludeObjective { .. } | Self::AdmitControlScope { .. }
+            ),
+            Some(ControlScope::Live) => match self {
+                // Committing buffered input starts a turn; interrupt,
+                // truncate and refresh act on an already-open session.
+                Self::MemberLiveControl { verb, .. } => {
+                    matches!(
+                        verb,
+                        super::bridge_protocol::BridgeLiveControlVerb::CommitInput
+                    )
+                }
+                Self::MemberLiveClose { .. }
+                | Self::MemberLiveStatus { .. }
+                | Self::AdmitControlScope { .. } => false,
+                _ => true,
+            },
+            Some(ControlScope::WireTopology) => {
+                matches!(self, Self::Wire { .. } | Self::WireMembersBatch { .. })
+            }
+            Some(ControlScope::AdminHost) => matches!(self, Self::BindHost { .. }),
+            Some(ControlScope::Retire) => matches!(
+                self,
+                Self::Respawn { .. }
+                    | Self::ResumeLifecycle { .. }
+                    | Self::Reset { .. }
+                    | Self::ReloadMemberRegistration { .. }
+            ),
+            Some(
+                ControlScope::List
+                | ControlScope::ReadHistory
+                | ControlScope::SubscribeEvents
+                | ControlScope::Cancel
+                | ControlScope::AdminGrants,
+            )
+            | None => false,
+        }
+    }
+
     pub(super) fn reject_scope_denied(self, denial: ScopeDenial) {
         self.reject_with_error(MobError::ScopeDenied(denial));
     }
@@ -400,6 +454,12 @@ impl MobCommand {
                 let _ = reply_tx.send(Err(error));
             }
             Self::Stop { reply_tx } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            Self::CloseIfIdle { reply_tx } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            Self::CloseAdmission { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(error));
             }
             Self::ResumeLifecycle { reply_tx, .. } => {
@@ -585,7 +645,8 @@ impl MobCommand {
                 tracing::error!("scope denial reached a test-only completion; dropped");
             }
             #[cfg(any(test, feature = "test-support"))]
-            Self::CrashStopPreservingDurableWorkForTest { reply_tx } => {
+            Self::CrashStopPreservingDurableWorkForTest { reply_tx }
+            | Self::RebindMemberSessionForTest { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(error));
             }
             // Internal-class / non-Result-channel arms have no typed error

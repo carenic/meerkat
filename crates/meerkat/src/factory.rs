@@ -275,6 +275,264 @@ enum ControllerClientRequirement {
     Required,
 }
 
+/// Whether a build completes its agent now or stops at its prepared surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentBuildPhase {
+    Complete,
+    Prepare,
+}
+
+/// The native member and registry a governed construction binds its
+/// application tool policy with. Binding reads the provider's current
+/// snapshot and validates it, so it happens in exactly one place.
+struct ConsequencePolicyOwner {
+    registry: Arc<meerkat_core::ToolConsequencePolicyRegistry>,
+    member: meerkat_core::MobMemberBinding,
+}
+
+impl ConsequencePolicyOwner {
+    /// The single place a construction binds its application tool policy.
+    fn bind(
+        &self,
+        provider_id: &meerkat_core::PolicyProviderId,
+        policy_id: &meerkat_core::PolicyId,
+    ) -> Result<meerkat_core::BoundToolConsequencePolicy, BuildAgentError> {
+        self.registry
+            .bind(self.member.clone(), provider_id.clone(), policy_id.clone())
+            .map_err(|error| {
+                BuildAgentError::Config(format!("application tool policy binding failed: {error}"))
+            })
+    }
+}
+
+/// The construction's application tool policy: none, bound, or (a prepared
+/// governed construction) awaiting its trusted host's selection, which is
+/// bound when the construction is finished.
+enum AssemblyConsequencePolicy {
+    Unmanaged,
+    Bound(meerkat_core::BoundToolConsequencePolicy),
+    AwaitingSelection(ConsequencePolicyOwner),
+}
+
+impl AssemblyConsequencePolicy {
+    /// Whether a policy governs this construction, bound or not yet.
+    fn governs(&self) -> bool {
+        !matches!(self, Self::Unmanaged)
+    }
+}
+
+/// The resources a construction started that must be settled if it is not
+/// finished, armed from the moment the construction first owns each (before
+/// any of its startup awaits) until a finished agent owns them. Dropped while
+/// armed, it spawns each owner's shutdown on the runtime the construction
+/// armed it on; [`Self::settle`] awaits that shutdown and stays armed until it
+/// completes, so a settle that is itself abandoned still hands it on.
+/// A trusted host's composition of one construction's own MCP router adapter.
+///
+/// Called once per construction that creates a router for its configured MCP
+/// servers, with that exact adapter, the actual session being built and its
+/// mob member binding (if any), before the adapter's tools are published or
+/// composed with other tools. The returned dispatcher (for example a checking
+/// wrapper around this same adapter) is what the construction publishes; the
+/// construction keeps owning the adapter itself for its lifecycle and cleanup.
+/// The returned dispatcher must forward `poll_external_updates` to the
+/// adapter: `wait_for_mcp` and the model boundary read connection progress
+/// and notices through it. Not called for tools supplied through
+/// `external_tools`. A refusal fails
+/// the build and shuts the adapter down. The arguments identify the
+/// construction; they grant nothing.
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+pub trait McpAdapterComposer: Send + Sync {
+    fn compose(
+        &self,
+        adapter: &Arc<meerkat_mcp::McpRouterAdapter>,
+        session_id: &meerkat_core::types::SessionId,
+        member: Option<&meerkat_core::MobMemberBinding>,
+    ) -> Result<Arc<dyn AgentToolDispatcher>, McpAdapterComposeRefusal>;
+}
+
+/// Why a trusted host refused to compose a construction's MCP adapter.
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{reason}")]
+pub struct McpAdapterComposeRefusal {
+    pub reason: String,
+}
+
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+impl McpAdapterComposeRefusal {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ConstructionCleanup {
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    mcp: Option<(Arc<meerkat_mcp::McpRouterAdapter>, tokio::runtime::Handle)>,
+    /// The session registration's observation slot the adapter is installed
+    /// in once the construction is finished.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    mcp_observation: Option<meerkat_core::McpObservationSlot>,
+    /// The finished agent's live MCP attachment surface over the same
+    /// adapter, installed on it when the construction finishes.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    live_mcp: Option<Arc<dyn meerkat_core::mcp_attachment::LiveMcpAttachmentSurface>>,
+}
+
+impl ConstructionCleanup {
+    /// The construction now owns `adapter`'s router, before staging or
+    /// connecting anything on it.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    fn arm_mcp(&mut self, adapter: Arc<meerkat_mcp::McpRouterAdapter>) {
+        self.mcp = Some((adapter, tokio::runtime::Handle::current()));
+    }
+
+    /// The construction is for the session registration that owns `slot`.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    fn observe_into(&mut self, slot: Option<meerkat_core::McpObservationSlot>) {
+        self.mcp_observation = slot;
+    }
+
+    /// The finished agent owns everything: nothing is left to settle. Its MCP
+    /// adapter becomes its registration's observed installation, replacing a
+    /// previous construction's; a finished construction without one ends the
+    /// previous installation. A construction that is never finished changes
+    /// nothing. The agent takes over releasing the adapter's router: its
+    /// owner releases it when it ends the agent.
+    fn disarm(&mut self, agent: &mut DynAgent) {
+        #[cfg(not(all(feature = "mcp", not(target_arch = "wasm32"))))]
+        let _ = agent;
+        #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+        {
+            self.live_mcp = None;
+            if let Some((adapter, _)) = &self.mcp {
+                agent.retain_owned_release(
+                    Arc::clone(adapter) as Arc<dyn meerkat_core::AgentOwnedRelease>
+                );
+            }
+            if let Some(slot) = &self.mcp_observation {
+                match &self.mcp {
+                    Some((adapter, _)) => {
+                        let _installed = slot.install(
+                            Arc::clone(adapter) as Arc<dyn meerkat_core::McpOperationObserver>
+                        );
+                    }
+                    None => slot.clear(),
+                }
+            }
+            self.mcp = None;
+            self.mcp_observation = None;
+        }
+    }
+
+    /// Give the finished `agent` its construction's live MCP attachment
+    /// surface (its own router), before the construction is disarmed.
+    fn install_live_mcp(&mut self, agent: &mut DynAgent) {
+        #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+        if let Some(surface) = self.live_mcp.take() {
+            agent.set_live_mcp_attachment(surface);
+        }
+        #[cfg(not(all(feature = "mcp", not(target_arch = "wasm32"))))]
+        let _ = agent;
+    }
+
+    /// Shut down everything this construction started, awaited.
+    async fn settle(&mut self) {
+        #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+        if let Some((adapter, _)) = &self.mcp {
+            adapter.shutdown().await;
+            self.mcp = None;
+        }
+    }
+}
+
+impl Drop for ConstructionCleanup {
+    fn drop(&mut self) {
+        #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+        if let Some((adapter, runtime)) = self.mcp.take() {
+            // The adapter's shutdown takes its router into a retained task on
+            // its first poll (a shutdown already under way is joined, not
+            // repeated); spawning it keeps that settlement going after the
+            // abandoned construction is gone.
+            runtime.spawn(async move { adapter.shutdown().await });
+        }
+    }
+}
+
+/// Everything one construction assembled before its call gate and agent are
+/// built: the final composed dispatcher and the parts the agent is built
+/// from. Owned by exactly one build.
+struct AgentAssembly {
+    tools: Arc<dyn AgentToolDispatcher>,
+    tool_execution_policy: Option<meerkat_core::ToolExecutionPolicy>,
+    consequence_policy: AssemblyConsequencePolicy,
+    tool_dispatch_admission: Option<Arc<dyn meerkat_core::ToolDispatchAdmission>>,
+    builder: AgentBuilder,
+    session: Session,
+    factory_metadata: SessionMetadata,
+    persisted_build_state: meerkat_core::SessionBuildState,
+    llm_adapter: Arc<dyn AgentLlmClient>,
+    store_adapter: Arc<dyn AgentSessionStore>,
+    hoisted_control_visibility_provider: Option<Arc<CatalogControlVisibilityProvider>>,
+    initial_tool_filter: Option<ToolFilter>,
+    /// The construction's static visibility filters, for its surface.
+    visibility_filters: Vec<ToolFilter>,
+    hoisted_parent_tool_authority: Option<meerkat_core::service::ParentToolCompositionAuthority>,
+    hoisted_mob_authority_handle:
+        Option<Arc<std::sync::RwLock<meerkat_core::service::MobToolAuthorityContext>>>,
+    controller_client: Option<meerkat_core::ControllerModelClient>,
+    cleanup: ConstructionCleanup,
+}
+
+/// One governed agent construction prepared by [`AgentFactory::prepare_agent`]
+/// and not yet finished: built once, held with everything it created
+/// (session, comms runtime, MCP connections, mob tools) and its actual tool
+/// surface. Until [`AgentFactory::finish_agent`] there is no agent, so no tool
+/// can be called, and provider-native capabilities stay disabled. Its
+/// application tool policy is the one its trusted host selects from this
+/// surface and is bound only when it is finished. Abandon it with
+/// [`Self::abort`], which awaits the shutdown of what it started; dropping it
+/// only starts that shutdown, as a task on the runtime it was prepared on, and
+/// nothing awaits its completion.
+pub struct PreparedAgent {
+    assembly: AgentAssembly,
+    surface: PreparedToolSurface,
+}
+
+impl std::fmt::Debug for PreparedAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedAgent")
+            .field("surface", &self.surface)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedAgent {
+    fn new(assembly: AgentAssembly) -> Self {
+        let surface =
+            PreparedToolSurface::of(assembly.tools.as_ref(), &assembly.visibility_filters);
+        Self { assembly, surface }
+    }
+
+    /// The actual tool surface of this construction.
+    pub fn tool_surface(&self) -> &PreparedToolSurface {
+        &self.surface
+    }
+
+    /// Abandon this construction: everything it started is shut down and
+    /// awaited. A session document it already persisted is not removed.
+    pub async fn abort(mut self) {
+        self.assembly.cleanup.settle().await;
+    }
+}
+
+pub use meerkat_core::tool_surface::{
+    PreparedCatalogEntry, PreparedToolCatalog, PreparedToolSurface, ToolSurfaceSelection,
+};
+
 #[cfg(not(target_arch = "wasm32"))]
 type CoreAgentFactoryBuildFuture =
     Pin<Box<dyn Future<Output = Result<DynAgent, meerkat_core::AgentBuildPolicyError>> + Send>>;
@@ -724,6 +982,13 @@ pub struct AgentBuildConfig {
     /// name equals `comms_name`, and skips config-mode construction. Set by
     /// the mob member-host materializer; never by ordinary surfaces.
     pub session_comms_runtime_override: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    /// A controller prepared under the realm's staged native owner before
+    /// this session was opened, type-erased
+    /// (`crate::encode_prepared_controller_for_service`). The build consumes
+    /// it once instead of resolving, decorating and pinning a controller; a
+    /// foreign payload or any mismatch is a typed refusal, never a fall back
+    /// to ordinary resolution.
+    pub prepared_controller: Option<Arc<dyn std::any::Any + Send + Sync>>,
     /// ADJ-17 prompt-section policy: `SpecPinned` (set ONLY by the member
     /// host's spec decompiler, and by revival re-running it) suppresses the
     /// factory-appended skill-inventory section so spec-built prompts are
@@ -860,6 +1125,7 @@ impl std::fmt::Debug for AgentBuildConfig {
                 "session_comms_runtime_override",
                 &self.session_comms_runtime_override.is_some(),
             )
+            .field("prepared_controller", &self.prepared_controller.is_some())
             .field("host_prompt_sections", &self.host_prompt_sections);
         #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
         debug.field("mcp_auth_resolver", &self.mcp_auth_resolver.is_some());
@@ -951,6 +1217,7 @@ impl AgentBuildConfig {
             application_tool_policy: meerkat_core::ApplicationToolPolicyBinding::Unmanaged,
             tool_consequence_policy_registry: None,
             session_comms_runtime_override: None,
+            prepared_controller: None,
             host_prompt_sections: meerkat_core::service::HostPromptSections::default(),
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
             mcp_auth_resolver: None,
@@ -1086,6 +1353,9 @@ impl AgentBuildConfig {
         // (a foreign payload is a typed build error there, never a silent
         // drop here).
         self.session_comms_runtime_override = build.session_comms_runtime_override.clone();
+        // Carried erased: consumption decodes it fail-closed (a foreign
+        // payload is a typed refusal there, never ordinary resolution).
+        self.prepared_controller = build.prepared_controller.clone();
         self.host_prompt_sections = build.host_prompt_sections;
     }
 
@@ -1165,6 +1435,9 @@ impl AgentBuildConfig {
             initial_turn_metadata: None,
             initial_work_authorization: None,
             session_comms_runtime_override: self.session_comms_runtime_override.clone(),
+            // A prepared controller is consumed by the one build it was
+            // handed to; a projection never carries it to another build.
+            prepared_controller: None,
             host_prompt_sections: self.host_prompt_sections,
         }
     }
@@ -1247,6 +1520,11 @@ pub enum BuildAgentError {
     /// with matching route facts. This is a setup refusal before work admission.
     #[error("the selected client cannot provide the required controller")]
     ControllerUnavailable,
+    /// A controller prepared under the realm's staged owner before this
+    /// session opened was refused by this build. Nothing was resolved in its
+    /// place.
+    #[error(transparent)]
+    PreparedController(#[from] crate::prepared_controller::PreparedControllerRefusal),
     /// Cannot infer provider from the given model name.
     #[error("Cannot infer provider from model '{model}'")]
     UnknownProvider { model: String },
@@ -1990,6 +2268,41 @@ struct SelfHostedClientBuild {
     credential_identity: meerkat_core::AuthCredentialIdentity,
 }
 
+/// An LLM client built for a session identity, with the credential the same
+/// resolution selected for it.
+pub(crate) struct LlmClientForIdentity {
+    pub(crate) client: Arc<dyn LlmClient>,
+    /// The durable binding and credential the client resolved through, when
+    /// that binding carries lifecycle authority (an explicit binding, or a
+    /// configured candidate). `None` for the synthetic environment default,
+    /// which never owns a lease, and for clients built without resolution.
+    pub(crate) selection: Option<LlmCredentialSelection>,
+}
+
+/// The binding a client resolved through and that connection's credential.
+pub(crate) struct LlmCredentialSelection {
+    pub(crate) auth_binding: AuthBindingRef,
+    pub(crate) credential_identity: meerkat_core::AuthCredentialIdentity,
+}
+
+impl LlmCredentialSelection {
+    /// Name `selection` on an identity that names no binding, as initial
+    /// construction does, and return the credential the identity's request
+    /// policy must carry. An identity that already names a binding keeps it.
+    pub(crate) fn bind_unselected(
+        selection: Option<Self>,
+        identity: &mut SessionLlmIdentity,
+    ) -> Option<meerkat_core::AuthCredentialIdentity> {
+        match selection {
+            Some(selection) if identity.auth_binding.is_none() => {
+                identity.auth_binding = Some(selection.auth_binding);
+                Some(selection.credential_identity)
+            }
+            _ => None,
+        }
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 struct RoutingImageGenerationExecutor {
     executors: BTreeMap<String, Arc<dyn meerkat_llm_core::ImageGenerationExecutor>>,
@@ -2389,6 +2702,9 @@ pub struct AgentFactory {
     command_hook_confinement: Option<Arc<crate::command_hook_confinement::CommandHookConfinement>>,
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     mcp_stdio_launch_profile: meerkat_mcp::McpStdioLaunchProfile,
+    /// The host's HTTP egress profile, retained by newly built routers.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    mcp_http_egress_profile: meerkat_mcp::HttpEgressProfile,
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     mcp_apps: bool,
     #[cfg(all(
@@ -2398,6 +2714,10 @@ pub struct AgentFactory {
     ))]
     mcp_router_observer_for_test:
         Option<Arc<dyn Fn(Arc<meerkat_mcp::McpRouterAdapter>) + Send + Sync>>,
+    /// The trusted host's composition of each construction's own MCP router
+    /// adapter, applied before the adapter's tools are published.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    mcp_adapter_composer: Option<Arc<dyn McpAdapterComposer>>,
     #[cfg(feature = "comms")]
     pub enable_comms: bool,
     pub enable_memory: bool,
@@ -2466,6 +2786,10 @@ pub struct AgentFactory {
     /// Process-local per-call MCP context preparation, shared by factory clones.
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     mcp_call_context_provider: Option<Arc<dyn meerkat_mcp::McpCallContextProvider>>,
+    /// Connector credential owner for connector-bound MCP servers, used when
+    /// no `mcp_call_context_provider` is set.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    connector_oauth_authority: Option<meerkat_providers::connector_login::ConnectorOAuthAuthority>,
     /// Trusted host operation review composition for every agent this factory
     /// builds. Deliberately absent from `AgentBuildConfig` and session build
     /// options. Its absence never skips a tier: native authorization resolves
@@ -2491,6 +2815,8 @@ impl std::fmt::Debug for AgentFactory {
         d.field("shell_confinement", &self.shell_confinement);
         #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
         d.field("mcp_stdio_launch_profile", &self.mcp_stdio_launch_profile);
+        #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+        d.field("mcp_http_egress_profile", &self.mcp_http_egress_profile);
         #[cfg(feature = "comms")]
         d.field("enable_comms", &self.enable_comms);
         #[cfg(feature = "skills")]
@@ -2518,6 +2844,54 @@ struct ResolvedLlmClientPhase {
     credential_identity: Option<meerkat_core::AuthCredentialIdentity>,
     #[cfg(not(target_arch = "wasm32"))]
     auto_image_generation_executor: Option<Arc<dyn meerkat_llm_core::ImageGenerationExecutor>>,
+}
+
+/// Where a controller's adapters publish run events.
+enum AdapterEventSink {
+    /// The build's own run channel, known when the adapters are built.
+    Channel(Option<mpsc::Sender<AgentEvent>>),
+    /// A slot the consuming build binds once (a prepared controller).
+    #[cfg_attr(
+        not(all(
+            feature = "session-store",
+            feature = "local-authorization",
+            not(target_arch = "wasm32")
+        )),
+        allow(dead_code)
+    )]
+    Late(meerkat_llm_core::LateEventChannel),
+}
+
+impl AdapterEventSink {
+    fn adapter(
+        &self,
+        client: Arc<dyn LlmClient>,
+        model: String,
+        provider: Provider,
+    ) -> Result<LlmClientAdapter, BuildAgentError> {
+        match self {
+            Self::Channel(Some(event_tx)) => {
+                LlmClientAdapter::try_with_event_channel_for_provider_identity(
+                    client,
+                    model,
+                    provider,
+                    event_tx.clone(),
+                )
+            }
+            Self::Channel(None) => {
+                LlmClientAdapter::try_for_provider_identity(client, model, provider)
+            }
+            Self::Late(slot) => {
+                LlmClientAdapter::try_with_late_event_channel_for_provider_identity(
+                    client,
+                    model,
+                    provider,
+                    slot.clone(),
+                )
+            }
+        }
+        .map_err(|error| BuildAgentError::Config(error.to_string()))
+    }
 }
 
 /// Side-effect-free exact binding selection for one experimental live target.
@@ -3600,6 +3974,8 @@ impl AgentFactory {
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
             mcp_stdio_launch_profile: meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+            mcp_http_egress_profile: meerkat_mcp::HttpEgressProfile::trusted_host(),
+            #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
             mcp_apps: false,
             #[cfg(all(
                 feature = "test-mcp-oauth-fixtures",
@@ -3607,6 +3983,8 @@ impl AgentFactory {
                 not(target_arch = "wasm32")
             ))]
             mcp_router_observer_for_test: None,
+            #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+            mcp_adapter_composer: None,
             #[cfg(feature = "comms")]
             enable_comms: false,
             enable_memory: false,
@@ -3629,6 +4007,8 @@ impl AgentFactory {
             mcp_auth_resolver: None,
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
             mcp_call_context_provider: None,
+            #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+            connector_oauth_authority: None,
             operation_review: None,
         }
     }
@@ -3645,6 +4025,18 @@ impl AgentFactory {
     ) -> Self {
         self.operation_review = Some(review);
         self
+    }
+
+    /// The approval owner that issues this factory's R3 human consent, as
+    /// the runtime's owner-loss settlement of that consent: present exactly
+    /// when the installed operation review routes R3 to human consent.
+    #[cfg(feature = "session-store")]
+    pub(crate) fn consent_owner_loss_settlement(
+        &self,
+    ) -> Option<Arc<dyn meerkat_core::approval::ConsentOwnerLossSettlement>> {
+        self.operation_review
+            .as_ref()
+            .and_then(|review| review.consent_owner_loss_settlement())
     }
 
     /// Select the browser capability profile for every direct and mob build.
@@ -3770,6 +4162,8 @@ impl AgentFactory {
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
             mcp_stdio_launch_profile: meerkat_mcp::McpStdioLaunchProfile::trusted_host(),
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+            mcp_http_egress_profile: meerkat_mcp::HttpEgressProfile::trusted_host(),
+            #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
             mcp_apps: false,
             #[cfg(all(
                 feature = "test-mcp-oauth-fixtures",
@@ -3777,6 +4171,8 @@ impl AgentFactory {
                 not(target_arch = "wasm32")
             ))]
             mcp_router_observer_for_test: None,
+            #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+            mcp_adapter_composer: None,
             #[cfg(feature = "comms")]
             enable_comms: false,
             enable_memory: false,
@@ -3799,6 +4195,8 @@ impl AgentFactory {
             mcp_auth_resolver: None,
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
             mcp_call_context_provider: None,
+            #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+            connector_oauth_authority: None,
             operation_review: None,
         }
     }
@@ -3816,6 +4214,14 @@ impl AgentFactory {
         self.mcp_auth_resolver.is_some()
     }
 
+    /// The installed default MCP credential source, if any.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    pub(crate) fn installed_mcp_auth_resolver(
+        &self,
+    ) -> Option<Arc<dyn meerkat_mcp::McpAuthResolver>> {
+        self.mcp_auth_resolver.clone()
+    }
+
     /// Install the default credential source for OAuth-protected MCP
     /// servers (typically [`crate::HostAuthService::mcp_oauth_authority`]).
     /// A missing credential surfaces as the typed `AuthorizationRequired`
@@ -3823,6 +4229,26 @@ impl AgentFactory {
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     pub fn mcp_auth_resolver(mut self, resolver: Arc<dyn meerkat_mcp::McpAuthResolver>) -> Self {
         self.mcp_auth_resolver = Some(resolver);
+        self
+    }
+
+    /// Whether a connector credential owner is installed.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    pub fn has_connector_oauth_authority(&self) -> bool {
+        self.connector_oauth_authority.is_some()
+    }
+
+    /// Install the connector credential owner (typically
+    /// [`crate::HostAuthService::connector_oauth_authority`]). Without an
+    /// explicit `mcp_call_context_provider`, every router this factory builds
+    /// then admits connector credentials for its connector-bound servers
+    /// ([`crate::ConnectorMcpCallContextProvider::live`]).
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    pub fn connector_oauth_authority(
+        mut self,
+        authority: meerkat_providers::connector_login::ConnectorOAuthAuthority,
+    ) -> Self {
+        self.connector_oauth_authority = Some(authority);
         self
     }
 
@@ -4055,6 +4481,17 @@ impl AgentFactory {
         self
     }
 
+    /// Install the host's HTTP egress profile in newly built routers. Every
+    /// later add, reload and restore of a remote MCP server retains it. A
+    /// required profile is an execution boundary, not tool permission; the
+    /// host binds its OAuth credential owner to the same profile
+    /// ([`meerkat_providers::mcp_oauth::McpOAuthAuthority::with_http_egress`]).
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    pub fn with_mcp_http_egress_profile(mut self, profile: meerkat_mcp::HttpEgressProfile) -> Self {
+        self.mcp_http_egress_profile = profile;
+        self
+    }
+
     /// Observe the actual factory-created MCP router for fixture synchronization.
     ///
     /// This test-only observer does not replace the router or consume its
@@ -4070,6 +4507,14 @@ impl AgentFactory {
         F: Fn(Arc<meerkat_mcp::McpRouterAdapter>) + Send + Sync + 'static,
     {
         self.mcp_router_observer_for_test = Some(Arc::new(observer));
+        self
+    }
+
+    /// Compose each construction's own MCP router adapter before its tools
+    /// are published (see [`McpAdapterComposer`]).
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    pub fn with_mcp_adapter_composer(mut self, composer: Arc<dyn McpAdapterComposer>) -> Self {
+        self.mcp_adapter_composer = Some(composer);
         self
     }
 
@@ -4642,7 +5087,7 @@ impl AgentFactory {
         identity: &SessionLlmIdentity,
         auth_lease_handle: Option<meerkat_core::handles::GeneratedAuthLeaseHandle>,
         preferred_realm: Option<&RealmId>,
-    ) -> Result<Arc<dyn LlmClient>, FactoryError> {
+    ) -> Result<LlmClientForIdentity, FactoryError> {
         let text_profile = registry
             .profile_witness_for_provider(identity.provider, &identity.model)
             .ok_or_else(|| {
@@ -4653,9 +5098,10 @@ impl AgentFactory {
                 ))
             })?;
         if std::env::var("RKAT_TEST_CLIENT").ok().as_deref() == Some("1") {
-            return Ok(Arc::new(meerkat_client::TestClient::for_provider(
-                identity.provider,
-            )));
+            return Ok(LlmClientForIdentity {
+                client: Arc::new(meerkat_client::TestClient::for_provider(identity.provider)),
+                selection: None,
+            });
         }
 
         let explicit_auth_binding = identity.auth_binding.is_some();
@@ -4708,6 +5154,13 @@ impl AgentFactory {
                     {
                         Self::publish_auth_lease(handle, lease_auth_binding, &connection)?;
                     }
+                    // As in initial construction: a binding with lifecycle
+                    // authority is the identity's binding, and the connection
+                    // names its credential.
+                    let selection = lease_auth_binding.map(|auth_binding| LlmCredentialSelection {
+                        auth_binding,
+                        credential_identity: connection.credential_identity.clone(),
+                    });
                     let text_target = meerkat_llm_core::provider_runtime::ResolvedTextTarget::new(
                         identity.clone(),
                         text_profile.clone(),
@@ -4718,9 +5171,10 @@ impl AgentFactory {
                             "resolved text target identity mismatch".to_string(),
                         )
                     })?;
-                    return provider_registry
+                    let client = provider_registry
                         .build_text_client(text_target)
-                        .map_err(FactoryError::ClientBuild);
+                        .map_err(FactoryError::ClientBuild)?;
+                    return Ok(LlmClientForIdentity { client, selection });
                 }
                 Err(error) => {
                     first_resolution_error.get_or_insert(error);
@@ -4849,6 +5303,26 @@ impl AgentFactory {
         auth_lease_handle: Option<meerkat_core::handles::GeneratedAuthLeaseHandle>,
         preferred_realm: Option<&RealmId>,
     ) -> Result<Arc<dyn LlmClient>, FactoryError> {
+        self.build_llm_client_with_selection_for_identity_in_realm(
+            config,
+            identity,
+            auth_lease_handle,
+            preferred_realm,
+        )
+        .await
+        .map(|built| built.client)
+    }
+
+    /// [`Self::build_llm_client_for_identity_with_auth_lease_in_realm`], also
+    /// returning the credential the resolution selected, so a caller whose
+    /// identity names no binding can carry the one that actually resolved.
+    pub(crate) async fn build_llm_client_with_selection_for_identity_in_realm(
+        &self,
+        config: &Config,
+        identity: &SessionLlmIdentity,
+        auth_lease_handle: Option<meerkat_core::handles::GeneratedAuthLeaseHandle>,
+        preferred_realm: Option<&RealmId>,
+    ) -> Result<LlmClientForIdentity, FactoryError> {
         let registry = config
             .model_registry(meerkat_models::canonical())
             .map_err(|err| FactoryError::ClientCreationFailed(err.to_string()))?;
@@ -4877,7 +5351,15 @@ impl AgentFactory {
                     preferred_realm,
                 )
                 .await
-                .map(|resolved| resolved.client);
+                .map(|resolved| LlmClientForIdentity {
+                    selection: resolved.durable_auth_binding.map(|auth_binding| {
+                        LlmCredentialSelection {
+                            auth_binding,
+                            credential_identity: resolved.credential_identity,
+                        }
+                    }),
+                    client: resolved.client,
+                });
         }
 
         self.build_hosted_llm_client_for_identity_from_registry(
@@ -5387,22 +5869,39 @@ impl AgentFactory {
                 .base_url
                 .clone()
                 .unwrap_or(spec.base_url);
+            // Authorizer-backed auth is refused above, so the credential is
+            // fixed here: the resolved static secret, or none for an
+            // authless server.
+            let client: Arc<dyn LlmClient> = Arc::new(
+                OpenAiCompatibleClient::new_with_options(
+                    spec.mode,
+                    spec.remote_model,
+                    base_url,
+                    bearer_token,
+                    OpenAiCompatibleClientOptions {
+                        supports_temperature: spec.supports_temperature,
+                        supports_thinking: spec.supports_thinking,
+                        supports_reasoning: spec.supports_reasoning,
+                        supports_image_tool_results: spec.supports_image_tool_results,
+                    },
+                )
+                .with_image_input_support(spec.supports_image_input)
+                .with_static_credential(),
+            );
+            // The selected target the session identity will carry: the
+            // durable binding it records, and the actual resolved backend
+            // and credential owner, as for a registry-built client.
+            let selected_identity = SessionLlmIdentity {
+                auth_binding: durable_auth_binding.clone(),
+                ..identity.clone()
+            };
+            let client = meerkat_llm_core::request_authorization::select_resolved_connection(
+                client,
+                selected_identity,
+                &connection,
+            );
             Ok(SelfHostedClientBuild {
-                client: Arc::new(
-                    OpenAiCompatibleClient::new_with_options(
-                        spec.mode,
-                        spec.remote_model,
-                        base_url,
-                        bearer_token,
-                        OpenAiCompatibleClientOptions {
-                            supports_temperature: spec.supports_temperature,
-                            supports_thinking: spec.supports_thinking,
-                            supports_reasoning: spec.supports_reasoning,
-                            supports_image_tool_results: spec.supports_image_tool_results,
-                        },
-                    )
-                    .with_image_input_support(spec.supports_image_input),
-                ),
+                client,
                 durable_auth_binding,
                 credential_identity: connection.credential_identity,
             })
@@ -5829,12 +6328,153 @@ impl AgentFactory {
         Ok((agent, controller))
     }
 
+    /// Prepare one governed agent construction without finishing it: the
+    /// same composition [`Self::build_agent`] runs, through the final
+    /// composed dispatcher, returning its actual tool surface. The build must
+    /// carry its member binding and the host policy registry: the
+    /// construction is governed by the application tool policy its trusted
+    /// host selects from this surface, bound only by [`Self::finish_agent`].
+    /// Provider-native capabilities stay disabled, and no agent exists until
+    /// then, so nothing can be called.
+    pub async fn prepare_agent(
+        &self,
+        build_config: AgentBuildConfig,
+        config: &Config,
+    ) -> Result<PreparedAgent, BuildAgentError> {
+        Box::pin(self.assemble_agent(
+            build_config,
+            config,
+            ControllerClientRequirement::NotRequested,
+            AgentBuildPhase::Prepare,
+        ))
+        .await
+        .map(PreparedAgent::new)
+    }
+
+    /// [`Self::prepare_agent`] that also pins the selected controller, as
+    /// [`Self::build_agent_with_controller`] does.
+    pub async fn prepare_agent_with_controller(
+        &self,
+        build_config: AgentBuildConfig,
+        config: &Config,
+    ) -> Result<PreparedAgent, BuildAgentError> {
+        Box::pin(self.assemble_agent(
+            build_config,
+            config,
+            ControllerClientRequirement::Required,
+            AgentBuildPhase::Prepare,
+        ))
+        .await
+        .map(PreparedAgent::new)
+    }
+
+    /// Finish a prepared construction under its trusted host's `selection`:
+    /// the selection must have been made from this construction's own surface
+    /// and must be a resolved `Provider` binding, which is bound now with the
+    /// construction's own member and registry and recorded as the session's
+    /// policy; then its calls are gated and its agent built from that same
+    /// construction, whose visible tools must lie within its surface. Nothing
+    /// is rebuilt. On any refusal or failure everything the construction
+    /// started is shut down and awaited (or, if this call is abandoned, that
+    /// shutdown is started as a task and not awaited).
+    pub async fn finish_agent(
+        &self,
+        prepared: PreparedAgent,
+        selection: ToolSurfaceSelection,
+    ) -> Result<(DynAgent, Option<meerkat_core::ControllerModelClient>), BuildAgentError> {
+        let PreparedAgent {
+            mut assembly,
+            surface,
+        } = prepared;
+        let mut cleanup = std::mem::take(&mut assembly.cleanup);
+        let finished = async {
+            if selection.compiled_against != surface {
+                return Err(BuildAgentError::Config(
+                    "the tool-surface selection was not made from this construction's surface"
+                        .to_string(),
+                ));
+            }
+            let (agent, controller) = Self::complete_assembly(assembly, Some(selection)).await?;
+            if let Some(outside) = agent
+                .visible_tool_defs()
+                .iter()
+                .map(meerkat_core::ToolDef::identity)
+                .find(|identity| !surface.contains(identity))
+            {
+                return Err(BuildAgentError::Config(format!(
+                    "the finished agent exposes tool `{}` outside its prepared surface",
+                    outside.name
+                )));
+            }
+            Ok((agent, controller))
+        }
+        .await;
+        match finished {
+            Ok(mut finished) => {
+                cleanup.install_live_mcp(&mut finished.0);
+                cleanup.disarm(&mut finished.0);
+                Ok(finished)
+            }
+            Err(error) => {
+                cleanup.settle().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Build an agent whose prepared surface a trusted host decides first:
+    /// prepare the governed construction, ask `gate` for its selection on the
+    /// actual surface, then finish that same construction under it. A
+    /// refusal abandons the construction, awaiting the shutdown of what it
+    /// started, and fails the build; nothing is built twice.
+    pub async fn build_agent_through_surface_gate(
+        &self,
+        build_config: AgentBuildConfig,
+        config: &Config,
+        gate: &dyn meerkat_core::ToolSurfaceGate,
+    ) -> Result<DynAgent, BuildAgentError> {
+        let prepared = self.prepare_agent(build_config, config).await?;
+        let selection = match gate.decide(prepared.tool_surface()).await {
+            Ok(selection) => selection,
+            Err(refusal) => {
+                prepared.abort().await;
+                return Err(BuildAgentError::Config(refusal.to_string()));
+            }
+        };
+        self.finish_agent(prepared, selection)
+            .await
+            .map(|(agent, _)| agent)
+    }
+
     async fn build_agent_inner(
+        &self,
+        build_config: AgentBuildConfig,
+        config: &Config,
+        controller_requirement: ControllerClientRequirement,
+    ) -> Result<(DynAgent, Option<meerkat_core::ControllerModelClient>), BuildAgentError> {
+        let mut assembly = Box::pin(self.assemble_agent(
+            build_config,
+            config,
+            controller_requirement,
+            AgentBuildPhase::Complete,
+        ))
+        .await?;
+        let mut cleanup = std::mem::take(&mut assembly.cleanup);
+        let mut built = Self::complete_assembly(assembly, None).await;
+        if let Ok((agent, _)) = &mut built {
+            cleanup.install_live_mcp(agent);
+            cleanup.disarm(agent);
+        }
+        built
+    }
+
+    async fn assemble_agent(
         &self,
         mut build_config: AgentBuildConfig,
         config: &Config,
         controller_requirement: ControllerClientRequirement,
-    ) -> Result<(DynAgent, Option<meerkat_core::ControllerModelClient>), BuildAgentError> {
+        phase: AgentBuildPhase,
+    ) -> Result<AgentAssembly, BuildAgentError> {
         #[cfg(not(target_arch = "wasm32"))]
         if self.command_hook_confinement.is_some() && build_config.hook_engine_override.is_some() {
             return Err(BuildAgentError::Config(
@@ -6081,22 +6721,20 @@ impl AgentFactory {
             .map_err(|err| BuildAgentError::Config(format!("Tool access policy: {err}")))?;
         let tool_dispatch_admission = build_config.tool_dispatch_admission.clone();
 
-        let bound_consequence_policy = match &build_config.application_tool_policy {
-            meerkat_core::ApplicationToolPolicyBinding::Unmanaged => None,
-            meerkat_core::ApplicationToolPolicyBinding::Inherit => {
+        let consequence_policy = match (&build_config.application_tool_policy, phase) {
+            (meerkat_core::ApplicationToolPolicyBinding::Inherit, _) => {
                 return Err(BuildAgentError::Config(
                     "application tool policy 'inherit' is unresolved at the AgentFactory seam"
                         .to_string(),
                 ));
             }
-            meerkat_core::ApplicationToolPolicyBinding::Provider {
-                provider_id,
-                policy_id,
-            } => {
+            (meerkat_core::ApplicationToolPolicyBinding::Unmanaged, AgentBuildPhase::Complete) => {
+                AssemblyConsequencePolicy::Unmanaged
+            }
+            (binding, phase) => {
                 let member = build_config.mob_member_binding.clone().ok_or_else(|| {
                     BuildAgentError::Config(
-                        "provider-bound application tool policy requires MobMemberBinding"
-                            .to_string(),
+                        "a governed application tool policy requires MobMemberBinding".to_string(),
                     )
                 })?;
                 let registry = build_config
@@ -6104,19 +6742,26 @@ impl AgentFactory {
                     .as_ref()
                     .ok_or_else(|| {
                         BuildAgentError::Config(
-                            "provider-bound application tool policy requires the host policy registry"
+                            "a governed application tool policy requires the host policy registry"
                                 .to_string(),
                         )
                     })?;
-                Some(
-                    registry
-                        .bind(member, provider_id.clone(), policy_id.clone())
-                        .map_err(|error| {
-                            BuildAgentError::Config(format!(
-                                "application tool policy binding failed: {error}"
-                            ))
-                        })?,
-                )
+                let owner = ConsequencePolicyOwner {
+                    registry: Arc::clone(registry),
+                    member,
+                };
+                match (phase, binding) {
+                    (
+                        AgentBuildPhase::Complete,
+                        meerkat_core::ApplicationToolPolicyBinding::Provider {
+                            provider_id,
+                            policy_id,
+                        },
+                    ) => AssemblyConsequencePolicy::Bound(owner.bind(provider_id, policy_id)?),
+                    // A prepared construction is governed from here on; its
+                    // policy is the one its host selects from its surface.
+                    _ => AssemblyConsequencePolicy::AwaitingSelection(owner),
+                }
             }
         };
 
@@ -6125,7 +6770,7 @@ impl AgentFactory {
         // binding or admission. The policy is derived once, from these inputs
         // and the final model identity, before any helper is provisioned.
         let governed_tool_inputs_disable_native = tool_dispatch_admission.is_some()
-            || bound_consequence_policy.is_some()
+            || consequence_policy.governs()
             || tool_execution_policy
                 .as_ref()
                 .is_some_and(|policy| !policy.is_unrestricted());
@@ -6153,6 +6798,30 @@ impl AgentFactory {
                 .or(resolved_self_hosted_server_id)
         } else {
             None
+        };
+        // A controller prepared before this session existed is taken here,
+        // once, in place of client resolution and assembly (see
+        // `crate::prepared_controller`). Every refusal fails the build;
+        // nothing is resolved in its place.
+        let prepared_controller = match build_config.prepared_controller.take() {
+            Some(payload) => Some(self.take_prepared_controller(
+                &payload,
+                &build_config,
+                config,
+                &registry,
+                provider,
+                &self_hosted_server_id,
+                session.id(),
+                resumed_session_metadata.is_some(),
+            )?),
+            None => None,
+        };
+        // The registry that minted the prepared fallback candidates' profile
+        // witnesses serves every later registry read of this build (its
+        // defining facts were just compared with this build's own).
+        let registry = match prepared_controller.as_deref() {
+            Some(graph) => graph.registry.clone(),
+            None => registry,
         };
         let agent_llm_client_was_overridden = build_config.agent_llm_client_override.is_some();
         let raw_llm_client_was_overridden = build_config.llm_client_override.is_some();
@@ -6189,16 +6858,38 @@ impl AgentFactory {
             });
 
         // 3. Create LLM client (split out for opt-level=0 stack-frame size;
-        // see `resolve_llm_client_phase`).
-        let primary_llm_client_phase = self
-            .resolve_llm_client_phase(
-                config,
-                &registry,
-                provider,
-                &self_hosted_server_id,
-                &mut build_config,
-            )
-            .await;
+        // see `resolve_llm_client_phase`). A prepared controller already
+        // resolved under this session's auth owner: its settled model and
+        // binding are adopted exactly as resolution would set them.
+        let session_auth_lease = match &build_config.runtime_build_mode {
+            RuntimeBuildMode::SessionOwned(bindings) => Some(bindings.auth_lease().clone()),
+            RuntimeBuildMode::StandaloneEphemeral => None,
+        };
+        let primary_llm_client_phase = match prepared_controller.as_deref() {
+            Some(graph) => {
+                build_config.model.clone_from(&graph.resolved_model);
+                build_config
+                    .auth_binding
+                    .clone_from(&graph.resolved_auth_binding);
+                Ok(ResolvedLlmClientPhase {
+                    llm_client: None,
+                    credential_identity: graph.credential_identity.clone(),
+                    #[cfg(not(target_arch = "wasm32"))]
+                    auto_image_generation_executor: graph.auto_image_generation_executor.clone(),
+                })
+            }
+            None => {
+                self.resolve_llm_client_phase(
+                    config,
+                    &registry,
+                    provider,
+                    &self_hosted_server_id,
+                    &mut build_config,
+                    session_auth_lease.as_ref(),
+                )
+                .await
+            }
+        };
         #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
         let resolved_llm_client_phase = match primary_llm_client_phase {
             Ok(resolved) => resolved,
@@ -6242,6 +6933,14 @@ impl AgentFactory {
         #[cfg(any(not(feature = "session-store"), target_arch = "wasm32"))]
         let resolved_llm_client_phase = primary_llm_client_phase?;
         let llm_client = resolved_llm_client_phase.llm_client;
+        // The selected account's own output limit, when its provider states
+        // one: an unspecified per-turn budget never asks for more.
+        let account_output_token_limit = match prepared_controller.as_deref() {
+            Some(graph) => graph.account_output_token_limit,
+            None => llm_client
+                .as_ref()
+                .and_then(|client| client.output_token_limit()),
+        };
         let resolved_auth_credential_identity = resolved_llm_client_phase.credential_identity;
         #[cfg(not(target_arch = "wasm32"))]
         let auto_image_generation_executor =
@@ -6309,7 +7008,12 @@ impl AgentFactory {
             };
         let auth_credential_identity =
             configured_credential_identity.or(resolved_auth_credential_identity);
-        let event_tap = meerkat_core::new_event_tap();
+        // The one tap shared by the adapters and the agent: a prepared
+        // controller's adapters already publish to its own.
+        let event_tap = match prepared_controller.as_deref() {
+            Some(graph) => graph.event_tap.clone(),
+            None => meerkat_core::new_event_tap(),
+        };
         #[cfg(not(target_arch = "wasm32"))]
         let auto_web_search_executor: Option<Arc<dyn meerkat_llm_core::WebSearchExecutor>> = {
             if build_config.web_search_executor_override.is_none()
@@ -6361,181 +7065,55 @@ impl AgentFactory {
                     BuildAgentError::Config(format!("session LLM capability hydration: {err}"))
                 })?;
         }
-        let llm_adapter: Arc<dyn AgentLlmClient> = if let Some(agent_client) =
-            build_config.agent_llm_client_override.take()
-        {
-            agent_client
-        } else {
-            let llm_client = llm_client.ok_or_else(|| {
-                BuildAgentError::Config(
-                    "internal error: missing LLM client for adapter build".to_string(),
-                )
-            })?;
-            let mut llm_adapter_inner = match build_config.event_tx.clone() {
-                Some(tx) => LlmClientAdapter::try_with_event_channel_for_provider_identity(
-                    llm_client,
-                    model.clone(),
-                    provider,
-                    tx,
-                )
-                .map_err(|error| BuildAgentError::Config(error.to_string()))?,
-                None => {
-                    LlmClientAdapter::try_for_provider_identity(llm_client, model.clone(), provider)
-                        .map_err(|error| BuildAgentError::Config(error.to_string()))?
-                }
-            };
-            llm_adapter_inner = llm_adapter_inner.with_event_tap(event_tap.clone());
-            // K2: the build config carries the typed `ProviderParamsOverride`
-            // end-to-end; the adapter default is its provider tag (no legacy
-            // JSON-bag projection at this seam).
-            if let Some(typed_tag) = build_config
-                .provider_params
-                .as_ref()
-                .and_then(|params| params.provider_tag.clone())
-            {
-                llm_adapter_inner = llm_adapter_inner.with_provider_params(Some(typed_tag));
-            }
-            Arc::new(llm_adapter_inner)
-        };
-        let llm_adapter = Self::decorate_agent_llm_client(
-            llm_adapter,
-            build_config.agent_llm_client_decorator.as_ref(),
-        )
-        .map_err(BuildAgentError::LlmClient)?;
-        let llm_adapter = if !agent_llm_client_was_overridden
-            && !raw_llm_client_was_overridden
-            && config.model_fallback.is_enabled()
-        {
-            let primary_request_policy = self.request_policy_for_session_llm_identity(
-                config,
-                &resolved_llm_identity,
-                build_config.override_web_search,
-                session.id(),
-            )?;
-            let primary_target_profile = registry.profile_witness_for_provider(
-                resolved_llm_identity.provider,
-                &resolved_llm_identity.model,
-            ).ok_or_else(|| {
-                BuildAgentError::Config(format!(
-                    "model fallback cannot bind active model '{}:{}' because it is absent from the effective model registry",
-                    resolved_llm_identity.provider.as_str(),
-                    resolved_llm_identity.model
-                ))
-            })?;
-            let mut candidates = vec![ModelFallbackCandidate {
-                identity: resolved_llm_identity.clone(),
-                request_policy: primary_request_policy,
-                client: Arc::clone(&llm_adapter),
-                target_profile: primary_target_profile,
-            }];
-            let auth_lease_handle = match &build_config.runtime_build_mode {
-                RuntimeBuildMode::SessionOwned(bindings) => Some(bindings.auth_lease().clone()),
-                RuntimeBuildMode::StandaloneEphemeral => None,
-            };
-            let (identities, mut skipped) =
-                self.model_fallback_identities(config, &registry, &resolved_llm_identity)?;
-            for identity in identities {
-                let target_profile = match registry
-                    .profile_witness_for_provider(identity.provider, &identity.model)
-                {
-                    Some(profile) => profile,
-                    None => {
-                        return Err(BuildAgentError::Config(format!(
-                            "model fallback target '{}:{}' is absent from the effective model registry",
-                            identity.provider.as_str(),
-                            identity.model
-                        )));
-                    }
-                };
-                let raw_client = match self
-                    .build_llm_client_for_identity_with_auth_lease_in_realm(
-                        config,
-                        &identity,
-                        auth_lease_handle.clone(),
-                        build_config.realm_id.as_ref(),
-                    )
-                    .await
-                {
-                    Ok(client) => client,
-                    Err(FactoryError::ProviderAuth(
-                        meerkat_llm_core::provider_runtime::errors::ProviderAuthError::Auth(
-                            meerkat_core::AuthError::MissingSecret
-                            | meerkat_core::AuthError::InteractiveLoginRequired
-                            | meerkat_core::AuthError::UserReauthRequired
-                            | meerkat_core::AuthError::HostOwnedUnavailable
+        let (llm_adapter, controller_client) = match prepared_controller {
+            Some(graph) => Self::install_prepared_controller(
+                *graph,
+                build_config.event_tx.clone(),
+                controller_requirement,
+            )?,
+            None => {
+                let llm_adapter: Arc<dyn AgentLlmClient> =
+                    match build_config.agent_llm_client_override.take() {
+                        Some(agent_client) => Self::decorate_agent_llm_client(
+                            agent_client,
+                            build_config.agent_llm_client_decorator.as_ref(),
                         )
-                        | meerkat_llm_core::provider_runtime::errors::ProviderAuthError::ExternalResolverMissing(_)
-                    ) | FactoryError::ClientBuild(
-                        meerkat_llm_core::provider_runtime::errors::ProviderClientError::NoCredentialMaterial
-                    ) | FactoryError::ConnectionTarget(
-                        meerkat_core::ConnectionTargetError::BindingInvalid {
-                            source: meerkat_core::ProviderBindingError::UnknownBinding(_),
-                            ..
+                        .map_err(BuildAgentError::LlmClient)?,
+                        None => {
+                            let llm_client = llm_client.ok_or_else(|| {
+                                BuildAgentError::Config(
+                                    "internal error: missing LLM client for adapter build"
+                                        .to_string(),
+                                )
+                            })?;
+                            self.assemble_controller_client(
+                                config,
+                                &registry,
+                                &build_config,
+                                llm_client,
+                                &resolved_llm_identity,
+                                &AdapterEventSink::Channel(build_config.event_tx.clone()),
+                                &event_tap,
+                                session.id(),
+                                session_auth_lease.clone(),
+                                !raw_llm_client_was_overridden,
+                            )
+                            .await?
                         }
-                    )) => {
-                        skipped.push(meerkat_core::AgentLlmFallbackSkippedTarget::new(
-                            identity,
-                            meerkat_core::model_fallback::ModelFallbackSkipReason::AuthUnavailable,
-                        ));
-                        continue;
-                    }
-                    Err(error) => return Err(BuildAgentError::LlmClient(error)),
+                    };
+                // Capture the final decorated selection once, before
+                // tool/comms construction. The existing fallback owner pins
+                // its actual child, so a later fallback mutation cannot
+                // retarget this work's controller.
+                let controller_client = match controller_requirement {
+                    ControllerClientRequirement::NotRequested => None,
+                    ControllerClientRequirement::Required => Some(Self::pin_selected_controller(
+                        &llm_adapter,
+                        &resolved_llm_identity,
+                    )?),
                 };
-                let mut adapter = match build_config.event_tx.clone() {
-                    Some(tx) => LlmClientAdapter::try_with_event_channel_for_provider_identity(
-                        raw_client,
-                        identity.model.clone(),
-                        identity.provider,
-                        tx,
-                    )
-                    .map_err(|error| BuildAgentError::Config(error.to_string()))?,
-                    None => LlmClientAdapter::try_for_provider_identity(
-                        raw_client,
-                        identity.model.clone(),
-                        identity.provider,
-                    )
-                    .map_err(|error| BuildAgentError::Config(error.to_string()))?,
-                };
-                adapter = adapter.with_event_tap(event_tap.clone());
-                let decorated = Self::decorate_agent_llm_client(
-                    Arc::new(adapter),
-                    build_config.agent_llm_client_decorator.as_ref(),
-                )
-                .map_err(BuildAgentError::LlmClient)?;
-                let request_policy = self.request_policy_for_session_llm_identity(
-                    config,
-                    &identity,
-                    build_config.override_web_search,
-                    session.id(),
-                )?;
-                candidates.push(ModelFallbackCandidate {
-                    target_profile,
-                    request_policy,
-                    identity,
-                    client: decorated,
-                });
+                (llm_adapter, controller_client)
             }
-            match ModelFallbackClient::new(
-                candidates,
-                config.model_fallback.policy.clone(),
-                skipped,
-                auth_lease_handle.clone(),
-            ) {
-                Some(client) => Arc::new(client) as Arc<dyn AgentLlmClient>,
-                None => llm_adapter,
-            }
-        } else {
-            llm_adapter
-        };
-        // Capture the final decorated selection once, before tool/comms
-        // construction. The existing fallback owner pins its actual child,
-        // so a later fallback mutation cannot retarget this work's controller.
-        let controller_client = match controller_requirement {
-            ControllerClientRequirement::NotRequested => None,
-            ControllerClientRequirement::Required => Some(Self::pin_selected_controller(
-                &llm_adapter,
-                &resolved_llm_identity,
-            )?),
         };
         #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
         let brain_swap_models =
@@ -6579,15 +7157,19 @@ impl AgentFactory {
 
         // 5. Resolve max_tokens (config field is Option for realm-inheritance
         // presence; resolve the operative value here at point-of-use).
+        // An explicit budget (build or config) is kept as requested; one above
+        // the account's limit is refused by its provider. Only the model
+        // default is bounded by the selected account's own output limit.
         let max_tokens = build_config
             .max_tokens
             .or_else(|| config.configured_max_tokens())
             .unwrap_or_else(|| {
-                model_aware_default_max_tokens(
+                let default = model_aware_default_max_tokens(
                     &registry,
                     resolved_llm_identity.provider,
                     &resolved_llm_identity.model,
-                )
+                );
+                account_output_token_limit.map_or(default, |limit| default.min(limit))
             });
         let _realm_scope_root = self.realm_scope_root(&build_config);
         let _conventions_context_root = self
@@ -6925,17 +7507,45 @@ impl AgentFactory {
         // bind_external_tool_surface_handle below is a ptr-eq no-op instead
         // of a poisoning rebind; connection waits ride the unconditional
         // `wait_for_mcp` poll loop like every other external dispatcher.
+        #[cfg_attr(
+            not(all(feature = "mcp", not(target_arch = "wasm32"))),
+            allow(unused_mut)
+        )]
+        let mut cleanup = ConstructionCleanup::default();
         #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
-        if !build_config.mcp_servers.is_empty() {
-            let surface_handle: Arc<dyn meerkat_core::ExternalToolSurfaceHandle> =
-                match resolved_mode {
-                    RuntimeBuildMode::SessionOwned(bindings) => {
-                        Arc::clone(bindings.external_tool_surface())
-                    }
-                    _ => Arc::new(
+        cleanup.observe_into(match resolved_mode {
+            RuntimeBuildMode::SessionOwned(bindings) => bindings.mcp_observation_slot().cloned(),
+            _ => None,
+        });
+        // A governed session-owned construction (one whose bindings carry the
+        // host's configured attachment authority) owns a router even with no
+        // configured server, so its member can attach its first server live.
+        #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+        let live_mcp_attachable = matches!(
+            resolved_mode,
+            RuntimeBuildMode::SessionOwned(bindings)
+                if bindings.configured_mcp_attachment().is_some()
+        );
+        #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+        if !build_config.mcp_servers.is_empty() || live_mcp_attachable {
+            // A registration's surface outlives this construction: its router
+            // borrows it and releases only what it staged. A standalone
+            // construction's private surface is its router's own.
+            let (surface_handle, surface_ownership): (
+                Arc<dyn meerkat_core::ExternalToolSurfaceHandle>,
+                meerkat_mcp::McpSurfaceOwnership,
+            ) = match resolved_mode {
+                RuntimeBuildMode::SessionOwned(bindings) => (
+                    Arc::clone(bindings.external_tool_surface()),
+                    meerkat_mcp::McpSurfaceOwnership::Borrowed,
+                ),
+                _ => (
+                    Arc::new(
                         meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral(),
                     ),
-                };
+                    meerkat_mcp::McpSurfaceOwnership::Owned,
+                ),
+            };
             // With a resolver, a missing credential is the typed
             // human-authorization status (the native authority opens no
             // browser); without one, servers connect without OAuth.
@@ -6943,6 +7553,8 @@ impl AgentFactory {
                 surface_handle,
                 self.mcp_stdio_launch_profile.clone(),
             )
+            .with_http_egress_profile(self.mcp_http_egress_profile.clone())
+            .with_surface_ownership(surface_ownership)
             .with_mcp_auth(
                 meerkat_providers::mcp_oauth::McpAuthMode::Interactive,
                 build_config
@@ -6955,25 +7567,67 @@ impl AgentFactory {
                     meerkat_mcp::apps::McpAppsClientServiceFactory,
                 ));
             }
-            if let Some(provider) = &self.mcp_call_context_provider {
-                router = router.with_call_context_provider(Arc::clone(provider));
+            // A host provider wins; otherwise connector-bound servers get the
+            // connector owner, resolved from each call's own staged
+            // configuration, so live adds and restarts are served too.
+            let call_context_provider = self.mcp_call_context_provider.clone().or_else(|| {
+                let authority = self.connector_oauth_authority.clone()?;
+                Some(
+                    Arc::new(crate::ConnectorMcpCallContextProvider::live(authority))
+                        as Arc<dyn meerkat_mcp::McpCallContextProvider>,
+                )
+            });
+            if let Some(provider) = call_context_provider {
+                router = router.with_call_context_provider(provider);
             }
+            // On a governed runtime every configured server carries the
+            // installed host's authority to its connection's physical entry,
+            // where it is asked after preparation and before any spawn or
+            // request; a configured row is configuration, not authority. A
+            // refused server fails that connection; the session continues.
+            let configured_authority = match resolved_mode {
+                RuntimeBuildMode::SessionOwned(bindings) => {
+                    bindings.configured_mcp_attachment().cloned()
+                }
+                _ => None,
+            };
+            // The construction owns the router from here: its cleanup is
+            // armed before anything is staged or connected, so abandoning the
+            // construction at any later await shuts those connections down.
+            let adapter = Arc::new(meerkat_mcp::McpRouterAdapter::new(router));
+            cleanup.arm_mcp(Arc::clone(&adapter));
+            cleanup.live_mcp = Some(Arc::new(crate::surface::AdapterLiveMcpAttachment::new(
+                Arc::clone(&adapter),
+                configured_authority.is_some(),
+            )));
             for server in &build_config.mcp_servers {
-                router.stage_add(server.clone()).map_err(|error| {
+                let staged = match &configured_authority {
+                    Some(authority) => {
+                        adapter
+                            .stage_add_governed(
+                                server.clone(),
+                                meerkat_mcp::ConfiguredMcpEntry::new(
+                                    Arc::clone(authority),
+                                    server.clone(),
+                                ),
+                            )
+                            .await
+                    }
+                    None => adapter.stage_add(server.clone()).await,
+                };
+                staged.map_err(|error| {
                     BuildAgentError::McpSetup(format!(
                         "stage MCP server '{}': {error}",
                         server.name
                     ))
                 })?;
             }
-            router.apply_staged().await.map_err(|error| {
+            adapter.apply_staged().await.map_err(|error| {
                 BuildAgentError::McpSetup(format!("apply staged MCP servers: {error}"))
             })?;
-            let adapter = meerkat_mcp::McpRouterAdapter::new(router);
             adapter.refresh_tools().await.map_err(|error| {
                 BuildAgentError::McpSetup(format!("refresh MCP tools: {error}"))
             })?;
-            let adapter = Arc::new(adapter);
             #[cfg(all(
                 feature = "test-mcp-oauth-fixtures",
                 feature = "mcp",
@@ -6982,7 +7636,24 @@ impl AgentFactory {
             if let Some(observer) = &self.mcp_router_observer_for_test {
                 observer(Arc::clone(&adapter));
             }
-            let adapter: Arc<dyn AgentToolDispatcher> = adapter;
+            // The trusted host composes this construction's own adapter
+            // before any of its tools is published. A refusal fails the build
+            // while the cleanup armed above still owns the adapter, so its
+            // connections are shut down.
+            let adapter: Arc<dyn AgentToolDispatcher> = match &self.mcp_adapter_composer {
+                Some(composer) => composer
+                    .compose(
+                        &adapter,
+                        session.id(),
+                        build_config.mob_member_binding.as_ref(),
+                    )
+                    .map_err(|refusal| {
+                        BuildAgentError::McpSetup(format!(
+                            "MCP adapter composition refused: {refusal}"
+                        ))
+                    })?,
+                None => adapter,
+            };
             build_config.external_tools = Some(match build_config.external_tools.take() {
                 Some(existing) => Arc::new(meerkat_core::gateway::DynamicToolComposite::new(vec![
                     existing, adapter,
@@ -7409,7 +8080,13 @@ impl AgentFactory {
                         config,
                     )
                     .await;
-                    if layered_hooks.entries.is_empty() {
+                    // Run overrides execute through this engine too. With
+                    // override entries and no base entries the engine is
+                    // still composed, so admission validates and the run
+                    // executes the exact effective set rather than dropping it.
+                    if layered_hooks.entries.is_empty()
+                        && build_config.hooks_override.entries.is_empty()
+                    {
                         None
                     } else {
                         let engine = meerkat_hooks::DefaultHookEngine::new(layered_hooks);
@@ -7695,6 +8372,18 @@ impl AgentFactory {
             }
         }
 
+        // Per-session MCP attachment intents and their revision counter are
+        // session-owned durable state, not build config: a rebuilt or resumed
+        // session keeps the ones it recorded.
+        let (recorded_mcp_attachment_intents, mcp_attachment_intent_revision) = session
+            .build_state()
+            .map(|state| {
+                (
+                    state.mcp_attachment_intents,
+                    state.mcp_attachment_intent_revision,
+                )
+            })
+            .unwrap_or_default();
         let persisted_build_state = meerkat_core::SessionBuildState {
             output_schema: build_config.output_schema.clone(),
             hooks_override: build_config.hooks_override.clone(),
@@ -7710,6 +8399,8 @@ impl AgentFactory {
             shell_env: build_config.shell_env.clone(),
             mob_tool_authority_context: build_config.mob_tool_authority_context.clone(),
             call_timeout_override: build_config.call_timeout_override.clone(),
+            mcp_attachment_intents: recorded_mcp_attachment_intents,
+            mcp_attachment_intent_revision,
         };
 
         // Resolve the structured-output retry budget exactly once, here at the
@@ -7872,6 +8563,10 @@ impl AgentFactory {
             .provider_native_tool_policy(provider_native_tool_policy)
             .with_call_timeout_override(effective_call_timeout_override);
 
+        if let Some(max_turns) = config.agent.max_turns {
+            builder = builder.max_turns(max_turns);
+        }
+
         if let Some(defaults) = provider_request_defaults_for(
             provider,
             &model,
@@ -7920,21 +8615,9 @@ impl AgentFactory {
         }
         let _is_resumed = build_config.resume_session.is_some();
         let session_id = session.id().clone();
-        session
-            .set_session_metadata(factory_metadata)
-            .map_err(|err| {
-                BuildAgentError::Config(format!(
-                    "Failed to store session metadata before core build: {err}"
-                ))
-            })?;
-        session
-            .set_build_state(persisted_build_state)
-            .map_err(|err| {
-                BuildAgentError::Config(format!(
-                    "Failed to store session build state before core build: {err}"
-                ))
-            })?;
-        builder = builder.resume_session(session);
+        // The session's metadata and build state are stored, and the session
+        // handed to the builder, when the construction is finished: a
+        // prepared construction records its selected policy then.
         #[cfg(feature = "comms")]
         if let Some(runtime) = comms_runtime {
             builder =
@@ -8198,6 +8881,102 @@ impl AgentFactory {
             }
         }
 
+        let visibility_filters = capability_base_filter_override
+            .into_iter()
+            .chain(
+                tool_execution_policy
+                    .as_ref()
+                    .map(meerkat_core::ToolExecutionPolicy::static_visibility_filter),
+            )
+            .chain(initial_tool_filter.clone())
+            .collect();
+        Ok(AgentAssembly {
+            tools,
+            tool_execution_policy,
+            consequence_policy,
+            tool_dispatch_admission,
+            builder,
+            session,
+            factory_metadata,
+            persisted_build_state,
+            llm_adapter,
+            store_adapter,
+            hoisted_control_visibility_provider,
+            initial_tool_filter,
+            visibility_filters,
+            hoisted_parent_tool_authority,
+            hoisted_mob_authority_handle,
+            controller_client,
+            cleanup,
+        })
+    }
+
+    /// Finish an assembly: bind its host's `selection` if it awaits one,
+    /// record the session's metadata, gate its calls and build its agent.
+    async fn complete_assembly(
+        assembly: AgentAssembly,
+        selection: Option<ToolSurfaceSelection>,
+    ) -> Result<(DynAgent, Option<meerkat_core::ControllerModelClient>), BuildAgentError> {
+        let AgentAssembly {
+            mut tools,
+            tool_execution_policy,
+            consequence_policy,
+            tool_dispatch_admission,
+            mut builder,
+            mut session,
+            mut factory_metadata,
+            persisted_build_state,
+            llm_adapter,
+            store_adapter,
+            hoisted_control_visibility_provider,
+            initial_tool_filter,
+            visibility_filters: _,
+            hoisted_parent_tool_authority,
+            hoisted_mob_authority_handle,
+            controller_client,
+            cleanup: _,
+        } = assembly;
+        let bound_consequence_policy = match consequence_policy {
+            AssemblyConsequencePolicy::Unmanaged => None,
+            AssemblyConsequencePolicy::Bound(policy) => Some(policy),
+            AssemblyConsequencePolicy::AwaitingSelection(owner) => {
+                let selection = selection.ok_or_else(|| {
+                    BuildAgentError::Config(
+                        "a prepared governed construction needs its host's tool-surface selection"
+                            .to_string(),
+                    )
+                })?;
+                let meerkat_core::ApplicationToolPolicyBinding::Provider {
+                    provider_id,
+                    policy_id,
+                } = &selection.binding
+                else {
+                    return Err(BuildAgentError::Config(
+                        "a governed construction's selected application tool policy must be a resolved provider binding"
+                            .to_string(),
+                    ));
+                };
+                let bound = owner.bind(provider_id, policy_id)?;
+                factory_metadata.tooling.application_tool_policy = selection.binding.clone();
+                Some(bound)
+            }
+        };
+        session
+            .set_session_metadata(factory_metadata)
+            .map_err(|err| {
+                BuildAgentError::Config(format!(
+                    "Failed to store session metadata before core build: {err}"
+                ))
+            })?;
+        session
+            .set_build_state(persisted_build_state)
+            .map_err(|err| {
+                BuildAgentError::Config(format!(
+                    "Failed to store session build state before core build: {err}"
+                ))
+            })?;
+        builder = builder.resume_session(session);
+
         // 12i. Call-level tool execution gate — the OUTERMOST composition.
         // Applied after every gateway/memory/catalog-control composition so
         // memory_search and every gateway-composed tool is gated. The gate
@@ -8295,6 +9074,430 @@ impl AgentFactory {
         Ok((agent, controller_client))
     }
 
+    /// build_agent phase 4: the final agent-facing client over `llm_client`
+    /// (the session's resolved raw client for `identity`): its adapter on
+    /// `events` and the shared `event_tap`, the final-client decorator, and,
+    /// when allowed and configured, the fallback selector over the decorated
+    /// candidates resolved under `auth_lease`.
+    #[allow(clippy::too_many_arguments)]
+    async fn assemble_controller_client(
+        &self,
+        config: &Config,
+        registry: &ModelRegistry,
+        build_config: &AgentBuildConfig,
+        llm_client: Arc<dyn LlmClient>,
+        identity: &SessionLlmIdentity,
+        events: &AdapterEventSink,
+        event_tap: &meerkat_core::EventTap,
+        session_id: &meerkat_core::SessionId,
+        auth_lease: Option<meerkat_core::handles::GeneratedAuthLeaseHandle>,
+        fallback_allowed: bool,
+    ) -> Result<Arc<dyn AgentLlmClient>, BuildAgentError> {
+        let mut llm_adapter_inner =
+            events.adapter(llm_client, identity.model.clone(), identity.provider)?;
+        llm_adapter_inner = llm_adapter_inner.with_event_tap(event_tap.clone());
+        // K2: the build config carries the typed `ProviderParamsOverride`
+        // end-to-end; the adapter default is its provider tag (no legacy
+        // JSON-bag projection at this seam).
+        if let Some(typed_tag) = build_config
+            .provider_params
+            .as_ref()
+            .and_then(|params| params.provider_tag.clone())
+        {
+            llm_adapter_inner = llm_adapter_inner.with_provider_params(Some(typed_tag));
+        }
+        let llm_adapter = Self::decorate_agent_llm_client(
+            Arc::new(llm_adapter_inner),
+            build_config.agent_llm_client_decorator.as_ref(),
+        )
+        .map_err(BuildAgentError::LlmClient)?;
+        if !fallback_allowed || !config.model_fallback.is_enabled() {
+            return Ok(llm_adapter);
+        }
+        let primary_request_policy = self.request_policy_for_session_llm_identity(
+            config,
+            identity,
+            build_config.override_web_search,
+            session_id,
+        )?;
+        let primary_target_profile = registry
+            .profile_witness_for_provider(identity.provider, &identity.model)
+            .ok_or_else(|| {
+                BuildAgentError::Config(format!(
+                    "model fallback cannot bind active model '{}:{}' because it is absent from the effective model registry",
+                    identity.provider.as_str(),
+                    identity.model
+                ))
+            })?;
+        let mut candidates = vec![ModelFallbackCandidate {
+            identity: identity.clone(),
+            request_policy: primary_request_policy,
+            client: Arc::clone(&llm_adapter),
+            target_profile: primary_target_profile,
+        }];
+        let (identities, mut skipped) =
+            self.model_fallback_identities(config, registry, identity)?;
+        for identity in identities {
+            let target_profile = match registry
+                .profile_witness_for_provider(identity.provider, &identity.model)
+            {
+                Some(profile) => profile,
+                None => {
+                    return Err(BuildAgentError::Config(format!(
+                        "model fallback target '{}:{}' is absent from the effective model registry",
+                        identity.provider.as_str(),
+                        identity.model
+                    )));
+                }
+            };
+            let built = match self
+                .build_llm_client_with_selection_for_identity_in_realm(
+                    config,
+                    &identity,
+                    auth_lease.clone(),
+                    build_config.realm_id.as_ref(),
+                )
+                .await
+            {
+                Ok(built) => built,
+                Err(FactoryError::ProviderAuth(
+                    meerkat_llm_core::provider_runtime::errors::ProviderAuthError::Auth(
+                        meerkat_core::AuthError::MissingSecret
+                        | meerkat_core::AuthError::InteractiveLoginRequired
+                        | meerkat_core::AuthError::UserReauthRequired
+                        | meerkat_core::AuthError::HostOwnedUnavailable
+                    )
+                    | meerkat_llm_core::provider_runtime::errors::ProviderAuthError::ExternalResolverMissing(_)
+                ) | FactoryError::ClientBuild(
+                    meerkat_llm_core::provider_runtime::errors::ProviderClientError::NoCredentialMaterial
+                ) | FactoryError::ConnectionTarget(
+                    meerkat_core::ConnectionTargetError::BindingInvalid {
+                        source: meerkat_core::ProviderBindingError::UnknownBinding(_),
+                        ..
+                    }
+                )) => {
+                    skipped.push(meerkat_core::AgentLlmFallbackSkippedTarget::new(
+                        identity,
+                        meerkat_core::model_fallback::ModelFallbackSkipReason::AuthUnavailable,
+                    ));
+                    continue;
+                }
+                Err(error) => return Err(BuildAgentError::LlmClient(error)),
+            };
+            // A target that names no binding is served by whichever
+            // candidate resolved; its identity and request policy name that
+            // selection, so a switch to it publishes and rotates to the
+            // credential its client actually uses.
+            let mut identity = identity;
+            let selected_credential =
+                LlmCredentialSelection::bind_unselected(built.selection, &mut identity);
+            let adapter = events
+                .adapter(built.client, identity.model.clone(), identity.provider)?
+                .with_event_tap(event_tap.clone());
+            let decorated = Self::decorate_agent_llm_client(
+                Arc::new(adapter),
+                build_config.agent_llm_client_decorator.as_ref(),
+            )
+            .map_err(BuildAgentError::LlmClient)?;
+            let mut request_policy = self.request_policy_for_session_llm_identity(
+                config,
+                &identity,
+                build_config.override_web_search,
+                session_id,
+            )?;
+            if let Some(credential_identity) = selected_credential {
+                request_policy.credential_identity = Some(credential_identity);
+            }
+            candidates.push(ModelFallbackCandidate {
+                target_profile,
+                request_policy,
+                identity,
+                client: decorated,
+            });
+        }
+        Ok(
+            match ModelFallbackClient::new(
+                candidates,
+                config.model_fallback.policy.clone(),
+                skipped,
+                auth_lease,
+            ) {
+                Some(client) => Arc::new(client) as Arc<dyn AgentLlmClient>,
+                None => llm_adapter,
+            },
+        )
+    }
+
+    /// Prepare the controller of a session that does not exist yet, for its
+    /// pre-assigned `session_id`, under the realm machine's actual auth
+    /// lifecycle owner `auth_lease` (see `crate::prepared_controller`).
+    ///
+    /// It runs the ordinary build's provider resolution, final-client
+    /// decoration, fallback assembly and controller pin, under that owner,
+    /// with the adapters' run channel left to the set-once slot the consuming
+    /// build binds. It sends no model request. An injected client, a resumed
+    /// session, session runtime bindings and an explicit web search enable
+    /// (whose executor is built per session) are refused before any effect.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(
+        not(all(
+            feature = "session-store",
+            feature = "local-authorization",
+            not(target_arch = "wasm32")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) async fn prepare_controller_graph(
+        &self,
+        mut build_config: AgentBuildConfig,
+        config: &Config,
+        auth_lease: meerkat_core::handles::GeneratedAuthLeaseHandle,
+        session_id: &SessionId,
+    ) -> Result<crate::prepared_controller::PreparedControllerGraph, BuildAgentError> {
+        use crate::prepared_controller::{
+            PreparedControllerGraph, PreparedControllerInputs, PreparedControllerRefusal as Refusal,
+        };
+        if build_config.llm_client_override.is_some()
+            || build_config.agent_llm_client_override.is_some()
+        {
+            return Err(Refusal::InjectedClient.into());
+        }
+        if build_config.prepared_controller.is_some() {
+            return Err(
+                Refusal::Unsupported("a prepared controller inside its preparation").into(),
+            );
+        }
+        if !matches!(
+            build_config.runtime_build_mode,
+            RuntimeBuildMode::StandaloneEphemeral
+        ) {
+            return Err(
+                Refusal::Unsupported("session runtime bindings before the session exists").into(),
+            );
+        }
+        if build_config.resume_session.as_ref().is_some_and(|session| {
+            session.id() != session_id
+                || session.session_metadata().is_some()
+                || !session.messages().is_empty()
+        }) {
+            return Err(Refusal::Unsupported("resuming an existing session").into());
+        }
+        if matches!(
+            build_config.override_web_search,
+            ToolCategoryOverride::Enable
+        ) {
+            return Err(Refusal::Unsupported("an explicit web search enable").into());
+        }
+        self.validate_runtime_profile(&build_config, config)?;
+        let mut effective_config;
+        let config = if let Some(fallback) = &build_config.model_fallback {
+            effective_config = config.clone();
+            effective_config.model_fallback = fallback.clone();
+            &effective_config
+        } else {
+            config
+        };
+        config
+            .model_fallback
+            .validate()
+            .map_err(|error| BuildAgentError::Config(error.to_string()))?;
+        let registry = if build_config.custom_models.is_empty() {
+            self.model_registry(config)?
+        } else {
+            ModelRegistry::from_config_with_models(
+                config,
+                &build_config.custom_models,
+                meerkat_models::canonical(),
+            )
+            .map_err(|err| BuildAgentError::Config(err.to_string()))?
+        };
+        let (provider, resolved_self_hosted_server_id) =
+            self.resolve_provider_from_registry(&registry, &build_config)?;
+        if registry
+            .entry_for_provider(provider, &build_config.model)
+            .is_some_and(|entry| {
+                entry.release_stage == meerkat_core::ModelReleaseStage::Experimental
+            })
+        {
+            return Err(BuildAgentError::LlmClient(
+                FactoryError::ExperimentalModelRequiresLiveChannel {
+                    provider: provider.as_str(),
+                    model: build_config.model.clone(),
+                },
+            ));
+        }
+        let self_hosted_server_id = if matches!(provider, Provider::SelfHosted) {
+            build_config
+                .self_hosted_server_id
+                .clone()
+                .or(resolved_self_hosted_server_id)
+        } else {
+            None
+        };
+        let inputs = PreparedControllerInputs::capture(
+            config,
+            &build_config,
+            provider,
+            &self_hosted_server_id,
+        );
+        let decorator = build_config.agent_llm_client_decorator.clone();
+        let phase = self
+            .resolve_llm_client_phase(
+                config,
+                &registry,
+                provider,
+                &self_hosted_server_id,
+                &mut build_config,
+                Some(&auth_lease),
+            )
+            .await?;
+        let llm_client = phase.llm_client.ok_or_else(|| {
+            BuildAgentError::Config(
+                "internal error: missing LLM client for the prepared controller".to_string(),
+            )
+        })?;
+        let account_output_token_limit = llm_client.output_token_limit();
+        let identity = SessionLlmIdentity {
+            model: build_config.model.clone(),
+            provider,
+            self_hosted_server_id,
+            provider_params: build_config.provider_params.clone(),
+            auth_binding: build_config.auth_binding.clone(),
+        };
+        let event_tap = meerkat_core::new_event_tap();
+        let late_event = meerkat_llm_core::LateEventChannel::new();
+        let llm_adapter = self
+            .assemble_controller_client(
+                config,
+                &registry,
+                &build_config,
+                llm_client,
+                &identity,
+                &AdapterEventSink::Late(late_event.clone()),
+                &event_tap,
+                session_id,
+                Some(auth_lease.clone()),
+                true,
+            )
+            .await?;
+        let controller = Self::pin_selected_controller(&llm_adapter, &identity)?;
+        let (fallback_identities, fallback_skips) =
+            self.model_fallback_identities(config, &registry, &identity)?;
+        Ok(PreparedControllerGraph {
+            llm_adapter,
+            controller,
+            event_tap,
+            late_event,
+            account_output_token_limit,
+            credential_identity: phase.credential_identity,
+            auto_image_generation_executor: phase.auto_image_generation_executor,
+            resolved_model: identity.model,
+            resolved_auth_binding: identity.auth_binding,
+            auth_lease,
+            registry,
+            decorator,
+            inputs,
+            fallback_identities,
+            fallback_skips: crate::prepared_controller::fallback_skip_facts(&fallback_skips),
+        })
+    }
+
+    /// Take the prepared controller `payload` names for this build, once. It
+    /// is refused, with nothing resolved in its place, unless this is the
+    /// session-owned build minting its pre-assigned session under the auth
+    /// owner it was prepared under, with the same controller facts: the same
+    /// request and configuration facts, final-client decorator, and fallback
+    /// targets. The comparison is pure configuration and selection; it
+    /// resolves and refreshes nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn take_prepared_controller(
+        &self,
+        payload: &Arc<dyn Any + Send + Sync>,
+        build_config: &AgentBuildConfig,
+        config: &Config,
+        registry: &ModelRegistry,
+        provider: Provider,
+        self_hosted_server_id: &Option<String>,
+        session_id: &meerkat_core::SessionId,
+        resumed: bool,
+    ) -> Result<Box<crate::prepared_controller::PreparedControllerGraph>, BuildAgentError> {
+        use crate::prepared_controller::{
+            PreparedControllerInputs, PreparedControllerRefusal as Refusal,
+        };
+        let ticket = crate::prepared_controller::decode_prepared_controller(payload)?;
+        if build_config.llm_client_override.is_some()
+            || build_config.agent_llm_client_override.is_some()
+        {
+            return Err(Refusal::InjectedClient.into());
+        }
+        let RuntimeBuildMode::SessionOwned(bindings) = &build_config.runtime_build_mode else {
+            return Err(Refusal::NotSessionOwned.into());
+        };
+        if ticket.session_id() != session_id {
+            return Err(Refusal::SessionMismatch.into());
+        }
+        if resumed {
+            return Err(Refusal::Unsupported("resuming an existing session").into());
+        }
+        let inputs = PreparedControllerInputs::capture(
+            config,
+            build_config,
+            provider,
+            self_hosted_server_id,
+        );
+        let graph = ticket.cell().take_if(|graph| {
+            if !graph.auth_lease.same_owner(bindings.auth_lease()) {
+                return Err(Refusal::AuthOwnerMismatch);
+            }
+            if let Some(fact) = graph.inputs.first_difference(&inputs) {
+                return Err(Refusal::InputsChanged(fact));
+            }
+            if !crate::prepared_controller::same_decorator(
+                graph.decorator.as_ref(),
+                build_config.agent_llm_client_decorator.as_ref(),
+            ) {
+                return Err(Refusal::InputsChanged("final client decorator"));
+            }
+            let (identities, skipped) = self
+                .model_fallback_identities(config, registry, &graph.resolved_identity())
+                .map_err(|_| Refusal::InputsChanged("model fallback targets"))?;
+            if identities != graph.fallback_identities
+                || crate::prepared_controller::fallback_skip_facts(&skipped) != graph.fallback_skips
+            {
+                return Err(Refusal::InputsChanged("model fallback targets"));
+            }
+            Ok(())
+        })?;
+        Ok(graph)
+    }
+
+    /// Install a taken prepared controller into its consuming build: the
+    /// build's run channel is bound once into the adapters' shared slot, and
+    /// the retained final client and pin are used unchanged.
+    fn install_prepared_controller(
+        graph: crate::prepared_controller::PreparedControllerGraph,
+        event_tx: Option<mpsc::Sender<AgentEvent>>,
+        controller_requirement: ControllerClientRequirement,
+    ) -> Result<
+        (
+            Arc<dyn AgentLlmClient>,
+            Option<meerkat_core::ControllerModelClient>,
+        ),
+        BuildAgentError,
+    > {
+        if let Some(event_tx) = event_tx
+            && !graph.late_event.bind(event_tx)
+        {
+            // Only the one build that took the graph binds its slot.
+            return Err(crate::prepared_controller::PreparedControllerRefusal::Consumed.into());
+        }
+        let controller = match controller_requirement {
+            ControllerClientRequirement::NotRequested => None,
+            ControllerClientRequirement::Required => Some(graph.controller),
+        };
+        Ok((graph.llm_adapter, controller))
+    }
+
     fn pin_selected_controller(
         client: &Arc<dyn AgentLlmClient>,
         identity: &SessionLlmIdentity,
@@ -8331,6 +9534,7 @@ impl AgentFactory {
         provider: Provider,
         self_hosted_server_id: &Option<String>,
         build_config: &mut AgentBuildConfig,
+        auth_lease: Option<&meerkat_core::handles::GeneratedAuthLeaseHandle>,
     ) -> Result<ResolvedLlmClientPhase, BuildAgentError> {
         #[cfg(not(target_arch = "wasm32"))]
         let mut auto_image_generation_executor: Option<
@@ -8362,13 +9566,7 @@ impl AgentFactory {
                 }
                 None => {
                     if matches!(provider, Provider::SelfHosted) {
-                        let auth_lease_handle = if let RuntimeBuildMode::SessionOwned(bindings) =
-                            &build_config.runtime_build_mode
-                        {
-                            Some(bindings.auth_lease().clone())
-                        } else {
-                            None
-                        };
+                        let auth_lease_handle = auth_lease.cloned();
                         let resolved = self
                             .build_self_hosted_client_for_identity(
                                 config,
@@ -8432,12 +9630,11 @@ impl AgentFactory {
                                 Some(resolved_auth_binding.clone())
                             };
                             let mut candidate_env = env.clone();
-                            if let RuntimeBuildMode::SessionOwned(bindings) =
-                                &build_config.runtime_build_mode
+                            if let Some(auth_lease) = auth_lease
                                 && lease_auth_binding.is_some()
                             {
-                                candidate_env = candidate_env
-                                    .with_auth_lease_handle(bindings.auth_lease().clone());
+                                candidate_env =
+                                    candidate_env.with_auth_lease_handle(auth_lease.clone());
                             }
                             match provider_registry
                                 .resolve(&target.realm, &resolved_auth_binding, &candidate_env)
@@ -8506,16 +9703,11 @@ impl AgentFactory {
                         // Publish immediately after resolve. Provider resolution can refresh and
                         // persist OAuth token bytes; AuthMachine must observe the returned lease
                         // before any later build step can fail.
-                        if let RuntimeBuildMode::SessionOwned(bindings) =
-                            &build_config.runtime_build_mode
+                        if let Some(auth_lease) = auth_lease
                             && let Some(lease_auth_binding) = lease_auth_binding.as_ref()
                         {
-                            Self::publish_auth_lease(
-                                bindings.auth_lease(),
-                                lease_auth_binding,
-                                &connection,
-                            )
-                            .map_err(BuildAgentError::LlmClient)?;
+                            Self::publish_auth_lease(auth_lease, lease_auth_binding, &connection)
+                                .map_err(BuildAgentError::LlmClient)?;
                         }
 
                         #[cfg(not(target_arch = "wasm32"))]
@@ -8650,10 +9842,10 @@ impl AgentFactory {
                         env = env.with_provider_auth_persistence(persistence);
                     }
                 }
-                if let RuntimeBuildMode::SessionOwned(bindings) = &build_config.runtime_build_mode
+                if let Some(auth_lease) = auth_lease
                     && !auth_binding.is_env_default()
                 {
-                    env = env.with_auth_lease_handle(bindings.auth_lease().clone());
+                    env = env.with_auth_lease_handle(auth_lease.clone());
                 }
                 for (handle, resolver) in &self.external_auth_resolvers {
                     env = env.with_external_resolver(handle.clone(), resolver.clone());
@@ -8665,10 +9857,10 @@ impl AgentFactory {
                 else {
                     continue;
                 };
-                if let RuntimeBuildMode::SessionOwned(bindings) = &build_config.runtime_build_mode
+                if let Some(auth_lease) = auth_lease
                     && !auth_binding.is_env_default()
                 {
-                    Self::publish_auth_lease(bindings.auth_lease(), &auth_binding, &connection)
+                    Self::publish_auth_lease(auth_lease, &auth_binding, &connection)
                         .map_err(BuildAgentError::LlmClient)?;
                 }
                 let Ok(Some(executor)) = self
@@ -8702,6 +9894,9 @@ impl AgentFactory {
 /// credential-free provider runtime in that private slot, and exposing a
 /// public setter purely to let a test reach it would widen the production
 /// surface for no production reason.
+#[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod auth_clear_default_hot_swap_tests;
 #[cfg(all(test, feature = "session-store", not(target_arch = "wasm32")))]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod brain_swap_runtime_loop_ab_tests;
@@ -9440,6 +10635,7 @@ mod tests {
             .with_provenance(meerkat_core::types::ToolProvenance {
                 kind: meerkat_core::types::ToolSourceKind::Callback,
                 source_id: name.into(),
+                artifact: None,
             }),
         )
     }
@@ -10941,7 +12137,7 @@ mod tests {
             })
         );
 
-        let caller_key = "mobkit:identity:parent-1";
+        let caller_key = "meta:identity:parent-1";
         let caller_params = ProviderParamsOverride {
             provider_tag: Some(ProviderTag::OpenAi(OpenAiProviderTag {
                 prompt_cache_key: Some(caller_key.to_string()),
@@ -11282,6 +12478,969 @@ mod tests {
             Some(&expected_witness),
             "the resumed owner holds the original identity"
         );
+    }
+
+    /// An inherited ceiling naming the MCP tools of a parent that is ready,
+    /// handed to a child whose own connection to the same server can still be
+    /// pending. The ceiling is an exact witnessed upper bound, not a claim
+    /// that the child mounts the tool now. The fixture's tools are deferred
+    /// catalog entries, so each agent requests them through the catalog
+    /// control plane before they list.
+    #[cfg(all(
+        feature = "test-mcp-oauth-fixtures",
+        feature = "mcp",
+        not(target_arch = "wasm32")
+    ))]
+    mod inherited_mcp_ceiling {
+        use super::*;
+        use meerkat_core::types::ToolCall;
+        use std::time::Duration;
+
+        type CapturedRequest = Arc<std::sync::Mutex<Option<LlmRequest>>>;
+        type ObservedAdapters = Arc<std::sync::Mutex<Vec<Arc<meerkat_mcp::McpRouterAdapter>>>>;
+
+        /// A factory whose MCP routers are observed, so a test can wait for a
+        /// child's connection without draining it.
+        fn observed_factory(root: &std::path::Path) -> (AgentFactory, ObservedAdapters) {
+            let observed: ObservedAdapters = Arc::default();
+            let observer = Arc::clone(&observed);
+            let factory = AgentFactory::new(root.join("sessions"))
+                .builtins(false)
+                .with_mcp_router_observer_for_test(move |adapter| {
+                    observer.lock().unwrap().push(adapter);
+                });
+            (factory, observed)
+        }
+
+        fn last_adapter(observed: &ObservedAdapters) -> Arc<meerkat_mcp::McpRouterAdapter> {
+            Arc::clone(observed.lock().unwrap().last().expect("an observed router"))
+        }
+
+        /// The fixture as the declarative server `fixture`: whichever process
+        /// serves it, its tools carry the source witness `Mcp/fixture`. A
+        /// gated server starts the fixture only once `gate` exists, so its
+        /// connection stays pending for as long as the test holds the gate.
+        fn fixture_server(gate: Option<&std::path::Path>) -> meerkat_core::McpServerConfig {
+            let fixture = mcp_test_server::fixture_binary()
+                .to_string_lossy()
+                .to_string();
+            match gate {
+                None => meerkat_core::McpServerConfig::stdio(
+                    "fixture",
+                    fixture,
+                    Vec::new(),
+                    HashMap::new(),
+                ),
+                Some(gate) => meerkat_core::McpServerConfig::stdio(
+                    "fixture",
+                    "/bin/sh",
+                    vec![
+                        "-c".to_string(),
+                        "while [ ! -e \"$0\" ]; do sleep 0.02; done; exec \"$1\"".to_string(),
+                        gate.to_string_lossy().to_string(),
+                        fixture,
+                    ],
+                    HashMap::new(),
+                ),
+            }
+        }
+
+        /// One turn, so the agent crosses a boundary.
+        async fn turn(agent: &mut DynAgent, text: &str) {
+            agent.set_runtime_execution_kind(Some(
+                meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
+            ));
+            agent
+                .run(meerkat_core::ContentInput::Text(text.into()))
+                .await
+                .expect("an agent turn");
+        }
+
+        /// One child turn; returns the tool names its provider request listed.
+        async fn listed_in_a_turn(
+            agent: &mut DynAgent,
+            text: &str,
+            captured: &CapturedRequest,
+        ) -> Vec<String> {
+            turn(agent, text).await;
+            captured
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the turn's provider request")
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str().to_string())
+                .collect()
+        }
+
+        /// Dispatch one call through the agent's native visibility precheck.
+        async fn call(
+            agent: &mut DynAgent,
+            name: &str,
+            args: serde_json::Value,
+        ) -> meerkat_core::ToolDispatchOutcome {
+            agent
+                .dispatch_external_tool_call(ToolCall::new(
+                    format!("{name}-call"),
+                    name.to_string(),
+                    args,
+                ))
+                .await
+                .expect("an external call outcome")
+        }
+
+        /// Request deferred tools through the catalog control plane; returns
+        /// the load resolution of each name.
+        async fn load(agent: &mut DynAgent, names: &[&str]) -> Vec<serde_json::Value> {
+            let outcome = call(
+                agent,
+                "tool_catalog_load",
+                serde_json::json!({ "names": names }),
+            )
+            .await;
+            let response: serde_json::Value = serde_json::from_str(&outcome.result.text_content())
+                .expect("a catalog load response");
+            response["resolutions"]
+                .as_array()
+                .cloned()
+                .expect("load resolutions")
+        }
+
+        fn resolution<'a>(
+            resolutions: &'a [serde_json::Value],
+            name: &str,
+        ) -> &'a serde_json::Value {
+            resolutions
+                .iter()
+                .find(|resolution| resolution["name"] == name)
+                .expect("a load resolution for the requested name")
+        }
+
+        fn refusal(
+            outcome: &meerkat_core::ToolDispatchOutcome,
+        ) -> Option<&meerkat_core::ToolError> {
+            let Some(meerkat_core::ToolDispatchTerminalCause::RuntimeToolError { error }) =
+                outcome.terminal_cause()
+            else {
+                return None;
+            };
+            Some(error)
+        }
+
+        fn dispatched(outcome: &meerkat_core::ToolDispatchOutcome, expected: &str) -> bool {
+            refusal(outcome).is_none()
+                && !outcome.result.is_error
+                && outcome.result.text_content().contains(expected)
+        }
+
+        fn names_contain(names: &[meerkat_core::ToolName], name: &str) -> bool {
+            names.iter().any(|known| known.as_str() == name)
+        }
+
+        /// A parent that is ready: it waited for `fixture` and requested
+        /// `echo` and `add`, so both are in its visible set. Returned with the
+        /// composition authority that mints its inherit_parent handoffs from
+        /// that set, as the mob spawn tooling does.
+        async fn ready_parent(
+            factory: &AgentFactory,
+        ) -> (
+            DynAgent,
+            meerkat_core::service::ParentToolCompositionAuthority,
+        ) {
+            let session = Session::new();
+            let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+            let bindings = runtime
+                .prepare_bindings(session.id().clone())
+                .await
+                .expect("parent bindings");
+            let mut build = AgentBuildConfig::new("claude-sonnet-4-5");
+            build.provider = Some(Provider::Anthropic);
+            build.llm_client_override = Some(Arc::new(meerkat_client::TestClient::default()));
+            build.resume_session = Some(session);
+            build.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings);
+            build.override_builtins = ToolCategoryOverride::Disable;
+            build.mcp_servers = vec![fixture_server(None)];
+            build.wait_for_mcp = true;
+            let mut parent = factory
+                .build_agent(build, &Config::default())
+                .await
+                .expect("a parent that waited for its server");
+            let loaded = load(&mut parent, &["echo", "add"]).await;
+            for name in ["echo", "add"] {
+                assert_eq!(
+                    resolution(&loaded, name)["accepted"],
+                    true,
+                    "the ready parent requests `{name}`: {loaded:?}"
+                );
+            }
+            turn(&mut parent, "parent boundary").await;
+            let visible = parent.tool_scope_snapshot().expect("parent scope");
+            assert!(
+                names_contain(&visible.visible_names, "echo")
+                    && names_contain(&visible.visible_names, "add"),
+                "precondition: the ready parent exposes echo and add: {visible:?}"
+            );
+            // SAFETY: factory tests use the same facade bridge token as
+            // production AgentFactory to mint a parent composition authority.
+            #[allow(unsafe_code)]
+            let authority = unsafe {
+                core_agent_factory_parent_tool_composition_authority_new(
+                    agent_factory_policy_bridge_token(),
+                    None,
+                )
+            }
+            .expect("parent composition authority");
+            // SAFETY: same sealed facade bridge token as authority creation.
+            #[allow(unsafe_code)]
+            unsafe {
+                core_agent_factory_parent_tool_composition_authority_set_tool_scope(
+                    agent_factory_policy_bridge_token(),
+                    &authority,
+                    parent.tool_scope(),
+                )
+            }
+            .expect("the parent's live ToolScope");
+            (parent, authority)
+        }
+
+        /// A child built through the factory with its own declaration of
+        /// `server` and the handed-off `ceiling`, on a fresh runtime
+        /// registration for `session`.
+        async fn build_child(
+            factory: &AgentFactory,
+            session: Session,
+            server: meerkat_core::McpServerConfig,
+            wait_for_mcp: bool,
+            ceiling: meerkat_core::InheritedToolVisibilityAuthority,
+            captured: &CapturedRequest,
+        ) -> Result<DynAgent, BuildAgentError> {
+            let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+            let bindings = runtime
+                .prepare_bindings(session.id().clone())
+                .await
+                .expect("child bindings");
+            let mut build = AgentBuildConfig::new("gpt-5.6-sol");
+            build.provider = Some(Provider::OpenAI);
+            build.llm_client_override = Some(Arc::new(CapturingLlmClient {
+                request: Arc::clone(captured),
+            }));
+            build.resume_session = Some(session);
+            build.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings);
+            build.override_builtins = ToolCategoryOverride::Disable;
+            build.mcp_servers = vec![server];
+            build.wait_for_mcp = wait_for_mcp;
+            build.initial_tool_visibility_state = Some(ceiling);
+            factory.build_agent(build, &Config::default()).await
+        }
+
+        /// The parent is ready and the child does not wait for its servers,
+        /// so the child's own connection to `fixture` is pending when its
+        /// build fits the handoff. The child keeps every witnessed ceiling
+        /// name. Before its projection of that source arrives the tool is
+        /// neither listed, requested nor called; once it arrives the tool is
+        /// requested, lists and dispatches.
+        #[tokio::test]
+        async fn a_child_keeps_a_ready_parents_mcp_tools_while_its_own_connection_is_pending() {
+            let temp = tempfile::tempdir().expect("temp root");
+            let (factory, observed) = observed_factory(temp.path());
+            let (mut parent, authority) = ready_parent(&factory).await;
+            let ceiling = authority
+                .authorize_inherited_tool_visibility_with_overlays(None, None)
+                .expect("the ready parent's inherit_parent handoff");
+            let echo_witness = ceiling
+                .witnesses()
+                .get("echo")
+                .cloned()
+                .expect("the ready parent hands off the fixture's echo");
+            assert!(
+                echo_witness
+                    .last_seen_provenance
+                    .as_ref()
+                    .is_some_and(|source| source.kind == meerkat_core::ToolSourceKind::Mcp
+                        && source.source_id.as_str() == "fixture"),
+                "the handoff witnesses echo by its exact source: {echo_witness:?}"
+            );
+
+            let gate = temp.path().join("fixture-gate");
+            let captured = CapturedRequest::default();
+            let mut child = build_child(
+                &factory,
+                Session::new(),
+                fixture_server(Some(&gate)),
+                false,
+                ceiling.clone(),
+                &captured,
+            )
+            .await
+            .expect("the child builds");
+            let adapter = last_adapter(&observed);
+
+            let pending = child.tool_scope_snapshot().expect("child scope");
+            assert!(
+                !names_contain(&pending.known_base_names, "echo"),
+                "precondition: the child's own connection is pending: {pending:?}"
+            );
+            assert_eq!(
+                &pending.base_filter,
+                ceiling.filter(),
+                "the child keeps every witnessed ceiling name while its source is pending"
+            );
+            let durable = child
+                .session()
+                .try_tool_visibility_state()
+                .expect("parse visibility")
+                .expect("a committed visibility record");
+            assert_eq!(
+                durable.filter_witnesses.get("echo"),
+                Some(&echo_witness),
+                "the durable ceiling keeps the parent's exact witness"
+            );
+
+            // Before the child's projection of `fixture` arrives.
+            let listed = listed_in_a_turn(&mut child, "before", &captured).await;
+            assert!(
+                !listed.iter().any(|name| name == "echo"),
+                "an unready tool is never listed: {listed:?}"
+            );
+            let early = load(&mut child, &["echo"]).await;
+            assert_eq!(
+                resolution(&early, "echo")["accepted"],
+                false,
+                "an unready tool cannot be requested: {early:?}"
+            );
+            let before = call(
+                &mut child,
+                "echo",
+                serde_json::json!({ "message": "before-arrival" }),
+            )
+            .await;
+            assert!(
+                matches!(
+                    refusal(&before),
+                    Some(meerkat_core::ToolError::NotFound { .. })
+                ),
+                "an unready tool is never called: {before:?}"
+            );
+
+            // The projection arrives at the child's next boundary.
+            std::fs::write(&gate, b"open").expect("open the gate");
+            assert!(
+                adapter
+                    .wait_connect_results_delivered(Duration::from_secs(30))
+                    .await,
+                "the child's connection completes"
+            );
+            turn(&mut child, "arrival").await;
+            let loaded = load(&mut child, &["echo"]).await;
+            assert_eq!(
+                resolution(&loaded, "echo")["accepted"],
+                true,
+                "the witnessed tool can be requested once its source's projection arrives: \
+                 {loaded:?}"
+            );
+            let listed = listed_in_a_turn(&mut child, "after", &captured).await;
+            assert!(
+                listed.iter().any(|name| name == "echo"),
+                "the witnessed tool lists once its source's projection arrives: {listed:?}"
+            );
+            let after = call(
+                &mut child,
+                "echo",
+                serde_json::json!({ "message": "after-arrival" }),
+            )
+            .await;
+            assert!(
+                dispatched(&after, "after-arrival"),
+                "the witnessed tool dispatches once its source's projection arrives: {after:?}"
+            );
+
+            child.release_owned_resources().await;
+            parent.release_owned_resources().await;
+        }
+
+        /// Control: a child that waits for its own servers mounts `fixture`
+        /// before its build fits the handoff, and keeps, requests, lists and
+        /// dispatches the handed-off tool.
+        #[tokio::test]
+        async fn a_waiting_child_keeps_and_lists_a_ready_parents_mcp_tools() {
+            let temp = tempfile::tempdir().expect("temp root");
+            let (factory, _observed) = observed_factory(temp.path());
+            let (mut parent, authority) = ready_parent(&factory).await;
+            let ceiling = authority
+                .authorize_inherited_tool_visibility_with_overlays(None, None)
+                .expect("the ready parent's inherit_parent handoff");
+            let captured = CapturedRequest::default();
+            let mut child = build_child(
+                &factory,
+                Session::new(),
+                fixture_server(None),
+                true,
+                ceiling.clone(),
+                &captured,
+            )
+            .await
+            .expect("the child builds");
+
+            assert_eq!(
+                &child
+                    .tool_scope_snapshot()
+                    .expect("child scope")
+                    .base_filter,
+                ceiling.filter()
+            );
+            let loaded = load(&mut child, &["echo"]).await;
+            assert_eq!(resolution(&loaded, "echo")["accepted"], true, "{loaded:?}");
+            let listed = listed_in_a_turn(&mut child, "waited", &captured).await;
+            assert!(
+                listed.iter().any(|name| name == "echo"),
+                "a waiting child lists the handed-off tool: {listed:?}"
+            );
+            let called = call(
+                &mut child,
+                "echo",
+                serde_json::json!({ "message": "waited" }),
+            )
+            .await;
+            assert!(dispatched(&called, "waited"), "{called:?}");
+
+            child.release_owned_resources().await;
+            parent.release_owned_resources().await;
+        }
+
+        /// A child whose durable ceiling witnessed the parent's MCP tools is
+        /// resumed with the retained handoff while its own connection is
+        /// pending again: the ceiling survives the reconnect, and the tool is
+        /// requested, lists and dispatches once the child reconnects.
+        #[tokio::test]
+        async fn a_resumed_child_keeps_its_witnessed_mcp_ceiling_across_a_reconnect() {
+            let temp = tempfile::tempdir().expect("temp root");
+            let (factory, observed) = observed_factory(temp.path());
+            let (mut parent, authority) = ready_parent(&factory).await;
+            let ceiling = authority
+                .authorize_inherited_tool_visibility_with_overlays(None, None)
+                .expect("the ready parent's inherit_parent handoff");
+            let captured = CapturedRequest::default();
+
+            // First life: the child waited, so its ceiling holds every name.
+            let mut first = build_child(
+                &factory,
+                Session::new(),
+                fixture_server(None),
+                true,
+                ceiling.clone(),
+                &captured,
+            )
+            .await
+            .expect("the child builds");
+            let loaded = load(&mut first, &["echo"]).await;
+            assert_eq!(resolution(&loaded, "echo")["accepted"], true, "{loaded:?}");
+            let listed = listed_in_a_turn(&mut first, "first life", &captured).await;
+            assert!(
+                listed.iter().any(|name| name == "echo"),
+                "precondition: the first life lists echo: {listed:?}"
+            );
+            assert_eq!(
+                &first
+                    .tool_scope_snapshot()
+                    .expect("first scope")
+                    .base_filter,
+                ceiling.filter(),
+                "precondition: the first life holds the whole ceiling"
+            );
+            let session = first.session().clone();
+            first.release_owned_resources().await;
+
+            // Resumed with the retained handoff; the connection is pending again.
+            let mut resumed = build_child(
+                &factory,
+                session,
+                fixture_server(None),
+                false,
+                ceiling.clone(),
+                &captured,
+            )
+            .await
+            .expect("the resume builds while the child's own connection is pending");
+            let adapter = last_adapter(&observed);
+            let pending = resumed.tool_scope_snapshot().expect("resumed scope");
+            assert!(
+                !names_contain(&pending.known_base_names, "echo"),
+                "precondition: the resumed child's connection is pending: {pending:?}"
+            );
+            assert_eq!(
+                &pending.base_filter,
+                ceiling.filter(),
+                "the resumed durable ceiling keeps every witnessed name across the reconnect"
+            );
+
+            assert!(
+                adapter
+                    .wait_connect_results_delivered(Duration::from_secs(30))
+                    .await,
+                "the resumed child reconnects"
+            );
+            turn(&mut resumed, "reconnect").await;
+            let loaded = load(&mut resumed, &["echo"]).await;
+            assert_eq!(
+                resolution(&loaded, "echo")["accepted"],
+                true,
+                "the resumed child can request the witnessed tool once it reconnects: {loaded:?}"
+            );
+            let listed = listed_in_a_turn(&mut resumed, "after reconnect", &captured).await;
+            assert!(
+                listed.iter().any(|name| name == "echo"),
+                "the resumed child lists the witnessed tool once it reconnects: {listed:?}"
+            );
+            let after = call(
+                &mut resumed,
+                "echo",
+                serde_json::json!({ "message": "after-reconnect" }),
+            )
+            .await;
+            assert!(
+                dispatched(&after, "after-reconnect"),
+                "the resumed child dispatches the witnessed tool: {after:?}"
+            );
+
+            resumed.release_owned_resources().await;
+            parent.release_owned_resources().await;
+        }
+
+        /// An actual incoming narrowing still narrows: a resumed child handed
+        /// a narrower parent snapshot while its connection is pending keeps
+        /// exactly what both ceilings allow. After the reconnect the kept tool
+        /// is requested, lists and dispatches; the narrowed-away tool, though
+        /// mounted, can be neither requested, listed nor called.
+        #[tokio::test]
+        async fn a_resumed_child_applies_an_incoming_narrowing_to_its_mcp_ceiling() {
+            let temp = tempfile::tempdir().expect("temp root");
+            let (factory, observed) = observed_factory(temp.path());
+            let (mut parent, authority) = ready_parent(&factory).await;
+            let ceiling = authority
+                .authorize_inherited_tool_visibility_with_overlays(None, None)
+                .expect("the ready parent's inherit_parent handoff");
+            assert!(
+                matches!(
+                    ceiling.filter(),
+                    meerkat_core::tool_scope::ToolFilter::Allow(names)
+                        if names.contains("echo") && names.contains("add")
+                ),
+                "precondition: the full handoff names echo and add: {:?}",
+                ceiling.filter()
+            );
+            let only_echo: std::collections::HashSet<String> =
+                ["echo".to_string()].into_iter().collect();
+            let narrowed = authority
+                .authorize_inherited_tool_visibility_with_overlays(Some(&only_echo), None)
+                .expect("the parent's narrower handoff");
+            let captured = CapturedRequest::default();
+
+            let mut first = build_child(
+                &factory,
+                Session::new(),
+                fixture_server(None),
+                true,
+                ceiling.clone(),
+                &captured,
+            )
+            .await
+            .expect("the child builds");
+            turn(&mut first, "first life").await;
+            let session = first.session().clone();
+            first.release_owned_resources().await;
+
+            let mut resumed = build_child(
+                &factory,
+                session,
+                fixture_server(None),
+                false,
+                narrowed.clone(),
+                &captured,
+            )
+            .await
+            .expect("a narrowing resume builds while the narrowed-away source is pending");
+            let adapter = last_adapter(&observed);
+            let pending = resumed.tool_scope_snapshot().expect("resumed scope");
+            assert!(
+                !names_contain(&pending.known_base_names, "echo"),
+                "precondition: the resumed child's connection is pending: {pending:?}"
+            );
+            assert_eq!(
+                &pending.base_filter,
+                narrowed.filter(),
+                "an incoming narrowing narrows the durable ceiling to what both allow"
+            );
+
+            assert!(
+                adapter
+                    .wait_connect_results_delivered(Duration::from_secs(30))
+                    .await,
+                "the resumed child reconnects"
+            );
+            turn(&mut resumed, "reconnect").await;
+            let loaded = load(&mut resumed, &["echo", "add"]).await;
+            assert_eq!(resolution(&loaded, "echo")["accepted"], true, "{loaded:?}");
+            assert_eq!(
+                resolution(&loaded, "add")["rejected_reason"],
+                "not_filterable",
+                "the narrowed-away tool cannot be requested: {loaded:?}"
+            );
+            let listed = listed_in_a_turn(&mut resumed, "after reconnect", &captured).await;
+            assert!(
+                listed.iter().any(|name| name == "echo")
+                    && !listed.iter().any(|name| name == "add"),
+                "only the kept tool lists after the reconnect: {listed:?}"
+            );
+            let kept = call(
+                &mut resumed,
+                "echo",
+                serde_json::json!({ "message": "kept-after-narrowing" }),
+            )
+            .await;
+            assert!(
+                dispatched(&kept, "kept-after-narrowing"),
+                "the kept tool dispatches: {kept:?}"
+            );
+            let narrowed_away =
+                call(&mut resumed, "add", serde_json::json!({ "a": 1, "b": 2 })).await;
+            assert!(
+                matches!(
+                    refusal(&narrowed_away),
+                    Some(meerkat_core::ToolError::AccessDenied { .. })
+                ),
+                "the narrowed-away tool is refused though the child mounts it: {narrowed_away:?}"
+            );
+
+            resumed.release_owned_resources().await;
+            parent.release_owned_resources().await;
+        }
+    }
+
+    /// A capturing client whose selected account allows at most `limit`
+    /// output tokens per request (as a Copilot account model states).
+    struct AccountCappedClient {
+        inner: CapturingLlmClient,
+        limit: u32,
+    }
+
+    #[async_trait]
+    impl LlmClient for AccountCappedClient {
+        fn output_token_limit(&self) -> Option<u32> {
+            Some(self.limit)
+        }
+
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            self.inner.project_replay_messages(messages)
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a LlmRequest,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>> {
+            self.inner.stream(request)
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            Provider::Anthropic
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// The per-turn output budget a fresh agent on `claude-fable-5`
+    /// requests through a client whose account allows at most 64_000 output
+    /// tokens, with `max_tokens` as the build's own value.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn requested_output_budget(max_tokens: Option<u32>) -> u32 {
+        let session_id = SessionId::new();
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let bindings = runtime
+            .prepare_bindings(session_id.clone())
+            .await
+            .expect("session runtime bindings");
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let mut build = AgentBuildConfig::new("claude-fable-5");
+        build.provider = Some(Provider::Anthropic);
+        build.max_tokens = max_tokens;
+        build.resume_session = Some(Session::with_id(session_id));
+        build.llm_client_override = Some(Arc::new(AccountCappedClient {
+            inner: CapturingLlmClient {
+                request: Arc::clone(&captured),
+            },
+            limit: 64_000,
+        }));
+        build.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings);
+        build.override_builtins = ToolCategoryOverride::Disable;
+
+        let temp = tempfile::tempdir().expect("temp session store");
+        let factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
+        let mut agent = factory
+            .build_agent(build, &Config::default())
+            .await
+            .expect("agent on the account-capped client");
+        agent.set_runtime_execution_kind(Some(
+            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
+        ));
+        agent
+            .run(meerkat_core::ContentInput::Text("budget".into()))
+            .await
+            .expect("agent turn");
+        let request = captured
+            .lock()
+            .expect("captured request lock")
+            .clone()
+            .expect("provider request");
+        request.max_tokens
+    }
+
+    /// An unspecified per-turn output budget is the model default bounded by
+    /// the selected account's own limit (the catalog default for
+    /// claude-fable-5 is 128_000; this account allows 64_000). An explicit
+    /// budget is kept as requested: one above the limit is the provider's to
+    /// refuse, never silently lowered.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn an_unspecified_output_budget_respects_the_account_limit() {
+        assert_eq!(requested_output_budget(None).await, 64_000);
+        assert_eq!(requested_output_budget(Some(128_000)).await, 128_000);
+        assert_eq!(requested_output_budget(Some(1_024)).await, 1_024);
+    }
+
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    mod live_member_mcp {
+        use super::*;
+        use meerkat_core::mcp_attachment::{
+            ConfiguredMcpAttachmentAuthority, LiveMcpAttachError, LiveMcpAttachment,
+            McpAttachmentAuthority, McpAttachmentOutcome, McpAttachmentRefusal,
+        };
+        use meerkat_core::mcp_config::{McpScope, McpServerConfig};
+
+        struct AllowConfigured;
+        impl ConfiguredMcpAttachmentAuthority for AllowConfigured {
+            fn authorize_configured(
+                &self,
+                _: &McpServerConfig,
+            ) -> Result<(), McpAttachmentRefusal> {
+                Ok(())
+            }
+        }
+
+        /// A prepared control for exactly `server` that allows or denies its
+        /// live apply.
+        struct Control {
+            server: McpServerConfig,
+            apply: Result<(), McpAttachmentRefusal>,
+        }
+        impl McpAttachmentAuthority for Control {
+            fn server(&self) -> &McpServerConfig {
+                &self.server
+            }
+            fn authorize_apply(&self) -> Result<(), McpAttachmentRefusal> {
+                self.apply.clone()
+            }
+            fn authorize_persist(&self, _: McpScope) -> Result<(), McpAttachmentRefusal> {
+                Err(McpAttachmentRefusal::Denied)
+            }
+        }
+
+        fn sentinel(name: &str, marker: &std::path::Path) -> McpServerConfig {
+            McpServerConfig::stdio(
+                name,
+                "/bin/sh",
+                vec!["-c".into(), format!("touch '{}'", marker.display())],
+                std::collections::HashMap::new(),
+            )
+        }
+
+        /// A fresh member with no configured MCP server, built on a session
+        /// whose bindings are governed (they carry the host's configured
+        /// attachment authority) or not.
+        async fn member(governed: bool) -> DynAgent {
+            let session = Session::new();
+            let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+            let mut bindings = runtime
+                .prepare_bindings(session.id().clone())
+                .await
+                .expect("session runtime bindings");
+            if governed {
+                bindings = bindings.__with_configured_mcp_attachment(Arc::new(AllowConfigured));
+            }
+            let mut build = AgentBuildConfig::new("claude-sonnet-4-5");
+            build.resume_session = Some(session);
+            build.llm_client_override = Some(Arc::new(meerkat_client::TestClient::default()));
+            build.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings);
+            build.override_builtins = ToolCategoryOverride::Disable;
+            let temp = tempfile::tempdir().expect("temp session store");
+            AgentFactory::new(temp.path().join("sessions"))
+                .builtins(false)
+                .build_agent(build, &Config::default())
+                .await
+                .expect("member with no configured MCP server")
+        }
+
+        async fn spawned(marker: &std::path::Path) -> bool {
+            for _ in 0..50 {
+                if marker.exists() {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            }
+            false
+        }
+
+        /// A governed member built with no configured server still owns its
+        /// construction's router, so its FIRST server attaches live: staged
+        /// with its prepared control and applied now (the server starts only
+        /// after the control allows the apply at its physical entry). A
+        /// control that denies the apply starts nothing; a control for
+        /// another descriptor is a mismatch. An ungoverned member with no
+        /// server keeps having no router and no attachment surface.
+        #[tokio::test]
+        async fn a_governed_member_without_servers_attaches_its_first_server() {
+            let markers = tempfile::tempdir().unwrap();
+            let agent = member(true).await;
+            let surface = Arc::clone(
+                agent
+                    .live_mcp_attachment()
+                    .expect("the governed member owns its router"),
+            );
+
+            let allowed = sentinel("first", &markers.path().join("first"));
+            let outcome = surface
+                .attach(LiveMcpAttachment {
+                    control: Arc::new(Control {
+                        server: allowed.clone(),
+                        apply: Ok(()),
+                    }),
+                    server: allowed,
+                    persist: None,
+                })
+                .await
+                .map(|receipt| receipt.outcome);
+            assert_eq!(
+                outcome,
+                Ok(McpAttachmentOutcome {
+                    persisted: false,
+                    staged: true,
+                })
+            );
+            assert!(
+                spawned(&markers.path().join("first")).await,
+                "the allowed first server starts"
+            );
+
+            let denied = sentinel("denied", &markers.path().join("denied"));
+            assert!(
+                surface
+                    .attach(LiveMcpAttachment {
+                        control: Arc::new(Control {
+                            server: denied.clone(),
+                            apply: Err(McpAttachmentRefusal::Denied),
+                        }),
+                        server: denied,
+                        persist: None,
+                    })
+                    .await
+                    .is_ok(),
+                "staging is not a connection claim"
+            );
+            assert!(
+                !spawned(&markers.path().join("denied")).await,
+                "a denied apply starts nothing"
+            );
+
+            let other = sentinel("other", &markers.path().join("other"));
+            assert_eq!(
+                surface
+                    .attach(LiveMcpAttachment {
+                        control: Arc::new(Control {
+                            server: sentinel("not-other", &markers.path().join("x")),
+                            apply: Ok(()),
+                        }),
+                        server: other,
+                        persist: None,
+                    })
+                    .await
+                    .map(|receipt| receipt.outcome),
+                Err(LiveMcpAttachError::Refused(McpAttachmentRefusal::Mismatch))
+            );
+            assert!(!markers.path().join("other").exists());
+
+            assert!(
+                member(false).await.live_mcp_attachment().is_none(),
+                "an ungoverned member with no server has no router"
+            );
+        }
+
+        /// A requested durable attachment whose persisted write the control
+        /// refuses stages nothing (it never becomes a live-only success),
+        /// while a separately explicit live-only request for the same
+        /// server stages it.
+        #[tokio::test]
+        async fn a_refused_persist_stages_nothing_and_live_only_is_explicit() {
+            let markers = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let agent = member(true).await;
+            let surface = Arc::clone(agent.live_mcp_attachment().expect("owned router"));
+            let server = sentinel("durable", &markers.path().join("durable"));
+            let control = || {
+                Arc::new(Control {
+                    server: server.clone(),
+                    apply: Ok(()),
+                }) as Arc<dyn McpAttachmentAuthority>
+            };
+
+            assert_eq!(
+                surface
+                    .attach(LiveMcpAttachment {
+                        control: control(),
+                        server: server.clone(),
+                        persist: Some(
+                            meerkat_core::mcp_config::McpConfigMutationAuthority::project(
+                                Some(project.path().to_path_buf()),
+                                None,
+                            )
+                        ),
+                    })
+                    .await
+                    .map(|receipt| receipt.outcome),
+                Err(LiveMcpAttachError::Refused(McpAttachmentRefusal::Denied)),
+                "the control refuses the persisted write"
+            );
+            assert!(
+                !spawned(&markers.path().join("durable")).await,
+                "a refused requested persist stages nothing"
+            );
+            assert!(
+                !project.path().join(".rkat").join("mcp.toml").exists(),
+                "nothing was written"
+            );
+
+            assert_eq!(
+                surface
+                    .attach(LiveMcpAttachment {
+                        control: control(),
+                        server,
+                        persist: None,
+                    })
+                    .await
+                    .map(|receipt| receipt.outcome),
+                Ok(McpAttachmentOutcome {
+                    persisted: false,
+                    staged: true,
+                })
+            );
+            assert!(
+                spawned(&markers.path().join("durable")).await,
+                "the explicit live-only request stages and starts it"
+            );
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -11988,6 +14147,135 @@ mod tests {
         assert_eq!(fallback_routing.session_provider, Some(Provider::OpenAI));
     }
 
+    /// A source that names no binding (served by the environment default)
+    /// falls back to a target that names none either. The target's client
+    /// resolves the realm's configured default; the switch must name that
+    /// binding in the session identity and keep its lease, as initial
+    /// construction does for a resolved default.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn fallback_from_an_unbound_source_names_the_resolved_default_binding() {
+        let primary_model = "claude-sonnet-4-5";
+        let backup_model = "custom-text-only-backup";
+        let backup_binding = configured_auth_binding("fallback_test", "default_openai");
+        let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backup_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let temp = tempfile::tempdir().unwrap();
+        let mut factory = AgentFactory::new(temp.path().join("sessions"))
+            .without_provider_auth_persistence()
+            .builtins(false);
+        factory.provider_registry = Arc::new(
+            meerkat_llm_core::provider_runtime::ProviderRuntimeRegistry::empty()
+                .with_runtime(Arc::new(ScriptedStickyFallbackProviderRuntime {
+                    provider: Provider::Anthropic,
+                    client: Arc::new(ScriptedStickyFallbackClient {
+                        provider: Provider::Anthropic,
+                        fail_recoverably: true,
+                        calls: Arc::clone(&primary_calls),
+                    }),
+                }))
+                .with_runtime(Arc::new(ScriptedStickyFallbackProviderRuntime {
+                    provider: Provider::OpenAI,
+                    client: Arc::new(ScriptedStickyFallbackClient {
+                        provider: Provider::OpenAI,
+                        fail_recoverably: false,
+                        calls: Arc::clone(&backup_calls),
+                    }),
+                })),
+        );
+
+        // Only the fallback's provider has a configured binding.
+        let mut config = Config::default();
+        config.realm.insert(
+            "fallback_test".to_string(),
+            inline_realm_section(&[("openai", "test-backup-key")]),
+        );
+        config.models.custom.insert(
+            backup_model.to_string(),
+            meerkat_core::config::CustomModelConfig {
+                provider: Provider::OpenAI,
+                display_name: Some("Text-only backup".to_string()),
+                context_window: Some(32_000),
+                max_input_tokens: None,
+                max_output_tokens: Some(4_096),
+                vision: Some(false),
+                web_search: Some(false),
+                call_timeout_secs: None,
+            },
+        );
+        config.model_fallback.enabled = Some(true);
+        config.model_fallback.policy.cross_provider = true;
+        config.model_fallback.policy.trigger_after_attempts = 1;
+        config.model_fallback.policy.require_tool_parity = false;
+        config.model_fallback.chain = vec![ModelFallbackTarget {
+            model: backup_model.to_string(),
+            provider: Some(Provider::OpenAI),
+            auth_binding: None,
+        }];
+        config.retry.max_retries = 1;
+        config.retry.initial_delay = std::time::Duration::ZERO;
+        config.retry.max_delay = std::time::Duration::ZERO;
+        config.retry.multiplier = 1.0;
+
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let session = Session::new();
+        let bindings = runtime
+            .prepare_bindings(session.id().clone())
+            .await
+            .expect("ephemeral machine should prepare real session-owned bindings");
+        let mut build = AgentBuildConfig::new(primary_model);
+        build.max_tokens = Some(1024);
+        build.provider = Some(Provider::Anthropic);
+        build.realm_id = Some(RealmId::parse("fallback_test").expect("test realm"));
+        build.resume_session = Some(session);
+        build.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings.clone());
+        build.override_builtins = ToolCategoryOverride::Disable;
+
+        let mut agent = factory
+            .build_agent(build, &config)
+            .await
+            .expect("real factory should build the fallback chain");
+        assert_eq!(
+            agent
+                .session()
+                .session_metadata()
+                .expect("canonical session metadata")
+                .llm_identity()
+                .auth_binding,
+            None,
+            "the source is served by the environment default and names no binding"
+        );
+
+        agent.set_runtime_execution_kind(Some(
+            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
+        ));
+        let result = agent
+            .run(meerkat_core::ContentInput::Text(
+                "exercise fallback".to_string(),
+            ))
+            .await
+            .expect("recoverable primary failure should retry successfully on backup");
+        assert_eq!(result.text, "backup success");
+        assert_eq!(backup_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let active_identity = agent
+            .session()
+            .session_metadata()
+            .expect("fallback should retain canonical session metadata")
+            .llm_identity();
+        assert_eq!(active_identity.model, backup_model);
+        assert_eq!(
+            active_identity.auth_binding,
+            Some(backup_binding.clone()),
+            "the switch names the binding the fallback client resolved"
+        );
+        let lease = meerkat_core::handles::LeaseKey::from_auth_binding(&backup_binding);
+        assert!(
+            bindings.auth_lease().snapshot(&lease).credential_present,
+            "the resolved default's lease is held after the switch"
+        );
+    }
+
     #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn runtime_backed_persistent_sticky_fallback_survives_authoritative_reload() {
@@ -12034,7 +14322,8 @@ mod tests {
             )
             .expect("construct runtime authority");
             let (service, adapter) =
-                crate::surface::build_runtime_backed_service(builder, 4, persistence);
+                crate::surface::build_runtime_backed_service(builder, 4, persistence)
+                    .expect("compose the runtime-backed service");
             let service = Arc::new(service);
             let session = Session::new();
             session_id = session.id().clone();
@@ -12209,7 +14498,8 @@ mod tests {
         )
         .expect("construct runtime authority");
         let (restart_service, restart_adapter) =
-            crate::surface::build_runtime_backed_service(restart_builder, 4, restart_persistence);
+            crate::surface::build_runtime_backed_service(restart_builder, 4, restart_persistence)
+                .expect("compose the runtime-backed service");
         let restart_service = Arc::new(restart_service);
         assert!(
             !restart_adapter.contains_session(&session_id).await,
@@ -12387,7 +14677,8 @@ mod tests {
         )
         .expect("construct runtime authority");
         let (service, adapter) =
-            crate::surface::build_runtime_backed_service(builder, 4, persistence);
+            crate::surface::build_runtime_backed_service(builder, 4, persistence)
+                .expect("compose the runtime-backed service");
         let service = Arc::new(service);
         let session = Session::new();
         let session_id = session.id().clone();
@@ -15151,6 +17442,110 @@ mod tests {
         assert_eq!(snapshot.generation, 0);
     }
 
+    /// A self-hosted controller (authless or with a static secret) carries
+    /// its actual selected target, so native setup pins it with its real
+    /// route facts and a credential readiness that needs nothing more.
+    #[cfg(all(feature = "openai", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn a_self_hosted_controller_pins_with_its_resolved_target() {
+        for authless in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
+            let _calls = if authless {
+                install_authless_self_hosted_runtime(&mut factory)
+            } else {
+                install_recording_self_hosted_runtime(&mut factory)
+            };
+            let mut config = config_with_self_hosted_server(SelfHostedServerConfig {
+                transport: SelfHostedTransport::OpenAiCompatible,
+                base_url: "http://127.0.0.1:11434".to_string(),
+                api_style: SelfHostedApiStyle::ChatCompletions,
+            });
+            insert_self_hosted_realm_binding(
+                &mut config,
+                "dev",
+                "dev_local",
+                "http://realm.example/v1",
+                if authless {
+                    CredentialSourceSpec::ManagedStore
+                } else {
+                    CredentialSourceSpec::InlineSecret {
+                        secret: "realm-token".to_string(),
+                    }
+                },
+            );
+            if authless {
+                config
+                    .realm
+                    .get_mut("dev")
+                    .unwrap()
+                    .auth
+                    .get_mut("dev_local_auth")
+                    .unwrap()
+                    .auth_method = "none".to_string();
+            }
+
+            let session = Session::new();
+            let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+            let bindings = runtime
+                .prepare_bindings(session.id().clone())
+                .await
+                .unwrap();
+            let mut build = AgentBuildConfig::new("gemma-4-e2b");
+            build.provider = Some(Provider::SelfHosted);
+            build.realm_id = Some(RealmId::parse("dev").unwrap());
+            build.resume_session = Some(session);
+            build.runtime_build_mode =
+                meerkat_core::RuntimeBuildMode::SessionOwned(bindings.clone());
+            build.override_builtins = ToolCategoryOverride::Disable;
+
+            let (_agent, controller) = factory
+                .build_agent_with_controller(build, &config)
+                .await
+                .unwrap_or_else(|error| panic!("authless={authless}: {error}"));
+            let selection = controller.selection();
+            assert_eq!(selection.provider(), Provider::SelfHosted);
+            assert_eq!(selection.model(), "gemma-4-e2b");
+            assert_eq!(selection.self_hosted_server_id(), Some("local"));
+            let binding = selection
+                .auth_binding()
+                .expect("the resolved durable binding");
+            assert_eq!(binding.realm.as_str(), "dev");
+            assert_eq!(binding.binding.as_str(), "dev_local");
+            assert_eq!(
+                selection.credential(),
+                &meerkat_core::AuthCredentialIdentity::Binding(binding.clone())
+            );
+            // The resolved connection's own auth decides the requirement
+            // native admission reads: only the authless route needs no lease.
+            assert_eq!(
+                selection.credential_requirement(),
+                if authless {
+                    meerkat_core::ControllerCredentialRequirement::Authless
+                } else {
+                    meerkat_core::ControllerCredentialRequirement::Required
+                },
+                "authless={authless}"
+            );
+            let facts = controller
+                .client()
+                .controller_model_facts()
+                .expect("request-free route facts");
+            assert_eq!(facts.selection(), selection);
+            assert_eq!(facts.wire_model(), "gemma4:e2b");
+            assert!(
+                facts.endpoint().starts_with("http://realm.example/v1"),
+                "{}",
+                facts.endpoint()
+            );
+            controller
+                .client()
+                .prepare_controller_credential()
+                .await
+                .unwrap_or_else(|error| panic!("authless={authless}: {error}"));
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn factory_accepts_local_machine_bindings_for_pre_authoritative_mob_resources() {
@@ -15277,6 +17672,7 @@ mod tests {
                     last_seen_provenance: Some(meerkat_core::ToolProvenance {
                         kind: meerkat_core::ToolSourceKind::Callback,
                         source_id: "deferred_existing".into(),
+                        artifact: None,
                     }),
                 },
             )]
@@ -15289,6 +17685,7 @@ mod tests {
                         last_seen_provenance: Some(meerkat_core::ToolProvenance {
                             kind: meerkat_core::ToolSourceKind::Callback,
                             source_id: "old_parent".into(),
+                            artifact: None,
                         }),
                     },
                 ),
@@ -15298,6 +17695,7 @@ mod tests {
                         last_seen_provenance: Some(meerkat_core::ToolProvenance {
                             kind: meerkat_core::ToolSourceKind::Callback,
                             source_id: "active_secret".into(),
+                            artifact: None,
                         }),
                     },
                 ),
@@ -15307,6 +17705,7 @@ mod tests {
                         last_seen_provenance: Some(meerkat_core::ToolProvenance {
                             kind: meerkat_core::ToolSourceKind::Callback,
                             source_id: "staged_visible".into(),
+                            artifact: None,
                         }),
                     },
                 ),
@@ -17739,6 +20138,10 @@ mod tests {
             "configured [shell] program must reach the composed shell tool (stdout {stdout_program:?})"
         );
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::panic)]
+    mod prepared_controller;
 }
 
 impl AgentFactory {
@@ -17937,6 +20340,7 @@ mod prompt_tests {
                             meerkat_core::ToolProvenance {
                                 kind: meerkat_core::ToolSourceKind::Callback,
                                 source_id: "registered".into(),
+                                artifact: None,
                             },
                         )
                     } else {
@@ -18027,11 +20431,11 @@ mod prompt_tests {
             .iter()
             .map(|name| {
                 Arc::new(ToolDef {
-                    audience: Default::default(),
                     name: (*name).into(),
                     description: format!("{name} tool"),
                     input_schema: serde_json::json!({ "type": "object" }),
                     provenance: None,
+                    audience: Default::default(),
                 })
             })
             .collect::<Vec<_>>()
@@ -18058,14 +20462,15 @@ mod prompt_tests {
             .iter()
             .map(|(name, description)| {
                 Arc::new(ToolDef {
-                    audience: Default::default(),
                     name: (*name).into(),
                     description: (*description).to_string(),
                     input_schema: serde_json::json!({ "type": "object" }),
                     provenance: Some(meerkat_core::ToolProvenance {
                         kind: meerkat_core::ToolSourceKind::Mob,
                         source_id: "mob".into(),
+                        artifact: None,
                     }),
+                    audience: Default::default(),
                 })
             })
             .collect::<Vec<_>>()
@@ -18501,18 +20906,18 @@ mod prompt_tests {
         let temp = tempfile::tempdir().unwrap();
         let factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
         let secret = Arc::new(ToolDef {
-            audience: Default::default(),
             name: "secret_lookup".into(),
             description: "Look up a secret value".to_string(),
             input_schema: serde_json::json!({"type":"object"}),
             provenance: None,
+            audience: Default::default(),
         });
         let secret_audit = Arc::new(ToolDef {
-            audience: Default::default(),
             name: "secret_audit".into(),
             description: "Audit a secret value".to_string(),
             input_schema: serde_json::json!({"type":"object"}),
             provenance: None,
+            audience: Default::default(),
         });
         let dispatcher = UsageTestDispatcher {
             tools: vec![Arc::clone(&secret), Arc::clone(&secret_audit)].into(),
@@ -18549,11 +20954,11 @@ mod prompt_tests {
         let temp = tempfile::tempdir().unwrap();
         let factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
         let visible = Arc::new(ToolDef {
-            audience: Default::default(),
             name: "visible".into(),
             description: "Always-inline tool".to_string(),
             input_schema: serde_json::json!({"type":"object"}),
             provenance: None,
+            audience: Default::default(),
         });
         let dispatcher = UsageTestDispatcher {
             tools: vec![Arc::clone(&visible)].into(),
@@ -18606,11 +21011,11 @@ mod prompt_tests {
         let temp = tempfile::tempdir().unwrap();
         let factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
         let secret = Arc::new(ToolDef {
-            audience: Default::default(),
             name: "secret_lookup".into(),
             description: "Look up a secret value".to_string(),
             input_schema: serde_json::json!({"type":"object"}),
             provenance: None,
+            audience: Default::default(),
         });
         let dispatcher = UsageTestDispatcher {
             tools: vec![Arc::clone(&secret)].into(),
@@ -18913,5 +21318,925 @@ mod memory_vocabulary_tests {
             super::MEMORY_TOOL_NAMES,
             meerkat_memory::MemorySearchDispatcher::tool_names()
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod prepared_agent_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct NeverLlm;
+
+    #[async_trait::async_trait]
+    impl LlmClient for NeverLlm {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            _request: &'a meerkat_client::LlmRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = Result<meerkat_client::LlmEvent, meerkat_client::LlmError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(futures::stream::empty())
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Other
+        }
+
+        async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
+            Ok(())
+        }
+    }
+
+    struct AllowAll;
+    impl meerkat_core::ToolConsequencePolicySnapshot for AllowAll {
+        fn provenance(&self) -> meerkat_core::PolicyEvaluationProvenance {
+            meerkat_core::PolicyEvaluationProvenance {
+                revision: meerkat_core::PolicyRevision(1),
+                digest: meerkat_core::PolicyDigest::from_canonical_bytes(b"allow-all"),
+            }
+        }
+
+        fn evaluate(
+            &self,
+            _request: &meerkat_core::ToolConsequenceRequest,
+        ) -> meerkat_core::ToolConsequenceVerdict {
+            meerkat_core::ToolConsequenceVerdict::Allow
+        }
+    }
+
+    /// A host policy provider that counts the snapshots it is asked for.
+    struct CountingProvider {
+        id: meerkat_core::PolicyProviderId,
+        snapshots: Arc<AtomicUsize>,
+    }
+    impl meerkat_core::ToolConsequenceNarrowingPolicy for CountingProvider {
+        fn provider_id(&self) -> &meerkat_core::PolicyProviderId {
+            &self.id
+        }
+
+        fn generation(&self) -> meerkat_core::PolicyProviderGeneration {
+            meerkat_core::PolicyProviderGeneration(1)
+        }
+
+        fn snapshot(
+            &self,
+            _policy_id: &meerkat_core::PolicyId,
+        ) -> Result<
+            Arc<dyn meerkat_core::ToolConsequencePolicySnapshot>,
+            meerkat_core::ToolConsequenceFailure,
+        > {
+            self.snapshots.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(AllowAll))
+        }
+    }
+
+    fn build() -> AgentBuildConfig {
+        let mut build = AgentBuildConfig::new("prepared-surface-model");
+        build.llm_client_override = Some(Arc::new(NeverLlm));
+        build.override_builtins = ToolCategoryOverride::Enable;
+        build.backend = Some(meerkat_core::RecoveryBackendKind::Memory);
+        build
+    }
+
+    fn governed(provider: &str, snapshots: &Arc<AtomicUsize>) -> AgentBuildConfig {
+        let mut build = build();
+        build.mob_member_binding = Some(meerkat_core::MobMemberBinding {
+            mob_id: "mob".into(),
+            role: "worker".into(),
+            member: "worker-1".into(),
+        });
+        build.tool_consequence_policy_registry = Some(Arc::new(
+            meerkat_core::ToolConsequencePolicyRegistry::new(
+                vec![Arc::new(CountingProvider {
+                    id: meerkat_core::PolicyProviderId::new("host").unwrap(),
+                    snapshots: Arc::clone(snapshots),
+                })],
+                meerkat_core::PolicyEvaluationSupervisorConfig::default(),
+                None,
+            )
+            .unwrap(),
+        ));
+        build.application_tool_policy = meerkat_core::ApplicationToolPolicyBinding::Provider {
+            provider_id: meerkat_core::PolicyProviderId::new(provider).unwrap(),
+            policy_id: meerkat_core::PolicyId::new("member-tools").unwrap(),
+        };
+        build
+    }
+
+    fn selection(provider: &str, surface: &PreparedToolSurface) -> ToolSurfaceSelection {
+        ToolSurfaceSelection {
+            binding: meerkat_core::ApplicationToolPolicyBinding::Provider {
+                provider_id: meerkat_core::PolicyProviderId::new(provider).unwrap(),
+                policy_id: meerkat_core::PolicyId::new("member-tools").unwrap(),
+            },
+            compiled_against: surface.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_prepared_surface_is_the_construction_the_finished_agent_serves() {
+        let factory = AgentFactory::minimal().builtins(true);
+        let config = Config::default();
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let prepared = factory
+            .prepare_agent(governed("host", &snapshots), &config)
+            .await
+            .expect("prepared");
+        let surface = prepared.tool_surface().clone();
+        assert!(!surface.tools.is_empty(), "the builtins are composed");
+        assert!(
+            surface
+                .projected
+                .iter()
+                .all(|identity| surface.tools.contains(identity)),
+            "the projection narrows the upper bound"
+        );
+        assert!(
+            surface
+                .tools
+                .iter()
+                .all(|identity| identity.provenance.is_some()),
+            "provenance is reported as constructed: {surface:?}"
+        );
+        if let PreparedToolCatalog::Complete(entries) = &surface.catalog {
+            for identity in &surface.tools {
+                assert!(
+                    entries.iter().any(|entry| &entry.identity == identity),
+                    "a complete catalog holds every composed tool"
+                );
+            }
+        }
+        let (agent, controller) = factory
+            .finish_agent(prepared, selection("host", &surface))
+            .await
+            .expect("finished");
+        assert!(controller.is_none());
+        let served: Vec<_> = agent
+            .visible_tool_defs()
+            .iter()
+            .map(meerkat_core::ToolDef::identity)
+            .collect();
+        assert!(!served.is_empty());
+        for identity in &served {
+            assert!(
+                surface.projected.contains(identity),
+                "the finished agent serves the projected surface: {identity:?}"
+            );
+        }
+        assert_eq!(
+            agent
+                .session()
+                .session_metadata()
+                .unwrap()
+                .tooling
+                .application_tool_policy,
+            selection("host", &surface).binding,
+            "the session records the selected policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_binds_only_the_selection_made_from_this_construction() {
+        let factory = AgentFactory::minimal().builtins(true);
+        let config = Config::default();
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let prepared = factory
+            .prepare_agent(governed("host", &snapshots), &config)
+            .await
+            .expect("prepared");
+        assert_eq!(
+            snapshots.load(Ordering::SeqCst),
+            0,
+            "preparation reads no policy"
+        );
+        let surface = prepared.tool_surface().clone();
+        factory
+            .finish_agent(prepared, selection("host", &surface))
+            .await
+            .expect("finished");
+        assert_eq!(
+            snapshots.load(Ordering::SeqCst),
+            1,
+            "finish binds the selection once"
+        );
+
+        // A selection compiled against another surface never binds.
+        let prepared = factory
+            .prepare_agent(governed("host", &snapshots), &config)
+            .await
+            .expect("prepared");
+        let mut other = prepared.tool_surface().clone();
+        other.tools.pop();
+        match factory
+            .finish_agent(prepared, selection("host", &other))
+            .await
+        {
+            Ok(_) => panic!("a selection made from another surface must not finish"),
+            Err(BuildAgentError::Config(message)) => {
+                assert!(
+                    message.contains("not made from this construction"),
+                    "{message}"
+                );
+            }
+            Err(other) => panic!("unexpected refusal: {other}"),
+        }
+        assert_eq!(snapshots.load(Ordering::SeqCst), 1, "nothing was bound");
+
+        // An unmanaged or unresolved selection cannot downgrade the
+        // governed construction.
+        for binding in [
+            meerkat_core::ApplicationToolPolicyBinding::Unmanaged,
+            meerkat_core::ApplicationToolPolicyBinding::Inherit,
+        ] {
+            let prepared = factory
+                .prepare_agent(governed("host", &snapshots), &config)
+                .await
+                .expect("prepared");
+            let compiled_against = prepared.tool_surface().clone();
+            match factory
+                .finish_agent(
+                    prepared,
+                    ToolSurfaceSelection {
+                        binding,
+                        compiled_against,
+                    },
+                )
+                .await
+            {
+                Ok(_) => panic!("a governed construction must finish under a provider binding"),
+                Err(BuildAgentError::Config(message)) => {
+                    assert!(message.contains("resolved provider binding"), "{message}");
+                }
+                Err(other) => panic!("unexpected refusal: {other}"),
+            }
+        }
+
+        // A selected provider that does not bind refuses the finish.
+        let prepared = factory
+            .prepare_agent(governed("host", &snapshots), &config)
+            .await
+            .expect("prepared");
+        let surface = prepared.tool_surface().clone();
+        match factory
+            .finish_agent(prepared, selection("absent", &surface))
+            .await
+        {
+            Ok(_) => panic!("an unbindable selection must refuse the finish"),
+            Err(BuildAgentError::Config(message)) => assert!(
+                message.contains("application tool policy binding failed"),
+                "{message}"
+            ),
+            Err(other) => panic!("unexpected refusal: {other}"),
+        }
+
+        // The same build completed in one step binds the policy it names.
+        let complete = Arc::new(AtomicUsize::new(0));
+        factory
+            .build_agent(governed("host", &complete), &config)
+            .await
+            .expect("built");
+        assert_eq!(complete.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn preparation_requires_the_governed_member_and_registry() {
+        let factory = AgentFactory::minimal().builtins(true);
+        match factory.prepare_agent(build(), &Config::default()).await {
+            Ok(_) => panic!("an ungoverned preparation must be refused"),
+            Err(BuildAgentError::Config(message)) => {
+                assert!(message.contains("requires MobMemberBinding"), "{message}");
+            }
+            Err(other) => panic!("unexpected refusal: {other}"),
+        }
+    }
+
+    /// A gate that records the surfaces it decided and selects or refuses.
+    struct RecordingGate {
+        decided: std::sync::Mutex<Vec<PreparedToolSurface>>,
+        refuse: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::ToolSurfaceGate for RecordingGate {
+        async fn decide(
+            &self,
+            surface: &PreparedToolSurface,
+        ) -> Result<ToolSurfaceSelection, meerkat_core::ToolSurfaceRefusal> {
+            self.decided.lock().unwrap().push(surface.clone());
+            if self.refuse {
+                Err(meerkat_core::ToolSurfaceRefusal::new("not this surface"))
+            } else {
+                Ok(selection("host", surface))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gated_build_is_decided_on_its_one_construction() {
+        let factory = AgentFactory::minimal().builtins(true);
+        let config = Config::default();
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let gate = RecordingGate {
+            decided: Default::default(),
+            refuse: false,
+        };
+        let agent = factory
+            .build_agent_through_surface_gate(governed("host", &snapshots), &config, &gate)
+            .await
+            .expect("selected");
+        let decided = gate.decided.lock().unwrap().clone();
+        assert_eq!(decided.len(), 1, "decided once, before the agent existed");
+        assert_eq!(
+            snapshots.load(Ordering::SeqCst),
+            1,
+            "the selection was bound"
+        );
+        for identity in agent
+            .visible_tool_defs()
+            .iter()
+            .map(meerkat_core::ToolDef::identity)
+        {
+            assert!(decided[0].contains(&identity));
+        }
+
+        let refusing = RecordingGate {
+            decided: Default::default(),
+            refuse: true,
+        };
+        match factory
+            .build_agent_through_surface_gate(governed("host", &snapshots), &config, &refusing)
+            .await
+        {
+            Ok(_) => panic!("a refused surface builds no agent"),
+            Err(BuildAgentError::Config(message)) => {
+                assert!(message.contains("not this surface"), "{message}");
+            }
+            Err(other) => panic!("unexpected refusal: {other}"),
+        }
+        assert_eq!(refusing.decided.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_aborted_preparation_builds_nothing() {
+        let factory = AgentFactory::minimal().builtins(true);
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let prepared = factory
+            .prepare_agent(governed("host", &snapshots), &Config::default())
+            .await
+            .expect("prepared");
+        prepared.abort().await;
+        assert_eq!(snapshots.load(Ordering::SeqCst), 0);
+    }
+
+    /// The trusted host's composer receives the construction's exact MCP
+    /// adapter, session and member before publication, and what it returns
+    /// is what the construction publishes; a refusal fails the build and
+    /// shuts that adapter down.
+    #[cfg(all(
+        feature = "test-mcp-oauth-fixtures",
+        feature = "mcp",
+        not(target_arch = "wasm32")
+    ))]
+    #[tokio::test]
+    async fn the_mcp_adapter_composer_sees_the_exact_adapter_before_publication() {
+        type Composed = (
+            Arc<meerkat_mcp::McpRouterAdapter>,
+            meerkat_core::types::SessionId,
+            Option<meerkat_core::MobMemberBinding>,
+        );
+        struct Recording {
+            composed: std::sync::Mutex<Vec<Composed>>,
+            refuse: bool,
+        }
+        impl McpAdapterComposer for Recording {
+            fn compose(
+                &self,
+                adapter: &Arc<meerkat_mcp::McpRouterAdapter>,
+                session_id: &meerkat_core::types::SessionId,
+                member: Option<&meerkat_core::MobMemberBinding>,
+            ) -> Result<Arc<dyn AgentToolDispatcher>, McpAdapterComposeRefusal> {
+                self.composed.lock().unwrap().push((
+                    Arc::clone(adapter),
+                    session_id.clone(),
+                    member.cloned(),
+                ));
+                if self.refuse {
+                    return Err(McpAdapterComposeRefusal::new("not this installation"));
+                }
+                Ok(Arc::new(Hiding(Arc::clone(adapter))))
+            }
+        }
+        /// Publishes none of the adapter's tools but forwards its updates:
+        /// proves the returned dispatcher, not the raw adapter, is published.
+        struct Hiding(Arc<meerkat_mcp::McpRouterAdapter>);
+        #[async_trait::async_trait]
+        impl AgentToolDispatcher for Hiding {
+            fn tools(&self) -> Arc<[Arc<meerkat_core::ToolDef>]> {
+                Arc::from(Vec::new())
+            }
+            async fn dispatch(
+                &self,
+                call: meerkat_core::ToolCallView<'_>,
+            ) -> Result<meerkat_core::ops::ToolDispatchOutcome, meerkat_core::error::ToolError>
+            {
+                Err(meerkat_core::error::ToolError::not_found(call.name))
+            }
+            async fn poll_external_updates(&self) -> meerkat_core::ExternalToolUpdate {
+                self.0.poll_external_updates().await
+            }
+        }
+        let observed: Arc<std::sync::Mutex<Vec<Arc<meerkat_mcp::McpRouterAdapter>>>> =
+            Arc::default();
+        let observer = Arc::clone(&observed);
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let mcp_build = || {
+            let mut build = governed("host", &snapshots);
+            build.mcp_servers = vec![meerkat_core::McpServerConfig::stdio(
+                "fixture",
+                mcp_test_server::fixture_binary()
+                    .to_string_lossy()
+                    .to_string(),
+                Vec::new(),
+                std::collections::HashMap::new(),
+            )];
+            build.wait_for_mcp = true;
+            build
+        };
+        let composer = Arc::new(Recording {
+            composed: Default::default(),
+            refuse: false,
+        });
+        let factory = AgentFactory::minimal()
+            .builtins(true)
+            .with_mcp_router_observer_for_test(move |adapter| {
+                observer.lock().unwrap().push(adapter);
+            })
+            .with_mcp_adapter_composer(Arc::clone(&composer) as Arc<dyn McpAdapterComposer>);
+        let prepared = factory
+            .prepare_agent(mcp_build(), &Config::default())
+            .await
+            .expect("prepared");
+        let adapter = Arc::clone(observed.lock().unwrap().last().expect("observed"));
+        {
+            let composed = composer.composed.lock().unwrap();
+            assert_eq!(composed.len(), 1, "composed once, for this construction");
+            let (composed_adapter, _session, member) = &composed[0];
+            assert!(Arc::ptr_eq(composed_adapter, &adapter), "the exact adapter");
+            assert_eq!(
+                member.as_ref().map(|member| member.member.as_str()),
+                Some("worker-1")
+            );
+        }
+        assert!(
+            !adapter.tools().is_empty(),
+            "the adapter itself is connected"
+        );
+        assert!(
+            prepared
+                .tool_surface()
+                .tools
+                .iter()
+                .all(|tool| !adapter.tools().iter().any(|mcp| mcp.name == tool.name)),
+            "the composed dispatcher, not the raw adapter, is published"
+        );
+        prepared.abort().await;
+
+        let refusing = Arc::new(Recording {
+            composed: Default::default(),
+            refuse: true,
+        });
+        let observer = Arc::clone(&observed);
+        let factory = AgentFactory::minimal()
+            .builtins(true)
+            .with_mcp_router_observer_for_test(move |adapter| {
+                observer.lock().unwrap().push(adapter);
+            })
+            .with_mcp_adapter_composer(Arc::clone(&refusing) as Arc<dyn McpAdapterComposer>);
+        match factory.prepare_agent(mcp_build(), &Config::default()).await {
+            Ok(_) => panic!("a refused composition builds nothing"),
+            Err(BuildAgentError::McpSetup(message)) => {
+                assert!(message.contains("not this installation"), "{message}");
+            }
+            Err(other) => panic!("unexpected refusal: {other}"),
+        }
+        let refused = Arc::clone(observed.lock().unwrap().last().expect("observed"));
+        assert_eq!(refusing.composed.lock().unwrap().len(), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while refused.observe_operation("fixture", "echo").await
+                != meerkat_core::McpOperationObservation::Retired
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the refused construction's router is shut down");
+    }
+
+    /// A session-owned construction installs its MCP adapter into its
+    /// registration's observation slot only when it finishes; a finished
+    /// rebuild without MCP ends that installation; a refused finish installs
+    /// nothing.
+    #[cfg(all(
+        feature = "test-mcp-oauth-fixtures",
+        feature = "mcp",
+        not(target_arch = "wasm32")
+    ))]
+    #[tokio::test]
+    async fn a_finished_session_owned_construction_installs_its_observed_adapter() {
+        use meerkat_core::McpOperationObservation as Observation;
+        let observed: Arc<std::sync::Mutex<Vec<Arc<meerkat_mcp::McpRouterAdapter>>>> =
+            Arc::default();
+        let observer = Arc::clone(&observed);
+        let factory = AgentFactory::minimal()
+            .builtins(true)
+            .with_mcp_router_observer_for_test(move |adapter| {
+                observer.lock().unwrap().push(adapter);
+            });
+        let config = Config::default();
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let registration = || async {
+            let session = Session::new();
+            let bindings = runtime
+                .prepare_bindings(session.id().clone())
+                .await
+                .unwrap();
+            (session, bindings)
+        };
+        let mcp_build = |session: &Session, bindings: &meerkat_core::SessionRuntimeBindings| {
+            let mut build = governed("host", &snapshots);
+            build.mcp_servers = vec![meerkat_core::McpServerConfig::stdio(
+                "fixture",
+                mcp_test_server::fixture_binary()
+                    .to_string_lossy()
+                    .to_string(),
+                Vec::new(),
+                std::collections::HashMap::new(),
+            )];
+            build.wait_for_mcp = true;
+            build.resume_session = Some(session.clone());
+            build.runtime_build_mode =
+                meerkat_core::RuntimeBuildMode::SessionOwned(bindings.clone());
+            build
+        };
+
+        let (session, bindings) = registration().await;
+        let slot = bindings
+            .mcp_observation_slot()
+            .cloned()
+            .expect("the registration's slot");
+        let prepared = factory
+            .prepare_agent(mcp_build(&session, &bindings), &config)
+            .await
+            .expect("prepared");
+        assert!(
+            slot.current().is_none(),
+            "a prepared construction is not installed"
+        );
+        let surface = prepared.tool_surface().clone();
+        let (mut agent, _) = factory
+            .finish_agent(prepared, selection("host", &surface))
+            .await
+            .expect("finished");
+        let installed = slot
+            .current()
+            .and_then(|(_, observer)| observer)
+            .expect("the finished adapter is installed");
+        assert!(
+            matches!(
+                installed.observe_operation("fixture", "echo").await,
+                Observation::Callable { .. }
+            ),
+            "the installed observer is the connected adapter"
+        );
+        // The agent's owner ending it releases the router it was handed.
+        agent.release_owned_resources().await;
+        assert_eq!(
+            installed.observe_operation("fixture", "echo").await,
+            Observation::Retired,
+            "ending the agent releases this construction's own adapter"
+        );
+
+        // An aborted rebuild keeps the installation; a finished rebuild for
+        // the same registration without declarative MCP servers ends it.
+        let plain = || {
+            let mut plain = governed("host", &snapshots);
+            plain.resume_session = Some(session.clone());
+            plain.runtime_build_mode =
+                meerkat_core::RuntimeBuildMode::SessionOwned(bindings.clone());
+            plain
+        };
+        let (current, _) = slot.current().expect("installed");
+        factory
+            .prepare_agent(plain(), &config)
+            .await
+            .expect("prepared rebuild")
+            .abort()
+            .await;
+        assert!(
+            slot.is_current(current),
+            "an aborted preparation keeps the installation"
+        );
+        let prepared = factory
+            .prepare_agent(plain(), &config)
+            .await
+            .expect("prepared rebuild");
+        let surface = prepared.tool_surface().clone();
+        let (_rebuilt, _) = factory
+            .finish_agent(prepared, selection("host", &surface))
+            .await
+            .expect("finished rebuild");
+        assert!(
+            slot.current().is_none(),
+            "a rebuild without MCP leaves no earlier adapter observed"
+        );
+
+        let (session, bindings) = registration().await;
+        let slot = bindings
+            .mcp_observation_slot()
+            .cloned()
+            .expect("the registration's slot");
+        let prepared = factory
+            .prepare_agent(mcp_build(&session, &bindings), &config)
+            .await
+            .expect("prepared");
+        let mut other = prepared.tool_surface().clone();
+        other.tools.pop();
+        assert!(
+            factory
+                .finish_agent(prepared, selection("host", &other))
+                .await
+                .is_err()
+        );
+        assert!(
+            slot.current().is_none(),
+            "a refused finish installs nothing"
+        );
+    }
+
+    /// One registration rebuilds with the same declarative MCP server after
+    /// each way a construction can end: a refused finish, an abort, a drop and
+    /// a finished construction whose adapter was shut down. Each ended
+    /// router releases only its own lineage of the registration's surface, so
+    /// the surface stays open and holds no server nothing serves.
+    #[cfg(all(
+        feature = "test-mcp-oauth-fixtures",
+        feature = "mcp",
+        not(target_arch = "wasm32")
+    ))]
+    #[tokio::test]
+    async fn a_registration_rebuilds_with_the_same_mcp_server() {
+        use meerkat_core::McpOperationObservation as Observation;
+        let observed: Arc<std::sync::Mutex<Vec<Arc<meerkat_mcp::McpRouterAdapter>>>> =
+            Arc::default();
+        let observer = Arc::clone(&observed);
+        let factory = AgentFactory::minimal()
+            .builtins(true)
+            .with_mcp_router_observer_for_test(move |adapter| {
+                observer.lock().unwrap().push(adapter);
+            });
+        let config = Config::default();
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let session = Session::new();
+        let bindings = runtime
+            .prepare_bindings(session.id().clone())
+            .await
+            .unwrap();
+        let slot = bindings
+            .mcp_observation_slot()
+            .cloned()
+            .expect("the registration's slot");
+        let mcp_build = || {
+            let mut build = governed("host", &snapshots);
+            build.mcp_servers = vec![meerkat_core::McpServerConfig::stdio(
+                "fixture",
+                mcp_test_server::fixture_binary()
+                    .to_string_lossy()
+                    .to_string(),
+                Vec::new(),
+                std::collections::HashMap::new(),
+            )];
+            build.wait_for_mcp = true;
+            build.resume_session = Some(session.clone());
+            build.runtime_build_mode =
+                meerkat_core::RuntimeBuildMode::SessionOwned(bindings.clone());
+            build
+        };
+        let last = || Arc::clone(observed.lock().unwrap().last().expect("observed"));
+        let released = |adapter: Arc<meerkat_mcp::McpRouterAdapter>| async move {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while adapter.observe_operation("fixture", "echo").await != Observation::Retired {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the ended construction's router is shut down");
+        };
+        let nothing_left_active = || {
+            let entry = bindings.external_tool_surface().surface_snapshot("fixture");
+            assert_ne!(
+                entry.and_then(|entry| entry.base_state),
+                Some(meerkat_core::ExternalToolSurfaceBaseState::Active),
+                "an ended router leaves no server active that nothing serves"
+            );
+        };
+
+        // A refused finish.
+        let prepared = factory
+            .prepare_agent(mcp_build(), &config)
+            .await
+            .expect("first construction");
+        let mut other = prepared.tool_surface().clone();
+        other.tools.pop();
+        assert!(
+            factory
+                .finish_agent(prepared, selection("host", &other))
+                .await
+                .is_err()
+        );
+        released(last()).await;
+        nothing_left_active();
+
+        // An abort.
+        factory
+            .prepare_agent(mcp_build(), &config)
+            .await
+            .expect("construction after a refused finish")
+            .abort()
+            .await;
+        released(last()).await;
+        nothing_left_active();
+
+        // A drop.
+        drop(
+            factory
+                .prepare_agent(mcp_build(), &config)
+                .await
+                .expect("construction after an abort"),
+        );
+        released(last()).await;
+        nothing_left_active();
+
+        // A finished construction, then its adapter shut down.
+        let prepared = factory
+            .prepare_agent(mcp_build(), &config)
+            .await
+            .expect("construction after a drop");
+        let surface = prepared.tool_surface().clone();
+        let (_finished, _) = factory
+            .finish_agent(prepared, selection("host", &surface))
+            .await
+            .expect("finished");
+        let finished = last();
+        assert!(matches!(
+            finished.observe_operation("fixture", "echo").await,
+            Observation::Callable { .. }
+        ));
+        finished.shutdown().await;
+        nothing_left_active();
+
+        // The successor connects the same server on the same registration.
+        let prepared = factory
+            .prepare_agent(mcp_build(), &config)
+            .await
+            .expect("construction after a finished one ended");
+        let surface = prepared.tool_surface().clone();
+        let (_successor, _) = factory
+            .finish_agent(prepared, selection("host", &surface))
+            .await
+            .expect("successor finished");
+        let installed = slot
+            .current()
+            .and_then(|(_, observer)| observer)
+            .expect("the successor is installed");
+        assert!(matches!(
+            installed.observe_operation("fixture", "echo").await,
+            Observation::Callable { .. }
+        ));
+        assert_eq!(
+            bindings
+                .external_tool_surface()
+                .surface_snapshot("fixture")
+                .and_then(|entry| entry.base_state),
+            Some(meerkat_core::ExternalToolSurfaceBaseState::Active)
+        );
+        assert_eq!(
+            bindings
+                .external_tool_surface()
+                .diagnostic_snapshot()
+                .surface_phase,
+            meerkat_core::ExternalToolSurfaceGlobalPhase::Operating,
+            "no ended router shut the registration's surface"
+        );
+    }
+
+    /// An MCP construction abandoned by a refused finish, by dropping the
+    /// preparation, or by dropping it mid-preparation has its connections
+    /// shut down: awaited by the refused finish, started as a task by a drop.
+    #[cfg(all(
+        feature = "test-mcp-oauth-fixtures",
+        feature = "mcp",
+        not(target_arch = "wasm32")
+    ))]
+    #[tokio::test]
+    async fn abandoned_mcp_constructions_shut_their_connections_down() {
+        let adapters: Arc<std::sync::Mutex<Vec<Arc<meerkat_mcp::McpRouterAdapter>>>> =
+            Arc::default();
+        let observed = Arc::clone(&adapters);
+        let factory = AgentFactory::minimal()
+            .builtins(true)
+            .with_mcp_router_observer_for_test(move |adapter| {
+                observed.lock().unwrap().push(adapter);
+            });
+        let config = Config::default();
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let mcp_build = || {
+            let mut build = governed("host", &snapshots);
+            build.mcp_servers = vec![meerkat_core::McpServerConfig::stdio(
+                "fixture",
+                mcp_test_server::fixture_binary()
+                    .to_string_lossy()
+                    .to_string(),
+                Vec::new(),
+                std::collections::HashMap::new(),
+            )];
+            build.wait_for_mcp = true;
+            build
+        };
+        let connected = |adapter: &meerkat_mcp::McpRouterAdapter| !adapter.tools().is_empty();
+
+        // A refused finish awaits the shutdown before it returns.
+        let prepared = factory
+            .prepare_agent(mcp_build(), &config)
+            .await
+            .expect("prepared");
+        let adapter = Arc::clone(adapters.lock().unwrap().last().expect("observed"));
+        assert!(connected(&adapter), "the construction connected its server");
+        let mut other = prepared.tool_surface().clone();
+        other.tools.pop();
+        assert!(
+            factory
+                .finish_agent(prepared, selection("host", &other))
+                .await
+                .is_err(),
+            "refused"
+        );
+        assert!(
+            !connected(&adapter),
+            "the refused finish shut the connection down"
+        );
+
+        // A dropped preparation starts its shutdown.
+        let prepared = factory
+            .prepare_agent(mcp_build(), &config)
+            .await
+            .expect("prepared");
+        let adapter = Arc::clone(adapters.lock().unwrap().last().expect("observed"));
+        assert!(connected(&adapter));
+        drop(prepared);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while connected(&adapter) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the dropped preparation's connection is shut down");
+
+        // A preparation abandoned while it waits for its server, after the
+        // construction owns the router and before it returns, shuts it down.
+        let before = adapters.lock().unwrap().len();
+        let preparing = factory.prepare_agent(mcp_build(), &config);
+        tokio::select! {
+            biased;
+            _ = preparing => panic!("the preparation was to be abandoned while connecting"),
+            () = async {
+                while adapters.lock().unwrap().len() == before {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            } => {}
+        }
+        let adapter = Arc::clone(adapters.lock().unwrap().last().expect("observed"));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while adapter.tool_name_collisions().await.is_ok() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the abandoned preparation's router is shut down");
     }
 }

@@ -84,7 +84,8 @@ async fn build_service(
         4,
         persistence,
         root.join("config_state.json"),
-    );
+    )
+    .expect("compose the runtime-backed service");
     (service, adapter)
 }
 

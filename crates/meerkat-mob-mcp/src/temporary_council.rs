@@ -1303,6 +1303,15 @@ impl TemporaryCouncilCoordinator {
     ) -> Result<Admission, TemporaryCouncilError> {
         let mut validated = validated.clone();
         let council_id = validated.request.council_id.clone();
+        // A state standing down admits no new council run; admitted before
+        // the claim, so a refusal leaves no durable trace, and held until the
+        // run is the state's own task, so a stand-down cannot settle while
+        // this admission writes.
+        let Some(_admission) = self.state.state_tasks.admit("council admission") else {
+            return Err(TemporaryCouncilError::CoordinatorUnavailable {
+                detail: format!("council {council_id} not run: this mob state has stood down"),
+            });
+        };
 
         let store = self.store();
         let record = match store
@@ -1447,44 +1456,57 @@ impl TemporaryCouncilCoordinator {
         };
 
         let state = self.state.clone();
-        // OWNED task: the caller's await may be dropped; this may not.
-        tokio::spawn(async move {
-            let guard = InflightGuard::new(state.clone(), key);
-            let council_id = record.council_id.clone();
-            let supervised = {
-                let run = CouncilRun {
-                    state: state.clone(),
-                    validated,
-                    record,
-                    host_bootstrap,
-                    claim: claim.clone(),
+        let tasks = self.state.clone();
+        // OWNED task: the caller's await may be dropped; this may not. A
+        // stand-down joins it and never aborts it.
+        let admitted = tasks.state_tasks.spawn(
+            crate::state_tasks::StateTaskKind::Owned,
+            "temporary council run",
+            async move {
+                let guard = InflightGuard::new(state.clone(), key);
+                let council_id = record.council_id.clone();
+                let supervised = {
+                    let run = CouncilRun {
+                        state: state.clone(),
+                        validated,
+                        record,
+                        host_bootstrap,
+                        claim: claim.clone(),
+                    };
+                    // A panic inside execution must not be a silent hang: it is
+                    // caught here, converted to a typed terminal, and then sealed
+                    // by the SAME supervisor that would have sealed a crash.
+                    std::panic::AssertUnwindSafe(run.execute())
+                        .catch_unwind()
+                        .await
                 };
-                // A panic inside execution must not be a silent hang: it is
-                // caught here, converted to a typed terminal, and then sealed
-                // by the SAME supervisor that would have sealed a crash.
-                std::panic::AssertUnwindSafe(run.execute())
-                    .catch_unwind()
-                    .await
-            };
-            let published: CouncilPublish = Arc::new(match supervised {
-                Ok(outcome) => outcome,
-                Err(panic) => {
-                    let detail = panic_detail(&panic);
-                    tracing::error!(
-                        council_id = %council_id,
-                        detail = %detail,
-                        "temporary council execution panicked; sealing an interrupted terminal"
-                    );
-                    supervise_panicked_council(&state, &council_id, &claim, &detail).await
-                }
+                let published: CouncilPublish = Arc::new(match supervised {
+                    Ok(outcome) => outcome,
+                    Err(panic) => {
+                        let detail = panic_detail(&panic);
+                        tracing::error!(
+                            council_id = %council_id,
+                            detail = %detail,
+                            "temporary council execution panicked; sealing an interrupted terminal"
+                        );
+                        supervise_panicked_council(&state, &council_id, &claim, &detail).await
+                    }
+                });
+                // Release the reservation BEFORE publishing. The outcome is
+                // durably sealed by now, so a caller that arrives after a joined
+                // caller has its answer must replay the record rather than join
+                // this finished execution and be told it ran it.
+                drop(guard);
+                let _ = tx.send(Some(published));
+            },
+        );
+        if admitted.is_none() {
+            // Sealed between the admission check and the claim: the claim's
+            // lease expires and a later coordinator takes the council over.
+            return Err(TemporaryCouncilError::CoordinatorUnavailable {
+                detail: format!("council {council_id} not run: this mob state has stood down"),
             });
-            // Release the reservation BEFORE publishing. The outcome is
-            // durably sealed by now, so a caller that arrives after a joined
-            // caller has its answer must replay the record rather than join
-            // this finished execution and be told it ran it.
-            drop(guard);
-            let _ = tx.send(Some(published));
-        });
+        }
 
         Ok(Admission::Join(rx))
     }
@@ -3721,7 +3743,23 @@ async fn cleanup_council(
         }
     }
 
-    let temporary_mob_destroyed = if temporary.is_some() {
+    let temporary_present = temporary.is_some();
+    // The destroy drains the temporary mob's database observer, which a
+    // handle held here would still own: release it first.
+    drop(temporary);
+    // A temporary mob this state no longer manages may be one it destroyed
+    // whose storage cleanup is still owed. Only that same (console) destroy
+    // continues it; it is never read as the mob being gone.
+    let retained = if temporary_present || temporary_lookup_error.is_some() {
+        crate::RetiredDestroyLookup::Ordinary
+    } else {
+        state
+            .retired_destroy_lookup(&record.temporary_mob_id, &crate::MobDestroyCaller::Console)
+            .await
+    };
+    let temporary_mob_destroyed = if temporary_present
+        || matches!(retained, crate::RetiredDestroyLookup::Caller(_))
+    {
         // Per-mob storage removal is owned by MobMcpState destroy semantics.
         match budget_remaining(state, budget) {
             Some(remaining) => {
@@ -3758,10 +3796,18 @@ async fn cleanup_council(
         }
     } else if temporary_lookup_error.is_some() {
         false
+    } else if matches!(retained, crate::RetiredDestroyLookup::OtherCaller) {
+        debts.push(TemporaryCouncilCleanupDebt {
+            subject: format!("mob:{}", record.temporary_mob_id),
+            detail: "the temporary mob's storage cleanup is owed to the caller that destroyed it"
+                .to_string(),
+        });
+        false
     } else {
         // `handle_for` performs durable restoration before returning
-        // `MobNotFound`; authoritative absence therefore proves the mob was
-        // already destroyed or never reached creation.
+        // `MobNotFound`, and this state owes no cleanup of it; authoritative
+        // absence therefore proves the mob was already destroyed or never
+        // reached creation.
         true
     };
 

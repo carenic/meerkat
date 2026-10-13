@@ -18,9 +18,11 @@
 #[cfg(not(target_arch = "wasm32"))]
 pub use meerkat_core::session_hosting::spawn_blocking_holding_claim;
 pub use meerkat_core::session_hosting::{
-    ColdDeliveryOwnership, HostingCapability, HostingClaim, HostingClaimUnavailable, HostingOwner,
-    HostingPaths, HostingRefused, ServedElsewhere, SessionHostingAuthority, SessionServing,
-    grant_session_hosting, local_session_serving, try_cold_delivery_ownership, with_write_hosting,
+    ColdDeliveryOwnership, HostingAcquisition, HostingCapability, HostingClaim,
+    HostingClaimUnavailable, HostingOwner, HostingOwnerLossProof, HostingPaths, HostingRefused,
+    OwnerLossAttachment, OwnerLossReservation, ServedElsewhere, SessionHostingAuthority,
+    SessionServing, grant_session_hosting, local_session_serving, try_cold_delivery_ownership,
+    with_write_hosting,
 };
 
 /// [`HostingCapability::OsLock`] over `paths`, unless the OS lock cannot be

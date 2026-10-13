@@ -7198,7 +7198,14 @@ impl MeerkatMachine {
         session_id: &SessionId,
         error: &crate::completion::CompletionWaitError,
     ) -> Result<RuntimeCompletionWaitFailureAuthority, RuntimeDriverError> {
-        let failure = error.wait_failure_observation();
+        // A refused result disclosure is not a waiter failure: the input
+        // completed and its cleanup ran. Surfaces report it themselves.
+        let Some(failure) = error.wait_failure_observation() else {
+            return Err(RuntimeDriverError::ValidationFailed {
+                reason: "a refused result disclosure is not a completion waiter failure"
+                    .to_string(),
+            });
+        };
         let input =
             crate::meerkat_machine::dsl::MeerkatMachineInput::ResolveRuntimeCompletionWaitFailure {
                 session_id: crate::meerkat_machine::dsl::SessionId::from_domain(session_id),
@@ -15025,18 +15032,48 @@ impl MeerkatMachine {
         session_id: &SessionId,
         channel_id: &meerkat_live::LiveChannelId,
     ) -> Result<Option<meerkat_core::SessionLlmIdentity>, RuntimeDriverError> {
+        Ok(self
+            .live_channel_binding(session_id, channel_id)
+            .await?
+            .map(crate::live_execution::LiveChannelBinding::into_identity))
+    }
+
+    /// The current generated binding of `channel_id` on `session_id`: the
+    /// identity admitted at open plus the execution profile admitted for the
+    /// channel. `None` when the channel is not bound to the session. Absence
+    /// of a profile is the generated fact that the channel follows its
+    /// session's identity; it is never inferred from identity inequality.
+    #[cfg(feature = "live")]
+    pub async fn live_channel_binding(
+        &self,
+        session_id: &SessionId,
+        channel_id: &meerkat_live::LiveChannelId,
+    ) -> Result<Option<crate::live_execution::LiveChannelBinding>, RuntimeDriverError> {
         let state = self.session_dsl_state(session_id).await.map_err(|reason| {
             RuntimeDriverError::ValidationFailed {
                 reason: reason.to_string(),
             }
         })?;
-        state
+        let channel = channel_id.to_string();
+        if state.live_channel_session_by_channel.get(&channel) != Some(&session_id.to_string()) {
+            return Ok(None);
+        }
+        let Some(identity) = state
             .live_channel_identity_by_channel
-            .get(&channel_id.to_string())
+            .get(&channel)
             .cloned()
-            .map(meerkat_core::SessionLlmIdentity::try_from)
-            .transpose()
-            .map_err(RuntimeDriverError::Internal)
+        else {
+            return Ok(None);
+        };
+        let identity = meerkat_core::SessionLlmIdentity::try_from(identity)
+            .map_err(RuntimeDriverError::Internal)?;
+        Ok(Some(crate::live_execution::LiveChannelBinding::new(
+            identity,
+            state
+                .live_execution_profile_by_channel
+                .get(&channel)
+                .cloned(),
+        )))
     }
 
     #[cfg(feature = "live")]
@@ -16490,6 +16527,27 @@ impl MeerkatMachine {
             .map(|_| ())
     }
 
+    /// A failure after an exact-run cancel was accepted keeps that fact: the
+    /// generated transition already recorded the run's turn
+    /// `cancel_after_boundary`, so the run ends at its next boundary whatever
+    /// happened to the live delivery. Report the outcome as owned by the
+    /// run's recorded cancel, never as a run that ended before it. Ambient
+    /// cancellation keeps its error as is.
+    fn accepted_exact_cancel_failure(
+        requested_run_id: Option<&meerkat_core::RunId>,
+        error: RuntimeDriverError,
+    ) -> RuntimeDriverError {
+        match requested_run_id {
+            Some(run_id) => RuntimeDriverError::InterruptDispatchOutcomeUnknown {
+                run_id: run_id.clone(),
+                reason: format!(
+                    "the run's boundary cancel is recorded in its turn state; its live delivery failed: {error}"
+                ),
+            },
+            None => error,
+        }
+    }
+
     pub(super) async fn cancel_after_boundary_inner_for_incarnation(
         &self,
         session_id: &SessionId,
@@ -16643,6 +16701,30 @@ impl MeerkatMachine {
             let staged = match staged_result {
                 Ok(staged) => staged,
                 Err(_) => {
+                    // The exact-run arms accept only a cancellable turn. A
+                    // refusal for the still-current run whose turn already
+                    // ended is native proof that the run ended before the
+                    // cancel; nothing was recorded or dispatched.
+                    if let Some(requested_run_id) = requested_run_id {
+                        let authority = captured_dsl_authority
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let state = authority.state();
+                        if state.current_run_id
+                            == Some(crate::meerkat_machine::dsl::RunId::from_domain(
+                                requested_run_id,
+                            ))
+                            && matches!(
+                                state.turn_phase,
+                                crate::meerkat_machine::dsl::TurnPhase::Ready
+                                    | crate::meerkat_machine::dsl::TurnPhase::Completed
+                                    | crate::meerkat_machine::dsl::TurnPhase::Failed
+                                    | crate::meerkat_machine::dsl::TurnPhase::Cancelled
+                            )
+                        {
+                            return Ok(false);
+                        }
+                    }
                     // Stage-first classification (dispatch_user_interrupt
                     // shape): the machine rejected the input; a Destroyed
                     // binding surfaces as the terminal `Destroyed` truth,
@@ -16721,9 +16803,12 @@ impl MeerkatMachine {
                     &captured_dsl_authority,
                     dispatch_generation,
                 )?;
-                return Err(RuntimeDriverError::NotReady {
-                    state: RuntimeState::Destroyed,
-                });
+                return Err(Self::accepted_exact_cancel_failure(
+                    requested_run_id,
+                    RuntimeDriverError::NotReady {
+                        state: RuntimeState::Destroyed,
+                    },
+                ));
             };
             if !Arc::ptr_eq(&entry.mutation_gate, &captured_session_gate)
                 || !Arc::ptr_eq(&entry.dsl_authority, &captured_dsl_authority)
@@ -16733,10 +16818,13 @@ impl MeerkatMachine {
                     &captured_dsl_authority,
                     dispatch_generation,
                 )?;
-                return Err(RuntimeDriverError::StaleAuthority {
-                    reason: "boundary-cancel runtime session authority changed while staging"
-                        .to_string(),
-                });
+                return Err(Self::accepted_exact_cancel_failure(
+                    requested_run_id,
+                    RuntimeDriverError::StaleAuthority {
+                        reason: "boundary-cancel runtime session authority changed while staging"
+                            .to_string(),
+                    },
+                ));
             }
             let Some(attachment_id) = entry.live_attachment_id() else {
                 drop(sessions);
@@ -16744,9 +16832,12 @@ impl MeerkatMachine {
                     &captured_dsl_authority,
                     dispatch_generation,
                 )?;
-                return Err(RuntimeDriverError::NotReady {
-                    state: RuntimeState::Idle,
-                });
+                return Err(Self::accepted_exact_cancel_failure(
+                    requested_run_id,
+                    RuntimeDriverError::NotReady {
+                        state: RuntimeState::Idle,
+                    },
+                ));
             };
             let Some(effect_tx) = entry.effect_sender() else {
                 drop(sessions);
@@ -16754,9 +16845,12 @@ impl MeerkatMachine {
                     &captured_dsl_authority,
                     dispatch_generation,
                 )?;
-                return Err(RuntimeDriverError::NotReady {
-                    state: RuntimeState::Idle,
-                });
+                return Err(Self::accepted_exact_cancel_failure(
+                    requested_run_id,
+                    RuntimeDriverError::NotReady {
+                        state: RuntimeState::Idle,
+                    },
+                ));
             };
             (
                 member_lease,
@@ -16796,7 +16890,8 @@ impl MeerkatMachine {
                 requested_run_id.is_some(),
                 "CancelAfterBoundary",
             )
-            .await?;
+            .await
+            .map_err(|error| Self::accepted_exact_cancel_failure(requested_run_id, error))?;
         drop(gate_guard);
         Ok(true)
     }
@@ -17226,6 +17321,10 @@ impl MeerkatMachine {
                 Retry,
             }
 
+            // Bound before the member-effect authority so that it drops after
+            // it: a committed cancellation is told once M is released, even
+            // if a later step fails.
+            let mut runless_terminal = self.runless_terminal_announcement();
             let authority = self
                 .lock_member_effect_authority(session_id, expected_member)
                 .await?;
@@ -17274,6 +17373,7 @@ impl MeerkatMachine {
                                         );
                                     return Err(error);
                                 }
+                                runless_terminal.owe();
                                 let candidate_owner_input_id = crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
                                 Action::PublishQueued {
                                     driver: driver.clone(),
@@ -17322,6 +17422,10 @@ impl MeerkatMachine {
                     // publication IO so replacement is never pinned behind a
                     // wedged callback.
                     drop(authority);
+                    // The abandoned input's terminal is durable and readable:
+                    // tell the host before publication, whose failure leaves
+                    // it terminal all the same.
+                    runless_terminal.release();
                     let publication = if let Some((result_rx, start_tx)) = dispatch {
                         if let Some(start_tx) = start_tx {
                             let _ = start_tx.send(());
@@ -17471,6 +17575,10 @@ impl MeerkatMachine {
                 Retry,
             }
 
+            // Bound before the driver gate so that it drops after it: a
+            // committed cancellation is told once M is released, even if a
+            // later step fails.
+            let mut runless_terminal = self.runless_terminal_announcement();
             let authority = match self
                 .lock_current_session_driver_gate(session_id, &driver)
                 .await
@@ -17522,6 +17630,7 @@ impl MeerkatMachine {
                                 .rollback_prepared_runless_interaction_terminal_outboxes(prepared);
                             return Err(error);
                         }
+                        runless_terminal.owe();
                         let candidate_owner_input_id = crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
                         Action::PublishQueued {
                             completions,
@@ -17602,6 +17711,10 @@ impl MeerkatMachine {
                         _ => None,
                     };
                     drop(authority);
+                    // The abandoned input's terminal is durable and readable:
+                    // tell the host before publication, whose failure leaves
+                    // it terminal all the same.
+                    runless_terminal.release();
                     let publication = if let Some((result_rx, start_tx)) = dispatch {
                         if let Some(start_tx) = start_tx {
                             let _ = start_tx.send(());

@@ -151,6 +151,15 @@ impl NativeChild {
         if self.try_wait()?.is_some() {
             return Ok(());
         }
+        self.start_kill_without_reap()
+    }
+
+    /// Request direct-child termination without reaping an exited child, so
+    /// its PID, and any process group it leads, stays held until wait or drop.
+    pub fn start_kill_without_reap(&mut self) -> io::Result<()> {
+        if self.status.is_some() {
+            return Ok(());
+        }
         if let Some(pid) = self.pid {
             // SAFETY: Only this owner reaps the child, so its PID cannot be reused.
             if unsafe { libc::kill(pid, libc::SIGKILL) } == -1 {

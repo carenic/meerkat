@@ -100,10 +100,13 @@ impl MeerkatMachine {
         })
     }
 
+    /// Realize Reset under the caller's M, owing `runless_terminal` the
+    /// inputs it abandons. The caller took the announcement before M.
     async fn realize_reset_under_mutation_guard(
         &self,
         session_id: &SessionId,
         driver: &SharedDriver,
+        runless_terminal: &mut super::RunlessTerminalAnnouncement,
     ) -> Result<MutationGuardedResetCommit, RuntimeControlPlaneError> {
         let reason = "runtime reset";
         let (completion_input_ids, prepared_terminals) = {
@@ -134,7 +137,7 @@ impl MeerkatMachine {
         }
 
         let mut drv = driver.lock().await;
-        let report = match machine_reset(&mut drv).await {
+        let report = match machine_reset(&mut drv, runless_terminal).await {
             Ok(report) => report,
             Err(err) => {
                 drv.rollback_prepared_runless_interaction_terminal_outboxes(prepared_terminals);
@@ -210,8 +213,13 @@ impl MeerkatMachine {
                 runtime_id: LogicalRuntimeId::for_session(&lease.session_id),
             });
         }
+        // No active input: this reset abandons nothing and owes nothing.
         let committed = self
-            .realize_reset_under_mutation_guard(&lease.session_id, &driver)
+            .realize_reset_under_mutation_guard(
+                &lease.session_id,
+                &driver,
+                &mut super::RunlessTerminalAnnouncement::default(),
+            )
             .await
             .map_err(|error| RuntimeDriverError::Internal(error.to_string()))?;
         debug_assert!(committed.completion_input_ids.is_empty());
@@ -306,6 +314,12 @@ impl MeerkatMachine {
         > = match command {
             MeerkatMachineCommand::Ingest { runtime_id, input } => {
                 crate::stack_relief::box_in_own_frame(|| async move {
+                    // Bound before every native guard of this admission so
+                    // that it drops after them: a queued input this admission
+                    // coalesces or supersedes is told once they are released,
+                    // or, when M moves into the accepted boundary work, by that
+                    // work once it has released M.
+                    let mut runless_terminal = self.runless_terminal_announcement();
                     let credential_custody = ingest_custody.ok_or_else(|| {
                         RuntimeControlPlaneError::Internal(
                             "owned direct-ingest transaction requires acquired credential custody"
@@ -623,6 +637,7 @@ impl MeerkatMachine {
                                 &completions,
                                 displaced_input_id,
                                 &result,
+                                &mut runless_terminal,
                             )
                             .await;
                             if !Self::accept_outcome_matches_preview(&preview_result, &result) {
@@ -697,6 +712,7 @@ impl MeerkatMachine {
                             wake_tx,
                             signal.should_wake(),
                             fallback_wake,
+                            runless_terminal,
                         );
                     } else {
                         fallback_wake.disarm();
@@ -873,6 +889,10 @@ impl MeerkatMachine {
                     // replacement while waiting can reset A's driver while
                     // applying B's DSL transition.
                     let (session_id, _, _, _) = self.lookup_entry(&runtime_id).await?;
+                    // Bound before every M this reset takes, so that the
+                    // inputs it abandons are told after M is released, even
+                    // when their publication later fails.
+                    let mut runless_terminal = self.runless_terminal_announcement();
                     loop {
                         let gate_guard = self
                             .lock_current_durability_ready_session_mutation_gate(&session_id)
@@ -951,7 +971,11 @@ impl MeerkatMachine {
                         }
 
                         let committed = self
-                            .realize_reset_under_mutation_guard(&session_id, &driver)
+                            .realize_reset_under_mutation_guard(
+                                &session_id,
+                                &driver,
+                                &mut runless_terminal,
+                            )
                             .await?;
                         let dispatch = match (
                             committed.candidate_owner_input_id.as_ref(),
@@ -977,6 +1001,7 @@ impl MeerkatMachine {
                             (None, _) => None,
                         };
                         drop(gate_guard);
+                        runless_terminal.release();
                         if let Some((result_rx, start_tx)) = dispatch {
                             if let Some(start_tx) = start_tx {
                                 let _ = start_tx.send(());
@@ -1088,6 +1113,10 @@ impl MeerkatMachine {
                         &session_id,
                     )
                     .await?;
+                    // Bound before L and M so that it drops after both: the
+                    // inputs this destroy abandons are told once both are
+                    // released, even when a later step fails.
+                    let mut runless_terminal = self.runless_terminal_announcement();
                     #[cfg(feature = "live")]
                     let live_lifecycle_lease = self
                         .acquire_member_live_disposal_lease(&session_id)
@@ -1201,10 +1230,15 @@ impl MeerkatMachine {
                     match Box::pin(machine_commit_prepared_destroy(
                         &mut drv,
                         prepared_destroy.lifecycle,
+                        &mut runless_terminal,
                     ))
                     .await
                     {
-                        Ok(()) => {}
+                        Ok(()) => {
+                            if report.inputs_abandoned > 0 {
+                                runless_terminal.owe();
+                            }
+                        }
                         Err(err) => {
                             drv.rollback_prepared_runless_interaction_terminal_outboxes(
                                 prepared_terminals,
@@ -1260,6 +1294,7 @@ impl MeerkatMachine {
                     drop(mutation_guard);
                     #[cfg(feature = "live")]
                     drop(live_lifecycle_lease);
+                    runless_terminal.release();
                     let publication_result =
                         if let Some((result_rx, start_tx)) = publication_dispatch {
                             if let Some(start_tx) = start_tx {

@@ -542,7 +542,8 @@ fn canonicalize_message_images_for_digest_in_place(message: &mut Message) {
             for block in &mut notice.blocks {
                 match block {
                     crate::types::SystemNoticeBlock::Comms { content, .. }
-                    | crate::types::SystemNoticeBlock::ExternalEvent { content, .. } => {
+                    | crate::types::SystemNoticeBlock::ExternalEvent { content, .. }
+                    | crate::types::SystemNoticeBlock::RuntimeNotice { content, .. } => {
                         canonicalize_digest_image_blocks(content);
                     }
                     _ => {}
@@ -565,7 +566,8 @@ fn canonicalize_message_raw_json_for_digest_in_place(message: &mut Message) {
             for block in &mut notice.blocks {
                 match block {
                     crate::types::SystemNoticeBlock::Comms { content, .. }
-                    | crate::types::SystemNoticeBlock::ExternalEvent { content, .. } => {
+                    | crate::types::SystemNoticeBlock::ExternalEvent { content, .. }
+                    | crate::types::SystemNoticeBlock::RuntimeNotice { content, .. } => {
                         canonicalize_digest_structured_blocks(content);
                     }
                     _ => {}
@@ -3604,6 +3606,19 @@ pub struct SessionBuildState {
     pub mob_tool_authority_context: Option<MobToolAuthorityContext>,
     #[serde(default, skip_serializing_if = "is_default_call_timeout_override")]
     pub call_timeout_override: crate::CallTimeoutOverride,
+    /// Accepted per-session MCP attachment requests a restarted host
+    /// re-stages through the native attachment owners. Requests, never
+    /// permits: no credential, token or prepared control is recorded.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::mcp_session_intent::deserialize_recorded_intents"
+    )]
+    pub mcp_attachment_intents: Vec<crate::mcp_session_intent::McpSessionAttachmentIntent>,
+    /// The last revision any of this session's MCP attachment intents took.
+    /// Kept across removal so a revision is never reused.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub mcp_attachment_intent_revision: u64,
 }
 
 /// Deferred create-time prompt staged for the next turn.
@@ -8175,6 +8190,28 @@ impl Session {
         self.set_build_state(build_state)
     }
 
+    /// Apply one change to the session's recorded MCP attachment intents in
+    /// its durable build state.
+    pub fn apply_mcp_attachment_intent_mutation(
+        &mut self,
+        mutation: crate::mcp_session_intent::McpAttachmentIntentMutation,
+    ) -> Result<crate::mcp_session_intent::McpAttachmentIntentRecorded, String> {
+        let mut build_state = self
+            .build_state()
+            .ok_or_else(|| format!("session {} is missing session build state", self.id))?;
+        let recorded = crate::mcp_session_intent::apply_mcp_attachment_intent_mutation(
+            &mut build_state.mcp_attachment_intents,
+            &mut build_state.mcp_attachment_intent_revision,
+            mutation,
+        )
+        .map_err(|error| error.to_string())?;
+        if recorded.changed {
+            self.set_build_state(build_state)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(recorded)
+    }
+
     /// Load the in-memory generated mob operator authority, if still present.
     ///
     /// Stored/deserialized contexts deliberately fail this check and are not
@@ -9011,7 +9048,7 @@ pub fn try_lifecycle_terminal_from_map(
 
 /// Typed metadata-only view of a persisted session row or snapshot.
 ///
-/// The metadata read seam's currency (mobkit ask-24 clause 3): carries the
+/// The metadata read seam's currency (meta ask-24 clause 3): carries the
 /// session identity plus the two typed session-authority metadata facts,
 /// decoded fail-closed through the canonical map-level decoders. Consumers
 /// that only need ownership/policy/lifecycle facts read this view instead of
@@ -15815,6 +15852,308 @@ mod tests {
     }
 
     #[test]
+    fn mcp_attachment_intents_persist_in_the_session_build_state() {
+        let mut session = Session::new();
+        session
+            .set_build_state(SessionBuildState::default())
+            .expect("default build state");
+        let descriptor = crate::McpAttachmentDescriptorIdentity {
+            server_name: "docs".to_string(),
+            target: crate::McpAttachmentTarget::Http {
+                location: "https://docs.example/mcp".to_string(),
+                withheld: false,
+                binding: None,
+            },
+            oauth_account: Some("acct-1".to_string()),
+            oauth_account_selection: None,
+            connector_account: None,
+        };
+        let recorded = session
+            .apply_mcp_attachment_intent_mutation(crate::McpAttachmentIntentMutation::Request {
+                descriptor: descriptor.clone(),
+            })
+            .expect("record the request");
+        assert_eq!(
+            recorded.revision,
+            Some(crate::MCP_ATTACHMENT_REVISION_BASE + 1)
+        );
+
+        // The record survives the session's durable encoding.
+        let encoded = serde_json::to_value(&session).expect("encode session");
+        let restored: Session = serde_json::from_value(encoded).expect("decode session");
+        let intents = restored
+            .build_state()
+            .expect("build state")
+            .mcp_attachment_intents;
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].descriptor, descriptor);
+        assert_eq!(
+            intents[0].disposition,
+            crate::McpAttachmentIntentDisposition::Requested
+        );
+
+        // Withdrawal clears it; a no-op withdrawal changes nothing.
+        let mut session = restored;
+        let withdrawn = session
+            .apply_mcp_attachment_intent_mutation(crate::McpAttachmentIntentMutation::Withdraw {
+                server_name: "docs".to_string(),
+            })
+            .expect("withdraw");
+        assert!(withdrawn.changed);
+        assert!(
+            session
+                .build_state()
+                .expect("build state")
+                .mcp_attachment_intents
+                .is_empty()
+        );
+        let again = session
+            .apply_mcp_attachment_intent_mutation(crate::McpAttachmentIntentMutation::Withdraw {
+                server_name: "docs".to_string(),
+            })
+            .expect("withdraw again");
+        assert!(!again.changed);
+
+        // The revision counter survives removal and the durable encoding, so
+        // the next request of the name never reuses a revision.
+        let encoded = serde_json::to_value(&session).expect("encode session");
+        let mut session: Session = serde_json::from_value(encoded).expect("decode session");
+        let rerequested = session
+            .apply_mcp_attachment_intent_mutation(crate::McpAttachmentIntentMutation::Request {
+                descriptor,
+            })
+            .expect("request again");
+        assert_eq!(
+            rerequested.revision,
+            Some(crate::MCP_ATTACHMENT_REVISION_BASE + 2)
+        );
+    }
+
+    #[test]
+    fn predecessor_mcp_attachment_intents_decode_as_renewal_required_and_never_reuse_revisions() {
+        use crate::{McpAttachmentIntentDisposition as Disposition, McpAttachmentIntentMutation};
+        let mut session = Session::new();
+        let mut state = serde_json::to_value(SessionBuildState::default()).expect("encode");
+        // Literal predecessor rows: command-only stdio, raw-URL HTTP and a
+        // realm/slot/account-only connector, with no session counter.
+        state["mcp_attachment_intents"] = serde_json::json!([
+            {
+                "descriptor": {
+                    "server_name": "local",
+                    "target": { "kind": "stdio", "command": "python" }
+                },
+                "disposition": "suppressed_by_logout",
+                "revision": 2
+            },
+            {
+                "descriptor": {
+                    "server_name": "docs",
+                    "target": { "kind": "http", "url": "https://u:p@docs.example/mcp?k=v" },
+                    "oauth_account": "acct-1"
+                },
+                "disposition": "requested",
+                "revision": 1
+            },
+            {
+                "descriptor": {
+                    "server_name": "mail",
+                    "target": { "kind": "stdio", "command": "mail-mcp" },
+                    "connector_account": { "realm_id": "r", "slot_id": "s", "account": "a" }
+                },
+                "disposition": "requested",
+                "revision": 3
+            }
+        ]);
+        session.set_metadata_unchecked(SESSION_BUILD_STATE_KEY, state);
+
+        // The session's build state still decodes; every predecessor row is
+        // kept by name, disposition and revision but proves no target.
+        let restored = session
+            .try_build_state()
+            .expect("predecessor rows never fail the build state")
+            .expect("build state");
+        assert_eq!(restored.mcp_attachment_intent_revision, 0);
+        let rows: Vec<_> = restored
+            .mcp_attachment_intents
+            .iter()
+            .map(|row| {
+                (
+                    row.descriptor.server_name.as_str(),
+                    row.disposition,
+                    row.revision,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("local", Disposition::SuppressedByLogout, 2),
+                ("docs", Disposition::Requested, 1),
+                ("mail", Disposition::Requested, 3),
+            ]
+        );
+        for row in &restored.mcp_attachment_intents {
+            assert_eq!(
+                row.descriptor.target,
+                crate::McpAttachmentTarget::Predecessor
+            );
+            assert!(!row.descriptor.target.is_exact());
+        }
+        let encoded = serde_json::to_string(&restored).expect("encode");
+        assert!(!encoded.contains("u:p@") && !encoded.contains("k=v"));
+
+        // Withdraw, re-request and suppress the same name: the callback held
+        // from the predecessor row (revision 2) stays stale and changes
+        // nothing, and the fresh one still reinstates.
+        let name = || "local".to_string();
+        session
+            .apply_mcp_attachment_intent_mutation(McpAttachmentIntentMutation::Withdraw {
+                server_name: name(),
+            })
+            .expect("withdraw");
+        let descriptor = crate::McpAttachmentDescriptorIdentity {
+            server_name: name(),
+            target: crate::McpAttachmentTarget::Stdio {
+                command: "python".to_string(),
+                env_names: Vec::new(),
+                secret_env_names: Vec::new(),
+                withheld: false,
+                binding: None,
+            },
+            oauth_account: None,
+            oauth_account_selection: None,
+            connector_account: None,
+        };
+        session
+            .apply_mcp_attachment_intent_mutation(McpAttachmentIntentMutation::Request {
+                descriptor,
+            })
+            .expect("request again");
+        let suppressed = session
+            .apply_mcp_attachment_intent_mutation(McpAttachmentIntentMutation::SuppressByLogout {
+                server_name: name(),
+            })
+            .expect("suppress again");
+        let fresh = suppressed.revision.expect("fresh revision");
+        assert!(fresh > crate::MCP_ATTACHMENT_REVISION_BASE);
+        let before = session.build_state().expect("build state");
+        for stale in [1, 2, 3] {
+            assert!(
+                session
+                    .apply_mcp_attachment_intent_mutation(McpAttachmentIntentMutation::Reinstate {
+                        server_name: name(),
+                        expected_revision: stale,
+                    })
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            session
+                .build_state()
+                .expect("build state")
+                .mcp_attachment_intents,
+            before.mcp_attachment_intents
+        );
+        session
+            .apply_mcp_attachment_intent_mutation(McpAttachmentIntentMutation::Reinstate {
+                server_name: name(),
+                expected_revision: fresh,
+            })
+            .expect("the fresh callback reinstates");
+
+        // A predecessor row may carry any u64 revision, so the base alone
+        // proves nothing: removing a sole row keeps its revision as the
+        // session's floor (persisted), and a held callback for it stays
+        // stale after the name is requested and suppressed again.
+        let predecessor_session = |revision: u64| {
+            let mut session = Session::new();
+            let mut state = serde_json::to_value(SessionBuildState::default()).expect("encode");
+            state["mcp_attachment_intents"] = serde_json::json!([{
+                "descriptor": {
+                    "server_name": "local",
+                    "target": { "kind": "stdio", "command": "python" }
+                },
+                "disposition": "suppressed_by_logout",
+                "revision": revision
+            }]);
+            session.set_metadata_unchecked(SESSION_BUILD_STATE_KEY, state);
+            session
+        };
+        let held = crate::MCP_ATTACHMENT_REVISION_BASE + 2;
+        let mut session = predecessor_session(held);
+        let withdrawn = session
+            .apply_mcp_attachment_intent_mutation(McpAttachmentIntentMutation::Withdraw {
+                server_name: name(),
+            })
+            .expect("withdraw");
+        assert!(withdrawn.changed);
+        let encoded = serde_json::to_value(&session).expect("encode");
+        let mut session: Session = serde_json::from_value(encoded).expect("decode");
+        assert_eq!(
+            session
+                .build_state()
+                .expect("build state")
+                .mcp_attachment_intent_revision,
+            held,
+            "the removed row's revision is the persisted floor"
+        );
+        session
+            .apply_mcp_attachment_intent_mutation(McpAttachmentIntentMutation::Request {
+                descriptor: crate::McpAttachmentDescriptorIdentity {
+                    server_name: name(),
+                    target: crate::McpAttachmentTarget::Stdio {
+                        command: "python".to_string(),
+                        env_names: Vec::new(),
+                        secret_env_names: Vec::new(),
+                        withheld: false,
+                        binding: None,
+                    },
+                    oauth_account: None,
+                    oauth_account_selection: None,
+                    connector_account: None,
+                },
+            })
+            .expect("request again");
+        let suppressed = session
+            .apply_mcp_attachment_intent_mutation(McpAttachmentIntentMutation::SuppressByLogout {
+                server_name: name(),
+            })
+            .expect("suppress again");
+        assert!(suppressed.revision.expect("revision") > held);
+        assert!(
+            session
+                .apply_mcp_attachment_intent_mutation(McpAttachmentIntentMutation::Reinstate {
+                    server_name: name(),
+                    expected_revision: held,
+                })
+                .is_err(),
+            "the held predecessor callback stays stale"
+        );
+
+        // Removing a sole row at u64::MAX keeps exhaustion.
+        let mut session = predecessor_session(u64::MAX);
+        session
+            .apply_mcp_attachment_intent_mutation(McpAttachmentIntentMutation::Withdraw {
+                server_name: name(),
+            })
+            .expect("withdraw");
+        assert!(
+            session
+                .apply_mcp_attachment_intent_mutation(McpAttachmentIntentMutation::Request {
+                    descriptor: crate::McpAttachmentDescriptorIdentity {
+                        server_name: name(),
+                        target: crate::McpAttachmentTarget::Predecessor,
+                        oauth_account: None,
+                        oauth_account_selection: None,
+                        connector_account: None,
+                    },
+                })
+                .is_err(),
+            "an exhausted counter stays exhausted after removal"
+        );
+    }
+
+    #[test]
     fn test_session_mob_tool_authority_context_persists_projection_without_authority_seal() {
         let mut session = Session::new();
         session
@@ -17508,6 +17847,29 @@ mod deferred_tool_failure_tests {
     #[allow(dead_code)]
     mod released_v0_8_50_version_authority {
         include!("../tests/fixtures/v0_8_50_session_persistence_version_authority.rs.txt");
+    }
+
+    /// Stored input state v6 carries the protected mandatory-hook
+    /// withholding record. The released 0.8.50 authority, which admits only
+    /// v3 to v5, rejects a v6 row; the current authority still admits every
+    /// supported older form. An older binary may reject the new audit kind
+    /// before reaching this version check, so no specific error is promised.
+    #[test]
+    fn released_reader_rejects_stored_input_state_v6_and_current_admits_older_rows() {
+        use crate::generated::session_persistence_version_authority as current;
+        assert_eq!(current::stored_input_state_version(), 6);
+        assert!(
+            released_v0_8_50_version_authority::restore_stored_input_state_version(
+                current::stored_input_state_version()
+            )
+            .is_err()
+        );
+        for supported in [3, 4, 5, 6] {
+            assert_eq!(
+                current::restore_stored_input_state_version(supported),
+                Ok(6)
+            );
+        }
     }
 
     fn released_v3_reader_accepts_version(bytes: &[u8]) -> bool {

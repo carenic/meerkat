@@ -31,6 +31,7 @@ fn comms_provenance() -> Option<ToolProvenance> {
     Some(ToolProvenance {
         kind: ToolSourceKind::Comms,
         source_id: "comms".into(),
+        artifact: None,
     })
 }
 

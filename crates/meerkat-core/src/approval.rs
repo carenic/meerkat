@@ -7,9 +7,17 @@
 //! The same generated owner also holds process-local review attempts for
 //! retained native operations (see [`review`]). Review attempts are never
 //! persisted or restored, so a stored approval record can never reconstruct
-//! a review allow or spendable consent.
+//! a review allow or spendable consent. Human consent for a retained R3
+//! candidate (see [`consent`]) is one such attempt plus its approval record.
 
+pub mod consent;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod consent_test_support;
+mod owner_loss;
 pub mod review;
+
+pub use owner_loss::ConsentOwnerLossSettlement;
 
 use crate::generated::approval_lifecycle::{
     ApprovalLifecycleDecision, ApprovalLifecycleError, ApprovalLifecycleMachineAuthority,
@@ -17,7 +25,7 @@ use crate::generated::approval_lifecycle::{
     ReviewAttemptStatus, ReviewRetirementReason, ReviewVerdict,
 };
 use crate::lifecycle::identifiers::RunId;
-use crate::{SessionId, SurfaceMetadata, ToolCallId};
+use crate::{PrincipalRef, SessionId, SurfaceMetadata, ToolCallId};
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use review::{ReservedReviewError, ReviewAttemptHandle, ReviewOwnerError};
@@ -27,6 +35,9 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
+
+#[cfg(target_arch = "wasm32")]
+use crate::tokio;
 
 /// Durable approval id.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -299,6 +310,271 @@ pub struct ApprovalRecord {
     pub request_provenance: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<ApprovalDecisionRecord>,
+    /// Present only on an approval the native owner issued for one retained
+    /// R3 candidate (human consent). History, never an executable
+    /// capability: spendable consent lives only in the owner's process-local
+    /// custody of that candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent: Option<ApprovalConsentRecord>,
+}
+
+/// Authentication assurance the host's ingress owner established for one
+/// decision event. A displayed identity alone never implies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalAssurance {
+    /// The person was authenticated on the actual channel event.
+    PersonAuthenticated,
+    /// A delegated service credential authenticated the event.
+    ServiceCredential,
+    /// Only device or network trust was established.
+    DeviceTrusted,
+}
+
+/// The authenticated approver recorded on a consent decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ApprovalConsentApprover {
+    pub principal: PrincipalRef,
+    pub assurance: ApprovalAssurance,
+}
+
+/// Passive owner scope of a consent approval, committed with its issuance:
+/// the hosting domain and the session of the run that admitted the
+/// candidate. On the native path the runtime fills it from the work it
+/// admitted and staged; request metadata never supplies it. A trusted host
+/// that builds its own work context may set it too
+/// ([`crate::WorkAuthorizationContext::with_consent_scope`]).
+///
+/// Never authority. Every owner-authored transition of the row keeps it
+/// unchanged; that is not tamper-proofing, since the store row is writable.
+/// Recovery, wake and handoff re-validate it against the actual hosting
+/// claim and current candidate and never treat it as custody. A consent row
+/// without it takes no part in them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ApprovalConsentScope {
+    pub domain: crate::session_hosting::HostingDomainRef,
+    pub session_id: SessionId,
+}
+
+/// Consent facts of an approval issued for one retained R3 candidate.
+///
+/// A durable projection of the approval owner's own transitions. Decision
+/// status, spend and execution are separate facts: `Approved` with no
+/// `consumed_at` is not spendable after a restart, and `consumed_at` is not
+/// proof that the effect completed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ApprovalConsentRecord {
+    /// The owner scope committed at issuance, when the admitting run had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ApprovalConsentScope>,
+    /// The authenticated approver of the recorded decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<ApprovalConsentApprover>,
+    /// When a fresh exact attempt consumed the approval at its entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+    pub consumed_at: Option<DateTime<Utc>>,
+    /// The owner withdrew the unspent consent: a pending approval is then
+    /// `Cancelled` (never a denial), and approved history stays `Approved`
+    /// but can no longer be spent. Never set on spent consent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdrawal: Option<ApprovalConsentWithdrawal>,
+    /// The retained work of the run that admitted the candidate, committed
+    /// at issuance with the scope. Together they are the exact native
+    /// destination of this consent's notices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<ApprovalConsentOrigin>,
+    /// One delivery obligation per committed transition that owes the
+    /// owning session a notice, committed with that transition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deliveries: Vec<ApprovalConsentDelivery>,
+    /// Cross-run custody history of the retained candidate. History only:
+    /// custody itself is process-local and never restored from this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custody: Option<ApprovalConsentCustody>,
+}
+
+impl ApprovalConsentRecord {
+    /// Whether this consent has an exact native destination for its notices:
+    /// both a committed scope and a committed origin. A row without both owes
+    /// no notice and takes no part in delivery or transfer.
+    pub fn routable(&self) -> bool {
+        self.scope.is_some() && self.origin.is_some()
+    }
+
+    /// The delivery obligation of `transition`, if one was committed.
+    pub fn delivery(
+        &self,
+        transition: ApprovalConsentTransition,
+    ) -> Option<&ApprovalConsentDelivery> {
+        self.deliveries
+            .iter()
+            .find(|delivery| delivery.transition == transition)
+    }
+
+    /// Owe `transition`'s notice once, when the row is routable. Called only
+    /// on the record that commits `transition`, so the obligation is durable
+    /// exactly when the transition is.
+    pub(crate) fn owe_delivery(
+        &mut self,
+        transition: ApprovalConsentTransition,
+        committed_at: DateTime<Utc>,
+    ) {
+        if self.routable() && self.delivery(transition).is_none() {
+            self.deliveries.push(ApprovalConsentDelivery {
+                transition,
+                committed_at,
+                state: ApprovalConsentDeliveryState::Owed,
+            });
+        }
+    }
+}
+
+/// The retained work of the run that admitted a consent candidate: with the
+/// scope, the exact native destination of the consent's notices.
+///
+/// Committed at issuance and never changed. Never authority: a notice is
+/// admitted only through the runtime's own retained-resume validation of
+/// this identity, and a cross-run transfer compares the runtime-minted
+/// resume evidence, never this copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ApprovalConsentOrigin {
+    #[cfg_attr(feature = "schema", schemars(with = "serde_json::Value"))]
+    pub retained_work: crate::retained_work::RetainedWorkIdentity,
+}
+
+/// A committed consent transition that owes the owning session a notice.
+/// Each transition is owed on its own: a later transition never settles,
+/// replaces or retracts an earlier one's notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalConsentTransition {
+    /// An authenticated human approved it.
+    Approved,
+    /// An authenticated human declined it.
+    Denied,
+    /// The owner withdrew the unspent consent, for any withdrawal reason
+    /// (the row's `withdrawal` says which).
+    Withdrawn,
+}
+
+impl ApprovalConsentTransition {
+    /// The transition's stable name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+            Self::Withdrawn => "withdrawn",
+        }
+    }
+}
+
+impl FromStr for ApprovalConsentTransition {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "approved" => Ok(Self::Approved),
+            "denied" => Ok(Self::Denied),
+            "withdrawn" => Ok(Self::Withdrawn),
+            _ => Err(()),
+        }
+    }
+}
+
+/// One committed transition's notice obligation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ApprovalConsentDelivery {
+    pub transition: ApprovalConsentTransition,
+    /// When the transition (and with it this obligation) committed.
+    #[cfg_attr(feature = "schema", schemars(with = "String"))]
+    pub committed_at: DateTime<Utc>,
+    pub state: ApprovalConsentDeliveryState,
+}
+
+/// Where one transition's notice stands. It is committed `Owed` with its
+/// transition, and only the delivery owner's exact receipt for that same
+/// transition settles it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ApprovalConsentDeliveryState {
+    /// Committed with its transition and not known to be admitted. An
+    /// unknown admission stays owed until it is reconciled.
+    Owed,
+    /// The owning session's native admission durably accepted the notice.
+    /// Not model observation and not execution: a notice wakes work and
+    /// spends nothing.
+    Admitted {
+        session_id: SessionId,
+        input_id: String,
+    },
+    /// Proven terminal non-delivery, such as a settled policy refusal or a
+    /// retired owner. Never inferred from a later refusal after an unknown
+    /// earlier attempt.
+    Failed { reason: String },
+}
+
+/// Cross-run custody history of a retained consent candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ApprovalConsentCustody {
+    /// Parked at its run's close for a resumed run of its origin work.
+    Parked,
+    /// Transferred once into the resumed run staged with this admitted
+    /// notice input.
+    Transferred { input_id: String },
+}
+
+/// The owner's durable withdrawal of unspent consent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ApprovalConsentWithdrawal {
+    pub reason: ApprovalConsentWithdrawalReason,
+    #[cfg_attr(feature = "schema", schemars(with = "String"))]
+    pub withdrawn_at: DateTime<Utc>,
+}
+
+/// Why the owner withdrew unspent consent. None of these is a human denial.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalConsentWithdrawalReason {
+    /// The run that admitted the candidate closed.
+    RunEnded,
+    /// The consented decision is no longer the current one.
+    ContextChanged,
+    /// The current authorization refused the consented operation.
+    AuthorityChanged,
+    /// The consent request or its spendability expired.
+    Expired,
+    /// The owner abandoned the custody (for example after a conflicting or
+    /// uncertain store commit).
+    Abandoned,
+    /// The admitted notice input that would have moved the parked consent
+    /// into a resumed run ended before the move. It names that input only:
+    /// how the input ended stays the runtime owner's fact.
+    NoticeInputEnded { input_id: String },
+}
+
+impl From<ReviewRetirementReason> for ApprovalConsentWithdrawalReason {
+    fn from(reason: ReviewRetirementReason) -> Self {
+        match reason {
+            ReviewRetirementReason::RunEnded => Self::RunEnded,
+            ReviewRetirementReason::ContextChanged => Self::ContextChanged,
+            ReviewRetirementReason::AuthorityChanged => Self::AuthorityChanged,
+            ReviewRetirementReason::DeadlineExpired => Self::Expired,
+            ReviewRetirementReason::Abandoned => Self::Abandoned,
+        }
+    }
 }
 
 /// Input used by tools/runtime code to request an approval.
@@ -345,31 +621,110 @@ pub enum ApprovalError {
     EmptyAllowedDecisions,
     #[error("approval principal id must not be empty")]
     InvalidPrincipal,
+    /// A consent approval accepts only an authenticated human decision;
+    /// caller-supplied actor text is not authentication.
+    #[error("approval requires an authenticated human decision: {approval_id}")]
+    AuthenticationRequired { approval_id: ApprovalId },
+    /// The authenticated approver is not currently eligible to decide it.
+    #[error("approver is not eligible to decide approval: {approval_id}")]
+    NotEligible { approval_id: ApprovalId },
+    /// This owner holds no live retained candidate for the approval (it was
+    /// consumed, declined, expired, or lost on restart): fresh consent is
+    /// required.
+    #[error("approval has no live consent candidate: {approval_id}")]
+    ConsentUnavailable { approval_id: ApprovalId },
     #[error(transparent)]
     InvalidMetadata(#[from] crate::SurfaceMetadataError),
-    #[error("approval store error: {0}")]
-    Store(String),
+    /// The store committed nothing (unavailable, contended or failed before
+    /// any write). An explicitly attempted retry through fresh checks is
+    /// valid; nothing is resent automatically.
+    #[error("approval store unavailable: {0}")]
+    StoreUnavailable(String),
+    /// Another owner of the backing changed the row first. Nothing of this
+    /// commit was published; the row is reconciled before reuse.
+    #[error("approval changed in the store since it was checked: {approval_id}")]
+    StoreConflict { approval_id: ApprovalId },
+    /// The store may or may not have committed. Nothing was published and
+    /// any live consent custody was retired; the row is reconciled from the
+    /// store before reuse.
+    #[error("approval store commit outcome unknown: {approval_id}")]
+    StoreCommitUnknown { approval_id: ApprovalId },
+    /// The row awaits reconciliation and its stored form is unreadable,
+    /// missing or invalid: it stays unavailable, never spendable.
+    #[error("approval awaits reconciliation with its store: {approval_id}")]
+    Unreconciled { approval_id: ApprovalId },
+    /// A stored row contradicts its own history (status, decision audit or
+    /// consent facts); it is never restored.
+    #[error("stored approval is invalid: {approval_id}")]
+    InvalidStoredRecord { approval_id: ApprovalId },
+    /// An internal approval lifecycle invariant failed.
+    #[error("approval lifecycle invariant failed: {0}")]
+    LifecycleInvariant(String),
 }
 
 /// Durable approval store mechanics.
 ///
-/// Stores persist full records and do not decide status legality.
+/// Stores persist full records and do not decide status legality. Every
+/// write is conditional on the row the owner checked, which makes the store
+/// the one commit domain for every owner of the same backing (other
+/// instances or processes): a stale owner can neither overwrite another
+/// owner's decision nor record a consumed consent as unspent.
 pub trait ApprovalStore: Send + Sync {
     fn load_all(&self) -> Result<Vec<ApprovalRecord>, ApprovalStoreError>;
-    fn put(&self, record: &ApprovalRecord) -> Result<(), ApprovalStoreError>;
+    /// The stored row for one approval, for reconciliation.
+    fn get(&self, approval_id: &ApprovalId) -> Result<Option<ApprovalRecord>, ApprovalStoreError>;
+    /// Write `record` only if the stored row for its id still equals
+    /// `expected` (`None`: no row yet). Never waits for another owner of the
+    /// backing. The error says what is known about the write: nothing was
+    /// written ([`ApprovalStoreError::NotCommitted`],
+    /// [`ApprovalStoreError::Contended`]), another row won
+    /// ([`ApprovalStoreError::Conflict`]), or the write may have committed
+    /// ([`ApprovalStoreError::CommitUnknown`]).
+    fn put_if_current(
+        &self,
+        expected: Option<&ApprovalRecord>,
+        record: &ApprovalRecord,
+    ) -> Result<(), ApprovalStoreError>;
     fn is_persistent(&self) -> bool;
 }
 
-/// Approval store errors, erased at the service boundary.
+/// Approval store outcomes, each a statement about commitment.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ApprovalStoreError {
+    /// Proven no write: the failure happened before anything could commit.
     #[error("{0}")]
-    Backend(String),
+    NotCommitted(String),
+    /// The stored row is no longer the one the owner checked; nothing was
+    /// written by this call.
+    #[error("approval row changed since it was checked")]
+    Conflict,
+    /// Another owner of the backing holds it; nothing was written.
+    #[error("approval store is held by another owner")]
+    Contended,
+    /// The write may have committed (for example, a failed rename that the
+    /// filesystem cannot prove did not happen).
+    #[error("approval store commit outcome unknown: {0}")]
+    CommitUnknown(String),
 }
 
-impl From<ApprovalStoreError> for ApprovalError {
-    fn from(value: ApprovalStoreError) -> Self {
-        Self::Store(value.to_string())
+impl ApprovalStoreError {
+    /// The service outcome of a failed conditional write of `approval_id`.
+    fn into_commit_error(self, approval_id: &ApprovalId) -> ApprovalError {
+        match self {
+            Self::NotCommitted(reason) => ApprovalError::StoreUnavailable(reason),
+            Self::Contended => ApprovalError::StoreUnavailable(self.to_string()),
+            Self::Conflict => ApprovalError::StoreConflict {
+                approval_id: approval_id.clone(),
+            },
+            Self::CommitUnknown(_) => ApprovalError::StoreCommitUnknown {
+                approval_id: approval_id.clone(),
+            },
+        }
+    }
+
+    /// Whether this failed write leaves the stored row unknown to the owner.
+    fn leaves_row_unknown(&self) -> bool {
+        matches!(self, Self::Conflict | Self::CommitUnknown(_))
     }
 }
 
@@ -391,10 +746,24 @@ impl ApprovalStore for InMemoryApprovalStore {
         Ok(self.records.read().values().cloned().collect())
     }
 
-    fn put(&self, record: &ApprovalRecord) -> Result<(), ApprovalStoreError> {
-        self.records
-            .write()
-            .insert(record.approval_id.clone(), record.clone());
+    fn get(&self, approval_id: &ApprovalId) -> Result<Option<ApprovalRecord>, ApprovalStoreError> {
+        Ok(self.records.read().get(approval_id).cloned())
+    }
+
+    /// Never waits: a map held by another owner (a service sharing this
+    /// store) is [`ApprovalStoreError::Contended`], and nothing is written.
+    fn put_if_current(
+        &self,
+        expected: Option<&ApprovalRecord>,
+        record: &ApprovalRecord,
+    ) -> Result<(), ApprovalStoreError> {
+        let Some(mut records) = self.records.try_write() else {
+            return Err(ApprovalStoreError::Contended);
+        };
+        if records.get(&record.approval_id) != expected {
+            return Err(ApprovalStoreError::Conflict);
+        }
+        records.insert(record.approval_id.clone(), record.clone());
         Ok(())
     }
 
@@ -407,6 +776,44 @@ impl ApprovalStore for InMemoryApprovalStore {
 struct ApprovalServiceState {
     records: BTreeMap<ApprovalId, ApprovalRecord>,
     authority: ApprovalLifecycleMachineAuthority,
+    /// Process-local custody of retained R3 candidates, by approval. Never
+    /// persisted or restored: spendable consent dies with the process.
+    consent: BTreeMap<ApprovalId, Arc<consent::ConsentCandidate>>,
+    /// Consent approvals this service issued itself. A consent row loaded
+    /// from a shared store without such an entry may still be held by
+    /// another owner; this service cannot infer that custody was lost, and
+    /// reports it unavailable without claiming anything about that owner.
+    issued_consent: BTreeSet<ApprovalId>,
+    /// Rows whose stored form this owner no longer knows (a conflicting or
+    /// uncertain commit, or an unconfirmed withdrawal), with the mark that
+    /// reconciliation must still observe before it publishes.
+    unreconciled: BTreeMap<ApprovalId, u64>,
+    next_mark: u64,
+    /// Withdrawals whose custody is already retired but whose durable record
+    /// (and `Withdrawn` notice) waits for a store-capable owner holder.
+    pending_withdrawals: Vec<consent::PendingWithdrawal>,
+    /// Decided consent whose allowance is not published yet: its custody is
+    /// visible to withdrawal but cannot be spent until the decision's final
+    /// checks, after its store and owner-exit work, publish it.
+    unpublished: BTreeSet<ApprovalId>,
+    /// Retained candidates parked at their run's close for a resumed run of
+    /// their origin work. Their custody is kept, but nothing can spend them
+    /// until a confirmed transfer publishes them for that resumed run.
+    parked: BTreeSet<ApprovalId>,
+    /// Parks whose durable record waits for a store-capable owner holder.
+    pending_parks: Vec<ApprovalId>,
+    /// Runs open now whose staged inputs resume retained work: parked
+    /// consent their committed notice receipts name moves into them.
+    resumed_runs: Vec<consent::ResumedRun>,
+    /// Staged inputs of resumed runs that closed while parked consent of the
+    /// work they resumed, for their destination, still awaited its approved
+    /// notice's receipt: a receipt naming one arrives after its only run.
+    closed_inputs: Vec<consent::ClosedInput>,
+    /// Withdrawals whose custody is retired and whose durable record is not
+    /// yet confirmed, each with its exact cause: owed from before its first
+    /// conditional write, and recorded against its row once that row is
+    /// known (reconciled after a failed or uncertain write).
+    unreconciled_withdrawals: BTreeMap<ApprovalId, consent::PendingWithdrawal>,
 }
 
 impl ApprovalServiceState {
@@ -414,6 +821,17 @@ impl ApprovalServiceState {
         Self {
             records: BTreeMap::new(),
             authority: ApprovalLifecycleMachineAuthority::new(),
+            consent: BTreeMap::new(),
+            issued_consent: BTreeSet::new(),
+            unreconciled: BTreeMap::new(),
+            next_mark: 0,
+            pending_withdrawals: Vec::new(),
+            unpublished: BTreeSet::new(),
+            parked: BTreeSet::new(),
+            pending_parks: Vec::new(),
+            resumed_runs: Vec::new(),
+            closed_inputs: Vec::new(),
+            unreconciled_withdrawals: BTreeMap::new(),
         }
     }
 
@@ -424,6 +842,25 @@ impl ApprovalServiceState {
             state.records.insert(record.approval_id.clone(), record);
         }
         Ok(state)
+    }
+
+    /// The stored row of `approval_id` is no longer known: it is reconciled
+    /// before any reuse.
+    fn mark_unreconciled(&mut self, approval_id: &ApprovalId) {
+        self.next_mark += 1;
+        self.unreconciled
+            .insert(approval_id.clone(), self.next_mark);
+    }
+
+    /// The reconcile-before-reuse barrier, enforced under the reservation
+    /// itself: a marked row is never read, decided or written here.
+    fn ensure_reconciled(&self, approval_id: &ApprovalId) -> Result<(), ApprovalError> {
+        if self.unreconciled.contains_key(approval_id) {
+            return Err(ApprovalError::Unreconciled {
+                approval_id: approval_id.clone(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -478,7 +915,7 @@ fn lifecycle_rejection_error(
         },
         ApprovalLifecycleRejectionReason::InvalidDecision => {
             let Some(decision) = decision else {
-                return ApprovalError::Store(format!(
+                return ApprovalError::LifecycleInvariant(format!(
                     "generated approval lifecycle rejected {approval_id} with InvalidDecision but no decision context"
                 ));
             };
@@ -487,13 +924,32 @@ fn lifecycle_rejection_error(
         ApprovalLifecycleRejectionReason::EmptyAllowedDecisions => {
             ApprovalError::EmptyAllowedDecisions
         }
+        ApprovalLifecycleRejectionReason::AuthenticationRequired => {
+            ApprovalError::AuthenticationRequired {
+                approval_id: approval_id.clone(),
+            }
+        }
+        // The approval and its live attempt are no longer linked: the
+        // consent was spent, withdrawn or declined, so none is available.
+        ApprovalLifecycleRejectionReason::ConsentMismatch
+        | ApprovalLifecycleRejectionReason::AlreadyConsumed
+        | ApprovalLifecycleRejectionReason::NotConsent => ApprovalError::ConsentUnavailable {
+            approval_id: approval_id.clone(),
+        },
+        ApprovalLifecycleRejectionReason::InvalidRestoredRecord => {
+            ApprovalError::InvalidStoredRecord {
+                approval_id: approval_id.clone(),
+            }
+        }
         ApprovalLifecycleRejectionReason::AlreadyExists
-        | ApprovalLifecycleRejectionReason::InvalidRestoredRecord
+        | ApprovalLifecycleRejectionReason::ConsentLinked
         | ApprovalLifecycleRejectionReason::ReviewRetired
         | ApprovalLifecycleRejectionReason::ReviewNotSatisfied
-        | ApprovalLifecycleRejectionReason::ReviewPending => ApprovalError::Store(format!(
-            "generated approval lifecycle authority rejected {approval_id} with {reason:?}"
-        )),
+        | ApprovalLifecycleRejectionReason::ReviewPending => {
+            ApprovalError::LifecycleInvariant(format!(
+                "generated approval lifecycle authority rejected {approval_id} with {reason:?}"
+            ))
+        }
     }
 }
 
@@ -507,9 +963,11 @@ fn lifecycle_status_from_outcome(
         ApprovalLifecycleOutcome::Rejected(reason) => {
             Err(lifecycle_rejection_error(approval_id, reason, decision))
         }
-        ApprovalLifecycleOutcome::ReviewStatus(status) => Err(ApprovalError::Store(format!(
-            "generated approval lifecycle emitted review status {status:?} for approval {approval_id}"
-        ))),
+        ApprovalLifecycleOutcome::ReviewStatus(status) => {
+            Err(ApprovalError::LifecycleInvariant(format!(
+                "generated approval lifecycle emitted review status {status:?} for approval {approval_id}"
+            )))
+        }
     }
 }
 
@@ -524,7 +982,7 @@ fn review_status_from_outcome(
 }
 
 fn lifecycle_error(error: impl std::fmt::Display) -> ApprovalError {
-    ApprovalError::Store(format!(
+    ApprovalError::LifecycleInvariant(format!(
         "generated approval lifecycle authority failed: {error}"
     ))
 }
@@ -536,10 +994,47 @@ fn restored_lifecycle_decision(record: &ApprovalRecord) -> Option<ApprovalLifecy
         .map(|decision| approval_lifecycle_decision(decision.decision))
 }
 
+/// Consent facts of a stored row for the generated owner: (consent,
+/// authenticated, consumed), after validating the history the flags stand
+/// for. An approver must be a qualified human whose principal is the
+/// recorded decision's actor; a withdrawal is never on spent consent.
+fn stored_consent_flags(record: &ApprovalRecord) -> Result<(bool, bool, bool), ApprovalError> {
+    let invalid = || ApprovalError::InvalidStoredRecord {
+        approval_id: record.approval_id.clone(),
+    };
+    let Some(consent) = &record.consent else {
+        return Ok((false, false, false));
+    };
+    if let Some(approver) = &consent.approver {
+        let decided_by_approver = record
+            .decision
+            .as_ref()
+            .is_some_and(|decision| decision.actor.as_str() == approver.principal.id.as_str());
+        if approver.principal.kind != crate::PrincipalKind::Human
+            || approver.principal.validate_qualified().is_err()
+            || !decided_by_approver
+        {
+            return Err(invalid());
+        }
+    }
+    let consumed = consent.consumed_at.is_some();
+    if consent.withdrawal.is_some() && consumed {
+        return Err(invalid());
+    }
+    if record.status == ApprovalStatus::Cancelled && consent.withdrawal.is_none() {
+        return Err(invalid());
+    }
+    Ok((true, consent.approver.is_some(), consumed))
+}
+
+/// Generated restore of one stored row as history: never linked, never
+/// executable. The owner rejects contradictory status, decision audit and
+/// consent history.
 fn restore_record_into_authority(
     authority: &mut ApprovalLifecycleMachineAuthority,
     record: &ApprovalRecord,
 ) -> Result<(), ApprovalError> {
+    let (consent, authenticated, consumed) = stored_consent_flags(record)?;
     let (approve_allowed, deny_allowed) = allowed_decision_flags(&record.allowed_decisions);
     let outcome = authority
         .restore_approval(
@@ -549,20 +1044,37 @@ fn restore_record_into_authority(
             deny_allowed,
             record.expires_at.is_some(),
             restored_lifecycle_decision(record),
+            consent,
+            authenticated,
+            consumed,
         )
         .map_err(lifecycle_error)?;
-    let restored_status = lifecycle_status_from_outcome(
-        &record.approval_id,
-        outcome,
-        record.decision.as_ref().map(|decision| decision.decision),
-    )?;
-    if restored_status != record.status {
-        return Err(ApprovalError::Store(format!(
-            "generated approval lifecycle restored {} as {:?}, stored {:?}",
-            record.approval_id, restored_status, record.status
-        )));
+    restored_status_matches(record, outcome)
+}
+
+fn restored_status_matches(
+    record: &ApprovalRecord,
+    outcome: ApprovalLifecycleOutcome,
+) -> Result<(), ApprovalError> {
+    match outcome {
+        ApprovalLifecycleOutcome::Status(status)
+            if approval_status_from_lifecycle(status) == record.status =>
+        {
+            Ok(())
+        }
+        // Contradictory history or a duplicate stored row.
+        ApprovalLifecycleOutcome::Rejected(
+            ApprovalLifecycleRejectionReason::InvalidRestoredRecord
+            | ApprovalLifecycleRejectionReason::AlreadyExists
+            | ApprovalLifecycleRejectionReason::EmptyAllowedDecisions,
+        ) => Err(ApprovalError::InvalidStoredRecord {
+            approval_id: record.approval_id.clone(),
+        }),
+        other => Err(ApprovalError::LifecycleInvariant(format!(
+            "generated approval lifecycle restored {} as {other:?}, stored {:?}",
+            record.approval_id, record.status
+        ))),
     }
-    Ok(())
 }
 
 /// In-process approval service.
@@ -576,6 +1088,20 @@ pub struct ApprovalService {
     /// Review attempt disposals handed over without waiting; settled under
     /// the owner's next review commit. Never held while waiting for `state`.
     queued_disposals: Arc<parking_lot::Mutex<Vec<QueuedReviewDisposal>>>,
+    /// Work associations whose run closed while the owner was held; their
+    /// unspent consent is parked or withdrawn by the next lock holder's
+    /// release.
+    queued_withdrawals:
+        Arc<parking_lot::Mutex<Vec<crate::authorization::WorkAuthorizationContext>>>,
+    /// Set while a withdrawal's custody is retired, or a park kept, but its
+    /// durable record is still pending (a store-free release left it).
+    withdrawals_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// Advances after every committed consent notice obligation and every
+    /// recorded park ([`ApprovalService::subscribe_consent_deliveries`]).
+    consent_delivery_changes: Arc<tokio::sync::watch::Sender<u64>>,
+    /// Test-only wall clock offset, in seconds.
+    #[cfg(test)]
+    clock_skew: Arc<std::sync::atomic::AtomicI64>,
     #[cfg(test)]
     reservation_probe: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Test-only count of review-path acquisitions of `state`.
@@ -591,6 +1117,11 @@ impl ApprovalService {
             store: Arc::new(InMemoryApprovalStore::new()),
             unavailable_reason: None,
             queued_disposals: Arc::default(),
+            queued_withdrawals: Arc::default(),
+            withdrawals_pending: Arc::default(),
+            consent_delivery_changes: Arc::new(tokio::sync::watch::Sender::new(0)),
+            #[cfg(test)]
+            clock_skew: Arc::default(),
             #[cfg(test)]
             reservation_probe: None,
             #[cfg(test)]
@@ -599,12 +1130,20 @@ impl ApprovalService {
     }
 
     pub fn with_store(store: Arc<dyn ApprovalStore>) -> Result<Self, ApprovalError> {
-        let state = ApprovalServiceState::from_records(store.load_all()?)?;
+        let records = store
+            .load_all()
+            .map_err(|error| ApprovalError::StoreUnavailable(error.to_string()))?;
+        let state = ApprovalServiceState::from_records(records)?;
         Ok(Self {
             state: Arc::new(RwLock::new(state)),
             store,
             unavailable_reason: None,
             queued_disposals: Arc::default(),
+            queued_withdrawals: Arc::default(),
+            withdrawals_pending: Arc::default(),
+            consent_delivery_changes: Arc::new(tokio::sync::watch::Sender::new(0)),
+            #[cfg(test)]
+            clock_skew: Arc::default(),
             #[cfg(test)]
             reservation_probe: None,
             #[cfg(test)]
@@ -619,6 +1158,11 @@ impl ApprovalService {
             store: Arc::new(InMemoryApprovalStore::new()),
             unavailable_reason: Some(Arc::from(reason.into())),
             queued_disposals: Arc::default(),
+            queued_withdrawals: Arc::default(),
+            withdrawals_pending: Arc::default(),
+            consent_delivery_changes: Arc::new(tokio::sync::watch::Sender::new(0)),
+            #[cfg(test)]
+            clock_skew: Arc::default(),
             #[cfg(test)]
             reservation_probe: None,
             #[cfg(test)]
@@ -631,9 +1175,18 @@ impl ApprovalService {
         self.store.is_persistent()
     }
 
+    /// The owner's wall clock for record expiry.
+    pub(super) fn now(&self) -> DateTime<Utc> {
+        let now = Utc::now();
+        #[cfg(test)]
+        let now = now
+            + chrono::Duration::seconds(self.clock_skew.load(std::sync::atomic::Ordering::SeqCst));
+        now
+    }
+
     fn ensure_available(&self) -> Result<(), ApprovalError> {
         if let Some(reason) = &self.unavailable_reason {
-            return Err(ApprovalError::Store(format!(
+            return Err(ApprovalError::StoreUnavailable(format!(
                 "approval service unavailable: {reason}"
             )));
         }
@@ -689,8 +1242,9 @@ impl ApprovalService {
             metadata: request.metadata,
             request_provenance: request.request_provenance,
             decision: None,
+            consent: None,
         };
-        self.store.put(&record)?;
+        self.commit_row_locked(state, None, &record)?;
         state.authority = authority;
         state
             .records
@@ -700,28 +1254,48 @@ impl ApprovalService {
 
     pub fn get(&self, approval_id: &ApprovalId) -> Result<ApprovalRecord, ApprovalError> {
         self.ensure_available()?;
+        self.reconcile_if_unreconciled(approval_id)?;
         self.refresh_expiry(approval_id)?;
-        let record = self.state.read().records.get(approval_id).cloned();
+        // The row and its reconciliation mark are read in one reservation: a
+        // row marked since the refresh is never returned as current.
+        let record = {
+            let state = self.state.read();
+            state
+                .ensure_reconciled(approval_id)
+                .map(|()| state.records.get(approval_id).cloned())
+        };
         // A reader may have made a disposer's try-lock fail; settle after it.
-        self.settle_queued_disposals_now().run();
-        record.ok_or_else(|| ApprovalError::NotFound {
+        self.settle_owner_now().run();
+        record?.ok_or_else(|| ApprovalError::NotFound {
             approval_id: approval_id.clone(),
         })
     }
 
     pub fn list(&self, filter: ApprovalListFilter) -> Result<Vec<ApprovalRecord>, ApprovalError> {
         self.ensure_available()?;
+        let unreconciled: Vec<ApprovalId> =
+            self.state.read().unreconciled.keys().cloned().collect();
+        self.settle_owner_now().run();
+        for approval_id in unreconciled {
+            self.reconcile(&approval_id)?;
+        }
         self.refresh_all_expiry()?;
-        let records = self
-            .state
-            .read()
-            .records
-            .values()
-            .filter(|record| filter.status.is_none_or(|status| record.status == status))
-            .cloned()
-            .collect();
-        self.settle_queued_disposals_now().run();
-        Ok(records)
+        let records = {
+            let state = self.state.read();
+            match state.unreconciled.keys().next() {
+                Some(approval_id) => Err(ApprovalError::Unreconciled {
+                    approval_id: approval_id.clone(),
+                }),
+                None => Ok(state
+                    .records
+                    .values()
+                    .filter(|record| filter.status.is_none_or(|status| record.status == status))
+                    .cloned()
+                    .collect()),
+            }
+        };
+        self.settle_owner_now().run();
+        records
     }
 
     pub fn decide(
@@ -736,6 +1310,7 @@ impl ApprovalService {
         if actor.as_str().trim().is_empty() {
             return Err(ApprovalError::InvalidPrincipal);
         }
+        self.reconcile_if_unreconciled(approval_id)?;
         let now = Utc::now();
         let mut state = self.state.write();
         let result = self.decide_locked(
@@ -778,11 +1353,13 @@ impl ApprovalService {
                     reason,
                     Some(decision),
                 )),
-                ApprovalLifecycleOutcome::Status(status) => Err(ApprovalError::Store(format!(
-                    "generated approval lifecycle emitted {status:?} for missing approval {approval_id}"
-                ))),
+                ApprovalLifecycleOutcome::Status(status) => {
+                    Err(ApprovalError::LifecycleInvariant(format!(
+                        "generated approval lifecycle emitted {status:?} for missing approval {approval_id}"
+                    )))
+                }
                 ApprovalLifecycleOutcome::ReviewStatus(status) => {
-                    Err(ApprovalError::Store(format!(
+                    Err(ApprovalError::LifecycleInvariant(format!(
                         "generated approval lifecycle emitted review status {status:?} for missing approval {approval_id}"
                     )))
                 }
@@ -799,6 +1376,9 @@ impl ApprovalService {
                     approval_id: approval_id.clone(),
                 })?;
 
+        // Caller-supplied actor text is not authentication: the generated
+        // owner refuses it for a consent approval (`decide_consent` is the
+        // authenticated path).
         let mut authority = state.authority.clone();
         let outcome = authority
             .decide_approval(
@@ -808,7 +1388,7 @@ impl ApprovalService {
             .map_err(lifecycle_error)?;
         let status = lifecycle_status_from_outcome(approval_id, outcome, Some(decision))?;
 
-        let mut decided_record = record;
+        let mut decided_record = record.clone();
         decided_record.status = status;
         decided_record.updated_at = now;
         decided_record.decision = Some(ApprovalDecisionRecord {
@@ -818,7 +1398,7 @@ impl ApprovalService {
             reason,
             provenance,
         });
-        self.store.put(&decided_record)?;
+        self.commit_row_locked(state, Some(&record), &decided_record)?;
         state.authority = authority;
         state
             .records
@@ -842,13 +1422,13 @@ impl ApprovalService {
         let mut state = self.state.write();
         self.count_review_lock();
         let result = review_status_from_outcome(apply(&mut state.authority));
-        self.release_state(state).run();
+        self.release_review_state(state).run();
         result
     }
 
     /// Commit one review input that admits an effect (a verdict, or the spend
     /// at entry) under ONE commit reservation, the same state lock `decide`
-    /// and expiry hold through `ApprovalStore::put`:
+    /// and expiry hold through `ApprovalStore::put_if_current`:
     ///
     /// 0. first settle already queued disposals and carry their reports
     ///    back to the caller (they run arbitrary observers, so the caller
@@ -877,7 +1457,7 @@ impl ApprovalService {
             &crate::authorization::PreparedOperationCheck,
             &crate::authorization::WorkAuthorizationContext,
         )>,
-        final_check: impl FnOnce() -> Result<(), E>,
+        final_check: impl Fn() -> Result<(), E>,
         commit: impl FnOnce(
             &mut ApprovalLifecycleMachineAuthority,
         ) -> Result<ApprovalLifecycleOutcome, ApprovalLifecycleError>,
@@ -890,6 +1470,7 @@ impl ApprovalService {
                 error: ReservedReviewError::Owner(ReviewOwnerError::Unavailable),
                 disposal: None,
                 reports: SettledReports::default(),
+                committed: None,
             });
         }
         // Settle queued disposals before the reservation and final check;
@@ -909,6 +1490,7 @@ impl ApprovalService {
                 error,
                 disposal,
                 reports,
+                committed: None,
             });
         };
         self.count_review_lock();
@@ -942,14 +1524,29 @@ impl ApprovalService {
                 error,
                 disposal: Some(disposal),
                 reports: SettledReports::default(),
+                committed: None,
             }
         });
         // Disposals queued during this commit are settled as the lock is
-        // released. Every report goes back to the caller, which runs them
-        // only after releasing its own locks: after the effect for a spend,
-        // otherwise at once.
-        reports.absorb(self.release_state(state));
+        // released (in memory only: review paths make no store call). Every
+        // report goes back to the caller, which runs them only after
+        // releasing its own locks: after the effect for a spend, otherwise at
+        // once.
+        reports.absorb(self.release_review_state(state));
         match result {
+            // The spend's final check comes after every owner-exit step: the
+            // callback-free retained check runs again here, immediately
+            // before the effect handoff. A refusal now has zero effect; the
+            // committed spend stays spent (no refund).
+            Ok(status) if dispose_on_commit => match final_check() {
+                Ok(()) => Ok((status, reports)),
+                Err(failure) => Err(RefusedReviewCommit {
+                    error: ReservedReviewError::FinalCheck(failure),
+                    disposal: None,
+                    reports,
+                    committed: Some(status),
+                }),
+            },
             Ok(status) => Ok((status, reports)),
             Err(mut refused) => {
                 refused.reports = reports;
@@ -962,7 +1559,30 @@ impl ApprovalService {
     /// waiting; reports run after the lock is released.
     #[must_use = "run the reports once outside every lock"]
     fn settle_queued_disposals_now(&self) -> SettledReports {
-        if self.queued_disposals.lock().is_empty() {
+        if self.queued_disposals.lock().is_empty() && self.queued_withdrawals.lock().is_empty() {
+            return SettledReports::default();
+        }
+        match self.state.try_write() {
+            Some(state) => {
+                self.count_review_lock();
+                self.release_review_state(state)
+            }
+            None => SettledReports::default(),
+        }
+    }
+
+    /// Settle everything queued or pending from a store-capable path, now,
+    /// without waiting: queued disposals, run withdrawals, and withdrawals
+    /// whose durable record a store-free release left. When the owner is
+    /// held, its holder settles on release (or carries the duty on).
+    #[must_use = "run the reports once outside every lock"]
+    pub(crate) fn settle_owner_now(&self) -> SettledReports {
+        if self.queued_disposals.lock().is_empty()
+            && self.queued_withdrawals.lock().is_empty()
+            && !self
+                .withdrawals_pending
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
             return SettledReports::default();
         }
         match self.state.try_write() {
@@ -998,7 +1618,7 @@ impl ApprovalService {
         if let Some(mut state) = self.state.try_write() {
             self.count_review_lock();
             let result = dispose_locked(&mut state.authority, id, retire);
-            return (Some(result), self.release_state(state));
+            return (Some(result), self.release_review_state(state));
         }
         self.queued_disposals.lock().push(QueuedReviewDisposal {
             id: id.to_owned(),
@@ -1012,33 +1632,81 @@ impl ApprovalService {
         match self.state.try_write() {
             Some(state) => {
                 self.count_review_lock();
-                (None, self.release_state(state))
+                (None, self.release_review_state(state))
             }
             None => (None, SettledReports::default()),
         }
     }
 
-    /// Release the state lock, settling every queued disposal first UNDER
-    /// the queue mutex and unlocking while still holding it: a disposer that
-    /// failed its try-lock pushes under that mutex, so its entry is either
-    /// in this final drain or pushed after the unlock (when its own retry can
-    /// take the lock). No entry is lost between the last drain and the
-    /// unlock. The reports run later, outside both locks.
+    /// Release the state lock from a store-capable owner path: queued run
+    /// withdrawals are retired and recorded durably, then queued disposals
+    /// settle (see [`Self::release_with`]).
     fn release_state(
         &self,
-        mut state: parking_lot::RwLockWriteGuard<'_, ApprovalServiceState>,
+        state: parking_lot::RwLockWriteGuard<'_, ApprovalServiceState>,
     ) -> SettledReports {
-        let mut queue = self.queued_disposals.lock();
-        let settled = std::mem::take(&mut *queue)
-            .into_iter()
-            .map(|disposal| {
-                let result = dispose_locked(&mut state.authority, &disposal.id, disposal.retire);
-                (disposal.report, result)
-            })
-            .collect();
-        drop(state);
-        drop(queue);
-        SettledReports(settled)
+        self.release_with(state, true)
+    }
+
+    /// Release the state lock from a review path, which makes no store call:
+    /// queued run withdrawals only retire their custody here (in memory);
+    /// their durable record and notice wait for a store-capable holder.
+    fn release_review_state(
+        &self,
+        state: parking_lot::RwLockWriteGuard<'_, ApprovalServiceState>,
+    ) -> SettledReports {
+        self.release_with(state, false)
+    }
+
+    /// Release the state lock. Queued run withdrawals are drained in rounds:
+    /// their custody is retired in memory and, from a store-capable path,
+    /// recorded durably with no queue mutex held across that store or
+    /// observer work. The last round is decided UNDER the withdrawal and
+    /// disposal queue mutexes, and the state is unlocked while they are
+    /// still held: a pusher that failed its try-lock pushed under one of
+    /// them, so its entry is either drained here or pushed after the unlock
+    /// (when its own retry can take the lock). No entry is lost between the
+    /// last drain and the unlock. The reports run later, outside every lock.
+    fn release_with(
+        &self,
+        mut state: parking_lot::RwLockWriteGuard<'_, ApprovalServiceState>,
+        durable: bool,
+    ) -> SettledReports {
+        loop {
+            if durable {
+                self.record_pending_withdrawals_locked(&mut state);
+            }
+            let mut withdrawals = self.queued_withdrawals.lock();
+            if withdrawals.is_empty() {
+                let mut queue = self.queued_disposals.lock();
+                let settled = std::mem::take(&mut *queue)
+                    .into_iter()
+                    .map(|disposal| {
+                        let result =
+                            dispose_locked(&mut state.authority, &disposal.id, disposal.retire);
+                        (disposal.report, result)
+                    })
+                    .collect();
+                // A store-free release never drops a pending durable record:
+                // it hands the settlement duty to its reports.
+                let duty = !durable
+                    && (!state.pending_withdrawals.is_empty() || !state.pending_parks.is_empty());
+                drop(state);
+                drop(queue);
+                drop(withdrawals);
+                let reports = SettledReports(settled);
+                return if duty {
+                    reports.with_settlement_duty(self.clone())
+                } else {
+                    reports
+                };
+            }
+            let works = std::mem::take(&mut *withdrawals);
+            drop(withdrawals);
+            for work in works {
+                self.retire_work_custody_locked(&mut state, &work);
+            }
+        }
     }
 
     #[inline]
@@ -1071,7 +1739,7 @@ impl ApprovalService {
         };
         self.count_review_lock();
         let status = review_status_from_outcome(state.authority.begin_review(id.to_string()));
-        self.release_state(state).run();
+        self.release_review_state(state).run();
         match status {
             Ok(ReviewAttemptStatus::Pending) => {
                 Ok(ReviewAttemptHandle::new(id, binding.clone(), work.clone()))
@@ -1101,7 +1769,7 @@ impl ApprovalService {
         &self,
         handle: &ReviewAttemptHandle,
         verdict: ReviewVerdict,
-        final_check: impl FnOnce() -> Result<(), E>,
+        final_check: impl Fn() -> Result<(), E>,
         retirement: impl FnOnce(&ReservedReviewError<E>) -> ReviewRetirementReason,
         on_queued: impl FnOnce() -> QueuedDisposalReport,
     ) -> Result<(ReviewAttemptStatus, SettledReports), RefusedReviewCommit<E>> {
@@ -1156,7 +1824,7 @@ impl ApprovalService {
         handle: &ReviewAttemptHandle,
         check: &crate::authorization::PreparedOperationCheck,
         work: &crate::authorization::WorkAuthorizationContext,
-        final_check: impl FnOnce() -> Result<(), E>,
+        final_check: impl Fn() -> Result<(), E>,
         retirement: impl FnOnce(&ReservedReviewError<E>) -> ReviewRetirementReason,
         on_queued: impl FnOnce() -> QueuedDisposalReport,
     ) -> Result<(ReviewAttemptStatus, SettledReports), RefusedReviewCommit<E>> {
@@ -1180,8 +1848,145 @@ impl ApprovalService {
         self.apply_review(|authority| authority.release_review(handle.id().to_owned()))
     }
 
+    /// The conditional store write of one row, under the owner's
+    /// reservation, before anything is published. A conflicting or uncertain
+    /// write leaves the stored row unknown: the row is marked for
+    /// reconciliation and its live consent custody is retired (zero entry,
+    /// no refund, no automatic resend). A proven no-commit changes nothing.
+    fn commit_row_locked(
+        &self,
+        state: &mut ApprovalServiceState,
+        expected: Option<&ApprovalRecord>,
+        record: &ApprovalRecord,
+    ) -> Result<(), ApprovalError> {
+        let Err(error) = self.store.put_if_current(expected, record) else {
+            return Ok(());
+        };
+        if error.leaves_row_unknown() {
+            state.mark_unreconciled(&record.approval_id);
+            self.abandon_consent_locked(state, &record.approval_id);
+        }
+        Err(error.into_commit_error(&record.approval_id))
+    }
+
+    /// Reconcile one row with its store through the same generated owner,
+    /// before it is reused. The stored row is read outside the owner's
+    /// reservation and published under it only if the row is still marked
+    /// exactly as it was before the read. A missing, unreadable or invalid
+    /// stored row stays unavailable; reconciled history never recreates a
+    /// binding or executable consent, and never undoes a spend.
+    pub fn reconcile(&self, approval_id: &ApprovalId) -> Result<ApprovalRecord, ApprovalError> {
+        self.ensure_available()?;
+        let (mark, known) = {
+            let state = self.state.read();
+            (
+                state.unreconciled.get(approval_id).copied(),
+                state.records.get(approval_id).cloned(),
+            )
+        };
+        self.settle_owner_now().run();
+        let Some(mark) = mark else {
+            return known.ok_or_else(|| ApprovalError::NotFound {
+                approval_id: approval_id.clone(),
+            });
+        };
+        let stored = self
+            .store
+            .get(approval_id)
+            .map_err(|error| ApprovalError::StoreUnavailable(error.to_string()))?
+            .filter(|stored| stored.approval_id == *approval_id)
+            .ok_or_else(|| ApprovalError::Unreconciled {
+                approval_id: approval_id.clone(),
+            })?;
+        let mut state = self.state.write();
+        let result =
+            Self::reconcile_locked(&mut state, approval_id, mark, stored).and_then(|stored| {
+                // A withdrawal an unknown write left owed settles against the
+                // confirmed row under this reservation; when its own write
+                // fails, the row is unknown again and so reported.
+                self.settle_reconciled_withdrawal_locked(&mut state, approval_id)?;
+                Ok(state.records.get(approval_id).cloned().unwrap_or(stored))
+            });
+        self.release_state(state).run();
+        result
+    }
+
+    fn reconcile_locked(
+        state: &mut ApprovalServiceState,
+        approval_id: &ApprovalId,
+        mark: u64,
+        stored: ApprovalRecord,
+    ) -> Result<ApprovalRecord, ApprovalError> {
+        let unreconciled = || ApprovalError::Unreconciled {
+            approval_id: approval_id.clone(),
+        };
+        match state.unreconciled.get(approval_id) {
+            Some(current) if *current == mark => {}
+            // Marked again while the store was read: that read is stale.
+            Some(_) => return Err(unreconciled()),
+            None => {
+                return state
+                    .records
+                    .get(approval_id)
+                    .cloned()
+                    .ok_or_else(unreconciled);
+            }
+        }
+        let (consent, authenticated, consumed) =
+            stored_consent_flags(&stored).map_err(|_| unreconciled())?;
+        let (approve_allowed, deny_allowed) = allowed_decision_flags(&stored.allowed_decisions);
+        let mut authority = state.authority.clone();
+        let id = approval_id.to_string();
+        let status = approval_lifecycle_status(stored.status);
+        let decision = restored_lifecycle_decision(&stored);
+        let has_expiry = stored.expires_at.is_some();
+        // A row the generated owner never committed (an uncertain create) is
+        // restored as history; a known row is reconciled in place.
+        let outcome = if authority.status_for(&id).is_some() {
+            authority.reconcile_approval(
+                id,
+                status,
+                approve_allowed,
+                deny_allowed,
+                has_expiry,
+                decision,
+                consent,
+                authenticated,
+                consumed,
+            )
+        } else {
+            authority.restore_approval(
+                id,
+                status,
+                approve_allowed,
+                deny_allowed,
+                has_expiry,
+                decision,
+                consent,
+                authenticated,
+                consumed,
+            )
+        }
+        .map_err(lifecycle_error)?;
+        restored_status_matches(&stored, outcome).map_err(|_| unreconciled())?;
+        state.authority = authority;
+        state.records.insert(approval_id.clone(), stored.clone());
+        state.unreconciled.remove(approval_id);
+        Ok(stored)
+    }
+
+    /// Reconcile `approval_id` first when its stored row is unknown.
+    fn reconcile_if_unreconciled(&self, approval_id: &ApprovalId) -> Result<(), ApprovalError> {
+        let marked = self.state.read().unreconciled.contains_key(approval_id);
+        self.settle_owner_now().run();
+        if marked {
+            self.reconcile(approval_id)?;
+        }
+        Ok(())
+    }
+
     fn refresh_expiry(&self, approval_id: &ApprovalId) -> Result<(), ApprovalError> {
-        let now = Utc::now();
+        let now = self.now();
         let mut state = self.state.write();
         let result = self.refresh_expiry_locked(&mut state, approval_id, now);
         // An expiry put is an owner commit too: settle queued disposals.
@@ -1195,12 +2000,38 @@ impl ApprovalService {
         approval_id: &ApprovalId,
         now: DateTime<Utc>,
     ) -> Result<(), ApprovalError> {
+        self.observe_expiry_locked(state, approval_id, now, false)
+    }
+
+    /// Observe expiry at `now`, or earlier when the caller already observed
+    /// a passed deadline. A consent approval that expires retires its
+    /// retained candidate in the same reservation.
+    fn observe_expiry_locked(
+        &self,
+        state: &mut ApprovalServiceState,
+        approval_id: &ApprovalId,
+        now: DateTime<Utc>,
+        deadline_passed: bool,
+    ) -> Result<(), ApprovalError> {
+        // Withdrawals whose custody is already retired are recorded first,
+        // and a row whose stored form is unknown is never read or written
+        // here: it is reconciled through the owner before reuse.
+        self.record_pending_withdrawals_locked(state);
+        state.ensure_reconciled(approval_id)?;
+        // Backstop for a run that closed without its eager withdrawal: a
+        // live candidate whose retained decision is no longer current is
+        // withdrawn here (callback-free check under the reservation). A
+        // withdrawal that could not be recorded stops this read: nothing is
+        // derived from the old record and the retired machine state.
+        self.withdraw_stale_consent_locked(state, approval_id);
+        state.ensure_reconciled(approval_id)?;
         let Some(record) = state.records.get(approval_id).cloned() else {
             return Ok(());
         };
-        let expired = record
-            .expires_at
-            .is_some_and(|expires_at| expires_at <= now);
+        let expired = deadline_passed
+            || record
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= now);
         let mut authority = state.authority.clone();
         let outcome = authority
             .observe_approval_expiry(approval_id.to_string(), expired)
@@ -1209,12 +2040,20 @@ impl ApprovalService {
         if status == record.status {
             state.authority = authority;
         } else {
-            let mut expired_record = record;
+            let mut expired_record = record.clone();
             expired_record.status = status;
             expired_record.updated_at = now;
-            self.store.put(&expired_record)?;
+            self.commit_row_locked(state, Some(&record), &expired_record)?;
             state.authority = authority;
             state.records.insert(approval_id.clone(), expired_record);
+            self.withdraw_consent_locked(
+                state,
+                approval_id,
+                ReviewRetirementReason::DeadlineExpired,
+            );
+            // The expiry is committed; a withdrawal that could not be recorded
+            // leaves the row to reconciliation, never returned as current.
+            state.ensure_reconciled(approval_id)?;
         }
         Ok(())
     }
@@ -1227,7 +2066,7 @@ impl ApprovalService {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        self.settle_queued_disposals_now().run();
+        self.settle_owner_now().run();
         for id in ids {
             self.refresh_expiry(&id)?;
         }
@@ -1260,6 +2099,9 @@ pub(crate) struct RefusedReviewCommit<E> {
     /// Reports of unrelated disposals settled along the way; the caller
     /// runs them only after releasing its own locks.
     pub(crate) reports: SettledReports,
+    /// The commit already happened (a spend refused by its final check after
+    /// the owner exit): its status stays committed and nothing refunds.
+    pub(crate) committed: Option<ReviewAttemptStatus>,
 }
 
 /// Retire (when set) and release one attempt under a reservation already
@@ -1278,6 +2120,12 @@ fn dispose_locked(
 
 /// Settled review disposal reports, run outside every lock. Dropping runs
 /// any report not yet run, so none is lost.
+///
+/// A store-free (review path) release that left a withdrawal awaiting its
+/// durable record carries the owner's settlement duty here: once these
+/// reports run (outside every lock, after the effect for a spend), the
+/// owner settles from a store-capable path, or the holder that prevents it
+/// settles or carries the duty on in turn.
 #[must_use = "run the reports once outside every lock"]
 #[derive(Default)]
 pub(crate) struct SettledReports(Vec<SettledReviewDisposal>);
@@ -1287,9 +2135,17 @@ impl SettledReports {
         drop(self);
     }
 
-    /// Carry `other`'s reports with these, to run together later.
+    /// Carry `other`'s reports (and any settlement duty) with these, to run
+    /// together later.
     pub(crate) fn absorb(&mut self, mut other: SettledReports) {
         self.0.append(&mut other.0);
+    }
+
+    /// The owner's settlement duty, run with these reports.
+    fn with_settlement_duty(mut self, owner: ApprovalService) -> Self {
+        let settle: QueuedDisposalReport = Box::new(move |_| owner.settle_owner_now().run());
+        self.0.push((settle, Ok(ReviewAttemptStatus::Retired)));
+        self
     }
 }
 
@@ -1320,6 +2176,10 @@ mod tests {
         records: RwLock<BTreeMap<ApprovalId, ApprovalRecord>>,
         put_calls: AtomicUsize,
         fail_on_put_call: Option<usize>,
+        /// The failing put commits first and then reports an unknown outcome.
+        commit_then_fail: bool,
+        /// The failing put writes nothing but reports an unknown outcome.
+        unknown_without_write: bool,
     }
 
     impl TestApprovalStore {
@@ -1328,6 +2188,8 @@ mod tests {
                 records: RwLock::new(BTreeMap::new()),
                 put_calls: AtomicUsize::new(0),
                 fail_on_put_call,
+                commit_then_fail: false,
+                unknown_without_write: false,
             }
         }
 
@@ -1341,19 +2203,42 @@ mod tests {
             Ok(self.records.read().values().cloned().collect())
         }
 
-        fn put(&self, record: &ApprovalRecord) -> Result<(), ApprovalStoreError> {
+        fn get(
+            &self,
+            approval_id: &ApprovalId,
+        ) -> Result<Option<ApprovalRecord>, ApprovalStoreError> {
+            Ok(self.record(approval_id))
+        }
+
+        fn put_if_current(
+            &self,
+            expected: Option<&ApprovalRecord>,
+            record: &ApprovalRecord,
+        ) -> Result<(), ApprovalStoreError> {
             let put_call = self.put_calls.fetch_add(1, Ordering::SeqCst) + 1;
-            if self
+            let fails = self
                 .fail_on_put_call
-                .is_some_and(|fail_on_put_call| fail_on_put_call == put_call)
-            {
-                return Err(ApprovalStoreError::Backend(
+                .is_some_and(|fail_on_put_call| fail_on_put_call == put_call);
+            if fails && self.unknown_without_write {
+                return Err(ApprovalStoreError::CommitUnknown(
+                    "injected unknown outcome without a write".to_string(),
+                ));
+            }
+            if fails && !self.commit_then_fail {
+                return Err(ApprovalStoreError::NotCommitted(
                     "injected approval store failure".to_string(),
                 ));
             }
-            self.records
-                .write()
-                .insert(record.approval_id.clone(), record.clone());
+            let mut records = self.records.write();
+            if records.get(&record.approval_id) != expected {
+                return Err(ApprovalStoreError::Conflict);
+            }
+            records.insert(record.approval_id.clone(), record.clone());
+            if fails {
+                return Err(ApprovalStoreError::CommitUnknown(
+                    "injected failure after the write".to_string(),
+                ));
+            }
             Ok(())
         }
 
@@ -1390,7 +2275,7 @@ mod tests {
         }
     }
 
-    fn request() -> ApprovalRequest {
+    pub(super) fn request() -> ApprovalRequest {
         request_with_allowed(BTreeSet::from([
             ApprovalDecision::Approve,
             ApprovalDecision::Deny,
@@ -1506,7 +2391,7 @@ mod tests {
             )
             .expect_err("decision write should fail");
 
-        assert!(matches!(err, ApprovalError::Store(_)));
+        assert!(matches!(err, ApprovalError::StoreUnavailable(_)));
         let cached = service.get(&record.approval_id).expect("cached record");
         assert_eq!(cached.status, ApprovalStatus::Pending);
         assert!(cached.decision.is_none());
@@ -1540,7 +2425,128 @@ mod tests {
             .insert(record.approval_id.clone(), record);
 
         let restored = ApprovalService::with_store(store);
-        assert!(matches!(restored, Err(ApprovalError::Store(_))));
+        assert!(matches!(
+            restored,
+            Err(ApprovalError::InvalidStoredRecord { .. })
+        ));
+    }
+
+    /// The reconcile-before-reuse barrier holds at the reservation itself:
+    /// a decision that passed its preflight before the row was marked
+    /// (CommitUnknown that wrote nothing) cannot publish over the marked row,
+    /// so reconciliation publishes the actual stored row, never an older
+    /// snapshot over a newer confirmed one. The confirmed control decides.
+    #[test]
+    fn a_decision_past_preflight_cannot_publish_over_an_unreconciled_row() {
+        let mut store = TestApprovalStore::new(Some(2));
+        store.unknown_without_write = true;
+        let store = Arc::new(store);
+        let service = ApprovalService::with_store(store.clone()).expect("service");
+        let id = service
+            .request(request())
+            .expect("request accepted")
+            .approval_id;
+        assert_eq!(
+            service.decide(
+                &id,
+                ApprovalDecision::Deny,
+                principal("human:bob"),
+                None,
+                None
+            ),
+            Err(ApprovalError::StoreCommitUnknown {
+                approval_id: id.clone()
+            })
+        );
+        // Reconciliation reads the stored row outside the reservation.
+        let mark = *service.state.read().unreconciled.get(&id).expect("marked");
+        let stored = store.record(&id).expect("stored row");
+        // A decision that already passed its preflight reaches the reservation.
+        let mut state = service.state.write();
+        assert_eq!(
+            service.decide_locked(
+                &mut state,
+                &id,
+                ApprovalDecision::Approve,
+                principal("human:bob"),
+                None,
+                None,
+                Utc::now(),
+            ),
+            Err(ApprovalError::Unreconciled {
+                approval_id: id.clone()
+            })
+        );
+        assert_eq!(
+            store.put_calls.load(Ordering::SeqCst),
+            2,
+            "no write past the barrier"
+        );
+        let published =
+            ApprovalService::reconcile_locked(&mut state, &id, mark, stored).expect("reconciled");
+        service.release_state(state).run();
+        assert_eq!(published.status, ApprovalStatus::Pending);
+        // Confirmed control.
+        let decided = service
+            .decide(
+                &id,
+                ApprovalDecision::Approve,
+                principal("human:bob"),
+                None,
+                None,
+            )
+            .expect("decided");
+        assert_eq!(decided.status, ApprovalStatus::Approved);
+        assert_eq!(
+            store.record(&id).map(|row| row.status),
+            Some(ApprovalStatus::Approved)
+        );
+    }
+
+    /// A decision whose store write committed before reporting failure is
+    /// never published as a no-commit: the outcome is typed unknown, nothing
+    /// is visible from the uncertain write, and the row is reconciled from
+    /// the store before reuse.
+    #[test]
+    fn a_commit_then_error_decision_is_unknown_and_reconciled() {
+        let mut store = TestApprovalStore::new(Some(2));
+        store.commit_then_fail = true;
+        let store = Arc::new(store);
+        let service = ApprovalService::with_store(store.clone()).expect("service");
+        let record = service.request(request()).expect("request accepted");
+
+        let err = service
+            .decide(
+                &record.approval_id,
+                ApprovalDecision::Approve,
+                principal("human:bob"),
+                None,
+                None,
+            )
+            .expect_err("the decision outcome is unknown");
+        assert_eq!(
+            err,
+            ApprovalError::StoreCommitUnknown {
+                approval_id: record.approval_id.clone()
+            }
+        );
+        // The store did commit; reading reconciles to it.
+        let reconciled = service.get(&record.approval_id).expect("reconciled");
+        assert_eq!(reconciled.status, ApprovalStatus::Approved);
+        assert_eq!(
+            store.record(&record.approval_id).map(|row| row.status),
+            Some(ApprovalStatus::Approved)
+        );
+        assert!(matches!(
+            service.decide(
+                &record.approval_id,
+                ApprovalDecision::Deny,
+                principal("human:bob"),
+                None,
+                None,
+            ),
+            Err(ApprovalError::AlreadyDecided { .. })
+        ));
     }
 
     #[test]
@@ -1551,14 +2557,14 @@ mod tests {
             .expect_err("unavailable service should reject reads");
         assert!(matches!(
             err,
-            ApprovalError::Store(message) if message.contains("persistent approval restore failed")
+            ApprovalError::StoreUnavailable(message) if message.contains("persistent approval restore failed")
         ));
         let err = service
             .request(request())
             .expect_err("unavailable service should reject writes");
         assert!(matches!(
             err,
-            ApprovalError::Store(message) if message.contains("persistent approval restore failed")
+            ApprovalError::StoreUnavailable(message) if message.contains("persistent approval restore failed")
         ));
     }
 
@@ -1876,6 +2882,160 @@ mod review_owner_tests {
         );
     }
 
+    /// A held in-memory store is contention, reported at once: the
+    /// conditional write never waits and writes nothing; once free it
+    /// commits.
+    #[test]
+    fn a_held_in_memory_store_is_contention_not_a_wait() {
+        let store = InMemoryApprovalStore::new();
+        let record = ApprovalService::new()
+            .request(super::tests::request())
+            .expect("request accepted");
+        let held = store.records.read();
+        assert_eq!(
+            store.put_if_current(None, &record),
+            Err(ApprovalStoreError::Contended)
+        );
+        drop(held);
+        assert!(store.load_all().expect("rows").is_empty());
+        store
+            .put_if_current(None, &record)
+            .expect("a free store commits");
+    }
+
+    /// The generated owner holds the consent link and its one-use legality:
+    /// only the linked pair moves, only on an authenticated decision; a
+    /// generic input never decides the approval or spends its attempt; one
+    /// valid spend succeeds and a second is refused.
+    #[test]
+    fn the_generated_owner_spends_only_the_linked_consent_once() {
+        use ApprovalLifecycleOutcome::{Rejected, ReviewStatus, Status};
+        use ApprovalLifecycleRejectionReason as Reason;
+        let mut owner = ApprovalLifecycleMachineAuthority::new();
+        let s = |value: &str| value.to_owned();
+        for (approval, attempt) in [("a1", "r1"), ("a2", "r2")] {
+            assert_eq!(
+                owner.create_consent_approval(s(approval), s(attempt), true, true, true),
+                Ok(Status(ApprovalLifecycleStatus::Pending))
+            );
+        }
+        let approve = ApprovalLifecycleDecision::Approve;
+        assert_eq!(
+            owner.decide_approval(s("a1"), approve),
+            Ok(Rejected(Reason::AuthenticationRequired)),
+            "the generic decision never decides consent"
+        );
+        assert_eq!(
+            owner.decide_consent(s("a1"), s("r2"), approve, true),
+            Ok(Rejected(Reason::ConsentMismatch)),
+            "another approval's attempt is not linked"
+        );
+        assert_eq!(
+            owner.decide_consent(s("a1"), s("r1"), approve, false),
+            Ok(Rejected(Reason::AuthenticationRequired))
+        );
+        assert_eq!(
+            owner.decide_consent(s("a1"), s("r1"), approve, true),
+            Ok(Status(ApprovalLifecycleStatus::Approved))
+        );
+        assert_eq!(
+            owner.consume_review_for_entry(s("r1")),
+            Ok(Rejected(Reason::ConsentLinked)),
+            "the generic spend refuses a linked attempt"
+        );
+        assert_eq!(
+            owner.consume_consent_for_entry(s("a1"), s("r2")),
+            Ok(Rejected(Reason::ConsentMismatch))
+        );
+        assert_eq!(
+            owner.consume_consent_for_entry(s("a2"), s("r2")),
+            Ok(Rejected(Reason::ReviewNotSatisfied)),
+            "a pending consent is not spendable"
+        );
+        assert_eq!(
+            owner.consume_consent_for_entry(s("a1"), s("r1")),
+            Ok(ReviewStatus(ReviewAttemptStatus::Used))
+        );
+        assert_eq!(
+            owner.consume_consent_for_entry(s("a1"), s("r1")),
+            Ok(Rejected(Reason::AlreadyConsumed))
+        );
+        assert_eq!(
+            owner.withdraw_consent(s("a2"), s("r2"), ReviewRetirementReason::RunEnded),
+            Ok(Status(ApprovalLifecycleStatus::Cancelled)),
+            "a withdrawn pending consent is cancelled, not denied"
+        );
+        assert_eq!(
+            owner.decide_consent(s("a2"), s("r2"), approve, true),
+            Ok(Rejected(Reason::ConsentMismatch)),
+            "a withdrawn attempt can no longer be decided"
+        );
+    }
+
+    /// The generated owner settles a consent row no attempt is linked to,
+    /// without any candidate, whether its own owner still owes the
+    /// withdrawal's record or its issuing owner is proven lost: a pending
+    /// row is cancelled, approved unspent history is kept, and a missing,
+    /// non-consent, linked (held here), spent, expired or already settled
+    /// row is refused.
+    #[test]
+    fn the_generated_owner_settles_unlinked_consent_rows() {
+        use ApprovalLifecycleOutcome::{Rejected, Status};
+        use ApprovalLifecycleRejectionReason as Reason;
+        use ApprovalLifecycleStatus as Lifecycle;
+        let mut owner = ApprovalLifecycleMachineAuthority::new();
+        let s = |value: &str| value.to_owned();
+        let approve = Some(ApprovalLifecycleDecision::Approve);
+        let deny = Some(ApprovalLifecycleDecision::Deny);
+        for (id, status, decision, consent, authenticated, consumed) in [
+            ("pending", Lifecycle::Pending, None, true, false, false),
+            ("approved", Lifecycle::Approved, approve, true, true, false),
+            ("spent", Lifecycle::Approved, approve, true, true, true),
+            ("expired", Lifecycle::Expired, None, true, false, false),
+            ("denied", Lifecycle::Denied, deny, true, true, false),
+            ("cancelled", Lifecycle::Cancelled, None, true, false, false),
+            ("plain", Lifecycle::Pending, None, false, false, false),
+        ] {
+            assert_eq!(
+                owner.restore_approval(
+                    s(id),
+                    status,
+                    true,
+                    true,
+                    true,
+                    decision,
+                    consent,
+                    authenticated,
+                    consumed
+                ),
+                Ok(Status(status)),
+                "{id} restored"
+            );
+        }
+        assert_eq!(
+            owner.create_consent_approval(s("held"), s("r1"), true, true, true),
+            Ok(Status(Lifecycle::Pending))
+        );
+        for (id, expected) in [
+            ("missing", Rejected(Reason::NotFound)),
+            ("plain", Rejected(Reason::NotConsent)),
+            ("held", Rejected(Reason::ConsentLinked)),
+            ("spent", Rejected(Reason::AlreadyConsumed)),
+            ("expired", Rejected(Reason::Expired)),
+            ("denied", Rejected(Reason::AlreadyDecided)),
+            ("cancelled", Rejected(Reason::AlreadyDecided)),
+            ("pending", Status(Lifecycle::Cancelled)),
+            ("approved", Status(Lifecycle::Approved)),
+        ] {
+            assert_eq!(owner.settle_unlinked_consent(s(id)), Ok(expected), "{id}");
+        }
+        assert_eq!(
+            owner.settle_unlinked_consent(s("pending")),
+            Ok(Rejected(Reason::AlreadyDecided)),
+            "a cancelled row is settled once"
+        );
+    }
+
     #[derive(Default)]
     struct CountingStore(AtomicUsize);
 
@@ -1884,7 +3044,18 @@ mod review_owner_tests {
             Ok(Vec::new())
         }
 
-        fn put(&self, _record: &ApprovalRecord) -> Result<(), ApprovalStoreError> {
+        fn get(
+            &self,
+            _approval_id: &ApprovalId,
+        ) -> Result<Option<ApprovalRecord>, ApprovalStoreError> {
+            Ok(None)
+        }
+
+        fn put_if_current(
+            &self,
+            _expected: Option<&ApprovalRecord>,
+            _record: &ApprovalRecord,
+        ) -> Result<(), ApprovalStoreError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }

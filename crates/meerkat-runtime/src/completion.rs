@@ -51,20 +51,40 @@ pub enum CompletionWaitError {
     AttachmentReplaced,
     #[error("{0}")]
     AuthorityUnavailable(String),
+    /// The input completed and its result is preserved, but the result may
+    /// not be disclosed to this reader: the scoped destination it was
+    /// admitted under is not the session document's current binding. This
+    /// is not a waiter failure: the input is not failed and its completion
+    /// cleanup already ran.
+    #[error("the input's {observed:?} result is withheld: its scoped destination is not current")]
+    DisclosureRefused {
+        /// The body-free generated completion observation: what the input
+        /// reached, without its result or callback arguments.
+        observed: crate::meerkat_machine::dsl::RuntimeCompletionObservedOutcome,
+    },
 }
 
 impl CompletionWaitError {
+    /// The generated wait-failure observation of a waiter failure; `None`
+    /// for a disclosure refusal, which is not one.
     pub fn wait_failure_observation(
         &self,
-    ) -> crate::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation {
+    ) -> Option<crate::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation> {
         match self {
-            Self::ChannelClosed => {
-                crate::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::ChannelClosed
-            }
-            Self::AttachmentReplaced | Self::AuthorityUnavailable(_) => {
-                crate::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::AuthorityUnavailable
-            }
+            Self::ChannelClosed => Some(
+                crate::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::ChannelClosed,
+            ),
+            Self::AttachmentReplaced | Self::AuthorityUnavailable(_) => Some(
+                crate::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::AuthorityUnavailable,
+            ),
+            Self::DisclosureRefused { .. } => None,
         }
+    }
+
+    /// Stable typed predicate for a refused result disclosure.
+    #[must_use]
+    pub const fn is_disclosure_refused(&self) -> bool {
+        matches!(self, Self::DisclosureRefused { .. })
     }
 
     /// Stable typed predicate for retryable attachment replacement. Surfaces
@@ -320,11 +340,110 @@ impl CompletionCleanupObservation {
 
 /// Result carried on completion waiter plumbing after generated authority has
 /// selected both the public result class and cleanup observation.
+///
+/// The private delivery always carries the known outcome and its body-free
+/// cleanup observation through relays; the result payload is gated only
+/// where it is released to a public reader.
 #[derive(Debug)]
 struct CompletionDelivery {
     outcome: CompletionOutcome,
     cleanup_observation: CompletionCleanupObservation,
     terminal_outcome: Option<crate::input_state::InputTerminalOutcome>,
+    disclosure: Option<DeferredDisclosure>,
+}
+
+impl CompletionDelivery {
+    fn into_release(self) -> CompletionRelease {
+        CompletionRelease {
+            observed: self.cleanup_observation.observed_outcome(),
+            outcome: self.outcome,
+            disclosure: self.disclosure,
+        }
+    }
+}
+
+type DisclosureDecision = std::pin::Pin<Box<dyn Future<Output = bool> + Send>>;
+
+/// A disclosure decision captured when a completion is delivered and taken
+/// when its result payload is released (after waits and cleanup relays),
+/// against the actual current registration.
+#[derive(Clone)]
+pub(crate) struct DeferredDisclosure(Arc<dyn Fn() -> DisclosureDecision + Send + Sync>);
+
+impl DeferredDisclosure {
+    pub(crate) fn new<F, Fut>(permitted: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = bool> + Send + 'static,
+    {
+        Self(Arc::new(move || Box::pin(permitted())))
+    }
+
+    /// A decision that refuses: an input whose disclosure could not be
+    /// decided is never disclosed.
+    fn refused() -> Self {
+        Self::new(|| async { false })
+    }
+
+    pub(crate) async fn permitted(&self) -> bool {
+        (self.0)().await
+    }
+}
+
+impl std::fmt::Debug for DeferredDisclosure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeferredDisclosure")
+    }
+}
+
+/// Captures, for one delivered input, how its result payload's disclosure is
+/// decided at release.
+/// `None` when the input's disclosure cannot be decided from what the
+/// machine holds (the input is not admitted, or already archived).
+pub(crate) type CompletionDisclosureGate =
+    Arc<dyn Fn(&InputId) -> Option<DeferredDisclosure> + Send + Sync>;
+
+/// A delivered completion outcome whose result payload has not been released
+/// yet. [`Self::release`] releases it to the public reader, or refuses the
+/// disclosure with [`CompletionWaitError::DisclosureRefused`] while the
+/// input's completion and preserved result stand. Its `Debug` is opaque: it
+/// shows only the body-free observation, never the unreleased outcome.
+pub struct CompletionRelease {
+    outcome: CompletionOutcome,
+    observed: crate::meerkat_machine::dsl::RuntimeCompletionObservedOutcome,
+    disclosure: Option<DeferredDisclosure>,
+}
+
+impl std::fmt::Debug for CompletionRelease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompletionRelease")
+            .field("observed", &self.observed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CompletionRelease {
+    /// The body-free generated completion observation of this outcome.
+    #[must_use]
+    pub fn observed(&self) -> crate::meerkat_machine::dsl::RuntimeCompletionObservedOutcome {
+        self.observed
+    }
+
+    /// Release the outcome to this reader, deciding against the actual
+    /// current registration now. Only a result payload (a run result or
+    /// callback arguments) is ever withheld; lifecycle-only outcomes are
+    /// always released.
+    pub async fn release(self) -> Result<CompletionOutcome, CompletionWaitError> {
+        if let Some(disclosure) = &self.disclosure
+            && self.outcome.carries_result_payload()
+            && !disclosure.permitted().await
+        {
+            return Err(CompletionWaitError::DisclosureRefused {
+                observed: self.observed,
+            });
+        }
+        Ok(self.outcome)
+    }
 }
 
 /// Snapshot of one input's registered completion waiters.
@@ -358,6 +477,7 @@ pub struct CompletionHandle {
 #[derive(Debug)]
 struct CompletionWaiterToken {
     registry: Weak<StdMutex<CompletionWaiterMap>>,
+    disclosures: Weak<StdMutex<CapturedDisclosureMap>>,
     input_id: InputId,
     waiter_id: uuid::Uuid,
 }
@@ -382,32 +502,47 @@ impl CompletionHandle {
         rx.await.unwrap_or(Err(CompletionWaitError::ChannelClosed))
     }
 
-    /// Wait for the generated execution result or report mechanical waiter failure.
+    /// Wait for the generated execution result or report mechanical waiter
+    /// failure. A result this reader may not receive is refused with
+    /// [`CompletionWaitError::DisclosureRefused`].
     pub async fn try_wait(self) -> Result<CompletionOutcome, CompletionWaitError> {
         self.try_wait_delivery()
+            .await?
+            .into_release()
+            .release()
             .await
-            .map(|delivery| delivery.outcome)
     }
 
     /// Wait for completion and return the generated cleanup observation carried
-    /// with the authorized public outcome.
+    /// with the authorized public outcome. The cleanup observation is always
+    /// returned; the outcome is released (or its disclosure refused) by the
+    /// caller after its cleanup, with [`CompletionRelease::release`].
     pub async fn try_wait_with_cleanup_observation(
         self,
-    ) -> Result<(CompletionOutcome, CompletionCleanupObservation), CompletionWaitError> {
+    ) -> Result<(CompletionRelease, CompletionCleanupObservation), CompletionWaitError> {
         let delivery = self.try_wait_delivery().await?;
-        Ok((delivery.outcome, delivery.cleanup_observation))
+        let cleanup_observation = delivery.cleanup_observation.clone();
+        Ok((delivery.into_release(), cleanup_observation))
     }
 
     /// Wait for completion together with the exact committed input terminal
-    /// observed by the terminal-completion witness.
+    /// observed by the terminal-completion witness. The result payload is
+    /// released as in [`Self::try_wait`].
     pub async fn try_wait_with_terminal_outcome(
         self,
     ) -> Result<CompletionObservation, CompletionWaitError> {
         let delivery = self.try_wait_delivery().await?;
+        let input_terminal_outcome = delivery.terminal_outcome.clone();
         Ok(CompletionObservation {
-            outcome: delivery.outcome,
-            input_terminal_outcome: delivery.terminal_outcome,
+            outcome: delivery.into_release().release().await?,
+            input_terminal_outcome,
         })
+    }
+
+    /// Wait for the input's terminal as a wake only, without releasing its
+    /// result payload.
+    pub(crate) async fn wait_terminal_wake(self) {
+        let _wake = self.try_wait_delivery().await;
     }
 
     /// Wait for the generated execution result or report mechanical waiter failure.
@@ -539,6 +674,7 @@ impl CompletionHandle {
             outcome,
             cleanup_observation: CompletionCleanupObservation::from_realized_result(realized),
             terminal_outcome: None,
+            disclosure: None,
         }));
         Self {
             rx: Some(rx),
@@ -643,6 +779,12 @@ impl Drop for CompletionHandle {
                 input_waiters.remove(&token.waiter_id);
                 if input_waiters.is_empty() {
                     waiters.remove(&token.input_id);
+                    if let Some(disclosures) = token.disclosures.upgrade() {
+                        disclosures
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&token.input_id);
+                    }
                 }
             }
         }
@@ -669,6 +811,17 @@ impl PendingCompletionForTest {
 }
 
 impl CompletionOutcome {
+    /// Whether this outcome carries the run's result payload (its result or
+    /// the model-produced callback arguments), as opposed to a lifecycle-only
+    /// report. Only a result payload is subject to scoped disclosure.
+    #[must_use]
+    pub fn carries_result_payload(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed(_) | Self::CallbackPending { .. } | Self::CallbackBatchPending { .. }
+        )
+    }
+
     /// Mint a [`RuntimeTerminated`](Self::RuntimeTerminated) outcome from a
     /// termination reason, attaching the typed terminal failure metadata every
     /// surface keys off (runtime stop/destroy is a fatal terminal boundary).
@@ -1017,7 +1170,18 @@ pub(crate) fn authorized_interaction_terminal_events(
 pub(crate) struct CompletionRegistry {
     waiters: Arc<StdMutex<CompletionWaiterMap>>,
     receipt_less_observers: Arc<StdMutex<ReceiptLessTerminalObserverMap>>,
+    /// Decides at release whether a delivered result payload may reach its
+    /// public reader (the session document's scoped destination rule).
+    /// Without a gate every result is released.
+    disclosure_gate: Option<CompletionDisclosureGate>,
+    /// The disclosure decision of each waited input, captured when its first
+    /// waiter registers: the input is admitted and its destination recorded
+    /// then, while by delivery its terminal may already have archived that
+    /// record.
+    disclosures: Arc<StdMutex<CapturedDisclosureMap>>,
 }
+
+type CapturedDisclosureMap = HashMap<InputId, DeferredDisclosure>;
 
 type CompletionWaiterMap = HashMap<
     InputId,
@@ -1074,34 +1238,105 @@ impl Drop for ReceiptLessTerminalObserver {
 }
 
 impl CompletionRegistry {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// A registry whose result payloads are released through `gate`.
+    pub(crate) fn with_disclosure_gate(gate: CompletionDisclosureGate) -> Self {
+        Self {
+            disclosure_gate: Some(gate),
+            ..Self::default()
+        }
+    }
+
+    /// The disclosure of a delivered outcome: the decision captured when its
+    /// waiters registered. There is no late lookup: by delivery the input's
+    /// terminal may have archived what the machine recorded for it, so an
+    /// input with no captured decision is refused, never decided as
+    /// unscoped. (Every production registration follows the input's
+    /// admission, so this refusal is unreachable for them; it also holds on a
+    /// session without a governed host, where only a pre-admission
+    /// registration followed by an archive before delivery could reach it.)
+    fn disclosure_for(
+        &self,
+        captured: Option<DeferredDisclosure>,
+        outcome: &CompletionOutcome,
+    ) -> Option<DeferredDisclosure> {
+        if !outcome.carries_result_payload() {
+            return None;
+        }
+        self.disclosure_gate.as_ref()?;
+        Some(captured.unwrap_or_else(DeferredDisclosure::refused))
+    }
+
+    /// Take an input's waiters together with its captured disclosure, under
+    /// the waiter lock (lock order: waiters, then disclosures, as in
+    /// registration and handle drop).
+    fn take_input_waiters(
+        &self,
+        input_id: &InputId,
+    ) -> Option<(
+        Vec<oneshot::Sender<Result<CompletionDelivery, CompletionWaitError>>>,
+        Option<DeferredDisclosure>,
+    )> {
+        let mut waiters = self
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let input_waiters = waiters.remove(input_id)?;
+        let captured = self
+            .disclosures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(input_id);
+        Some((input_waiters.into_values().collect(), captured))
     }
 
     fn take_waiters(
         &self,
         input_id: &InputId,
     ) -> Option<Vec<oneshot::Sender<Result<CompletionDelivery, CompletionWaitError>>>> {
-        self.waiters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(input_id)
-            .map(|waiters| waiters.into_values().collect())
+        self.take_input_waiters(input_id)
+            .map(|(senders, _captured)| senders)
     }
 
+    #[cfg(test)]
     fn send_outcome(
         senders: Vec<oneshot::Sender<Result<CompletionDelivery, CompletionWaitError>>>,
         outcome: CompletionOutcome,
         cleanup_observation: CompletionCleanupObservation,
     ) {
-        Self::send_outcome_with_terminal(senders, outcome, cleanup_observation, None);
+        Self::send_delivery(senders, outcome, cleanup_observation, None, None);
     }
 
-    fn send_outcome_with_terminal(
+    /// Deliver a possibly result-bearing outcome with the disclosure
+    /// decision its waiters captured.
+    fn send_input_outcome(
+        &self,
+        captured: Option<DeferredDisclosure>,
         senders: Vec<oneshot::Sender<Result<CompletionDelivery, CompletionWaitError>>>,
         outcome: CompletionOutcome,
         cleanup_observation: CompletionCleanupObservation,
         terminal_outcome: Option<crate::input_state::InputTerminalOutcome>,
+    ) {
+        let disclosure = self.disclosure_for(captured, &outcome);
+        Self::send_delivery(
+            senders,
+            outcome,
+            cleanup_observation,
+            terminal_outcome,
+            disclosure,
+        );
+    }
+
+    fn send_delivery(
+        senders: Vec<oneshot::Sender<Result<CompletionDelivery, CompletionWaitError>>>,
+        outcome: CompletionOutcome,
+        cleanup_observation: CompletionCleanupObservation,
+        terminal_outcome: Option<crate::input_state::InputTerminalOutcome>,
+        disclosure: Option<DeferredDisclosure>,
     ) {
         for tx in senders {
             let outcome = outcome.clone();
@@ -1109,6 +1344,7 @@ impl CompletionRegistry {
                 outcome,
                 cleanup_observation: cleanup_observation.clone(),
                 terminal_outcome: terminal_outcome.clone(),
+                disclosure: disclosure.clone(),
             }));
         }
     }
@@ -1175,16 +1411,34 @@ impl CompletionRegistry {
     pub(crate) fn register(&mut self, input_id: InputId) -> CompletionHandle {
         let (tx, rx) = oneshot::channel();
         let waiter_id = meerkat_core::time_compat::new_uuid_v7();
-        self.waiters
+        // One critical section under the waiter lock (then disclosures, as in
+        // handle drop): a concurrent drop of the input's last old handle
+        // cannot clear the capture between the check and the waiter insert.
+        let mut waiters = self
+            .waiters
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(gate) = &self.disclosure_gate {
+            let mut disclosures = self
+                .disclosures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !disclosures.contains_key(&input_id)
+                && let Some(decision) = gate(&input_id)
+            {
+                disclosures.insert(input_id.clone(), decision);
+            }
+        }
+        waiters
             .entry(input_id.clone())
             .or_default()
             .insert(waiter_id, tx);
+        drop(waiters);
         CompletionHandle {
             rx: Some(rx),
             waiter_token: Some(CompletionWaiterToken {
                 registry: Arc::downgrade(&self.waiters),
+                disclosures: Arc::downgrade(&self.disclosures),
                 input_id,
                 waiter_id,
             }),
@@ -1244,11 +1498,13 @@ impl CompletionRegistry {
         result: RunResult,
         cleanup_observation: CompletionCleanupObservation,
     ) {
-        if let Some(senders) = self.take_waiters(input_id) {
-            Self::send_outcome(
+        if let Some((senders, captured)) = self.take_input_waiters(input_id) {
+            self.send_input_outcome(
+                captured,
                 senders,
                 CompletionOutcome::Completed(Box::new(result)),
                 cleanup_observation,
+                None,
             );
         }
     }
@@ -1309,8 +1565,14 @@ impl CompletionRegistry {
                 }
             };
         for input_id in input_ids {
-            if let Some(senders) = self.take_waiters(&input_id) {
-                Self::send_outcome(senders, outcome.clone(), cleanup_observation.clone());
+            if let Some((senders, captured)) = self.take_input_waiters(&input_id) {
+                self.send_input_outcome(
+                    captured,
+                    senders,
+                    outcome.clone(),
+                    cleanup_observation.clone(),
+                    None,
+                );
             }
         }
     }
@@ -1325,12 +1587,13 @@ impl CompletionRegistry {
         I: IntoIterator<Item = InputId>,
     {
         for input_id in input_ids {
-            if let Some(senders) = self.take_waiters(&input_id) {
+            if let Some((senders, captured)) = self.take_input_waiters(&input_id) {
                 let terminal_outcome = bundle
                     .terminal_completion_witness
                     .terminal_outcome(&input_id)
                     .cloned();
-                Self::send_outcome_with_terminal(
+                self.send_input_outcome(
+                    captured,
                     senders,
                     bundle.outcome.clone(),
                     bundle.cleanup_observation.clone(),
@@ -1381,8 +1644,9 @@ impl CompletionRegistry {
         args: Value,
         cleanup_observation: CompletionCleanupObservation,
     ) {
-        if let Some(senders) = self.take_waiters(input_id) {
-            Self::send_outcome(
+        if let Some((senders, captured)) = self.take_input_waiters(input_id) {
+            self.send_input_outcome(
+                captured,
                 senders,
                 CompletionOutcome::CallbackPending {
                     tool_use_id,
@@ -1390,6 +1654,7 @@ impl CompletionRegistry {
                     args,
                 },
                 cleanup_observation,
+                None,
             );
         }
     }
@@ -1543,12 +1808,17 @@ impl CompletionRegistry {
             return;
         }
         let cleanup_observation = Self::cleanup_from_realized_attempt(attempt);
-        let all_waiters = std::mem::take(
-            &mut *self
+        let all_waiters = {
+            let mut waiters = self
                 .waiters
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.disclosures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            std::mem::take(&mut *waiters)
+        };
         for (_, senders) in all_waiters {
             Self::send_outcome(
                 senders.into_values().collect(),
@@ -1587,12 +1857,17 @@ impl CompletionRegistry {
     }
 
     pub(crate) fn fail_all_waiters(&mut self, error: CompletionWaitError) {
-        let all_waiters = std::mem::take(
-            &mut *self
+        let all_waiters = {
+            let mut waiters = self
                 .waiters
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.disclosures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            std::mem::take(&mut *waiters)
+        };
         for (_, senders) in all_waiters {
             Self::send_error(senders.into_values().collect(), error.clone());
         }
@@ -1628,6 +1903,10 @@ impl CompletionRegistry {
                 if is_still_pending(input_id) {
                     return true;
                 }
+                self.disclosures
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(input_id);
                 Self::send_error(
                     std::mem::take(senders).into_values().collect(),
                     error.clone(),
@@ -1990,6 +2269,7 @@ mod tests {
                 terminal_outcome: Some(crate::input_state::InputTerminalOutcome::Abandoned {
                     reason: crate::input_state::InputAbandonReason::NeverExecuted,
                 }),
+                disclosure: None,
             }))
             .expect("test completion receiver remains live");
 
@@ -2244,6 +2524,195 @@ mod tests {
                 other => panic!("Expected Completed, got {other:?}"),
             }
         }
+    }
+
+    /// The result payload is gated where it is released, not where it is
+    /// delivered: a completion buffered while its destination is current is
+    /// refused once the destination retires before the public read. Cleanup
+    /// relays still observe the body-free cleanup evidence, the cleanup
+    /// observation accessor keeps it, and lifecycle-only outcomes are never
+    /// gated.
+    #[tokio::test]
+    async fn result_disclosure_is_decided_at_release_after_cleanup_relays() {
+        let permitted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let gate_permitted = Arc::clone(&permitted);
+        let mut registry =
+            CompletionRegistry::with_disclosure_gate(Arc::new(move |_input_id: &InputId| {
+                let permitted = Arc::clone(&gate_permitted);
+                Some(DeferredDisclosure::new(move || {
+                    let permitted = permitted.load(std::sync::atomic::Ordering::SeqCst);
+                    async move { permitted }
+                }))
+            }));
+        let input_id = InputId::new();
+        let (cleanup_tx, cleanup_rx) = oneshot::channel();
+        let relayed = registry.register(input_id.clone()).with_completion_cleanup(
+            move |observation| async move {
+                let _ = cleanup_tx.send(observation.is_ok());
+            },
+        );
+        let observed = registry.register(input_id.clone());
+        let current = registry.register(input_id.clone());
+        registry.resolve_completed_authorized(
+            &input_id,
+            make_run_result(),
+            authority(
+                RuntimeCompletionResultClass::Completed,
+                RuntimeCompletionObservedOutcome::Completed,
+            ),
+        );
+        assert!(
+            cleanup_rx.await.expect("the relay ran its cleanup"),
+            "the relay's cleanup observed the generated cleanup evidence"
+        );
+        match current.try_wait().await {
+            Ok(CompletionOutcome::Completed(result)) => assert_eq!(result.text, "hello"),
+            other => panic!("the current destination receives the result: {other:?}"),
+        }
+
+        // The destination retires after delivery was buffered, before release.
+        permitted.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            relayed.try_wait().await,
+            Err(CompletionWaitError::DisclosureRefused {
+                observed: RuntimeCompletionObservedOutcome::Completed
+            })
+        ));
+        let (release, _cleanup_observation) = observed
+            .try_wait_with_cleanup_observation()
+            .await
+            .expect("the cleanup observation is kept for the caller's cleanup");
+        let formatted = format!("{release:?}");
+        assert!(
+            !formatted.contains("hello"),
+            "formatting an unreleased outcome never shows its payload: {formatted}"
+        );
+        assert_eq!(
+            release.observed(),
+            RuntimeCompletionObservedOutcome::Completed
+        );
+        let refused = release
+            .release()
+            .await
+            .expect_err("the payload is withheld");
+        assert!(refused.is_disclosure_refused());
+        assert!(refused.wait_failure_observation().is_none());
+
+        let lifecycle_only = InputId::new();
+        let handle = registry.register(lifecycle_only.clone());
+        registry.resolve_without_result_authorized(
+            &lifecycle_only,
+            authority(
+                RuntimeCompletionResultClass::CompletedWithoutResult,
+                RuntimeCompletionObservedOutcome::CompletedWithoutResult,
+            ),
+        );
+        assert!(matches!(
+            handle.try_wait().await,
+            Ok(CompletionOutcome::CompletedWithoutResult)
+        ));
+
+        // Callback arguments are model-produced payload too: withheld, while
+        // the refusal still reports the truthful callback-pending status.
+        let callback = InputId::new();
+        let handle = registry.register(callback.clone());
+        registry.resolve_callback_pending_authorized(
+            &callback,
+            "call-1".to_string(),
+            "lookup".to_string(),
+            serde_json::json!({ "secret": "callback-argument-marker" }),
+            authority(
+                RuntimeCompletionResultClass::CallbackPending,
+                RuntimeCompletionObservedOutcome::CallbackPending,
+            ),
+        );
+        let refused = handle
+            .try_wait()
+            .await
+            .expect_err("callback arguments are withheld");
+        assert_eq!(
+            refused,
+            CompletionWaitError::DisclosureRefused {
+                observed: RuntimeCompletionObservedOutcome::CallbackPending
+            }
+        );
+        assert!(!refused.to_string().contains("callback-argument-marker"));
+    }
+
+    /// The disclosure decision is captured when the input's waiter registers,
+    /// while the input's destination is recorded. Its terminal may archive
+    /// that record before the result is delivered: a result for the current
+    /// destination is still disclosed, and a refused capture stays refused.
+    #[tokio::test]
+    async fn disclosure_is_captured_at_registration_not_at_delivery() {
+        let recorded = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let admitted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let gate_recorded = Arc::clone(&recorded);
+        let gate_admitted = Arc::clone(&admitted);
+        let mut registry =
+            CompletionRegistry::with_disclosure_gate(Arc::new(move |_input_id: &InputId| {
+                // What the machine holds for the input when the gate asks: no
+                // decision for an input it does not hold.
+                if !gate_admitted.load(std::sync::atomic::Ordering::SeqCst) {
+                    return None;
+                }
+                let permitted = gate_recorded.load(std::sync::atomic::Ordering::SeqCst);
+                Some(DeferredDisclosure::new(move || async move { permitted }))
+            }));
+        let current = InputId::new();
+        let handle = registry.register(current.clone());
+        // The input's terminal archives its destination record before delivery.
+        recorded.store(false, std::sync::atomic::Ordering::SeqCst);
+        registry.resolve_completed_authorized(
+            &current,
+            make_run_result(),
+            authority(
+                RuntimeCompletionResultClass::Completed,
+                RuntimeCompletionObservedOutcome::Completed,
+            ),
+        );
+        match handle.try_wait().await {
+            Ok(CompletionOutcome::Completed(result)) => assert_eq!(result.text, "hello"),
+            other => panic!("the current destination receives its result: {other:?}"),
+        }
+
+        // A waiter registered when the input was not disclosable stays refused.
+        let refused = InputId::new();
+        let handle = registry.register(refused.clone());
+        recorded.store(true, std::sync::atomic::Ordering::SeqCst);
+        registry.resolve_completed_authorized(
+            &refused,
+            make_run_result(),
+            authority(
+                RuntimeCompletionResultClass::Completed,
+                RuntimeCompletionObservedOutcome::Completed,
+            ),
+        );
+        assert!(matches!(
+            handle.try_wait().await,
+            Err(CompletionWaitError::DisclosureRefused { .. })
+        ));
+
+        // A waiter registered for an input the machine does not hold captures
+        // nothing, and delivery makes no late lookup (by then the record may
+        // be archived): the result is refused, never decided as unscoped,
+        // even once the input is admitted.
+        admitted.store(false, std::sync::atomic::Ordering::SeqCst);
+        let unknown = InputId::new();
+        let handle = registry.register(unknown.clone());
+        admitted.store(true, std::sync::atomic::Ordering::SeqCst);
+        registry.resolve_completed_authorized(
+            &unknown,
+            make_run_result(),
+            authority(
+                RuntimeCompletionResultClass::Completed,
+                RuntimeCompletionObservedOutcome::Completed,
+            ),
+        );
+        assert!(matches!(
+            handle.try_wait().await,
+            Err(CompletionWaitError::DisclosureRefused { .. })
+        ));
     }
 
     #[tokio::test]

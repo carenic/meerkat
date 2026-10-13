@@ -110,12 +110,12 @@ of this full catalog.
 | `jobs/subscribe` | Jobs | `JobsSubscribeParams` | `JobsSubscribeResult` | Add a durable record, notification, or event delivery subscription |
 | `jobs/unsubscribe` | Jobs | `JobsUnsubscribeParams` | `JobsUnsubscribeResult` | Remove a durable delivery subscription |
 | `monitors/start` | Jobs | `MonitorsStartParams` | `MonitorsStartResult` | Start a high-trust durable script monitor with explicit restart and output contracts |
-| `mobkit/jobs/heartbeat` | Host jobs | `MobkitJobHeartbeatParams` | `MobkitJobMutationResult` | Renew the exact committed attempt lease |
-| `mobkit/jobs/progress` | Host jobs | `MobkitJobProgressParams` | `MobkitJobMutationResult` | Commit progress under exact attempt/fence authority |
-| `mobkit/jobs/checkpoint` | Host jobs | `MobkitJobCheckpointParams` | `MobkitJobMutationResult` | Commit a restart checkpoint under exact attempt/fence authority |
-| `mobkit/jobs/complete` | Host jobs | `MobkitJobCompleteParams` | `MobkitJobMutationResult` | Commit successful terminality under exact attempt/fence authority |
-| `mobkit/jobs/fail` | Host jobs | `MobkitJobFailParams` | `MobkitJobMutationResult` | Commit failed terminality under exact attempt/fence authority |
-| `mobkit/jobs/cancel_ack` | Host jobs | `MobkitJobCancelAckParams` | `MobkitJobMutationResult` | Acknowledge cancellation under exact attempt/fence authority |
+| `meta/jobs/heartbeat` | Host jobs | `MetaJobHeartbeatParams` | `MetaJobMutationResult` | Renew the exact committed attempt lease |
+| `meta/jobs/progress` | Host jobs | `MetaJobProgressParams` | `MetaJobMutationResult` | Commit progress under exact attempt/fence authority |
+| `meta/jobs/checkpoint` | Host jobs | `MetaJobCheckpointParams` | `MetaJobMutationResult` | Commit a restart checkpoint under exact attempt/fence authority |
+| `meta/jobs/complete` | Host jobs | `MetaJobCompleteParams` | `MetaJobMutationResult` | Commit successful terminality under exact attempt/fence authority |
+| `meta/jobs/fail` | Host jobs | `MetaJobFailParams` | `MetaJobMutationResult` | Commit failed terminality under exact attempt/fence authority |
+| `meta/jobs/cancel_ack` | Host jobs | `MetaJobCancelAckParams` | `MetaJobMutationResult` | Acknowledge cancellation under exact attempt/fence authority |
 | `session/create` | Session | `CreateSessionParams` | `WireRunResult \| DeferredCreateResult` | Create session and run first turn |
 | `session/list` | Session | `ListSessionsParams` | `ListSessionsResult` | List active sessions |
 | `session/read` | Session | `ReadSessionParams` | `WireSessionInfo` | Get session state |
@@ -1622,7 +1622,7 @@ the `adoptable` restart class. Detached shell execution fails closed unless the
 realm supplies persistent job and blob stores plus its runtime delivery
 projector; there is no volatile fallback.
 
-The `mobkit/jobs/*` methods are host-worker mutation methods. Every heartbeat,
+The `meta/jobs/*` methods are host-worker mutation methods. Every heartbeat,
 progress, checkpoint, completion, failure, or cancellation acknowledgement is
 admitted under the exact attempt and fence authority carried by its typed
 params. Application clients should not synthesize worker mutations from the
@@ -1733,6 +1733,66 @@ Authorize approval decisions in the trusted host or authenticated proxy before
 forwarding the RPC call. REST, MCP, and CLI do not expose approval methods.
 </Warning>
 
+### R3 human consent on a stock governed pipe
+
+When `rkat-rpc` serves a stock governed realm whose owner requires R3 for an
+operation (see [governance settings](/concepts/configuration#governance-settings)),
+the realm's native owner issues one consent approval for the exact call and
+the stdio pipe's operator decides it. The pipe's operator is the
+operating-system user who started it: device trusted, in the pipe's own
+authentication scope, so a rule that requires a person refuses it. The scope
+ends with the pipe: from EOF on, while the connection drains its in-flight
+requests, no decision in it is eligible.
+
+`approval/consent_decide` takes only the approval and the decision. The
+connection names the approver, its assurance and its scope; any other field
+is an invalid parameter. It is listed by `initialize` only on a pipe that
+serves consent.
+
+```json Request
+{
+  "jsonrpc": "2.0",
+  "id": 31,
+  "method": "approval/consent_decide",
+  "params": {"approval_id": "01936f8a-7b2c-7000-8000-0000000000c1", "decision": "approve"}
+}
+```
+
+Each recorded transition arrives as an `approval/consent_notice` notification
+(`ConsentNoticeParams`): `kind` is `requested`, `approved`, `denied`, `used` or
+`withdrawn`. An approval executes nothing by itself.
+
+A `requested` notice carries the approval's `presentation`
+(`ConsentPresentationParams`), projected from the approval owner's own record
+before any decision: the exact `action` (its kind, the tool and the call's
+arguments), its `risk`, the `account` the operation acts with and the
+`mandate` it runs under (each as the operation's owners stated it, absent when
+they stated none), the `accepted_assurance` of the owner's rule and
+`expires_at`. The record keeps the account and the mandate in its
+`stock.action_account` and `stock.review_mandate` labels. The pipe decides
+only what it presented: an approval is issued only while the pipe is open, and
+a decision on an approval the pipe never presented is refused.
+
+```json Notification
+{
+  "jsonrpc": "2.0",
+  "method": "approval/consent_notice",
+  "params": {
+    "approval_id": "01936f8a-7b2c-7000-8000-0000000000c1",
+    "tool_call_id": "toolu_01",
+    "kind": "requested",
+    "presentation": {
+      "action": {"kind": "tool_call", "summary": "read", "body": {"folder": "inbox"}},
+      "risk": "high",
+      "account": "alice@example.com at https://accounts.example.com",
+      "mandate": "The local operator ... under a grant-lineage mandate. With the work's admitted ceiling it bounds this operation to: ...",
+      "accepted_assurance": "device_trusted",
+      "expires_at": "2026-10-11T09:05:00Z"
+    }
+  }
+}
+```
+
 ## Schedules, WorkGraph, and multi-host mobs
 
 The schedule family provides CRUD, pause/resume, occurrence listing, tool
@@ -1825,8 +1885,8 @@ The response is abridged; the full `WorkItem` shape is in the
 </ParamField>
 
 Every evidence entry, here and everywhere a `WorkEvidenceRef` appears (the
-`workgraph_add_evidence` tool argument, host mutation surfaces such as MobKit's
-`mobkit/workgraph/evidence/add`), has the shape
+`workgraph_add_evidence` tool argument, host mutation surfaces such as Meta's
+`meta/workgraph/evidence/add`), has the shape
 `{"kind": string, "id": string, "label"?: string, "summary"?: string}`. `kind`
 is an opaque provenance label (`artifact`, `pr`, `log`, `summary`,
 `notification`, ...); the reserved confirmation kinds (`host_confirmation`,

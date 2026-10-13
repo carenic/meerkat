@@ -82,6 +82,7 @@ impl AgentToolDispatcher for HostTools {
                     .with_provenance(meerkat_core::ToolProvenance {
                         kind: meerkat_core::ToolSourceKind::Callback,
                         source_id: name.into(),
+                        artifact: None,
                     }),
                 )
             })
@@ -399,7 +400,7 @@ async fn a_managed_host_without_a_child_policy_refuses_the_agents_mob_create() {
         fixture(|state| state.with_tool_consequence_policy_registry(registry()));
     let message = refused(&fixture, "child_tool_policy_required").await;
     // The message says why before it names the exact fix: the API, the
-    // MobKit init key, and the explicit Unmanaged opt-out.
+    // Meta init key, and the explicit Unmanaged opt-out.
     let why = "this host runs a tool-policy registry and no child application tool policy is \
                configured";
     assert!(message.starts_with(why), "{message}");
@@ -1138,6 +1139,171 @@ async fn a_restored_host_mob_member_keeps_its_durable_policy() {
         run_member_turn(&fixture, &mob_id, "guarded", &dispatched).await,
         [ALLOWED],
         "the restored host member keeps its durable policy"
+    );
+    fixture.teardown().await;
+}
+
+/// A persistent child mob whose member mounts the agent mob tools comes back
+/// after a cold restart. Restore rebuilds the member, and the member's build
+/// runs the generated mob-tool factory inside that restore, so the factory
+/// must not wait on the restore (it did, and the restore never finished).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_child_member_with_mob_tools_restores_after_a_cold_restart() {
+    let (mut fixture, dispatched) = fixture(|state| state);
+    fixture.seed_source_mob(&["creator"]).await;
+    let session = fixture
+        .state
+        .handle_for(&fixture.source_mob_id())
+        .await
+        .expect("source mob handle")
+        .resolve_bridge_session_id(&AgentIdentity::from("creator"))
+        .await
+        .expect("creator has a bridge session");
+    let surface = agent_surface(&fixture.state, session, creator_authority());
+    let child_id = format!("child-{}", fixture.scope);
+    dispatch(
+        &surface,
+        "mob_create",
+        json!({
+            "definition": {
+                "id": child_id,
+                "profiles": { "worker": {
+                    "model": "claude-sonnet-4-6",
+                    "tools": { "comms": true, "mob": true }
+                } }
+            }
+        }),
+    )
+    .await
+    .expect("the child mob is created");
+    let child_id = MobId::from(child_id.as_str());
+    fixture
+        .state
+        .mob_spawn(
+            &child_id,
+            "worker".into(),
+            AgentIdentity::from("child-worker"),
+            Some(MobRuntimeMode::TurnDriven),
+            None,
+            None,
+        )
+        .await
+        .expect("seat the child member that mounts the mob tools");
+
+    fixture
+        .restart_cold_with_agent_mob_tools(
+            |_| ScriptedTurn::Text("done".to_string()),
+            with_host_tools(&dispatched, |state| state),
+        )
+        .await;
+    let listed = tokio::time::timeout(Duration::from_secs(30), fixture.state.mob_list())
+        .await
+        .expect("restoring a child member with mob tools does not wait on its own restore")
+        .expect("restore");
+    assert!(
+        listed.iter().any(|(id, _)| *id == child_id),
+        "the child mob is restored: {listed:?}"
+    );
+    fixture.teardown().await;
+}
+
+/// The result of the `list-mobs` call in a request, if it carries one.
+fn list_mobs_result(request: &LlmRequest) -> Option<&ToolResult> {
+    request
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            meerkat_core::Message::ToolResults { results, .. } => results
+                .iter()
+                .find(|result| result.tool_use_id == "list-mobs"),
+            _ => None,
+        })
+}
+
+/// A persistent mob whose TurnDriven orchestrator mounts the agent mob tools
+/// comes back after a cold restart, and the orchestrator's resume
+/// notification turn lists the mobs, which needs the restore to have
+/// finished, and carries the successful listing into its next provider
+/// request. The restore must not wait on the notification's turn (it did,
+/// and never finished). This observes that second request, not the turn's
+/// terminal completion.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_orchestrator_resume_notification_reaches_its_listing_follow_up_after_a_cold_restart() {
+    let (mut fixture, dispatched) = fixture(|state| state);
+    let mob_id = MobId::from(format!("orchestrated-{}", fixture.scope).as_str());
+    let mut profile = support::participant_profile("orchestrator");
+    profile.tools.mob = true;
+    let mut definition = meerkat_mob::MobDefinition::explicit(mob_id.clone());
+    definition.profiles.insert(
+        meerkat_mob::ProfileName::from("lead"),
+        meerkat_mob::ProfileBinding::Inline(Box::new(profile)),
+    );
+    definition.orchestrator = Some(meerkat_mob::definition::OrchestratorConfig {
+        profile: meerkat_mob::ProfileName::from("lead"),
+    });
+    fixture
+        .state
+        .mob_create_definition(definition)
+        .await
+        .expect("create the orchestrated mob");
+    fixture
+        .state
+        .mob_spawn(
+            &mob_id,
+            "lead".into(),
+            AgentIdentity::from("lead"),
+            Some(MobRuntimeMode::TurnDriven),
+            None,
+            None,
+        )
+        .await
+        .expect("seat the TurnDriven orchestrator");
+
+    let listing_succeeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let answered = Arc::new(tokio::sync::Notify::new());
+    let script_listing = Arc::clone(&listing_succeeded);
+    let script_answered = Arc::clone(&answered);
+    fixture
+        .restart_cold_with_agent_mob_tools(
+            move |request| {
+                if let Some(result) = list_mobs_result(request) {
+                    // The result-dependent second provider request of the
+                    // notification turn (observed before its final text).
+                    if !result.is_error && result.text_content().contains("\"mobs\"") {
+                        script_listing.store(true, Ordering::SeqCst);
+                    }
+                    script_answered.notify_one();
+                    return ScriptedTurn::Text("reconciled".to_string());
+                }
+                if last_user_text(request).contains("resumed with") {
+                    return ScriptedTurn::ToolCall {
+                        id: "list-mobs".to_string(),
+                        name: "mob_list".to_string(),
+                        args: json!({}),
+                    };
+                }
+                ScriptedTurn::Text("done".to_string())
+            },
+            with_host_tools(&dispatched, |state| state),
+        )
+        .await;
+    let listed = tokio::time::timeout(Duration::from_secs(30), fixture.state.mob_list())
+        .await
+        .expect("the restore does not wait on the orchestrator's resume turn")
+        .expect("restore");
+    assert!(
+        listed.iter().any(|(id, _)| *id == mob_id),
+        "the orchestrated mob is restored: {listed:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(30), answered.notified())
+        .await
+        .expect(
+            "the resume notification's turn reaches its result-dependent second provider request",
+        );
+    assert!(
+        listing_succeeded.load(Ordering::SeqCst),
+        "the notification turn's mob_list succeeded"
     );
     fixture.teardown().await;
 }

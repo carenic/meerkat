@@ -3188,7 +3188,11 @@
           "interactive_login_required",
           "host_owned_unavailable",
           "io",
-          "other"
+          "other",
+          "credential_access_denied",
+          "credential_interaction_required",
+          "credential_access_pending",
+          "credential_store_unavailable"
         ],
         "type": "string"
       },
@@ -5685,7 +5689,7 @@
           },
           {
             "additionalProperties": false,
-            "description": "The current run was cancelled at its next boundary.",
+            "description": "A cancel at its next boundary was recorded for the current run. The\nreply does not wait for the run to reach that boundary.",
             "properties": {
               "run": {
                 "const": "cancelled_at_boundary",
@@ -10063,6 +10067,23 @@
         ],
         "type": "string"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "McpHttpTransport": {
         "description": "HTTP transport selection for URL-based servers",
         "enum": [
@@ -10070,6 +10091,24 @@
           "sse"
         ],
         "type": "string"
+      },
+      "McpServerAccess": {
+        "additionalProperties": false,
+        "description": "Host access ceiling for one MCP server, enforced by the connection that\ncalls it.\n\nOnly the raw MCP operations in `allowed_operations` may be called. The\nrouter does not offer any other under any name, and the connection\nrefuses any other before anything is sent.\nThe ceiling only narrows access. It does not certify that the listed\noperations are reads: session read-only policy still requires a trusted\nhost declaration for the exact destination and operation. Nothing is\ninferred from operation names or from the server's annotations.",
+        "properties": {
+          "allowed_operations": {
+            "description": "The raw MCP operation names that may be called.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "allowed_operations"
+        ],
+        "type": "object"
       },
       "MeerkatSchema": {
         "description": "A Meerkat-native JSON schema."
@@ -11137,6 +11176,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "args": {
                 "items": {
                   "type": "string"
@@ -11181,6 +11231,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "connect_timeout_secs": {
                 "format": "uint64",
                 "minimum": 0,
@@ -13605,13 +13666,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -14084,6 +14154,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -21398,6 +21479,23 @@
         ],
         "type": "string"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "OpenAiAssistantPhase": {
         "description": "Responses assistant-message phase, distinct from reasoning metadata.",
         "enum": [
@@ -21860,13 +21958,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -22135,6 +22242,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -24105,6 +24223,23 @@
           }
         ]
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "PeerId": {
         "description": "Canonical runtime identity for a peer.\n\n`PeerId` is the routing key: the router and trust store key by `PeerId`,\nnever by `PeerName`. Two peers may legitimately share a display `PeerName`\n(per the Wave-B V5 dogma note), but their `PeerId`s never collide — the\nunderlying UUID is globally unique.\n\nConstructed freshly (`PeerId::new`) for a peer minted locally, parsed\nfrom a hyphenated UUID (`PeerId::parse`) when we've been given an identity\nover the wire, or derived from a 32-byte Ed25519 public key when a transport\nstill authenticates by raw signing key.",
         "type": "string"
@@ -24416,13 +24551,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -24664,6 +24808,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -26165,6 +26320,13 @@
           "client": {
             "type": "string"
           },
+          "client_auth_profile": {
+            "description": "Id of a client-auth profile the host installed for this issuer and\nclient; omitted for the default public-client forms. Never a secret.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "issuer": {
             "type": "string"
           },
@@ -26396,6 +26558,13 @@
           "client": {
             "type": "string"
           },
+          "client_auth_profile": {
+            "description": "Id of a client-auth profile the host installed for this issuer and\nclient; omitted for the default public-client forms. Never a secret.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "issuer": {
             "type": "string"
           },
@@ -26574,6 +26743,84 @@
   },
   "McpAddParams": {
     "$defs": {
+      "McpAccountDeclaration": {
+        "description": "A host's declaration of the account an MCP server's operations act with.",
+        "enum": [
+          "none"
+        ],
+        "type": "string"
+      },
+      "McpConnectorBinding": {
+        "additionalProperties": false,
+        "description": "The connector credential a trusted MCP server installation's calls need:\nthe slot, the verified account and stable context the credential must be\nbound to, and each raw operation's required scopes and destination.",
+        "properties": {
+          "account": {
+            "description": "The provider-verified account subject (the strategy's canonical\naccount id) the credential must be bound to.",
+            "type": "string"
+          },
+          "client": {
+            "type": "string"
+          },
+          "issuer": {
+            "type": "string"
+          },
+          "operations": {
+            "additionalProperties": {
+              "$ref": "#/$defs/McpConnectorOperation"
+            },
+            "description": "Every raw operation the server exposes; an unlisted one is refused.",
+            "type": "object"
+          },
+          "realm_id": {
+            "type": "string"
+          },
+          "resource": {
+            "type": "string"
+          },
+          "slot_id": {
+            "type": "string"
+          },
+          "strategy_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "realm_id",
+          "slot_id",
+          "issuer",
+          "client",
+          "resource",
+          "strategy_id",
+          "account",
+          "operations"
+        ],
+        "type": "object"
+      },
+      "McpConnectorOperation": {
+        "additionalProperties": false,
+        "description": "One raw operation of a connector-bound installation.",
+        "properties": {
+          "destination_origin": {
+            "description": "`scheme://host[:port]` of the connector API the operation calls.",
+            "type": "string"
+          },
+          "read_only": {
+            "description": "The host's typed declaration that this operation only reads. Absent\n(`false`), the operation is undeclared, never inferred read-only from\nits name, the server's annotations or an access ceiling.",
+            "type": "boolean"
+          },
+          "required_scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "destination_origin"
+        ],
+        "type": "object"
+      },
       "McpHttpConfig": {
         "additionalProperties": false,
         "description": "HTTP transport configuration (streamable HTTP or legacy SSE)",
@@ -26649,6 +26896,24 @@
           }
         ]
       },
+      "McpServerAccess": {
+        "additionalProperties": false,
+        "description": "Host access ceiling for one MCP server, enforced by the connection that\ncalls it.\n\nOnly the raw MCP operations in `allowed_operations` may be called. The\nrouter does not offer any other under any name, and the connection\nrefuses any other before anything is sent.\nThe ceiling only narrows access. It does not certify that the listed\noperations are reads: session read-only policy still requires a trusted\nhost declaration for the exact destination and operation. Nothing is\ninferred from operation names or from the server's annotations.",
+        "properties": {
+          "allowed_operations": {
+            "description": "The raw MCP operation names that may be called.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "allowed_operations"
+        ],
+        "type": "object"
+      },
       "McpServerConfig": {
         "anyOf": [
           {
@@ -26660,6 +26925,28 @@
         ],
         "description": "Configuration for a single MCP server",
         "properties": {
+          "access": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/McpServerAccess"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Host access ceiling for this server's operations. Absent, every\noperation the server lists is callable (subject to session tool\npolicy). The server's own tool annotations never set or widen it."
+          },
+          "account": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/McpAccountDeclaration"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The host's declaration of the account this server's operations act\nwith, stated to review and consent: `none` declares that they act\nwith no selected account. Absent, the account is the connector\nbinding's or the OAuth account selection's, and otherwise unavailable:\na server without either never states that it has none. It conflicts\nwith both. Only host configuration sets it."
+          },
           "connect_timeout_secs": {
             "description": "Connection timeout in seconds (connect + handshake + list_tools).\nDefaults to 10 seconds when not specified.",
             "format": "uint32",
@@ -26668,6 +26955,17 @@
               "integer",
               "null"
             ]
+          },
+          "connector": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/McpConnectorBinding"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Trusted connector credential binding of a stdio server installation:\neach listed operation's calls carry the connector credential that\nsatisfies it, and the server gets the expected account binding at\nstartup. Only host configuration sets it."
           },
           "name": {
             "description": "Server name (must be unique within scope)",
@@ -26709,6 +27007,14 @@
             "default": {},
             "description": "Environment variables",
             "type": "object"
+          },
+          "secret_env": {
+            "description": "Names of environment variables whose values the realm that defines\nthis server keeps in its protected credential store. Only the names\nare configuration: each value is read for this exact definition when\nthe server is launched, and never from the host environment.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
           }
         },
         "required": [
@@ -39072,6 +39378,23 @@
         ],
         "type": "string"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "OpenAiAssistantPhase": {
         "description": "Responses assistant-message phase, distinct from reasoning metadata.",
         "enum": [
@@ -39534,13 +39857,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -39809,6 +40141,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [

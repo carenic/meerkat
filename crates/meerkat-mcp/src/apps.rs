@@ -156,6 +156,7 @@ pub(crate) fn project_tool(tool: &Tool, server: &str) -> Result<ToolDef, crate::
     .with_provenance(meerkat_core::types::ToolProvenance {
         kind: meerkat_core::types::ToolSourceKind::Mcp,
         source_id: server.into(),
+        artifact: None,
     })
     .with_audience(tool_audience(tool)?))
 }

@@ -214,6 +214,16 @@ impl ExternalToolSurfaceHandle for RuntimeExternalToolSurfaceHandle {
                 mm_dsl::MeerkatMachineInput::SurfaceShutdown,
                 "ExternalToolSurfaceHandle::shutdown_surface",
             ),
+            ExternalToolSurfaceInput::Release {
+                surface_id,
+                lineage,
+            } => self.apply_input_with_effects(
+                mm_dsl::MeerkatMachineInput::SurfaceRelease {
+                    surface_id,
+                    lineage,
+                },
+                "ExternalToolSurfaceHandle::release",
+            ),
         }
     }
 
@@ -501,6 +511,13 @@ fn map_surface_effect(
                 cause: ExternalToolSurfaceFailureCause::from(cause),
             })
         }
+        mm_dsl::MeerkatMachineEffect::SurfaceStageRecorded {
+            surface_id,
+            staged_intent_sequence,
+        } => Some(ExternalToolSurfaceEffect::StageRecorded {
+            surface_id,
+            staged_intent_sequence,
+        }),
         _ => None,
     }
 }
@@ -590,6 +607,120 @@ mod tests {
             handle.diagnostic_snapshot().surface_phase,
             ExternalToolSurfaceGlobalPhase::Shutdown
         );
+    }
+
+    /// Stage an add and return the lineage its `StageRecorded` effect names.
+    fn stage_add_recorded(handle: &RuntimeExternalToolSurfaceHandle, surface: &str) -> u64 {
+        handle
+            .apply_surface_input(ExternalToolSurfaceInput::StageAdd {
+                surface_id: surface.to_owned(),
+                now_ms: 10,
+            })
+            .expect("stage add")
+            .effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                ExternalToolSurfaceEffect::StageRecorded {
+                    staged_intent_sequence,
+                    ..
+                } => Some(staged_intent_sequence),
+                _ => None,
+            })
+            .expect("the stage records its lineage")
+    }
+
+    /// Apply and complete `lineage`'s add so it becomes the active lineage.
+    fn connect(handle: &RuntimeExternalToolSurfaceHandle, surface: &str, lineage: u64) {
+        handle
+            .apply_boundary(surface.to_owned(), 20, lineage, 0)
+            .expect("apply boundary");
+        let pending = handle
+            .surface_snapshot(surface)
+            .and_then(|snapshot| snapshot.pending_task_sequence)
+            .expect("pending task");
+        handle
+            .mark_pending_succeeded(surface.to_owned(), pending, lineage)
+            .expect("connected");
+    }
+
+    fn release(
+        handle: &RuntimeExternalToolSurfaceHandle,
+        surface: &str,
+        lineage: u64,
+    ) -> Result<(), DslTransitionError> {
+        handle
+            .apply_surface_input(ExternalToolSurfaceInput::Release {
+                surface_id: surface.to_owned(),
+                lineage,
+            })
+            .map(|_| ())
+    }
+
+    #[test]
+    fn release_clears_only_the_exact_lineage_it_names() {
+        let handle = handle_in_phase(mm_dsl::MeerkatPhase::Attached);
+
+        // A staged-only lineage is released; an unknown one is refused.
+        let staged = stage_add_recorded(&handle, "alpha");
+        assert!(release(&handle, "alpha", staged + 7).is_err());
+        assert!(release(&handle, "alpha", 0).is_err());
+        release(&handle, "alpha", staged).expect("release the staged lineage");
+        let snapshot = handle.surface_snapshot("alpha").expect("alpha");
+        assert_eq!(snapshot.staged_op, ExternalToolSurfaceStagedOp::None);
+        assert!(release(&handle, "alpha", staged).is_err(), "released once");
+
+        // An active lineage is released to Removed and leaves the visible set.
+        let first = stage_add_recorded(&handle, "alpha");
+        connect(&handle, "alpha", first);
+        assert!(handle.visible_surfaces().contains("alpha"));
+        release(&handle, "alpha", first).expect("release the active lineage");
+        assert_eq!(
+            handle.surface_snapshot("alpha").and_then(|s| s.base_state),
+            Some(ExternalToolSurfaceBaseState::Removed)
+        );
+        assert!(!handle.visible_surfaces().contains("alpha"));
+
+        // A predecessor releasing while its successor's staging of the same
+        // id waits: only the predecessor's connection goes.
+        let predecessor = stage_add_recorded(&handle, "beta");
+        connect(&handle, "beta", predecessor);
+        let successor = stage_add_recorded(&handle, "beta");
+        release(&handle, "beta", predecessor).expect("the predecessor's active lineage");
+        assert_eq!(
+            handle.surface_snapshot("beta").map(|s| s.staged_op),
+            Some(ExternalToolSurfaceStagedOp::Add),
+            "the successor's staging survives the predecessor's release"
+        );
+        connect(&handle, "beta", successor);
+        assert!(handle.visible_surfaces().contains("beta"));
+
+        // A predecessor releasing after its successor connected the same id:
+        // the late release is refused and touches nothing.
+        let predecessor = stage_add_recorded(&handle, "gamma");
+        connect(&handle, "gamma", predecessor);
+        let successor = stage_add_recorded(&handle, "gamma");
+        connect(&handle, "gamma", successor);
+        assert!(
+            release(&handle, "gamma", predecessor).is_err(),
+            "a late predecessor release is refused"
+        );
+        assert!(handle.visible_surfaces().contains("gamma"));
+        assert_eq!(
+            handle.surface_snapshot("gamma").and_then(|s| s.base_state),
+            Some(ExternalToolSurfaceBaseState::Active)
+        );
+        release(&handle, "gamma", successor).expect("the successor releases its own");
+    }
+
+    #[test]
+    fn release_stays_legal_after_staging_closes() {
+        let handle = handle_in_phase(mm_dsl::MeerkatPhase::Attached);
+        let lineage = stage_add_recorded(&handle, "alpha");
+        connect(&handle, "alpha", lineage);
+        handle.shutdown_surface().expect("shutdown surface");
+        assert!(handle.stage_add("beta".to_owned(), 30).is_err());
+        release(&handle, "alpha", lineage).expect("release after staging closed");
+        assert!(!handle.visible_surfaces().contains("alpha"));
     }
 
     #[test]

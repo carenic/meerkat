@@ -110,6 +110,47 @@ use tokio::sync::RwLock;
 // Live MCP per-session state
 // ---------------------------------------------------------------------------
 
+/// After a successful MCP login for `target`, wake the exact operation
+/// awaiting it in this server's live sessions
+/// ([`McpRouterAdapter::retry_authorized`]). Best effort per session: the
+/// login's success stands, and each outcome is logged.
+#[cfg(feature = "mcp")]
+pub async fn mcp_credential_landed(
+    state: &AppState,
+    target: &meerkat::McpServerIdentity,
+) -> Vec<(
+    SessionId,
+    Result<meerkat::AuthorizedRetry, meerkat::McpError>,
+)> {
+    let adapters: Vec<(SessionId, Arc<McpRouterAdapter>)> = state
+        .mcp_sessions
+        .read()
+        .await
+        .iter()
+        .map(|(session_id, session)| (session_id.clone(), Arc::clone(&session.adapter)))
+        .collect();
+    let mut outcomes = Vec::with_capacity(adapters.len());
+    for (session_id, adapter) in adapters {
+        let outcome = adapter.retry_authorized(target).await;
+        match &outcome {
+            Ok(meerkat::AuthorizedRetry::Staged) => tracing::info!(
+                %session_id,
+                server = target.server_name(),
+                "staged the MCP server awaiting this login"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                %session_id,
+                server = target.server_name(),
+                %error,
+                "could not stage the MCP server awaiting this login"
+            ),
+        }
+        outcomes.push((session_id, outcome));
+    }
+    outcomes
+}
+
 #[cfg(feature = "mcp")]
 pub struct SessionMcpState {
     pub(crate) adapter: Arc<McpRouterAdapter>,
@@ -178,6 +219,9 @@ pub struct AppState {
     /// AgentFactory. REST credential mutations and provider resolution can
     /// never observe the token vault without its matching mutation authority.
     pub provider_auth_persistence: meerkat_providers::auth_store::ProviderAuthPersistence,
+    /// Connector client-auth profiles the embedding host installs from its
+    /// own configuration (secrets never come from a request).
+    pub connector_client_auth_profiles: Vec<meerkat::ConnectorClientAuthProfile>,
     /// Process-local AuthMachine lifecycle registry for auth endpoints.
     pub auth_lease: meerkat_core::handles::GeneratedAuthLeaseHandle,
     /// Provider-runtime registry shared with the AgentFactory's auth
@@ -668,7 +712,7 @@ impl AppState {
                 max_sessions,
                 persistence,
                 realm_paths.root.join("config_state.json"),
-            );
+            )?;
         let auth_lease = runtime_adapter.generated_auth_lease_handle();
         #[cfg(feature = "mob")]
         let mob_session_service = session_service.clone();
@@ -750,6 +794,7 @@ impl AppState {
                 std::time::Duration::from_secs(5),
             )),
             provider_auth_persistence,
+            connector_client_auth_profiles: Vec::new(),
             auth_lease,
             provider_registry,
         })
@@ -4762,6 +4807,13 @@ async fn completion_wait_error_to_api_error(
     realm: &meerkat_core::RealmId,
     session_created: bool,
 ) -> ApiError {
+    // Not a waiter failure: the input completed and its cleanup ran.
+    if error.is_disclosure_refused() {
+        return ApiError::ResultDisclosureRefused(format!(
+            "session {}: {error}",
+            format_session_ref(realm, session_id)
+        ));
+    }
     match state
         .runtime_adapter
         .resolve_runtime_completion_wait_failure(session_id, &error)
@@ -5495,6 +5547,7 @@ async fn create_session_inner(
             .clone()
             .map(encode_llm_client_override_for_service),
         session_comms_runtime_override: None,
+        prepared_controller: None,
         host_prompt_sections: Default::default(),
         agent_llm_client_decorator: None,
         override_builtins: ToolCategoryOverride::from_override(req.enable_builtins),
@@ -6727,6 +6780,7 @@ async fn continue_session_inner(
                 .clone()
                 .map(encode_llm_client_override_for_service),
             session_comms_runtime_override: None,
+            prepared_controller: None,
             host_prompt_sections: Default::default(),
             agent_llm_client_decorator: None,
             override_builtins: ToolCategoryOverride::Inherit,
@@ -7863,9 +7917,10 @@ async fn apply_mcp_boundary_to_turn_prompt(
 fn session_mcp_router(state: &AppState) -> McpRouter {
     McpRouter::new().with_mcp_auth(
         meerkat::McpAuthMode::Interactive,
-        meerkat::default_mcp_auth_resolver(
+        meerkat::default_mcp_auth_resolver_in_realm(
             Some(state.provider_auth_persistence.clone()),
             state.runtime_adapter.provider_auth_runtime_authority(),
+            state.realm.clone(),
         ),
     )
 }
@@ -7957,34 +8012,37 @@ async fn mcp_add(
     }
 
     let adapter = resolve_mcp_adapter(&state, &session_id).await?;
-    let config = req.server_config;
-
-    let rollback = if req.persisted {
-        let authority = meerkat::surface::mcp_config_mutation_authority(
-            state.context_root.clone(),
-            state.user_config_root.clone(),
-        );
-        meerkat::surface::persist_mcp_add_if_requested(true, &authority, config.clone())
-            .await
-            .map_err(ApiError::Internal)?
-    } else {
-        None
-    };
-
-    if let Err(err) = adapter.stage_add(config).await {
-        let rollback_message =
-            match meerkat::surface::rollback_mcp_persisted_mutation(rollback).await {
-                Ok(()) => String::new(),
-                Err(rollback_err) => format!("; persisted rollback failed: {rollback_err}"),
-            };
-        return Err(ApiError::Internal(format!("{err}{rollback_message}")));
-    }
+    let authority = meerkat::surface::mcp_config_mutation_authority(
+        state.context_root.clone(),
+        state.user_config_root.clone(),
+    );
+    // REST carries no authenticated attachment control, so a governed
+    // runtime refuses here; an ungoverned one keeps the existing add.
+    let outcome = meerkat::surface::stage_mcp_live_add(
+        &adapter,
+        state.runtime_adapter.has_native_work_authorization_host(),
+        None,
+        &authority,
+        req.server_config,
+        req.persisted,
+    )
+    .await
+    .map_err(|error| match error {
+        meerkat::surface::McpLiveAddError::GovernedRequiresControl
+        | meerkat::surface::McpLiveAddError::Refused(_) => ApiError::BadRequestWithData {
+            message: error.to_string(),
+            code: "mcp_attachment_refused".to_string(),
+            details: serde_json::json!({}),
+        },
+        meerkat::surface::McpLiveAddError::Persist(message)
+        | meerkat::surface::McpLiveAddError::Stage(message) => ApiError::Internal(message),
+    })?;
 
     Ok(Json(meerkat::surface::mcp_live_response(
         req.session_id,
         meerkat_contracts::McpLiveOperation::Add,
         Some(server_name),
-        rollback.is_some(),
+        outcome.persisted,
     )))
 }
 
@@ -8356,6 +8414,10 @@ pub enum ApiError {
         request_id: String,
     },
     ServiceUnavailable(String),
+    /// The input completed, but its result may not be disclosed to this
+    /// reader: its scoped destination is not current. Not a failure of the
+    /// input.
+    ResultDisclosureRefused(String),
     SessionRuntimeUnavailable {
         message: String,
         details: Value,
@@ -8417,7 +8479,8 @@ fn api_error_message(error: &ApiError) -> String {
         | ApiError::Agent(message)
         | ApiError::Internal(message)
         | ApiError::ServiceUnavailable(message)
-        | ApiError::Gone(message) => message.clone(),
+        | ApiError::Gone(message)
+        | ApiError::ResultDisclosureRefused(message) => message.clone(),
         ApiError::BadRequestWithData { message, .. }
         | ApiError::InternalWithData { message, .. }
         | ApiError::SessionBusyWithData { message, .. }
@@ -8548,6 +8611,12 @@ impl IntoResponse for ApiError {
                 Some(details),
             ),
             ApiError::Gone(msg) => (StatusCode::GONE, "GONE".to_string(), msg, None),
+            ApiError::ResultDisclosureRefused(msg) => (
+                StatusCode::FORBIDDEN,
+                "RESULT_DISCLOSURE_REFUSED".to_string(),
+                msg,
+                None,
+            ),
             ApiError::SessionBusyWithData { message, details } => (
                 StatusCode::CONFLICT,
                 "SESSION_BUSY".to_string(),
@@ -16434,7 +16503,12 @@ matching the required schema. Output ONLY the JSON, no additional text or markdo
             {
                 http.oauth_account = Some("subject-7".to_owned());
             }
-            let target = meerkat::McpServerIdentity::from_config(&config).unwrap();
+            // The session router's resolver serves the state's realm, so the
+            // awaiting target, and the one the login-completion hook gets, is
+            // realm-scoped.
+            let target =
+                meerkat::McpServerIdentity::from_config_in_realm(state.realm.clone(), &config)
+                    .unwrap();
             let adapter = McpRouterAdapter::new(session_mcp_router(&state));
             // Session build binds the session's surface handle the same way.
             meerkat_core::AgentToolDispatcher::bind_external_tool_surface_handle(
@@ -16448,7 +16522,7 @@ matching the required schema. Output ONLY the JSON, no additional text or markdo
                 adapter.poll_lifecycle_actions().await.unwrap();
                 let awaiting = adapter.servers_awaiting_authorization().await;
                 if !awaiting.is_empty() {
-                    assert_eq!(awaiting, vec![target]);
+                    assert_eq!(awaiting, vec![target.clone()]);
                     break;
                 }
                 assert!(
@@ -16457,6 +16531,30 @@ matching the required schema. Output ONLY the JSON, no additional text or markdo
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
+
+            // The REST login-completion hook stages the exact awaiting server
+            // in this server's sessions, once.
+            let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+            let session_id = SessionId::new();
+            state.mcp_sessions.write().await.insert(
+                session_id.clone(),
+                SessionMcpState {
+                    adapter: Arc::new(adapter),
+                    turn_counter: 0,
+                    lifecycle_tx,
+                    lifecycle_rx,
+                    drain_task_running: Arc::new(AtomicBool::new(false)),
+                },
+            );
+            let landed = crate::mcp_credential_landed(&state, &target).await;
+            assert_eq!(landed.len(), 1);
+            assert_eq!(landed[0].0, session_id);
+            assert!(matches!(landed[0].1, Ok(meerkat::AuthorizedRetry::Staged)));
+            let again = crate::mcp_credential_landed(&state, &target).await;
+            assert!(matches!(
+                again[0].1,
+                Ok(meerkat::AuthorizedRetry::AlreadyPending)
+            ));
         }
 
         #[tokio::test]

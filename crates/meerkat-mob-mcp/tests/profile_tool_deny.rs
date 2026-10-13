@@ -94,7 +94,8 @@ fn wired_state(root: &std::path::Path, client: ScriptedCouncilClient) -> Arc<Mob
             Arc::new(meerkat_store::MemoryBlobStore::default()),
         )
         .expect("construct runtime authority"),
-    );
+    )
+    .expect("compose the runtime-backed service");
     meerkat_mob_mcp::wire_mob_tools(
         &mob_tools_slot,
         Arc::new(service),

@@ -126,7 +126,8 @@ async fn make_smoke_stack(paths: &SmokePaths) -> (MethodRouter, Arc<MobMcpState>
         64,
         persistence,
         NotificationSink::noop(),
-    );
+    )
+    .expect("compose the RPC session runtime");
     let config_store: Arc<dyn meerkat_core::ConfigStore> =
         Arc::new(MemoryConfigStore::new(config, meerkat_models::canonical()));
     runtime.set_config_runtime(Arc::new(ConfigRuntime::new(

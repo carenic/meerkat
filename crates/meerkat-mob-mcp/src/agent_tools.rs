@@ -1248,25 +1248,65 @@ impl AgentMobToolSurface {
             .parse_args()
             .map_err(|e| ToolError::invalid_arguments(call.name, e.to_string()))?;
         let mob_id = MobId::from(args.mob_id.clone());
+        let caller = self.destroy_caller();
 
-        self.ensure_mob_scope_authority(call.name, &mob_id).await?;
-        let audit_handle = self.bound_handle(&mob_id).await.ok();
-
-        let report = self
-            .state
-            .mob_destroy(&mob_id)
-            .await
-            .map_err(|e| Self::map_destroy_error(call, e))?;
-
-        if let Some(handle) = audit_handle.as_ref() {
-            self.record_successful_operator_action(handle, call.name)
-                .await;
+        // A destroy this state already admitted for this exact caller and
+        // natively completed is continued, or its report collected again,
+        // without the actor-routed gate below, which cannot admit once the
+        // actor has exited. The caller-side half of that gate still applies;
+        // any other caller is refused while the destroy's cleanup is owed.
+        match self.state.retired_destroy_lookup(&mob_id, &caller).await {
+            crate::RetiredDestroyLookup::Ordinary => {}
+            crate::RetiredDestroyLookup::OtherCaller => {
+                return Err(ToolError::access_denied(call.name));
+            }
+            crate::RetiredDestroyLookup::Caller(retired) => {
+                if !self
+                    .authority_context_snapshot()
+                    .can_manage_mob(mob_id.as_str())
+                {
+                    return Err(ToolError::access_denied(call.name));
+                }
+                let report = self
+                    .state
+                    .continue_retired_destroy(&mob_id, &retired)
+                    .await
+                    .map_err(|e| Self::map_destroy_error(call, e))?;
+                return Self::encode_destroy_report(call, &report);
+            }
         }
 
-        // Surface the structured destroy report so agents can observe
-        // force-destroyed members, orphaned remotes, deadline overruns,
-        // and partial cleanup errors rather than getting a bare `ok: true`.
-        let report_value = serde_json::to_value(&report).map_err(|e| {
+        self.ensure_mob_scope_authority(call.name, &mob_id).await?;
+        // The admitted destroy owns the mob's handles: this surface holds
+        // none across it and appends no operator provenance after it, since
+        // that append would go to the destroyed mob's store.
+        let report = self
+            .state
+            .mob_destroy_for(&mob_id, caller)
+            .await
+            .map_err(|e| Self::map_destroy_error(call, e))?;
+        Self::encode_destroy_report(call, &report)
+    }
+
+    /// The caller this surface's destroys are admitted for: its control
+    /// principal, the bridge session it serves, and the principal token of
+    /// its mob operator authority.
+    fn destroy_caller(&self) -> crate::MobDestroyCaller {
+        crate::MobDestroyCaller::Agent {
+            control_principal: self.control_principal.clone(),
+            owner_bridge_session_id: self.owner_bridge_session_id.clone(),
+            principal_token: self.authority_context_snapshot().principal_token().clone(),
+        }
+    }
+
+    /// Surface the structured destroy report so agents can observe
+    /// force-destroyed members, orphaned remotes, deadline overruns,
+    /// and partial cleanup errors rather than getting a bare `ok: true`.
+    fn encode_destroy_report(
+        call: ToolCallView<'_>,
+        report: &meerkat_mob::MobDestroyReport,
+    ) -> Result<meerkat_core::ToolDispatchOutcome, ToolError> {
+        let report_value = serde_json::to_value(report).map_err(|e| {
             ToolError::execution_failed(format!(
                 "{}: failed to serialize destroy report: {e}",
                 call.name,
@@ -1462,6 +1502,7 @@ impl AgentMobToolSurface {
                 source_identity.clone(),
                 job_id.clone(),
                 mob_id.clone(),
+                Arc::clone(&self.state),
             )
         });
         // The fork runs on a relieved task, whose synchronous tail can finish
@@ -1485,7 +1526,8 @@ impl AgentMobToolSurface {
                     job,
                 )
                 .await?;
-            let Some((runtime, owner_session_id, owner, source, job_id, mob_id)) = detached else {
+            let Some((runtime, owner_session_id, owner, source, job_id, mob_id, state)) = detached
+            else {
                 return Ok((fork, Some(run.retire_child_if_abandoned())));
             };
             // The child's supervisor owns the run; this custodian only turns
@@ -1498,6 +1540,7 @@ impl AgentMobToolSurface {
                 retained_work: retained_work.clone(),
             };
             spawn_detached_completion_custodian(
+                &state,
                 runtime,
                 owner_session_id,
                 DetachedCompletionOwner::Member(owner, source),
@@ -1736,22 +1779,31 @@ impl AgentMobToolSurface {
         // is not (the single-threaded browser runtime).
         let (outcome_tx, outcome_rx) = oneshot::channel();
         let council_id = request.council_id.clone();
-        tokio::spawn(async move {
-            let outcome = match council.run_detached(request, job).await {
-                // A council that ran but failed (e.g. participant seating)
-                // is delivered as failed; the record keeps the full typed
-                // outcome either way.
-                Ok(outcome) => (
-                    Ok(council_outcome_json(&outcome)),
-                    council_terminal_status(&outcome),
-                ),
-                Err(error) => (
-                    Ok(json!({"error": error.to_string()})),
-                    meerkat_core::event::BackgroundJobTerminalStatus::Failed,
-                ),
-            };
-            let _ = outcome_tx.send(outcome);
-        });
+        let admitted = self.state.state_tasks.spawn(
+            crate::state_tasks::StateTaskKind::Owned,
+            "detached council run",
+            async move {
+                let outcome = match council.run_detached(request, job).await {
+                    // A council that ran but failed (e.g. participant seating)
+                    // is delivered as failed; the record keeps the full typed
+                    // outcome either way.
+                    Ok(outcome) => (
+                        Ok(council_outcome_json(&outcome)),
+                        council_terminal_status(&outcome),
+                    ),
+                    Err(error) => (
+                        Ok(json!({"error": error.to_string()})),
+                        meerkat_core::event::BackgroundJobTerminalStatus::Failed,
+                    ),
+                };
+                let _ = outcome_tx.send(outcome);
+            },
+        );
+        if admitted.is_none() {
+            return Err(ToolError::execution_failed(
+                "council not run: this mob state has stood down".to_string(),
+            ));
+        }
         // The route's one membership read decided the owner: a convener that
         // is a mob member is revived through its mob when the runtime no
         // longer has it live (its idle executor retired while the council
@@ -1768,6 +1820,7 @@ impl AgentMobToolSurface {
             DetachedCompletionOwner::Session => DetachedCompletionOwner::Session,
         };
         spawn_detached_completion_custodian(
+            &self.state,
             runtime,
             self.owner_bridge_session_id.clone(),
             convener,
@@ -2394,9 +2447,11 @@ impl meerkat_core::service::MobToolsFactory for AgentMobToolSurfaceFactory {
             return Ok(Arc::new(EmptyAgentToolSurface));
         }
         let session_id_str = args.session_id.to_string();
+        // Only a hint, read without restoring: this build may run inside the
+        // persistent restore that is rebuilding this member.
         let implicit_mob_id = self
             .state
-            .find_implicit_mob_for_bridge_session(&session_id_str)
+            .restored_implicit_mob_for_bridge_session(&session_id_str)
             .await;
 
         // Extract parent canonical comms identity for wiring helpers.
@@ -2548,6 +2603,7 @@ fn tool_def(name: &str, description: &str, input_schema: serde_json::Value) -> A
         provenance: Some(ToolProvenance {
             kind: ToolSourceKind::Mob,
             source_id: "mob".into(),
+            artifact: None,
         }),
     })
 }
@@ -3006,7 +3062,7 @@ impl SpawnToolingInput {
 // Unknown fields fail closed. A misspelled or invented argument (a model
 // passing a field this tool does not define) must be an argument error the
 // model can correct, not a silently ignored intent. Host wrappers that add
-// their own fields (MobKit's `idle_retire_secs`) strip them before dispatch.
+// their own fields (Meta's `idle_retire_secs`) strip them before dispatch.
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ForkOffArgs {
@@ -3573,7 +3629,9 @@ pub(crate) enum DetachedJobRecorder {
 /// [`crate::detached_completion_sink`]). A submission that fails is
 /// submitted again from the recorded outcome by the restart re-link; the
 /// outcome itself is never dropped.
+#[allow(clippy::too_many_arguments)]
 fn spawn_detached_completion_custodian<F>(
+    state: &MobMcpState,
     sink: crate::detached_completion_sink::DetachedCompletionSink,
     owner_session_id: SessionId,
     owner: DetachedCompletionOwner,
@@ -3590,7 +3648,13 @@ fn spawn_detached_completion_custodian<F>(
         > + Send
         + 'static,
 {
-    tokio::spawn(async move {
+    // OWNED: a stand-down joins it. It is refused only once the state is
+    // sealed, when no work of the state can still be running; the restart
+    // re-link then delivers the recorded outcome.
+    let admitted = state.state_tasks.spawn(
+        crate::state_tasks::StateTaskKind::Owned,
+        "detached completion custodian",
+        async move {
         let (value, status) = outcome.await;
         let value = value.unwrap_or_else(|error| {
             json!({ "error": format!("{tool_name} could not encode its outcome: {error}") })
@@ -3669,7 +3733,14 @@ fn spawn_detached_completion_custodian<F>(
                 "detached completion was not submitted now; the restart re-link submits it from the recorded outcome"
             ),
         }
-    });
+    },
+    );
+    if admitted.is_none() {
+        tracing::warn!(
+            "a detached completion arrived after this mob state stood down; the restart \
+             re-link delivers its recorded outcome"
+        );
+    }
 }
 
 /// The plain-language note carried on a detached start result, so a model
@@ -3940,42 +4011,55 @@ where
     let session_id = session_id.clone();
     let result_session_id = session_id.clone();
     let (result_tx, result_rx) = oneshot::channel();
-    tokio::spawn(async move {
-        let session_key = session_id.to_string();
-        let result = match mob_state
-            .archive_mob_owned_bridge_session_with_cleanup(
-                &session_id,
-                "mob cleanup during archive incomplete",
-            )
-            .await
-        {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                let had_cleanup_anchor =
-                    mob_state.has_bridge_session_scoped_mobs(&session_key).await;
-                match service
-                    .archive_with_mob_lifecycle_authority(&session_id)
-                    .await
-                {
-                    Ok(()) => mob_state
-                        .destroy_bridge_session_mobs(&session_key)
+    let tasks = Arc::clone(&mob_state);
+    let admitted = tasks.state_tasks.spawn(
+        crate::state_tasks::StateTaskKind::Owned,
+        "session archive mob cleanup",
+        async move {
+            let session_key = session_id.to_string();
+            let result = match mob_state
+                .archive_mob_owned_bridge_session_with_cleanup(
+                    &session_id,
+                    "mob cleanup during archive incomplete",
+                )
+                .await
+            {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    let had_cleanup_anchor =
+                        mob_state.has_bridge_session_scoped_mobs(&session_key).await;
+                    match service
+                        .archive_with_mob_lifecycle_authority(&session_id)
                         .await
-                        .map_err(|error| {
-                            error.into_session_error("mob cleanup during archive incomplete")
-                        }),
-                    Err(SessionError::NotFound { .. }) if had_cleanup_anchor => mob_state
-                        .destroy_bridge_session_mobs(&session_key)
-                        .await
-                        .map_err(|error| {
-                            error.into_session_error("mob cleanup during archive incomplete")
-                        }),
-                    Err(error) => Err(error),
+                    {
+                        Ok(()) => mob_state
+                            .destroy_bridge_session_mobs(&session_key)
+                            .await
+                            .map_err(|error| {
+                                error.into_session_error("mob cleanup during archive incomplete")
+                            }),
+                        Err(SessionError::NotFound { .. }) if had_cleanup_anchor => mob_state
+                            .destroy_bridge_session_mobs(&session_key)
+                            .await
+                            .map_err(|error| {
+                                error.into_session_error("mob cleanup during archive incomplete")
+                            }),
+                        Err(error) => Err(error),
+                    }
                 }
-            }
-            Err(error) => Err(error),
-        };
-        let _ = result_tx.send(result);
-    });
+                Err(error) => Err(error),
+            };
+            let _ = result_tx.send(result);
+        },
+    );
+    if admitted.is_none() {
+        return Err(SessionError::Agent(
+            meerkat_core::error::AgentError::InternalError(format!(
+                "mob cleanup for archived session {result_session_id} not run: the mob state \
+                 has stood down"
+            )),
+        ));
+    }
     result_rx.await.map_err(|_| {
         SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
             "mob archive task ended before reporting a result for {result_session_id}"
@@ -6987,6 +7071,7 @@ mod tests {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Builtin,
                 source_id: "test-read-file".into(),
+                artifact: None,
             }),
         })])
         .await;
@@ -7834,6 +7919,7 @@ mod tests {
                 provenance: Some(ToolProvenance {
                     kind: ToolSourceKind::Builtin,
                     source_id: "core".into(),
+                    artifact: None,
                 }),
             }),
             Arc::new(ToolDef {
@@ -7844,6 +7930,7 @@ mod tests {
                 provenance: Some(ToolProvenance {
                     kind: ToolSourceKind::Mob,
                     source_id: "mob".into(),
+                    artifact: None,
                 }),
             }),
         ])
@@ -8108,6 +8195,7 @@ mod tests {
                 provenance: Some(ToolProvenance {
                     kind: ToolSourceKind::Callback,
                     source_id: format!("parent-{name}").into(),
+                    artifact: None,
                 }),
             })
         })

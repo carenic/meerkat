@@ -141,6 +141,7 @@ impl ScheduleToolDispatcher {
                     provenance: Some(ToolProvenance {
                         kind: ToolSourceKind::Schedule,
                         source_id: "schedule".into(),
+                        artifact: None,
                     }),
                 })
             })
@@ -1428,6 +1429,7 @@ mod tests {
                 provenance: Some(ToolProvenance {
                     kind: ToolSourceKind::Schedule,
                     source_id: "schedule".into(),
+                    artifact: None,
                 }),
             });
             Self {
@@ -1454,6 +1456,7 @@ mod tests {
                     provenance: Some(ToolProvenance {
                         kind: ToolSourceKind::Schedule,
                         source_id: "schedule".into(),
+                        artifact: None,
                     }),
                 }),
             }

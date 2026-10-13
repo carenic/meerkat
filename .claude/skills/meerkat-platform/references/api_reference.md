@@ -434,7 +434,7 @@ durable realm):
 - `jobs/cancel`, `jobs/retry` — machine-authorized mutations
 - `jobs/subscribe`, `jobs/unsubscribe` — durable delivery subscriptions
 - `monitors/start` — high-trust durable script monitor with explicit restart/output contracts
-- `mobkit/jobs/{heartbeat,progress,checkpoint,complete,fail,cancel_ack}` — host-worker lease surface (exact attempt/fence authority)
+- `meta/jobs/{heartbeat,progress,checkpoint,complete,fail,cancel_ack}` — host-worker lease surface (exact attempt/fence authority)
 
 Wire types live in `meerkat_contracts::wire::jobs`; the generated method
 catalog in `docs/api/rpc.mdx` is authoritative.

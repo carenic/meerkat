@@ -4,7 +4,10 @@
 
 mod adapter;
 pub mod apps;
+mod attempt;
+mod checked_route;
 mod client_service;
+mod connect_attempt;
 mod connection;
 mod context_provider;
 mod error;
@@ -17,20 +20,38 @@ mod transport;
 
 pub use adapter::McpRouterAdapter;
 pub use adapter::{McpNotReady, McpReloadFailure, McpReloadReport};
+pub use checked_route::{CheckedMcpRoute, CheckedMcpRouteError, CheckedMcpRouteSpec};
 pub use client_service::McpClientServiceFactory;
-pub use connection::{McpAuthResolver, McpConnection};
+pub use connect_attempt::{
+    McpAttemptSettlement, McpConnectAttempt, McpLocalTermination, McpRemoteSession,
+};
+pub use connection::{
+    McpAuthResolver, McpConnection, McpStdioCloseBounds, McpStdioCloseBoundsError,
+    McpStdioClosePhase, McpStdioCloseReceipt, McpStdioLeaderExitObservation, McpStdioLeaderOutcome,
+    McpStdioSignalOutcome, McpStdioWitnessOutcome,
+};
 pub use context_provider::{
-    McpCallContext, McpCallContextError, McpCallContextProvider, McpCallTarget, McpConnectionId,
-    McpResourceTarget,
+    McpCallContext, McpCallContextError, McpCallContextProvider, McpCallFinalCheck,
+    McpCallFinalCustody, McpCallTarget, McpConnectionId, McpResourceTarget,
 };
 pub use error::{McpError, ToolDiscoveryLimit};
+pub use meerkat_auth_core::http_egress::{
+    HttpEgressAddresses, HttpEgressError, HttpEgressOrigin, HttpEgressOriginError,
+    HttpEgressPolicy, HttpEgressProfile, HttpEgressRefusal, HttpEgressScheme,
+    HttpEgressUnavailable,
+};
 pub use meerkat_core::{ExternalToolDelta, ExternalToolDeltaPhase};
 pub use process_confinement::McpStdioLaunchProfile;
 pub use protocol::McpProtocol;
 pub use router::{
-    McpApplyDelta, McpApplyResult, McpBoundaryRejection, McpLifecycleAction, McpLifecyclePhase,
-    McpReloadTarget, McpRouter, McpServerLifecycleState, McpToolNameCollision, McpToolRoute,
+    AuthorizedRetry, HeldSurfaceLineages, McpApplyDelta, McpApplyResult, McpBoundaryRejection,
+    McpLifecycleAction, McpLifecyclePhase, McpReloadTarget, McpRouter, McpServerLifecycleState,
+    McpSurfaceOwnership, McpToolNameCollision, McpToolRoute, ReleasedCredential, SurfaceHold,
+    SurfaceOwnershipSlot,
 };
+
+mod configured_entry;
+pub use configured_entry::ConfiguredMcpEntry;
 
 // Capability registration
 inventory::submit! {
@@ -59,5 +80,9 @@ inventory::submit! {
 
 #[cfg(test)]
 mod client_service_tests;
+#[cfg(test)]
+mod connect_attempt_tests;
+#[cfg(test)]
+mod egress_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod stdio_test_fixture;

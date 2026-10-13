@@ -19,8 +19,9 @@ pub use realm_profile::{RealmProfileStore, StoredRealmProfile};
 #[cfg(not(target_arch = "wasm32"))]
 pub use sqlite::{
     SqliteForkedParticipantStore, SqliteMobEventStore, SqliteMobIdentityStatusStore,
-    SqliteMobIdentityStore, SqliteMobRunStore, SqliteMobRuntimeMetadataStore, SqliteMobSpecStore,
-    SqliteMobStores, SqliteRealmProfileStore, SqliteTemporaryCouncilStore,
+    SqliteMobIdentityStore, SqliteMobObserverDrain, SqliteMobObserverDrainRefused,
+    SqliteMobObserverDrainReport, SqliteMobRunStore, SqliteMobRuntimeMetadataStore,
+    SqliteMobSpecStore, SqliteMobStores, SqliteRealmProfileStore, SqliteTemporaryCouncilStore,
 };
 pub use temporary_council::{
     TemporaryCouncilRecord, TemporaryCouncilRecoveryVerdict, TemporaryCouncilStore,

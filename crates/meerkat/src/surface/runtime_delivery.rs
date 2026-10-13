@@ -137,6 +137,7 @@ pub struct SessionServiceDeliveryHost<S> {
     jobs: DetachedJobService,
     realm_id: Option<String>,
     continuations: Arc<crate::ContinuationHostBindings>,
+    consent_notices: Option<Arc<crate::ConsentNoticeProjector>>,
 }
 
 impl<S> SessionServiceDeliveryHost<S> {
@@ -154,6 +155,7 @@ impl<S> SessionServiceDeliveryHost<S> {
             jobs,
             realm_id,
             continuations: Arc::default(),
+            consent_notices: None,
         }
     }
 
@@ -165,6 +167,17 @@ impl<S> SessionServiceDeliveryHost<S> {
         continuations: Arc<crate::ContinuationHostBindings>,
     ) -> Self {
         self.continuations = continuations;
+        self
+    }
+
+    /// Project the consent notices `projector`'s issuing approval owner owes
+    /// to this host's hosting domain on the owner's rounds, and confirm them
+    /// against that owner when a governed runtime admits them. A stable
+    /// capability: the host opts in whether or not the owner is available
+    /// now.
+    #[must_use]
+    pub fn with_consent_notices(mut self, projector: Arc<crate::ConsentNoticeProjector>) -> Self {
+        self.consent_notices = Some(projector);
         self
     }
 }
@@ -190,7 +203,35 @@ where
     }
 
     fn retained_job_source(&self) -> Option<Arc<dyn crate::RetainedJobSource>> {
-        self.continuations.job_source()
+        let others = self.continuations.job_source();
+        match &self.consent_notices {
+            Some(projector) => Some(Arc::new(crate::consent_delivery::ConsentAwareJobSource {
+                consent: projector.job_source(),
+                others,
+            })),
+            None => others,
+        }
+    }
+
+    fn projects_owed_continuations(&self) -> bool {
+        self.consent_notices.is_some()
+    }
+
+    fn subscribe_owed_continuation_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.consent_notices
+            .as_ref()
+            .map(|projector| projector.subscribe_owed_changes())
+    }
+
+    async fn project_owed_continuations(
+        &self,
+        after: Option<&crate::OwedContinuationCursor>,
+        limit: usize,
+    ) -> crate::OwedContinuationProjection {
+        match &self.consent_notices {
+            Some(projector) => projector.project(after, limit).await,
+            None => crate::OwedContinuationProjection::default(),
+        }
     }
 
     async fn delivery_route(&self, session_id: &SessionId) -> Option<DeliveryRoute> {

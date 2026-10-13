@@ -24,7 +24,7 @@ use meerkat_auth_core::auth_oauth::{
 };
 use meerkat_auth_core::auth_store::{
     PersistedAuthMode, PersistedTokens, ProviderAuthPersistence, RefreshCoordinator, RefreshError,
-    RefreshFn, TokenKey, TokenStore,
+    RefreshFn, TokenKey, TokenStore, TokenStoreAccess,
 };
 use meerkat_auth_core::oauth_flow::{
     OAuthProviderIdentity, oauth_provider_declaration, oauth_provider_endpoints,
@@ -181,9 +181,9 @@ impl GoogleCodeAssistOAuthRuntime {
             let preparation = preparation_for_refresh.clone();
             Box::pin(async move {
                 let current = token_store
-                    .load(&key)
+                    .load_for(&key, TokenStoreAccess::Unattended)
                     .await
-                    .map_err(|e| RefreshError::Refresh(e.to_string()))?
+                    .map_err(RefreshError::from_token_store)?
                     .ok_or_else(|| {
                         RefreshError::Refresh(
                             "persisted tokens disappeared before OAuth refresh".into(),

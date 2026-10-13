@@ -169,7 +169,8 @@ pub fn admit_model_fallback(
             Message::SystemNotice(notice) => {
                 for block in &notice.blocks {
                     if let crate::SystemNoticeBlock::Comms { content, .. }
-                    | crate::SystemNoticeBlock::ExternalEvent { content, .. } = block
+                    | crate::SystemNoticeBlock::ExternalEvent { content, .. }
+                    | crate::SystemNoticeBlock::RuntimeNotice { content, .. } = block
                         && ((crate::types::has_images(content) && !capabilities.image_input)
                             || (crate::types::has_video(content) && !capabilities.inline_video))
                     {

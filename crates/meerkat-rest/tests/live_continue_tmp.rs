@@ -73,6 +73,7 @@ async fn integration_real_live_continue_hangs() {
     ));
 
     let state = AppState {
+        connector_client_auth_profiles: Vec::new(),
         store_path: store_path.clone(),
         max_tokens: config.agent.resolved_max_tokens_per_turn(),
         rest_host: config.rest.host.clone().into(),

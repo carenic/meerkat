@@ -683,6 +683,36 @@ const nativeE2eSystemTests = [
   },
   {
     packageKey: "meerkat-cli",
+    cargoTestTarget: "system_cli_realm_mcp",
+    name: "e2e_system_cli_realm_mcp_access_ceiling_bazel_test",
+    testName: "integration_real_cli_realm_mcp_access_ceiling",
+  },
+  {
+    packageKey: "meerkat-cli",
+    cargoTestTarget: "system_cli_realm_mcp",
+    name: "e2e_system_cli_realm_mcp_ceiling_refuses_invocation_bazel_test",
+    testName: "integration_real_cli_realm_mcp_ceiling_refuses_invocation",
+  },
+  {
+    packageKey: "meerkat-cli",
+    cargoTestTarget: "system_cli_realm_mcp",
+    name: "e2e_system_cli_realm_mcp_original_session_across_restart_bazel_test",
+    testName: "integration_real_cli_realm_mcp_original_session_across_restart",
+  },
+  {
+    packageKey: "meerkat-cli",
+    cargoTestTarget: "system_cli_realm_mcp",
+    name: "e2e_system_cli_realm_mcp_installation_does_not_grant_every_agent_bazel_test",
+    testName: "integration_real_cli_realm_mcp_installation_does_not_grant_every_agent",
+  },
+  {
+    packageKey: "meerkat-cli",
+    cargoTestTarget: "system_cli_realm_mcp",
+    name: "e2e_system_cli_realm_mcp_missing_tool_call_local_bazel_test",
+    testName: "integration_real_cli_realm_mcp_refused_write_is_call_local_feedback",
+  },
+  {
+    packageKey: "meerkat-cli",
     cargoTestTarget: "system_cli_export_atif",
     name: "e2e_system_cli_export_atif_bazel_test",
     testName: "integration_real_cli_export_atif",

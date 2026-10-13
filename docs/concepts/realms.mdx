@@ -174,8 +174,11 @@ With `multiprocess`:
 Startup refuses with a typed "multi-process hosting is unavailable" error when
 the realm's stores cannot provide this: an in-memory or external store without
 hosting claims, or a network or userspace filesystem (NFS, SMB, 9P, FUSE and
-similar) where OS locks cannot be trusted. `single_process` keeps the previous
-behavior and makes no multi-process claim.
+similar) where OS locks cannot be trusted. `single_process` does not require
+multi-process-capable storage. On stores that provide OS-locked hosting claims,
+session exclusivity still applies in both modes: another runtime cannot
+continue a session while its current host holds the claim. The claim is
+released when its last holder is dropped or the host process exits.
 
 On a store with OS-locked claims, in either mode, a session whose claim cannot
 be taken for a reason other than another holder (its lock file cannot be

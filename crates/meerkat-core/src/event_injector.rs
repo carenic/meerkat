@@ -108,7 +108,7 @@ pub trait SubscribableInjector: EventInjector {
     /// the transcript identity stamped at runtime admission joins with the
     /// caller's live interaction frames — the seam mob work-lane delivery
     /// uses to persist a host-supplied interaction id onto committed
-    /// transcript messages (mobkit ask-15 addendum).
+    /// transcript messages (meta ask-15 addendum).
     fn inject_with_interaction_id(
         &self,
         interaction_id: crate::interaction::InteractionId,

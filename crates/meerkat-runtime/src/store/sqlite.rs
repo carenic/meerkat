@@ -735,7 +735,17 @@ CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
                     .ok_or("stored_input_state_version is not an unsigned integer")?;
                 match version {
                     3 => {}
-                    5 if target_current => {
+                    // A row a 0.8.11 to 0.8.51 binary wrote is carried to the
+                    // current encoding through the generic decode, re-encode
+                    // and loss check below; only its version stamp changes.
+                    5 if target_current => {}
+                    version
+                        if target_current
+                            && version
+                                == u64::from(
+                                    meerkat_core::generated::session_persistence_version_authority::stored_input_state_version(),
+                                ) =>
+                    {
                         // A file already at the current encoding is verified,
                         // not rewritten: the row must already be exactly what
                         // this binary would write.
@@ -751,8 +761,10 @@ CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
                         let canonical = serde_json::to_vec(record.as_stored())
                             .map_err(|error| error.to_string())?;
                         if canonical != source_bytes {
-                            return Err("target-v2 current row is not exact canonical v5 output"
-                                .to_string());
+                            return Err(
+                                "target-v2 current row is not exact canonical current output"
+                                    .to_string(),
+                            );
                         }
                         return Ok(PreFloorAdmission::AlreadyCanonical);
                     }
@@ -3539,7 +3551,10 @@ END";
                 serde_json::from_slice(&v3_bytes).expect("source v3 json");
             let carried_v3_json: serde_json::Value =
                 serde_json::from_slice(&carried_v3).expect("carried v3 json");
-            assert_eq!(carried_v3_json["stored_input_state_version"], 5);
+            assert_eq!(
+                carried_v3_json["stored_input_state_version"],
+                meerkat_core::generated::session_persistence_version_authority::stored_input_state_version()
+            );
             for field in [
                 "input_id",
                 "current_state",
@@ -3918,7 +3933,7 @@ END";
             let successor = load_row(&conn, "runtime", &input_id);
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&successor).expect("successor json")["stored_input_state_version"],
-                5
+                meerkat_core::generated::session_persistence_version_authority::stored_input_state_version()
             );
 
             conn.execute_batch(
@@ -4118,6 +4133,23 @@ END";
             }
             other => RuntimeStoreError::WriteFailed(other.to_string()),
         }
+    }
+
+    /// The one place a controller administration open or BEGIN failure is
+    /// classified as busy: only SQLite lock contention. Every other cause,
+    /// including an unavailable expected catalog, keeps its ordinary mapping.
+    fn controller_custody_busy(
+        error: &meerkat_sqlite::SqliteStoreError,
+    ) -> Option<RuntimeStoreError> {
+        let busy = match error {
+            meerkat_sqlite::SqliteStoreError::Sqlite(error) => {
+                meerkat_sqlite::is_busy_or_locked(error)
+            }
+            _ => false,
+        };
+        busy.then(|| RuntimeStoreError::ControllerCustodyBusy {
+            detail: error.to_string(),
+        })
     }
 
     fn map_runtime_connection_error(
@@ -10242,6 +10274,18 @@ ORDER BY runtime_id";
         })
     }
 
+    /// One armed pause of a machine-lifecycle commit (tests only): the commit
+    /// that writes `input_id`'s state signals `entered` once its transaction
+    /// is written, then commits only after `release` sends (or its sender
+    /// drops). The pause runs on the blocking SQLite writer, so cancelling the
+    /// caller that awaits the commit does not cancel it.
+    #[cfg(test)]
+    struct MachineLifecycleCommitPause {
+        input_id: InputId,
+        entered: Arc<tokio::sync::Notify>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
     /// SQLite-backed runtime store sharing the same sqlite file as `SqliteSessionStore`.
     pub struct SqliteRuntimeStore {
         path: PathBuf,
@@ -10263,9 +10307,30 @@ ORDER BY runtime_id";
         /// Observability seam for the length-gate regression tests only.
         #[cfg(test)]
         snapshot_byte_probe_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        /// Test support: this instance's scripted loss of an input-persistence
+        /// acknowledgement after a real commit.
+        #[cfg(any(test, feature = "test-support"))]
+        input_persist_ack_loss: crate::store::InputPersistAckLossFault,
+        /// Armed pause of one machine-lifecycle commit. Commit-cancellation
+        /// regression tests only.
+        #[cfg(test)]
+        machine_lifecycle_commit_pause: std::sync::Mutex<Option<MachineLifecycleCommitPause>>,
     }
 
     impl SqliteRuntimeStore {
+        /// Test support: this store instance's scripted loss of an
+        /// input-persistence acknowledgement. Armed for one runtime, the next
+        /// `persist_input_states_atomically` batch of that runtime on this
+        /// store commits and then reports `WriteFailed` (see
+        /// [`crate::store::InputPersistAckLossFault`]).
+        #[cfg(any(test, feature = "test-support"))]
+        #[doc(hidden)]
+        pub fn input_persist_ack_loss_fault_for_test(
+            &self,
+        ) -> crate::store::InputPersistAckLossFault {
+            self.input_persist_ack_loss.clone()
+        }
+
         /// Install committed WholeBlob body bytes verbatim plus PENDING
         /// compaction projection outbox rows, bypassing every writer-side
         /// guard, so recovery tests can start from exactly the durable state
@@ -10373,7 +10438,36 @@ ORDER BY runtime_id";
                 snapshot_byte_probe_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                     0,
                 )),
+                #[cfg(any(test, feature = "test-support"))]
+                input_persist_ack_loss: crate::store::InputPersistAckLossFault::default(),
+                #[cfg(test)]
+                machine_lifecycle_commit_pause: std::sync::Mutex::new(None),
             })
+        }
+
+        /// Exclusive execution custody of the existing SQLite runtime
+        /// database at `path`: the claim a governed machine over a store of
+        /// that file holds, bound to the same physical file identity, taken
+        /// without waiting and without opening the database or constructing a
+        /// store. A trusted host whose own runtime store is another database
+        /// retains it through its machine
+        /// ([`crate::MeerkatMachine::persistent_governed_staged_with_associated_custody`])
+        /// to keep this database's other execution owners out, in any
+        /// process. The claim belongs to no store and grants no row or writer
+        /// authority over this database. A missing or unbindable file refuses
+        /// as unavailable.
+        pub fn try_acquire_governed_execution_custody(
+            path: impl Into<PathBuf>,
+        ) -> Result<
+            crate::store::RuntimeStoreExecutionClaim,
+            crate::store::RuntimeStoreExecutionCustodyError,
+        > {
+            let path = path.into();
+            validate_runtime_database_file(&path)
+                .map_err(|_| crate::store::RuntimeStoreExecutionCustodyError::Unavailable)?;
+            let (_, custody) = bind_runtime_execution_custody(path)
+                .map_err(|_| crate::store::RuntimeStoreExecutionCustodyError::Unavailable)?;
+            custody.try_acquire_governed()
         }
 
         /// Open an EXISTING WholeBlob runtime database for an operator repair.
@@ -10485,6 +10579,10 @@ ORDER BY runtime_id";
                 snapshot_byte_probe_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                     0,
                 )),
+                #[cfg(any(test, feature = "test-support"))]
+                input_persist_ack_loss: crate::store::InputPersistAckLossFault::default(),
+                #[cfg(test)]
+                machine_lifecycle_commit_pause: std::sync::Mutex::new(None),
             })
         }
 
@@ -10541,6 +10639,27 @@ ORDER BY runtime_id";
         fn inject_unregister_finalization_fault(&self, fault: u8) {
             self.unregister_finalization_fault
                 .store(fault, Ordering::SeqCst);
+        }
+
+        /// Pause the next machine-lifecycle commit that writes `input_id`'s
+        /// state once its transaction is written: it notifies `entered`, then
+        /// commits only after `release` sends (or its sender drops).
+        #[cfg(test)]
+        pub(crate) fn pause_machine_lifecycle_commit_of_input_for_test(
+            &self,
+            input_id: InputId,
+            entered: Arc<tokio::sync::Notify>,
+            release: std::sync::mpsc::Receiver<()>,
+        ) {
+            *self
+                .machine_lifecycle_commit_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(MachineLifecycleCommitPause {
+                    input_id,
+                    entered,
+                    release,
+                });
         }
 
         /// Total candidate bytes this store has shipped into the snapshot
@@ -11444,7 +11563,9 @@ ORDER BY runtime_id";
                     ..meerkat_sqlite::OpenOptions::default()
                 },
             )
-            .map_err(map_shared_sqlite_error)?;
+            .map_err(|error| {
+                controller_custody_busy(&error).unwrap_or_else(|| map_shared_sqlite_error(error))
+            })?;
             let connection = RuntimeConn {
                 conn: connection,
                 _guard: guard,
@@ -11455,12 +11576,15 @@ ORDER BY runtime_id";
             connection
                 .execute_batch("BEGIN IMMEDIATE")
                 .map_err(|error| {
-                    map_runtime_connection_error(
-                        &self.path,
-                        "controller administration BEGIN IMMEDIATE",
-                        std::panic::Location::caller(),
-                        error.into(),
-                    )
+                    let error = meerkat_sqlite::SqliteStoreError::from(error);
+                    controller_custody_busy(&error).unwrap_or_else(|| {
+                        map_runtime_connection_error(
+                            &self.path,
+                            "controller administration BEGIN IMMEDIATE",
+                            std::panic::Location::caller(),
+                            error,
+                        )
+                    })
                 })?;
             Ok(Box::new(SqliteControllerCustody { connection }))
         }
@@ -13972,6 +14096,13 @@ ORDER BY runtime_id";
             self
         }
 
+        #[cfg(any(test, feature = "test-support"))]
+        fn input_persist_ack_loss_fault_for_test(
+            &self,
+        ) -> Option<crate::store::InputPersistAckLossFault> {
+            Some(self.input_persist_ack_loss.clone())
+        }
+
         async fn commit_prepared_session_boundary_with_fence(
             &self,
             runtime_id: &LogicalRuntimeId,
@@ -15401,12 +15532,28 @@ ORDER BY runtime_id";
                     )
                 })
                 .collect();
+            #[cfg(any(test, feature = "test-support"))]
+            let ack_loss = self.input_persist_ack_loss.clone();
             spawn_blocking_holding_claim(move || {
                 let mut conn = open_runtime_connection(&path)?;
                 let tx = begin_runtime_transaction(&mut conn)?;
                 upsert_input_states(&tx, &runtime_id, &states)?;
                 tx.commit()
                     .map_err(|err| RuntimeStoreError::WriteFailed(err.to_string()))?;
+                // Test support: the batch is committed. An armed loss for
+                // exactly this runtime reports the acknowledgement as lost.
+                #[cfg(any(test, feature = "test-support"))]
+                if ack_loss.lose_after_commit(
+                    &runtime_id,
+                    states
+                        .iter()
+                        .map(|(stored, _)| stored.state.input_id.clone())
+                        .collect(),
+                ) {
+                    return Err(RuntimeStoreError::WriteFailed(
+                        "scripted input persistence acknowledgement lost after commit".into(),
+                    ));
+                }
                 Ok(())
             })
             .await
@@ -16287,11 +16434,33 @@ ORDER BY runtime_id";
                     )
                 })
                 .collect::<Vec<_>>();
+            #[cfg(test)]
+            let pause = {
+                let mut armed = self
+                    .machine_lifecycle_commit_pause
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let writes_paused_input = armed.as_ref().is_some_and(|pause| {
+                    input_states
+                        .iter()
+                        .any(|(stored, _)| stored.state.input_id == pause.input_id)
+                });
+                if writes_paused_input {
+                    armed.take()
+                } else {
+                    None
+                }
+            };
             spawn_blocking_holding_claim(move || {
                 let mut conn = open_runtime_connection(&path)?;
                 let tx = begin_runtime_transaction(&mut conn)?;
                 upsert_machine_lifecycle_snapshot(&tx, &runtime_id, &snapshot)?;
                 upsert_input_states(&tx, &runtime_id, &input_states)?;
+                #[cfg(test)]
+                if let Some(pause) = pause {
+                    pause.entered.notify_one();
+                    let _ = pause.release.recv();
+                }
                 tx.commit()
                     .map_err(|err| RuntimeStoreError::WriteFailed(err.to_string()))?;
                 Ok(())
@@ -17583,12 +17752,52 @@ ORDER BY runtime_id";
                 .unwrap()
                 .expect("released operation fence");
             assert!(
-                RuntimeStore::try_controller_mutation_custody(&store, &claim).is_err(),
-                "a maintenance holder must not self-admit online administration"
+                matches!(
+                    RuntimeStore::try_controller_mutation_custody(&store, &claim),
+                    Err(RuntimeStoreError::MaintenanceFenceHeld { .. })
+                ),
+                "a maintenance holder must not self-admit online administration, and is not busy"
             );
             drop(maintenance);
             RuntimeStore::try_controller_mutation_custody(&store, &claim)
                 .expect("ordinary administration resumes after actual fence release");
+        }
+
+        #[test]
+        fn controller_custody_busy_is_only_proven_contention() {
+            use meerkat_sqlite::{CurrentCatalogUnavailability, SqliteStoreError};
+            let catalog = |cause| SqliteStoreError::CurrentCatalogUnavailable {
+                domain: "runtime".to_string(),
+                cause,
+            };
+            let sqlite = |code| {
+                SqliteStoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(code),
+                    None,
+                ))
+            };
+            for busy in [
+                sqlite(rusqlite::ffi::SQLITE_BUSY),
+                sqlite(rusqlite::ffi::SQLITE_LOCKED),
+            ] {
+                assert!(
+                    matches!(
+                        controller_custody_busy(&busy),
+                        Some(RuntimeStoreError::ControllerCustodyBusy { .. })
+                    ),
+                    "{busy}"
+                );
+            }
+            for other in [
+                catalog(CurrentCatalogUnavailability::NotPrepared),
+                catalog(CurrentCatalogUnavailability::Poisoned),
+                sqlite(rusqlite::ffi::SQLITE_CORRUPT),
+                SqliteStoreError::MaintenanceFenceHeld {
+                    path: PathBuf::from("runtime.db"),
+                },
+            ] {
+                assert!(controller_custody_busy(&other).is_none(), "{other}");
+            }
         }
 
         #[cfg(any(target_os = "macos", target_os = "linux", windows))]
@@ -17613,7 +17822,13 @@ ORDER BY runtime_id";
             );
             let mut writer = open_runtime_connection(store.path()).unwrap();
             let transaction = begin_runtime_transaction(&mut writer).unwrap();
-            assert!(RuntimeStore::try_controller_mutation_custody(&store, &claim).is_err());
+            assert!(
+                matches!(
+                    RuntimeStore::try_controller_mutation_custody(&store, &claim),
+                    Err(RuntimeStoreError::ControllerCustodyBusy { .. })
+                ),
+                "a competing writer is typed momentary contention"
+            );
             drop(transaction);
             RuntimeStore::try_controller_mutation_custody(&store, &claim)
                 .expect("same claim succeeds after actual competing writer release");
@@ -19201,6 +19416,100 @@ ORDER BY runtime_id";
                     .is_none(),
                 "nothing of the refused write committed"
             );
+        }
+
+        /// Test-support seam for a downstream app's real-holder failure controls: the
+        /// armed acknowledgement loss belongs to ONE store instance and ONE
+        /// runtime, fires only after the batch really committed, records the
+        /// exact committed batch, and is consumed once. The erased accessor
+        /// reaches the same instance; other stores issue no seam.
+        #[tokio::test]
+        async fn input_persist_ack_loss_fault_targets_one_store_and_runtime_after_commit() {
+            let (_armed_dir, armed_store) = temp_store();
+            let (_other_dir, other_store) = temp_store();
+            let session = meerkat_core::types::SessionId::new();
+            let runtime = LogicalRuntimeId::for_session(&session);
+            let other_runtime = LogicalRuntimeId::new("ack-loss-other-runtime");
+            let erased: &dyn crate::store::RuntimeStore = &armed_store;
+            let fault = erased
+                .input_persist_ack_loss_fault_for_test()
+                .expect("a SqliteRuntimeStore issues the seam");
+            assert!(
+                crate::store::RuntimeStore::input_persist_ack_loss_fault_for_test(
+                    &crate::store::InMemoryRuntimeStore::new()
+                )
+                .is_none(),
+                "other stores issue no seam"
+            );
+            fault.lose_next_commit_acknowledgement(runtime.clone());
+
+            // Another store instance, and another runtime of the armed store,
+            // commit and acknowledge normally and leave the loss armed.
+            other_store
+                .persist_input_states_atomically(
+                    &runtime,
+                    &[persistable(StoredInputState::new_accepted(InputId::new()))],
+                )
+                .await
+                .expect("another store instance is not armed");
+            armed_store
+                .persist_input_states_atomically(
+                    &other_runtime,
+                    &[persistable(StoredInputState::new_accepted(InputId::new()))],
+                )
+                .await
+                .expect("another runtime of the armed store is not armed");
+            assert!(fault.is_armed());
+            assert_eq!(fault.consumed_commit(), None);
+
+            // The armed runtime: the batch commits, then its acknowledgement
+            // is lost.
+            let input_id = InputId::new();
+            let record = persistable(StoredInputState::new_accepted(input_id.clone()));
+            let expected_row = serde_json::to_vec(&record.clone_stored()).unwrap();
+            let lost = armed_store
+                .persist_input_states_atomically(&runtime, std::slice::from_ref(&record))
+                .await
+                .expect_err("the acknowledgement is lost");
+            assert!(
+                matches!(&lost, RuntimeStoreError::WriteFailed(message)
+                    if message.contains("acknowledgement lost after commit")),
+                "{lost:?}"
+            );
+            assert!(!fault.is_armed(), "consumed once");
+            assert_eq!(
+                fault.consumed_commit(),
+                Some((runtime.clone(), vec![input_id.clone()])),
+                "the exact committed batch"
+            );
+            let committed_row = Connection::open(&armed_store.path)
+                .unwrap()
+                .query_row(
+                    "SELECT state_json FROM runtime_input_states \
+                     WHERE runtime_id = ?1 AND input_id = ?2",
+                    params![runtime_id_text(&runtime), input_id.0.to_string()],
+                    |row| Ok(row.get::<_, JsonColumnBytes>(0)?.into_bytes()),
+                )
+                .unwrap();
+            assert_eq!(committed_row, expected_row, "the exact input row committed");
+            assert_eq!(
+                armed_store
+                    .load_input_state(&runtime, &input_id)
+                    .await
+                    .unwrap()
+                    .map(|stored| stored.state.input_id),
+                Some(input_id),
+                "the committed row reads back"
+            );
+
+            // One-shot: the next batch of the same runtime is acknowledged.
+            armed_store
+                .persist_input_states_atomically(
+                    &runtime,
+                    &[persistable(StoredInputState::new_accepted(InputId::new()))],
+                )
+                .await
+                .expect("the loss fired once");
         }
 
         /// #1813 (ADR R6 condition 2): another runtime reusing a key is
