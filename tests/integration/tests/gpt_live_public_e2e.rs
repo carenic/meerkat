@@ -5901,9 +5901,12 @@ impl SpokenTurn {
             entry.kind == TimelineKind::FixtureStart && entry.schedule_id() == Some(schedule_id)
         })?;
         let speech_end_ms = start.t_ms + start.detail_u64("speech_ms").unwrap_or(0);
+        // A final at the fixture's own start closed the previous utterance (a
+        // fixture anchored on that utterance's delegation starts in the same
+        // millisecond); the fixture's own final arrives after its speech.
         let input_final = timeline
             .iter()
-            .find(|entry| entry.kind == TimelineKind::InputFinal && entry.t_ms >= start.t_ms);
+            .find(|entry| entry.kind == TimelineKind::InputFinal && entry.t_ms > start.t_ms);
         let first_audio_ms = timeline
             .iter()
             .find(|entry| {
@@ -10990,42 +10993,104 @@ async fn run_s101_busy_backend(evidence: Journal) -> Result<(), Box<dyn std::err
             .rpc
             .session_history(json!(live.session_id), 30)
             .await?;
+        let timeline = live.peer.timeline().await?;
         // Under DurableFork the executor-input rows live in the fork sessions;
-        // the canonical (voice) session commits each delegation's final
-        // transcript as assistant rows after the spoken user row. Deterministic:
-        // three spoken user rows, each followed by at least one assistant row.
+        // the canonical (voice) session commits the spoken user rows and the
+        // model's spoken responses. Deterministic: the three spoken user rows
+        // are committed, and every response the browser heard (a
+        // `response_end` with its final transcript) is committed as assistant
+        // rows after the user rows whose input final preceded it. Whether the
+        // model answers between two utterances is its own turn-taking: job 2
+        // starts on the quick question's delegation, and the model may answer
+        // both in one later response (Live gate run 38410526290 on eee388c2).
         let rows = s100_user_rows(&history);
         let messages = history["messages"].as_array().cloned().unwrap_or_default();
         let roles: Vec<&str> = messages.iter().filter_map(|x| x["role"].as_str()).collect();
-        let mut answered_rows = 0usize;
-        let mut spoken_rows = 0usize;
-        for (index, message) in messages.iter().enumerate() {
-            if message["role"].as_str() != Some("user") {
-                continue;
-            }
-            let text = normalize_words(&history_text(&json!({"messages":[message]})));
-            if text.starts_with("result of the voice request") || text.starts_with(&normalize_words(S100_DELEGATION_CONTEXT_PREFIX)) {
-                continue;
-            }
-            spoken_rows += 1;
-            let answered = messages[index + 1..]
-                .iter()
-                .take_while(|m| m["role"].as_str() != Some("user"))
-                .any(|m| m["role"].as_str().is_some_and(|role| role.contains("assistant")));
-            if answered {
-                answered_rows += 1;
-            }
-        }
-        println!(
-            "GPT_LIVE_S101_HISTORY spoken_rows={spoken_rows} answered_rows={answered_rows} executor_inputs={:?} user_rows={:?} roles={roles:?}",
-            rows.executor_inputs, rows.spoken
-        );
-        if spoken_rows < 3 || answered_rows < 3 {
+        let delegation_prefix = normalize_words(S100_DELEGATION_CONTEXT_PREFIX);
+        let spoken_at: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| {
+                message["role"].as_str() == Some("user") && {
+                    let text = normalize_words(&history_text(&json!({"messages":[message]})));
+                    !text.starts_with("result of the voice request")
+                        && !text.starts_with(&delegation_prefix)
+                }
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if spoken_at.len() < 3 {
             deterministic_failures.push(format!(
-                "final transcripts not committed for every delegation: spoken user rows={spoken_rows}, followed by assistant rows={answered_rows} (three required)"
+                "spoken user rows not committed: {} of three",
+                spoken_at.len()
             ));
         }
-        let timeline = live.peer.timeline().await?;
+        // Letters and digits only: the committed rows split the transcript at
+        // speaker changes, possibly inside a word, and keep its own spacing.
+        let compact = |text: &str| normalize_words(text).replace(' ', "");
+        let input_finals: Vec<u64> = timeline
+            .iter()
+            .filter(|entry| entry.kind == TimelineKind::InputFinal)
+            .map(|entry| entry.detail_u64("t_ms").unwrap_or(entry.t_ms))
+            .collect();
+        let mut responses = Vec::new();
+        for response in timeline
+            .iter()
+            .filter(|entry| entry.kind == TimelineKind::ResponseEnd)
+        {
+            let text = compact(response.detail_str("text").unwrap_or_default());
+            if text.is_empty() {
+                continue;
+            }
+            let index = response.detail_u64("index");
+            // The response began at its first audio, or at its end when no
+            // audio was detected; an input final before that preceded it.
+            let started_ms = timeline
+                .iter()
+                .find(|entry| {
+                    entry.kind == TimelineKind::AssistantAudioStart
+                        && index.is_some()
+                        && entry.detail_u64("response") == index
+                })
+                .map_or(response.t_ms, |entry| entry.t_ms.min(response.t_ms));
+            let after_inputs = input_finals.iter().filter(|t| **t < started_ms).count();
+            // The rows after the spoken user row of the last preceding input.
+            let from = match after_inputs {
+                0 => Some(0),
+                n => spoken_at.get(n - 1).map(|at| at + 1),
+            };
+            let committed = from.is_some_and(|from| {
+                let assistant: String = messages[from..]
+                    .iter()
+                    .filter(|row| {
+                        row["role"]
+                            .as_str()
+                            .is_some_and(|role| role.contains("assistant"))
+                    })
+                    .map(assistant_row_text)
+                    .collect();
+                compact(&assistant).contains(&text)
+            });
+            if !committed {
+                deterministic_failures.push(format!(
+                    "response {index:?} heard after {after_inputs} input final(s) is not committed as assistant rows after the spoken user row of that input: {:?}",
+                    response.detail_str("text").unwrap_or_default()
+                ));
+            }
+            responses.push((index, after_inputs, committed));
+        }
+        if responses.is_empty() {
+            deterministic_failures.push(
+                "no heard response with a final transcript to check against the committed assistant rows"
+                    .to_owned(),
+            );
+        }
+        println!(
+            "GPT_LIVE_S101_HISTORY spoken_rows={} responses(index, after_inputs, committed)={responses:?} executor_inputs={:?} user_rows={:?} roles={roles:?}",
+            spoken_at.len(),
+            rows.executor_inputs,
+            rows.spoken
+        );
         let report = live.peer.energy().await?;
         evidence.record(EvidenceRecord::Energy {
             channel,
