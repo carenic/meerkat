@@ -145,7 +145,7 @@ impl CheckedMcpRoute {
 
     /// Whether the route still offers and runs its operations.
     pub fn is_open(&self) -> bool {
-        !self.closed.load(Ordering::Acquire)
+        !self.closed.load(Ordering::Acquire) && !self.adapter.is_closing()
     }
 
     /// Close the route for good: it offers nothing more, and no plan it

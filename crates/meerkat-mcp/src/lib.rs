@@ -20,14 +20,16 @@ mod transport;
 
 pub use adapter::McpRouterAdapter;
 pub use adapter::{McpNotReady, McpReloadFailure, McpReloadReport};
+pub use adapter::{McpRouterShutdownObservation, McpRouterShutdownObserver};
 pub use checked_route::{CheckedMcpRoute, CheckedMcpRouteError, CheckedMcpRouteSpec};
 pub use client_service::McpClientServiceFactory;
 pub use connect_attempt::{
     McpAttemptSettlement, McpConnectAttempt, McpLocalTermination, McpRemoteSession,
 };
 pub use connection::{
-    McpAuthResolver, McpConnection, McpStdioCloseBounds, McpStdioCloseBoundsError,
-    McpStdioClosePhase, McpStdioCloseReceipt, McpStdioLeaderExitObservation, McpStdioLeaderOutcome,
+    McpAuthResolver, McpCloseTicket, McpConnectFailure, McpConnection, McpCustodyNotHeld,
+    McpServerCloseOutcome, McpStdioCloseBounds, McpStdioCloseBoundsError, McpStdioClosePhase,
+    McpStdioCloseReceipt, McpStdioLeaderExitObservation, McpStdioLeaderOutcome,
     McpStdioSignalOutcome, McpStdioWitnessOutcome,
 };
 pub use context_provider::{
@@ -45,9 +47,9 @@ pub use process_confinement::McpStdioLaunchProfile;
 pub use protocol::McpProtocol;
 pub use router::{
     AuthorizedRetry, HeldSurfaceLineages, McpApplyDelta, McpApplyResult, McpBoundaryRejection,
-    McpLifecycleAction, McpLifecyclePhase, McpReloadTarget, McpRouter, McpServerLifecycleState,
-    McpSurfaceOwnership, McpToolNameCollision, McpToolRoute, ReleasedCredential, SurfaceHold,
-    SurfaceOwnershipSlot,
+    McpLifecycleAction, McpLifecyclePhase, McpReloadTarget, McpRouter, McpRouterShutdownReport,
+    McpServerCloseRecord, McpServerLifecycleState, McpSurfaceOwnership, McpToolNameCollision,
+    McpToolRoute, ReleasedCredential, SurfaceHold, SurfaceOwnershipSlot,
 };
 
 mod configured_entry;

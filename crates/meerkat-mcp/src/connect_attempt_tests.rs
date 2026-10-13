@@ -638,3 +638,125 @@ async fn a_deletion_answered_without_a_success_status_is_unconfirmed() {
         "{requests:?}"
     );
 }
+
+/// A router whose remote servers the close index tests close.
+fn close_index_router() -> crate::McpRouter {
+    crate::McpRouter::new_with_surface_handle(Arc::new(
+        meerkat_runtime::RuntimeExternalToolSurfaceHandle::ephemeral(),
+    ))
+}
+
+/// C8/C9: a remote connection's close is part of the close ticket. The
+/// ticket waits for the client to end (here its session deletion, held by
+/// the server) and reports `NoProcess` only once it has; the router's
+/// shutdown then joins the same close. (Fails at r3: the ticket covered only
+/// stdio custodies, so it read settled before this close had ended.)
+#[tokio::test]
+async fn a_close_ticket_waits_for_a_remote_close_and_reports_it() {
+    let (url, server) = spawn(Some(Pause::Delete)).await;
+    let mut router = close_index_router();
+    router.add_server(config(url)).await.expect("add_server");
+    let adapter = crate::McpRouterAdapter::new(router);
+
+    let ticket = adapter.begin_close();
+    let mut outcomes = Box::pin(ticket.outcomes());
+    server.reached().await;
+    assert!(
+        futures::poll!(outcomes.as_mut()).is_pending(),
+        "nothing is reported while the client's close is still running"
+    );
+    server.release.notify_one();
+    let records = tokio::time::timeout(BOUND, outcomes)
+        .await
+        .expect("the released close reports");
+    match &records[..] {
+        [crate::McpServerCloseRecord { server, outcome }] => {
+            assert_eq!(server, "held");
+            assert!(
+                matches!(outcome, crate::McpServerCloseOutcome::NoProcess),
+                "{outcome:?}"
+            );
+        }
+        other => panic!("one remote close record: {other:?}"),
+    }
+
+    let crate::McpRouterShutdownObservation::Reported(report) =
+        adapter.shutdown_with_report().await
+    else {
+        panic!("the shutdown reported");
+    };
+    assert!(
+        matches!(
+            report.servers(),
+            [crate::McpServerCloseRecord {
+                outcome: crate::McpServerCloseOutcome::NoProcess,
+                ..
+            }]
+        ),
+        "{report:?}"
+    );
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| *request == "DELETE")
+            .count(),
+        1,
+        "one close, joined by the shutdown"
+    );
+}
+
+/// Wait until the router reports `server`'s connect attempt failed: a
+/// refused attempt fails at once.
+async fn attempt_failed(adapter: &crate::McpRouterAdapter, server: &str) {
+    tokio::time::timeout(BOUND, async {
+        loop {
+            let actions = adapter
+                .poll_lifecycle_actions()
+                .await
+                .expect("lifecycle actions");
+            if actions.iter().any(|action| {
+                action.target == server && matches!(action.phase, crate::McpLifecyclePhase::Failed)
+            }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the attempt was refused at once");
+}
+
+/// C8 admission for a remote server: an add admitted before the close began
+/// but applied after it (it waited for the router lock a dispatch held) is
+/// refused before any request. (Fails at r3: only stdio custodies were
+/// fenced, and the attempt connected after the close.)
+#[tokio::test]
+async fn a_remote_add_applied_after_the_close_began_sends_nothing() {
+    let (url, server) = spawn(None).await;
+    let adapter = crate::McpRouterAdapter::new(close_index_router());
+    adapter
+        .stage_add(config(url))
+        .await
+        .expect("staged before the close");
+    let held = adapter.router_lock().read().await;
+    let mut apply = Box::pin(adapter.apply_staged());
+    assert!(
+        futures::poll!(apply.as_mut()).is_pending(),
+        "the apply passed admission and waits for the router lock"
+    );
+    let ticket = adapter.begin_close();
+    drop(held);
+    apply.await.expect("the admitted apply finishes");
+    // The attempt has ended before its effects are checked.
+    attempt_failed(&adapter, "held").await;
+    assert!(server.requests().is_empty(), "{:?}", server.requests());
+    assert!(ticket.outcomes().await.is_empty());
+    let crate::McpRouterShutdownObservation::Reported(report) =
+        adapter.shutdown_with_report().await
+    else {
+        panic!("the shutdown reported");
+    };
+    assert!(report.is_settled(), "{report:?}");
+    assert!(server.requests().is_empty(), "{:?}", server.requests());
+}

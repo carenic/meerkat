@@ -400,7 +400,9 @@ pub use factory::{
     resolve_create_session_model, resolve_provider_catalog_default_model,
 };
 #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
-pub use factory::{McpAdapterComposeRefusal, McpAdapterComposer};
+pub use factory::{
+    McpAdapterComposeRefusal, McpAdapterComposer, McpAdapterCustody, McpAdapterCustodyClosed,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use host_auth::{
     HostAuthDevicePoll, HostAuthDeviceStart, HostAuthError, HostAuthLoginComplete,

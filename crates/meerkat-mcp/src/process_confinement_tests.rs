@@ -483,7 +483,6 @@ done
         drop(pipes);
         let receipt = result
             .expect("retained native child can be reaped")
-            .unwrap()
             .expect("the cancelled waiter leaves its receipt to be joined");
         assert!(
             matches!(receipt.leader, McpStdioLeaderOutcome::Reaped(_)),

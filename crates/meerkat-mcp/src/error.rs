@@ -5,6 +5,12 @@ use meerkat_core::handles::DslTransitionError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
+    /// A connection's client close did not finish within its bound.
+    #[error("MCP server '{server}' close did not finish within {bound:?}")]
+    CloseTimedOut {
+        server: String,
+        bound: std::time::Duration,
+    },
     /// The governed attachment control refused this server, at staging or at
     /// the connection's physical entry. Nothing was spawned or contacted.
     #[error("MCP attachment refused: {0}")]

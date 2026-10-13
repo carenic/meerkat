@@ -6,7 +6,7 @@
 //! bound handle fails closed for lifecycle mutations until that owner is
 //! supplied.
 
-use crate::connection::{CustodyNotHeld, StdioChildCustody};
+use crate::connection::StdioChildCustody;
 use crate::external_tool_surface_authority::{
     ExternalToolSurfaceEffect, ExternalToolSurfaceError, ExternalToolSurfaceInput,
     ExternalToolSurfacePhase, ExternalToolSurfaceTransition, RemovalTimingInfo, StagedSurfaceOp,
@@ -16,7 +16,7 @@ use crate::generated::{
     protocol_surface_completion::{self, SurfaceCompletionObligation},
     protocol_surface_snapshot_alignment::{self, SurfaceSnapshotAlignmentObligation},
 };
-use crate::{McpAuthResolver, McpConnection, McpError};
+use crate::{McpAuthResolver, McpConnection, McpError, McpServerCloseOutcome};
 use async_trait::async_trait;
 use meerkat_auth_core::{McpAuthMode, McpServerIdentity};
 use meerkat_core::AgentToolDispatcher;
@@ -1360,6 +1360,58 @@ impl Drop for InflightCallGuard<'_> {
     }
 }
 
+/// One close an [`McpRouter`] owned, and what it observed.
+#[derive(Debug, Clone)]
+pub struct McpServerCloseRecord {
+    pub server: String,
+    pub outcome: McpServerCloseOutcome,
+}
+
+/// What [`McpRouter::shutdown_with_report`] observed: one record per close
+/// the router owned. That is every established connection, every pending
+/// connect attempt's process (including the close a failed attempt ran
+/// itself) and every close still running from an earlier remove, reload or
+/// replace, plus each earlier close of those kinds that ended unsettled.
+#[derive(Debug)]
+pub struct McpRouterShutdownReport {
+    servers: Vec<McpServerCloseRecord>,
+}
+
+impl McpRouterShutdownReport {
+    /// Every close record, in no particular order. A server can have more
+    /// than one: an earlier close that ended unsettled, and its last one.
+    #[must_use]
+    pub fn servers(&self) -> &[McpServerCloseRecord] {
+        &self.servers
+    }
+
+    /// Whether every close settled ([`McpServerCloseOutcome::is_settled`]).
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        self.servers.iter().all(|close| close.outcome.is_settled())
+    }
+
+    /// A report of exactly these records, for a host's own tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_records(records: Vec<McpServerCloseRecord>) -> Self {
+        Self { servers: records }
+    }
+}
+
+/// The outcome of closing a pending connect attempt's process at shutdown:
+/// the receipt of the close this call ran, or of the one it joined (a failed
+/// attempt's own close included).
+async fn pending_close_outcome(server: &str, custody: &StdioChildCustody) -> McpServerCloseOutcome {
+    match custody.terminate_or_join().await {
+        Ok(receipt) => {
+            crate::connection::trace_close_receipt(server, &receipt);
+            McpServerCloseOutcome::Stdio(receipt)
+        }
+        Err(not_held) => crate::connection::not_held_outcome(not_held),
+    }
+}
+
 /// Router for MCP tool calls across multiple servers.
 ///
 /// All lifecycle state transitions flow through the active surface owner.
@@ -1417,7 +1469,16 @@ pub struct McpRouter {
     /// time it returns. Dropping the router without `shutdown` aborts them;
     /// the custody's drop fallback then kills each server without observing
     /// its exit.
-    closing: tokio::task::JoinSet<Result<(), (String, McpError)>>,
+    closing: tokio::task::JoinSet<McpServerCloseRecord>,
+    /// The server each running close task is closing, by task id, so a task
+    /// that ends without reporting is still attributed.
+    closing_servers: HashMap<tokio::task::Id, String>,
+    /// Closes reaped before shutdown that did not settle (and failed connect
+    /// attempts' own closes that did not), kept for the shutdown report.
+    unsettled_closes: Vec<McpServerCloseRecord>,
+    /// Every connect attempt's custodies, from the attempt's admission,
+    /// shared with the adapter outside the router lock.
+    close_index: crate::connection::CloseIndex,
     pending_snapshot_alignment: Option<SurfaceSnapshotAlignmentObligation>,
     /// Queued canonical lifecycle deltas for async completions.
     completed_updates: VecDeque<CompletedLifecycleUpdate>,
@@ -1811,6 +1872,9 @@ impl McpRouter {
             connect_tasks: tokio::task::JoinSet::new(),
             pending_child_custody: HashMap::new(),
             closing: tokio::task::JoinSet::new(),
+            closing_servers: HashMap::new(),
+            unsettled_closes: Vec::new(),
+            close_index: crate::connection::CloseIndex::default(),
             pending_snapshot_alignment: None,
             completed_updates: VecDeque::new(),
             awaiting_authorization: BTreeMap::new(),
@@ -2520,8 +2584,21 @@ impl McpRouter {
         self.pending_obligations
             .insert(server_name, obligation.clone());
 
-        let stdio_custody = matches!(config.transport, McpTransportConfig::Stdio(_)).then(|| {
-            let custody = StdioChildCustody::with_bounds(self.stdio_close_bounds);
+        // The attempt's custodies are created and indexed together, under
+        // the close index's admission freeze, before anything can spawn or
+        // connect: an attempt admitted after the index began its close gets
+        // them closed, and is refused before any effect.
+        let crate::connection::AdmittedAttempt {
+            process: stdio_custody,
+            client: client_custody,
+            stop,
+            end,
+        } = self.close_index.admit(
+            &obligation.surface_id,
+            matches!(config.transport, McpTransportConfig::Stdio(_))
+                .then_some(self.stdio_close_bounds),
+        );
+        if let Some(custody) = &stdio_custody {
             self.pending_child_custody.insert(
                 (
                     obligation.surface_id.clone(),
@@ -2529,8 +2606,7 @@ impl McpRouter {
                 ),
                 custody.clone(),
             );
-            custody
-        });
+        }
         let tx = self.pending_tx.clone();
         let progress = Arc::clone(&self.progress);
         let delivered = Arc::clone(&self.connect_results_delivered);
@@ -2543,17 +2619,27 @@ impl McpRouter {
         // Reap tasks that already finished so the owned set stays bounded.
         while self.connect_tasks.try_join_next().is_some() {}
         self.connect_tasks.spawn(async move {
-            let result = McpConnection::connect_and_enumerate_with_custody_and_egress(
-                &config,
-                auth_mode,
-                auth_resolver,
-                client_factory,
-                stdio_custody,
-                &stdio_profile,
-                &http_egress,
-                control,
-            )
-            .await;
+            let result = {
+                // Marks the attempt's end once the connect below is done or
+                // dropped.
+                let _end = end;
+                tokio::select! {
+                    biased;
+                    // The index began its close: the attempt stops here.
+                    () = stop.requested() => Err(McpError::RouterShutDown),
+                    result = McpConnection::connect_and_enumerate_with_custody_and_egress(
+                        &config,
+                        auth_mode,
+                        auth_resolver,
+                        client_factory,
+                        stdio_custody,
+                        client_custody,
+                        &stdio_profile,
+                        &http_egress,
+                        control,
+                    ) => result,
+                }
+            };
             let sent = tx
                 .send(PendingResult {
                     obligation,
@@ -2623,7 +2709,8 @@ impl McpRouter {
             .remove(&(server_name.clone(), obligation.pending_task_sequence));
         // The result (a connection, or an error after the process exited) now
         // carries the process; the attempt's custody entry is done.
-        self.pending_child_custody
+        let attempt_custody = self
+            .pending_child_custody
             .remove(&(server_name.clone(), obligation.pending_task_sequence));
         match result {
             Ok((conn, tools)) => {
@@ -2738,6 +2825,23 @@ impl McpRouter {
                 }
             }
             Err(err) => {
+                // The failed attempt closed its own process, and what that
+                // close observed is still the router's to report when
+                // unsettled. An attempt its close index stopped left that
+                // close to the index: one still running is joined like any
+                // close the router started.
+                if let Some(custody) = attempt_custody {
+                    match custody.closed_receipt() {
+                        Some(receipt) => self.retain_if_unsettled(McpServerCloseRecord {
+                            server: server_name.clone(),
+                            outcome: McpServerCloseOutcome::Stdio(receipt),
+                        }),
+                        None if custody.close_pending() => {
+                            self.spawn_custody_close(server_name.clone(), custody);
+                        }
+                        None => {}
+                    }
+                }
                 // K14: a rejected mirror apply is a typed fault folded into
                 // the Failed action's detail below (the canonical lifecycle
                 // channel), never debug-swallowed.
@@ -3290,19 +3394,36 @@ impl McpRouter {
             }
         };
 
-        let stdio_custody = matches!(config.transport, McpTransportConfig::Stdio(_))
-            .then(|| StdioChildCustody::with_bounds(self.stdio_close_bounds));
-        let result = McpConnection::connect_and_enumerate_with_custody_and_egress(
-            &config,
-            self.mcp_auth_mode,
-            self.mcp_auth_resolver.clone(),
-            self.client_service_factory.clone(),
-            stdio_custody,
-            &self.stdio_launch_profile,
-            &self.http_egress_profile,
-            None,
-        )
-        .await;
+        // Created and indexed under the close index's admission freeze, as in
+        // `spawn_pending`.
+        let crate::connection::AdmittedAttempt {
+            process: stdio_custody,
+            client: client_custody,
+            stop,
+            end,
+        } = self.close_index.admit(
+            &server_name,
+            matches!(config.transport, McpTransportConfig::Stdio(_))
+                .then_some(self.stdio_close_bounds),
+        );
+        let result = {
+            let _end = end;
+            tokio::select! {
+                biased;
+                () = stop.requested() => Err(McpError::RouterShutDown),
+                result = McpConnection::connect_and_enumerate_with_custody_and_egress(
+                    &config,
+                    self.mcp_auth_mode,
+                    self.mcp_auth_resolver.clone(),
+                    self.client_service_factory.clone(),
+                    stdio_custody,
+                    client_custody,
+                    &self.stdio_launch_profile,
+                    &self.http_egress_profile,
+                    None,
+                ) => result,
+            }
+        };
         let confinement_error = result.as_ref().err().and_then(|error| match error {
             McpError::Confinement(refusal) => Some(*refusal),
             _ => None,
@@ -3476,29 +3597,84 @@ impl McpRouter {
             return;
         };
         self.reap_closing();
-        self.closing
-            .spawn(async move { conn.close().await.map_err(|error| (server_name, error)) });
+        self.spawn_close_task(server_name, conn);
     }
 
-    /// Reap finished closes so the set stays bounded in a long-lived router.
+    /// Close (or join the close of) a connect attempt's process through its
+    /// custody, in a router-owned task that `shutdown` joins.
+    fn spawn_custody_close(&mut self, server: String, custody: StdioChildCustody) {
+        let name = server.clone();
+        let task = self.closing.spawn(async move {
+            let outcome = pending_close_outcome(&server, &custody).await;
+            McpServerCloseRecord { server, outcome }
+        });
+        self.closing_servers.insert(task.id(), name);
+    }
+
+    /// [`Self::spawn_close`] without reaping finished closes first.
+    fn spawn_close_task(&mut self, server_name: String, conn: McpConnection) {
+        let server = server_name.clone();
+        let task = self.closing.spawn(async move {
+            let outcome = conn.close_with_outcome().await;
+            McpServerCloseRecord { server, outcome }
+        });
+        self.closing_servers.insert(task.id(), server_name);
+    }
+
+    /// Reap finished closes so the set stays bounded in a long-lived router,
+    /// keeping each one that did not settle for the shutdown report.
     fn reap_closing(&mut self) {
-        while let Some(joined) = self.closing.try_join_next() {
-            Self::report_close(joined);
+        while let Some(joined) = self.closing.try_join_next_with_id() {
+            let record = self.closed_record(joined);
+            Self::report_close(&record);
+            self.retain_if_unsettled(record);
         }
     }
 
-    fn report_close(joined: Result<Result<(), (String, McpError)>, tokio::task::JoinError>) {
+    /// The record of one joined close task; a task that ended without
+    /// reporting is recorded against the server it was closing.
+    fn closed_record(
+        &mut self,
+        joined: Result<(tokio::task::Id, McpServerCloseRecord), tokio::task::JoinError>,
+    ) -> McpServerCloseRecord {
         match joined {
-            Ok(Ok(())) => {}
-            Ok(Err((server, error))) => {
+            Ok((id, record)) => {
+                self.closing_servers.remove(&id);
+                record
+            }
+            Err(error) => McpServerCloseRecord {
+                server: self.closing_servers.remove(&error.id()).unwrap_or_default(),
+                outcome: McpServerCloseOutcome::TaskFailed {
+                    panicked: error.is_panic(),
+                },
+            },
+        }
+    }
+
+    fn retain_if_unsettled(&mut self, record: McpServerCloseRecord) {
+        if !record.outcome.is_settled() {
+            self.unsettled_closes.push(record);
+        }
+    }
+
+    /// Trace a close's failure; receipts and closes owned elsewhere were
+    /// traced by the close itself.
+    fn report_close(record: &McpServerCloseRecord) {
+        let server = &record.server;
+        match &record.outcome {
+            McpServerCloseOutcome::CloseFailed(error) => {
                 tracing::warn!(server = %server, error = %error, "MCP connection close failed");
             }
-            Err(error) if error.is_panic() => {
-                tracing::error!(error = %error, "MCP connection close task panicked");
+            McpServerCloseOutcome::TaskFailed { panicked: true } => {
+                tracing::error!(server = %server, "MCP connection close task panicked");
             }
-            Err(error) => {
-                tracing::warn!(error = %error, "MCP connection close task was cancelled");
+            McpServerCloseOutcome::TaskFailed { panicked: false } => {
+                tracing::warn!(server = %server, "MCP connection close task was cancelled");
             }
+            McpServerCloseOutcome::Stdio(_)
+            | McpServerCloseOutcome::NoProcess
+            | McpServerCloseOutcome::NeverSpawned
+            | McpServerCloseOutcome::NotHeld(_) => {}
         }
     }
 
@@ -4257,8 +4433,29 @@ impl McpRouter {
         result
     }
 
+    /// This router's close index, for its adapter.
+    pub(crate) fn close_index(&self) -> crate::connection::CloseIndex {
+        self.close_index.clone()
+    }
+
     /// Gracefully shutdown all connections.
-    pub async fn shutdown(mut self) {
+    ///
+    /// [`Self::shutdown_with_report`], discarding the report.
+    pub async fn shutdown(self) {
+        let _ = self.shutdown_with_report().await;
+    }
+
+    /// Gracefully shut down all connections, and report what every close the
+    /// router owned observed ([`McpRouterShutdownReport`]).
+    ///
+    /// Returns once every one of those closes has ended; none is aborted. A
+    /// stdio server's close ends within
+    /// [`crate::McpStdioCloseBounds::close_bound`] of the bounds its
+    /// connection captured, counted from when that close started.
+    pub async fn shutdown_with_report(mut self) -> McpRouterShutdownReport {
+        // Start every close now, through the close index: attempts stop, and
+        // the closes below join these.
+        drop(self.close_index.begin_close());
         // First consume any finished pending tasks through normal processing so
         // stale completion payloads close their transports via existing paths.
         self.drain_pending();
@@ -4289,32 +4486,8 @@ impl McpRouter {
                 tracing::warn!("MCP connect task panicked before shutdown: {error}");
             }
         }
-        // Every close below runs as a router-owned task joined at the end, so
-        // servers use their close grace concurrently rather than in turn.
-        self.reap_closing();
-        for ((server, _), custody) in std::mem::take(&mut self.pending_child_custody) {
-            self.closing.spawn(async move {
-                match custody.terminate_or_join().await {
-                    Ok(Some(receipt)) => {
-                        crate::connection::trace_close_receipt(&server, &receipt);
-                        Ok(())
-                    }
-                    // Never spawned, or the attempt that started the close
-                    // took (and traced) its receipt.
-                    Ok(None) | Err(CustodyNotHeld::NeverSpawned) => Ok(()),
-                    Err(not_held) => Err((
-                        server,
-                        McpError::ConnectionFailed {
-                            reason: format!(
-                                "stdio server close did not finish ({not_held:?}); its process \
-                                 group was killed without its exit being observed"
-                            ),
-                        },
-                    )),
-                }
-            });
-        }
-        // Drain any completion payloads that arrived after pending_tx drop.
+        // Every connect task has ended, so the channel now holds every result
+        // delivered after the drain above.
         let drained_results: Vec<PendingResult> = {
             let mut rx = match self.pending_rx.lock() {
                 Ok(guard) => guard,
@@ -4331,19 +4504,42 @@ impl McpRouter {
             }
             drained
         };
+        // Reap closes that already ended, keeping each unsettled one; every
+        // close below then runs as a router-owned task joined at the end, so
+        // servers use their close grace concurrently rather than in turn.
+        self.reap_closing();
+        let mut delivered = Vec::new();
         for pending in drained_results {
             if let Ok((conn, _)) = pending.result {
-                self.spawn_close(pending.obligation.surface_id, Some(conn));
+                // The delivered connection carries the attempt's custody, so
+                // its close is that process's one close.
+                self.pending_child_custody.remove(&(
+                    pending.obligation.surface_id.clone(),
+                    pending.obligation.pending_task_sequence,
+                ));
+                delivered.push((pending.obligation.surface_id, conn));
             }
+        }
+        for ((server, _), custody) in std::mem::take(&mut self.pending_child_custody) {
+            self.spawn_custody_close(server, custody);
+        }
+        for (server, conn) in delivered {
+            self.spawn_close_task(server, conn);
         }
         let servers = std::mem::take(&mut self.servers);
         for (_, entry) in servers {
-            self.spawn_close(entry.config.name, entry.connection);
+            if let Some(conn) = entry.connection {
+                self.spawn_close_task(entry.config.name, conn);
+            }
         }
-        while let Some(joined) = self.closing.join_next().await {
-            Self::report_close(joined);
+        let mut closes = std::mem::take(&mut self.unsettled_closes);
+        while let Some(joined) = self.closing.join_next_with_id().await {
+            let record = self.closed_record(joined);
+            Self::report_close(&record);
+            closes.push(record);
         }
         let _ = self.publish_projection_snapshot();
+        McpRouterShutdownReport { servers: closes }
     }
 
     /// Test hook: set a server's in-flight call count, through the surface
@@ -7530,6 +7726,10 @@ pub(crate) mod tests {
 #[cfg(test)]
 #[path = "call_context_tests.rs"]
 mod call_context_tests;
+
+#[cfg(test)]
+#[path = "shutdown_report_tests.rs"]
+mod shutdown_report_tests;
 
 #[cfg(test)]
 #[path = "apps_tests.rs"]

@@ -38,7 +38,9 @@ pub struct McpConnection {
     config: McpServerConfig,
     connection_id: crate::McpConnectionId,
     protected_metadata: ProtectedMetadataState,
-    service: ConnectedClient,
+    /// The client service, through its peer; its custody owns the running
+    /// service and closes it.
+    service: HeldClient,
     /// The stdio server's process, owned until `close` observes its exit.
     stdio_child: Option<StdioChildCustody>,
     /// Set once a Streamable HTTP server drops this connection's session.
@@ -63,6 +65,11 @@ pub struct McpConnection {
 /// the pipe, or a leader that cannot die, which would otherwise wedge
 /// shutdown.
 const STDIO_KILL_BACKSTOP: Duration = Duration::from_secs(10);
+
+/// How long a close waits for a remote (process-free) connection's client to
+/// end: the default stdio close bound, so a remote close is bounded like a
+/// stdio one. Past it the close fails with [`McpError::CloseTimedOut`].
+const REMOTE_CLOSE_BOUND: Duration = McpStdioCloseBounds::DEFAULT.close_bound();
 
 /// How often a stdio server's process is checked for exit (without reaping
 /// it) while its close waits.
@@ -153,6 +160,16 @@ impl McpStdioCloseBounds {
 
     pub fn term_grace(&self) -> Duration {
         self.term_grace
+    }
+
+    /// The longest one close under these bounds runs, from its start to its
+    /// end: the EOF grace, the TERM grace and the fixed backstop after the
+    /// kill. A host that waits for a close derives its deadline from this
+    /// bound instead of restating Core's phases.
+    pub const fn close_bound(&self) -> Duration {
+        self.eof_grace
+            .saturating_add(self.term_grace)
+            .saturating_add(STDIO_KILL_BACKSTOP)
     }
 }
 
@@ -308,22 +325,23 @@ enum CustodySlot {
     #[default]
     Vacant,
     Held(StdioChild),
-    /// A close task, started by a `terminate`, owns the process; `awaited`
-    /// while that `terminate` still waits for it.
+    /// A close task, started by a `terminate`, owns the process; its phase
+    /// deadlines count from `started`.
     Closing {
-        awaited: bool,
+        started: tokio::time::Instant,
     },
-    /// That close task finished. Its receipt stays here until a waiter takes
-    /// it: the `terminate` that started the close while `awaited`, otherwise
-    /// a [`StdioChildCustody::terminate_or_join`].
-    Closed {
-        receipt: Option<McpStdioCloseReceipt>,
-        awaited: bool,
-    },
+    /// That close task finished. Its receipt stays here, shared, for every
+    /// caller that asks: the `terminate` that started the close and every
+    /// join ([`StdioChildCustody::terminate_or_join`]), so a join never
+    /// loses it.
+    Closed(Arc<McpStdioCloseReceipt>),
     /// That close task was dropped before finishing (its runtime shut down);
     /// the process group was killed by the drop, without its exit being
     /// observed.
     Abandoned,
+    /// Closed before anything was spawned: a later spawn refuses, so no
+    /// process starts after the close.
+    Retired,
 }
 
 /// Why a [`StdioChildCustody::terminate`] call did not close anything.
@@ -385,12 +403,7 @@ struct ClosingOwner {
 impl ClosingOwner {
     fn finish(mut self, receipt: McpStdioCloseReceipt) {
         self.finished = true;
-        let mut slot = lock_slot(&self.slot);
-        let awaited = matches!(*slot, CustodySlot::Closing { awaited: true });
-        *slot = CustodySlot::Closed {
-            receipt: Some(receipt),
-            awaited,
-        };
+        *lock_slot(&self.slot) = CustodySlot::Closed(Arc::new(receipt));
     }
 }
 
@@ -398,26 +411,6 @@ impl Drop for ClosingOwner {
     fn drop(&mut self) {
         if !self.finished {
             *lock_slot(&self.slot) = CustodySlot::Abandoned;
-        }
-        self.close_progress
-            .send_modify(|seen| *seen = seen.wrapping_add(1));
-    }
-}
-
-/// The `terminate` waiting for the close it started. Dropped, taken receipt
-/// or not, it leaves an untaken receipt to a
-/// [`StdioChildCustody::terminate_or_join`].
-struct CloseWaiter {
-    slot: Arc<std::sync::Mutex<CustodySlot>>,
-    close_progress: Arc<tokio::sync::watch::Sender<u64>>,
-}
-
-impl Drop for CloseWaiter {
-    fn drop(&mut self) {
-        if let CustodySlot::Closing { awaited } | CustodySlot::Closed { awaited, .. } =
-            &mut *lock_slot(&self.slot)
-        {
-            *awaited = false;
         }
         self.close_progress
             .send_modify(|seen| *seen = seen.wrapping_add(1));
@@ -489,6 +482,10 @@ impl StdioChildCustody {
         // Acquire custody before spawning; nothing in this spawn awaits, so
         // nothing separates creating the child from installing its owner.
         let mut slot = lock_slot(&self.slot);
+        // A custody closed before any spawn refuses one.
+        if matches!(*slot, CustodySlot::Retired) {
+            return Err(McpError::RouterShutDown);
+        }
         // Binding validates the exact launch and retained backend before any
         // process exists. Required isolation has no Command fallback.
         let prepared = profile.prepare(stdio)?;
@@ -581,7 +578,7 @@ impl StdioChildCustody {
     }
 
     /// [`Self::terminate_from`] starting the close clock now.
-    pub(crate) async fn terminate(&self) -> Result<McpStdioCloseReceipt, CustodyNotHeld> {
+    pub(crate) async fn terminate(&self) -> Result<Arc<McpStdioCloseReceipt>, CustodyNotHeld> {
         self.terminate_from(tokio::time::Instant::now()).await
     }
 
@@ -589,7 +586,7 @@ impl StdioChildCustody {
     pub(crate) async fn terminate_from(
         &self,
         started: tokio::time::Instant,
-    ) -> Result<McpStdioCloseReceipt, CustodyNotHeld> {
+    ) -> Result<Arc<McpStdioCloseReceipt>, CustodyNotHeld> {
         self.terminate_after(started, std::future::ready(()))
             .await
             .1
@@ -631,20 +628,62 @@ impl StdioChildCustody {
         &self,
         started: tokio::time::Instant,
         first: impl std::future::Future<Output = T> + Send + 'static,
-    ) -> (Option<T>, Result<McpStdioCloseReceipt, CustodyNotHeld>) {
+    ) -> (Option<T>, Result<Arc<McpStdioCloseReceipt>, CustodyNotHeld>) {
         let mut progress = self.close_progress.subscribe();
+        let mut first_output = match self.start_close(started, first) {
+            Ok(first_output) => first_output,
+            Err((first, not_held)) => return (Some(first.await), Err(not_held)),
+        };
+        loop {
+            let finished = match &*lock_slot(&self.slot) {
+                // Shared, not taken: every join reads the same receipt.
+                CustodySlot::Closed(receipt) => Some(Ok(Arc::clone(receipt))),
+                CustodySlot::Abandoned => Some(Err(CustodyNotHeld::AbandonedElsewhere)),
+                CustodySlot::Vacant
+                | CustodySlot::Retired
+                | CustodySlot::Held(_)
+                | CustodySlot::Closing { .. } => None,
+            };
+            if let Some(finished) = finished {
+                return (first_output.try_recv().ok(), finished);
+            }
+            // The custody holds the sender, so this never fails while waiting.
+            let _ = progress.changed().await;
+        }
+    }
+
+    /// Start this custody's close now, from synchronous code: take the held
+    /// process and start its close task, which runs `first` before observing
+    /// anything ([`Self::terminate_after`]). A custody never spawned is
+    /// retired, so a later spawn refuses. Returns `first`'s output channel,
+    /// or `first` back with why there was nothing to start.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn start_close<T, F>(
+        &self,
+        started: tokio::time::Instant,
+        first: F,
+    ) -> Result<tokio::sync::oneshot::Receiver<T>, (F, CustodyNotHeld)>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = T> + Send + 'static,
+    {
         let held = {
             let mut slot = lock_slot(&self.slot);
-            match std::mem::replace(&mut *slot, CustodySlot::Closing { awaited: true }) {
+            match std::mem::replace(&mut *slot, CustodySlot::Closing { started }) {
                 CustodySlot::Held(held) => Ok(held),
+                // Closed before any spawn: no process may start after it.
+                CustodySlot::Vacant | CustodySlot::Retired => {
+                    *slot = CustodySlot::Retired;
+                    Err(CustodyNotHeld::NeverSpawned)
+                }
                 other => {
                     let not_held = match &other {
-                        CustodySlot::Vacant => CustodyNotHeld::NeverSpawned,
                         CustodySlot::Closing { .. } => CustodyNotHeld::ClosingElsewhere,
-                        CustodySlot::Closed { .. } => CustodyNotHeld::ClosedElsewhere,
-                        CustodySlot::Abandoned | CustodySlot::Held(_) => {
-                            CustodyNotHeld::AbandonedElsewhere
-                        }
+                        CustodySlot::Closed(_) => CustodyNotHeld::ClosedElsewhere,
+                        CustodySlot::Abandoned
+                        | CustodySlot::Held(_)
+                        | CustodySlot::Vacant
+                        | CustodySlot::Retired => CustodyNotHeld::AbandonedElsewhere,
                     };
                     *slot = other;
                     Err(not_held)
@@ -653,11 +692,7 @@ impl StdioChildCustody {
         };
         let held = match held {
             Ok(held) => held,
-            Err(not_held) => return (Some(first.await), Err(not_held)),
-        };
-        let waiter = CloseWaiter {
-            slot: Arc::clone(&self.slot),
-            close_progress: Arc::clone(&self.close_progress),
+            Err(not_held) => return Err((first, not_held)),
         };
         let owner = ClosingOwner {
             slot: Arc::clone(&self.slot),
@@ -665,7 +700,7 @@ impl StdioChildCustody {
             finished: false,
         };
         let bounds = self.bounds;
-        let (first_done, mut first_output) = tokio::sync::oneshot::channel();
+        let (first_done, first_output) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let mut held = held;
             let _ = first_done.send(first.await);
@@ -673,48 +708,95 @@ impl StdioChildCustody {
             drop(held);
             owner.finish(receipt);
         });
-        loop {
-            let taken = match &mut *lock_slot(&self.slot) {
-                // Taken here, under the lock: only now is it consumed.
-                CustodySlot::Closed { receipt, .. } => {
-                    Some(receipt.take().ok_or(CustodyNotHeld::ClosedElsewhere))
-                }
-                CustodySlot::Abandoned => Some(Err(CustodyNotHeld::AbandonedElsewhere)),
-                CustodySlot::Vacant | CustodySlot::Held(_) | CustodySlot::Closing { .. } => None,
-            };
-            if let Some(taken) = taken {
-                drop(waiter);
-                return (first_output.try_recv().ok(), taken);
-            }
-            // The custody holds the sender, so this never fails while waiting.
-            let _ = progress.changed().await;
+        Ok(first_output)
+    }
+
+    /// Whether nothing of this custody is left to report: its close finished
+    /// and settled, or it was retired before any spawn.
+    fn finished_settled(&self) -> bool {
+        match &*lock_slot(&self.slot) {
+            CustodySlot::Closed(receipt) => receipt_settled(receipt),
+            CustodySlot::Retired => true,
+            CustodySlot::Vacant
+            | CustodySlot::Held(_)
+            | CustodySlot::Closing { .. }
+            | CustodySlot::Abandoned => false,
+        }
+    }
+
+    /// When the close running now will have ended: its start plus its
+    /// [`McpStdioCloseBounds::close_bound`]. `None` when no close runs.
+    fn close_deadline(&self) -> Option<tokio::time::Instant> {
+        match &*lock_slot(&self.slot) {
+            CustodySlot::Closing { started } => Some(*started + self.bounds.close_bound()),
+            CustodySlot::Vacant
+            | CustodySlot::Held(_)
+            | CustodySlot::Closed(_)
+            | CustodySlot::Abandoned
+            | CustodySlot::Retired => None,
+        }
+    }
+
+    /// Whether a process is held whose close has not finished: held, or
+    /// closing.
+    pub(crate) fn close_pending(&self) -> bool {
+        matches!(
+            *lock_slot(&self.slot),
+            CustodySlot::Held(_) | CustodySlot::Closing { .. }
+        )
+    }
+
+    /// Retire a custody whose process was never spawned, so none ever is.
+    fn retire_if_vacant(&self) {
+        let mut slot = lock_slot(&self.slot);
+        if matches!(*slot, CustodySlot::Vacant) {
+            *slot = CustodySlot::Retired;
         }
     }
 
     /// [`Self::terminate`], or, when another call already started the close,
-    /// wait for that close to finish. Returns the receipt when this call
-    /// started the close, or when no other call is waiting to take it, and
-    /// `None` when the call that started the close took it.
+    /// wait for that close to finish ([`Self::join_close`]). Either way it
+    /// returns that close's one receipt, shared with every other caller.
     pub(crate) async fn terminate_or_join(
         &self,
-    ) -> Result<Option<McpStdioCloseReceipt>, CustodyNotHeld> {
-        let mut progress = self.close_progress.subscribe();
+    ) -> Result<Arc<McpStdioCloseReceipt>, CustodyNotHeld> {
         match self.terminate().await {
-            Ok(receipt) => return Ok(Some(receipt)),
-            Err(CustodyNotHeld::ClosingElsewhere | CustodyNotHeld::ClosedElsewhere) => {}
-            Err(not_held) => return Err(not_held),
+            Err(CustodyNotHeld::ClosingElsewhere | CustodyNotHeld::ClosedElsewhere) => {
+                self.join_close().await
+            }
+            terminated => terminated,
         }
+    }
+
+    /// Wait for the close another call started to finish, and return its
+    /// receipt.
+    pub(crate) async fn join_close(&self) -> Result<Arc<McpStdioCloseReceipt>, CustodyNotHeld> {
+        let mut progress = self.close_progress.subscribe();
         loop {
-            match &mut *lock_slot(&self.slot) {
-                CustodySlot::Closed {
-                    receipt,
-                    awaited: false,
-                } => return Ok(receipt.take()),
+            match &*lock_slot(&self.slot) {
+                CustodySlot::Closed(receipt) => return Ok(Arc::clone(receipt)),
                 CustodySlot::Abandoned => return Err(CustodyNotHeld::AbandonedElsewhere),
-                CustodySlot::Vacant | CustodySlot::Held(_) => return Ok(None),
-                CustodySlot::Closing { .. } | CustodySlot::Closed { awaited: true, .. } => {}
+                CustodySlot::Vacant | CustodySlot::Retired => {
+                    return Err(CustodyNotHeld::NeverSpawned);
+                }
+                // A custody's one process is closed at most once, so a held
+                // process means no close of it was started.
+                CustodySlot::Held(_) => return Err(CustodyNotHeld::ClosedElsewhere),
+                CustodySlot::Closing { .. } => {}
             }
             let _ = progress.changed().await;
+        }
+    }
+
+    /// The receipt of this custody's finished close, if it has one.
+    pub(crate) fn closed_receipt(&self) -> Option<Arc<McpStdioCloseReceipt>> {
+        match &*lock_slot(&self.slot) {
+            CustodySlot::Closed(receipt) => Some(Arc::clone(receipt)),
+            CustodySlot::Vacant
+            | CustodySlot::Retired
+            | CustodySlot::Held(_)
+            | CustodySlot::Closing { .. }
+            | CustodySlot::Abandoned => None,
         }
     }
 
@@ -736,7 +818,7 @@ impl StdioChildCustody {
         let mut progress = self.close_progress.subscribe();
         while !matches!(
             *lock_slot(&self.slot),
-            CustodySlot::Closed { .. } | CustodySlot::Abandoned
+            CustodySlot::Closed(_) | CustodySlot::Abandoned
         ) {
             let _ = progress.changed().await;
         }
@@ -1479,6 +1561,7 @@ impl McpConnection {
             auth_resolver,
             client_factory,
             None,
+            ClientCustody::default(),
             stdio_profile,
             http_egress,
             PhysicalEntry::default(),
@@ -1489,7 +1572,11 @@ impl McpConnection {
 
     /// [`Self::connect_with_services`] with the custody a stdio server's
     /// process is deposited into before the handshake (a fresh one when
-    /// `None`). On failure the process is terminated before returning.
+    /// `None`), and the custody its connected client is deposited into. On
+    /// failure the process is terminated before returning. An attempt whose
+    /// client custody was closed before it began is refused before any
+    /// effect; a client it connects after that close is closed at once and
+    /// refused.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn connect_with_custody(
         config: &McpServerConfig,
@@ -1497,6 +1584,7 @@ impl McpConnection {
         auth_resolver: Option<Arc<dyn McpAuthResolver>>,
         client_factory: Option<Arc<dyn McpClientServiceFactory>>,
         stdio_custody: Option<StdioChildCustody>,
+        client_custody: ClientCustody,
         profile: &McpStdioLaunchProfile,
         http_egress: &HttpEgressProfile,
         mut entry: PhysicalEntry,
@@ -1506,6 +1594,8 @@ impl McpConnection {
         // any process or transport effect.
         config.validate_access()?;
         config.validate_secret_env()?;
+        // So is an attempt its router's close index refused.
+        client_custody.admit()?;
         if let McpTransportConfig::Http(http) = &config.transport {
             let target = McpServerIdentity::from_config(config)
                 .map_err(mcp_auth_error_to_connection_failed)?;
@@ -1554,8 +1644,21 @@ impl McpConnection {
                     .await
                 {
                     Ok(service) => {
-                        stdio_child = Some(custody);
-                        service
+                        match client_custody.deposit(service, custody.bounds.eof_grace()) {
+                            Ok(service) => {
+                                stdio_child = Some(custody);
+                                service
+                            }
+                            // Its close index closed it while it connected: the
+                            // client was closed at once, and the process close
+                            // is that index's.
+                            Err(refused) => {
+                                if let Ok(receipt) = custody.terminate().await {
+                                    trace_close_receipt(&config.name, &receipt);
+                                }
+                                return Err(refused);
+                            }
+                        }
                     }
                     Err(e) => {
                         if let Ok(receipt) = custody.terminate().await {
@@ -1580,6 +1683,7 @@ impl McpConnection {
                             auth_resolver,
                             client_factory,
                             client,
+                            &client_custody,
                             entry,
                             http_egress,
                             attempt,
@@ -1606,9 +1710,10 @@ impl McpConnection {
                         )
                         .await
                         .map_err(|e| failed(format!("Failed to establish SSE connection: {e}")))?;
-                        client.serve(transport).await.map_err(|e| {
+                        let service = client.serve(transport).await.map_err(|e| {
                             failed(format!("Failed to establish MCP connection: {e}"))
-                        })?
+                        })?;
+                        client_custody.deposit(service, REMOTE_CLOSE_BOUND)?
                     }
                 }
             }
@@ -1637,6 +1742,7 @@ impl McpConnection {
         auth_resolver: Option<Arc<dyn McpAuthResolver>>,
         client_factory: Option<Arc<dyn McpClientServiceFactory>>,
         client: ClientServiceSelection,
+        client_custody: &ClientCustody,
         entry: PhysicalEntry,
         http_egress: &HttpEgressProfile,
         attempt: Option<&crate::McpConnectAttempt>,
@@ -1655,6 +1761,7 @@ impl McpConnection {
                 None,
                 None,
                 client,
+                client_custody,
                 first_request,
                 http_egress,
                 attempt,
@@ -1738,6 +1845,7 @@ impl McpConnection {
                 bearer,
                 None,
                 client,
+                client_custody,
                 first_request,
                 http_egress,
                 attempt,
@@ -1752,6 +1860,7 @@ impl McpConnection {
             bearer.clone(),
             Some(crate::transport::streamable_http::AuthChallengeRecorder::default()),
             client,
+            client_custody,
             first_request.clone(),
             http_egress,
             attempt,
@@ -1802,6 +1911,7 @@ impl McpConnection {
                     bearer,
                     None,
                     retry_client,
+                    client_custody,
                     first_request,
                     http_egress,
                     attempt,
@@ -1821,6 +1931,7 @@ impl McpConnection {
         bearer: Option<OAuthBearer>,
         recorder: Option<crate::transport::streamable_http::AuthChallengeRecorder>,
         client: ClientServiceSelection,
+        client_custody: &ClientCustody,
         first_request: crate::transport::streamable_http::FirstRequestEntry,
         http_egress: &HttpEgressProfile,
         attempt: Option<&crate::McpConnectAttempt>,
@@ -1831,6 +1942,7 @@ impl McpConnection {
                 auth: Default::default(),
                 refused: None,
                 egress: None,
+                shut_down: false,
             })?;
         let protected_metadata = ProtectedMetadataState::default();
         let session_expiry = SessionExpiryRecorder::default();
@@ -1864,6 +1976,16 @@ impl McpConnection {
                 auth: recorder.take(),
                 refused: first_request.refusal(),
                 egress: egress.recorded(),
+                shut_down: false,
+            })?;
+        let service = client_custody
+            .deposit(service, REMOTE_CLOSE_BOUND)
+            .map_err(|_| StreamableConnectError {
+                reason: McpError::RouterShutDown.to_string(),
+                auth: Default::default(),
+                refused: None,
+                egress: None,
+                shut_down: true,
             })?;
         Ok(Self {
             config: config.clone(),
@@ -1983,6 +2105,7 @@ impl McpConnection {
             auth_resolver,
             client_factory,
             stdio_custody,
+            ClientCustody::default(),
             stdio_profile,
             http_egress,
             None,
@@ -2008,6 +2131,7 @@ impl McpConnection {
             auth_resolver,
             client_factory,
             stdio_custody,
+            ClientCustody::default(),
             profile,
             &HttpEgressProfile::trusted_host(),
             control,
@@ -2017,9 +2141,9 @@ impl McpConnection {
 
     /// [`Self::connect_and_enumerate_with_services`] with a caller-held custody
     /// for a stdio server's process, so the caller can also terminate it while
-    /// the attempt is still in flight, under the host's HTTP egress profile.
-    /// On failure or timeout the process's close has finished when this
-    /// returns, unless another caller owns it.
+    /// the attempt is still in flight, and for its client, under the host's
+    /// HTTP egress profile. On failure or timeout the process's close has
+    /// finished when this returns, unless another caller owns it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn connect_and_enumerate_with_custody_and_egress(
         config: &McpServerConfig,
@@ -2027,6 +2151,7 @@ impl McpConnection {
         auth_resolver: Option<Arc<dyn McpAuthResolver>>,
         client_factory: Option<Arc<dyn McpClientServiceFactory>>,
         stdio_custody: Option<StdioChildCustody>,
+        client_custody: ClientCustody,
         profile: &McpStdioLaunchProfile,
         http_egress: &HttpEgressProfile,
         control: Option<Arc<dyn McpAttachmentAuthority>>,
@@ -2037,6 +2162,7 @@ impl McpConnection {
             auth_resolver,
             client_factory,
             stdio_custody,
+            client_custody,
             profile,
             http_egress,
             control,
@@ -2087,6 +2213,7 @@ impl McpConnection {
             auth_resolver,
             client_factory,
             None,
+            ClientCustody::default(),
             &McpStdioLaunchProfile::trusted_host(),
             http_egress,
             None,
@@ -2140,7 +2267,9 @@ impl McpConnection {
         // The close's own outcome is observed through its end, which the
         // attempt's lease on it records.
         attempt.spawn_retained(async move {
-            let _ = service.cancel().await;
+            let _ = service
+                .close_until(tokio::time::Instant::now() + REMOTE_CLOSE_BOUND)
+                .await;
         });
         let graceful = attempt.settle_until(started + bound / 2).await;
         if graceful.local == crate::McpLocalTermination::Joined {
@@ -2157,6 +2286,7 @@ impl McpConnection {
         auth_resolver: Option<Arc<dyn McpAuthResolver>>,
         client_factory: Option<Arc<dyn McpClientServiceFactory>>,
         stdio_custody: Option<StdioChildCustody>,
+        client_custody: ClientCustody,
         profile: &McpStdioLaunchProfile,
         http_egress: &HttpEgressProfile,
         control: Option<Arc<dyn McpAttachmentAuthority>>,
@@ -2178,6 +2308,7 @@ impl McpConnection {
                 auth_resolver,
                 client_factory,
                 stdio_custody.clone(),
+                client_custody,
                 profile,
                 http_egress,
                 PhysicalEntry::new(control),
@@ -2471,6 +2602,799 @@ impl McpConnection {
     pub async fn close_with_receipt(self) -> Result<Option<McpStdioCloseReceipt>, McpError> {
         close_connected(&self.config.name, self.service, self.stdio_child).await
     }
+
+    /// [`Self::close`], reporting what it observed as one typed outcome; it
+    /// never fails. A stdio server's receipt is kept whatever its leader
+    /// outcome (a failed reap included), and a close of the same process
+    /// that another call started is joined for its receipt. A remote
+    /// transport whose client closed is [`McpServerCloseOutcome::NoProcess`].
+    pub async fn close_with_outcome(self) -> McpServerCloseOutcome {
+        let server = self.config.name.clone();
+        let observed =
+            close_connected_observed(&server, self.service, self.stdio_child, true).await;
+        close_outcome(&server, observed)
+    }
+
+    /// [`Self::connect`] within `timeout`. A connect that fails or times out
+    /// after it spawned a stdio server's process closes that process through
+    /// its custody before returning, and reports the close.
+    pub async fn connect_within(
+        config: &McpServerConfig,
+        timeout: Duration,
+    ) -> Result<Self, McpConnectFailure> {
+        let custody = matches!(config.transport, McpTransportConfig::Stdio(_))
+            .then(StdioChildCustody::default);
+        let connected = tokio::time::timeout(
+            timeout,
+            Self::connect_with_custody(
+                config,
+                McpAuthMode::Stored,
+                None,
+                None,
+                custody.clone(),
+                ClientCustody::default(),
+                &McpStdioLaunchProfile::trusted_host(),
+                &HttpEgressProfile::trusted_host(),
+                PhysicalEntry::default(),
+                None,
+            ),
+        )
+        .await;
+        let (error, timed_out) = match connected {
+            Ok(Ok(connection)) => return Ok(connection),
+            Ok(Err(error)) => (error, false),
+            Err(_) => (
+                McpError::ConnectionFailed {
+                    reason: format!("Timed out connecting to '{}' ({timeout:?})", config.name),
+                },
+                true,
+            ),
+        };
+        let close = match custody {
+            None => None,
+            Some(custody) => match custody.terminate_or_join().await {
+                Ok(receipt) => {
+                    trace_close_receipt(&config.name, &receipt);
+                    Some(McpServerCloseOutcome::Stdio(receipt))
+                }
+                Err(CustodyNotHeld::NeverSpawned) => None,
+                Err(not_held) => Some(not_held_outcome(not_held)),
+            },
+        };
+        Err(McpConnectFailure {
+            error,
+            timed_out,
+            close,
+        })
+    }
+}
+
+/// A [`McpConnection::connect_within`] that did not connect.
+#[derive(Debug)]
+pub struct McpConnectFailure {
+    pub error: McpError,
+    /// The connect did not finish within its timeout.
+    pub timed_out: bool,
+    /// The close of the server process the attempt spawned, run through its
+    /// custody before returning; `None` when no process was spawned.
+    pub close: Option<McpServerCloseOutcome>,
+}
+
+/// What one close of an MCP server connection observed.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum McpServerCloseOutcome {
+    /// A stdio server's close: what it observed of the server's process and
+    /// stdout, whatever the leader outcome (a failed reap included). A failed
+    /// client cancel next to it is traced only; the receipt alone says what
+    /// the close observed of the process.
+    Stdio(Arc<McpStdioCloseReceipt>),
+    /// A connection with no server process (a remote transport) whose
+    /// client closed.
+    NoProcess,
+    /// A stdio server's process was never spawned: nothing to end.
+    NeverSpawned,
+    /// The server's process close was not this close's, and its receipt
+    /// could not be joined.
+    NotHeld(McpCustodyNotHeld),
+    /// The close failed with no process to observe: a client close failed
+    /// on a remote transport, or for a stdio server never spawned.
+    CloseFailed(Arc<McpError>),
+    /// The task running the close ended without reporting.
+    TaskFailed { panicked: bool },
+}
+
+impl McpServerCloseOutcome {
+    /// Whether this close settled its server, from the receipt's final facts
+    /// only (never its `settled_in`): a stdio server's leader was reaped and
+    /// every holder of its stdout closed it. A connection with no process,
+    /// or a server never spawned, settles trivially. Nothing is promised
+    /// about processes outside the server's stdout and its leader.
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        match self {
+            Self::Stdio(receipt) => receipt_settled(receipt),
+            Self::NoProcess | Self::NeverSpawned => true,
+            Self::NotHeld(_) | Self::CloseFailed(_) | Self::TaskFailed { .. } => false,
+        }
+    }
+}
+
+/// Why a close has no receipt of its server's process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum McpCustodyNotHeld {
+    /// Another close of the same process owned it and had not finished.
+    ClosingElsewhere,
+    /// Another close of the same process owned it and finished.
+    ClosedElsewhere,
+    /// The process's close task was dropped before it finished (its runtime
+    /// shut down): its group was killed without its exit being observed.
+    AbandonedElsewhere,
+}
+
+/// A stdio close settled: its leader was reaped and every holder of its
+/// stdout closed it.
+fn receipt_settled(receipt: &McpStdioCloseReceipt) -> bool {
+    matches!(receipt.leader, McpStdioLeaderOutcome::Reaped(_))
+        && matches!(receipt.witness, McpStdioWitnessOutcome::Closed(_))
+}
+
+/// Shared custody of one connection attempt's client service, for every
+/// transport. The connection reaches its server through the client's peer
+/// ([`HeldClient`]); a close takes the running service from here, so it can
+/// start without the connection (from its router's [`CloseIndex`]), and
+/// every other close of the same client joins that one for its result.
+#[derive(Clone, Default)]
+pub(crate) struct ClientCustody {
+    slot: Arc<std::sync::Mutex<ClientSlot>>,
+    /// Bumped whenever the slot changes, so its waiters recheck it.
+    progress: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+/// Where a client custody's client stands.
+#[derive(Default)]
+enum ClientSlot {
+    /// No client yet: its connect attempt has not finished its handshake.
+    #[default]
+    Vacant,
+    Held(ConnectedClient),
+    /// A close task owns the client and waits for its service until
+    /// `started` plus `bound`.
+    Closing {
+        started: tokio::time::Instant,
+        bound: Duration,
+    },
+    /// That close task finished; its result is shared with every join.
+    Closed(ClientClose),
+    /// That close task was dropped before finishing (its runtime shut down).
+    Abandoned,
+    /// Closed before it held a client: its attempt is refused or stopped, and
+    /// a client the attempt still connects is closed at once.
+    Retired,
+    /// Its connect attempt ended without a client: nothing to close.
+    Unconnected,
+}
+
+/// How one close of a client ended.
+#[derive(Debug, Clone)]
+pub(crate) enum ClientClose {
+    /// Its service ended.
+    Ended,
+    /// Waiting for its service failed: the service task panicked or was
+    /// cancelled.
+    WaitFailed(Arc<str>),
+    /// Its service had not ended within the close's bound; the wait was
+    /// dropped and the service left to end on its own.
+    TimedOut(Duration),
+}
+
+/// How a client custody ended, as its joins read it.
+#[derive(Debug, Clone)]
+pub(crate) enum ClientEnd {
+    Closed(ClientClose),
+    /// The close task was dropped before it finished.
+    Abandoned,
+    /// The connect attempt ended without a client: there was nothing to
+    /// close.
+    Unconnected,
+}
+
+/// Marks a client custody `Closed` when its close task finishes, and
+/// `Abandoned` when that task is dropped first; either way it then wakes the
+/// custody's waiters.
+struct ClientCloseOwner {
+    custody: ClientCustody,
+    finished: bool,
+}
+
+impl ClientCloseOwner {
+    fn finish(mut self, closed: ClientClose) {
+        self.finished = true;
+        *self.custody.slot() = ClientSlot::Closed(closed);
+    }
+}
+
+impl Drop for ClientCloseOwner {
+    fn drop(&mut self) {
+        if !self.finished {
+            *self.custody.slot() = ClientSlot::Abandoned;
+        }
+        self.custody.changed();
+    }
+}
+
+impl ClientCustody {
+    fn slot(&self) -> std::sync::MutexGuard<'_, ClientSlot> {
+        self.slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn changed(&self) {
+        self.progress
+            .send_modify(|seen| *seen = seen.wrapping_add(1));
+    }
+
+    /// Refuse an attempt whose custody was closed before it began: it has
+    /// no effect yet, and gets none.
+    fn admit(&self) -> Result<(), McpError> {
+        match &*self.slot() {
+            ClientSlot::Vacant => Ok(()),
+            ClientSlot::Held(_)
+            | ClientSlot::Closing { .. }
+            | ClientSlot::Closed(_)
+            | ClientSlot::Abandoned
+            | ClientSlot::Retired
+            | ClientSlot::Unconnected => Err(McpError::RouterShutDown),
+        }
+    }
+
+    /// Hold `client`, the attempt's connected client, and return the
+    /// connection's handle to it, whose drop closes it within `bound`. A
+    /// custody closed while the attempt connected closes the client at once,
+    /// within `bound`, and refuses it.
+    fn deposit(&self, client: ConnectedClient, bound: Duration) -> Result<HeldClient, McpError> {
+        let peer = rmcp::service::Peer::clone(&client);
+        let mcp_apps = client.supports_mcp_apps();
+        let mut slot = self.slot();
+        if matches!(*slot, ClientSlot::Vacant) {
+            *slot = ClientSlot::Held(client);
+            drop(slot);
+            self.changed();
+            return Ok(HeldClient {
+                peer,
+                mcp_apps,
+                custody: self.clone(),
+                bound,
+            });
+        }
+        // Closed first (its close index began its close): no client stays
+        // held after that.
+        let started = tokio::time::Instant::now();
+        *slot = ClientSlot::Closing { started, bound };
+        drop(slot);
+        self.spawn_close(client, started, bound);
+        self.changed();
+        Err(McpError::RouterShutDown)
+    }
+
+    /// Start this client's close now, from synchronous code, waiting for its
+    /// service at most `bound`: take the held client and close it in a task
+    /// of its own, so dropping any wait for it never stops it. A custody with
+    /// no client yet is retired instead. A close already started, or a
+    /// custody already finished, is left as it is.
+    fn start_close(&self, started: tokio::time::Instant, bound: Duration) {
+        let mut slot = self.slot();
+        match std::mem::replace(&mut *slot, ClientSlot::Closing { started, bound }) {
+            ClientSlot::Held(client) => {
+                drop(slot);
+                self.spawn_close(client, started, bound);
+            }
+            ClientSlot::Vacant => {
+                *slot = ClientSlot::Retired;
+                drop(slot);
+            }
+            other => {
+                *slot = other;
+                return;
+            }
+        }
+        self.changed();
+    }
+
+    /// Retire a custody that holds no client yet: its attempt is refused or
+    /// stopped, and a client it still connects is closed at once.
+    fn retire(&self) {
+        let mut slot = self.slot();
+        if matches!(*slot, ClientSlot::Vacant) {
+            *slot = ClientSlot::Retired;
+            drop(slot);
+            self.changed();
+        }
+    }
+
+    fn spawn_close(&self, client: ConnectedClient, started: tokio::time::Instant, bound: Duration) {
+        let owner = ClientCloseOwner {
+            custody: self.clone(),
+            finished: false,
+        };
+        tokio::spawn(async move {
+            owner.finish(await_client_close(started, bound, client.cancel()).await);
+        });
+    }
+
+    /// Wait until this custody's client close, or its attempt, has finished.
+    async fn join(&self) -> ClientEnd {
+        let mut progress = self.progress.subscribe();
+        loop {
+            match &*self.slot() {
+                ClientSlot::Closed(closed) => return ClientEnd::Closed(closed.clone()),
+                ClientSlot::Abandoned => return ClientEnd::Abandoned,
+                ClientSlot::Unconnected => return ClientEnd::Unconnected,
+                ClientSlot::Vacant
+                | ClientSlot::Held(_)
+                | ClientSlot::Closing { .. }
+                | ClientSlot::Retired => {}
+            }
+            // The custody holds the sender, so this never fails while waiting.
+            let _ = progress.changed().await;
+        }
+    }
+
+    /// The connect attempt ended. A custody it left without a client has
+    /// nothing to close.
+    fn attempt_ended(&self) {
+        let mut slot = self.slot();
+        if matches!(*slot, ClientSlot::Vacant | ClientSlot::Retired) {
+            *slot = ClientSlot::Unconnected;
+            drop(slot);
+            self.changed();
+        }
+    }
+
+    /// When the close running now will have ended: its start plus its bound.
+    /// `None` when no close runs.
+    fn close_deadline(&self) -> Option<tokio::time::Instant> {
+        match &*self.slot() {
+            ClientSlot::Closing { started, bound } => Some(*started + *bound),
+            ClientSlot::Vacant
+            | ClientSlot::Held(_)
+            | ClientSlot::Closed(_)
+            | ClientSlot::Abandoned
+            | ClientSlot::Retired
+            | ClientSlot::Unconnected => None,
+        }
+    }
+
+    /// Whether its attempt may still connect a client (retired while it
+    /// connected): that client is closed at once.
+    fn awaits_attempt(&self) -> bool {
+        matches!(*self.slot(), ClientSlot::Retired)
+    }
+
+    /// Whether nothing of this custody is left to report: its client closed
+    /// cleanly, or its attempt ended without one.
+    fn finished_settled(&self) -> bool {
+        matches!(
+            *self.slot(),
+            ClientSlot::Closed(ClientClose::Ended) | ClientSlot::Unconnected
+        )
+    }
+
+    /// Cancel the held client's service without taking it: the service ends
+    /// on its own, as when it is dropped, and a later close still joins it.
+    fn cancel_held(&self) {
+        if let ClientSlot::Held(client) = &*self.slot() {
+            client.cancellation_token().cancel();
+        }
+    }
+}
+
+/// Wait for a client's close (its service's end) at most until `started`
+/// plus `bound`.
+async fn await_client_close<T>(
+    started: tokio::time::Instant,
+    bound: Duration,
+    close: impl std::future::Future<Output = Result<T, tokio::task::JoinError>>,
+) -> ClientClose {
+    match tokio::time::timeout_at(started + bound, close).await {
+        Ok(Ok(_)) => ClientClose::Ended,
+        Ok(Err(error)) => ClientClose::WaitFailed(format!("{error:?}").into()),
+        Err(_) => ClientClose::TimedOut(bound),
+    }
+}
+
+/// What a connection holds of its client: the peer it reaches its server
+/// through, and the custody that owns the running client and closes it.
+/// Dropped without a close, it starts the client's close through the custody
+/// (within a Tokio runtime; elsewhere it cancels the service), as dropping
+/// the service itself would cancel it, so that close is still observed.
+pub(crate) struct HeldClient {
+    peer: rmcp::service::Peer<rmcp::RoleClient>,
+    mcp_apps: bool,
+    custody: ClientCustody,
+    /// How long a close started by this handle's drop waits for the service.
+    bound: Duration,
+}
+
+impl std::ops::Deref for HeldClient {
+    type Target = rmcp::service::Peer<rmcp::RoleClient>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.peer
+    }
+}
+
+impl HeldClient {
+    /// `client`, held by a custody of its own.
+    pub(crate) fn standalone(client: ConnectedClient) -> Self {
+        let custody = ClientCustody::default();
+        let held = Self {
+            peer: rmcp::service::Peer::clone(&client),
+            mcp_apps: client.supports_mcp_apps(),
+            custody: custody.clone(),
+            bound: REMOTE_CLOSE_BOUND,
+        };
+        *custody.slot() = ClientSlot::Held(client);
+        held
+    }
+
+    pub(crate) fn supports_mcp_apps(&self) -> bool {
+        self.mcp_apps
+    }
+
+    /// Close the client, waiting for its service until `deadline`; when
+    /// another close of it started first, join that close instead.
+    pub(crate) async fn close_until(self, deadline: tokio::time::Instant) -> ClientEnd {
+        let started = tokio::time::Instant::now();
+        self.custody
+            .start_close(started, deadline.saturating_duration_since(started));
+        self.custody.join().await
+    }
+}
+
+/// The existing already-running unit constructors stay source-compatible.
+impl From<rmcp::service::RunningService<rmcp::RoleClient, ()>> for HeldClient {
+    fn from(service: rmcp::service::RunningService<rmcp::RoleClient, ()>) -> Self {
+        Self::standalone(service.into())
+    }
+}
+
+impl Drop for HeldClient {
+    fn drop(&mut self) {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            self.custody
+                .start_close(tokio::time::Instant::now(), self.bound);
+        } else {
+            self.custody.cancel_held();
+        }
+    }
+}
+
+/// The failure of a client close, as a close of its connection reports it:
+/// `None` when its service ended (or there was no client to close).
+fn client_close_failure(server: &str, end: &ClientEnd) -> Option<McpError> {
+    match end {
+        ClientEnd::Closed(ClientClose::Ended) | ClientEnd::Unconnected => None,
+        ClientEnd::Closed(ClientClose::WaitFailed(reason)) => Some(McpError::ConnectionFailed {
+            reason: format!("Failed to close connection: {reason}"),
+        }),
+        ClientEnd::Closed(ClientClose::TimedOut(bound)) => Some(McpError::CloseTimedOut {
+            server: server.to_owned(),
+            bound: *bound,
+        }),
+        ClientEnd::Abandoned => Some(McpError::ConnectionFailed {
+            reason: "Failed to close connection: its close task was dropped before it finished"
+                .to_string(),
+        }),
+    }
+}
+
+/// Every close one router owns, kept outside the router lock: each connect
+/// attempt's process custody (stdio) and client custody from the moment the
+/// attempt is admitted, and so every connection made from them, its earlier
+/// closes that ended unsettled included. The router and its adapter share it
+/// ([`crate::McpRouterAdapter::begin_close`]).
+#[derive(Clone, Default)]
+pub(crate) struct CloseIndex(Arc<CloseIndexShared>);
+
+#[derive(Default)]
+struct CloseIndexShared {
+    state: std::sync::Mutex<CloseIndexState>,
+    /// Becomes `true` when the close begins, so admitted attempts stop.
+    closing: tokio::sync::watch::Sender<bool>,
+}
+
+#[derive(Default)]
+struct CloseIndexState {
+    /// Set by [`CloseIndex::begin_close`]: admission is frozen, and no
+    /// custody is indexed after it.
+    closing: bool,
+    entries: Vec<IndexedClose>,
+}
+
+/// One admitted connect attempt's custodies.
+#[derive(Clone)]
+struct IndexedClose {
+    server: String,
+    /// The stdio server's process; `None` for a remote server.
+    process: Option<StdioChildCustody>,
+    client: ClientCustody,
+}
+
+impl CloseIndex {
+    fn state(&self) -> std::sync::MutexGuard<'_, CloseIndexState> {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Admit one connect attempt of `server`. This is the one boundary where
+    /// a router creates an attempt's custodies, and it is atomic with the
+    /// index's admission freeze: under the index lock the custodies are
+    /// created (a process custody under `stdio_bounds` for a stdio server)
+    /// and indexed, before anything can spawn or connect through them. Once
+    /// the index is closing they are created closed instead and not indexed:
+    /// the attempt is refused before any effect.
+    pub(crate) fn admit(
+        &self,
+        server: &str,
+        stdio_bounds: Option<McpStdioCloseBounds>,
+    ) -> AdmittedAttempt {
+        let process = stdio_bounds.map(StdioChildCustody::with_bounds);
+        let client = ClientCustody::default();
+        let mut state = self.state();
+        if state.closing {
+            drop(state);
+            if let Some(process) = &process {
+                process.retire_if_vacant();
+            }
+            client.retire();
+        } else {
+            state.entries.retain(|entry| !entry.finished_settled());
+            state.entries.push(IndexedClose {
+                server: server.to_owned(),
+                process: process.clone(),
+                client: client.clone(),
+            });
+        }
+        AdmittedAttempt {
+            stop: AttemptStop(self.0.closing.subscribe()),
+            end: AttemptEnd {
+                process: process.clone(),
+                client: client.clone(),
+            },
+            process,
+            client,
+        }
+    }
+
+    /// Freeze admission and start, now, every close this index covers that
+    /// has not started, without any router lock or in-flight call: a held
+    /// stdio server's client is closed and then its process, under that
+    /// custody's own bounds; a held remote client is closed within
+    /// [`McpStdioCloseBounds::close_bound`] of the defaults; a custody that
+    /// holds nothing yet is retired, so its attempt stops and spawns or
+    /// connects nothing more (a client it still connects is closed at
+    /// once). A close already running is joined. A later call returns a
+    /// ticket over the same closes. Call it within a Tokio runtime.
+    pub(crate) fn begin_close(&self) -> McpCloseTicket {
+        let now = tokio::time::Instant::now();
+        let closes = {
+            let mut state = self.state();
+            state.closing = true;
+            state.entries.clone()
+        };
+        self.0.closing.send_replace(true);
+        let ends = closes
+            .iter()
+            .map(|close| close.begin(now))
+            .fold(now, std::cmp::Ord::max);
+        McpCloseTicket {
+            closes,
+            deadline: ends + McpCloseTicket::JOIN_ALLOWANCE,
+        }
+    }
+
+    /// Whether [`Self::begin_close`] ran.
+    pub(crate) fn is_closing(&self) -> bool {
+        self.state().closing
+    }
+}
+
+impl IndexedClose {
+    /// Whether nothing of this attempt is left to report.
+    fn finished_settled(&self) -> bool {
+        match &self.process {
+            Some(process) => process.finished_settled(),
+            None => self.client.finished_settled(),
+        }
+    }
+
+    /// Start this close at `now` unless one runs or ran, and return when it
+    /// will have ended: its own start plus its bound.
+    fn begin(&self, now: tokio::time::Instant) -> tokio::time::Instant {
+        match &self.process {
+            Some(process) => {
+                let client = self.client.clone();
+                let eof_grace = process.bounds.eof_grace();
+                // As in an ordinary close, the client goes first: its stdin
+                // closing is the server's EOF.
+                let close_client = async move {
+                    client.start_close(tokio::time::Instant::now(), eof_grace);
+                    let _ = tokio::time::timeout(eof_grace, client.join()).await;
+                };
+                match process.start_close(now, close_client) {
+                    Ok(_) => now + process.bounds.close_bound(),
+                    Err(_) => {
+                        // Nothing spawned yet: the attempt stops, and no
+                        // client may follow.
+                        self.client.retire();
+                        process.close_deadline().unwrap_or(now)
+                    }
+                }
+            }
+            None => {
+                self.client.start_close(now, REMOTE_CLOSE_BOUND);
+                match self.client.close_deadline() {
+                    Some(ends) => ends,
+                    // A client its attempt still connects is closed at once.
+                    None if self.client.awaits_attempt() => now + REMOTE_CLOSE_BOUND,
+                    None => now,
+                }
+            }
+        }
+    }
+
+    /// This attempt's close outcome once it has reported; `None` for a remote
+    /// attempt that ended without connecting, which had nothing to close.
+    async fn outcome(&self) -> Option<McpServerCloseOutcome> {
+        match &self.process {
+            Some(process) => Some(match process.join_close().await {
+                Ok(receipt) => McpServerCloseOutcome::Stdio(receipt),
+                Err(not_held) => not_held_outcome(not_held),
+            }),
+            None => match self.client.join().await {
+                ClientEnd::Unconnected => None,
+                end => Some(close_outcome(
+                    &self.server,
+                    ObservedClose {
+                        process: ObservedProcessClose::NoCustody,
+                        cancel_failure: client_close_failure(&self.server, &end),
+                    },
+                )),
+            },
+        }
+    }
+}
+
+/// One admitted connect attempt: its custodies, the signal it stops on, and
+/// the marker of its end.
+pub(crate) struct AdmittedAttempt {
+    pub(crate) process: Option<StdioChildCustody>,
+    pub(crate) client: ClientCustody,
+    pub(crate) stop: AttemptStop,
+    pub(crate) end: AttemptEnd,
+}
+
+/// Resolves once its index begins its close: the attempt stops there,
+/// dropping whatever it had not connected.
+pub(crate) struct AttemptStop(tokio::sync::watch::Receiver<bool>);
+
+impl AttemptStop {
+    pub(crate) async fn requested(mut self) {
+        if self.0.wait_for(|closing| *closing).await.is_err() {
+            // The index is gone, so no close can begin.
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Marks the end of one connect attempt when dropped (it returned, or it was
+/// dropped): a custody it left without a client or a process has nothing to
+/// close, and none can come.
+pub(crate) struct AttemptEnd {
+    process: Option<StdioChildCustody>,
+    client: ClientCustody,
+}
+
+impl Drop for AttemptEnd {
+    fn drop(&mut self) {
+        self.client.attempt_ended();
+        if let Some(process) = &self.process {
+            process.retire_if_vacant();
+        }
+    }
+}
+
+/// The closes [`crate::McpRouterAdapter::begin_close`] started or joined:
+/// one per connect attempt its router admitted.
+#[must_use]
+pub struct McpCloseTicket {
+    closes: Vec<IndexedClose>,
+    deadline: tokio::time::Instant,
+}
+
+impl McpCloseTicket {
+    /// How long past its own close bound a close's task may take to report.
+    pub const JOIN_ALLOWANCE: Duration = Duration::from_secs(2);
+
+    /// When every close this ticket covers will have reported: the latest
+    /// end of a close it started or joined (that close's own start, plus
+    /// its [`McpStdioCloseBounds::close_bound`] for a stdio server or the
+    /// default close bound for a remote one), plus [`Self::JOIN_ALLOWANCE`].
+    #[must_use]
+    pub fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
+    }
+
+    /// One record per close, once it has reported: each stdio server's
+    /// process close (its receipt, or why it has none) and each remote
+    /// connection's client close ([`McpServerCloseOutcome::NoProcess`] only
+    /// when its client ended). A remote attempt that ended without
+    /// connecting had nothing to close and has no record. No close is
+    /// aborted.
+    pub async fn outcomes(self) -> Vec<crate::McpServerCloseRecord> {
+        futures::future::join_all(self.closes.into_iter().map(|close| async move {
+            close
+                .outcome()
+                .await
+                .map(|outcome| crate::McpServerCloseRecord {
+                    server: close.server,
+                    outcome,
+                })
+        }))
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
+/// The outcome of a close whose custody gave no receipt.
+pub(crate) fn not_held_outcome(not_held: CustodyNotHeld) -> McpServerCloseOutcome {
+    match not_held {
+        CustodyNotHeld::NeverSpawned => McpServerCloseOutcome::NeverSpawned,
+        CustodyNotHeld::ClosingElsewhere => {
+            McpServerCloseOutcome::NotHeld(McpCustodyNotHeld::ClosingElsewhere)
+        }
+        CustodyNotHeld::ClosedElsewhere => {
+            McpServerCloseOutcome::NotHeld(McpCustodyNotHeld::ClosedElsewhere)
+        }
+        CustodyNotHeld::AbandonedElsewhere => {
+            McpServerCloseOutcome::NotHeld(McpCustodyNotHeld::AbandonedElsewhere)
+        }
+    }
+}
+
+/// The outcome of one observed connection close. A failed client cancel
+/// with no process at all is the close's failure; next to a process receipt,
+/// or a process close owned elsewhere, it is traced only.
+pub(crate) fn close_outcome(server: &str, observed: ObservedClose) -> McpServerCloseOutcome {
+    let ObservedClose {
+        process,
+        cancel_failure,
+    } = observed;
+    let no_process = matches!(
+        process,
+        ObservedProcessClose::NoCustody
+            | ObservedProcessClose::NotHeld(CustodyNotHeld::NeverSpawned)
+    );
+    match (process, cancel_failure) {
+        (_, Some(failure)) if no_process => McpServerCloseOutcome::CloseFailed(Arc::new(failure)),
+        (process, cancel_failure) => {
+            if let Some(failure) = cancel_failure {
+                tracing::warn!(server, error = %failure, "MCP connection close failed");
+            }
+            match process {
+                ObservedProcessClose::Receipt(receipt) => McpServerCloseOutcome::Stdio(receipt),
+                ObservedProcessClose::NoCustody => McpServerCloseOutcome::NoProcess,
+                ObservedProcessClose::NotHeld(not_held) => not_held_outcome(not_held),
+            }
+        }
+    }
 }
 
 /// What admits one `tools/call` at a connection, before any request is
@@ -2653,40 +3577,19 @@ fn tool_call_failure(
 /// reap failed is returned as that OS error instead.
 pub(crate) async fn close_connected(
     server: &str,
-    service: ConnectedClient,
+    service: HeldClient,
     stdio_child: Option<StdioChildCustody>,
 ) -> Result<Option<McpStdioCloseReceipt>, McpError> {
-    let started = tokio::time::Instant::now();
-    let (cancelled, receipt) = match stdio_child {
-        Some(custody) => {
-            let eof_deadline = started + custody.bounds.eof_grace();
-            let cancel_server = server.to_owned();
-            let cancel = async move {
-                match tokio::time::timeout_at(eof_deadline, service.cancel()).await {
-                    Ok(cancelled) => Some(cancelled),
-                    Err(_) => {
-                        tracing::debug!(
-                            server = %cancel_server,
-                            "MCP client cancel outlasted the EOF grace; dropped"
-                        );
-                        None
-                    }
-                }
-            };
-            let (cancelled, receipt) = custody.terminate_after(started, cancel).await;
-            let receipt = match receipt {
-                Ok(receipt) => {
-                    trace_close_receipt(server, &receipt);
-                    Some(receipt)
-                }
-                Err(not_held) => {
-                    tracing::debug!(server, ?not_held, "MCP stdio server close owned elsewhere");
-                    None
-                }
-            };
-            (cancelled.flatten(), receipt)
+    let ObservedClose {
+        process,
+        cancel_failure,
+    } = close_connected_observed(server, service, stdio_child, false).await;
+    let receipt = match process {
+        // The custody keeps its own copy of the receipt for later joins.
+        ObservedProcessClose::Receipt(receipt) => {
+            Some(Arc::try_unwrap(receipt).unwrap_or_else(|shared| duplicate_receipt(&shared)))
         }
-        None => (Some(service.cancel().await), None),
+        ObservedProcessClose::NoCustody | ObservedProcessClose::NotHeld(_) => None,
     };
     // A failed reap (its status consumed by another reaper, say) fails the
     // close with that OS error; the receipt was traced above.
@@ -2697,12 +3600,117 @@ pub(crate) async fn close_connected(
     {
         return Err(McpError::Io(error));
     }
-    if let Some(Err(e)) = cancelled {
-        return Err(McpError::ConnectionFailed {
-            reason: format!("Failed to close connection: {e:?}"),
-        });
+    if let Some(failure) = cancel_failure {
+        return Err(failure);
     }
     Ok(receipt)
+}
+
+/// An owned copy of a shared receipt. A failed reap's OS error keeps its
+/// error number; an error without one keeps its kind and message.
+fn duplicate_receipt(receipt: &McpStdioCloseReceipt) -> McpStdioCloseReceipt {
+    McpStdioCloseReceipt {
+        settled_in: receipt.settled_in,
+        leader_exit: receipt.leader_exit,
+        witness: receipt.witness,
+        sigterm: receipt.sigterm,
+        sigkill: receipt.sigkill,
+        final_group_signal: receipt.final_group_signal,
+        leader: match &receipt.leader {
+            McpStdioLeaderOutcome::Reaped(status) => McpStdioLeaderOutcome::Reaped(*status),
+            McpStdioLeaderOutcome::WaitFailed(error) => {
+                McpStdioLeaderOutcome::WaitFailed(error.raw_os_error().map_or_else(
+                    || std::io::Error::new(error.kind(), error.to_string()),
+                    std::io::Error::from_raw_os_error,
+                ))
+            }
+            McpStdioLeaderOutcome::NotReaped => McpStdioLeaderOutcome::NotReaped,
+        },
+        elapsed: receipt.elapsed,
+    }
+}
+
+/// Everything one [`close_connected_observed`] saw: what happened to the
+/// connection's server process, and the client cancel's own failure.
+pub(crate) struct ObservedClose {
+    pub(crate) process: ObservedProcessClose,
+    /// The client cancel failed. `None` when it finished, or outlasted the
+    /// EOF grace and was dropped.
+    pub(crate) cancel_failure: Option<McpError>,
+}
+
+/// What one close saw of its connection's server process.
+pub(crate) enum ObservedProcessClose {
+    /// The connection held no stdio custody: a remote transport.
+    NoCustody,
+    /// The process's close: its receipt, whatever its leader outcome (a
+    /// failed reap included), traced by the call that ran the close.
+    Receipt(Arc<McpStdioCloseReceipt>),
+    /// No receipt of the process's close: never spawned, owned elsewhere
+    /// (when not joined), or abandoned.
+    NotHeld(CustodyNotHeld),
+}
+
+/// [`close_connected`] keeping everything it observed: the receipt even when
+/// its reap failed, why there is no receipt, and the cancel's failure next
+/// to the receipt rather than in its place. With `join`, a close of the same
+/// process that another call started is waited for, and its receipt kept.
+pub(crate) async fn close_connected_observed(
+    server: &str,
+    service: HeldClient,
+    stdio_child: Option<StdioChildCustody>,
+    join: bool,
+) -> ObservedClose {
+    let started = tokio::time::Instant::now();
+    let Some(custody) = stdio_child else {
+        // With no process close to bound it, the client close is bounded by
+        // the default close bound itself; a close of the same client that
+        // started elsewhere is joined.
+        let closed = service.close_until(started + REMOTE_CLOSE_BOUND).await;
+        return ObservedClose {
+            process: ObservedProcessClose::NoCustody,
+            cancel_failure: client_close_failure(server, &closed),
+        };
+    };
+    let eof_deadline = started + custody.bounds.eof_grace();
+    let cancel_server = server.to_owned();
+    let cancel = async move {
+        // The client close runs in its custody's own task: past the EOF
+        // grace only this wait is dropped.
+        match tokio::time::timeout_at(eof_deadline, service.close_until(eof_deadline)).await {
+            Ok(ClientEnd::Closed(ClientClose::TimedOut(_))) | Err(_) => {
+                tracing::debug!(
+                    server = %cancel_server,
+                    "MCP client cancel outlasted the EOF grace; dropped"
+                );
+                None
+            }
+            Ok(closed) => client_close_failure(&cancel_server, &closed),
+        }
+    };
+    let (cancel_failure, receipt) = custody.terminate_after(started, cancel).await;
+    let process = match receipt {
+        Ok(receipt) => {
+            trace_close_receipt(server, &receipt);
+            ObservedProcessClose::Receipt(receipt)
+        }
+        // The close another call started is this process's close: its
+        // receipt (traced by that call) is this close's too.
+        Err(CustodyNotHeld::ClosingElsewhere | CustodyNotHeld::ClosedElsewhere) if join => {
+            match custody.join_close().await {
+                Ok(receipt) => ObservedProcessClose::Receipt(receipt),
+                Err(not_held) => ObservedProcessClose::NotHeld(not_held),
+            }
+        }
+        Err(not_held) => {
+            tracing::debug!(server, ?not_held, "MCP stdio server close owned elsewhere");
+            ObservedProcessClose::NotHeld(not_held)
+        }
+    };
+    ObservedClose {
+        process,
+        cancel_failure: cancel_failure.flatten(),
+    }
 }
 
 /// Trace every fact of a close receipt. A close that settled before any
@@ -2764,6 +3772,9 @@ struct StreamableConnectError {
     /// The host egress profile refused or could not enforce one of the
     /// attempt's requests.
     egress: Option<HttpEgressError>,
+    /// Its close index closed the attempt while it connected; the client it
+    /// connected was closed at once.
+    shut_down: bool,
 }
 
 impl StreamableConnectError {
@@ -2772,6 +3783,9 @@ impl StreamableConnectError {
     }
 
     fn into_mcp_error(self, server: &str) -> McpError {
+        if self.shut_down {
+            return McpError::RouterShutDown;
+        }
         match (self.refused, self.egress) {
             (Some(refusal), _) => McpError::AttachmentRefused(refusal),
             (None, Some(error)) => McpError::from_egress(server, error),
@@ -2783,7 +3797,8 @@ impl StreamableConnectError {
 }
 
 fn auth_failure_suggests_oauth(error: &StreamableConnectError) -> bool {
-    error.refused.is_none()
+    !error.shut_down
+        && error.refused.is_none()
         && error.egress.is_none()
         && (error.auth.challenge().is_some() || error.auth.status().is_some())
 }
@@ -3845,8 +4860,7 @@ pub mod tests {
         let receipt = custody
             .terminate_or_join()
             .await
-            .expect("cancellation must leave the child in retained custody")
-            .expect("the cancelled waiter leaves its receipt to be joined");
+            .expect("cancellation leaves the child in retained custody, and its receipt to a join");
         assert!(
             matches!(receipt.leader, McpStdioLeaderOutcome::Reaped(_)),
             "retained owner reaps the child: {receipt:?}"
@@ -3885,12 +4899,10 @@ pub mod tests {
             "first waiter reaps the child: {receipt:?}"
         );
         if second_waited {
+            let joined = second.await.expect("the joined close was not abandoned");
             assert!(
-                second
-                    .await
-                    .expect("the joined close was not abandoned")
-                    .is_none(),
-                "the first waiter completed custody"
+                Arc::ptr_eq(&joined, &receipt),
+                "a join reads the first waiter's receipt, not nothing"
             );
         }
         assert_child_reaped(pid);
@@ -3915,7 +4927,11 @@ pub mod tests {
         let (custody, _pipes) = custody_test_child().await;
         let pid = custody.spawned_pid().await;
         let (waiting, resume) = custody.pause_next_reap();
-        let close = tokio::spawn(close_connected("reap-failure", client, Some(custody)));
+        let close = tokio::spawn(close_connected(
+            "reap-failure",
+            HeldClient::standalone(client),
+            Some(custody),
+        ));
         waiting.await.expect("close reached its reap await");
 
         // Fault injection: another process owner consumes the status before
@@ -3936,6 +4952,44 @@ pub mod tests {
             matches!(result, Err(McpError::Io(ref error)) if error.raw_os_error() == Some(nix::errno::Errno::ECHILD as i32)),
             "close must return the typed reap error, got {result:?}"
         );
+    }
+
+    /// C9: a client close whose service does not end within its bound is
+    /// `TimedOut`, its connection close's typed `CloseTimedOut` failure,
+    /// never settled.
+    #[tokio::test]
+    async fn a_client_close_past_its_bound_is_a_typed_close_failure() {
+        let bound = Duration::from_millis(50);
+        let closed = await_client_close(
+            tokio::time::Instant::now(),
+            bound,
+            std::future::pending::<Result<(), tokio::task::JoinError>>(),
+        )
+        .await;
+        assert!(
+            matches!(closed, ClientClose::TimedOut(waited) if waited == bound),
+            "{closed:?}"
+        );
+        let outcome = close_outcome(
+            "remote",
+            ObservedClose {
+                process: ObservedProcessClose::NoCustody,
+                cancel_failure: client_close_failure("remote", &ClientEnd::Closed(closed)),
+            },
+        );
+        assert!(
+            matches!(
+                &outcome,
+                McpServerCloseOutcome::CloseFailed(error)
+                    if matches!(
+                        **error,
+                        McpError::CloseTimedOut { ref server, bound: waited }
+                            if server == "remote" && waited == bound
+                    )
+            ),
+            "{outcome:?}"
+        );
+        assert!(!outcome.is_settled());
     }
 
     /// A connector-bound stdio server starts with its expected account
@@ -4074,6 +5128,37 @@ pub mod tests {
             custody.terminate().await.err(),
             Some(CustodyNotHeld::ClosedElsewhere),
             "the failed attempt already closed and reaped the server"
+        );
+
+        // C6/T7: a bounded connect whose timeout fires while its failed
+        // handshake is still closing the server joins that close, and
+        // reports its final native facts: the server closed its stdout and
+        // ignored EOF, so it was terminated and reaped. The close began
+        // before the timeout fired, so it is the handshake's own close.
+        let timeout = Duration::from_secs(2);
+        let called = tokio::time::Instant::now();
+        let Err(failure) = McpConnection::connect_within(&config, timeout).await else {
+            panic!("a server without stdout cannot connect");
+        };
+        let returned = called.elapsed();
+        assert!(failure.timed_out, "{failure:?}");
+        let Some(McpServerCloseOutcome::Stdio(receipt)) = &failure.close else {
+            panic!("the joined close's receipt: {failure:?}");
+        };
+        assert!(
+            matches!(receipt.leader, McpStdioLeaderOutcome::Reaped(_)),
+            "{receipt:?}"
+        );
+        assert!(
+            matches!(receipt.witness, McpStdioWitnessOutcome::Closed(_)),
+            "{receipt:?}"
+        );
+        assert_eq!(receipt.sigterm, Some(McpStdioSignalOutcome::Sent));
+        assert!(
+            returned.saturating_sub(receipt.elapsed) < timeout,
+            "the close began before the connect's timeout: returned after {returned:?}, \
+             close took {:?}",
+            receipt.elapsed
         );
     }
 
@@ -4721,8 +5806,7 @@ pub mod tests {
         let receipt = custody
             .terminate_or_join()
             .await
-            .expect("the close finished")
-            .expect("the dropped close left its receipt");
+            .expect("the close finished and the dropped close left its receipt");
         assert_eq!(
             receipt.settled_in,
             Some(McpStdioClosePhase::Term),
@@ -4756,8 +5840,7 @@ pub mod tests {
         let receipt = custody
             .terminate_or_join()
             .await
-            .expect("the close finished")
-            .expect("the dropped waiter never took the receipt");
+            .expect("the close finished and its receipt is joined");
         assert_eq!(receipt.settled_in, Some(McpStdioClosePhase::Eof));
     }
 
@@ -4842,8 +5925,7 @@ pub mod tests {
         let receipt = custody
             .terminate_or_join()
             .await
-            .expect("the close finished")
-            .expect("the dropped wait left its receipt");
+            .expect("the close finished and the dropped wait left its receipt");
         assert_eq!(
             receipt.settled_in,
             Some(McpStdioClosePhase::Term),

@@ -368,6 +368,31 @@ impl McpAdapterComposeRefusal {
     }
 }
 
+/// A trusted host's custody of every MCP router adapter its factory's
+/// constructions create, so it can shut each one down and observe that
+/// shutdown ([`meerkat_mcp::McpRouterAdapter::shutdown_observer`]) even when
+/// the construction fails or is abandoned.
+///
+/// [`Self::adopt`] is called once per construction that creates a router for
+/// its configured MCP servers, with that exact adapter, as soon as the
+/// construction's own cleanup owns it and before any server is staged or
+/// connected. A closed custody fails the build there, before any server
+/// process exists, and the construction's cleanup shuts the empty adapter
+/// down.
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+pub trait McpAdapterCustody: Send + Sync {
+    fn adopt(
+        &self,
+        adapter: &Arc<meerkat_mcp::McpRouterAdapter>,
+    ) -> Result<(), McpAdapterCustodyClosed>;
+}
+
+/// An [`McpAdapterCustody`] that no longer adopts adapters.
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("MCP adapter custody is closed")]
+pub struct McpAdapterCustodyClosed;
+
 #[derive(Default)]
 struct ConstructionCleanup {
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
@@ -2718,6 +2743,10 @@ pub struct AgentFactory {
     /// adapter, applied before the adapter's tools are published.
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     mcp_adapter_composer: Option<Arc<dyn McpAdapterComposer>>,
+    /// The trusted host's custody of each construction's own MCP router
+    /// adapter, adopted before anything is staged.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    mcp_adapter_custody: Option<Arc<dyn McpAdapterCustody>>,
     #[cfg(feature = "comms")]
     pub enable_comms: bool,
     pub enable_memory: bool,
@@ -3985,6 +4014,8 @@ impl AgentFactory {
             mcp_router_observer_for_test: None,
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
             mcp_adapter_composer: None,
+            #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+            mcp_adapter_custody: None,
             #[cfg(feature = "comms")]
             enable_comms: false,
             enable_memory: false,
@@ -4173,6 +4204,8 @@ impl AgentFactory {
             mcp_router_observer_for_test: None,
             #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
             mcp_adapter_composer: None,
+            #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+            mcp_adapter_custody: None,
             #[cfg(feature = "comms")]
             enable_comms: false,
             enable_memory: false,
@@ -4515,6 +4548,14 @@ impl AgentFactory {
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     pub fn with_mcp_adapter_composer(mut self, composer: Arc<dyn McpAdapterComposer>) -> Self {
         self.mcp_adapter_composer = Some(composer);
+        self
+    }
+
+    /// Give each construction's own MCP router adapter into `custody` before
+    /// anything is staged (see [`McpAdapterCustody`]).
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    pub fn with_mcp_adapter_custody(mut self, custody: Arc<dyn McpAdapterCustody>) -> Self {
+        self.mcp_adapter_custody = Some(custody);
         self
     }
 
@@ -7596,6 +7637,15 @@ impl AgentFactory {
             // construction at any later await shuts those connections down.
             let adapter = Arc::new(meerkat_mcp::McpRouterAdapter::new(router));
             cleanup.arm_mcp(Arc::clone(&adapter));
+            // The host's custody adopts the adapter before any server is
+            // staged; a closed custody fails the build here, before any
+            // server process exists, and the armed cleanup shuts the empty
+            // adapter down.
+            if let Some(custody) = &self.mcp_adapter_custody {
+                custody
+                    .adopt(&adapter)
+                    .map_err(|closed| BuildAgentError::McpSetup(closed.to_string()))?;
+            }
             cleanup.live_mcp = Some(Arc::new(crate::surface::AdapterLiveMcpAttachment::new(
                 Arc::clone(&adapter),
                 configured_authority.is_some(),
@@ -21844,6 +21894,144 @@ mod prepared_agent_tests {
         })
         .await
         .expect("the refused construction's router is shut down");
+    }
+
+    /// A configured fixture MCP server the construction connects.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    fn mcp_fixture_build(snapshots: &Arc<AtomicUsize>) -> AgentBuildConfig {
+        let mut build = governed("host", snapshots);
+        build.mcp_servers = vec![meerkat_core::McpServerConfig::stdio(
+            "fixture",
+            mcp_test_server::fixture_binary()
+                .to_string_lossy()
+                .to_string(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+        )];
+        build.wait_for_mcp = true;
+        build
+    }
+
+    /// The trusted host's custody adopts each construction's exact MCP
+    /// adapter before any server is staged, and observes that adapter's
+    /// shutdown when the construction is abandoned.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn the_mcp_adapter_custody_adopts_the_adapter_before_anything_is_staged() {
+        type Adopted = (Arc<meerkat_mcp::McpRouterAdapter>, bool);
+        #[derive(Default)]
+        struct Recording {
+            adopted: std::sync::Mutex<Vec<Adopted>>,
+        }
+        impl McpAdapterCustody for Recording {
+            fn adopt(
+                &self,
+                adapter: &Arc<meerkat_mcp::McpRouterAdapter>,
+            ) -> Result<(), McpAdapterCustodyClosed> {
+                let nothing_staged = adapter.tools().is_empty();
+                self.adopted
+                    .lock()
+                    .unwrap()
+                    .push((Arc::clone(adapter), nothing_staged));
+                Ok(())
+            }
+        }
+        let custody = Arc::new(Recording::default());
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let factory = AgentFactory::minimal()
+            .builtins(true)
+            .with_mcp_adapter_custody(Arc::clone(&custody) as Arc<dyn McpAdapterCustody>);
+        let prepared = factory
+            .prepare_agent(mcp_fixture_build(&snapshots), &Config::default())
+            .await
+            .expect("prepared");
+        let (adapter, nothing_staged) = {
+            let adopted = custody.adopted.lock().unwrap();
+            assert_eq!(adopted.len(), 1, "adopted once, for this construction");
+            (Arc::clone(&adopted[0].0), adopted[0].1)
+        };
+        assert!(
+            nothing_staged,
+            "nothing was staged or connected at adoption"
+        );
+        assert!(
+            !adapter.tools().is_empty(),
+            "the adopted adapter is the construction's own, now connected"
+        );
+        let mut observer = adapter.shutdown_observer();
+
+        prepared.abort().await;
+
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(30), observer.observe())
+            .await
+            .expect("the abandoned construction's adapter is shut down");
+        match observed {
+            meerkat_mcp::McpRouterShutdownObservation::Reported(report) => {
+                assert!(
+                    report
+                        .servers()
+                        .iter()
+                        .any(|record| record.server == "fixture"),
+                    "{report:?}"
+                );
+                assert!(report.is_settled(), "{report:?}");
+            }
+            other => panic!("the shutdown reported: {other:?}"),
+        }
+    }
+
+    /// A closed custody fails the build at adoption, before any server is
+    /// staged: no server process ever exists for the construction, and the
+    /// empty adapter is shut down.
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn a_closed_mcp_adapter_custody_fails_the_build_before_any_server_exists() {
+        #[derive(Default)]
+        struct Closed {
+            adopted: std::sync::Mutex<Vec<Arc<meerkat_mcp::McpRouterAdapter>>>,
+        }
+        impl McpAdapterCustody for Closed {
+            fn adopt(
+                &self,
+                adapter: &Arc<meerkat_mcp::McpRouterAdapter>,
+            ) -> Result<(), McpAdapterCustodyClosed> {
+                self.adopted.lock().unwrap().push(Arc::clone(adapter));
+                Err(McpAdapterCustodyClosed)
+            }
+        }
+        let custody = Arc::new(Closed::default());
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let factory = AgentFactory::minimal()
+            .builtins(true)
+            .with_mcp_adapter_custody(Arc::clone(&custody) as Arc<dyn McpAdapterCustody>);
+        match factory
+            .prepare_agent(mcp_fixture_build(&snapshots), &Config::default())
+            .await
+        {
+            Ok(_) => panic!("a closed custody builds nothing"),
+            Err(BuildAgentError::McpSetup(message)) => {
+                assert_eq!(message, "MCP adapter custody is closed");
+            }
+            Err(other) => panic!("unexpected refusal: {other}"),
+        }
+        let adapter = {
+            let adopted = custody.adopted.lock().unwrap();
+            assert_eq!(adopted.len(), 1, "the adoption was asked once");
+            Arc::clone(&adopted[0])
+        };
+        let mut observer = adapter.shutdown_observer();
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(30), observer.observe())
+            .await
+            .expect("the refused construction's adapter is shut down");
+        match observed {
+            meerkat_mcp::McpRouterShutdownObservation::Reported(report) => {
+                assert!(
+                    report.servers().is_empty(),
+                    "nothing was staged, so nothing was spawned or closed: {report:?}"
+                );
+            }
+            other => panic!("the shutdown reported: {other:?}"),
+        }
     }
 
     /// A session-owned construction installs its MCP adapter into its

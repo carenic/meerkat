@@ -77,6 +77,63 @@ pub struct McpReloadFailure {
     pub error: McpError,
 }
 
+/// What an [`McpRouterShutdownObserver`] read of its adapter's router
+/// shutdown.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum McpRouterShutdownObservation {
+    /// The router's shutdown finished, with what every close it owned
+    /// observed.
+    Reported(Arc<crate::McpRouterShutdownReport>),
+    /// The shutdown can no longer report: the adapter was dropped without
+    /// shutting its router down, or the shutdown task was dropped before it
+    /// reported (its runtime shut down).
+    Abandoned,
+}
+
+/// The one shutdown of an [`McpRouterAdapter`]'s router, observed from
+/// outside the adapter ([`McpRouterAdapter::shutdown_observer`]). It outlives
+/// the adapter, and every clone observes the same shutdown.
+#[derive(Debug, Clone)]
+pub struct McpRouterShutdownObserver {
+    report: tokio::sync::watch::Receiver<Option<Arc<crate::McpRouterShutdownReport>>>,
+}
+
+impl McpRouterShutdownObserver {
+    /// Wait until the shutdown reports, or can no longer report.
+    pub async fn observe(&mut self) -> McpRouterShutdownObservation {
+        match self.report.wait_for(Option::is_some).await {
+            Ok(published) => published
+                .as_ref()
+                .map_or(McpRouterShutdownObservation::Abandoned, |report| {
+                    McpRouterShutdownObservation::Reported(Arc::clone(report))
+                }),
+            Err(_) => McpRouterShutdownObservation::Abandoned,
+        }
+    }
+
+    /// The observation now, without waiting: `None` while the shutdown has
+    /// neither reported nor been abandoned.
+    #[must_use]
+    pub fn current(&self) -> Option<McpRouterShutdownObservation> {
+        let reported = || {
+            self.report
+                .borrow()
+                .as_ref()
+                .map(|report| McpRouterShutdownObservation::Reported(Arc::clone(report)))
+        };
+        if let Some(reported) = reported() {
+            return Some(reported);
+        }
+        // A closed channel publishes nothing more; a report sent just before
+        // it closed is read again first.
+        self.report
+            .has_changed()
+            .is_err()
+            .then(|| reported().unwrap_or(McpRouterShutdownObservation::Abandoned))
+    }
+}
+
 /// Adapter that wraps an [`McpRouter`] to implement [`AgentToolDispatcher`].
 ///
 /// Tool visibility and routing come from the router's atomically published
@@ -108,9 +165,20 @@ pub struct McpRouterAdapter {
     surface_ownership: crate::SurfaceOwnershipSlot,
     execution_authority_id: u64,
     execution_binding_epoch: AtomicU64,
-    /// Set once the taken router's shutdown task finishes. Kept here so a
-    /// later shutdown joins that same work after an earlier call was dropped.
-    router_shutdown: std::sync::Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
+    /// Publishes the router's shutdown report to every observer
+    /// ([`Self::shutdown_observer`]). Created with the adapter; the sender
+    /// moves into the shutdown task when the router is taken, so a later
+    /// shutdown joins that same work after an earlier call was dropped. A
+    /// sender dropped without a report (the adapter dropped before shutting
+    /// its router down, or the shutdown task dropped) reads as Abandoned.
+    shutdown_report: std::sync::Mutex<
+        Option<tokio::sync::watch::Sender<Option<Arc<crate::McpRouterShutdownReport>>>>,
+    >,
+    shutdown_observer: McpRouterShutdownObserver,
+    /// The router's close index, outside the router lock
+    /// ([`Self::begin_close`]). Once it is closing, dispatch and every
+    /// staging entry refuse before taking a router guard.
+    close_index: crate::connection::CloseIndex,
     /// Test-only acknowledgement sent just before a bind's first read of the
     /// surface handle slot (it reads the slot, then claims it to write).
     #[cfg(test)]
@@ -371,6 +439,8 @@ impl McpRouterAdapter {
         let external_surface_handle = router.external_surface_handle_slot();
         let held_surface_lineages = router.held_surface_lineages();
         let surface_ownership = router.surface_ownership_slot();
+        let close_index = router.close_index();
+        let (shutdown_report, report) = tokio::sync::watch::channel(None);
         Self {
             router: AsyncRwLock::new(Some(router)),
             has_pending: AtomicBool::new(has_pending),
@@ -384,7 +454,9 @@ impl McpRouterAdapter {
             surface_ownership,
             execution_authority_id: NEXT_MCP_EXECUTION_AUTHORITY_ID.fetch_add(1, Ordering::Relaxed),
             execution_binding_epoch: AtomicU64::new(0),
-            router_shutdown: std::sync::Mutex::new(None),
+            shutdown_report: std::sync::Mutex::new(Some(shutdown_report)),
+            shutdown_observer: McpRouterShutdownObserver { report },
+            close_index,
             #[cfg(test)]
             bind_claim_attempt: std::sync::Mutex::new(None),
         }
@@ -595,32 +667,39 @@ impl McpRouterAdapter {
 
     /// Gracefully shutdown the MCP router.
     ///
+    /// [`Self::shutdown_with_report`], discarding the observation.
+    pub async fn shutdown(&self) {
+        let _ = self.shutdown_with_report().await;
+    }
+
+    /// Gracefully shut down the MCP router, and return what its shutdown
+    /// observed of every close it owned ([`crate::McpRouter::shutdown_with_report`]).
+    ///
     /// Takes the router out of the adapter and shuts it down in a task of its
     /// own, so dropping this call stops only the wait: the taken router still
-    /// finishes its shutdown, and a later call waits for that same shutdown.
-    /// After this call, tool calls will fail.
-    pub async fn shutdown(&self) {
+    /// finishes its shutdown, and a later call waits for that same shutdown
+    /// and reads the same report. After this call, tool calls will fail.
+    pub async fn shutdown_with_report(&self) -> McpRouterShutdownObservation {
+        // Every close starts now, without the router lock: an in-flight call
+        // that holds a router guard does not delay it.
+        drop(self.begin_close());
         let mut router = self.router.write().await;
         if let Some(router) = router.take() {
             self.execution_binding_epoch.fetch_add(1, Ordering::AcqRel);
-            let (finished, shutdown) = tokio::sync::watch::channel(false);
-            tokio::spawn(async move {
-                router.shutdown().await;
-                finished.send_replace(true);
-            });
-            *self
-                .router_shutdown
+            let report = self
+                .shutdown_report
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(shutdown);
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            tokio::spawn(async move {
+                let shutdown = router.shutdown_with_report().await;
+                if let Some(report) = report {
+                    report.send_replace(Some(Arc::new(shutdown)));
+                }
+            });
         }
-        let shutdown = self
-            .router_shutdown
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(mut shutdown) = shutdown
-            && shutdown.wait_for(|finished| *finished).await.is_err()
-        {
+        let observation = self.shutdown_observer().observe().await;
+        if matches!(observation, McpRouterShutdownObservation::Abandoned) {
             tracing::error!("MCP router shutdown task ended without finishing");
         }
         self.has_pending.store(false, Ordering::Release);
@@ -630,6 +709,41 @@ impl McpRouterAdapter {
         self.set_catalog_cache(Arc::from([]));
         self.set_pending_sources_cache(Arc::from([]));
         self.set_surface_snapshot_cache(None);
+        observation
+    }
+
+    /// Close admission and start, now, every close the router owns, without
+    /// the router lock or any in-flight dispatch: from here on dispatch and
+    /// every staging entry refuse before taking a router guard, a connect
+    /// attempt stops and spawns or connects nothing more, each held stdio
+    /// server's client is closed and then its process under its own
+    /// bounds, and each remote connection's client is closed. A close
+    /// already running is joined. A later call returns a ticket over the
+    /// same closes, and [`Self::shutdown_with_report`] joins them for the
+    /// same outcomes. Call it within a Tokio runtime.
+    pub fn begin_close(&self) -> crate::McpCloseTicket {
+        self.close_index.begin_close()
+    }
+
+    /// Whether the router's close began ([`Self::begin_close`]).
+    pub(crate) fn is_closing(&self) -> bool {
+        self.close_index.is_closing()
+    }
+
+    fn refuse_if_closing(&self) -> Result<(), String> {
+        if self.is_closing() {
+            return Err("MCP router is closing".to_string());
+        }
+        Ok(())
+    }
+
+    /// An observer of this adapter's one router shutdown, whoever starts it.
+    /// It outlives the adapter: dropped without shutting its router down, the
+    /// adapter leaves its observers reading
+    /// [`McpRouterShutdownObservation::Abandoned`].
+    #[must_use]
+    pub fn shutdown_observer(&self) -> McpRouterShutdownObserver {
+        self.shutdown_observer.clone()
     }
 
     /// Read collision diagnostics from the router's current projection owner.
@@ -647,6 +761,7 @@ impl McpRouterAdapter {
 
     /// Stage an MCP server add operation.
     pub async fn stage_add(&self, config: McpServerConfig) -> Result<(), String> {
+        self.refuse_if_closing()?;
         let mut router = self.router.write().await;
         let router = router
             .as_mut()
@@ -669,6 +784,7 @@ impl McpRouterAdapter {
         config: McpServerConfig,
         authority: Arc<dyn McpAttachmentAuthority>,
     ) -> Result<(), String> {
+        self.refuse_if_closing()?;
         let mut router = self.router.write().await;
         let router = router
             .as_mut()
@@ -690,6 +806,7 @@ impl McpRouterAdapter {
         config: McpServerConfig,
         authority: Arc<dyn McpAttachmentAuthority>,
     ) -> Result<meerkat_core::mcp_attachment::McpAttachmentAttempt, String> {
+        self.refuse_if_closing()?;
         let server = config.name.clone();
         let mut router = self.router.write().await;
         let router = router
@@ -781,6 +898,9 @@ impl McpRouterAdapter {
         &self,
         target: &meerkat_auth_core::McpServerIdentity,
     ) -> Result<crate::AuthorizedRetry, crate::McpError> {
+        if self.is_closing() {
+            return Ok(crate::AuthorizedRetry::RouterClosed);
+        }
         let mut router = self.router.write().await;
         let Some(router) = router.as_mut() else {
             return Ok(crate::AuthorizedRetry::RouterClosed);
@@ -810,6 +930,7 @@ impl McpRouterAdapter {
 
     /// Stage an MCP server reload operation.
     pub async fn stage_reload<T: Into<McpReloadTarget>>(&self, target: T) -> Result<(), String> {
+        self.refuse_if_closing()?;
         let mut router = self.router.write().await;
         let router = router
             .as_mut()
@@ -823,6 +944,7 @@ impl McpRouterAdapter {
 
     /// Apply staged MCP operations.
     pub async fn apply_staged(&self) -> Result<McpApplyResult, String> {
+        self.refuse_if_closing()?;
         let mut router = self.router.write().await;
         let router = router
             .as_mut()
@@ -1052,6 +1174,9 @@ impl McpRouterAdapter {
     /// non-clean report as a typed wire fault, instead of hand-rolling
     /// per-server stage loops that abort halfway with partial staging.
     pub async fn stage_reload_all(&self) -> Result<McpReloadReport, McpError> {
+        if self.is_closing() {
+            return Err(McpError::RouterShutDown);
+        }
         let mut router = self.router.write().await;
         let router = router.as_mut().ok_or(McpError::RouterShutDown)?;
         let mut report = McpReloadReport::default();
@@ -1389,6 +1514,9 @@ impl AgentToolDispatcher for McpRouterAdapter {
         call: ToolCallView<'_>,
         context: &meerkat_core::ToolDispatchContext,
     ) -> Result<meerkat_core::ops::ToolDispatchOutcome, ToolError> {
+        if self.is_closing() {
+            return Err(ToolError::execution_failed("MCP router is closing"));
+        }
         let guard = self.router.read().await;
         match &*guard {
             Some(router) => router.dispatch_with_context(call, context).await,
@@ -1402,6 +1530,9 @@ impl AgentToolDispatcher for McpRouterAdapter {
         context: &meerkat_core::ToolDispatchContext,
         plan: &meerkat_core::ResolvedToolExecutionPlan,
     ) -> Result<meerkat_core::ops::ToolDispatchOutcome, ToolError> {
+        if self.is_closing() {
+            return Err(ToolError::execution_failed("MCP router is closing"));
+        }
         let guard = self.router.read().await;
         match &*guard {
             Some(router) => {
@@ -1676,6 +1807,10 @@ impl meerkat_core::McpOperationObserver for McpRouterAdapter {
         McpRouterAdapter::observe_operation(self, server, raw_operation).await
     }
 }
+
+#[cfg(test)]
+#[path = "shutdown_observer_tests.rs"]
+mod shutdown_observer_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

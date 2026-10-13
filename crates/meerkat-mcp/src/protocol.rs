@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::{McpError, ToolDiscoveryLimit};
 
 pub struct McpProtocol {
-    service: crate::client_service::ConnectedClient,
+    service: crate::connection::HeldClient,
     /// The stdio server's process when built from a connection that owns one.
     stdio_child: Option<crate::connection::StdioChildCustody>,
     /// Server name for typed call failures.
@@ -45,7 +45,7 @@ impl McpProtocol {
     }
 
     pub(crate) fn from_connection(
-        service: crate::client_service::ConnectedClient,
+        service: crate::connection::HeldClient,
         stdio_child: Option<crate::connection::StdioChildCustody>,
         server: String,
         access: Option<meerkat_core::McpServerAccess>,

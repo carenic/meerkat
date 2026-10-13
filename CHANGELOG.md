@@ -37,6 +37,9 @@ them.
 
 ### Breaking
 
+- `meerkat-mcp`: `McpError` has a new variant, `CloseTimedOut { server, bound }`,
+  for a connection whose client close did not finish within its bound.
+  Exhaustive matches over `McpError` need an arm for it.
 - MobKit is renamed Meta in Core's public surface, with no aliases for the
   old names. `meerkat-contracts`: `MobkitJobHeartbeatParams`,
   `MobkitJobProgressParams`, `MobkitJobCheckpointParams`,
@@ -2048,6 +2051,47 @@ them.
 
 ### Fixed
 
+- `meerkat-mcp`: shutdown reports what each MCP server close observed
+  instead of discarding it. `McpRouter::shutdown_with_report` returns an
+  `McpRouterShutdownReport` with one `McpServerCloseRecord` per close the
+  router owned: established servers, pending connect attempts (a failed
+  attempt's own close included), closes still running from an earlier
+  remove, reload or replace, and earlier closes that ended unsettled.
+  `McpRouter::shutdown` keeps its signature and delegates. Each record's
+  `McpServerCloseOutcome` is typed: a stdio close keeps its shared
+  `McpStdioCloseReceipt`, a failed reap included, and counts as settled
+  only when its leader was reaped and every holder of its stdout closed
+  it. A stdio server's custody keeps the receipt of its one close for
+  every caller that joins it, so a join no longer loses it.
+  `McpConnection::close_with_outcome` reports one connection's close the
+  same way (`close` and `close_with_receipt` are unchanged), and
+  `McpConnection::connect_within` connects under a timeout and reports the
+  close of any process a failed or timed-out connect spawned.
+  `McpRouterAdapter::shutdown_with_report` and
+  `McpRouterAdapter::shutdown_observer` publish the one report to observers
+  that outlive the adapter, or `Abandoned` when the adapter was dropped
+  without shutting its router down or its shutdown task was dropped before
+  reporting. `McpStdioCloseBounds::close_bound` is the longest one stdio
+  close runs.
+  Every connect attempt's process and client custodies are created and
+  indexed together, under the router's close admission freeze, before
+  anything can spawn or connect. `McpRouterAdapter::begin_close` starts
+  every close the router owns at once, without the router lock or any
+  in-flight dispatch: from then on dispatch and staging refuse before
+  taking a router guard, a connect attempt stops and spawns or connects
+  nothing more, each stdio server's client and then its process are closed
+  under its own bounds, and each remote connection's client is closed. Its
+  `McpCloseTicket` gives the closes' deadline, counted from when each close
+  actually began, and their outcomes, a remote close included
+  (`NoProcess` only once its client ended); the adapter's and the router's
+  shutdowns now begin the same way and join the same closes. A remote
+  connection's client close is now bounded by the default close bound, and
+  its expiry is `McpError::CloseTimedOut`.
+- `meerkat`: `AgentFactory::with_mcp_adapter_custody` gives each
+  construction's own MCP router adapter to a host's `McpAdapterCustody`
+  as soon as the construction's cleanup owns it, before any server is
+  staged. A closed custody (`McpAdapterCustodyClosed`) fails the build
+  there, before any server process exists.
 - `meerkat-mcp`: a Streamable HTTP inspection can run within a caller-held
   `McpConnectAttempt`, created before the inspection's first await
   (`McpConnection::connect_and_enumerate_in_attempt` and
