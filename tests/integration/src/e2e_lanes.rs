@@ -6601,13 +6601,13 @@ fn suite_spec(name: &str) -> Option<&'static Spec> {
 mod tests {
     use super::{
         ArtifactManifest, ArtifactRequirement, CommandLockMode, CommandSpec, E2ePlan, E2eSelection,
-        ExecutionMode, Lane, NodeSetup, OutputPolicy, SMOKE_ENTRIES, SmokeRuntimeClass,
-        SmokeScheduler, bazel_build_event_provenance, build_commands_for_mode,
+        ExecutionMode, Lane, NodeSetup, OutputPolicy, RustTestRequirement, SMOKE_ENTRIES,
+        SmokeRuntimeClass, SmokeScheduler, bazel_build_event_provenance, build_commands_for_mode,
         inherited_cargo_build_context, normalize_command_with_env, order_smoke_specs_for_runtime,
-        parse_cargo_build_requirement, plan_for_selection, pre_command_lock_mode, repo_cargo,
-        require_built_by_recorded_invocation, run_command, sanitize_artifact_key, scenario_env,
-        scenario_spec, smoke_runtime_class, smoke_test_filter_for_selection, source_revision_key,
-        suite_spec, workspace_root,
+        parse_cargo_build_requirement, parse_cargo_test_requirement, plan_for_selection,
+        pre_command_lock_mode, repo_cargo, require_built_by_recorded_invocation, run_command,
+        sanitize_artifact_key, scenario_env, scenario_spec, smoke_runtime_class,
+        smoke_test_filter_for_selection, source_revision_key, suite_spec, workspace_root,
     };
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -6812,6 +6812,94 @@ mod tests {
             missing.is_empty() && stale.is_empty(),
             "prebuild_e2e_system_bins is out of step with the system suites' pre-commands; \
              missing: {missing:?}; stale: {stale:?}"
+        );
+    }
+
+    /// The e2e-system lane prebuilds (scripts/run-build-backend-lane,
+    /// `prebuild_e2e_system_rkat_tests` and `prebuild_e2e_system_other_tests`)
+    /// the test target of every cargo-test suite in tests/e2e_system_lane.rs,
+    /// with the suite's own package and features: a target missing from the
+    /// prebuild compiles inside its first suite's behaviour timeout.
+    #[test]
+    fn system_lane_prebuild_builds_every_system_suites_test_target() {
+        let root = workspace_root();
+        let script_path = root.join("scripts/run-build-backend-lane");
+        let lane_path = root.join("tests/integration/tests/e2e_system_lane.rs");
+        let (Ok(script), Ok(lane)) = (
+            std::fs::read_to_string(&script_path),
+            std::fs::read_to_string(&lane_path),
+        ) else {
+            // The Bazel unit target's runfiles do not carry scripts/; the
+            // Cargo unit lane runs this drift gate on every CI push.
+            eprintln!(
+                "skipping system test-target prebuild coverage: {} or {} not present in this sandbox",
+                script_path.display(),
+                lane_path.display()
+            );
+            return;
+        };
+
+        let mut needed = BTreeSet::new();
+        for invocation in lane.split("system_suite!(").skip(1) {
+            let suite = invocation
+                .split('"')
+                .nth(1)
+                .expect("every system_suite! names its suite");
+            let spec =
+                suite_spec(suite).unwrap_or_else(|| panic!("system suite '{suite}' has no spec"));
+            if let CommandSpec::CargoTest {
+                package,
+                test_target,
+                features,
+                all_features,
+                ..
+            } = spec.command
+            {
+                needed.insert(RustTestRequirement::new(
+                    package,
+                    test_target,
+                    features,
+                    all_features,
+                ));
+            }
+        }
+        assert!(
+            !needed.is_empty(),
+            "no cargo-test system suites found in {}",
+            lane_path.display()
+        );
+
+        let mut prebuilt = BTreeSet::new();
+        for function in [
+            "prebuild_e2e_system_rkat_tests",
+            "prebuild_e2e_system_other_tests",
+        ] {
+            // Each entry is one command continued over several lines.
+            let body = script
+                .split(&format!("{function}() {{"))
+                .nth(1)
+                .and_then(|rest| rest.split("\n}").next())
+                .unwrap_or_else(|| panic!("{function} is defined"))
+                .replace("\\\n", " ");
+            prebuilt.extend(
+                body.lines()
+                    .filter_map(|line| line.trim().strip_prefix("\"${cargo_bin}\" "))
+                    .map(|arguments| {
+                        let command: Vec<&str> = std::iter::once("cargo")
+                            .chain(arguments.split_whitespace())
+                            .collect();
+                        assert!(command.contains(&"--no-run"), "not a prebuild: {arguments}");
+                        parse_cargo_test_requirement(&command).unwrap_or_else(|| {
+                            panic!("not a cargo test build of one target: {arguments}")
+                        })
+                    }),
+            );
+        }
+
+        let missing: Vec<_> = needed.difference(&prebuilt).collect();
+        assert!(
+            missing.is_empty(),
+            "the e2e-system prebuild misses system suites' test targets: {missing:?}"
         );
     }
 

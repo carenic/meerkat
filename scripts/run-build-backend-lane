@@ -114,6 +114,11 @@ prebuild_e2e_system_rkat_tests() {
     --features integration-real-tests \
     --test live_smoke_cli \
     --no-run
+  "${cargo_bin}" test \
+    -p rkat \
+    --features integration-real-tests \
+    --test system_cli_realm_mcp \
+    --no-run
 }
 
 prebuild_e2e_system_other_tests() {
@@ -129,6 +134,10 @@ prebuild_e2e_system_other_tests() {
   "${cargo_bin}" test \
     -p meerkat-integration-tests \
     --test system_shared_realm \
+    --no-run
+  "${cargo_bin}" test \
+    -p meerkat-rpc \
+    --test realm_mcp_original_session \
     --no-run
 }
 
