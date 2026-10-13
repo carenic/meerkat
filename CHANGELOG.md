@@ -2274,6 +2274,11 @@ them.
 
 ### Fixed
 
+- `meerkat-rpc`: a mob member's callback tools are those registered on the
+  connection that created its mob, before or after the member's spawn;
+  `rkat-rpc` mob members had none since callback routes became
+  per-connection in 0.8.51. A mob without a live route is claimed by the
+  connection that spawns into it.
 - `meerkat-mcp`: shutdown reports what each MCP server close observed
   instead of discarding it. `McpRouter::shutdown_with_report` returns an
   `McpRouterShutdownReport` with one `McpServerCloseRecord` per close the

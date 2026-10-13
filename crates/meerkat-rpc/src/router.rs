@@ -179,6 +179,26 @@ pub fn compose_rpc_mob_state(
                 .map(|dispatcher| Arc::new(dispatcher) as Arc<dyn AgentToolDispatcher>)
         }
     });
+    // A mob's members build their callback tools from the route of the
+    // connection that owns the mob (`SessionRuntime::mob_callback_route`);
+    // the process-default source above serves only a restored mob's builds
+    // before its id is known.
+    let mob_tools_provider: Arc<
+        dyn Fn(&meerkat_mob::MobId) -> Option<Arc<dyn AgentToolDispatcher>> + Send + Sync,
+    > = Arc::new({
+        let runtime = Arc::downgrade(runtime);
+        let configured_mcp_tools = configured_mcp_tools.clone();
+        move |mob_id: &meerkat_mob::MobId| {
+            let callback_tools = runtime.upgrade().and_then(|runtime| {
+                let route = runtime.mob_callback_route(mob_id)?;
+                Some(
+                    Arc::new(runtime.callback_tool_dispatcher_for_route(&route, vec![]))
+                        as Arc<dyn AgentToolDispatcher>,
+                )
+            });
+            compose_rpc_mob_external_tools(callback_tools, configured_mcp_tools.clone())
+        }
+    });
     let tools_provider =
         rpc_mob_external_tools_provider_from_parts(callback_tools_provider, configured_mcp_tools);
     let mut state = meerkat_mob_mcp::MobMcpState::new_with_runtime_adapter(
@@ -203,6 +223,7 @@ pub fn compose_rpc_mob_state(
     )
     .with_default_llm_client_provider(Some(llm_provider))
     .with_external_tools_provider(Some(tools_provider))
+    .with_mob_external_tools_provider(Some(mob_tools_provider))
     // A top-level session that convenes a detached council is revived
     // through this runtime when its idle executor was retired meanwhile.
     .with_detached_owner_host(Arc::new(crate::detached_owner::RpcDetachedOwnerHost::new(
@@ -229,6 +250,26 @@ fn send_receipt_json(
     receipt: meerkat_core::comms::SendReceipt,
 ) -> Result<serde_json::Value, serde_json::Error> {
     serde_json::to_value(meerkat_contracts::CommsSendResult::from(receipt))
+}
+
+/// The mob a member-building call addresses.
+#[cfg(feature = "mob")]
+#[derive(serde::Deserialize)]
+struct MobCallbackRouteParams {
+    mob_id: String,
+}
+
+/// The mob a `mob/create` call creates.
+#[cfg(feature = "mob")]
+#[derive(serde::Deserialize)]
+struct MobCreateCallbackRouteParams {
+    definition: MobCallbackRouteParamsDefinition,
+}
+
+#[cfg(feature = "mob")]
+#[derive(serde::Deserialize)]
+struct MobCallbackRouteParamsDefinition {
+    id: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2024,6 +2065,44 @@ impl MethodRouter {
             .or_else(|| self.runtime.default_callback_route())
     }
 
+    /// `mob/create`: the new mob's members build their callback tools from
+    /// this connection's route.
+    #[cfg(feature = "mob")]
+    async fn handle_mob_create(
+        &self,
+        id: Option<crate::protocol::RpcId>,
+        params: Option<&serde_json::value::RawValue>,
+    ) -> RpcResponse {
+        let response = handlers::mob::handle_create(id, params, &self.mob_state).await;
+        if response.error.is_none()
+            && let Some(route) = &self.callback_route
+            && let Some(params) = params.and_then(|params| {
+                serde_json::from_str::<MobCreateCallbackRouteParams>(params.get()).ok()
+            })
+        {
+            self.runtime.bind_mob_callback_route(
+                meerkat_mob::MobId::from(params.definition.id.as_str()),
+                route.clone(),
+            );
+        }
+        response
+    }
+
+    /// Before a call that builds members of a mob: a mob without a live
+    /// callback route takes this connection's.
+    #[cfg(feature = "mob")]
+    fn claim_mob_callback_route(&self, params: Option<&serde_json::value::RawValue>) {
+        if let Some(route) = &self.callback_route
+            && let Some(params) = params.and_then(|params| {
+                serde_json::from_str::<MobCallbackRouteParams>(params.get()).ok()
+            })
+            && !params.mob_id.trim().is_empty()
+        {
+            self.runtime
+                .claim_mob_callback_route(&meerkat_mob::MobId::from(params.mob_id.as_str()), route);
+        }
+    }
+
     // This intentionally does only the minimum owner probe. Handlers perform
     // the authoritative operation-specific read again so they observe the
     // freshest lifecycle state instead of routing off a cached snapshot.
@@ -2548,9 +2627,7 @@ impl MethodRouter {
                 }
             }
             #[cfg(feature = "mob")]
-            "mob/create" => {
-                routed_arm(|| handlers::mob::handle_create(id, params, &self.mob_state)).await
-            }
+            "mob/create" => routed_arm(|| self.handle_mob_create(id, params)).await,
             #[cfg(feature = "mob")]
             "mob/list" => routed_arm(|| handlers::mob::handle_list(id, &self.mob_state)).await,
             #[cfg(feature = "mob")]
@@ -2563,14 +2640,17 @@ impl MethodRouter {
             }
             #[cfg(feature = "mob")]
             "mob/spawn" => {
+                self.claim_mob_callback_route(params);
                 routed_arm(|| handlers::mob::handle_spawn(id, params, &self.mob_state)).await
             }
             #[cfg(feature = "mob")]
             "mob/spawn_many" => {
+                self.claim_mob_callback_route(params);
                 routed_arm(|| handlers::mob::handle_spawn_many(id, params, &self.mob_state)).await
             }
             #[cfg(feature = "mob")]
             "mob/ensure_member" => {
+                self.claim_mob_callback_route(params);
                 routed_arm(|| handlers::mob::handle_ensure_member(id, params, &self.mob_state))
                     .await
             }
@@ -2631,6 +2711,7 @@ impl MethodRouter {
             }
             #[cfg(feature = "mob")]
             "mob/respawn" => {
+                self.claim_mob_callback_route(params);
                 routed_arm(|| handlers::mob::handle_respawn(id, params, &self.mob_state)).await
             }
             #[cfg(feature = "mob")]

@@ -2548,6 +2548,13 @@ pub struct SessionRuntime {
     /// an unbound session falls back to the process-default route only.
     session_callback_routes:
         StdRwLock<HashMap<SessionId, crate::callback_dispatcher::CallbackRoute>>,
+    /// The callback route each mob's members build their callback tools
+    /// from: the route of the connection that created the mob, or that
+    /// spawned into it while it had no live route. An unbound mob falls back
+    /// to the process-default route only.
+    #[cfg(feature = "mob")]
+    mob_callback_routes:
+        StdRwLock<HashMap<meerkat_mob::MobId, crate::callback_dispatcher::CallbackRoute>>,
     /// Handle to the builder's mob tools slot inside the session service.
     /// Captured before the builder is consumed so `set_mob_tools` can write
     /// through to the actual builder that creates agents.
@@ -3500,6 +3507,8 @@ impl SessionRuntime {
             unsettled_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             default_callback_route: StdRwLock::new(None),
             session_callback_routes: StdRwLock::new(HashMap::new()),
+            #[cfg(feature = "mob")]
+            mob_callback_routes: StdRwLock::new(HashMap::new()),
             builder_mob_tools_slot,
             builder_schedule_tools_slot,
             builder_agent_llm_client_decorator_slot,
@@ -3669,6 +3678,8 @@ impl SessionRuntime {
             unsettled_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             default_callback_route: StdRwLock::new(None),
             session_callback_routes: StdRwLock::new(HashMap::new()),
+            #[cfg(feature = "mob")]
+            mob_callback_routes: StdRwLock::new(HashMap::new()),
             builder_mob_tools_slot,
             builder_schedule_tools_slot,
             builder_agent_llm_client_decorator_slot,
@@ -6997,6 +7008,55 @@ impl SessionRuntime {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id);
+    }
+
+    /// Bind `mob_id`'s members to `route`, replacing any earlier binding:
+    /// the connection that created the mob owns its callbacks.
+    #[cfg(feature = "mob")]
+    pub(crate) fn bind_mob_callback_route(
+        &self,
+        mob_id: meerkat_mob::MobId,
+        route: crate::callback_dispatcher::CallbackRoute,
+    ) {
+        self.mob_callback_routes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(mob_id, route);
+    }
+
+    /// Bind `mob_id`'s members to `route` unless they have a live route: a
+    /// restored mob, or one whose connection is gone, is claimed by the
+    /// connection that spawns into it. Another connection's live route is
+    /// never replaced.
+    #[cfg(feature = "mob")]
+    pub(crate) fn claim_mob_callback_route(
+        &self,
+        mob_id: &meerkat_mob::MobId,
+        route: &crate::callback_dispatcher::CallbackRoute,
+    ) {
+        let mut routes = self
+            .mob_callback_routes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if routes.get(mob_id).is_none_or(|bound| bound.is_closed()) {
+            routes.insert(mob_id.clone(), route.clone());
+        }
+    }
+
+    /// The callback route `mob_id`'s members build their callback tools
+    /// from, falling back to the process-default route for an unbound mob.
+    /// Never another connection's route.
+    #[cfg(feature = "mob")]
+    pub(crate) fn mob_callback_route(
+        &self,
+        mob_id: &meerkat_mob::MobId,
+    ) -> Option<crate::callback_dispatcher::CallbackRoute> {
+        self.mob_callback_routes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(mob_id)
+            .cloned()
+            .or_else(|| self.default_callback_route())
     }
 
     /// P1#5: attach the live adapter host so the runtime can fan out
