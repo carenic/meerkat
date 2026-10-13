@@ -1777,6 +1777,16 @@ mod tcp_callback_ownership {
                 1 => route_case(&mut h).await,
                 2 => disconnect_case(&mut h, false).await,
                 3 => disconnect_case(&mut h, true).await,
+                #[cfg(feature = "mob")]
+                4 => mob_member_case(&mut h, true).await,
+                #[cfg(feature = "mob")]
+                5 => mob_member_case(&mut h, false).await,
+                #[cfg(feature = "mob")]
+                6 => mob_foreign_refused_spawn_case(&mut h).await,
+                #[cfg(feature = "mob")]
+                7 => mob_recreated_case(&mut h, true).await,
+                #[cfg(feature = "mob")]
+                8 => mob_recreated_case(&mut h, false).await,
                 _ => unreachable!(),
             }
             h.exhausted();
@@ -2063,5 +2073,278 @@ mod tcp_callback_ownership {
     #[ignore = "#1458: TCP EOF aborts the connection's in-flight turn/start; out of scope for #1451"]
     async fn tcp_callback_disconnected_owner_accepted_work_finishes_after_eof() {
         run_case(3).await;
+    }
+
+    /// A mob member's callback tools are the tools registered on the
+    /// connection that created its mob: the member sees the tool, loads it
+    /// and its call reaches that connection, whether the tool was registered
+    /// before the member was spawned (`register_first`) or after.
+    #[cfg(feature = "mob")]
+    async fn mob_member_case(h: &mut Harness, register_first: bool) {
+        let (prompt, tool) = if register_first {
+            ("mob-register-then-spawn", "early_lookup")
+        } else {
+            ("mob-spawn-then-register", "late_lookup")
+        };
+        h.provider.plan(
+            prompt,
+            [
+                Step::Load {
+                    tool,
+                    call_id: "load-member",
+                },
+                Step::Call {
+                    tool,
+                    call_id: "call-member",
+                },
+                finish(),
+            ],
+        );
+        let (_, mut a) = h.connect().await;
+        if register_first {
+            a.register(tool).await;
+        }
+        let mob_id = a
+            .request(
+                5,
+                "mob/create",
+                json!({"definition":{"id":"callback_mob","profiles":{"worker":{"model":"claude-sonnet-4-6","tools":{"comms":true}}}}}),
+            )
+            .await["mob_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        a.request(
+            6,
+            "mob/spawn",
+            json!({"mob_id":mob_id,"profile":"worker","agent_identity":"w1","runtime_mode":"turn_driven"}),
+        )
+        .await;
+        if !register_first {
+            a.register(tool).await;
+        }
+        a.send(json!({"jsonrpc":"2.0","id":7,"method":"mob/turn_start","params":{"mob_id":mob_id,"agent_identity":"w1","prompt":prompt}}))
+            .await;
+        let initial = h.seen(prompt).await;
+        assert!(
+            initial.tools.iter().any(|name| name == "tool_catalog_load"),
+            "the member has the connection's deferred callback tools: {initial:?}"
+        );
+        let loaded = h.seen(prompt).await;
+        assert_catalog_load(&loaded, "load-member", tool);
+        assert!(
+            loaded.tools.iter().any(|name| name == tool),
+            "real catalog load: {loaded:?}"
+        );
+        let callback = a.next_significant().await;
+        assert_eq!(callback["params"]["name"], tool, "{callback}");
+        assert_eq!(
+            callback["params"]["tool_use_id"], "call-member",
+            "{callback}"
+        );
+        a.answer(&callback, "member-synthetic-result").await;
+        a.response(7).await;
+        assert_result(
+            &h.seen(prompt).await,
+            "call-member",
+            "member-synthetic-result",
+        );
+    }
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn tcp_callback_tools_registered_before_spawn_reach_the_mob_member() {
+        run_case(4).await;
+    }
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn tcp_callback_tools_registered_after_spawn_reach_the_mob_member() {
+        run_case(5).await;
+    }
+
+    /// A refused member-building call from another connection binds nothing:
+    /// after B's malformed mob/spawn on A's mob, A's member still sees and
+    /// calls A's tool, and the call arrives on A.
+    #[cfg(feature = "mob")]
+    async fn mob_foreign_refused_spawn_case(h: &mut Harness) {
+        let (prompt, tool) = ("mob-after-foreign-refused-spawn", "owner_lookup");
+        h.provider.plan(
+            prompt,
+            [
+                Step::Load {
+                    tool,
+                    call_id: "load-owner",
+                },
+                Step::Call {
+                    tool,
+                    call_id: "call-owner",
+                },
+                finish(),
+            ],
+        );
+        let (_, mut a) = h.connect().await;
+        let (_, mut b) = h.connect().await;
+        a.register(tool).await;
+        let mob_id = a
+            .request(
+                5,
+                "mob/create",
+                json!({"definition":{"id":"owned_mob","profiles":{"worker":{"model":"claude-sonnet-4-6","tools":{"comms":true}}}}}),
+            )
+            .await["mob_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // No profile or agent identity: the handler refuses it.
+        b.send(json!({"jsonrpc":"2.0","id":6,"method":"mob/spawn","params":{"mob_id":mob_id}}))
+            .await;
+        let refused = b.next_significant().await;
+        assert_eq!(refused["id"], json!(6), "{refused}");
+        assert!(!refused["error"].is_null(), "{refused}");
+        a.request(
+            7,
+            "mob/spawn",
+            json!({"mob_id":mob_id,"profile":"worker","agent_identity":"w1","runtime_mode":"turn_driven"}),
+        )
+        .await;
+        a.send(json!({"jsonrpc":"2.0","id":8,"method":"mob/turn_start","params":{"mob_id":mob_id,"agent_identity":"w1","prompt":prompt}}))
+            .await;
+        let loaded = {
+            let initial = h.seen(prompt).await;
+            assert!(
+                initial.tools.iter().any(|name| name == "tool_catalog_load"),
+                "{initial:?}"
+            );
+            h.seen(prompt).await
+        };
+        assert_catalog_load(&loaded, "load-owner", tool);
+        let (owner, callback) = tokio::select! {
+            frame = a.next_significant() => ("A", frame),
+            frame = b.next_significant() => ("B", frame),
+        };
+        assert_eq!(callback["params"]["name"], tool, "{callback}");
+        if owner == "A" {
+            a.answer(&callback, "owner-synthetic-result").await;
+        } else {
+            b.answer(&callback, "owner-synthetic-result").await;
+        }
+        a.response(8).await;
+        assert_result(
+            &h.seen(prompt).await,
+            "call-owner",
+            "owner-synthetic-result",
+        );
+        assert_eq!(owner, "A", "A's member's callback arrived on B: {callback}");
+    }
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn tcp_callback_refused_foreign_spawn_leaves_the_mob_route_with_its_creator() {
+        run_case(6).await;
+    }
+
+    /// A mob's callback route belongs to the incarnation its connection
+    /// created. A creates M, registers its tool and destroys M; M is then
+    /// re-created, over RPC by B (`over_rpc`) or in-process, and B spawns a
+    /// member. That member never reaches A's tool: over RPC it has B's, and
+    /// in-process (no creating connection) it has no callback tools at all.
+    #[cfg(feature = "mob")]
+    async fn mob_recreated_case(h: &mut Harness, over_rpc: bool) {
+        let prompt = if over_rpc {
+            "mob-recreated-over-rpc"
+        } else {
+            "mob-recreated-in-process"
+        };
+        if over_rpc {
+            h.provider.plan(
+                prompt,
+                [
+                    Step::Load {
+                        tool: "b_lookup",
+                        call_id: "load-b-member",
+                    },
+                    Step::Call {
+                        tool: "b_lookup",
+                        call_id: "call-b-member",
+                    },
+                    finish(),
+                ],
+            );
+        } else {
+            h.provider.plan(prompt, [finish()]);
+        }
+        let (_, mut a) = h.connect().await;
+        let (_, mut b) = h.connect().await;
+        a.register("a_lookup").await;
+        b.register("b_lookup").await;
+        let definition = json!({"id":"implicit-stale","profiles":{"delegate":{"model":"claude-sonnet-4-6","tools":{"comms":true}}}});
+        a.request(5, "mob/create", json!({ "definition": definition }))
+            .await;
+        a.request(6, "mob/destroy", json!({"mob_id":"implicit-stale"}))
+            .await;
+        if over_rpc {
+            b.request(7, "mob/create", json!({ "definition": definition }))
+                .await;
+        } else {
+            h.runtime
+                .mob_state()
+                .expect("the RPC mob state")
+                .mob_create_definition(meerkat_mob::MobDefinition::implicit(
+                    "stale",
+                    "claude-sonnet-4-6",
+                ))
+                .await
+                .expect("re-created in-process");
+        }
+        b.request(
+            8,
+            "mob/spawn",
+            json!({"mob_id":"implicit-stale","profile":"delegate","agent_identity":"w1","runtime_mode":"turn_driven"}),
+        )
+        .await;
+        b.send(json!({"jsonrpc":"2.0","id":9,"method":"mob/turn_start","params":{"mob_id":"implicit-stale","agent_identity":"w1","prompt":prompt}}))
+            .await;
+        let initial = h.seen(prompt).await;
+        if !over_rpc {
+            assert!(
+                !initial
+                    .tools
+                    .iter()
+                    .any(|name| name == "tool_catalog_load" || name.ends_with("_lookup")),
+                "a mob no connection created has no callback tools: {initial:?}"
+            );
+            b.response(9).await;
+            return;
+        }
+        let loaded = h.seen(prompt).await;
+        assert_catalog_load(&loaded, "load-b-member", "b_lookup");
+        assert!(
+            !loaded.tools.iter().any(|name| name == "a_lookup"),
+            "A's tool reached the re-created mob: {loaded:?}"
+        );
+        let (owner, callback) = tokio::select! {
+            frame = a.next_significant() => ("A", frame),
+            frame = b.next_significant() => ("B", frame),
+        };
+        assert_eq!(callback["params"]["name"], "b_lookup", "{callback}");
+        if owner == "B" {
+            b.answer(&callback, "b-member-result").await;
+        } else {
+            a.answer(&callback, "b-member-result").await;
+        }
+        b.response(9).await;
+        assert_result(&h.seen(prompt).await, "call-b-member", "b-member-result");
+        assert_eq!(
+            owner, "B",
+            "the re-created mob's callback arrived on A: {callback}"
+        );
+    }
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn tcp_callback_mob_recreated_over_rpc_never_reaches_the_old_creator() {
+        run_case(7).await;
+    }
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn tcp_callback_mob_recreated_in_process_never_reaches_the_old_creator() {
+        run_case(8).await;
     }
 }

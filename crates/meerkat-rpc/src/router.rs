@@ -2024,6 +2024,35 @@ impl MethodRouter {
             .or_else(|| self.runtime.default_callback_route())
     }
 
+    /// `mob/create`: the new mob's members build their callback tools from
+    /// this connection's route. The route is given to that mob alone when it
+    /// is built, so a mob later created under the same id, or restored, never
+    /// reaches this connection's callbacks.
+    #[cfg(feature = "mob")]
+    async fn handle_mob_create(
+        &self,
+        id: Option<crate::protocol::RpcId>,
+        params: Option<&serde_json::value::RawValue>,
+    ) -> RpcResponse {
+        let member_external_tools = self.callback_route.clone().map(|route| {
+            let runtime = Arc::downgrade(&self.runtime);
+            Arc::new(move || {
+                let runtime = runtime.upgrade()?;
+                Some(
+                    Arc::new(runtime.callback_tool_dispatcher_for_route(&route, vec![]))
+                        as Arc<dyn AgentToolDispatcher>,
+                )
+            }) as meerkat_mob::ExternalToolsProvider
+        });
+        handlers::mob::handle_create_with_member_external_tools(
+            id,
+            params,
+            &self.mob_state,
+            member_external_tools,
+        )
+        .await
+    }
+
     // This intentionally does only the minimum owner probe. Handlers perform
     // the authoritative operation-specific read again so they observe the
     // freshest lifecycle state instead of routing off a cached snapshot.
@@ -2548,9 +2577,7 @@ impl MethodRouter {
                 }
             }
             #[cfg(feature = "mob")]
-            "mob/create" => {
-                routed_arm(|| handlers::mob::handle_create(id, params, &self.mob_state)).await
-            }
+            "mob/create" => routed_arm(|| self.handle_mob_create(id, params)).await,
             #[cfg(feature = "mob")]
             "mob/list" => routed_arm(|| handlers::mob::handle_list(id, &self.mob_state)).await,
             #[cfg(feature = "mob")]

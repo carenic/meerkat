@@ -315,6 +315,56 @@ async fn the_custody_resolver_forwards_every_credential_method_and_keeps_explici
     );
 }
 
+#[tokio::test]
+async fn the_custody_resolver_keeps_the_account_its_inner_source_selected() {
+    use meerkat_core::OperationAccount;
+    use meerkat_mcp::McpAuthResolver as _;
+    let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+    let native = crate::HostAuthService::new(
+        meerkat_providers::auth_store::ProviderAuthPersistence::new(
+            store(),
+            Arc::new(meerkat_providers::auth_store::InMemoryCoordinator::new()),
+        ),
+        runtime.provider_auth_runtime_authority(),
+    )
+    .with_mcp_realm(realm("team"))
+    .mcp_oauth_authority()
+    .expect("the native MCP OAuth owner");
+    let target = |account: Option<&str>| {
+        let mut server = McpServerConfig::streamable_http(
+            "mail",
+            "https://mcp.example:8443/mcp",
+            HashMap::new(),
+        );
+        if let McpTransportConfig::Http(http) = &mut server.transport {
+            http.oauth_account = account.map(str::to_owned);
+        }
+        meerkat_providers::mcp_oauth::McpServerIdentity::from_config(&server)
+            .expect("the server's OAuth target")
+    };
+    let (selected, unselected) = (target(Some("subject-7")), target(None));
+    let known = OperationAccount::selected("https://mcp.example:8443", "subject-7");
+    assert_eq!(
+        native.selected_account(&selected),
+        known,
+        "positive control: the native owner states its Known selection"
+    );
+
+    // The custody states the native owner's selection, and none of its own.
+    let docs = Documents::new([("team", document("team", None, vec![search(&[])]))]);
+    let wrapped = RealmMcpServiceSecrets::from_realm_source(
+        docs as Arc<dyn meerkat_core::RealmConfigSource>,
+        realm("team"),
+        store(),
+    )
+    .serve_for(Arc::new(native));
+    assert_eq!(wrapped.selected_account(&selected), known);
+    assert_eq!(
+        wrapped.selected_account(&unselected),
+        OperationAccount::Unavailable
+    );
+}
+
 #[cfg(all(feature = "session-store", feature = "local-authorization"))]
 mod owner_updates {
     use std::path::{Path, PathBuf};

@@ -2274,6 +2274,10 @@ them.
 
 ### Fixed
 
+- `meerkat-rpc`: a mob member's callback tools are those registered on the
+  connection that created its mob, before or after the member's spawn;
+  `rkat-rpc` mob members had none since callback routes became
+  per-connection in 0.8.51.
 - `meerkat-mcp`: shutdown reports what each MCP server close observed
   instead of discarding it. `McpRouter::shutdown_with_report` returns an
   `McpRouterShutdownReport` with one `McpServerCloseRecord` per close the
@@ -2445,6 +2449,31 @@ them.
   turn, as the shared runtime-backed executor does, instead of every
   governed prompt being refused as "governed executor support is
   unavailable".
+
+- The CLI launches a realm-defined MCP stdio server with the service secrets
+  its realm stored for the server's declared `secret_env` slots. It refused
+  every declared slot before: the MCP loader of `rkat run` and `rkat resume`
+  on an ordinary realm held no service-secret custody, and the servers
+  launched through the CLI's runtime-backed composition (such as a governed
+  realm's configured servers) were refused as ownerless, because that
+  composition's configuration is a snapshot. Both now read the realm's own
+  config documents and the CLI's credential store. An unstored slot still
+  refuses the launch, and a server only an `mcp.toml` defines is still
+  refused as ownerless.
+
+- Runtime-backed hosts keep the OAuth account selected for an MCP server
+  (`oauth_account`) when realm service-secret custody wraps the host's MCP
+  credential source (`RealmMcpServiceSecrets::serve_for`), as every
+  runtime-backed composition with provider-auth persistence does. The
+  custody did not forward `McpAuthResolver::selected_account`, so the
+  account was reported as unavailable, and the stock policy refused each
+  reviewed operation on such a server. A source that states no account
+  still states none through the custody.
+
+- The MCP credential source of `rkat run` and `rkat resume` states the
+  account the native MCP OAuth owner selected for a server
+  (`oauth_account`). It stated none, so in a governed realm the stock policy
+  refused each reviewed operation on such a server.
 
 - A governed realm whose selected controller is an explicitly authless
   self-hosted server (`auth_method = "none"`) now admits its first input.
@@ -2863,6 +2892,13 @@ them.
 - In a governed realm, sessions a schedule materializes are not bound to an
   agent yet, so every configured MCP server of such a session is unavailable
   (refused, never admitted without a grant).
+- `meerkat-rpc`: a mob's members reach callback tools only through the
+  connection whose `mob/create` created that mob. A mob restored after a
+  restart, or created other than by `mob/create`, has no callback route,
+  so its members get the process-default callback tools (none in
+  `rkat-rpc`), as before this release; members of a mob whose creating
+  connection is gone keep that connection's route, and their callbacks
+  fail as unavailable. Re-create the mob to bind it to a live connection.
 
 ### Testing
 

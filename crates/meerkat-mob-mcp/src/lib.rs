@@ -2499,6 +2499,7 @@ impl MobMcpState {
         &self,
         mut builder: MobBuilder,
         scope: child_tool_policy::ChildMobScope,
+        member_external_tools: Option<meerkat_mob::ExternalToolsProvider>,
     ) -> MobBuilder {
         if let Some(hook) = self.member_runtime_registration_hook.as_ref() {
             builder = builder.with_member_runtime_registration_hook(Arc::clone(hook));
@@ -2506,7 +2507,9 @@ impl MobMcpState {
         builder = builder
             .with_session_service(self.session_service.clone())
             .allow_ephemeral_sessions(!self.session_service.supports_persistent_sessions())
-            .with_default_external_tools_provider(self.external_tools_provider.clone())
+            .with_default_external_tools_provider(
+                member_external_tools.or_else(|| self.external_tools_provider.clone()),
+            )
             .with_workgraph_service(self.workgraph_service.clone());
         builder = self.child_tool_bundles.configure(builder);
         if let Some(bundles) = self.additional_child_tool_bundles.get() {
@@ -2969,7 +2972,7 @@ impl MobMcpState {
     ) -> Result<MobId, MobError> {
         let scope = child_tool_policy::ChildMobScope::default();
         let handle = self
-            .configure_builder(MobBuilder::for_resume(storage), scope.clone())
+            .configure_builder(MobBuilder::for_resume(storage), scope.clone(), None)
             .before_activation(self.restore_scope_hook(scope))
             .resume()
             .await?;
@@ -3210,7 +3213,7 @@ impl MobMcpState {
         let scope = child_tool_policy::ChildMobScope::default();
         let (custody, custody_watch) = meerkat_mob::runtime::start_admitted_destroy_custody();
         let resumed = self
-            .configure_builder(MobBuilder::for_resume(storage), scope.clone())
+            .configure_builder(MobBuilder::for_resume(storage), scope.clone(), None)
             .before_activation(self.restore_scope_hook(scope))
             .admit_destroy_before_start(
                 CommandAuthority::principal(self.console_principal.clone()),
@@ -3479,7 +3482,23 @@ impl MobMcpState {
         &self,
         definition: MobDefinition,
     ) -> Result<MobId, MobError> {
-        self.mob_create_definition_inner(definition, None).await
+        self.mob_create_definition_inner(definition, None, None)
+            .await
+    }
+
+    /// [`Self::mob_create_definition`] whose members build with
+    /// `member_external_tools` as their default external tools, in place of
+    /// [`Self::with_external_tools_provider`]'s state-wide source: the tools
+    /// of the caller that creates the mob, such as its connection's callback
+    /// tools. They belong to this mob alone; a mob later created under the
+    /// same id, or restored, never receives them.
+    pub async fn mob_create_definition_with_member_external_tools(
+        &self,
+        definition: MobDefinition,
+        member_external_tools: meerkat_mob::ExternalToolsProvider,
+    ) -> Result<MobId, MobError> {
+        self.mob_create_definition_inner(definition, None, Some(member_external_tools))
+            .await
     }
 
     pub async fn mob_create_from_mobpack(
@@ -3542,6 +3561,7 @@ impl MobMcpState {
             .configure_builder(
                 MobBuilder::new(definition, storage),
                 child_tool_policy::ChildMobScope::default(),
+                None,
             )
             .create()
             .await?;
@@ -3599,6 +3619,7 @@ impl MobMcpState {
                 destroy_on_owner_archive,
                 implicit_delegation_mob,
             )),
+            None,
         )
         .await
     }
@@ -3607,6 +3628,7 @@ impl MobMcpState {
         &self,
         definition: MobDefinition,
         owner_bridge_session_authority: Option<(SessionId, bool, bool)>,
+        member_external_tools: Option<meerkat_mob::ExternalToolsProvider>,
     ) -> Result<MobId, MobError> {
         // (b) gate, ADJ-P5-11: no per-mob grant can authorize creating a
         // mob that does not exist yet.
@@ -3618,14 +3640,22 @@ impl MobMcpState {
                 .run_admitted_create("mob create", async move {
                     let _admission = admission;
                     state
-                        .mob_create_definition_admitted(definition, owner_bridge_session_authority)
+                        .mob_create_definition_admitted(
+                            definition,
+                            owner_bridge_session_authority,
+                            member_external_tools,
+                        )
                         .await
                 })
                 .await;
         }
         let _admission = admission;
-        self.mob_create_definition_admitted(definition, owner_bridge_session_authority)
-            .await
+        self.mob_create_definition_admitted(
+            definition,
+            owner_bridge_session_authority,
+            member_external_tools,
+        )
+        .await
     }
 
     /// Run an admitted create, which ends by inserting the mob it built, as
@@ -3653,6 +3683,7 @@ impl MobMcpState {
         &self,
         mut definition: MobDefinition,
         owner_bridge_session_authority: Option<(SessionId, bool, bool)>,
+        member_external_tools: Option<meerkat_mob::ExternalToolsProvider>,
     ) -> Result<MobId, MobError> {
         self.hydrate_definition_skill_sources(&mut definition)
             .await?;
@@ -3682,8 +3713,11 @@ impl MobMcpState {
                 .supply(&mut definition)?;
         }
         let scope = child_tool_policy::ChildMobScope::new(child);
-        let mut builder =
-            self.configure_builder(MobBuilder::new(definition.clone(), storage), scope);
+        let mut builder = self.configure_builder(
+            MobBuilder::new(definition.clone(), storage),
+            scope,
+            member_external_tools,
+        );
         if let Some((owner_bridge_session_id, destroy_on_owner_archive, implicit_delegation_mob)) =
             owner_bridge_session_authority
         {
