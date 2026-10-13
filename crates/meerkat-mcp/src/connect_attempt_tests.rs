@@ -51,6 +51,8 @@ struct Server {
     sse_get: bool,
     /// Whether its initialize answer opens a session.
     issues_session: bool,
+    /// Whether it answers `tools/list` with an error.
+    fail_tools_list: bool,
     reached: Notify,
     release: Notify,
     requests: Mutex<Vec<String>>,
@@ -63,6 +65,7 @@ impl Server {
             delete_status: StatusCode::OK,
             sse_get: false,
             issues_session: true,
+            fail_tools_list: false,
             reached: Notify::new(),
             release: Notify::new(),
             requests: Mutex::new(Vec::new()),
@@ -153,6 +156,12 @@ async fn on_post(State(server): State<Arc<Server>>, body: String) -> Response {
             server.hold(Pause::Initialized).await;
             StatusCode::ACCEPTED.into_response()
         }
+        "tools/list" if server.fail_tools_list => axum::Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32603, "message": "tool listing failed" }
+        }))
+        .into_response(),
         "tools/list" => {
             server.hold(Pause::ToolsList).await;
             axum::Json(json!({
@@ -759,4 +768,50 @@ async fn a_remote_add_applied_after_the_close_began_sends_nothing() {
     };
     assert!(report.is_settled(), "{report:?}");
     assert!(server.requests().is_empty(), "{:?}", server.requests());
+}
+
+/// A remote attempt that connected and then failed its tool enumeration
+/// closes the client it connected, and that close is still the router's to
+/// report: the shutdown waits for it (here its session deletion, held by the
+/// server) and reports it, rather than reading settled before it ended.
+#[tokio::test]
+async fn a_failed_remote_attempts_close_is_in_the_shutdown_report() {
+    let mut fixture = Server::new(Some(Pause::Delete));
+    fixture.fail_tools_list = true;
+    let (url, server) = serve(fixture).await;
+    let mut router = close_index_router();
+    router
+        .add_server(config(url))
+        .await
+        .expect_err("the enumeration fails after the connection");
+    server.reached().await;
+
+    let mut shutdown = Box::pin(router.shutdown_with_report());
+    assert!(
+        futures::poll!(shutdown.as_mut()).is_pending(),
+        "the shutdown waits for the failed attempt's close"
+    );
+    server.release.notify_one();
+    let report = tokio::time::timeout(BOUND, shutdown)
+        .await
+        .expect("the shutdown reports once the close ended");
+    match report.servers() {
+        [crate::McpServerCloseRecord { server, outcome }] => {
+            assert_eq!(server, "held");
+            assert!(
+                matches!(outcome, crate::McpServerCloseOutcome::NoProcess),
+                "{outcome:?}"
+            );
+        }
+        other => panic!("one close record: {other:?}"),
+    }
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| *request == "DELETE")
+            .count(),
+        1,
+        "the attempt's one close"
+    );
 }

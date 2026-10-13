@@ -2054,9 +2054,10 @@ them.
 - `meerkat-mcp`: shutdown reports what each MCP server close observed
   instead of discarding it. `McpRouter::shutdown_with_report` returns an
   `McpRouterShutdownReport` with one `McpServerCloseRecord` per close the
-  router owned: established servers, pending connect attempts (a failed
-  attempt's own close included), closes still running from an earlier
-  remove, reload or replace, and earlier closes that ended unsettled.
+  router owned: established servers, connect attempts (a failed attempt's
+  own close of its process, or of a remote client it connected, included),
+  closes still running from an earlier remove, reload or replace, and
+  earlier closes that ended unsettled.
   `McpRouter::shutdown` keeps its signature and delegates. Each record's
   `McpServerCloseOutcome` is typed: a stdio close keeps its shared
   `McpStdioCloseReceipt`, a failed reap included, and counts as settled

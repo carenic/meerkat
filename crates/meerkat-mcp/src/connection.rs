@@ -737,6 +737,11 @@ impl StdioChildCustody {
         }
     }
 
+    /// Whether two handles share one custody.
+    pub(crate) fn same_custody(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.slot, &other.slot)
+    }
+
     /// Whether a process is held whose close has not finished: held, or
     /// closing.
     pub(crate) fn close_pending(&self) -> bool {
@@ -2603,6 +2608,11 @@ impl McpConnection {
         close_connected(&self.config.name, self.service, self.stdio_child).await
     }
 
+    /// This connection's client custody.
+    pub(crate) fn client_custody(&self) -> &ClientCustody {
+        &self.service.custody
+    }
+
     /// [`Self::close`], reporting what it observed as one typed outcome; it
     /// never fails. A stdio server's receipt is kept whatever its leader
     /// outcome (a failed reap included), and a close of the same process
@@ -2834,6 +2844,11 @@ impl ClientCustody {
     fn changed(&self) {
         self.progress
             .send_modify(|seen| *seen = seen.wrapping_add(1));
+    }
+
+    /// Whether two handles share one custody.
+    fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.slot, &other.slot)
     }
 
     /// Refuse an attempt whose custody was closed before it began: it has
@@ -3184,7 +3199,13 @@ impl CloseIndex {
         let now = tokio::time::Instant::now();
         let closes = {
             let mut state = self.state();
-            state.closing = true;
+            if !state.closing {
+                // Freezing: closes that had already ended settled leave
+                // nothing to report; every other one stays, an earlier
+                // close that ended unsettled included.
+                state.entries.retain(|entry| !entry.finished_settled());
+                state.closing = true;
+            }
             state.entries.clone()
         };
         self.0.closing.send_replace(true);
@@ -3201,6 +3222,26 @@ impl CloseIndex {
     /// Whether [`Self::begin_close`] ran.
     pub(crate) fn is_closing(&self) -> bool {
         self.state().closing
+    }
+
+    /// Whether this index holds the attempt `client` is the client custody
+    /// of: its close is this index's to report.
+    pub(crate) fn covers_client(&self, client: &ClientCustody) -> bool {
+        self.state()
+            .entries
+            .iter()
+            .any(|entry| entry.client.same(client))
+    }
+
+    /// Whether this index holds the attempt `process` is the process custody
+    /// of: its close is this index's to report.
+    pub(crate) fn covers_process(&self, process: &StdioChildCustody) -> bool {
+        self.state().entries.iter().any(|entry| {
+            entry
+                .process
+                .as_ref()
+                .is_some_and(|indexed| indexed.same_custody(process))
+        })
     }
 }
 
@@ -3220,11 +3261,14 @@ impl IndexedClose {
             Some(process) => {
                 let client = self.client.clone();
                 let eof_grace = process.bounds.eof_grace();
+                let eof_deadline = now + eof_grace;
                 // As in an ordinary close, the client goes first: its stdin
-                // closing is the server's EOF.
+                // closing is the server's EOF. The client close and its wait
+                // end by this close's own EOF deadline, counted from its
+                // recorded start however late this first runs.
                 let close_client = async move {
-                    client.start_close(tokio::time::Instant::now(), eof_grace);
-                    let _ = tokio::time::timeout(eof_grace, client.join()).await;
+                    client.start_close(now, eof_grace);
+                    let _ = tokio::time::timeout_at(eof_deadline, client.join()).await;
                 };
                 match process.start_close(now, close_client) {
                     Ok(_) => now + process.bounds.close_bound(),
@@ -3333,9 +3377,10 @@ impl McpCloseTicket {
     /// One record per close, once it has reported: each stdio server's
     /// process close (its receipt, or why it has none) and each remote
     /// connection's client close ([`McpServerCloseOutcome::NoProcess`] only
-    /// when its client ended). A remote attempt that ended without
-    /// connecting had nothing to close and has no record. No close is
-    /// aborted.
+    /// when its client ended), for every attempt whose close had not ended
+    /// settled when the close began, an earlier close that ended unsettled
+    /// included. A remote attempt that ended without connecting had nothing
+    /// to close and has no record. No close is aborted.
     pub async fn outcomes(self) -> Vec<crate::McpServerCloseRecord> {
         futures::future::join_all(self.closes.into_iter().map(|close| async move {
             close

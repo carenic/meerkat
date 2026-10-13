@@ -1368,10 +1368,14 @@ pub struct McpServerCloseRecord {
 }
 
 /// What [`McpRouter::shutdown_with_report`] observed: one record per close
-/// the router owned. That is every established connection, every pending
-/// connect attempt's process (including the close a failed attempt ran
-/// itself) and every close still running from an earlier remove, reload or
-/// replace, plus each earlier close of those kinds that ended unsettled.
+/// the router owned. Every connect attempt's close comes from its original
+/// custody through the router's close index: each established connection,
+/// each pending attempt's process, each failed attempt's own close (its
+/// process, or a remote attempt's connected client) and every close still
+/// running from an earlier remove, reload or replace, plus each earlier close
+/// of those kinds that ended unsettled. A close the router ran outside its
+/// index (an attempt refused after the close began) is recorded by the
+/// router itself.
 #[derive(Debug)]
 pub struct McpRouterShutdownReport {
     servers: Vec<McpServerCloseRecord>,
@@ -1473,8 +1477,11 @@ pub struct McpRouter {
     /// The server each running close task is closing, by task id, so a task
     /// that ends without reporting is still attributed.
     closing_servers: HashMap<tokio::task::Id, String>,
-    /// Closes reaped before shutdown that did not settle (and failed connect
-    /// attempts' own closes that did not), kept for the shutdown report.
+    /// Running close tasks whose close the close index holds: the index
+    /// reports that close, so the task's own record is not kept.
+    indexed_closes: std::collections::HashSet<tokio::task::Id>,
+    /// Closes outside the close index reaped before shutdown that did not
+    /// settle, kept for the shutdown report.
     unsettled_closes: Vec<McpServerCloseRecord>,
     /// Every connect attempt's custodies, from the attempt's admission,
     /// shared with the adapter outside the router lock.
@@ -1873,6 +1880,7 @@ impl McpRouter {
             pending_child_custody: HashMap::new(),
             closing: tokio::task::JoinSet::new(),
             closing_servers: HashMap::new(),
+            indexed_closes: std::collections::HashSet::new(),
             unsettled_closes: Vec::new(),
             close_index: crate::connection::CloseIndex::default(),
             pending_snapshot_alignment: None,
@@ -2825,12 +2833,13 @@ impl McpRouter {
                 }
             }
             Err(err) => {
-                // The failed attempt closed its own process, and what that
-                // close observed is still the router's to report when
-                // unsettled. An attempt its close index stopped left that
-                // close to the index: one still running is joined like any
-                // close the router started.
-                if let Some(custody) = attempt_custody {
+                // The failed attempt closed its own process (or left that
+                // close to its close index), and what that close observes is
+                // still the router's to report: the close index holds it. A
+                // custody outside the index is handled here.
+                if let Some(custody) =
+                    attempt_custody.filter(|custody| !self.close_index.covers_process(custody))
+                {
                     match custody.closed_receipt() {
                         Some(receipt) => self.retain_if_unsettled(McpServerCloseRecord {
                             server: server_name.clone(),
@@ -3604,50 +3613,66 @@ impl McpRouter {
     /// custody, in a router-owned task that `shutdown` joins.
     fn spawn_custody_close(&mut self, server: String, custody: StdioChildCustody) {
         let name = server.clone();
+        let indexed = self.close_index.covers_process(&custody);
         let task = self.closing.spawn(async move {
             let outcome = pending_close_outcome(&server, &custody).await;
             McpServerCloseRecord { server, outcome }
         });
         self.closing_servers.insert(task.id(), name);
+        if indexed {
+            self.indexed_closes.insert(task.id());
+        }
     }
 
     /// [`Self::spawn_close`] without reaping finished closes first.
     fn spawn_close_task(&mut self, server_name: String, conn: McpConnection) {
         let server = server_name.clone();
+        let indexed = self.close_index.covers_client(conn.client_custody());
         let task = self.closing.spawn(async move {
             let outcome = conn.close_with_outcome().await;
             McpServerCloseRecord { server, outcome }
         });
         self.closing_servers.insert(task.id(), server_name);
-    }
-
-    /// Reap finished closes so the set stays bounded in a long-lived router,
-    /// keeping each one that did not settle for the shutdown report.
-    fn reap_closing(&mut self) {
-        while let Some(joined) = self.closing.try_join_next_with_id() {
-            let record = self.closed_record(joined);
-            Self::report_close(&record);
-            self.retain_if_unsettled(record);
+        if indexed {
+            self.indexed_closes.insert(task.id());
         }
     }
 
-    /// The record of one joined close task; a task that ended without
-    /// reporting is recorded against the server it was closing.
+    /// Reap finished closes so the set stays bounded in a long-lived router,
+    /// keeping each one outside the close index that did not settle for the
+    /// shutdown report (the index keeps its own).
+    fn reap_closing(&mut self) {
+        while let Some(joined) = self.closing.try_join_next_with_id() {
+            let (record, indexed) = self.closed_record(joined);
+            Self::report_close(&record);
+            if !indexed {
+                self.retain_if_unsettled(record);
+            }
+        }
+    }
+
+    /// The record of one joined close task, and whether the close index
+    /// holds its close; a task that ended without reporting is recorded
+    /// against the server it was closing.
     fn closed_record(
         &mut self,
         joined: Result<(tokio::task::Id, McpServerCloseRecord), tokio::task::JoinError>,
-    ) -> McpServerCloseRecord {
+    ) -> (McpServerCloseRecord, bool) {
         match joined {
             Ok((id, record)) => {
                 self.closing_servers.remove(&id);
-                record
+                (record, self.indexed_closes.remove(&id))
             }
-            Err(error) => McpServerCloseRecord {
-                server: self.closing_servers.remove(&error.id()).unwrap_or_default(),
-                outcome: McpServerCloseOutcome::TaskFailed {
-                    panicked: error.is_panic(),
-                },
-            },
+            Err(error) => {
+                let id = error.id();
+                let record = McpServerCloseRecord {
+                    server: self.closing_servers.remove(&id).unwrap_or_default(),
+                    outcome: McpServerCloseOutcome::TaskFailed {
+                        panicked: error.is_panic(),
+                    },
+                };
+                (record, self.indexed_closes.remove(&id))
+            }
         }
     }
 
@@ -4454,8 +4479,9 @@ impl McpRouter {
     /// connection captured, counted from when that close started.
     pub async fn shutdown_with_report(mut self) -> McpRouterShutdownReport {
         // Start every close now, through the close index: attempts stop, and
-        // the closes below join these.
-        drop(self.close_index.begin_close());
+        // the closes below join these. The ticket reports every close the
+        // index holds, from its original custody.
+        let ticket = self.close_index.begin_close();
         // First consume any finished pending tasks through normal processing so
         // stale completion payloads close their transports via existing paths.
         self.drain_pending();
@@ -4534,7 +4560,13 @@ impl McpRouter {
         }
         let mut closes = std::mem::take(&mut self.unsettled_closes);
         while let Some(joined) = self.closing.join_next_with_id().await {
-            let record = self.closed_record(joined);
+            let (record, indexed) = self.closed_record(joined);
+            Self::report_close(&record);
+            if !indexed {
+                closes.push(record);
+            }
+        }
+        for record in ticket.outcomes().await {
             Self::report_close(&record);
             closes.push(record);
         }

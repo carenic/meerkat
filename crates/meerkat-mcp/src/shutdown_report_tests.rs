@@ -477,11 +477,6 @@ mod stdio {
         .await;
         kill(holder);
         reaped.expect("the removal close ends within its bounds");
-        assert_eq!(
-            router.unsettled_closes.len(),
-            1,
-            "the unsettled close is kept"
-        );
 
         let report = router.shutdown_with_report().await;
 
@@ -522,7 +517,7 @@ mod stdio {
         // The attempt's own close ends after the backstop (the escaped
         // process holds the stdout); its result then carries the failure.
         let processed = tokio::time::timeout(Duration::from_secs(30), async {
-            while router.unsettled_closes.is_empty() {
+            while !router.pending_child_custody.is_empty() {
                 router.drain_pending();
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -537,6 +532,114 @@ mod stdio {
         assert_eq!(record.server, "never-answers");
         assert_reaped_with(record, still_open);
         assert!(!report.is_settled());
+    }
+
+    /// A server whose synchronous installation fails after its process
+    /// spawned closes that process itself. A close of it that ended
+    /// unsettled is still the router's to report at shutdown, although the
+    /// attempt never had a pending entry. The test kills the escaped process
+    /// once the close has ended.
+    #[tokio::test]
+    async fn a_failed_installations_unsettled_close_is_kept_for_the_report() {
+        let mut escaped = PidReport::new("report-failed-install-holder");
+        let mut router =
+            surface_router().with_stdio_close_bounds(crate::McpStdioCloseBounds::IMMEDIATE);
+        // Never answers its handshake, so its one-second connect fails.
+        let mut config = McpServerConfig::stdio(
+            "never-answers",
+            "/bin/sh",
+            vec![
+                "-c".to_string(),
+                format!(
+                    "setsid sh -c 'echo $$ > \"{}\"; exec sleep 60' &\nexec sleep 60\n",
+                    escaped.path().display()
+                ),
+            ],
+            HashMap::new(),
+        );
+        config.connect_timeout_secs = Some(1);
+        let (added, holder) = tokio::join!(router.add_server(config), escaped.pids());
+        let [holder] = holder[..] else {
+            panic!("one escaped pid: {holder:?}");
+        };
+        // The installation returns once its own close has ended.
+        added.expect_err("a server that never answers is not installed");
+        kill(holder);
+
+        let report = router.shutdown_with_report().await;
+
+        let record = only_record(&report);
+        assert_eq!(record.server, "never-answers");
+        assert_reaped_with(record, still_open);
+        assert!(!report.is_settled());
+    }
+
+    /// A stdio close the close index starts keeps the EOF deadline counted
+    /// from its recorded start, however late its task first runs: the client
+    /// close and its wait end by that deadline, so a server that ignores EOF
+    /// is terminated by it rather than after a fresh grace.
+    #[test]
+    fn a_close_the_index_starts_keeps_its_eof_deadline() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let bounds = crate::McpStdioCloseBounds::new(
+                Duration::from_secs(2),
+                Duration::from_secs(3),
+            )
+            .expect("bounds within the maximum");
+            let index = crate::connection::CloseIndex::default();
+            let attempt = index.admit("never-answers", Some(bounds));
+            let mut started = PidReport::new("index-eof-deadline");
+            let config = never_answers("never-answers", &started);
+            // The attempt spawns its server and then waits for a handshake
+            // that never comes, so its client custody stays empty.
+            let connect = tokio::spawn({
+                let process = attempt.process.clone();
+                let client = attempt.client.clone();
+                async move {
+                    McpConnection::connect_with_custody(
+                        &config,
+                        McpAuthMode::Stored,
+                        None,
+                        None,
+                        process,
+                        client,
+                        &crate::McpStdioLaunchProfile::trusted_host(),
+                        &crate::HttpEgressProfile::trusted_host(),
+                        crate::connection::PhysicalEntry::default(),
+                        None,
+                    )
+                    .await
+                }
+            });
+            let [_pid] = started.pids().await[..] else {
+                panic!("one server pid");
+            };
+
+            let ticket = index.begin_close();
+            // Hold this runtime's only thread, so the close's task first runs
+            // well after the close's recorded start.
+            std::thread::sleep(Duration::from_secs(3));
+            let records = ticket.outcomes().await;
+
+            let [record] = &records[..] else {
+                panic!("one close record: {records:?}");
+            };
+            let receipt = stdio_receipt(&record.outcome);
+            assert_eq!(
+                receipt.sigterm,
+                Some(crate::McpStdioSignalOutcome::Sent),
+                "{receipt:?}"
+            );
+            assert!(
+                receipt.elapsed < Duration::from_secs(4),
+                "terminated by its own EOF deadline, not a fresh grace after the late start: {receipt:?}"
+            );
+            let _ = connect.await;
+        });
     }
 
     /// C1: a connection's own close reports its typed outcome; a server that
