@@ -2862,9 +2862,15 @@ impl SystemNoticeBlock {
                 }
                 lines.join("\n")
             }
-            Self::ToolConfig { payload } => {
-                format!("Tool configuration changed: {}", payload.status_text())
-            }
+            Self::ToolConfig { payload } => match payload.status_info() {
+                // The deferred-catalog notice body names each change. Its
+                // counters cannot tell a tool the boundary made visible from
+                // one that left the catalog, so the model text omits them.
+                crate::event::ToolConfigChangeStatus::DeferredCatalogDelta { .. } => {
+                    "Tool configuration changed: deferred catalog updated".to_string()
+                }
+                _ => format!("Tool configuration changed: {}", payload.status_text()),
+            },
             Self::ToolProcessInterrupted {
                 tool_call_id,
                 spawner,

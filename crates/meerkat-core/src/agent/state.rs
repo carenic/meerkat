@@ -6023,10 +6023,25 @@ where
                                 added_hidden_names.join(", ")
                             ));
                         }
-                        if !removed_hidden_names.is_empty() {
+                        // A name leaves the hidden set either because this
+                        // boundary made it visible (it was loaded) or because
+                        // it left the deferred catalog. Only the second is a
+                        // removal; the typed delta keeps both names.
+                        let (now_available, no_longer_available): (Vec<_>, Vec<_>) =
+                            removed_hidden_names
+                                .iter()
+                                .cloned()
+                                .partition(|name| visible_names_set.contains(name));
+                        if !now_available.is_empty() {
                             notice_parts.push(format!(
-                                "deferred tools removed: {}",
-                                removed_hidden_names.join(", ")
+                                "deferred tools now available to call: {}",
+                                now_available.join(", ")
+                            ));
+                        }
+                        if !no_longer_available.is_empty() {
+                            notice_parts.push(format!(
+                                "deferred tools no longer available: {}",
+                                no_longer_available.join(", ")
                             ));
                         }
                         if !pending_sources.is_empty() {
@@ -21645,6 +21660,167 @@ mod tests {
                 "failed deferred visibility effects must not activate deferred_tool"
             );
         }
+    }
+
+    /// A name leaves the hidden deferred set either because this boundary
+    /// made it visible (it was loaded) or because its source dropped it from
+    /// the catalog. The model-facing notice keeps the two apart: a loaded tool
+    /// is available to call, a dropped one is no longer available. The typed
+    /// delta still carries both names, and the provider request carries only
+    /// the loaded one.
+    #[tokio::test]
+    async fn deferred_catalog_notice_separates_loaded_tools_from_removed_tools() {
+        struct ShrinkingDeferredDispatcher {
+            deferred: DeferredLoadDispatcher,
+            gone: Arc<ToolDef>,
+            gone_removed: std::sync::atomic::AtomicBool,
+        }
+
+        impl ShrinkingDeferredDispatcher {
+            fn gone_present(&self) -> bool {
+                !self.gone_removed.load(std::sync::atomic::Ordering::SeqCst)
+            }
+        }
+
+        #[async_trait]
+        impl AgentToolDispatcher for ShrinkingDeferredDispatcher {
+            fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+                let mut tools = self.deferred.tools().to_vec();
+                if self.gone_present() {
+                    tools.push(Arc::clone(&self.gone));
+                }
+                tools.into()
+            }
+
+            fn tool_catalog_capabilities(&self) -> crate::ToolCatalogCapabilities {
+                self.deferred.tool_catalog_capabilities()
+            }
+
+            fn tool_catalog(&self) -> Arc<[crate::ToolCatalogEntry]> {
+                let mut catalog = self.deferred.tool_catalog().to_vec();
+                if self.gone_present() {
+                    catalog.push(crate::ToolCatalogEntry::session_deferred(
+                        Arc::clone(&self.gone),
+                        true,
+                        crate::ToolProvenance {
+                            kind: crate::ToolSourceKind::Callback,
+                            source_id: "test".into(),
+                            artifact: None,
+                        },
+                    ));
+                }
+                catalog.into()
+            }
+
+            async fn dispatch(
+                &self,
+                call: ToolCallView<'_>,
+            ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
+                if call.name == "tool_catalog_load" {
+                    // The source drops this tool while the load is accepted,
+                    // so the next boundary sees one loaded and one dropped name.
+                    self.gone_removed
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                self.deferred.dispatch(call).await
+            }
+        }
+
+        let client = Arc::new(DeferredLoadVisibilityClient::new());
+        let tools = Arc::new(ShrinkingDeferredDispatcher {
+            deferred: DeferredLoadDispatcher::new(),
+            gone: Arc::new(ToolDef {
+                audience: Default::default(),
+                name: "deferred_tool_gone".into(),
+                description: "deferred tool whose source drops it while another tool loads."
+                    .to_string(),
+                input_schema: serde_json::json!({ "type": "object" }),
+                provenance: Some(crate::ToolProvenance {
+                    kind: crate::ToolSourceKind::Callback,
+                    source_id: "test".into(),
+                    artifact: None,
+                }),
+            }),
+            gone_removed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .with_tool_visibility_owner(explicit_test_visibility_owner())
+            .build_standalone(client.clone(), tools, Arc::new(NoopStore))
+            .await;
+        agent.config.max_turns = Some(2);
+
+        let result = agent.run("prompt".to_string().into()).await.unwrap();
+        assert_eq!(result.text, "done");
+
+        // The provider arrays are the truth the notice must agree with.
+        assert_eq!(
+            client.seen_tools(),
+            vec![
+                vec!["tool_catalog_load".to_string()],
+                vec!["deferred_tool".to_string(), "tool_catalog_load".to_string()],
+            ]
+        );
+
+        let deferred_notices = agent
+            .session()
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                Message::SystemNotice(notice)
+                    if notice.kind == SystemNoticeKind::ToolScope
+                        && notice.body.as_deref().is_some_and(|body| {
+                            body.starts_with("Deferred catalog changed at turn boundary:")
+                        }) =>
+                {
+                    Some(notice)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deferred_notices.len(), 2, "{deferred_notices:?}");
+        assert_eq!(
+            deferred_notices[0].body.as_deref(),
+            Some(
+                "Deferred catalog changed at turn boundary: new deferred tools available: \
+                 deferred_tool, deferred_tool_gone, deferred_tool_two"
+            )
+        );
+        let load_notice = deferred_notices[1];
+        assert_eq!(
+            load_notice.body.as_deref(),
+            Some(
+                "Deferred catalog changed at turn boundary: deferred tools now available to \
+                 call: deferred_tool; deferred tools no longer available: deferred_tool_gone"
+            )
+        );
+        assert_eq!(
+            load_notice.model_projection_text(),
+            "Deferred catalog changed at turn boundary: deferred tools now available to call: \
+             deferred_tool; deferred tools no longer available: deferred_tool_gone\n\
+             Tool configuration changed: deferred catalog updated"
+        );
+
+        // The typed delta and its host status text are unchanged: both names
+        // left the hidden set.
+        let [crate::types::SystemNoticeBlock::ToolConfig { payload }] =
+            load_notice.blocks.as_slice()
+        else {
+            panic!("expected one tool-config block: {:?}", load_notice.blocks);
+        };
+        assert_eq!(
+            payload
+                .deferred_catalog_delta
+                .as_ref()
+                .map(|delta| delta.removed_hidden_names.clone()),
+            Some(vec![
+                crate::ToolName::from("deferred_tool"),
+                crate::ToolName::from("deferred_tool_gone"),
+            ])
+        );
+        assert_eq!(
+            payload.status_text(),
+            "deferred_catalog_delta(added_hidden=0,removed_hidden=2,pending_sources=0)"
+        );
     }
 
     #[tokio::test]

@@ -2505,6 +2505,18 @@ them.
   `denied` or `malformed_facts` refusal read under a stable publication is
   final.
 
+- `meerkat-core`: the deferred-catalog notice the model receives at a turn
+  boundary no longer reports tools that `tool_catalog_load` just made
+  available as removed. A tool that leaves the hidden deferred catalog
+  because it is now in the request's tool list is announced as "deferred
+  tools now available to call"; a tool that left the catalog is announced as
+  "deferred tools no longer available". The notice's summary line in the
+  model text now reads "Tool configuration changed: deferred catalog
+  updated" instead of repeating counters that cannot tell the two apart. The
+  `tool_config_changed` event and its `deferred_catalog_delta` payload are
+  unchanged: `removed_hidden_names` and the status counts still cover both
+  cases. Notices already stored in a session keep their original text.
+
 ### Changed
 
 - `rkat-rpc` serves governed realms in its ordinary build: `meerkat-rpc`
