@@ -121,13 +121,13 @@ from .generated.types import (
     MobHostStatus,
     MobIdParams,
     MobIngressInteractionParams,
-    MobkitJobCancelAckParams,
-    MobkitJobCheckpointParams,
-    MobkitJobCompleteParams,
-    MobkitJobFailParams,
-    MobkitJobHeartbeatParams,
-    MobkitJobMutationResult,
-    MobkitJobProgressParams,
+    MetaJobCancelAckParams,
+    MetaJobCheckpointParams,
+    MetaJobCompleteParams,
+    MetaJobFailParams,
+    MetaJobHeartbeatParams,
+    MetaJobMutationResult,
+    MetaJobProgressParams,
     MobMemberHistoryParams,
     MobMemberHistoryResult,
     MobMemberToolDeclarationParams,
@@ -232,6 +232,8 @@ from .mob import (
     MobWireMembersBatchEdgeInput,
     WorkOrigin,
 )
+from .consent import parse_consent_notice
+from .generated.types import ConsentNoticeParams
 from .live import LiveNotification, parse_live_notification
 from .session import DeferredSession, Session, _normalize_skill_ref
 from .streaming import (
@@ -611,6 +613,7 @@ class MeerkatClient:
         self._tool_registry = ToolRegistry()
         self._tool_registration_errors: dict[str, MeerkatError] = {}
         self._live_notification_listeners: list[Callable[[LiveNotification], None]] = []
+        self._consent_notice_listeners: list[Callable[[ConsentNoticeParams], None]] = []
         self._request = cast(RpcRequest, self._request_impl)
 
     # -- Tool registration -------------------------------------------------
@@ -785,6 +788,7 @@ class MeerkatClient:
         self._dispatcher = _StdoutDispatcher(self._process.stdout)
         self._dispatcher.set_stderr_tail(self._stderr_tail)
         self._dispatcher.set_live_notification_sink(self._dispatch_live_notification)
+        self._dispatcher.set_consent_notice_sink(self._dispatch_consent_notice)
         if self._process.stdin:
             self._dispatcher.set_stdin_writer(self._process.stdin)
         self._dispatcher.start()
@@ -2177,63 +2181,63 @@ class MeerkatClient:
         )
         return MonitorsStartResult(job=result.job)
 
-    async def mobkit_job_heartbeat(
-        self, params: MobkitJobHeartbeatParams
-    ) -> MobkitJobMutationResult:
-        return MobkitJobMutationResult(
+    async def meta_job_heartbeat(
+        self, params: MetaJobHeartbeatParams
+    ) -> MetaJobMutationResult:
+        return MetaJobMutationResult(
             job=self._parse_job_get_result(
-                await self._request("mobkit/jobs/heartbeat", _wire_params(params)),
-                "Invalid mobkit/jobs/heartbeat response",
+                await self._request("meta/jobs/heartbeat", _wire_params(params)),
+                "Invalid meta/jobs/heartbeat response",
             ).job
         )
 
-    async def mobkit_job_progress(
-        self, params: MobkitJobProgressParams
-    ) -> MobkitJobMutationResult:
-        return MobkitJobMutationResult(
+    async def meta_job_progress(
+        self, params: MetaJobProgressParams
+    ) -> MetaJobMutationResult:
+        return MetaJobMutationResult(
             job=self._parse_job_get_result(
-                await self._request("mobkit/jobs/progress", _wire_params(params)),
-                "Invalid mobkit/jobs/progress response",
+                await self._request("meta/jobs/progress", _wire_params(params)),
+                "Invalid meta/jobs/progress response",
             ).job
         )
 
-    async def mobkit_job_checkpoint(
-        self, params: MobkitJobCheckpointParams
-    ) -> MobkitJobMutationResult:
-        return MobkitJobMutationResult(
+    async def meta_job_checkpoint(
+        self, params: MetaJobCheckpointParams
+    ) -> MetaJobMutationResult:
+        return MetaJobMutationResult(
             job=self._parse_job_get_result(
-                await self._request("mobkit/jobs/checkpoint", _wire_params(params)),
-                "Invalid mobkit/jobs/checkpoint response",
+                await self._request("meta/jobs/checkpoint", _wire_params(params)),
+                "Invalid meta/jobs/checkpoint response",
             ).job
         )
 
-    async def mobkit_job_complete(
-        self, params: MobkitJobCompleteParams
-    ) -> MobkitJobMutationResult:
-        return MobkitJobMutationResult(
+    async def meta_job_complete(
+        self, params: MetaJobCompleteParams
+    ) -> MetaJobMutationResult:
+        return MetaJobMutationResult(
             job=self._parse_job_get_result(
-                await self._request("mobkit/jobs/complete", _wire_params(params)),
-                "Invalid mobkit/jobs/complete response",
+                await self._request("meta/jobs/complete", _wire_params(params)),
+                "Invalid meta/jobs/complete response",
             ).job
         )
 
-    async def mobkit_job_fail(
-        self, params: MobkitJobFailParams
-    ) -> MobkitJobMutationResult:
-        return MobkitJobMutationResult(
+    async def meta_job_fail(
+        self, params: MetaJobFailParams
+    ) -> MetaJobMutationResult:
+        return MetaJobMutationResult(
             job=self._parse_job_get_result(
-                await self._request("mobkit/jobs/fail", _wire_params(params)),
-                "Invalid mobkit/jobs/fail response",
+                await self._request("meta/jobs/fail", _wire_params(params)),
+                "Invalid meta/jobs/fail response",
             ).job
         )
 
-    async def mobkit_job_cancel_ack(
-        self, params: MobkitJobCancelAckParams
-    ) -> MobkitJobMutationResult:
-        return MobkitJobMutationResult(
+    async def meta_job_cancel_ack(
+        self, params: MetaJobCancelAckParams
+    ) -> MetaJobMutationResult:
+        return MetaJobMutationResult(
             job=self._parse_job_get_result(
-                await self._request("mobkit/jobs/cancel_ack", _wire_params(params)),
-                "Invalid mobkit/jobs/cancel_ack response",
+                await self._request("meta/jobs/cancel_ack", _wire_params(params)),
+                "Invalid meta/jobs/cancel_ack response",
             ).job
         )
 
@@ -4772,6 +4776,37 @@ class MeerkatClient:
 
         return unsubscribe
 
+    def on_consent_notice(
+        self, callback: Callable[[ConsentNoticeParams], None]
+    ) -> Callable[[], None]:
+        """Receive each ``approval/consent_notice``: one recorded R3 human
+        consent transition of an approval this connection's approver decides
+        (served by a stock governed pipe).
+
+        Returns an unsubscribe function. Callbacks run on the reader task and
+        must not block. Notices that arrive with no callback are dropped; a
+        malformed one or a kind this SDK build does not know is ignored. A
+        raising callback does not stop the others or the transport. A notice
+        grants nothing.
+        """
+        self._consent_notice_listeners.append(callback)
+
+        def unsubscribe() -> None:
+            if callback in self._consent_notice_listeners:
+                self._consent_notice_listeners.remove(callback)
+
+        return unsubscribe
+
+    def _dispatch_consent_notice(self, params: Any) -> None:
+        notice = parse_consent_notice(params)
+        if notice is None:
+            return
+        for callback in list(self._consent_notice_listeners):
+            try:
+                callback(notice)
+            except Exception:  # noqa: BLE001 - a callback fault is its own
+                _logger.debug("consent notice callback raised", exc_info=True)
+
     def _dispatch_live_notification(self, method: str, params: Any) -> None:
         notification = parse_live_notification(method, params)
         if notification is None:
@@ -6261,6 +6296,7 @@ class MeerkatClient:
         elif block_type == "runtime_notice":
             MeerkatClient._require_present_string_field(block, "category", context)
             MeerkatClient._validate_nullable_response_string(block, "detail", context)
+            validate_content()
         else:
             MeerkatClient._validate_nullable_response_string(block, "summary", context)
 

@@ -418,6 +418,29 @@ impl Decoder for ProtectedInputCodec {
     }
 }
 
+/// What must stay held while an entered request can still leave this
+/// process. The request carries it to [`ProtectedStdioTransport::send`],
+/// which takes it out before the codec consumes the request and keeps it
+/// until the request's bytes are flushed or the writer is retired.
+#[derive(Clone)]
+pub(crate) struct SendCustody(#[allow(dead_code)] Arc<dyn Send + Sync>);
+
+impl SendCustody {
+    pub(crate) fn new(held: impl Send + Sync + 'static) -> Self {
+        Self(Arc::new(held))
+    }
+}
+
+/// The custody a request carries, if any.
+fn send_custody(message: &ClientJsonRpcMessage) -> Option<SendCustody> {
+    if let ClientJsonRpcMessage::Request(message) = message
+        && let ClientRequest::CallToolRequest(request) = &message.request
+    {
+        return request.extensions.get::<SendCustody>().cloned();
+    }
+    None
+}
+
 struct ProtectedOutputCodec;
 
 impl Encoder<ClientJsonRpcMessage> for ProtectedOutputCodec {
@@ -433,7 +456,30 @@ impl Encoder<ClientJsonRpcMessage> for ProtectedOutputCodec {
 
 pub(crate) struct ProtectedStdioTransport<R: AsyncRead, W: AsyncWrite> {
     read: FramedRead<R, ProtectedInputCodec>,
-    write: Arc<Mutex<Option<FramedWrite<W, ProtectedOutputCodec>>>>,
+    write: Arc<Mutex<Option<ProtectedWriter<W>>>>,
+}
+
+/// The stdio writer and the custody of every request whose bytes it may
+/// still hold unflushed. A send whose flush fails or is cancelled leaves its
+/// bytes buffered for a later flush, so its custody stays here until a flush
+/// succeeds or the writer is retired (closed or dropped).
+struct ProtectedWriter<W> {
+    framed: FramedWrite<W, ProtectedOutputCodec>,
+    unflushed: Vec<SendCustody>,
+}
+
+impl<W: AsyncWrite + Unpin> ProtectedWriter<W> {
+    async fn send(&mut self, item: ClientJsonRpcMessage) -> io::Result<()> {
+        if let Some(custody) = send_custody(&item) {
+            self.unflushed.push(custody);
+        }
+        let sent = self.framed.send(item).await;
+        if sent.is_ok() {
+            // Everything buffered so far has been flushed.
+            self.unflushed.clear();
+        }
+        sent
+    }
 }
 
 impl<R: AsyncRead, W: AsyncWrite> ProtectedStdioTransport<R, W> {
@@ -446,10 +492,10 @@ impl<R: AsyncRead, W: AsyncWrite> ProtectedStdioTransport<R, W> {
                     state,
                 },
             ),
-            write: Arc::new(Mutex::new(Some(FramedWrite::new(
-                write,
-                ProtectedOutputCodec,
-            )))),
+            write: Arc::new(Mutex::new(Some(ProtectedWriter {
+                framed: FramedWrite::new(write, ProtectedOutputCodec),
+                unflushed: Vec::new(),
+            }))),
         }
     }
 }

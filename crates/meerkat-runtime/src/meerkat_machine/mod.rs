@@ -1123,7 +1123,28 @@ pub(crate) mod credential_custody;
 mod local_authorization;
 pub use controller_custody::NativeControllerGrantMutation;
 #[cfg(feature = "local-authorization")]
-pub use local_authorization::{NativeGrantWorkConfiguration, NativeIngressCheck};
+pub use local_authorization::{
+    AgentConfiguredMcpProvider, AgentInstallationGrant, ConfiguredMcpAttachmentProvider,
+    ConfiguredMcpConjuncts, NativeGrantWorkConfiguration, NativeIngressCheck,
+    NativeRetainedResumeCheck,
+};
+#[cfg(feature = "local-authorization")]
+mod scoped_original;
+pub use mcp_attachment::scoped_destination_target;
+#[cfg(feature = "local-authorization")]
+pub use scoped_original::{
+    AuthenticatedOriginal, AuthenticatedOriginalSource, OriginalDisposition,
+    ScopedGrantComposition, ScopedInvocation, ScopedMandateOwner, ScopedOriginalIngress,
+    SourceOriginalBasis, bind_scoped_original, original_operation_grant, require_active_original,
+    require_source_original_live, review_bounds_text,
+};
+#[cfg(feature = "local-authorization")]
+mod scoped_retained_resume;
+#[cfg(feature = "local-authorization")]
+pub use scoped_retained_resume::{
+    RetainedControllerOwner, RetainedInvocationOwner, ScopedRetainedResume,
+};
+mod agent_mandate;
 pub mod composition;
 mod dispatch_control;
 mod dispatch_drain;
@@ -1138,8 +1159,17 @@ mod durability_health;
 #[cfg(feature = "live")]
 mod live_context_preparation;
 mod llm_reconfigure;
+mod mcp_attachment;
+mod mcp_observation;
+pub use mcp_observation::McpObservationRefusal;
+mod admitted_original;
+pub use admitted_original::{AdmittedOriginal, AdmittedOriginalRefusal};
 mod retained_resume;
 mod runtime_control;
+pub use agent_mandate::{
+    AgentBindingUnavailable, AgentMandateError, SessionAgentBinding, SessionAgentMandate,
+};
+pub(crate) mod scoped_context;
 mod session_management;
 mod terminal_receipt;
 mod traits;
@@ -1311,6 +1341,30 @@ pub enum RuntimeSessionUnregisterAdmission {
     Pending(RuntimeSessionUnregisterObserver),
 }
 
+/// Typed answer of the same-registration quiescent close admission
+/// ([`MeerkatMachine::unregister_session_registration_until_terminal_if_quiescent`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeSessionQuiescentClose {
+    /// The exact registration's owned unregister teardown completed. Either
+    /// it held no non-terminal input and no run, and `BeginUnregisterSession`
+    /// committed while its mutation gate still excluded ingress; or its drain
+    /// window had lost its owner and no run was in flight. In that second
+    /// case the teardown, like any unregister, abandons every input the drain
+    /// still held (reason `Stopped`) and resolves its completion as
+    /// runtime-terminated, so a later resume does not run it.
+    Closed,
+    /// The exact registration holds a non-terminal input or a run. Nothing
+    /// was staged: the registration and its running owner keep serving, and
+    /// every retained input stays queued native work. A drain window that
+    /// lost its owner answers this only while a run is still in flight.
+    Busy,
+    /// Another unregister already owns this registration's teardown. This
+    /// call staged and joined nothing.
+    AlreadyClosing,
+    /// The supplied registration is absent or no longer current.
+    NotCurrent,
+}
+
 /// The wait a caller dispatched on after starting or joining an owned
 /// unregister teardown saga, reported to a test that armed
 /// [`MeerkatMachine::test_witness_next_unregister_wait`].
@@ -1455,11 +1509,26 @@ impl UnregisterTeardownMechanicalObservations {
 struct RuntimeSessionEntry {
     /// Canonical runtime control-plane identity for this registered session.
     runtime_id: LogicalRuntimeId,
+    /// The agent this registration's session acts as, bound by the trusted
+    /// governed host. Every registration owns a fresh, unbound slot.
+    agent_binding: agent_mandate::SessionAgentBinding,
+    /// The tool-surface gate this registration's trusted host installed, if
+    /// any. Every registration owns a fresh, empty slot.
+    tool_surface_gate: meerkat_core::ToolSurfaceGateSlot,
+    /// The MCP adapter this registration's latest finished construction
+    /// installed, for observation only. Every registration owns a fresh slot.
+    mcp_observation: meerkat_core::McpObservationSlot,
     /// This runtime owner's hosting claim for the session (#1813), taken
     /// before the registration's durable recovery and held exactly as long as
     /// this entry: unregister finalization, which removes the entry after
     /// teardown, releases it.
     _hosting_claim: meerkat_core::session_hosting::HostingClaim,
+    /// The owner-loss proof whose settlement this registration completed
+    /// when it published: present only when its claim's lineage began with a
+    /// cross-process fresh acquisition or takeover, the issuing consent
+    /// owner settled it, and no earlier registration of the lineage
+    /// completed it. Historical record only.
+    owner_loss_proof: Option<meerkat_core::session_hosting::HostingOwnerLossProof>,
     /// Reconstructed solely for archive convergence. This cleanup ownership
     /// survives caller timeout; ordinary/concurrent registrations never carry
     /// it.
@@ -2615,6 +2684,11 @@ pub struct PendingRuntimeExecutorAttachment {
     machine: Arc<MeerkatMachine>,
     witness: RuntimeExecutorAttachmentWitness,
     mutation_guard: Option<crate::tokio::sync::OwnedMutexGuard<()>>,
+    /// Runless terminals this attachment committed under its mutation
+    /// guard (settled interrupted runs, a replaced predecessor), told once
+    /// that guard is released or handed off. Declared after the guard so
+    /// that it drops after it.
+    runless_terminal: RunlessTerminalAnnouncement,
     cleanup_spawner: MachineCleanupTaskSpawner,
     should_wake: bool,
     persist_lifecycle_on_commit: bool,
@@ -2689,6 +2763,42 @@ impl MeerkatMachine {
             .map_err(|_| crate::input_authority::unavailable())?;
         self.install_native_credential_observer()?;
         Ok(self)
+    }
+
+    /// Install the issuing consent owner's owner-loss settlement (consent
+    /// owner loss): every registration that attaches a claim lineage owing a
+    /// settlement (its grant excluded every earlier holder of the session's
+    /// claim) has that owner settle what a lost owner left in the session's
+    /// scope, under the registration's live reservation, before the session
+    /// can admit anything. The composition installs the same approval owner
+    /// that issues the consent, once, before any session is registered.
+    /// Without one nothing is settled, so no registration ever records a
+    /// settlement as complete.
+    pub fn install_consent_owner_loss_settlement(
+        &self,
+        settlement: Arc<dyn meerkat_core::approval::ConsentOwnerLossSettlement>,
+    ) -> Result<(), ConsentOwnerLossInstallRefused> {
+        if self.consent_owner_loss_settlement.get().is_some() {
+            return Err(ConsentOwnerLossInstallRefused::AlreadyInstalled);
+        }
+        let sessions = self
+            .sessions
+            .try_read()
+            .map_err(|_| ConsentOwnerLossInstallRefused::SessionsRegistered)?;
+        if !sessions.is_empty() {
+            return Err(ConsentOwnerLossInstallRefused::SessionsRegistered);
+        }
+        self.consent_owner_loss_settlement
+            .set(settlement)
+            .map_err(|_| ConsentOwnerLossInstallRefused::AlreadyInstalled)?;
+        drop(sessions);
+        Ok(())
+    }
+
+    /// Whether the issuing consent owner's owner-loss settlement was
+    /// installed. A composition observation, never a permission decision.
+    pub fn has_consent_owner_loss_settlement(&self) -> bool {
+        self.consent_owner_loss_settlement.get().is_some()
     }
 
     /// Whether the actual native owner was installed before this machine was
@@ -2881,6 +2991,11 @@ pub struct CommittedRuntimeExecutorAttachmentPublicationLease {
     machine: Arc<MeerkatMachine>,
     witness: RuntimeExecutorAttachmentWitness,
     mutation_guard: Option<crate::tokio::sync::OwnedMutexGuard<()>>,
+    /// Runless terminals committed under the retained mutation guard (its
+    /// pending attachment's, and recovered predecessor inputs), told once
+    /// that guard is released or handed off. Declared after the guard so
+    /// that it drops after it.
+    runless_terminal: RunlessTerminalAnnouncement,
     cleanup_spawner: MachineCleanupTaskSpawner,
     should_wake: bool,
     persist_lifecycle_on_commit: bool,
@@ -2990,7 +3105,11 @@ impl PreparedRuntimeExecutorAttachmentRetirement {
         })?;
         self.armed = false;
         self.machine
-            .unregister_executor_attachment_if_current_with_guard(self.witness.clone(), guard)
+            .unregister_executor_attachment_if_current_with_guard(
+                self.witness.clone(),
+                RunlessTerminalAnnouncement::default(),
+                guard,
+            )
             .await
     }
 }
@@ -3205,6 +3324,9 @@ impl PendingRuntimeExecutorAttachment {
                     )
                     .await?
                 {
+                    // Committed: told once this attachment releases its
+                    // mutation guard, even if a later input fails here.
+                    self.runless_terminal.owe();
                     abandoned.push((input_id, run_id));
                 } else {
                     // Not queued: recovery did not hand it back for replay, so
@@ -3402,10 +3524,12 @@ impl PendingRuntimeExecutorAttachment {
         should_wake: bool,
         persist_lifecycle_on_commit: bool,
     ) -> Self {
+        let runless_terminal = machine.runless_terminal_announcement();
         Self {
             machine,
             witness,
             mutation_guard: Some(mutation_guard),
+            runless_terminal,
             cleanup_spawner,
             should_wake,
             persist_lifecycle_on_commit,
@@ -3555,11 +3679,13 @@ impl PendingRuntimeExecutorAttachment {
             )
         })?;
         // `try_commit_with` disarms Pending on success; transfer the exact
-        // guard into the publication lease instead of releasing it.
+        // guard into the publication lease instead of releasing it, and with
+        // it the runless terminals still owed until that guard's release.
         Ok(CommittedRuntimeExecutorAttachmentPublicationLease {
             machine: Arc::clone(&self.machine),
             witness,
             mutation_guard: Some(mutation_guard),
+            runless_terminal: std::mem::take(&mut self.runless_terminal),
             cleanup_spawner: self.cleanup_spawner.clone(),
             should_wake: self.should_wake,
             persist_lifecycle_on_commit: self.persist_lifecycle_on_commit,
@@ -3671,6 +3797,9 @@ impl PendingRuntimeExecutorAttachment {
                         driver.rollback_prepared_runless_interaction_terminal_outboxes(prepared);
                         return Err(error);
                     }
+                    // Told once M is released or handed off, whether or not
+                    // this replacement then commits.
+                    self.runless_terminal.owe();
                     let candidate_owner_input_id = crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
                     (predecessor_input_ids, candidate_owner_input_id)
                 }
@@ -3711,6 +3840,9 @@ impl PendingRuntimeExecutorAttachment {
         if result.is_ok() {
             if !retain_mutation_guard {
                 self.mutation_guard.take();
+                // M is released: tell the runless terminals committed
+                // under it (a retained guard carries them into its lease).
+                self.runless_terminal.release();
             }
             self.armed = false;
             if let Some((driver, publication_handle, input_ids, candidate_owner_input_id)) =
@@ -3753,9 +3885,13 @@ impl PendingRuntimeExecutorAttachment {
         })?;
         let machine = Arc::clone(&self.machine);
         let witness = self.witness.clone();
+        // M moves into the owned abort, and the runless terminals committed
+        // under it move with it: told once the abort has released M, before
+        // it awaits the teardown, even if this caller is cancelled first.
+        let runless_terminal = std::mem::take(&mut self.runless_terminal);
         let completion = self.cleanup_spawner.spawn(async move {
             machine
-                .abort_pending_executor_attachment(witness, guard)
+                .abort_pending_executor_attachment(witness, runless_terminal, guard)
                 .await
         });
         self.armed = false;
@@ -3787,11 +3923,12 @@ impl PendingRuntimeExecutorAttachment {
         })?;
         let machine = Arc::clone(&self.machine);
         let witness = self.witness.clone();
+        let runless_terminal = std::mem::take(&mut self.runless_terminal);
         self.cleanup_spawner.spawn(async move {
-            if let Err(error) = machine
-                .abort_pending_executor_attachment(witness.clone(), guard)
-                .await
-            {
+            let aborted = machine
+                .abort_pending_executor_attachment(witness.clone(), runless_terminal, guard)
+                .await;
+            if let Err(error) = aborted {
                 tracing::warn!(
                     session_id = %witness.session_id(),
                     %error,
@@ -3824,9 +3961,10 @@ impl PendingRuntimeExecutorAttachment {
         let machine = Arc::clone(&self.machine);
         let witness = self.witness.clone();
         let session_id = witness.session_id().clone();
+        let runless_terminal = std::mem::take(&mut self.runless_terminal);
         let completion = self.cleanup_spawner.spawn(async move {
             machine
-                .abort_pending_executor_attachment(witness, guard)
+                .abort_pending_executor_attachment(witness, runless_terminal, guard)
                 .await
         });
         self.armed = false;
@@ -3945,6 +4083,11 @@ impl CommittedRuntimeExecutorAttachmentPublicationLease {
             let abandoned = driver
                 .abandon_pending_inputs(crate::input_state::InputAbandonReason::Cancelled)
                 .await?;
+            if abandoned > 0 {
+                // Told once this lease releases or hands off M, even if a
+                // check below fails.
+                self.runless_terminal.owe();
+            }
             if abandoned != predecessor_input_ids.len() {
                 return Err(RuntimeDriverError::Internal(format!(
                     "recovered predecessor abandonment for session {} terminalized {abandoned} of {} active inputs",
@@ -4008,6 +4151,7 @@ impl CommittedRuntimeExecutorAttachmentPublicationLease {
             )
             .await?;
         self.mutation_guard.take();
+        self.runless_terminal.release();
         self.armed = false;
         Ok(witness)
     }
@@ -4074,6 +4218,7 @@ impl CommittedRuntimeExecutorAttachmentPublicationLease {
             })?
             .finalize()?;
         self.mutation_guard.take();
+        self.runless_terminal.release();
         self.armed = false;
         Ok((witness, residency_publication))
     }
@@ -4094,15 +4239,35 @@ impl CommittedRuntimeExecutorAttachmentPublicationLease {
                 "committed publication lease lost its mutation fence before abort".to_string(),
             )
         })?;
-        let completion = self
-            .machine
-            .spawn_executor_attachment_retirement_with_guard(
-                self.witness.clone(),
-                guard,
-                self.cleanup_spawner.clone(),
-            );
+        // M moves into the owned retirement, and the runless terminals
+        // committed under it move with it: told once the retirement has
+        // released M, before it awaits the teardown, not when this lease
+        // returns.
+        let machine = Arc::clone(&self.machine);
+        let witness = self.witness.clone();
+        let runless_terminal = std::mem::take(&mut self.runless_terminal);
+        let (result_tx, result_rx) = crate::tokio::sync::oneshot::channel();
+        self.cleanup_spawner.spawn(async move {
+            let retired = machine
+                .unregister_executor_attachment_if_current_with_guard(
+                    witness.clone(),
+                    runless_terminal,
+                    guard,
+                )
+                .await;
+            if let Err(error) = &retired {
+                tracing::warn!(
+                    session_id = %witness.session_id(),
+                    %error,
+                    "owned exact runtime attachment retirement failed"
+                );
+            }
+            let _ = result_tx.send(retired);
+        });
         self.armed = false;
-        Ok(completion)
+        Ok(RuntimeExecutorAttachmentRetirementCompletion::new(
+            result_rx,
+        ))
     }
 
     /// Retire this exact retained attachment while the surface retains B.
@@ -4119,9 +4284,14 @@ impl CommittedRuntimeExecutorAttachmentPublicationLease {
         })?;
         let machine = Arc::clone(&self.machine);
         let witness = self.witness.clone();
+        let runless_terminal = std::mem::take(&mut self.runless_terminal);
         let completion = self.cleanup_spawner.spawn(async move {
             machine
-                .unregister_executor_attachment_if_current_with_guard(witness, guard)
+                .unregister_executor_attachment_if_current_with_guard(
+                    witness,
+                    runless_terminal,
+                    guard,
+                )
                 .await
         });
         self.armed = false;
@@ -4144,11 +4314,16 @@ impl Drop for CommittedRuntimeExecutorAttachmentPublicationLease {
         self.armed = false;
         let machine = Arc::clone(&self.machine);
         let witness = self.witness.clone();
+        let runless_terminal = std::mem::take(&mut self.runless_terminal);
         self.cleanup_spawner.spawn(async move {
-            if let Err(error) = machine
-                .unregister_executor_attachment_if_current_with_guard(witness.clone(), guard)
-                .await
-            {
+            let retired = machine
+                .unregister_executor_attachment_if_current_with_guard(
+                    witness.clone(),
+                    runless_terminal,
+                    guard,
+                )
+                .await;
+            if let Err(error) = retired {
                 tracing::warn!(
                     session_id = %witness.session_id(),
                     %error,
@@ -4170,11 +4345,12 @@ impl Drop for PendingRuntimeExecutorAttachment {
         self.armed = false;
         let machine = Arc::clone(&self.machine);
         let witness = self.witness.clone();
+        let runless_terminal = std::mem::take(&mut self.runless_terminal);
         self.cleanup_spawner.spawn(async move {
-            if let Err(error) = machine
-                .abort_pending_executor_attachment(witness.clone(), guard)
-                .await
-            {
+            let aborted = machine
+                .abort_pending_executor_attachment(witness.clone(), runless_terminal, guard)
+                .await;
+            if let Err(error) = aborted {
                 tracing::warn!(
                     session_id = %witness.session_id(),
                     %error,
@@ -4559,43 +4735,55 @@ impl PreparedSessionMaterialization {
     /// claim that fences same-session actor creation and executor attachment.
     #[must_use]
     pub async fn owns_current_materialization_claim(&self) -> bool {
+        self.registration_witness().await.is_some()
+    }
+
+    /// The exact registration this materialization claim owns, as its opaque
+    /// witness; `None` once the claim no longer owns the current entry. The
+    /// mutation gate is released before returning, so consumers revalidate the
+    /// witness at use and never substitute a session-id lookup for it.
+    pub async fn registration_witness(&self) -> Option<RuntimeSessionRegistrationWitness> {
         if !self.armed {
-            return false;
+            return None;
         }
-        let Some(_mutation_guard) = self
+        let _mutation_guard = self
             .machine
             .lock_current_durability_ready_session_mutation_gate(self.session_id())
             .await
-            .ok()
-        else {
-            return false;
-        };
-        let Ok(authority) = crate::validated_session_runtime_bindings_authority(&self.bindings)
-        else {
-            return false;
-        };
+            .ok()?;
+        let authority = crate::validated_session_runtime_bindings_authority(&self.bindings).ok()?;
         let sessions = self.machine.sessions.read().await;
-        sessions.get(self.session_id()).is_some_and(|entry| {
-            entry.epoch_id == *self.bindings.epoch_id()
-                && Arc::ptr_eq(&entry.materialization_claim_state, &self.claim_state)
-                && Arc::ptr_eq(&entry.dsl_authority, &authority.dsl_authority)
-                && Arc::ptr_eq(&entry.handle_teardown_gate, &authority.teardown_gate)
-                && !entry.physical_attachment_is_live()
-                && self
-                    .claim_state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .exact_claim_is(
-                        self.claim_id,
-                        &[
-                            crate::RuntimeActorMaterializationClaimPhase::Prepared,
-                            crate::RuntimeActorMaterializationClaimPhase::Staged,
-                            crate::RuntimeActorMaterializationClaimPhase::ActorCreating,
-                            crate::RuntimeActorMaterializationClaimPhase::ActorMaterializedPendingCommit,
-                            crate::RuntimeActorMaterializationClaimPhase::Aborting,
-                        ],
-                    )
-        })
+        sessions
+            .get(self.session_id())
+            .filter(|entry| {
+                entry.epoch_id == *self.bindings.epoch_id()
+                    && Arc::ptr_eq(&entry.materialization_claim_state, &self.claim_state)
+                    && Arc::ptr_eq(&entry.dsl_authority, &authority.dsl_authority)
+                    && Arc::ptr_eq(&entry.handle_teardown_gate, &authority.teardown_gate)
+                    && !entry.physical_attachment_is_live()
+                    && self
+                        .claim_state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .exact_claim_is(
+                            self.claim_id,
+                            &[
+                                crate::RuntimeActorMaterializationClaimPhase::Prepared,
+                                crate::RuntimeActorMaterializationClaimPhase::Staged,
+                                crate::RuntimeActorMaterializationClaimPhase::ActorCreating,
+                                crate::RuntimeActorMaterializationClaimPhase::ActorMaterializedPendingCommit,
+                                crate::RuntimeActorMaterializationClaimPhase::Aborting,
+                            ],
+                        )
+            })
+            .map(|entry| {
+                RuntimeSessionRegistrationWitness::new(
+                    Arc::downgrade(&self.machine.shared),
+                    self.session_id().clone(),
+                    entry.epoch_id.clone(),
+                    Arc::downgrade(&entry.mutation_gate),
+                )
+            })
     }
 
     /// Prove that one atomic resume observation is the current durable
@@ -5359,9 +5547,30 @@ enum RuntimeLoopAttachmentSlot {
 }
 
 impl RuntimeSessionEntry {
+    /// The winning publication of this registration, or an accepted reuse
+    /// of it, completes its owner-loss reservation, which the issuing consent
+    /// owner settled: the lineage's settlement is complete and the entry
+    /// keeps the settled proof. A preparation abandoned before publication,
+    /// or a candidate another registration published first, drops its
+    /// reservation instead, which returns the proof to the lineage for the
+    /// registration that does publish.
+    fn complete_owner_loss(
+        &mut self,
+        reservation: Option<meerkat_core::session_hosting::OwnerLossReservation>,
+    ) {
+        if let Some(reservation) = reservation {
+            self.owner_loss_proof = Some(reservation.complete());
+        }
+    }
+
     /// Wake materialization-claim release waiters because this registration
     /// is leaving the registry (its claim can no longer be held).
+    /// The registration left the machine: retire its agent binding for good
+    /// and wake materialization waiters.
     fn notify_registration_removed(&self) {
+        self.agent_binding.retire();
+        self.tool_surface_gate.retire();
+        self.mcp_observation.retire();
         self.materialization_claim_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5639,6 +5848,11 @@ impl RuntimeSessionEntry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.handle_teardown_gate.close();
+        // Every detached session-owned handle fails closed from here, and so
+        // does the registration's agent binding and tool-surface gate.
+        self.agent_binding.retire();
+        self.tool_surface_gate.retire();
+        self.mcp_observation.retire();
     }
 
     /// True while the runtime-loop executor registration is `Active` *or*
@@ -6664,6 +6878,64 @@ impl MeerkatMachine {
         }
     }
 
+    /// Deterministically hold the next scoped context binding of
+    /// `session_id` immediately before its driver takes the session
+    /// document's machine authority ([`Self::bind_scoped_context_within`]):
+    /// its registration, mutation gate and driver are held, and its binder's
+    /// final decision has not run. The receiver resolves when the binding
+    /// arrives there; sending on or dropping the sender releases it. Test
+    /// builds only.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn arm_scoped_binding_before_machine_authority_test_hook(
+        &self,
+        session_id: SessionId,
+    ) -> (
+        crate::tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = crate::tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut hook = self
+            .test_scoped_binding_before_machine_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            hook.is_none(),
+            "scoped binding machine-authority test hook already armed"
+        );
+        *hook = Some((session_id, entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    /// The binding's side of
+    /// [`Self::arm_scoped_binding_before_machine_authority_test_hook`]: a
+    /// synchronous wait, as the wait for the machine authority is.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn run_scoped_binding_before_machine_authority_test_hook(
+        &self,
+        session_id: &SessionId,
+    ) {
+        let armed = {
+            let mut hook = self
+                .test_scoped_binding_before_machine_authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if hook
+                .as_ref()
+                .is_some_and(|(armed_session_id, _, _)| armed_session_id == session_id)
+            {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered_tx, release_rx)) = armed {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn run_runtime_loop_before_queue_authority_test_hook(
         &self,
@@ -7555,7 +7827,8 @@ impl MeerkatMachine {
     /// durable admission acknowledgement. The input and its completion waiter
     /// are already committed before this is called; actor slowness can delay
     /// exact injection but can no longer delay acceptance of this or later
-    /// inputs.
+    /// inputs. The admission's owed runless terminals move with its mutation
+    /// guard and are told once this work has released it.
     #[allow(clippy::too_many_arguments)]
     fn spawn_accepted_ingress_boundary_work(
         &self,
@@ -7568,12 +7841,25 @@ impl MeerkatMachine {
         wake_tx: Option<mpsc::Sender<()>>,
         should_wake: bool,
         fallback_wake: AcceptedIngressFallbackWakeGuard,
+        runless_terminal: RunlessTerminalAnnouncement,
     ) {
         let machine = self.clone();
         let session_id = session_id.clone();
         let work_session_id = session_id.clone();
         let work = cleanup_spawner.spawn(async move {
-            if let Err(error) = machine
+            #[cfg(test)]
+            {
+                let hold = machine
+                    .test_accepted_boundary_work_hold
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some((entered, release)) = hold {
+                    let _ = entered.send(());
+                    let _ = release.await;
+                }
+            }
+            let dispatched = machine
                 .dispatch_accepted_ingress_boundary_work_owned(
                     &work_session_id,
                     held_mutation_gate,
@@ -7584,8 +7870,9 @@ impl MeerkatMachine {
                     should_wake,
                     fallback_wake,
                 )
-                .await
-            {
+                .await;
+            drop(runless_terminal);
+            if let Err(error) = dispatched {
                 tracing::error!(
                     session_id = %work_session_id,
                     %error,
@@ -9125,6 +9412,74 @@ impl LiveChannelStatusAuthority {
     }
 }
 
+/// Told, with no argument, each time a machine makes an accepted input's
+/// terminal readable without running it: an exact cancellation abandoned the
+/// input while it was queued, a later admission superseded or coalesced it,
+/// or a refused admission at its retry cap, an interrupted run's settlement,
+/// a stop, a retirement without a runtime loop, a replaced or recovered
+/// predecessor, or a failed accepted admission abandoned it. It carries no
+/// state and grants nothing; whoever is told re-reads the native terminal
+/// facts it cares about. It is only a signal: it must neither block nor call
+/// back into the machine. See
+/// [`MeerkatMachine::set_runless_input_terminal_hint`].
+pub type RunlessInputTerminalHint = Arc<dyn Fn() + Send + Sync>;
+
+/// Why a runtime refused to install an issuing consent owner as its
+/// owner-loss settlement
+/// ([`MeerkatMachine::install_consent_owner_loss_settlement`]). Nothing
+/// changed: the runtime keeps its registrations and any settlement it
+/// already had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConsentOwnerLossInstallRefused {
+    /// A session is registered, or being registered, on this runtime: its
+    /// registration published without this owner.
+    #[error("a session is already registered on this runtime")]
+    SessionsRegistered,
+    /// Another owner-loss settlement is already installed on this runtime.
+    #[error("another consent owner-loss settlement is already installed on this runtime")]
+    AlreadyInstalled,
+}
+
+/// One tell of a machine's [`RunlessInputTerminalHint`], owed by the step
+/// that commits runless input terminals.
+///
+/// The step takes it before the native locks it commits under, so that it
+/// drops after them, and [owes](Self::owe) it after each committed terminal.
+/// It tells the hint once, when it drops or is [released](Self::release)
+/// owing: after the locks are released, for a committed prefix even when a
+/// later step fails, and, moved into a retained handoff, even when nobody
+/// awaits that handoff any more. Moved with M into detached work, it is told
+/// once that work releases M, not once the work ends.
+#[derive(Default)]
+#[must_use = "an owed runless terminal is told only when its announcement drops or is released"]
+pub(crate) struct RunlessTerminalAnnouncement {
+    hint: Option<RunlessInputTerminalHint>,
+    owed: bool,
+}
+
+impl RunlessTerminalAnnouncement {
+    /// A runless input terminal was committed.
+    pub(crate) fn owe(&mut self) {
+        self.owed = true;
+    }
+
+    /// Tell the hint now if a terminal is owed; nothing stays owed.
+    pub(crate) fn release(&mut self) {
+        if std::mem::take(&mut self.owed)
+            && let Some(hint) = self.hint.as_ref()
+        {
+            hint();
+        }
+    }
+}
+
+impl Drop for RunlessTerminalAnnouncement {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// Session-scoped execution kernel for the Meerkat runtime.
 ///
 /// Owns per-session runtime state (driver, ops registry, completion waiters,
@@ -9134,6 +9489,11 @@ impl LiveChannelStatusAuthority {
 #[doc(hidden)]
 pub struct MeerkatMachineShared {
     native_work_authorization_host: crate::input_authority::NativeWorkAuthorizationSlot,
+    /// The issuing consent owner's owner-loss settlement, installed by the
+    /// composition before any session is registered. Empty: nothing is
+    /// settled and nothing is recorded as settled.
+    consent_owner_loss_settlement:
+        std::sync::OnceLock<Arc<dyn meerkat_core::approval::ConsentOwnerLossSettlement>>,
     /// This runtime owner's identity for session hosting claims (#1813).
     /// Every claim this machine's lineage takes (its registrations, and its
     /// session service's actors, cold attaches and store-only writes) carries
@@ -9305,6 +9665,9 @@ pub struct MeerkatMachineShared {
     /// exit. It carries no state: waiters re-check the session's DSL
     /// `current_run_id` after every wake.
     run_settlements: crate::tokio::sync::watch::Sender<u64>,
+    /// Host-installed [`RunlessInputTerminalHint`]. Shell composition slot,
+    /// NOT machine state.
+    runless_input_terminal_hint: StdRwLock<Option<RunlessInputTerminalHint>>,
     /// One-shot deterministic fault for the materializer's executor-attach
     /// publication window. Test-support only; production builds compile the
     /// post-ensure hook to a no-op and carry no field.
@@ -9346,6 +9709,15 @@ pub struct MeerkatMachineShared {
     /// and exact session gate but before it locks that session gate.
     #[cfg(test)]
     test_fenced_accept_after_lease: StdMutex<
+        Option<(
+            crate::tokio::sync::oneshot::Sender<()>,
+            crate::tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    /// Deterministic test gate inside accepted-ingress boundary work, while
+    /// it still owns the admission's session mutation gate.
+    #[cfg(test)]
+    test_accepted_boundary_work_hold: StdMutex<
         Option<(
             crate::tokio::sync::oneshot::Sender<()>,
             crate::tokio::sync::oneshot::Receiver<()>,
@@ -9444,6 +9816,19 @@ pub struct MeerkatMachineShared {
             SessionId,
             crate::tokio::sync::oneshot::Sender<()>,
             crate::tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    /// One-shot deterministic gate in a scoped context binding, immediately
+    /// before its driver takes the session document's machine authority:
+    /// its registration, mutation gate and driver are held, and its binder's
+    /// final decision has not run. Tests complete an authorization
+    /// publication while a binding is held here.
+    #[cfg(any(test, feature = "test-support"))]
+    test_scoped_binding_before_machine_authority: StdMutex<
+        Option<(
+            SessionId,
+            crate::tokio::sync::oneshot::Sender<()>,
+            std::sync::mpsc::Receiver<()>,
         )>,
     >,
     /// One-shot deterministic gate after a ReloadRequired discard publishes
@@ -9682,6 +10067,32 @@ impl Drop for MemberResidencyUpdate {
     }
 }
 
+/// A non-owning, opaque identity of one machine's runtime owner
+/// ([`MeerkatMachine::runtime_owner`]). It is not an execution handle: it
+/// reaches nothing of the machine and grants nothing. Holding it keeps none
+/// of that owner alive (no execution custody, session fact or store). It is
+/// not serializable: it names an owner only in this process, while held.
+/// While it is held the owner's allocation is not reused, so it never names
+/// another owner's handle; once every handle of its owner is gone it names
+/// no handle at all.
+#[derive(Clone)]
+pub struct RuntimeOwnerIdentity(std::sync::Weak<MeerkatMachineShared>);
+
+impl std::fmt::Debug for RuntimeOwnerIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RuntimeOwnerIdentity")
+    }
+}
+
+impl RuntimeOwnerIdentity {
+    /// Whether `machine` is a handle of this exact runtime owner, as
+    /// [`MeerkatMachine::is_same_runtime_owner`] decides between two handles.
+    #[must_use]
+    pub fn is_owner_of(&self, machine: &MeerkatMachine) -> bool {
+        std::ptr::eq(self.0.as_ptr(), Arc::as_ptr(&machine.shared))
+    }
+}
+
 /// Cloneable handle to the process-local runtime authority.
 ///
 /// Clones share every machine-owned session fact and shell-mechanics lock.
@@ -9691,6 +10102,125 @@ impl Drop for MemberResidencyUpdate {
 #[derive(Clone)]
 pub struct MeerkatMachine {
     shared: Arc<MeerkatMachineShared>,
+}
+
+/// A governed persistent machine before its native host is installed.
+///
+/// It owns the realm's governed execution custody and the machine's sole
+/// auth lifecycle owner, with no session registration and no native work
+/// authorization host. A host composition prepares work that needs that
+/// actual owner (for example a controller resolved under its auth lease)
+/// and performs its idle administrative effects under the same custody,
+/// then installs the native host exactly once through one of the
+/// `install_*` methods, which return the ordinary machine. Installation
+/// refuses while any clone of this machine is still shared.
+///
+/// Not `Clone`: the stage has one owner. Dropping it releases its custody
+/// only when no handle sharing that custody survives (see
+/// [`Self::release`]).
+pub struct StagedMeerkatMachine {
+    machine: MeerkatMachine,
+}
+
+/// The execution custody a persistent machine acquires over its store.
+enum MachineCustody {
+    /// An ordinary shared claim.
+    Shared,
+    /// The store's exclusive governed claim, retaining an associated store's
+    /// governed claim with it when one is supplied.
+    Governed {
+        associated: Option<crate::store::RuntimeStoreExecutionClaim>,
+    },
+}
+
+/// What [`StagedMeerkatMachine::release`] did to the stage's execution
+/// custody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedCustodyRelease {
+    /// The release itself completed the custody claim's final destruction:
+    /// the realm's execution custody is released.
+    Released,
+    /// Another handle sharing the custody (an exported auth lease clone held
+    /// by owned auth work, or a machine clone) still holds the claim; its
+    /// last holder releases the realm, and nothing here waits for it.
+    Retained,
+}
+
+impl StagedMeerkatMachine {
+    /// The machine's generated auth lifecycle owner: the same owner its
+    /// sessions' bindings clone once the stage is installed. A clone shares
+    /// the stage's custody for as long as it lives.
+    pub fn generated_auth_lease_handle(&self) -> meerkat_core::handles::GeneratedAuthLeaseHandle {
+        self.machine.generated_auth_lease_handle()
+    }
+
+    /// The machine's current provider-auth pair, exactly as
+    /// [`MeerkatMachine::provider_auth_runtime_authority`] snapshots it: the
+    /// generated auth lifecycle owner above with the OAuth flow authority
+    /// over that same owner, never a new one. Like an auth lease clone, the
+    /// pair shares the stage's custody claim and not the machine: it does
+    /// not refuse installation, and while it lives [`Self::release`] reports
+    /// `Retained`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn provider_auth_runtime_authority(&self) -> ProviderAuthRuntimeAuthority {
+        self.machine.provider_auth_runtime_authority()
+    }
+
+    /// A clone for one administrative effect performed under this stage's
+    /// custody. The native host cannot be installed until every such clone
+    /// has been dropped.
+    pub fn administrative_machine(&self) -> MeerkatMachine {
+        self.machine.clone()
+    }
+
+    /// Drop the stage without installing a host and report whether that
+    /// released its execution custody.
+    ///
+    /// The exact claim is kept while the stage is dropped. `Released` is
+    /// reported only when this call then holds the only reference to it (no
+    /// other strong or weak reference, so none can appear) and has run the
+    /// claim's final destruction, in place, to completion: the realm's
+    /// custody is free when it returns. Otherwise another holder still shares
+    /// the claim and `Retained` is reported; that holder's own final drop
+    /// releases the realm, and nothing here waits for it.
+    pub fn release(self) -> StagedCustodyRelease {
+        let claim = self.machine.shared.execution_custody.clone();
+        drop(self);
+        let Some(mut claim) = claim else {
+            return StagedCustodyRelease::Released;
+        };
+        if Arc::get_mut(&mut claim).is_none() {
+            return StagedCustodyRelease::Retained;
+        }
+        drop(claim);
+        StagedCustodyRelease::Released
+    }
+
+    /// Hold the final destruction of the stage's execution custody claim,
+    /// whichever thread runs it (test support): the receiver reports that
+    /// thread once it is parked there, still holding the custody, and the
+    /// destruction completes once the sender is used or dropped. `None`
+    /// without execution custody.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_custody_release_for_test(
+        &self,
+    ) -> Option<(
+        std::sync::mpsc::Receiver<std::thread::ThreadId>,
+        std::sync::mpsc::Sender<()>,
+    )> {
+        self.machine
+            .shared
+            .execution_custody
+            .as_ref()
+            .map(crate::store::execution_custody_final_drop_hold)
+    }
+}
+
+impl std::fmt::Debug for StagedMeerkatMachine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagedMeerkatMachine")
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::ops::Deref for MeerkatMachine {
@@ -9871,6 +10401,44 @@ impl MeerkatMachine {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Install the [`RunlessInputTerminalHint`] this machine tells after it
+    /// makes an accepted input's terminal readable without a run, once the
+    /// native locks it committed the terminal under are released. A later
+    /// install replaces the earlier one; announcements already taken keep
+    /// the hint they were taken with.
+    pub fn set_runless_input_terminal_hint(&self, hint: RunlessInputTerminalHint) {
+        *self
+            .runless_input_terminal_hint
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hint);
+    }
+
+    /// Tell the installed [`RunlessInputTerminalHint`], if any. Call it only
+    /// once the terminal it announces is durable and readable and no native
+    /// lock is held; a step that can fail after its commit, or that holds
+    /// native locks, owes a [`Self::runless_terminal_announcement`] instead.
+    #[allow(
+        dead_code,
+        reason = "the direct tell for a step that holds no native lock and cannot fail after its commit"
+    )]
+    pub(crate) fn hint_runless_input_terminal(&self) {
+        let mut announcement = self.runless_terminal_announcement();
+        announcement.owe();
+    }
+
+    /// An announcement that tells the installed [`RunlessInputTerminalHint`]
+    /// once it is owed and drops.
+    pub(crate) fn runless_terminal_announcement(&self) -> RunlessTerminalAnnouncement {
+        RunlessTerminalAnnouncement {
+            hint: self
+                .runless_input_terminal_hint
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            owed: false,
+        }
     }
 
     /// The interrupted-run evidence store installed in the session's
@@ -10877,6 +11445,15 @@ impl MeerkatMachine {
         self.shares_runtime_execution_owner_with(other)
     }
 
+    /// This machine's runtime owner as a non-owning, opaque identity: it
+    /// names the owner [`Self::is_same_runtime_owner`] compares, for any
+    /// handle of it, and keeps none of it alive (no execution custody,
+    /// session fact or store).
+    #[must_use]
+    pub fn runtime_owner(&self) -> RuntimeOwnerIdentity {
+        RuntimeOwnerIdentity(Arc::downgrade(&self.shared))
+    }
+
     /// Whether this adapter shares the same runtime persistence authority as
     /// another adapter. Runtime-backed composition surfaces use this to reject
     /// mismatched adapters before visible terminal events can outrun the store
@@ -10927,6 +11504,7 @@ impl MeerkatMachine {
         Self {
             shared: Arc::new(MeerkatMachineShared {
                 native_work_authorization_host: Arc::new(std::sync::OnceLock::new()),
+                consent_owner_loss_settlement: std::sync::OnceLock::new(),
                 hosting_owner: meerkat_core::session_hosting::HostingOwner::mint(),
                 sessions: RwLock::new(HashMap::new()),
                 #[cfg(not(target_arch = "wasm32"))]
@@ -10977,6 +11555,7 @@ impl MeerkatMachine {
                 live_unbound_rejection_authority: live_unbound_rejection_authority(),
                 session_claims: Arc::new(crate::handles::RuntimeSessionClaimRegistry::new()),
                 run_settlements: crate::tokio::sync::watch::Sender::new(0),
+                runless_input_terminal_hint: StdRwLock::new(None),
                 #[cfg(feature = "test-support")]
                 test_stop_executor_after_ensure: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-support")]
@@ -10996,6 +11575,8 @@ impl MeerkatMachine {
                 #[cfg(test)]
                 test_fenced_accept_after_lease: StdMutex::new(None),
                 #[cfg(test)]
+                test_accepted_boundary_work_hold: StdMutex::new(None),
+                #[cfg(test)]
                 test_pending_attachment_before_regate: StdMutex::new(None),
                 #[cfg(test)]
                 test_registration_transaction_contention_probe: StdMutex::new(None),
@@ -11014,6 +11595,8 @@ impl MeerkatMachine {
                 registration_run_start_holds: std::sync::Mutex::new(HashMap::new()),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_executor_apply: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_scoped_binding_before_machine_authority: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_run_start_held_parks: crate::tokio::sync::watch::Sender::new(0),
                 #[cfg(any(test, feature = "test-support"))]
@@ -11060,23 +11643,55 @@ impl MeerkatMachine {
         blob_store: Option<Arc<dyn BlobStore>>,
         governed: bool,
     ) -> Result<Self, RuntimeDriverError> {
-        let execution_custody = match (store.execution_custody(), governed) {
-            (Some(owner), true) => Some(Arc::new(
-                owner
+        let custody = if governed {
+            MachineCustody::Governed { associated: None }
+        } else {
+            MachineCustody::Shared
+        };
+        Self::persistent_with_custody(store, blob_store, custody)
+    }
+
+    /// [`Self::persistent_with_mode`] with the execution custody `custody`:
+    /// a governed machine may retain an associated store's governed claim
+    /// with its own ([`Self::persistent_governed_staged_with_associated_custody`]).
+    fn persistent_with_custody(
+        store: Arc<dyn RuntimeStore>,
+        blob_store: Option<Arc<dyn BlobStore>>,
+        custody: MachineCustody,
+    ) -> Result<Self, RuntimeDriverError> {
+        let execution_custody = match (store.execution_custody(), custody) {
+            (Some(owner), MachineCustody::Governed { associated }) => {
+                // An associated claim on this store itself (by any path)
+                // would let the machine admit itself; it is refused.
+                if associated
+                    .as_ref()
+                    .is_some_and(|associated| owner.binds_same_store(associated))
+                {
+                    return Err(execution_custody_error(
+                        crate::store::RuntimeStoreExecutionCustodyError::Unsupported,
+                    ));
+                }
+                let mut claim = owner
                     .try_acquire_governed()
-                    .map_err(execution_custody_error)?,
-            )),
-            (Some(owner), false) => Some(Arc::new(
+                    .map_err(execution_custody_error)?;
+                if let Some(associated) = associated {
+                    claim
+                        .retain_associated(associated)
+                        .map_err(execution_custody_error)?;
+                }
+                Some(Arc::new(claim))
+            }
+            (Some(owner), MachineCustody::Shared) => Some(Arc::new(
                 owner
                     .try_acquire_shared()
                     .map_err(execution_custody_error)?,
             )),
-            (None, true) => {
+            (None, MachineCustody::Governed { .. }) => {
                 return Err(execution_custody_error(
                     crate::store::RuntimeStoreExecutionCustodyError::Unsupported,
                 ));
             }
-            (None, false) => None,
+            (None, MachineCustody::Shared) => None,
         };
         #[cfg(not(target_arch = "wasm32"))]
         let (auth_lease, oauth_flows) = {
@@ -11102,6 +11717,7 @@ impl MeerkatMachine {
         Ok(Self {
             shared: Arc::new(MeerkatMachineShared {
                 native_work_authorization_host: Arc::new(std::sync::OnceLock::new()),
+                consent_owner_loss_settlement: std::sync::OnceLock::new(),
                 hosting_owner: meerkat_core::session_hosting::HostingOwner::mint(),
                 sessions: RwLock::new(HashMap::new()),
                 #[cfg(not(target_arch = "wasm32"))]
@@ -11152,6 +11768,7 @@ impl MeerkatMachine {
                 live_unbound_rejection_authority: live_unbound_rejection_authority(),
                 session_claims: Arc::new(crate::handles::RuntimeSessionClaimRegistry::new()),
                 run_settlements: crate::tokio::sync::watch::Sender::new(0),
+                runless_input_terminal_hint: StdRwLock::new(None),
                 #[cfg(feature = "test-support")]
                 test_stop_executor_after_ensure: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "test-support")]
@@ -11170,6 +11787,8 @@ impl MeerkatMachine {
                 test_user_interrupt_ack_timeout: StdMutex::new(USER_INTERRUPT_ACK_TIMEOUT),
                 #[cfg(test)]
                 test_fenced_accept_after_lease: StdMutex::new(None),
+                #[cfg(test)]
+                test_accepted_boundary_work_hold: StdMutex::new(None),
                 #[cfg(test)]
                 test_pending_attachment_before_regate: StdMutex::new(None),
                 #[cfg(test)]
@@ -11190,6 +11809,8 @@ impl MeerkatMachine {
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_executor_apply: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
+                test_scoped_binding_before_machine_authority: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
                 test_run_start_held_parks: crate::tokio::sync::watch::Sender::new(0),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_parked: crate::tokio::sync::watch::Sender::new(
@@ -11205,6 +11826,47 @@ impl MeerkatMachine {
                 test_before_finalized_unregister_removal: StdMutex::new(None),
             }),
         })
+    }
+
+    /// The realm's governed persistent machine, staged before its native
+    /// host is installed (see [`StagedMeerkatMachine`]).
+    ///
+    /// It acquires the store's governed execution custody now, exactly as a
+    /// governed open does, so a competing opener of the same realm is refused
+    /// promptly by the existing custody rules for as long as the stage (or any
+    /// handle sharing its custody) lives.
+    pub fn persistent_governed_staged(
+        store: Arc<dyn crate::store::RuntimeStore>,
+        blob_store: Option<Arc<dyn meerkat_core::BlobStore>>,
+    ) -> Result<StagedMeerkatMachine, RuntimeDriverError> {
+        Self::persistent_with_mode(store, blob_store, true)
+            .map(|machine| StagedMeerkatMachine { machine })
+    }
+
+    /// [`Self::persistent_governed_staged`] for a trusted host whose
+    /// governed composition is bound to another actual store's files: the
+    /// stage also retains `associated`, that store's governed claim (for
+    /// example [`crate::store::SqliteRuntimeStore::try_acquire_governed_execution_custody`]),
+    /// together with its own store's claim. Every handle sharing the stage's
+    /// custody shares both, and both are released only with that custody, so
+    /// the associated store's other execution owners stay out for as long as
+    /// this machine (or any handle sharing its custody) lives. Refused when
+    /// this store's governed custody is held, when `associated` binds this
+    /// same store (by any path) or is not a governed claim; `associated` is
+    /// then released.
+    pub fn persistent_governed_staged_with_associated_custody(
+        store: Arc<dyn crate::store::RuntimeStore>,
+        blob_store: Option<Arc<dyn meerkat_core::BlobStore>>,
+        associated: crate::store::RuntimeStoreExecutionClaim,
+    ) -> Result<StagedMeerkatMachine, RuntimeDriverError> {
+        Self::persistent_with_custody(
+            store,
+            blob_store,
+            MachineCustody::Governed {
+                associated: Some(associated),
+            },
+        )
+        .map(|machine| StagedMeerkatMachine { machine })
     }
 
     /// Shared auth lifecycle handle used by all runtime-backed session
@@ -11907,6 +12569,19 @@ mod live_bridge_original_work_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod oauth_pair_tests;
+
+impl Drop for MeerkatMachineShared {
+    /// The owner of every registration is gone: no holder that outlives it
+    /// (an exported configured-attachment authority) may still observe one of
+    /// its agent bindings as current.
+    fn drop(&mut self) {
+        for entry in self.sessions.get_mut().values() {
+            entry.agent_binding.retire();
+            entry.tool_surface_gate.retire();
+            entry.mcp_observation.retire();
+        }
+    }
+}
 
 impl MeerkatMachineShared {
     fn require_governed_execution_custody(&self) -> Result<(), RuntimeDriverError> {

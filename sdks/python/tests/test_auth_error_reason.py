@@ -15,7 +15,9 @@ EXPECTED = {
     "slot_occupied", "slot_account_mismatch", "slot_context_mismatch",
     "slot_mode_mismatch", "unverified_connector_publication", "reauth_required",
     "authorization_required", "callback_unavailable", "upstream_failure",
-    "configuration_invalid", "infrastructure",
+    "configuration_invalid", "credential_access_denied",
+    "credential_interaction_required", "credential_access_pending",
+    "credential_store_unavailable", "infrastructure",
 }
 
 

@@ -259,6 +259,7 @@ fn core_tool_visibility_witness(
             meerkat_core::types::ToolProvenance {
                 kind: core_tool_source_kind(provenance.kind),
                 source_id: meerkat_core::types::ToolSourceId::new(provenance.source_id.clone()),
+                artifact: None,
             }
         }),
     }

@@ -14,6 +14,12 @@
 //! such commit for that runtime fails once with a store write error, after
 //! the run has already consumed its inputs in memory: the failed durable
 //! boundary that leaves the runtime's durability degraded.
+//!
+//! It can also fail a runtime's reads until restored: its resume-authority
+//! observation ([`CommitGateRuntimeStore::fail_resume_observations`]), so the
+//! session owner's lifecycle cannot be observed, or the bounded identity read
+//! a session read consults ([`CommitGateRuntimeStore::fail_session_reads`]),
+//! so the session cannot be read.
 
 use std::sync::{Arc, Mutex};
 
@@ -34,6 +40,8 @@ pub struct CommitGateRuntimeStore {
     fail_next: Mutex<Option<LogicalRuntimeId>>,
     failed: watch::Sender<bool>,
     hold: watch::Sender<CommitHold>,
+    failing_observations: Mutex<Option<LogicalRuntimeId>>,
+    failing_reads: Mutex<Option<LogicalRuntimeId>>,
 }
 
 impl Default for CommitGateRuntimeStore {
@@ -50,7 +58,44 @@ impl CommitGateRuntimeStore {
             fail_next: Mutex::new(None),
             failed: watch::channel(false).0,
             hold: watch::channel(CommitHold::Idle).0,
+            failing_observations: Mutex::new(None),
+            failing_reads: Mutex::new(None),
         }
+    }
+
+    /// Fail every resume-authority observation of `runtime_id` until
+    /// [`Self::restore_resume_observations`].
+    pub fn fail_resume_observations(&self, runtime_id: LogicalRuntimeId) {
+        *self.failing_observations.lock().expect("commit gate lock") = Some(runtime_id);
+    }
+
+    /// Let resume-authority observations through again.
+    pub fn restore_resume_observations(&self) {
+        *self.failing_observations.lock().expect("commit gate lock") = None;
+    }
+
+    /// Fail every bounded committed-identity read of `runtime_id` (the read
+    /// a session read consults) until [`Self::restore_session_reads`].
+    pub fn fail_session_reads(&self, runtime_id: LogicalRuntimeId) {
+        *self.failing_reads.lock().expect("commit gate lock") = Some(runtime_id);
+    }
+
+    /// Let committed-identity reads through again.
+    pub fn restore_session_reads(&self) {
+        *self.failing_reads.lock().expect("commit gate lock") = None;
+    }
+
+    fn read_fails(
+        failing: &Mutex<Option<LogicalRuntimeId>>,
+        runtime_id: &LogicalRuntimeId,
+        what: &str,
+    ) -> Result<(), meerkat_runtime::RuntimeStoreError> {
+        if failing.lock().expect("commit gate lock").as_ref() == Some(runtime_id) {
+            return Err(meerkat_runtime::RuntimeStoreError::ReadFailed(format!(
+                "commit gate: injected {what} failure"
+            )));
+        }
+        Ok(())
     }
 
     /// Fail the next boundary commit of `runtime_id`, once.
@@ -162,6 +207,30 @@ impl meerkat_runtime::RuntimeStore for CommitGateRuntimeStore {
         meerkat_runtime::RuntimeStoreError,
     > {
         self.inner.load_session_boundary_authority(runtime_id).await
+    }
+
+    async fn load_session_resume_observation(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+    ) -> Result<
+        meerkat_runtime::store::RuntimeSessionResumeObservation,
+        meerkat_runtime::RuntimeStoreError,
+    > {
+        Self::read_fails(&self.failing_observations, runtime_id, "resume observation")?;
+        meerkat_runtime::RuntimeStore::load_session_resume_observation(&self.inner, runtime_id)
+            .await
+    }
+
+    async fn load_whole_blob_store_authority(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+    ) -> Result<
+        Option<meerkat_runtime::store::WholeBlobStoreAuthority>,
+        meerkat_runtime::RuntimeStoreError,
+    > {
+        Self::read_fails(&self.failing_reads, runtime_id, "session read")?;
+        meerkat_runtime::RuntimeStore::load_whole_blob_store_authority(&self.inner, runtime_id)
+            .await
     }
 
     async fn delete_runtime_session_catalog_entry(

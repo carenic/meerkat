@@ -21,7 +21,12 @@ use meerkat_llm_core::{LlmClient, LlmDoneOutcome, LlmEvent, LlmRequest, LlmStrea
 use meerkat_llm_core::{http, streaming};
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::time::Duration;
+
+use crate::tool_schema_root::{
+    kind_of, project_tool_schema_root, root_needs_projection, tool_schema_refusal,
+};
 
 /// Default connect timeout
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -610,7 +615,7 @@ impl AnthropicClient {
     }
 
     fn system_notice_anthropic_content(notice: &SystemNoticeMessage) -> Value {
-        let rendered = notice.model_projection_text();
+        let rendered = notice.model_projection_lead_text();
         let mut parts = Vec::new();
         if !rendered.trim().is_empty() {
             parts.push(serde_json::json!({
@@ -622,10 +627,23 @@ impl AnthropicClient {
         for block in &notice.blocks {
             match block {
                 SystemNoticeBlock::Comms { content, .. }
-                | SystemNoticeBlock::ExternalEvent { content, .. } => {
-                    for content_block in content {
-                        if !matches!(content_block, ContentBlock::Text { .. }) {
-                            parts.push(Self::content_block_to_anthropic_part(content_block));
+                | SystemNoticeBlock::ExternalEvent { content, .. }
+                | SystemNoticeBlock::RuntimeNotice { content, .. } => {
+                    if block.content_follows_notice_text() {
+                        // Runtime notice content and comms response blocks
+                        // follow the notice text in their own order, each
+                        // block lowered once.
+                        parts.extend(content.iter().map(Self::content_block_to_anthropic_part));
+                    } else {
+                        // The content's text is part of the notice text;
+                        // only its media follows it.
+                        for content_block in content {
+                            if matches!(
+                                content_block,
+                                ContentBlock::Image { .. } | ContentBlock::Video { .. }
+                            ) {
+                                parts.push(Self::content_block_to_anthropic_part(content_block));
+                            }
                         }
                     }
                 }
@@ -998,7 +1016,8 @@ impl AnthropicClient {
                 .tools
                 .iter()
                 .map(|t| -> Result<Value, LlmError> {
-                    let input_schema = normalize_anthropic_tool_input_schema(&t.input_schema)?;
+                    let input_schema =
+                        normalize_anthropic_tool_input_schema(&t.name, &t.input_schema)?;
                     Ok(serde_json::json!({
                         "name": t.name,
                         "description": t.description,
@@ -2301,7 +2320,54 @@ impl LlmClient for AnthropicClient {
     }
 }
 
-fn normalize_anthropic_tool_input_schema(schema: &Value) -> Result<Value, LlmError> {
+/// Keywords removed from every schema node (property names excepted) once
+/// local `$ref`s are inlined.
+const STRIPPED_TOOL_SCHEMA_KEYWORDS: &[&str] = &[
+    "$schema",
+    "$defs",
+    "defs",
+    "definitions",
+    "$ref",
+    "$id",
+    "$anchor",
+];
+
+/// Normalize a tool's `input_schema` for the Anthropic request body.
+///
+/// Local `$ref`s are inlined (an unresolvable one is refused), definition
+/// keywords are stripped, and the root is then projected onto one object
+/// schema by [`project_tool_schema_root`]: Anthropic refuses a tool whose
+/// `input_schema` root carries `oneOf`/`anyOf`/`allOf` or lacks `"type"`, and
+/// one such tool fails the whole request. Only the emitted request body
+/// changes: `ToolDef.input_schema` is unchanged, and this makes no claim about
+/// validation at execution. A schema that none of this would change is returned
+/// borrowed.
+///
+/// # Errors
+///
+/// [`LlmError::InvalidRequest`] for an unresolved `$ref`, or naming
+/// `tool_name` when the schema is not an object schema or its root falls
+/// outside the rules of [`project_tool_schema_root`].
+fn normalize_anthropic_tool_input_schema<'a>(
+    tool_name: &str,
+    schema: &'a Value,
+) -> Result<Cow<'a, Value>, LlmError> {
+    let Value::Object(root) = schema else {
+        return Err(tool_schema_refusal(
+            tool_name,
+            &format!(
+                "its input schema is {}, not an object schema",
+                kind_of(schema)
+            ),
+        ));
+    };
+    if !root_needs_projection(root)
+        && !contains_schema_ref(schema)
+        && !contains_stripped_tool_schema_keyword(schema)
+    {
+        return Ok(Cow::Borrowed(schema));
+    }
+
     let mut unresolved_refs = Vec::new();
     let mut normalized =
         inline_local_schema_refs(schema, schema, &mut Vec::new(), 0, &mut unresolved_refs);
@@ -2317,7 +2383,55 @@ fn normalize_anthropic_tool_input_schema(schema: &Value) -> Result<Value, LlmErr
         });
     }
     strip_anthropic_tool_schema_definition_keywords(&mut normalized);
-    Ok(normalized)
+    match &mut normalized {
+        Value::Object(root) => project_tool_schema_root(tool_name, root)?,
+        other => {
+            return Err(tool_schema_refusal(
+                tool_name,
+                &format!(
+                    "its input schema resolves to {}, not an object schema",
+                    kind_of(other)
+                ),
+            ));
+        }
+    }
+    Ok(Cow::Owned(normalized))
+}
+
+/// Whether any object in `value` carries a string `$ref`, the only thing
+/// [`inline_local_schema_refs`] rewrites or refuses.
+fn contains_schema_ref(value: &Value) -> bool {
+    match value {
+        Value::Object(obj) => {
+            matches!(obj.get("$ref"), Some(Value::String(_)))
+                || obj.values().any(contains_schema_ref)
+        }
+        Value::Array(items) => items.iter().any(contains_schema_ref),
+        _ => false,
+    }
+}
+
+/// Whether [`strip_anthropic_tool_schema_definition_keywords`] would remove
+/// anything from `value`. Walks exactly the nodes the strip visits.
+fn contains_stripped_tool_schema_keyword(value: &Value) -> bool {
+    match value {
+        Value::Object(obj) => {
+            STRIPPED_TOOL_SCHEMA_KEYWORDS
+                .iter()
+                .any(|keyword| obj.contains_key(*keyword))
+                || obj.iter().any(|(key, child)| {
+                    if key == "properties" {
+                        child.as_object().is_some_and(|props| {
+                            props.values().any(contains_stripped_tool_schema_keyword)
+                        })
+                    } else {
+                        contains_stripped_tool_schema_keyword(child)
+                    }
+                })
+        }
+        Value::Array(items) => items.iter().any(contains_stripped_tool_schema_keyword),
+        _ => false,
+    }
 }
 
 fn inline_local_schema_refs(
@@ -2411,13 +2525,9 @@ fn resolve_local_schema_ref<'a>(root: &'a Value, reference: &str) -> Option<&'a 
 fn strip_anthropic_tool_schema_definition_keywords(value: &mut Value) {
     match value {
         Value::Object(obj) => {
-            obj.remove("$schema");
-            obj.remove("$defs");
-            obj.remove("defs");
-            obj.remove("definitions");
-            obj.remove("$ref");
-            obj.remove("$id");
-            obj.remove("$anchor");
+            for keyword in STRIPPED_TOOL_SCHEMA_KEYWORDS {
+                obj.remove(*keyword);
+            }
 
             for (key, child) in obj.iter_mut() {
                 if key == "properties" {
@@ -5581,6 +5691,173 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_runtime_notice_with_image_emits_typed_image_part()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let client = AnthropicClient::new("test-key".to_string())?;
+        let mut request = LlmRequest::new(
+            "claude-sonnet-4-5",
+            vec![Message::SystemNotice(
+                meerkat_core::SystemNoticeMessage::with_block(
+                    meerkat_core::SystemNoticeKind::Generic,
+                    None,
+                    SystemNoticeBlock::RuntimeNotice {
+                        category: "consent_attempt".to_string(),
+                        detail: Some("correlated result".to_string()),
+                        payload: Some(serde_json::json!({"payload_marker": "never-projected"})),
+                        content: vec![ContentBlock::Image {
+                            media_type: "image/png".to_string(),
+                            data: ImageData::Inline {
+                                data: "iVBOR...".to_string(),
+                            },
+                        }],
+                    },
+                ),
+            )],
+        );
+        request.messages = client.project_replay_messages(&request.messages)?;
+
+        let body = client.build_request_body(&request)?;
+        assert!(!body.to_string().contains("never-projected"));
+        let messages = body["messages"].as_array().unwrap();
+        let content = messages[0]["content"].as_array().unwrap();
+
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert!(
+            content[0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("correlated result"))
+        );
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "iVBOR...");
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_comms_response_blocks_lower_once() -> Result<(), Box<dyn std::error::Error>> {
+        let client = AnthropicClient::new("test-key".to_string())?;
+        let mut request = LlmRequest::new(
+            "claude-sonnet-4-5",
+            vec![Message::SystemNotice(
+                meerkat_core::SystemNoticeMessage::with_block(
+                    meerkat_core::SystemNoticeKind::Comms,
+                    None,
+                    SystemNoticeBlock::Comms {
+                        kind: meerkat_core::types::CommsNoticeKind::ResponseTerminal,
+                        direction: meerkat_core::types::SystemNoticeDirection::Incoming,
+                        peer: Some(meerkat_core::SystemNoticePeer {
+                            id: meerkat_core::comms::PeerId::new(),
+                            display_name: Some("operator".to_string()),
+                        }),
+                        sender_taint: None,
+                        request_id: Some("request-7".to_string()),
+                        intent: None,
+                        status: Some("completed".to_string()),
+                        summary: None,
+                        payload: Some(serde_json::json!({"result_marker_q7": true})),
+                        content: vec![
+                            ContentBlock::structured(&serde_json::json!({"block_marker_z9": 2}))
+                                .expect("structured response block"),
+                        ],
+                    },
+                ),
+            )],
+        );
+        request.messages = client.project_replay_messages(&request.messages)?;
+
+        let body = client.build_request_body(&request)?;
+        let rendered = body["messages"][0]["content"].to_string();
+        assert_eq!(
+            rendered.matches("result_marker_q7").count(),
+            1,
+            "the response result appears once: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches("block_marker_z9").count(),
+            1,
+            "the response block appears once: {rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_runtime_notice_content_lowers_in_order_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let client = AnthropicClient::new("test-key".to_string())?;
+        let mut request = LlmRequest::new(
+            "claude-sonnet-4-5",
+            vec![Message::SystemNotice(
+                meerkat_core::SystemNoticeMessage::with_block(
+                    meerkat_core::SystemNoticeKind::Generic,
+                    None,
+                    SystemNoticeBlock::RuntimeNotice {
+                        category: "consent_attempt".to_string(),
+                        detail: Some("correlated result".to_string()),
+                        payload: None,
+                        content: vec![
+                            ContentBlock::Text {
+                                text: "first".to_string(),
+                            },
+                            ContentBlock::Image {
+                                media_type: "image/png".to_string(),
+                                data: ImageData::Inline {
+                                    data: "aW1hZ2Ux".to_string(),
+                                },
+                            },
+                            ContentBlock::Text {
+                                text: "second".to_string(),
+                            },
+                            ContentBlock::Image {
+                                media_type: "image/png".to_string(),
+                                data: ImageData::Inline {
+                                    data: "aW1hZ2Uy".to_string(),
+                                },
+                            },
+                            ContentBlock::structured(&serde_json::json!({"rows": 2}))
+                                .expect("structured content"),
+                        ],
+                    },
+                ),
+            )],
+        );
+        request.messages = client.project_replay_messages(&request.messages)?;
+
+        let body = client.build_request_body(&request)?;
+        let parts: Vec<(String, String)> = body["messages"][0]["content"]
+            .as_array()
+            .ok_or("content array")?
+            .iter()
+            .map(|part| {
+                (
+                    part["type"].as_str().unwrap_or_default().to_owned(),
+                    part["text"]
+                        .as_str()
+                        .or_else(|| part["source"]["data"].as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                )
+            })
+            .collect();
+        let expected: Vec<(String, String)> = [
+            ("text", "correlated result"),
+            ("text", "first"),
+            ("image", "aW1hZ2Ux"),
+            ("text", "second"),
+            ("image", "aW1hZ2Uy"),
+            ("text", "{\"rows\":2}"),
+        ]
+        .iter()
+        .map(|(kind, value)| ((*kind).to_owned(), (*value).to_owned()))
+        .collect();
+        assert_eq!(
+            parts, expected,
+            "detail first, then the content in order, once"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn anthropic_text_only_user_message_stays_string() -> Result<(), Box<dyn std::error::Error>> {
         let client = AnthropicClient::new("test-key".to_string())?;
         let request = LlmRequest::new(
@@ -5598,6 +5875,75 @@ mod tests {
         );
         assert_eq!(messages[0]["content"], "just text");
         Ok(())
+    }
+
+    // =========================================================================
+    // Tool input schema normalization
+    // =========================================================================
+
+    #[test]
+    fn tool_input_schema_needing_no_rewrite_is_borrowed() {
+        let in_shape = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "$id": {"type": "string", "description": "a property named like a keyword"},
+                "mode": {"oneOf": [{"const": "fast"}, {"const": "exact"}]}
+            },
+            "required": ["$id"],
+            "not": {"required": ["$id", "mode"]}
+        });
+        assert!(matches!(
+            normalize_anthropic_tool_input_schema("lookup", &in_shape),
+            Ok(Cow::Borrowed(_))
+        ));
+        assert!(!root_needs_projection(
+            in_shape.as_object().expect("object root")
+        ));
+
+        for malformed_required in [
+            serde_json::json!({
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": "id"
+            }),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id", 1]
+            }),
+        ] {
+            assert!(
+                root_needs_projection(malformed_required.as_object().expect("object root")),
+                "{malformed_required}"
+            );
+            assert!(
+                matches!(
+                    normalize_anthropic_tool_input_schema("lookup", &malformed_required),
+                    Err(LlmError::InvalidRequest { .. })
+                ),
+                "{malformed_required}"
+            );
+        }
+
+        for rewritten in [
+            serde_json::json!({"type": "object", "$schema": "https://json-schema.org/draft/2020-12/schema"}),
+            serde_json::json!({"type": "object", "properties": {"a": {"type": "string", "$id": "a"}}}),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"a": {"$ref": "#/$defs/A"}},
+                "$defs": {"A": {"type": "string"}}
+            }),
+            serde_json::json!({"type": "object", "allOf": []}),
+            serde_json::json!({"properties": {}}),
+        ] {
+            assert!(
+                matches!(
+                    normalize_anthropic_tool_input_schema("lookup", &rewritten),
+                    Ok(Cow::Owned(_))
+                ),
+                "{rewritten}"
+            );
+        }
     }
 
     // =========================================================================

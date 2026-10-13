@@ -10,9 +10,15 @@
 //! `ApprovalStore`, never restored. A historical approval record therefore
 //! cannot reconstruct a review allow.
 //!
-//! This is a review-path checkpoint. Qualified human review (R3 and R2
-//! escalation routes), durable consent consumption, closed batches and a typed
-//! host action reference are not implemented; R3 and escalation settle locally.
+//! R3 with a host human route retains one human attempt for the exact
+//! candidate and settles locally; an authenticated decision and a fresh
+//! explicit attempt spend it once (see [`super::consent`]). Without a route,
+//! R3 settles locally as before. With a route, an R2 escalation or an
+//! expired R2 deadline settles and retires the model attempt (keeping its
+//! own outcome) and then requests consent from the same human owner; an
+//! ordinary reviewer failure stays local feedback, because it cannot yet be
+//! told apart from a protected observation failure, which must never reach
+//! a human. Closed batches are not implemented.
 //! The reviewer receives the exact call, authorization facts and retained work
 //! owner through [`ReviewCandidate`]. Its optional `read_review_context` method
 //! supplies independently source-authorized original input material; unsupported
@@ -30,11 +36,17 @@ use serde::{Deserialize, Serialize};
 use crate::tokio;
 
 use crate::ToolCallView;
-use crate::approval::{RefusedReviewCommit, SettledReports};
-use crate::authorization::{
-    OperationAuthorizationFacts, OperationObservationError, PolicyPublicationObservation,
-    PreparedAuthorizationBinding, PreparedOperationCheck, WorkAuthorizationContext,
+use crate::approval::consent::{
+    ConsentCandidate, ConsentCandidateParts, ConsentNoticeKind, ConsentPresentationCandidate,
+    ConsentProjections, ConsentRefusal, HumanConsent, HumanConsentRoute, consent_request,
 };
+use crate::approval::{ApprovalId, RefusedReviewCommit, SettledReports};
+use crate::authorization::{
+    OperationAuthorizationError, OperationAuthorizationFacts, OperationObservationError,
+    PolicyPublicationObservation, PreparedAuthorizationBinding, PreparedOperationCheck,
+    ReviewOperationContext, ReviewOperationContextResolution, WorkAuthorizationContext,
+};
+use crate::lifecycle::identifiers::RunId;
 
 mod context;
 pub use context::{MAX_REVIEW_CONTEXT_BYTES, ReviewContextFuture, ReviewContextMaterial};
@@ -96,6 +108,16 @@ pub enum ReviewUnavailableKind {
     /// The dispatch that admitted this review already ended (cancelled,
     /// timed out or settled); a retained clone can no longer enter.
     DispatchEnded,
+    /// Another owner of the approval store changed the consent first; the
+    /// retained consent was retired and the approval is reconciled.
+    StoreConflict,
+    /// The approval store cannot confirm whether the consent spend
+    /// committed. Nothing entered and nothing is refunded.
+    StoreCommitUnknown,
+    /// The owner requires review material for this operation (its selected
+    /// action account or current mandate) and could not supply it. No review
+    /// attempt or approval exists and nothing entered.
+    ContextUnavailable,
 }
 
 impl fmt::Display for ReviewUnavailableKind {
@@ -107,6 +129,9 @@ impl fmt::Display for ReviewUnavailableKind {
             Self::UnsupportedEntry => "this tool cannot honor required operation review",
             Self::OwnerUnavailable => "operation review owner unavailable",
             Self::DispatchEnded => "the operation's dispatch already ended",
+            Self::StoreConflict => "the approval changed elsewhere",
+            Self::StoreCommitUnknown => "the approval store could not confirm the commit",
+            Self::ContextUnavailable => "the operation's review context is unavailable",
         })
     }
 }
@@ -151,7 +176,10 @@ impl OperationReviewRefusal {
 impl From<OperationReviewRefusal> for crate::ToolError {
     fn from(refusal: OperationReviewRefusal) -> Self {
         match refusal {
-            OperationReviewRefusal::Unsatisfied { kind } => Self::ReviewUnsatisfied { kind },
+            OperationReviewRefusal::Unsatisfied { kind } => Self::ReviewUnsatisfied {
+                kind,
+                approval_id: None,
+            },
             OperationReviewRefusal::Unavailable { kind } => Self::ReviewUnavailable { kind },
         }
     }
@@ -186,9 +214,17 @@ pub struct ReviewCandidate<'a> {
     pub(super) call: ToolCallView<'a>,
     pub(super) check: &'a PreparedOperationCheck,
     attribution: ReviewOperationAttribution,
+    operation_context: Option<&'a ReviewOperationContext>,
 }
 
 impl<'a> ReviewCandidate<'a> {
+    /// The owners' passive material for this operation (selected action
+    /// account, current mandate), read once for this attempt. `None` when the
+    /// owners stated it is not applicable. It grants nothing.
+    pub fn operation_context(&self) -> Option<&'a ReviewOperationContext> {
+        self.operation_context
+    }
+
     /// Exact origin for this attempt's source reads and reviewer inference.
     /// This diagnostic association never grants either operation permission.
     pub fn attribution(&self) -> &ReviewOperationAttribution {
@@ -324,6 +360,26 @@ impl ReviewAttemptHandle {
     fn attribution(&self) -> ReviewOperationAttribution {
         ReviewOperationAttribution::from_attempt(self)
     }
+
+    /// The same attempt (its id and generated status) bound to another exact
+    /// operation and work: only the consent owner moves parked custody into
+    /// a resumed run this way.
+    pub(super) fn rebound(
+        &self,
+        binding: PreparedAuthorizationBinding,
+        work: WorkAuthorizationContext,
+    ) -> Self {
+        Self {
+            id: Arc::clone(&self.id),
+            binding,
+            work,
+        }
+    }
+
+    /// Whether the attempt was issued under this exact work association.
+    pub(super) fn admitted_under(&self, work: &WorkAuthorizationContext) -> bool {
+        self.work.same_context(work)
+    }
 }
 
 /// Typed review owner failure, internal to core.
@@ -349,8 +405,87 @@ pub(crate) enum ReservedReviewError<E> {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum FinalCheckFailure {
     DeadlineExpired,
-    AuthorityChanged(crate::ToolError),
+    /// The prepared owner's coherent current check refused; its failure is
+    /// observed only after every lock is released.
+    AuthorityChanged(crate::authorization::OperationAuthorizationError),
     ContextChanged,
+}
+
+/// Classify the retained decision's callback-free current check, run under a
+/// commit reservation. A re-preparation request means the reviewed context is
+/// no longer current; every other failure changed the authority.
+pub(crate) fn retained_current_failure(
+    check: &PreparedOperationCheck,
+) -> Option<FinalCheckFailure> {
+    match check.check_retained_current() {
+        Ok(()) => None,
+        Err(crate::authorization::OperationAuthorizationError::Refused(refusal))
+            if refusal.kind() == crate::authorization::OperationRefusalKind::ReprepareRequired =>
+        {
+            Some(FinalCheckFailure::ContextChanged)
+        }
+        Err(error) => Some(FinalCheckFailure::AuthorityChanged(error)),
+    }
+}
+
+/// A refusal decided under an owner lock. An authority failure is observed
+/// (arbitrary owner code) only by [`Self::resolve`], once every lock is
+/// released.
+#[derive(Debug)]
+#[must_use = "resolve once every lock is released"]
+pub(crate) enum EntryRefusal {
+    Settled(crate::ToolError),
+    Authority {
+        check: PreparedOperationCheck,
+        error: crate::authorization::OperationAuthorizationError,
+    },
+}
+
+impl EntryRefusal {
+    pub(crate) fn resolve(self) -> crate::ToolError {
+        match self {
+            Self::Settled(error) => error,
+            Self::Authority { check, error } => check.observe_retained_check_failure(error).into(),
+        }
+    }
+}
+
+impl From<crate::ToolError> for EntryRefusal {
+    fn from(error: crate::ToolError) -> Self {
+        Self::Settled(error)
+    }
+}
+
+/// A refused spend. When the spend already committed (`spent`), the entry
+/// stays consumed: a later attempt refuses as already consumed, and nothing
+/// is refunded.
+struct SpendRefused {
+    refusal: EntryRefusal,
+    pending: PendingObservations,
+    spent: bool,
+}
+
+impl SpendRefused {
+    fn into_transition(
+        self,
+    ) -> (
+        ReviewEntryState,
+        Result<(), EntryRefusal>,
+        PendingObservations,
+        PendingObservations,
+    ) {
+        let state = if self.spent {
+            ReviewEntryState::Consumed
+        } else {
+            ReviewEntryState::Settled
+        };
+        (
+            state,
+            Err(self.refusal),
+            self.pending,
+            PendingObservations::default(),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +516,7 @@ pub struct BoundOperationReview {
     approvals: super::ApprovalService,
     deadline: std::time::Duration,
     observer: Option<Arc<dyn OperationReviewObserver>>,
+    human_consent: Option<HumanConsent>,
 }
 
 impl fmt::Debug for BoundOperationReview {
@@ -388,12 +524,19 @@ impl fmt::Debug for BoundOperationReview {
         f.debug_struct("BoundOperationReview")
             .field("deadline", &self.deadline)
             .field("observer", &self.observer.is_some())
+            .field(
+                "human_consent_validity",
+                &self.human_consent.as_ref().map(|consent| consent.validity),
+            )
             .finish_non_exhaustive()
     }
 }
 
 fn unsatisfied(kind: ReviewUnsatisfiedKind) -> crate::ToolError {
-    crate::ToolError::ReviewUnsatisfied { kind }
+    crate::ToolError::ReviewUnsatisfied {
+        kind,
+        approval_id: None,
+    }
 }
 
 fn unavailable(kind: ReviewUnavailableKind) -> crate::ToolError {
@@ -401,12 +544,15 @@ fn unavailable(kind: ReviewUnavailableKind) -> crate::ToolError {
 }
 
 /// Observations and settled reports of unrelated disposals, collected under
-/// a lock and delivered after it is released: observations first, then the
-/// reports (arbitrary observer code, so never under a lock).
+/// a lock and delivered after it is released: observations first, then
+/// consent projections, then the reports (arbitrary observer code, so never
+/// under a lock).
 #[derive(Default)]
 #[must_use = "deliver once every lock is released"]
 struct PendingObservations {
     observations: Vec<ReviewObservation>,
+    /// Boxed: every review refusal carries this beside its error.
+    consent: Option<Box<ConsentProjections>>,
     reports: SettledReports,
 }
 
@@ -414,7 +560,14 @@ impl PendingObservations {
     fn one(observation: ReviewObservation) -> Self {
         Self {
             observations: vec![observation],
-            reports: SettledReports::default(),
+            ..Self::default()
+        }
+    }
+
+    fn consent(consent: ConsentProjections) -> Self {
+        Self {
+            consent: Some(Box::new(consent)),
+            ..Self::default()
         }
     }
 
@@ -425,6 +578,11 @@ impl PendingObservations {
 
     fn extend(&mut self, other: Self) {
         self.observations.extend(other.observations);
+        match (&mut self.consent, other.consent) {
+            (Some(consent), Some(more)) => consent.extend(*more),
+            (consent @ None, more) => *consent = more,
+            (Some(_), None) => {}
+        }
         self.reports.absorb(other.reports);
     }
 }
@@ -445,6 +603,7 @@ impl BoundOperationReview {
             approvals,
             deadline,
             observer: None,
+            human_consent: None,
         }
     }
 
@@ -452,6 +611,68 @@ impl BoundOperationReview {
     pub fn with_observer(mut self, observer: Arc<dyn OperationReviewObserver>) -> Self {
         self.observer = Some(observer);
         self
+    }
+
+    /// Route R3 to qualified human consent through `route`: each candidate
+    /// gets one approval valid for `validity` (finite, chosen by the host)
+    /// from its request. Without a route R3 settles locally and nothing is
+    /// retained. This never selects a tier.
+    #[must_use]
+    pub fn with_human_consent(
+        mut self,
+        route: Arc<dyn HumanConsentRoute>,
+        validity: std::time::Duration,
+    ) -> Self {
+        self.human_consent = Some(HumanConsent { route, validity });
+        self
+    }
+
+    /// The approval owner that issues this review's human consent, as the
+    /// runtime's owner-loss settlement of that consent
+    /// ([`super::ConsentOwnerLossSettlement`]): present exactly when R3 routes
+    /// to human consent. Without a route no consent is issued here, so none
+    /// is owed.
+    pub fn consent_owner_loss_settlement(
+        &self,
+    ) -> Option<Arc<dyn super::ConsentOwnerLossSettlement>> {
+        self.human_consent
+            .as_ref()
+            .map(|_| Arc::new(self.approvals.clone()) as Arc<dyn super::ConsentOwnerLossSettlement>)
+    }
+
+    /// The run that admitted `work` closed: park the unspent human consent it
+    /// admitted for a resumed run of that work where it can be transferred,
+    /// and withdraw the rest, without waiting for the approval owner.
+    pub(crate) fn close_consent_for_work(&self, work: &WorkAuthorizationContext) {
+        if self.human_consent.is_some() {
+            self.approvals.close_consent_for_work(work);
+        }
+    }
+
+    /// A run opened under `work` as `run_id`: when it resumes retained work
+    /// through staged notice inputs, the parked consent their committed
+    /// receipts name moves into it.
+    pub(crate) fn open_consent_for_run(&self, work: &WorkAuthorizationContext, run_id: &RunId) {
+        if self.human_consent.is_some() {
+            self.approvals.open_consent_for_run(work, run_id);
+        }
+    }
+
+    /// The decided human consent among `requested` that the run `run_id` of
+    /// `work` can spend now (see
+    /// [`super::ApprovalService::decided_consent_for_run`]); none without a
+    /// human route.
+    pub(crate) fn decided_consent_for_run(
+        &self,
+        work: &WorkAuthorizationContext,
+        run_id: Option<&RunId>,
+        requested: &[crate::ApprovalId],
+    ) -> crate::approval::consent::DecidedConsentScan {
+        if self.human_consent.is_none() {
+            return crate::approval::consent::DecidedConsentScan::Decided(Vec::new());
+        }
+        self.approvals
+            .decided_consent_for_run(work, run_id, requested)
     }
 
     fn observation(
@@ -471,12 +692,16 @@ impl BoundOperationReview {
     fn deliver(&self, pending: PendingObservations) {
         let PendingObservations {
             observations,
+            consent,
             reports,
         } = pending;
         if let Some(observer) = self.observer.as_ref() {
             for observation in observations {
                 observer.observe(observation);
             }
+        }
+        if let Some(consent) = consent {
+            consent.deliver();
         }
         reports.run();
     }
@@ -498,10 +723,30 @@ pub(crate) async fn admit_operation_review(
 ) -> Result<ReviewEntry, crate::ToolError> {
     match prepared.review_tier() {
         OperationReviewTier::R1 => return Ok(ReviewEntry::not_required()),
-        // No qualified human route exists in this checkpoint, and a model
-        // allow can never satisfy R3: settle locally with zero entry.
+        // A model allow can never satisfy R3. Without a host human route it
+        // settles locally with zero entry; with one, one human attempt is
+        // retained for this exact candidate and it still settles locally:
+        // nothing parks, and only a fresh explicit attempt can spend it.
         OperationReviewTier::R3 => {
-            return Err(unsatisfied(ReviewUnsatisfiedKind::HumanConsentRequired));
+            return Err(
+                match review.and_then(|review| {
+                    review
+                        .human_consent
+                        .as_ref()
+                        .map(|consent| (review, consent))
+                }) {
+                    None => unsatisfied(ReviewUnsatisfiedKind::HumanConsentRequired),
+                    Some(_) if support == ReviewEntrySupport::Unsupported => {
+                        unavailable(ReviewUnavailableKind::UnsupportedEntry)
+                    }
+                    Some((review, consent)) => match resolve_operation_context(prepared) {
+                        Ok(context) => {
+                            request_human_consent(review, consent, call, prepared, &context)
+                        }
+                        Err(error) => error,
+                    },
+                },
+            );
         }
         OperationReviewTier::R2 => {}
     }
@@ -518,6 +763,9 @@ pub(crate) async fn admit_operation_review(
     if support == ReviewEntrySupport::Unsupported {
         return Err(unavailable(ReviewUnavailableKind::UnsupportedEntry));
     }
+    // Read the owners' passive material once, before any attempt exists, so
+    // a missing required context or an owner denial leaves no attempt.
+    let operation_context = resolve_operation_context(prepared)?;
     // The deadline starts before the first access to the owner. Beginning
     // the attempt takes the owner's reservation without waiting (this runs
     // on an async thread): a held owner refuses locally at once, typed, with
@@ -556,6 +804,7 @@ pub(crate) async fn admit_operation_review(
         call,
         check: prepared,
         attribution,
+        operation_context: material(&operation_context),
     };
     let verdict = match tokio::time::timeout_at(deadline, review.reviewer.review(&candidate)).await
     {
@@ -566,7 +815,7 @@ pub(crate) async fn admit_operation_review(
                 unavailable(ReviewUnavailableKind::DeadlineExpired),
             );
             review.deliver(pending);
-            return Err(error);
+            return Err(human_fallback(review, call, prepared, &operation_context).unwrap_or(error));
         }
     };
 
@@ -591,7 +840,7 @@ pub(crate) async fn admit_operation_review(
             unavailable(ReviewUnavailableKind::DeadlineExpired),
         );
         review.deliver(pending);
-        return Err(error);
+        return Err(human_fallback(review, call, prepared, &operation_context).unwrap_or(error));
     }
     match prepared.current() {
         Err(error) => {
@@ -615,6 +864,7 @@ pub(crate) async fn admit_operation_review(
 
     // Every verdict is accepted only under the owner's commit reservation,
     // after the same deadline/currentness checks are repeated there.
+    let escalated = matches!(verdict, Some(ReviewVerdict::Escalate));
     let settled = match verdict {
         Some(ReviewVerdict::Allow) => {
             return match retained.record_verdict(ReviewVerdict::Allow) {
@@ -642,13 +892,159 @@ pub(crate) async fn admit_operation_review(
         Ok((mut pending, error)) => {
             pending.extend(retained.release());
             review.deliver(pending);
-            Err(error)
+            // The model attempt is settled (as escalated) and released
+            // first; only then does the same human owner take it over.
+            Err(escalated
+                .then(|| human_fallback(review, call, prepared, &operation_context))
+                .flatten()
+                .unwrap_or(error))
         }
         Err((error, pending)) => {
             review.deliver(pending);
             Err(error)
         }
     }
+}
+
+/// R2 human fallback after the model attempt was already settled and
+/// retired: when a human route is configured, request consent for the same
+/// candidate from it. `None` without a route (local feedback stands).
+fn human_fallback(
+    review: &Arc<BoundOperationReview>,
+    call: ToolCallView<'_>,
+    prepared: &PreparedOperationCheck,
+    operation_context: &ReviewOperationContextResolution,
+) -> Option<crate::ToolError> {
+    review
+        .human_consent
+        .as_ref()
+        .map(|consent| request_human_consent(review, consent, call, prepared, operation_context))
+}
+
+/// Read the owners' passive review material exactly once for this candidate,
+/// after R1 is ruled out. A required context the owner cannot supply is typed
+/// unavailable, an owner denial stays a refusal and an observation failure
+/// stays infrastructure.
+fn resolve_operation_context(
+    prepared: &PreparedOperationCheck,
+) -> Result<ReviewOperationContextResolution, crate::ToolError> {
+    prepared
+        .work_authorization()
+        .authorization()
+        .review_operation_context(prepared.binding())
+        .map_err(|error| match error {
+            OperationAuthorizationError::Unavailable => {
+                unavailable(ReviewUnavailableKind::ContextUnavailable)
+            }
+            refused_or_observation => crate::ToolError::from(refused_or_observation),
+        })
+}
+
+fn material(resolution: &ReviewOperationContextResolution) -> Option<&ReviewOperationContext> {
+    match resolution {
+        ReviewOperationContextResolution::NotApplicable => None,
+        ReviewOperationContextResolution::Material(context) => Some(context),
+    }
+}
+
+/// R3 with a host human route (or R2 taken over by it): issue one consent
+/// approval for this exact candidate and retain its human attempt, then
+/// settle locally with
+/// action-required feedback. The decision never executes the action; a fresh
+/// explicit attempt does ([`admit_consent_attempt`]).
+fn request_human_consent(
+    review: &Arc<BoundOperationReview>,
+    consent: &HumanConsent,
+    call: ToolCallView<'_>,
+    prepared: &PreparedOperationCheck,
+    operation_context: &ReviewOperationContextResolution,
+) -> crate::ToolError {
+    let owner_unavailable = || unavailable(ReviewUnavailableKind::OwnerUnavailable);
+    // Present only material that is still current with the retained
+    // decision. A deadline fallback can run long after the material was read;
+    // any owner change since the preparation makes the retained check stale,
+    // and then nothing is presented or requested as current.
+    if let Err(error) = prepared.check_retained_current() {
+        return match prepared.observe_retained_check_failure(error) {
+            OperationAuthorizationError::Refused(refusal)
+                if refusal.kind()
+                    == crate::authorization::OperationRefusalKind::ReprepareRequired =>
+            {
+                unsatisfied(ReviewUnsatisfiedKind::ContextChanged)
+            }
+            error => crate::ToolError::from(error),
+        };
+    }
+    // Host presentation, outside every owner lock. A candidate the route
+    // cannot present readably gets no approval.
+    let Ok(presentation) = consent.route.present(&ConsentPresentationCandidate {
+        call,
+        check: prepared,
+        operation_context: material(operation_context),
+    }) else {
+        return owner_unavailable();
+    };
+    let Some(request) = consent_request(call, presentation, consent.validity) else {
+        return owner_unavailable();
+    };
+    let Some(deadline) = tokio::time::Instant::now().checked_add(consent.validity) else {
+        return owner_unavailable();
+    };
+    match review.approvals.try_request_consent(
+        request,
+        ConsentCandidateParts {
+            admitted: prepared.clone(),
+            deadline,
+            tool_call_id: Arc::from(call.id),
+            route: Arc::clone(&consent.route),
+            observer: review.observer.clone(),
+        },
+    ) {
+        // The reference is the owner's own committed request, never one taken
+        // from the call, its metadata or its arguments.
+        Ok((approval_id, projections)) => {
+            projections.deliver();
+            crate::ToolError::ReviewUnsatisfied {
+                kind: ReviewUnsatisfiedKind::HumanConsentRequired,
+                approval_id: Some(approval_id),
+            }
+        }
+        Err(_) => owner_unavailable(),
+    }
+}
+
+/// Admission of a fresh explicit attempt of one retained R3 candidate after
+/// an authenticated human decision. The approval owner resolves the
+/// candidate only for the presenting context's own admitted work and run, and
+/// returns its exact retained decision: the caller dispatches the retained
+/// binding-owned call through the common fenced tail, whose leaf spends the
+/// decision once at entry.
+pub(crate) fn admit_consent_attempt(
+    review: Option<&Arc<BoundOperationReview>>,
+    approval_id: &ApprovalId,
+    work: &WorkAuthorizationContext,
+    run_id: Option<&RunId>,
+) -> Result<(ReviewEntry, PreparedOperationCheck), crate::ToolError> {
+    let Some(review) = review.filter(|review| review.human_consent.is_some()) else {
+        return Err(unsatisfied(ReviewUnsatisfiedKind::HumanConsentRequired));
+    };
+    let candidate = review
+        .approvals
+        .resolve_consent_attempt(approval_id, work, run_id)
+        .map_err(ConsentRefusal::into_tool_error)?;
+    let admitted = candidate.admitted().clone();
+    let retained = RetainedConsent {
+        review: Arc::clone(review),
+        approval_id: approval_id.clone(),
+        candidate,
+    };
+    Ok((
+        ReviewEntry::new(
+            ReviewEntryState::Consent(retained),
+            Some(Arc::clone(review)),
+        ),
+        admitted,
+    ))
 }
 
 /// Per-operation review entry, shared by clones of one operation's dispatch
@@ -671,6 +1067,9 @@ struct ReviewEntryInner {
 enum ReviewEntryState {
     NotRequired,
     Retained(RetainedReview),
+    /// A fresh attempt of a retained R3 candidate holding an authenticated
+    /// human approval; the leaf spends it once.
+    Consent(RetainedConsent),
     Consumed,
     Settled,
 }
@@ -691,6 +1090,7 @@ impl fmt::Debug for ReviewEntry {
         f.write_str(match &self.0.lock().state {
             ReviewEntryState::NotRequired => "ReviewEntry(NotRequired)",
             ReviewEntryState::Retained(_) => "ReviewEntry(Retained)",
+            ReviewEntryState::Consent(_) => "ReviewEntry(Consent)",
             ReviewEntryState::Consumed => "ReviewEntry(Consumed)",
             ReviewEntryState::Settled => "ReviewEntry(Settled)",
         })
@@ -763,7 +1163,10 @@ impl ReviewEntry {
             let mut inner = self.0.lock();
             let review = inner.review.clone();
             let current = std::mem::replace(&mut inner.state, ReviewEntryState::Settled);
-            let fresh_spend = matches!(current, ReviewEntryState::Retained(_));
+            let fresh_spend = matches!(
+                current,
+                ReviewEntryState::Retained(_) | ReviewEntryState::Consent(_)
+            );
             // `used` carries the spend's `Used` projection and the reports its
             // reservation settled: both run after the effect.
             let (next, result, pending, used) = consume_state(current, entering);
@@ -783,7 +1186,8 @@ impl ReviewEntry {
             // Only refusal-path projections; never the spend's `Used`.
             review.deliver(pending);
         }
-        result
+        // A refused authority is observed only now, with every lock released.
+        result.map_err(EntryRefusal::resolve)
     }
 
     fn release_custody(&self) {
@@ -822,6 +1226,10 @@ impl ReviewEntry {
                     );
                     pending.extend(retired);
                 }
+                // An unspent consent (a failure before entry, a cancelled or
+                // timed-out attempt) stays with its owner, still spendable
+                // by a later fresh attempt; only this dispatch is closed.
+                ReviewEntryState::Consent(_) => {}
                 // A spent or not-required entry keeps its state: nested or
                 // late R1 staging remains a plain authorization check, and a
                 // second spend still refuses as already consumed.
@@ -911,8 +1319,18 @@ type Transition = (
 );
 
 fn check_state(current: ReviewEntryState, entering: &PreparedOperationCheck) -> Transition {
-    use ReviewEntryState::{Consumed, NotRequired, Retained, Settled};
+    use ReviewEntryState::{Consent, Consumed, NotRequired, Retained, Settled};
     match (entering.review_tier(), current) {
+        // Identity, not tier: the consented decision is the entering one (an
+        // R3 candidate, or an R2 one a human took over).
+        (_, Consent(consent)) if entering.same_check(consent.admitted()) => {
+            (Consent(consent), Ok(()), PendingObservations::default())
+        }
+        // The consented decision is no longer the entering one: fresh consent.
+        (_, Consent(consent)) => {
+            let (error, pending) = consent.retire_changed();
+            (Settled, Err(error), pending)
+        }
         (OperationReviewTier::R3, Retained(mut retained)) => {
             let (error, pending) = retained.retire(
                 ReviewRetirementReason::ContextChanged,
@@ -920,6 +1338,15 @@ fn check_state(current: ReviewEntryState, entering: &PreparedOperationCheck) -> 
             );
             (Settled, Err(error), pending)
         }
+        // Terminal states keep their disposition for every tier, before the
+        // R3 catch-all: a spent clone stays spent (its spend refuses as
+        // already consumed) and an ended dispatch's clone stays ended.
+        (_, Consumed) => (Consumed, Ok(()), PendingObservations::default()),
+        (_, Settled) => (
+            Settled,
+            Err(unavailable(ReviewUnavailableKind::DispatchEnded)),
+            PendingObservations::default(),
+        ),
         (OperationReviewTier::R3, _) => (
             Settled,
             Err(unsatisfied(ReviewUnsatisfiedKind::HumanConsentRequired)),
@@ -947,7 +1374,6 @@ fn check_state(current: ReviewEntryState, entering: &PreparedOperationCheck) -> 
         (OperationReviewTier::R1, NotRequired) => {
             (NotRequired, Ok(()), PendingObservations::default())
         }
-        (_, Consumed) => (Consumed, Ok(()), PendingObservations::default()),
         (OperationReviewTier::R1, Retained(mut retained)) => {
             let (error, pending) = retained.retire(
                 ReviewRetirementReason::ContextChanged,
@@ -960,11 +1386,6 @@ fn check_state(current: ReviewEntryState, entering: &PreparedOperationCheck) -> 
             Err(unsatisfied(ReviewUnsatisfiedKind::ContextChanged)),
             PendingObservations::default(),
         ),
-        (_, Settled) => (
-            Settled,
-            Err(unavailable(ReviewUnavailableKind::DispatchEnded)),
-            PendingObservations::default(),
-        ),
     }
 }
 
@@ -973,29 +1394,29 @@ fn consume_state(
     entering: &PreparedOperationCheck,
 ) -> (
     ReviewEntryState,
-    Result<(), crate::ToolError>,
+    Result<(), EntryRefusal>,
     PendingObservations,
     PendingObservations,
 ) {
-    use ReviewEntryState::{Consumed, NotRequired, Retained, Settled};
+    use ReviewEntryState::{Consent, Consumed, NotRequired, Retained, Settled};
+    let none = PendingObservations::default;
     match current {
-        NotRequired => (
-            NotRequired,
-            Ok(()),
-            PendingObservations::default(),
-            PendingObservations::default(),
-        ),
+        Consent(consent) => match consent.consume(entering) {
+            Ok(used) => (Consumed, Ok(()), none(), used),
+            Err(refused) => (*refused).into_transition(),
+        },
+        NotRequired => (NotRequired, Ok(()), none(), none()),
         Consumed => (
             Consumed,
-            Err(unsatisfied(ReviewUnsatisfiedKind::AlreadyConsumed)),
-            PendingObservations::default(),
-            PendingObservations::default(),
+            Err(unsatisfied(ReviewUnsatisfiedKind::AlreadyConsumed).into()),
+            none(),
+            none(),
         ),
         Settled => (
             Settled,
-            Err(unavailable(ReviewUnavailableKind::DispatchEnded)),
-            PendingObservations::default(),
-            PendingObservations::default(),
+            Err(unavailable(ReviewUnavailableKind::DispatchEnded).into()),
+            none(),
+            none(),
         ),
         Retained(mut retained) => {
             // Absolute deadline at the spend, then the identity-bound spend.
@@ -1004,21 +1425,77 @@ fn consume_state(
                     ReviewRetirementReason::DeadlineExpired,
                     unavailable(ReviewUnavailableKind::DeadlineExpired),
                 );
-                return (Settled, Err(error), pending, PendingObservations::default());
+                return (Settled, Err(error.into()), pending, none());
             }
             if !entering.same_check(&retained.admitted) {
                 let (error, pending) = retained.retire(
                     ReviewRetirementReason::ContextChanged,
                     unsatisfied(ReviewUnsatisfiedKind::ContextChanged),
                 );
-                return (Settled, Err(error), pending, PendingObservations::default());
+                return (Settled, Err(error.into()), pending, none());
             }
             match retained.consume(entering) {
-                Ok(used) => (Consumed, Ok(()), PendingObservations::default(), used),
-                Err((error, pending)) => {
-                    (Settled, Err(error), pending, PendingObservations::default())
-                }
+                Ok(used) => (Consumed, Ok(()), none(), used),
+                Err(refused) => (*refused).into_transition(),
             }
+        }
+    }
+}
+
+/// A fresh attempt's hold on one retained R3 candidate. The candidate's
+/// custody stays with the approval owner: dropping this (a failure before
+/// entry, cancellation) spends nothing and retires nothing.
+pub(crate) struct RetainedConsent {
+    review: Arc<BoundOperationReview>,
+    approval_id: ApprovalId,
+    candidate: Arc<ConsentCandidate>,
+}
+
+impl RetainedConsent {
+    fn admitted(&self) -> &PreparedOperationCheck {
+        self.candidate.admitted()
+    }
+
+    /// The consented decision is no longer the entering one: retire the
+    /// candidate (fresh consent is required) and settle this attempt.
+    fn retire_changed(&self) -> (crate::ToolError, PendingObservations) {
+        let reports = self.review.approvals.try_retire_consent(
+            &self.approval_id,
+            &self.candidate,
+            ReviewRetirementReason::ContextChanged,
+        );
+        (
+            unsatisfied(ReviewUnsatisfiedKind::ContextChanged),
+            PendingObservations::default().with_reports(reports),
+        )
+    }
+
+    /// Spend the decision once for the exact entering decision. Returns the
+    /// deferred `Used` projection and notice; the caller must not deliver
+    /// them before the effect.
+    fn consume(
+        &self,
+        entering: &PreparedOperationCheck,
+    ) -> Result<PendingObservations, Box<SpendRefused>> {
+        let (entered, spent, mut projections) = self.review.approvals.consume_consent_for_entry(
+            &self.approval_id,
+            &self.candidate,
+            entering,
+        );
+        if entered.is_ok() || spent {
+            // The spend committed: `Used` is its truth. On success it is
+            // delivered after the effect; after a final-check refusal it goes
+            // with the refusal (zero effect, nothing refunded).
+            projections.observe(&self.candidate, ReviewAttemptStatus::Used, None);
+            projections.notify(&self.candidate, &self.approval_id, ConsentNoticeKind::Used);
+        }
+        match entered {
+            Ok(()) => Ok(PendingObservations::consent(projections)),
+            Err(refusal) => Err(Box::new(SpendRefused {
+                refusal: refusal.into_entry_refusal(),
+                pending: PendingObservations::consent(projections),
+                spent,
+            })),
         }
     }
 }
@@ -1041,21 +1518,20 @@ impl RetainedReview {
     }
 
     /// Run under the owner's commit reservation, immediately before the
-    /// conditional commit: the absolute deadline, then the entering decision's
-    /// currentness, then its identity with the reviewed decision.
+    /// conditional commit: the absolute deadline, the entering decision's
+    /// identity with the reviewed one, then the prepared owner's coherent
+    /// current check of that retained decision. Nothing here re-prepares or
+    /// observes: the entering decision's full current check already ran at
+    /// its staging, outside every lock, and a failure here is observed only
+    /// after the reservation is released.
     fn final_check(&self, entering: &PreparedOperationCheck) -> Result<(), FinalCheckFailure> {
         if self.expired() {
             return Err(FinalCheckFailure::DeadlineExpired);
         }
-        match entering.current() {
-            Err(error) => Err(FinalCheckFailure::AuthorityChanged(error.into())),
-            Ok(current)
-                if !current.same_check(entering) || !entering.same_check(&self.admitted) =>
-            {
-                Err(FinalCheckFailure::ContextChanged)
-            }
-            Ok(_) => Ok(()),
+        if !entering.same_check(&self.admitted) {
+            return Err(FinalCheckFailure::ContextChanged);
         }
+        retained_current_failure(&self.admitted).map_or(Ok(()), Err)
     }
 
     /// Retirement reason for a refused reserved commit. Contention (a held
@@ -1085,14 +1561,51 @@ impl RetainedReview {
     fn refused_commit(
         &mut self,
         refused: RefusedReviewCommit<FinalCheckFailure>,
-    ) -> (crate::ToolError, PendingObservations) {
+    ) -> (EntryRefusal, PendingObservations) {
         let reason = Self::refused_retirement(&refused.error);
+        if let Some(status) = refused.committed {
+            // A committed spend refused by its final check after the owner
+            // exit: the attempt stays spent (its `Used` is reported now, as
+            // nothing will enter) and nothing is refunded.
+            let pending = match self.handle.take() {
+                Some(handle) => PendingObservations::one(BoundOperationReview::observation(
+                    &handle,
+                    &self.tool_call_id,
+                    status,
+                    None,
+                )),
+                None => PendingObservations::default(),
+            }
+            .with_reports(refused.reports);
+            let refusal = match refused.error {
+                ReservedReviewError::FinalCheck(FinalCheckFailure::AuthorityChanged(error)) => {
+                    EntryRefusal::Authority {
+                        check: self.admitted.clone(),
+                        error,
+                    }
+                }
+                ReservedReviewError::FinalCheck(FinalCheckFailure::DeadlineExpired) => {
+                    unavailable(ReviewUnavailableKind::DeadlineExpired).into()
+                }
+                _ => unsatisfied(ReviewUnsatisfiedKind::ContextChanged).into(),
+            };
+            return (refusal, pending);
+        }
         let error = match refused.error {
             ReservedReviewError::Contended => unavailable(ReviewUnavailableKind::OwnerUnavailable),
             ReservedReviewError::FinalCheck(FinalCheckFailure::DeadlineExpired) => {
                 unavailable(ReviewUnavailableKind::DeadlineExpired)
             }
-            ReservedReviewError::FinalCheck(FinalCheckFailure::AuthorityChanged(error)) => error,
+            ReservedReviewError::FinalCheck(FinalCheckFailure::AuthorityChanged(error)) => {
+                let pending = self.refused_disposal(reason, refused.disposal, refused.reports);
+                return (
+                    EntryRefusal::Authority {
+                        check: self.admitted.clone(),
+                        error,
+                    },
+                    pending,
+                );
+            }
             ReservedReviewError::FinalCheck(FinalCheckFailure::ContextChanged) => {
                 unsatisfied(ReviewUnsatisfiedKind::ContextChanged)
             }
@@ -1110,7 +1623,18 @@ impl RetainedReview {
                 unavailable(ReviewUnavailableKind::OwnerUnavailable)
             }
         };
-        let pending = match (self.handle.take(), refused.disposal) {
+        let pending = self.refused_disposal(reason, refused.disposal, refused.reports);
+        (EntryRefusal::Settled(error), pending)
+    }
+
+    /// Projection of the attempt's disposal under a refused reservation.
+    fn refused_disposal(
+        &mut self,
+        reason: ReviewRetirementReason,
+        disposal: Option<Result<ReviewAttemptStatus, ReviewOwnerError>>,
+        reports: SettledReports,
+    ) -> PendingObservations {
+        let pending = match (self.handle.take(), disposal) {
             (Some(handle), Some(Ok(status))) => {
                 PendingObservations::one(BoundOperationReview::observation(
                     &handle,
@@ -1121,7 +1645,7 @@ impl RetainedReview {
             }
             _ => PendingObservations::default(),
         };
-        (error, pending.with_reports(refused.reports))
+        pending.with_reports(reports)
     }
 
     /// Report for a disposal the owner settles later: delivers the settled
@@ -1208,7 +1732,12 @@ impl RetainedReview {
                 BoundOperationReview::observation(handle, &self.tool_call_id, status, None),
             )
             .with_reports(reports)),
-            Err(refused) => Err(self.refused_commit(refused)),
+            // Called outside every entry lock, and the owner's reservation
+            // is already released: observe a refused authority now.
+            Err(refused) => {
+                let (refusal, pending) = self.refused_commit(refused);
+                Err((refusal.resolve(), pending))
+            }
         }
     }
 
@@ -1271,12 +1800,13 @@ impl RetainedReview {
     fn consume(
         &mut self,
         entering: &PreparedOperationCheck,
-    ) -> Result<PendingObservations, (crate::ToolError, PendingObservations)> {
+    ) -> Result<PendingObservations, Box<SpendRefused>> {
         let Some(handle) = self.handle.as_ref() else {
-            return Err((
-                unavailable(ReviewUnavailableKind::OwnerUnavailable),
-                PendingObservations::default(),
-            ));
+            return Err(Box::new(SpendRefused {
+                refusal: unavailable(ReviewUnavailableKind::OwnerUnavailable).into(),
+                pending: PendingObservations::default(),
+                spent: false,
+            }));
         };
         let spent = self.review.approvals.consume_review_for_entry(
             handle,
@@ -1299,7 +1829,15 @@ impl RetainedReview {
                 // delivered together, after the effect.
                 Ok(PendingObservations::one(used).with_reports(reports))
             }
-            Err(refused) => Err(self.refused_commit(refused)),
+            Err(refused) => {
+                let spent = refused.committed.is_some();
+                let (refusal, pending) = self.refused_commit(refused);
+                Err(Box::new(SpendRefused {
+                    refusal,
+                    pending,
+                    spent,
+                }))
+            }
         }
     }
 }
@@ -1348,6 +1886,17 @@ mod seam_tests {
     struct R2Work;
 
     impl WorkAuthorization for R2Work {
+        /// This test owner has no review material: explicitly not applicable.
+        fn review_operation_context(
+            &self,
+            _binding: &crate::authorization::PreparedAuthorizationBinding,
+        ) -> Result<
+            crate::authorization::ReviewOperationContextResolution,
+            crate::authorization::OperationAuthorizationError,
+        > {
+            Ok(crate::authorization::ReviewOperationContextResolution::NotApplicable)
+        }
+
         fn prepare(
             &self,
             _binding: &PreparedAuthorizationBinding,
@@ -1513,6 +2062,7 @@ mod seam_tests {
             entry.consume(&check),
             Err(crate::ToolError::ReviewUnsatisfied {
                 kind: ReviewUnsatisfiedKind::AlreadyConsumed,
+                approval_id: None,
             })
         );
         guard.complete();
@@ -1527,10 +2077,10 @@ mod seam_tests {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod reservation_tests {
     //! The approval owner's commit reservation under real contention: a
-    //! human `decide` holds it through a blocked `ApprovalStore::put`. Review
-    //! paths never wait for it (they run on async threads): a held owner
-    //! refuses locally at once, and refusal cleanup is queued for the
-    //! owner's next commit. Deadline and currentness are re-checked after the
+    //! human `decide` holds it through a blocked store write. Review paths
+    //! never wait for it (they run on async threads): a held owner refuses
+    //! locally at once, and refusal cleanup is queued for the owner's next
+    //! commit. Deadline and currentness are re-checked after the
     //! reservation is taken, and no queued report runs between a successful
     //! spend and the effect.
 
@@ -1567,6 +2117,10 @@ mod reservation_tests {
         sequence: AtomicU64,
         /// Runs once inside the next currentness check (test injection).
         on_check: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// The current permission is withdrawn: every check refuses.
+        denied: AtomicBool,
+        /// Arbitrary owner code run while a refusal is observed.
+        on_observe: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     }
 
     struct Decision {
@@ -1587,17 +2141,42 @@ mod reservation_tests {
             if let Some(hook) = hook {
                 hook();
             }
-            if self.sequence == self.owner.sequence.load(Ordering::Acquire) {
+            if self.owner.denied.load(Ordering::Acquire) {
+                Err(OperationRefused::new(OperationRefusalKind::Denied).into())
+            } else if self.sequence == self.owner.sequence.load(Ordering::Acquire) {
                 Ok(())
             } else {
                 Err(OperationRefused::new(OperationRefusalKind::ReprepareRequired).into())
             }
+        }
+
+        fn observe(
+            &self,
+            _binding: &PreparedAuthorizationBinding,
+            _observation: crate::authorization::OperationObservation,
+        ) -> Result<(), crate::authorization::OperationObservationError> {
+            let hook = self.owner.on_observe.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+            Ok(())
         }
     }
 
     struct OwnerWork(Arc<Owner>);
 
     impl WorkAuthorization for OwnerWork {
+        /// This test owner has no review material: explicitly not applicable.
+        fn review_operation_context(
+            &self,
+            _binding: &crate::authorization::PreparedAuthorizationBinding,
+        ) -> Result<
+            crate::authorization::ReviewOperationContextResolution,
+            crate::authorization::OperationAuthorizationError,
+        > {
+            Ok(crate::authorization::ReviewOperationContextResolution::NotApplicable)
+        }
+
         fn prepare(
             &self,
             _binding: &PreparedAuthorizationBinding,
@@ -1609,7 +2188,7 @@ mod reservation_tests {
         }
     }
 
-    /// Blocks the armed `put` (inside `decide`, under the owner's state
+    /// Blocks the armed store write (inside `decide`, under the owner's state
     /// lock) until released, for at most `BOUND`.
     struct GatedStore {
         armed: AtomicBool,
@@ -1622,7 +2201,18 @@ mod reservation_tests {
             Ok(Vec::new())
         }
 
-        fn put(&self, _record: &ApprovalRecord) -> Result<(), ApprovalStoreError> {
+        fn get(
+            &self,
+            _approval_id: &crate::approval::ApprovalId,
+        ) -> Result<Option<ApprovalRecord>, ApprovalStoreError> {
+            Ok(None)
+        }
+
+        fn put_if_current(
+            &self,
+            _expected: Option<&ApprovalRecord>,
+            _record: &ApprovalRecord,
+        ) -> Result<(), ApprovalStoreError> {
             if self.armed.swap(false, Ordering::AcqRel) {
                 let _ = self.held.lock().send(());
                 let _ = self.release.lock().recv_timeout(BOUND);
@@ -1801,7 +2391,7 @@ mod reservation_tests {
         }
 
         /// A human decision takes the owner's commit reservation and holds
-        /// it inside `ApprovalStore::put` until released (at most `BOUND`).
+        /// it inside its store write until released (at most `BOUND`).
         fn hold_reservation(&self) -> std::thread::JoinHandle<()> {
             let id = self
                 .approvals
@@ -1885,6 +2475,7 @@ mod reservation_tests {
                     result,
                     Err(crate::ToolError::ReviewUnsatisfied {
                         kind: ReviewUnsatisfiedKind::ContextChanged,
+                        approval_id: None,
                     })
                 );
                 assert_eq!(
@@ -1901,6 +2492,66 @@ mod reservation_tests {
                     observer.statuses().last().copied(),
                     Some((ReviewAttemptStatus::Used, None))
                 );
+            }
+        }
+    }
+
+    /// R2's final check under the reservation is the retained decision's
+    /// coherent current check only: a permission withdrawn between staging
+    /// and the spend refuses there, and its observation (owner code that
+    /// re-enters the approval owner) runs only after every lock is released.
+    /// The unchanged control spends.
+    #[tokio::test]
+    async fn a_refused_spend_is_observed_only_after_the_reservation() {
+        for withdrawn in [true, false] {
+            let h = harness();
+            let (review, observer) = h.review(Arc::new(ImmediateAllow), DEADLINE);
+            let entry = admit(&review, &h.check, &h.work)
+                .await
+                .expect("allowed and retained");
+            let reentered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let approvals = h.approvals.clone();
+            let count = Arc::clone(&reentered);
+            *h.owner.on_observe.lock() = Some(Arc::new(move || {
+                approvals
+                    .list(crate::approval::ApprovalListFilter::default())
+                    .expect("the owner is free while a refusal is observed");
+                count.fetch_add(1, Ordering::SeqCst);
+            }));
+            h.owner.denied.store(withdrawn, Ordering::Release);
+
+            let (done, spent) = mpsc::channel();
+            let check = h.check.clone();
+            let spender = std::thread::spawn(move || {
+                let guard = ReviewDispatchGuard::new(entry.clone());
+                let result = entry.consume(&check);
+                guard.complete();
+                let _ = done.send(result);
+            });
+            let result = spent
+                .recv_timeout(BOUND)
+                .expect("no deadlock: the observation runs outside every lock");
+            spender.join().expect("spender");
+            if withdrawn {
+                assert_eq!(
+                    result,
+                    Err(crate::ToolError::AuthorizationRefused {
+                        refusal: OperationRefused::new(OperationRefusalKind::Denied),
+                    })
+                );
+                assert_eq!(reentered.load(Ordering::SeqCst), 1, "observed once");
+                assert_eq!(
+                    observer.statuses().last().copied(),
+                    Some((
+                        ReviewAttemptStatus::Retired,
+                        Some(ReviewRetirementReason::AuthorityChanged)
+                    ))
+                );
+                assert!(!observer.used());
+            } else {
+                assert_eq!(result, Ok(()));
+                assert_eq!(reentered.load(Ordering::SeqCst), 0);
+                assert!(observer.used());
             }
         }
     }
@@ -1942,6 +2593,7 @@ mod reservation_tests {
             result.err(),
             Some(crate::ToolError::ReviewUnsatisfied {
                 kind: ReviewUnsatisfiedKind::ContextChanged,
+                approval_id: None,
             })
         );
         assert_eq!(

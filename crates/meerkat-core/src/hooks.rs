@@ -87,6 +87,11 @@ impl HookPoint {
         )
     }
 
+    /// Points whose invocation carries a model operation.
+    pub fn carries_model_operation(self) -> bool {
+        matches!(self, Self::PreLlmRequest | Self::PostLlmResponse)
+    }
+
     /// Whether this point observes an already-committed or terminally-resolved
     /// fact and therefore cannot carry policy authority.
     pub fn is_observe_only(self) -> bool {
@@ -116,6 +121,39 @@ pub enum HookExecutionMode {
 pub enum HookCapability {
     Observe,
     Guardrail,
+}
+
+/// Which model operations a hook entry governs at `PreLlmRequest` and
+/// `PostLlmResponse`.
+///
+/// The default governs every model request. `OrdinaryOnly` is the policy
+/// owner's explicit statement that its prerequisite does not govern the
+/// separate controller-feedback request the agent sends after a mandatory
+/// prerequisite withheld an ordinary operation. It never applies implicitly.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum HookModelOperationScope {
+    #[default]
+    All,
+    OrdinaryOnly,
+}
+
+impl HookModelOperationScope {
+    pub fn is_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+
+    /// Whether an entry with this scope applies to `operation`. Points that
+    /// carry no model operation are governed as before.
+    pub fn admits(self, operation: Option<&HookModelOperation>) -> bool {
+        match self {
+            Self::All => true,
+            Self::OrdinaryOnly => !matches!(
+                operation,
+                Some(HookModelOperation::ControllerFeedback { .. })
+            ),
+        }
+    }
 }
 
 /// Runtime input kind projected onto the public hook surface.
@@ -1032,6 +1070,48 @@ pub struct HookLlmRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_params: Option<crate::lifecycle::run_primitive::ProviderParamsOverride>,
     pub message_count: usize,
+    /// The exact model operation this request belongs to.
+    #[serde(default)]
+    pub operation: HookModelOperation,
+}
+
+/// Purpose of one model request, minted by the agent loop for the exact
+/// request it is about to send. It is never derived from the authorization
+/// use, the selected provider, caller metadata or controller routing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HookModelOperation {
+    /// An ordinary model request. `sequence` numbers the run's model requests.
+    Ordinary { sequence: u64 },
+    /// The distinct control request that returns a withheld operation's typed
+    /// result to the admitted controller in the same run.
+    ControllerFeedback {
+        sequence: u64,
+        withheld: HookWithheldModelOperation,
+    },
+}
+
+impl Default for HookModelOperation {
+    fn default() -> Self {
+        Self::Ordinary { sequence: 0 }
+    }
+}
+
+impl HookModelOperation {
+    pub fn sequence(&self) -> u64 {
+        match self {
+            Self::Ordinary { sequence } | Self::ControllerFeedback { sequence, .. } => *sequence,
+        }
+    }
+}
+
+/// The exact ordinary operation a mandatory prerequisite withheld.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct HookWithheldModelOperation {
+    pub sequence: u64,
+    pub hook_id: HookId,
+    pub point: HookPoint,
 }
 
 /// LLM response view exposed to hooks.
@@ -1052,6 +1132,9 @@ pub struct HookLlmResponse {
     /// from this field instead of racing the lossy observe stream.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub server_tool_content: Vec<ServerToolKind>,
+    /// The exact model operation this response answers.
+    #[serde(default)]
+    pub operation: HookModelOperation,
 }
 
 /// Tool call view exposed to hooks.
@@ -1282,6 +1365,19 @@ impl Serialize for HookInvocation {
 }
 
 impl HookInvocation {
+    /// The exact model operation a `PreLlmRequest` or `PostLlmResponse`
+    /// invocation carries. Other points carry none.
+    pub fn model_operation(&self) -> Option<&HookModelOperation> {
+        self.llm_request
+            .as_ref()
+            .map(|request| &request.operation)
+            .or_else(|| {
+                self.llm_response
+                    .as_ref()
+                    .map(|response| &response.operation)
+            })
+    }
+
     pub fn new(point: HookPoint, session_id: SessionId) -> Self {
         Self {
             point,
@@ -1707,6 +1803,7 @@ impl HookRegisteredBackgroundCompletion {
                 category: "background_hook_completion".to_owned(),
                 detail: Some(payload.to_string()),
                 payload: Some(payload),
+                content: Vec::new(),
             },
         )
         .into()
@@ -1723,6 +1820,162 @@ pub(crate) fn background_feedback_reason(reason: &HookFailureReason) -> HookFail
         },
         other => other.clone(),
     }
+}
+
+/// One enabled mandatory (Guardrail) entry an engine would execute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookMandatoryGate {
+    pub hook_id: HookId,
+    pub point: HookPoint,
+    pub model_operations: HookModelOperationScope,
+}
+
+/// Mandatory hook topology of an engine's exact effective entries.
+///
+/// A mandatory model-request prerequisite that fails withholds only its
+/// dependent operation and returns a typed result to the admitted controller
+/// in the same run. A topology that cannot satisfy that is rejected before
+/// activation or admission, never discovered as a run failure.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HookMandatoryTopology {
+    gates: Vec<HookMandatoryGate>,
+}
+
+impl HookMandatoryTopology {
+    /// No mandatory entries.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Every enabled Guardrail entry, in registration order.
+    pub fn from_entries<'a>(
+        entries: impl IntoIterator<Item = &'a crate::config::HookEntryConfig>,
+    ) -> Self {
+        Self {
+            gates: entries
+                .into_iter()
+                .filter(|entry| entry.enabled && entry.capability == HookCapability::Guardrail)
+                .map(|entry| HookMandatoryGate {
+                    hook_id: entry.id.clone(),
+                    point: entry.point,
+                    model_operations: entry.model_operations,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn gates(&self) -> &[HookMandatoryGate] {
+        &self.gates
+    }
+
+    /// Whether a failure of `hook_id` at `point` is an admitted model-request
+    /// gate scoped to ordinary operations, and so may be recovered through
+    /// same-run controller feedback. Any other failure stays fail-closed.
+    pub fn admits_controller_feedback(&self, hook_id: &HookId, point: HookPoint) -> bool {
+        self.gates.iter().any(|gate| {
+            &gate.hook_id == hook_id
+                && gate.point == point
+                && point.carries_model_operation()
+                && gate.model_operations == HookModelOperationScope::OrdinaryOnly
+        })
+    }
+
+    /// Whether any mandatory entry governs a model request.
+    pub fn has_model_request_gate(&self) -> bool {
+        self.gates
+            .iter()
+            .any(|gate| gate.point.carries_model_operation())
+    }
+
+    /// Topology checks that need no run: every model-request gate must
+    /// explicitly exclude the controller-feedback request, and lifecycle
+    /// points whose only denial is run refusal or deferral are unsupported.
+    pub fn validate_activation(&self) -> Result<(), HookTopologyError> {
+        for gate in &self.gates {
+            match gate.point {
+                HookPoint::PreLlmRequest | HookPoint::PostLlmResponse
+                    if gate.model_operations.is_all() =>
+                {
+                    return Err(HookTopologyError::UnscopedModelRequestGate {
+                        hook_id: gate.hook_id.clone(),
+                        point: gate.point,
+                    });
+                }
+                HookPoint::RunStarted | HookPoint::TurnBoundary => {
+                    return Err(HookTopologyError::UnsupportedLifecycleGate {
+                        hook_id: gate.hook_id.clone(),
+                        point: gate.point,
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Run admission: the activation checks plus a retained authorized
+    /// controller for every model-request gate.
+    pub fn validate_admission(&self, controller_retained: bool) -> Result<(), HookTopologyError> {
+        self.validate_activation()?;
+        if !controller_retained
+            && let Some(gate) = self
+                .gates
+                .iter()
+                .find(|gate| gate.point.carries_model_operation())
+        {
+            return Err(HookTopologyError::MissingController {
+                hook_id: gate.hook_id.clone(),
+                point: gate.point,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// An unsupported hook configuration, reported before activation or
+/// admission. It is not a policy denial and not a failed admitted run.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HookTopologyError {
+    #[error(
+        "mandatory hook '{hook_id}' at {point:?} governs every model request, including the controller-feedback request; set model_operations = \"ordinary_only\" to state that its prerequisite does not govern that request"
+    )]
+    UnscopedModelRequestGate { hook_id: HookId, point: HookPoint },
+    #[error(
+        "mandatory hook '{hook_id}' at {point:?} is not supported: a denial there cannot withhold only its dependent operation"
+    )]
+    UnsupportedLifecycleGate { hook_id: HookId, point: HookPoint },
+    #[error(
+        "hook '{hook_id}' sets model_operations at {point:?}, which carries no model operation"
+    )]
+    ScopeWithoutModelOperation { hook_id: HookId, point: HookPoint },
+    #[error(
+        "mandatory hook '{hook_id}' at {point:?} requires a retained authorized controller for same-run feedback, and this work has none"
+    )]
+    MissingController { hook_id: HookId, point: HookPoint },
+}
+
+/// Per-entry scope check: `model_operations` only applies where a model
+/// operation exists.
+pub fn validate_hook_entry_scope(
+    entry: &crate::config::HookEntryConfig,
+) -> Result<(), HookTopologyError> {
+    if !entry.model_operations.is_all() && !entry.point.carries_model_operation() {
+        return Err(HookTopologyError::ScopeWithoutModelOperation {
+            hook_id: entry.id.clone(),
+            point: entry.point,
+        });
+    }
+    Ok(())
+}
+
+/// Activation check for a configured entry set.
+pub fn validate_hook_activation(
+    entries: &[crate::config::HookEntryConfig],
+) -> Result<(), HookTopologyError> {
+    for entry in entries {
+        validate_hook_entry_scope(entry)?;
+    }
+    HookMandatoryTopology::from_entries(entries).validate_activation()
 }
 
 /// Runtime-independent engine interface.
@@ -1788,6 +2041,17 @@ pub trait HookEngine: Send + Sync + 'static {
         Ok(Vec::new())
     }
 
+    /// Attest the mandatory topology of the exact effective entries this
+    /// engine would execute under `overrides`. Run admission validates it
+    /// before RunStarted, run publication and the user append. There is no
+    /// default: an engine cannot be admitted without stating it. A denial an
+    /// engine returns outside its attested gates keeps the fail-closed
+    /// terminal disposition: same-run feedback recovers only admitted gates.
+    fn mandatory_topology(
+        &self,
+        overrides: Option<&crate::config::HookRunOverrides>,
+    ) -> Result<HookMandatoryTopology, HookEngineError>;
+
     async fn execute(
         &self,
         invocation: HookInvocation,
@@ -1810,6 +2074,109 @@ pub trait HookEngine: Send + Sync + 'static {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activation_rejects_mandatory_topologies_that_cannot_stay_local() {
+        use crate::config::HookEntryConfig;
+        let gate = |point, model_operations| HookEntryConfig {
+            id: HookId::new("gate"),
+            point,
+            capability: HookCapability::Guardrail,
+            model_operations,
+            ..Default::default()
+        };
+        let scoped = gate(
+            HookPoint::PreLlmRequest,
+            HookModelOperationScope::OrdinaryOnly,
+        );
+        assert_eq!(
+            validate_hook_activation(std::slice::from_ref(&scoped)),
+            Ok(())
+        );
+        assert!(matches!(
+            validate_hook_activation(&[gate(
+                HookPoint::PostLlmResponse,
+                HookModelOperationScope::All
+            )]),
+            Err(HookTopologyError::UnscopedModelRequestGate { .. })
+        ));
+        for point in [HookPoint::RunStarted, HookPoint::TurnBoundary] {
+            assert!(matches!(
+                validate_hook_activation(&[gate(point, HookModelOperationScope::All)]),
+                Err(HookTopologyError::UnsupportedLifecycleGate { .. })
+            ));
+        }
+        assert!(matches!(
+            validate_hook_activation(&[HookEntryConfig {
+                capability: HookCapability::Observe,
+                ..gate(
+                    HookPoint::PreToolExecution,
+                    HookModelOperationScope::OrdinaryOnly
+                )
+            }]),
+            Err(HookTopologyError::ScopeWithoutModelOperation { .. })
+        ));
+        // Optional observers and disabled gates are not mandatory topology.
+        assert_eq!(
+            validate_hook_activation(&[
+                HookEntryConfig {
+                    capability: HookCapability::Observe,
+                    ..gate(HookPoint::RunStarted, HookModelOperationScope::All)
+                },
+                HookEntryConfig {
+                    enabled: false,
+                    ..gate(HookPoint::TurnBoundary, HookModelOperationScope::All)
+                },
+            ]),
+            Ok(())
+        );
+        let topology = HookMandatoryTopology::from_entries([&scoped]);
+        assert_eq!(topology.validate_admission(true), Ok(()));
+        assert!(matches!(
+            topology.validate_admission(false),
+            Err(HookTopologyError::MissingController { .. })
+        ));
+        assert_eq!(
+            HookMandatoryTopology::none().validate_admission(false),
+            Ok(())
+        );
+        // The scope never applies implicitly, and the wire default is All.
+        let decoded: HookEntryConfig = serde_json::from_value(serde_json::json!({
+            "id": "gate", "point": "pre_llm_request", "capability": "guardrail"
+        }))
+        .unwrap();
+        assert_eq!(decoded.model_operations, HookModelOperationScope::All);
+        assert!(
+            serde_json::to_value(&decoded)
+                .unwrap()
+                .get("model_operations")
+                .is_none()
+        );
+        let mut config = crate::config::Config::default();
+        config.hooks.entries.push(decoded);
+        assert!(
+            config
+                .validate(*crate::model_profile::test_catalog::TEST_CATALOG)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ordinary_only_scope_excludes_only_controller_feedback() {
+        let feedback = HookModelOperation::ControllerFeedback {
+            sequence: 2,
+            withheld: HookWithheldModelOperation {
+                sequence: 1,
+                hook_id: HookId::new("gate"),
+                point: HookPoint::PreLlmRequest,
+            },
+        };
+        let ordinary = HookModelOperation::Ordinary { sequence: 3 };
+        assert!(HookModelOperationScope::All.admits(Some(&feedback)));
+        assert!(HookModelOperationScope::OrdinaryOnly.admits(Some(&ordinary)));
+        assert!(HookModelOperationScope::OrdinaryOnly.admits(None));
+        assert!(!HookModelOperationScope::OrdinaryOnly.admits(Some(&feedback)));
+    }
     use crate::comms::{CommsCommand, PeerDeliveryOutcome, PeerId, PeerRoute, SendReceipt};
     use crate::types::{ContentBlock, ToolResult};
     use std::sync::Arc;
@@ -1835,6 +2202,13 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl HookEngine for BlockingObserveEngine {
+        fn mandatory_topology(
+            &self,
+            _overrides: Option<&crate::config::HookRunOverrides>,
+        ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError> {
+            Ok(crate::hooks::HookMandatoryTopology::none())
+        }
+
         async fn execute(
             &self,
             invocation: HookInvocation,
@@ -1900,6 +2274,13 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl HookEngine for AbortObservedEngine {
+        fn mandatory_topology(
+            &self,
+            _overrides: Option<&crate::config::HookRunOverrides>,
+        ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError> {
+            Ok(crate::hooks::HookMandatoryTopology::none())
+        }
+
         async fn execute(
             &self,
             _invocation: HookInvocation,
@@ -1957,6 +2338,13 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl HookEngine for ImmediateObserveEngine {
+        fn mandatory_topology(
+            &self,
+            _overrides: Option<&crate::config::HookRunOverrides>,
+        ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError> {
+            Ok(crate::hooks::HookMandatoryTopology::none())
+        }
+
         async fn execute(
             &self,
             _invocation: HookInvocation,
@@ -2018,6 +2406,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HookEngine for SharedSourceObserveEngine {
+        fn mandatory_topology(
+            &self,
+            _overrides: Option<&crate::config::HookRunOverrides>,
+        ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError> {
+            Ok(crate::hooks::HookMandatoryTopology::none())
+        }
+
         fn background_completion_source_id(&self) -> Option<HookBackgroundSourceId> {
             Some(self.source_id)
         }
@@ -2084,6 +2479,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl HookEngine for KnownBackgroundLifecycleEngine {
+        fn mandatory_topology(
+            &self,
+            _overrides: Option<&crate::config::HookRunOverrides>,
+        ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError> {
+            Ok(crate::hooks::HookMandatoryTopology::none())
+        }
+
         fn background_session_status(
             &self,
             _session_id: &SessionId,
@@ -2572,6 +2974,7 @@ mod tests {
         let provenance = ToolProvenance {
             kind: ToolSourceKind::Mcp,
             source_id: ToolSourceId::new("test-server"),
+            artifact: None,
         };
         let call_with = HookToolCall {
             provenance: Some(provenance.clone()),
@@ -2618,6 +3021,7 @@ mod tests {
             stop_reason: Some(StopReason::EndTurn),
             usage: None,
             server_tool_content: Vec::new(),
+            operation: HookModelOperation::default(),
         };
         let json = serde_json::to_value(&response).expect("serialize");
         assert!(

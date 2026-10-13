@@ -28,6 +28,9 @@ mod entry;
 pub use entry::PreparedOperationCheck;
 mod audit;
 pub use audit::{
+    MANDATORY_HOOK_ID_BYTES, MANDATORY_HOOK_PROVIDER_NATIVE_NAME_BYTES,
+    MANDATORY_HOOK_PROVIDER_NATIVE_TOOLS, MandatoryHookCause, MandatoryHookProviderTool,
+    MandatoryHookWithheldEffect, MandatoryHookWithholding, MandatoryHookWithholdingRecord,
     OperationObservation, OperationObservationError, OperationObservationPhase,
     OperationObservedOutcome,
 };
@@ -97,6 +100,28 @@ pub struct ModelAuthorizationFacts {
     pub credential: Option<AuthCredentialIdentity>,
     pub usage: ModelAuthorizationUse,
     pub live_channel: Option<LiveChannelId>,
+}
+
+impl ModelAuthorizationFacts {
+    /// The canonical key of this request's actual lowered route
+    /// ([`crate::ControllerRouteKey`]), computed exactly as at admission.
+    /// `None` when the request names no credential owner or backend profile,
+    /// which no admitted controller route lacks.
+    pub fn controller_route_key(&self) -> Option<crate::ControllerRouteKey> {
+        Some(crate::ControllerRouteKey::of(
+            crate::llm_client::ControllerRouteParts {
+                provider: self.identity.provider,
+                model: &self.identity.model,
+                self_hosted_server_id: self.identity.self_hosted_server_id.as_deref(),
+                auth_binding: self.identity.auth_binding.as_ref(),
+                credential: self.credential.as_ref()?,
+                backend_profile_id: self.backend_profile_id.as_deref()?,
+                backend_kind: &self.backend_kind,
+                endpoint: &self.endpoint,
+                wire_model: &self.wire_model,
+            },
+        ))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -321,6 +346,82 @@ impl<T> fmt::Debug for ObservedAuthorizationResult<T> {
     }
 }
 
+/// Upper bound, in bytes, for each field of [`ReviewOperationContext`].
+pub const MAX_REVIEW_OPERATION_CONTEXT_BYTES: usize = 4 * 1024;
+
+/// Passive owner material for one reviewed operation: the action account the
+/// operation owner actually selected and the current mandate the admitted-work
+/// owner holds, read under their existing publication. It is presentation and
+/// reviewer input only, never permission, a credential reference or an
+/// explanation rebuilt from identifiers or history.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReviewOperationContext {
+    action_account: Option<Arc<str>>,
+    mandate: Option<Arc<str>>,
+}
+
+/// The owner supplied no field, a blank field or a field over its bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("review operation context is empty, blank or exceeds its bound")]
+pub struct ReviewOperationContextInvalid;
+
+impl ReviewOperationContext {
+    /// At least one field is required; each present field must be nonblank
+    /// and at most [`MAX_REVIEW_OPERATION_CONTEXT_BYTES`]. Nothing is truncated.
+    pub fn new(
+        action_account: Option<String>,
+        mandate: Option<String>,
+    ) -> Result<Self, ReviewOperationContextInvalid> {
+        fn bounded(
+            field: Option<String>,
+        ) -> Result<Option<Arc<str>>, ReviewOperationContextInvalid> {
+            match field {
+                None => Ok(None),
+                Some(text)
+                    if text.trim().is_empty()
+                        || text.len() > MAX_REVIEW_OPERATION_CONTEXT_BYTES =>
+                {
+                    Err(ReviewOperationContextInvalid)
+                }
+                Some(text) => Ok(Some(Arc::from(text))),
+            }
+        }
+        let action_account = bounded(action_account)?;
+        let mandate = bounded(mandate)?;
+        if action_account.is_none() && mandate.is_none() {
+            return Err(ReviewOperationContextInvalid);
+        }
+        Ok(Self {
+            action_account,
+            mandate,
+        })
+    }
+
+    pub fn action_account(&self) -> Option<&str> {
+        self.action_account.as_deref()
+    }
+
+    pub fn mandate(&self) -> Option<&str> {
+        self.mandate.as_deref()
+    }
+}
+
+impl fmt::Debug for ReviewOperationContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReviewOperationContext([REDACTED])")
+    }
+}
+
+/// Outcome of reading review material. `NotApplicable` is an explicit owner
+/// answer that the operation has no such material. An owner that requires
+/// material it cannot read, or that does not support the read, is
+/// `Unavailable` instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewOperationContextResolution {
+    NotApplicable,
+    Material(ReviewOperationContext),
+}
+
 /// Immutable feature-owned context attached to one admitted work item.
 ///
 /// Implementations resolve current owner policy against all correlated operation
@@ -340,6 +441,19 @@ pub trait WorkAuthorization: Send + Sync {
         Box::pin(async { Err(OperationAuthorizationError::Unavailable) })
     }
 
+    /// Passive review material for this exact prepared operation, read once
+    /// after R1 is ruled out and before reviewer transport or human
+    /// presentation. Synchronous and without I/O. A wrapper must forward it.
+    /// Fail closed: an owner that does not implement this is `Unavailable`,
+    /// so R2/R3 review settles as context unavailable. Only an owner that
+    /// knows the material is genuinely inapplicable answers `NotApplicable`.
+    fn review_operation_context(
+        &self,
+        _binding: &PreparedAuthorizationBinding,
+    ) -> Result<ReviewOperationContextResolution, OperationAuthorizationError> {
+        Err(OperationAuthorizationError::Unavailable)
+    }
+
     /// The native work owner's admitted controller selection, if supported.
     /// This is data for matching the actual selected client, never permission
     /// to construct a client or infer an external account from credentials.
@@ -354,6 +468,18 @@ pub trait WorkAuthorization: Send + Sync {
 
     /// Preserve the publication from this exact preparation, including a
     /// coherent refusal. Legacy owners report only what their decision retains.
+    /// Stage a typed historical mandatory-hook withholding for the actual
+    /// model candidate in this work's protected native custody. Audit-only:
+    /// it prepares nothing, re-runs no permission and looks up no provider.
+    /// Work without protected custody cannot record it, so there is no
+    /// successful default; a failure is infrastructure, never a denial.
+    fn observe_mandatory_hook_withholding(
+        &self,
+        _record: &MandatoryHookWithholdingRecord,
+    ) -> Result<(), OperationObservationError> {
+        Err(OperationObservationError)
+    }
+
     fn prepare_observed(
         &self,
         binding: &PreparedAuthorizationBinding,
@@ -365,6 +491,62 @@ pub trait WorkAuthorization: Send + Sync {
             .and_then(|decision| decision.policy_observation());
         ObservedAuthorizationResult { result, policy }
     }
+
+    /// Run `operation` only while the exact prepared operation of
+    /// `binding` is currently permitted by this work's own retained owners
+    /// and inside `prepared`, the validity of the decision the caller
+    /// actually holds (its window and monotonic cutoff; `None` refuses),
+    /// conjoined with `further` (typed facts of a trusted native composition,
+    /// for example further retained originals), holding this owner's own
+    /// non-waiting exclusion of authority changes through `operation`.
+    /// Wrappers check their own custody and forward; the default is
+    /// unavailable. `operation` runs at most once and must not await.
+    ///
+    /// This is the generic composition boundary: the owner that answers is
+    /// the context's own authorization chain by construction, and an
+    /// implementor that does not override it refuses without running
+    /// `operation`.
+    fn run_if_current_within(
+        &self,
+        _binding: &PreparedAuthorizationBinding,
+        _prepared: Option<&OperationValidity>,
+        _further: &(dyn std::any::Any + Send + Sync),
+        _operation: &mut dyn FnMut(),
+    ) -> Result<(), OperationAuthorizationError> {
+        Err(OperationAuthorizationError::Unavailable)
+    }
+
+    /// Whether this owner can take `further` and `intent` for
+    /// `issue_child_if_current_within`: their types and this owner's own
+    /// issuance composition, checked before any review is spent. It decides
+    /// nothing about permission. The default is unavailable.
+    fn validate_child_issuance(
+        &self,
+        _further: &(dyn std::any::Any + Send + Sync),
+        _intent: &(dyn std::any::Any + Send + Sync),
+    ) -> Result<(), OperationAuthorizationError> {
+        Err(OperationAuthorizationError::Unavailable)
+    }
+
+    /// Issue (or recover) a child grant for `intent` only while the exact
+    /// prepared operation of `binding` is currently permitted by this
+    /// work's own retained owners with `further` conjoined, under the same
+    /// single non-waiting exclusion `run_if_current_within` uses: the
+    /// complete entry decision, its review tier no stricter than
+    /// `entered_tier` (the review this dispatch actually entered), and the
+    /// grant owner's own reserved issuance with the decision's validity.
+    /// The typed outcome is returned boxed. Wrappers check their own custody
+    /// and forward; the default is unavailable and issues nothing.
+    fn issue_child_if_current_within(
+        &self,
+        _binding: &PreparedAuthorizationBinding,
+        _prepared: Option<&OperationValidity>,
+        _further: &(dyn std::any::Any + Send + Sync),
+        _intent: &(dyn std::any::Any + Send + Sync),
+        _entered_tier: OperationReviewTier,
+    ) -> Result<Box<dyn std::any::Any + Send>, OperationAuthorizationError> {
+        Err(OperationAuthorizationError::Unavailable)
+    }
 }
 
 struct WorkAuthorizationContextInner {
@@ -372,6 +554,9 @@ struct WorkAuthorizationContextInner {
     execution_scope: OperationExecutionScope,
     controller_client: Option<crate::ControllerModelClient>,
     retained_work: Option<crate::retained_work::RetainedWorkIdentity>,
+    consent_scope: Option<crate::approval::ApprovalConsentScope>,
+    consent_hosting: Option<crate::session_hosting::HostingClaim>,
+    resumed_inputs: Vec<crate::retained_work::ResumedInput>,
 }
 
 /// Process-local authorization context for one admitted work association.
@@ -401,6 +586,9 @@ impl WorkAuthorizationContext {
             execution_scope,
             controller_client: None,
             retained_work: None,
+            consent_scope: None,
+            consent_hosting: None,
+            resumed_inputs: Vec::new(),
         }))
     }
 
@@ -427,6 +615,9 @@ impl WorkAuthorizationContext {
             execution_scope: self.0.execution_scope.clone(),
             controller_client: Some(controller_client),
             retained_work: self.0.retained_work.clone(),
+            consent_scope: self.0.consent_scope.clone(),
+            consent_hosting: self.0.consent_hosting.clone(),
+            resumed_inputs: self.0.resumed_inputs.clone(),
         })))
     }
 
@@ -440,7 +631,96 @@ impl WorkAuthorizationContext {
             execution_scope: self.0.execution_scope.clone(),
             controller_client: self.0.controller_client.clone(),
             retained_work: Some(identity),
+            consent_scope: self.0.consent_scope.clone(),
+            consent_hosting: self.0.consent_hosting.clone(),
+            resumed_inputs: self.0.resumed_inputs.clone(),
         }))
+    }
+
+    /// Record the hosting domain and session of the staged run this context
+    /// authorizes. On the native path the runtime attaches it from the run it
+    /// staged; a trusted host building its own context may attach it too. A
+    /// consent approval admitted under this context commits it as passive
+    /// scope. Identity data only, never a permission or custody.
+    ///
+    /// A hosting claim lineage recorded before stays only when it derives
+    /// exactly this scope (see [`Self::with_consent_hosting`]).
+    #[must_use]
+    pub fn with_consent_scope(self, scope: crate::approval::ApprovalConsentScope) -> Self {
+        let consent_hosting = self
+            .0
+            .consent_hosting
+            .clone()
+            .filter(|claim| consent_scope_of(claim).as_ref() == Some(&scope));
+        Self(Arc::new(WorkAuthorizationContextInner {
+            authorization: Arc::clone(&self.0.authorization),
+            execution_scope: self.0.execution_scope.clone(),
+            controller_client: self.0.controller_client.clone(),
+            retained_work: self.0.retained_work.clone(),
+            consent_scope: Some(scope),
+            consent_hosting,
+            resumed_inputs: self.0.resumed_inputs.clone(),
+        }))
+    }
+
+    /// Record the staged inputs of this run that resume retained work, each
+    /// with the identity of the run it resumes. On the native path the
+    /// runtime attaches them from the batch it staged. Identity data only:
+    /// the consent owner moves parked custody into the run only for an input
+    /// its own committed notice receipt names.
+    #[must_use]
+    pub fn with_resumed_inputs(self, inputs: Vec<crate::retained_work::ResumedInput>) -> Self {
+        Self(Arc::new(WorkAuthorizationContextInner {
+            authorization: Arc::clone(&self.0.authorization),
+            execution_scope: self.0.execution_scope.clone(),
+            controller_client: self.0.controller_client.clone(),
+            retained_work: self.0.retained_work.clone(),
+            consent_scope: self.0.consent_scope.clone(),
+            consent_hosting: self.0.consent_hosting.clone(),
+            resumed_inputs: inputs,
+        }))
+    }
+
+    /// The staged inputs of this run that resume retained work.
+    pub fn resumed_inputs(&self) -> &[crate::retained_work::ResumedInput] {
+        &self.0.resumed_inputs
+    }
+
+    /// The hosting domain and session of the staged run, when the native
+    /// owner recorded them.
+    pub fn consent_scope(&self) -> Option<&crate::approval::ApprovalConsentScope> {
+        self.0.consent_scope.as_ref()
+    }
+
+    /// Record a lineage clone of the runtime owner's hosting claim for the
+    /// session of the staged run, with the consent scope that lineage
+    /// derives: its hosting domain and its session. A lineage and a scope
+    /// can therefore never name different sessions or domains. The native
+    /// runtime attaches it where it fills the consent scope. A consent
+    /// candidate admitted under this context keeps the clone for as long as
+    /// it holds custody, so the session's claim is never released while
+    /// custody exists. A claim without a cross-process domain records
+    /// nothing. Lineage only: it grants no permission and is never persisted.
+    #[must_use]
+    pub fn with_consent_hosting(self, claim: crate::session_hosting::HostingClaim) -> Self {
+        let Some(scope) = consent_scope_of(&claim) else {
+            return self;
+        };
+        Self(Arc::new(WorkAuthorizationContextInner {
+            authorization: Arc::clone(&self.0.authorization),
+            execution_scope: self.0.execution_scope.clone(),
+            controller_client: self.0.controller_client.clone(),
+            retained_work: self.0.retained_work.clone(),
+            consent_scope: Some(scope),
+            consent_hosting: Some(claim),
+            resumed_inputs: self.0.resumed_inputs.clone(),
+        }))
+    }
+
+    /// The hosting claim lineage the native runtime attached for the session
+    /// of the staged run, when it attached one.
+    pub fn consent_hosting(&self) -> Option<&crate::session_hosting::HostingClaim> {
+        self.0.consent_hosting.as_ref()
     }
 
     /// Identity of the staged run this context authorizes, when the native
@@ -451,6 +731,24 @@ impl WorkAuthorizationContext {
 
     pub fn controller_client(&self) -> Option<&crate::ControllerModelClient> {
         self.0.controller_client.as_ref()
+    }
+
+    /// Record that a mandatory hook withheld the actual model candidate
+    /// `operation_id`, under this work's own execution scope.
+    pub fn observe_mandatory_hook_withholding(
+        &self,
+        operation_id: crate::OperationId,
+        run_id: Option<RunId>,
+        withholding: MandatoryHookWithholding,
+    ) -> Result<(), OperationObservationError> {
+        self.0.authorization.observe_mandatory_hook_withholding(
+            &MandatoryHookWithholdingRecord::new(
+                operation_id,
+                self.0.execution_scope.clone(),
+                run_id,
+                withholding,
+            ),
+        )
     }
 
     pub fn authorization(&self) -> &Arc<dyn WorkAuthorization> {
@@ -467,10 +765,32 @@ impl WorkAuthorizationContext {
     }
 }
 
+/// The consent scope a hosting claim lineage derives: its cross-process
+/// hosting domain and its session.
+fn consent_scope_of(
+    claim: &crate::session_hosting::HostingClaim,
+) -> Option<crate::approval::ApprovalConsentScope> {
+    Some(crate::approval::ApprovalConsentScope {
+        domain: claim.domain_ref()?,
+        session_id: claim.session_id().clone(),
+    })
+}
+
 impl fmt::Debug for WorkAuthorizationContext {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("WorkAuthorizationContext([REDACTED])")
     }
+}
+
+/// The temporal window of one exact prepared decision: usable from
+/// `not_before_ms` and before `expires_at_ms` on the wall clock, and before
+/// `deadline` on the monotonic clock of the read that compiled it. Data of
+/// the decision, never a permission by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperationValidity {
+    pub not_before_ms: u64,
+    pub expires_at_ms: u64,
+    pub deadline: crate::time_compat::Instant,
 }
 
 /// Prepared decision bound to the immutable operation and coherent owner state.
@@ -498,6 +818,14 @@ pub trait PreparedOperationAuthorization: Send + Sync {
     /// owner or wrapper that forgets it fails to compile instead of silently
     /// implying R1. Wrappers delegate; return stored Copy data only.
     fn review_tier(&self) -> OperationReviewTier;
+
+    /// The exact temporal window this decision was compiled with, when its
+    /// owner bounds it so. Stored Copy data only. `None` (the default, and
+    /// any wrapper that does not delegate) makes a caller that needs the
+    /// window refuse.
+    fn validity(&self) -> Option<OperationValidity> {
+        None
+    }
 
     fn check_current(
         &self,
@@ -590,6 +918,36 @@ pub enum OperationAuthorizationError {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    #[test]
+    fn review_operation_context_is_bounded_at_construction_and_redacted() {
+        use super::{
+            MAX_REVIEW_OPERATION_CONTEXT_BYTES, ReviewOperationContext,
+            ReviewOperationContextInvalid,
+        };
+        assert_eq!(
+            ReviewOperationContext::new(None, None),
+            Err(ReviewOperationContextInvalid)
+        );
+        assert_eq!(
+            ReviewOperationContext::new(Some(" \n".into()), None),
+            Err(ReviewOperationContextInvalid)
+        );
+        assert_eq!(
+            ReviewOperationContext::new(
+                None,
+                Some("x".repeat(MAX_REVIEW_OPERATION_CONTEXT_BYTES + 1))
+            ),
+            Err(ReviewOperationContextInvalid)
+        );
+        let mandate = "x".repeat(MAX_REVIEW_OPERATION_CONTEXT_BYTES);
+        let context =
+            ReviewOperationContext::new(Some("billing-account-7".into()), Some(mandate.clone()))
+                .unwrap();
+        assert_eq!(context.action_account(), Some("billing-account-7"));
+        assert_eq!(context.mandate(), Some(mandate.as_str()));
+        assert_eq!(format!("{context:?}"), "ReviewOperationContext([REDACTED])");
+    }
+
     use super::*;
 
     fn binding_fixture() -> PreparedAuthorizationBinding {
@@ -605,6 +963,88 @@ mod tests {
                 usage: SourceAuthorizationUse::Read,
             }),
         })
+    }
+
+    /// Consent owner loss (3): a work context records the consent scope its
+    /// hosting claim lineage derives (the lineage's domain and session), so
+    /// a lineage and a scope never name different sessions or domains. A
+    /// scope set afterwards keeps the lineage only when the lineage derives
+    /// it, and a claim without a cross-process domain records nothing.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_consent_lineage_and_its_scope_name_one_session_in_one_domain() {
+        use crate::approval::ApprovalConsentScope;
+        use crate::session_hosting::{
+            HostingCapability, HostingOwner, HostingPaths, grant_session_hosting,
+        };
+        struct NoWork;
+        impl WorkAuthorization for NoWork {
+            fn prepare(
+                &self,
+                _binding: &PreparedAuthorizationBinding,
+            ) -> Result<Arc<dyn PreparedOperationAuthorization>, OperationAuthorizationError>
+            {
+                Err(OperationAuthorizationError::Unavailable)
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = |name: &str| HostingPaths {
+            hosting_lock_dir: dir.path().join(name),
+            cold_delivery_lock: dir.path().join(name).join("cold-delivery.lock"),
+            database: None,
+        };
+        let capability = HostingCapability::OsLock(Arc::new(paths("hosting")));
+        let session = SessionId::new();
+        let claim =
+            grant_session_hosting(&capability, &HostingOwner::mint(), &session).expect("claim");
+        let work = WorkAuthorizationContext::new(Arc::new(NoWork), OperationExecutionScope::Domain);
+        let derived = ApprovalConsentScope {
+            domain: paths("hosting").domain_ref(),
+            session_id: session.clone(),
+        };
+
+        let hosted = work.clone().with_consent_hosting(claim);
+        assert_eq!(
+            hosted.consent_scope(),
+            Some(&derived),
+            "the lineage derives its scope"
+        );
+        assert!(hosted.consent_hosting().is_some());
+        let other_session = hosted.clone().with_consent_scope(ApprovalConsentScope {
+            domain: derived.domain.clone(),
+            session_id: SessionId::new(),
+        });
+        assert!(
+            other_session.consent_hosting().is_none(),
+            "a scope of another session drops the lineage"
+        );
+        let other_domain = hosted.clone().with_consent_scope(ApprovalConsentScope {
+            domain: paths("other").domain_ref(),
+            session_id: session.clone(),
+        });
+        assert!(
+            other_domain.consent_hosting().is_none(),
+            "a scope of another domain drops the lineage"
+        );
+        assert!(
+            hosted
+                .with_consent_scope(derived)
+                .consent_hosting()
+                .is_some(),
+            "the scope the lineage derives keeps it"
+        );
+
+        let unclaimed = grant_session_hosting(
+            &HostingCapability::ProcessLocal,
+            &HostingOwner::mint(),
+            &session,
+        )
+        .expect("an unclaimed grant");
+        let local = work.with_consent_hosting(unclaimed);
+        assert!(
+            local.consent_hosting().is_none() && local.consent_scope().is_none(),
+            "a claim without a cross-process domain records nothing"
+        );
     }
 
     #[test]

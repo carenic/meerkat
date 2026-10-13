@@ -150,9 +150,9 @@ the `AgentIdentity`. That is the string a peer sees in `peers` output and in
 every projected peer message (`Peer message from release-triage/analyst/analyst-1:`);
 projected peer requests carry the `peer_id` plus that display name. Each
 component must start with an ASCII letter or `_` and may contain only ASCII
-alphanumerics, `-`, or `_`, so MobKit identity-first members whose identities
+alphanumerics, `-`, or `_`, so Meta identity-first members whose identities
 carry other characters (for example `domain:payments`) appear as `mk--` encoded
-segments (`release-triage/domain/mk--domain_cpayments`). MobKit decodes those
+segments (`release-triage/domain/mk--domain_cpayments`). Meta decodes those
 segments only at its console and RPC projections; the model always sees the
 encoded form.
 
@@ -161,7 +161,7 @@ Because the mob id is part of every member's name, renaming a mob (changing
 a new `mob.<id>` realm with fresh sessions. Live trust and peer-directory
 entries are re-registered under the new names. The old `{old_mob}/...` names
 survive only in identity-keyed state a host keeps outside the mob realm, such
-as MobKit's per-identity agent memory, and that is where a renamed mob's stale
+as Meta's per-identity agent memory, and that is where a renamed mob's stale
 names come back from.
 
 ## Trust model
@@ -602,7 +602,7 @@ act on the answers:
 For a bounded ask whose answer must be used inside the same turn, use
 `delegate`: it spawns a helper and returns the helper's exact bounded result to
 the calling turn. For host-driven sequencing, send and then wait for the
-completion of the turn that send started (MobKit's `send_and_wait` and
+completion of the turn that send started (Meta's `send_and_wait` and
 `dispatch_and_wait` do this with a completion baseline captured before
 delivery), or write the fan-out and fan-in as a mob flow (`dispatch_mode:
 "fan_out"` followed by a `depends_on` step with `dispatch_mode: "fan_in"`; see

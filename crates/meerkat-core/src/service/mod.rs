@@ -278,7 +278,7 @@ pub struct SessionProviderAuthFailure {
 }
 
 impl SessionProviderAuthFailure {
-    /// Stable secret-free payload for session, MobKit, RPC, and MCP surfaces.
+    /// Stable secret-free payload for session, Meta, RPC, and MCP surfaces.
     pub fn structured_data(&self) -> serde_json::Value {
         let mut data = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
         if let Some(data) = data.as_object_mut() {
@@ -403,7 +403,7 @@ impl SessionError {
     }
 
     /// Preserve a typed provider-auth failure across the generic
-    /// session-builder and MobKit/RPC boundaries.
+    /// session-builder and Meta/RPC boundaries.
     pub fn provider_auth_failure(failure: SessionProviderAuthFailure) -> Self {
         Self::FailedWithData {
             message: failure.public_message(),
@@ -793,7 +793,7 @@ impl WorkGraphNamespaceGrant {
 ///
 /// # Serialized shape
 ///
-/// A host that receives the build over JSON (MobKit's `callback/build_agent`,
+/// A host that receives the build over JSON (Meta's `callback/build_agent`,
 /// once the host forwards it) sees this object:
 ///
 /// ```json
@@ -809,8 +809,8 @@ impl WorkGraphNamespaceGrant {
 ///
 /// - `source_member` is the source's [`crate::MobMemberBinding`]: the source
 ///   member's mob id, role (profile name) and member id, exactly as the mob
-///   roster names it. In a MobKit mob the member id is MobKit's encoded roster
-///   id; MobKit's own durable identity (`domain:calendar`) is not part of it.
+///   roster names it. In a Meta mob the member id is Meta's encoded roster
+///   id; Meta's own durable identity (`domain:calendar`) is not part of it.
 /// - `source_session_id` is the source session (a UUID string) the child's
 ///   transcript was forked from.
 ///
@@ -964,6 +964,14 @@ pub struct SessionBuildOptions {
     /// must mint the member runtime itself (durable per-session keypair,
     /// acceptor registration, session claim).
     pub session_comms_runtime_override: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    /// Opaque transport for a controller prepared under the realm's staged
+    /// native owner before this session was opened (the facade's
+    /// `encode_prepared_controller_for_service`).
+    ///
+    /// Factory builders downcast this to the concrete one-shot ticket. An
+    /// unrecognized payload is a typed build rejection, never a silent fall
+    /// back to ordinary provider resolution.
+    pub prepared_controller: Option<Arc<dyn std::any::Any + Send + Sync>>,
     /// Prompt-section policy for factory prompt assembly (multi-host mobs
     /// A1). `SpecPinned` is set ONLY by the mob member-host spec decompiler
     /// (and revival's re-run); everything else inherits `Full`.
@@ -1874,6 +1882,7 @@ impl Default for SessionBuildOptions {
             blob_store_override: None,
             llm_client_override: None,
             session_comms_runtime_override: None,
+            prepared_controller: None,
             host_prompt_sections: HostPromptSections::Full,
             agent_llm_client_decorator: None,
             override_builtins: ToolCategoryOverride::Inherit,
@@ -1954,6 +1963,7 @@ impl std::fmt::Debug for SessionBuildOptions {
                 "session_comms_runtime_override",
                 &self.session_comms_runtime_override.is_some(),
             )
+            .field("prepared_controller", &self.prepared_controller.is_some())
             .field("host_prompt_sections", &self.host_prompt_sections)
             .field(
                 "agent_llm_client_decorator",
@@ -3208,6 +3218,20 @@ pub trait SessionService: Send + Sync {
         ))
     }
 
+    /// Apply one change to the session's durable per-session MCP attachment
+    /// intents (an accepted request, a withdrawal, a sign-out suppression or
+    /// a revision-fenced reinstatement), committed through the session's
+    /// ordinary durable owner.
+    async fn update_session_mcp_attachment_intent(
+        &self,
+        _id: &SessionId,
+        _mutation: crate::mcp_session_intent::McpAttachmentIntentMutation,
+    ) -> Result<crate::mcp_session_intent::McpAttachmentIntentRecorded, SessionError> {
+        Err(SessionError::Unsupported(
+            "update_session_mcp_attachment_intent".to_string(),
+        ))
+    }
+
     /// Whether a live in-memory session bridge currently exists for `id`.
     ///
     /// This is intentionally distinct from `list()` / `SessionSummary`:
@@ -3756,6 +3780,10 @@ mod tests {
             crate::AuthErrorKind::HostOwnedUnavailable,
             crate::AuthErrorKind::Io,
             crate::AuthErrorKind::Other,
+            crate::AuthErrorKind::CredentialAccessDenied,
+            crate::AuthErrorKind::CredentialInteractionRequired,
+            crate::AuthErrorKind::CredentialAccessPending,
+            crate::AuthErrorKind::CredentialStoreUnavailable,
         ];
         for kind in kinds {
             let failure = SessionProviderAuthFailure {

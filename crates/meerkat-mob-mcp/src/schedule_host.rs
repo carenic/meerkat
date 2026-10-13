@@ -2130,6 +2130,7 @@ mod tests {
                     last_seen_provenance: Some(meerkat_core::ToolProvenance {
                         kind: meerkat_core::ToolSourceKind::Callback,
                         source_id: "send".into(),
+                        artifact: None,
                     }),
                 },
             ),
@@ -2139,6 +2140,7 @@ mod tests {
                     last_seen_provenance: Some(meerkat_core::ToolProvenance {
                         kind: meerkat_core::ToolSourceKind::Callback,
                         source_id: "read_file".into(),
+                        artifact: None,
                     }),
                 },
             ),
@@ -2180,6 +2182,7 @@ mod tests {
                         last_seen_provenance: Some(meerkat_core::ToolProvenance {
                             kind: meerkat_core::ToolSourceKind::Callback,
                             source_id: "send".into(),
+                            artifact: None,
                         }),
                     },
                 )]

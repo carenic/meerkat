@@ -253,6 +253,28 @@ pub enum ExperimentalLiveContextRecoveryError {
     },
 }
 
+/// A replacement open's failure as a recovery error. A refused execution
+/// profile selection is a channel binding failure; a failed abandonment of
+/// the open admission it rode on is reported as a binding cleanup failure,
+/// like a failed close of a replacement that was already published.
+#[cfg(all(feature = "live-webrtc", feature = "openai-live"))]
+fn replacement_open_error(error: LiveOpenError) -> ExperimentalLiveContextRecoveryError {
+    use crate::session_runtime::errors::LiveExecutionProfileAdmissionError;
+    let binding = ExperimentalLiveOpenAuthorityError::ChannelBindingFailed;
+    match error {
+        LiveOpenError::ExecutionProfileAdmission(LiveExecutionProfileAdmissionError::Refused(
+            _,
+        )) => ExperimentalLiveContextRecoveryError::Authority(binding),
+        LiveOpenError::ExecutionProfileAdmission(
+            LiveExecutionProfileAdmissionError::AbandonmentFailed { abandonment, .. },
+        ) => ExperimentalLiveContextRecoveryError::BindingCleanup {
+            binding,
+            cleanup: abandonment.to_string(),
+        },
+        error => error.into(),
+    }
+}
+
 #[cfg(feature = "live-webrtc")]
 #[derive(Clone, Copy)]
 enum LiveWebrtcAnswerDeliveryDisposition {
@@ -575,7 +597,7 @@ async fn record_live_webrtc_answer_rejection(
     }
 }
 
-/// One shared answer coordinator for RPC and member/MobKit surfaces.
+/// One shared answer coordinator for RPC and member/Meta surfaces.
 /// Generated admission is resolved before the provider transport can see the
 /// offer, and exact cleanup remains owned until response publication settles.
 #[cfg(feature = "live-webrtc")]
@@ -1633,7 +1655,7 @@ impl<B: SessionAgentBuilder + 'static> ServiceMemberLiveHost<B> {
     }
 
     /// Complete a WebRTC bootstrap through the same machine-admitted answer
-    /// coordinator used by RPC. MobKit/member surfaces supply only their
+    /// coordinator used by RPC. Meta/member surfaces supply only their
     /// composed transport and foreign offer material.
     #[cfg(feature = "live-webrtc")]
     pub async fn answer_webrtc_offer(
@@ -2247,12 +2269,14 @@ impl<B: SessionAgentBuilder + 'static> ServiceMemberLiveHost<B> {
         Ok((Some(outcome), Some(cursor)))
     }
 
+    /// Stage the replacement's execution. Its execution profile was already
+    /// admitted inside the replacement open, before the channel was
+    /// published.
     #[cfg(all(feature = "live-webrtc", feature = "openai-live"))]
     async fn stage_live_replacement_execution(
         &self,
         session_id: &SessionId,
         channel_id: &LiveChannelId,
-        profile: meerkat_runtime::live_execution::LiveExecutionProfileSelection,
         canonical_seed_cursor: u64,
         reserved_cursor: Option<u64>,
     ) -> Result<
@@ -2262,9 +2286,6 @@ impl<B: SessionAgentBuilder + 'static> ServiceMemberLiveHost<B> {
         ),
         meerkat_runtime::RuntimeDriverError,
     > {
-        self.runtime_adapter
-            .resolve_live_execution_profile_admission(session_id, channel_id, &profile)
-            .await?;
         match reserved_cursor {
             Some(cursor) => self
                 .runtime_adapter
@@ -2360,15 +2381,16 @@ impl<B: SessionAgentBuilder + 'static> ServiceMemberLiveHost<B> {
                 projection,
                 Some(LiveOpenTransport::Webrtc),
                 &recovery,
+                pending.execution_profile(),
             )
-            .await?;
+            .await
+            .map_err(replacement_open_error)?;
 
         let replacement_channel_id = LiveChannelId::new(&result.channel_id);
         let (stage, preparation_lease) = match self
             .stage_live_replacement_execution(
                 recovery.session_id(),
                 &replacement_channel_id,
-                pending.execution_profile().clone(),
                 // Seeded at open covers the boundary's rows like a
                 // before-open summary; a late summary keeps its lease.
                 if matches!(
@@ -2543,15 +2565,16 @@ impl<B: SessionAgentBuilder + 'static> ServiceMemberLiveHost<B> {
                 projection,
                 Some(LiveOpenTransport::Webrtc),
                 &recovery,
+                pending.execution_profile(),
             )
-            .await?;
+            .await
+            .map_err(replacement_open_error)?;
 
         let replacement_channel_id = LiveChannelId::new(&result.channel_id);
         let (stage, preparation_lease) = match self
             .stage_live_replacement_execution(
                 recovery.session_id(),
                 &replacement_channel_id,
-                pending.execution_profile().clone(),
                 // Seeded at open covers the boundary's rows like a
                 // before-open summary; a late summary keeps its lease.
                 if matches!(
@@ -3148,6 +3171,7 @@ pub fn member_live_error_from_open(error: LiveOpenError) -> MemberLiveError {
         | LiveOpenError::AdmissionRejectedChannelCollision { .. }
         | LiveOpenError::AdmissionRejectedRevokedChannel { .. }
         | LiveOpenError::AdmissionRejectedNoReason
+        | LiveOpenError::ExecutionProfileAdmission(_)
         | LiveOpenError::MissingHostHandoff
         | LiveOpenError::HostOpenSessionAlreadyBound { .. }
         | LiveOpenError::HostOpen(_)
@@ -3334,5 +3358,52 @@ mod pump_retirement_classification_tests {
         assert!(futures::poll!(ended.as_mut()).is_pending());
         drop(close);
         assert!(futures::poll!(ended.as_mut()).is_ready());
+    }
+}
+
+#[cfg(all(test, feature = "live-webrtc", feature = "openai-live"))]
+mod replacement_open_error_tests {
+    use super::{ExperimentalLiveContextRecoveryError, replacement_open_error};
+    use crate::experimental_gpt_live::ExperimentalLiveOpenAuthorityError;
+    use crate::session_runtime::errors::{LiveExecutionProfileAdmissionError, LiveOpenError};
+    use meerkat_runtime::RuntimeDriverError;
+
+    fn synthetic(reason: &str) -> RuntimeDriverError {
+        RuntimeDriverError::ValidationFailed {
+            reason: reason.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_failed_abandonment_after_a_refused_profile_is_a_binding_cleanup_failure() {
+        let refused = replacement_open_error(LiveOpenError::ExecutionProfileAdmission(
+            LiveExecutionProfileAdmissionError::Refused(synthetic("synthetic profile refusal")),
+        ));
+        assert!(
+            matches!(
+                &refused,
+                ExperimentalLiveContextRecoveryError::Authority(
+                    ExperimentalLiveOpenAuthorityError::ChannelBindingFailed
+                )
+            ),
+            "an abandoned admission is a binding failure: {refused:?}"
+        );
+
+        let unabandoned = replacement_open_error(LiveOpenError::ExecutionProfileAdmission(
+            LiveExecutionProfileAdmissionError::AbandonmentFailed {
+                refusal: synthetic("synthetic profile refusal"),
+                abandonment: synthetic("synthetic abandonment failure"),
+            },
+        ));
+        assert!(
+            matches!(
+                &unabandoned,
+                ExperimentalLiveContextRecoveryError::BindingCleanup {
+                    binding: ExperimentalLiveOpenAuthorityError::ChannelBindingFailed,
+                    cleanup,
+                } if cleanup.contains("synthetic abandonment failure")
+            ),
+            "a failed abandonment is reported, never claimed done: {unabandoned:?}"
+        );
     }
 }

@@ -232,6 +232,9 @@ pub struct ContinuationReceipt {
     pub key: ContinuationKey,
     pub delivery_id: String,
     pub submission_digest: String,
+    /// The submitter's observation time when the key was first committed
+    /// (fork_off and council sample the clock at submission). Not part of
+    /// the content: every replay returns the first receipt's value.
     pub committed_at_ms: u64,
 }
 
@@ -310,6 +313,39 @@ pub enum ContinuationStatusError {
     Inconsistent(String),
 }
 
+/// What [`ContinuationOwnerService::observe_retained_completion`] found for
+/// the exact expected content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContinuationObservation {
+    /// No continuation is bound to the owner and key: nothing was committed.
+    NotSubmitted,
+    /// The key is bound to exactly the expected content; its current status.
+    /// An applied status means the continuation was admitted as input to
+    /// its owner, not that the owner's resulting work has completed.
+    Matched {
+        receipt: ContinuationReceipt,
+        status: ContinuationStatus,
+    },
+}
+
+/// Why an exact-content observation found no answer for the expected content.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ContinuationObserveError {
+    /// The owner and key are bound to other content: whatever that
+    /// continuation's status is, it is not the expected one's.
+    #[error("continuation key {} is bound to other content", existing.key.as_str())]
+    ContentMismatch { existing: Box<ContinuationReceipt> },
+    /// The expected delivery does not name the job's committed outcome.
+    #[error("invalid continuation: {0}")]
+    Invalid(String),
+    #[error("continuation authority unavailable: {0}")]
+    Unavailable(String),
+    /// The store holds facts that cannot all be true.
+    #[error("continuation authority is inconsistent: {0}")]
+    Inconsistent(String),
+}
+
 /// The state of the incarnation behind a delivery address.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddressResolution {
@@ -319,6 +355,17 @@ pub enum AddressResolution {
     NotServed,
     /// The incarnation is retired; it never serves again.
     Retired,
+}
+
+/// What a status read observes about the incarnation behind a delivery
+/// address: only what its owners' records prove, with nothing served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressObservation {
+    /// The records prove the incarnation retired: it never serves again.
+    Retired,
+    /// Not proven retired: it may be served now or later. Serving it is
+    /// delivery work, which an observation never does.
+    MayServe,
 }
 
 /// Resolves continuation owners and delivery addresses. Hosts with mobs
@@ -332,11 +379,28 @@ pub trait ContinuationAddressResolver: Send + Sync {
         owner: &ContinuationOwner,
     ) -> Result<Option<LogicalRuntimeId>, String>;
 
-    /// The incarnation state behind an address.
+    /// The incarnation state behind an address, for delivery: serving it
+    /// may make its owner live (revive a member or a session, attach its
+    /// executor).
     async fn resolve_address(
         &self,
         address: &LogicalRuntimeId,
     ) -> Result<AddressResolution, String>;
+
+    /// Observe the incarnation behind an address without serving it: whether
+    /// its owners' records prove it retired. A status read uses this. It
+    /// revives no owner, attaches no executor, claims no hosting and starts
+    /// no work; only [`Self::resolve_address`], for delivery, does that.
+    /// `Err` when the records cannot be read now.
+    ///
+    /// The default proves nothing ([`AddressObservation::MayServe`]); a
+    /// resolver whose records can prove a retirement reports it.
+    async fn observe_address(
+        &self,
+        _address: &LogicalRuntimeId,
+    ) -> Result<AddressObservation, String> {
+        Ok(AddressObservation::MayServe)
+    }
 }
 
 /// Resolves standalone-session owners only: a session's address is its own
@@ -364,20 +428,34 @@ impl ContinuationAddressResolver for SessionAddressResolver {
         &self,
         address: &LogicalRuntimeId,
     ) -> Result<AddressResolution, String> {
-        if address
-            .member_address()
-            .map_err(|error| error.to_string())?
-            .is_some()
-        {
-            return Err("member addresses need a mob-aware continuation resolver".into());
-        }
-        let session = address
-            .0
-            .strip_prefix("rt:session:")
-            .and_then(|raw| SessionId::parse(raw).ok())
-            .ok_or_else(|| format!("{address} is not a session delivery address"))?;
-        Ok(AddressResolution::Session(session))
+        Ok(AddressResolution::Session(session_address_owner(address)?))
     }
+
+    /// A session address names its own session; nothing here proves it
+    /// retired.
+    async fn observe_address(
+        &self,
+        address: &LogicalRuntimeId,
+    ) -> Result<AddressObservation, String> {
+        session_address_owner(address)?;
+        Ok(AddressObservation::MayServe)
+    }
+}
+
+/// The session a standalone-session address names.
+fn session_address_owner(address: &LogicalRuntimeId) -> Result<SessionId, String> {
+    if address
+        .member_address()
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Err("member addresses need a mob-aware continuation resolver".into());
+    }
+    address
+        .0
+        .strip_prefix("rt:session:")
+        .and_then(|raw| SessionId::parse(raw).ok())
+        .ok_or_else(|| format!("{address} is not a session delivery address"))
 }
 
 /// Submits continuations and reads their status.
@@ -619,7 +697,84 @@ impl ContinuationOwnerService {
         .await
     }
 
+    /// Read-only: whether the expected retained completion (`delivery` with
+    /// `job`'s committed retained work) is exactly the content bound to
+    /// `(owner, delivery.key)`, and if so its current status. The comparison
+    /// uses the same submission digest a commit binds, so a status observed
+    /// for other content under the same key is never reported as this one's.
+    /// Never commits, and never serves the owner, whatever it finds (see
+    /// [`Self::continuation_status`]).
+    ///
+    /// For a [`ContinuationOwner::Session`] owner the job's owner session is
+    /// checked against it here, as a commit checks it. For a
+    /// [`ContinuationOwner::Member`] owner neither the digest nor this call
+    /// covers the job's owner session: as for a commit, the session serving
+    /// the member's bound incarnation is verified at delivery, so a match
+    /// here does not promise it.
+    ///
+    /// # Errors
+    /// [`ContinuationObserveError::ContentMismatch`] when the key is bound to
+    /// other content; [`ContinuationObserveError::Invalid`] when `delivery`
+    /// does not name `job`'s committed outcome (the checks of
+    /// [`Self::submit_retained_completion`]); store failures otherwise.
+    pub async fn observe_retained_completion(
+        &self,
+        owner: &ContinuationOwner,
+        delivery: &ContinuationDelivery,
+        job: &RetainedJobRecord,
+    ) -> Result<ContinuationObservation, ContinuationObserveError> {
+        let owed_elsewhere = match owner {
+            ContinuationOwner::Session { session_id } => &job.facts.owner_session_id != session_id,
+            ContinuationOwner::Member { .. } => false,
+        };
+        if delivery.result.producer != job.producer
+            || delivery.result.producer_id != job.job_id
+            || owed_elsewhere
+            || delivery.result.result_digest != job.facts.result_digest
+        {
+            return Err(ContinuationObserveError::Invalid(
+                "the delivery does not name the job's committed outcome".into(),
+            ));
+        }
+        let digest = Self::submission_digest(owner, delivery, job.facts.retained_work.as_ref())
+            .map_err(|error| ContinuationObserveError::Unavailable(error.to_string()))?;
+        let Some(binding) = self
+            .inbox
+            .continuation_key_binding(&owner.ledger_owner(), delivery.key.as_str())
+            .await
+            .map_err(|error| ContinuationObserveError::Unavailable(error.to_string()))?
+        else {
+            return Ok(ContinuationObservation::NotSubmitted);
+        };
+        let receipt = Self::receipt(owner, &delivery.key, &binding);
+        if binding.submission_digest != digest {
+            return Err(ContinuationObserveError::ContentMismatch {
+                existing: Box::new(receipt),
+            });
+        }
+        let status = self
+            .continuation_status(owner, &delivery.key)
+            .await
+            .map_err(|error| match error {
+                ContinuationStatusError::Unavailable(detail) => {
+                    ContinuationObserveError::Unavailable(detail)
+                }
+                ContinuationStatusError::Inconsistent(detail) => {
+                    ContinuationObserveError::Inconsistent(detail)
+                }
+            })?;
+        Ok(ContinuationObservation::Matched { receipt, status })
+    }
+
     /// The authoritative status of `(owner, key)`, read from the store.
+    ///
+    /// A row not yet admitted is [`ContinuationStatus::Stranded`] only when
+    /// its owners' records prove the owner retired
+    /// ([`ContinuationAddressResolver::observe_address`]), and pending
+    /// otherwise. Nothing is served to answer: no owner is revived, no
+    /// executor attached and no hosting claimed, which stays delivery work.
+    /// An observation that cannot be made now is
+    /// [`ContinuationStatusError::Unavailable`].
     pub async fn continuation_status(
         &self,
         owner: &ContinuationOwner,
@@ -716,21 +871,19 @@ impl ContinuationOwnerService {
                 }
                 match self
                     .resolver
-                    .resolve_address(&binding.address)
+                    .observe_address(&binding.address)
                     .await
                     .map_err(ContinuationStatusError::Unavailable)?
                 {
-                    AddressResolution::Retired => Ok(ContinuationStatus::Stranded {
+                    AddressObservation::Retired => Ok(ContinuationStatus::Stranded {
                         receipt,
                         cause: StrandedCause::OwnerRetired,
                     }),
-                    AddressResolution::Session(_) | AddressResolution::NotServed => {
-                        Ok(ContinuationStatus::Pending {
-                            receipt,
-                            sequence: delivery_sequence,
-                            admitted: None,
-                        })
-                    }
+                    AddressObservation::MayServe => Ok(ContinuationStatus::Pending {
+                        receipt,
+                        sequence: delivery_sequence,
+                        admitted: None,
+                    }),
                 }
             }
         }
@@ -781,8 +934,11 @@ pub enum RetainedJobLookup {
     Unavailable(String),
 }
 
-/// The committed owner of fork_off and council jobs (the mob runtime): the
-/// one place a retained completion's job is confirmed.
+/// The committed owner of fork_off and council jobs (the mob runtime), and
+/// of the `Host` namespaces a host composes into it (its committed setup
+/// results): the one place a retained completion's job is confirmed. It
+/// answers [`RetainedJobLookup::Absent`] for any producer or namespace it
+/// does not own.
 #[async_trait::async_trait]
 pub trait RetainedJobSource: Send + Sync {
     /// What this owner committed about `producer`'s job `job_id`.
@@ -806,9 +962,26 @@ pub trait RetainedJobSource: Send + Sync {
 /// anything is bound, member addresses read as not served and retained
 /// completions find no job owner, so their rows stay pending, never refused
 /// or settled.
-#[derive(Default)]
+///
+/// The bindings also carry the delivery owners' source hint
+/// ([`Self::subscribe_source_changes`]): every binding and rebinding, and
+/// every [`Self::source_custody_changed`] the bound job owner announces,
+/// wakes the delivery owners subscribed to it to retry the rows they hold
+/// blocked. The hint is only a wake, never a fact: a retry asks the bound
+/// source again, and the source alone decides.
 pub struct ContinuationHostBindings {
     slot: std::sync::Mutex<BindingSlot>,
+    /// Advances after every binding and every announced custody change.
+    source_changes: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for ContinuationHostBindings {
+    fn default() -> Self {
+        Self {
+            slot: std::sync::Mutex::default(),
+            source_changes: tokio::sync::watch::Sender::new(0),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -875,6 +1048,7 @@ impl std::fmt::Debug for ContinuationHostBindings {
         f.debug_struct("ContinuationHostBindings")
             .field("generation", &slot.generation)
             .field("bound", &slot.live().is_some())
+            .field("source_changes", &*self.source_changes.borrow())
             .finish()
     }
 }
@@ -913,13 +1087,18 @@ impl ContinuationHostBindings {
         resolver: Arc<dyn ContinuationAddressResolver>,
         job_source: Arc<dyn RetainedJobSource>,
     ) -> Result<ContinuationBinding, ContinuationBindError> {
-        let mut slot = self.slot();
-        if slot.live().is_some() {
-            return Err(ContinuationBindError::AlreadyBound(
-                ContinuationBindingGeneration(slot.generation),
-            ));
-        }
-        Ok(Self::install(&mut slot, resolver, job_source))
+        let binding = {
+            let mut slot = self.slot();
+            if slot.live().is_some() {
+                return Err(ContinuationBindError::AlreadyBound(
+                    ContinuationBindingGeneration(slot.generation),
+                ));
+            }
+            Self::install(&mut slot, resolver, job_source)
+        };
+        // Published once the services are readable through the slot.
+        self.publish_source_change();
+        Ok(binding)
     }
 
     /// Take the slot over from the binding of generation `replaced`, which
@@ -934,12 +1113,61 @@ impl ContinuationHostBindings {
         resolver: Arc<dyn ContinuationAddressResolver>,
         job_source: Arc<dyn RetainedJobSource>,
     ) -> Result<ContinuationBinding, ContinuationBindError> {
-        let mut slot = self.slot();
-        let current = ContinuationBindingGeneration(slot.generation);
-        if replaced != current {
-            return Err(ContinuationBindError::StaleGeneration { replaced, current });
-        }
-        Ok(Self::install(&mut slot, resolver, job_source))
+        let binding = {
+            let mut slot = self.slot();
+            let current = ContinuationBindingGeneration(slot.generation);
+            if replaced != current {
+                return Err(ContinuationBindError::StaleGeneration { replaced, current });
+            }
+            Self::install(&mut slot, resolver, job_source)
+        };
+        // Published once the services are readable through the slot.
+        self.publish_source_change();
+        Ok(binding)
+    }
+
+    /// Observe source changes of these continuation services: the value
+    /// advances after every binding, every rebinding and every
+    /// [`Self::source_custody_changed`]. It carries no state; a delivery
+    /// owner asks the bound source again on every advance. The signal closes
+    /// when these bindings are dropped.
+    pub fn subscribe_source_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.source_changes.subscribe()
+    }
+
+    /// Announce that the bound job owner's committed facts may have become
+    /// readable, for example once its custody is restored or its pin
+    /// recorded: every delivery owner subscribed to these bindings retries
+    /// the rows it holds blocked, asking the source again. Call it after the
+    /// facts are readable through the source. It grants nothing and asserts
+    /// nothing; an announcement with nothing changed costs one retry.
+    pub fn source_custody_changed(&self) {
+        self.publish_source_change();
+    }
+
+    /// Announce, as [`Self::source_custody_changed`], each terminal `runtime`
+    /// makes readable without a run: an exact cancellation abandoned a queued
+    /// input, or an admission superseded or coalesced one. A delivery owner
+    /// subscribed to these bindings then retries the rows it holds blocked
+    /// and starts a round of its host's owed continuations, which reads the
+    /// native terminal again, instead of waiting for a reconcile. `runtime`
+    /// holds these bindings only weakly; installing again replaces the
+    /// runtime's earlier [`meerkat_runtime::RunlessInputTerminalHint`].
+    pub fn announce_runless_input_terminals_of(
+        self: &Arc<Self>,
+        runtime: &meerkat_runtime::MeerkatMachine,
+    ) {
+        let bindings = Arc::downgrade(self);
+        runtime.set_runless_input_terminal_hint(Arc::new(move || {
+            if let Some(bindings) = bindings.upgrade() {
+                bindings.source_custody_changed();
+            }
+        }));
+    }
+
+    fn publish_source_change(&self) {
+        self.source_changes
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     /// The bound address resolver, while a binding lives.
@@ -1238,6 +1466,12 @@ pub(crate) async fn admit_continuation_row(
 /// producer and job, the same retained work, the destination session it is
 /// owed to and the result it committed. Anything else is an immutably
 /// invalid binding; a failure to ask is retryable.
+///
+/// A `Host` completion is confirmed the same way, by the configured source:
+/// the host composes into it the owner of the namespaces it actually
+/// produces (a setup result it committed). The namespace string itself
+/// proves nothing; a source that does not own that namespace and job
+/// answers [`RetainedJobLookup::Absent`], which refuses the row.
 async fn verify_committed_job(
     source: &dyn RetainedJobSource,
     delivery: &ContinuationDelivery,
@@ -1249,11 +1483,11 @@ async fn verify_committed_job(
             meerkat_runtime::RuntimeDeliveryRefusalReason::NoAdmissibleWorkBinding,
         )
     };
-    if !matches!(
-        delivery.result.producer,
-        ContinuationProducer::ForkOff | ContinuationProducer::Council
-    ) {
-        return Err(invalid());
+    match &delivery.result.producer {
+        ContinuationProducer::ForkOff | ContinuationProducer::Council => {}
+        // An empty namespace names no host operation.
+        ContinuationProducer::Host { namespace } if !namespace.is_empty() => {}
+        ContinuationProducer::Host { .. } => return Err(invalid()),
     }
     let facts = match source
         .retained_job(&delivery.result.producer, &delivery.result.producer_id)

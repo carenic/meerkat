@@ -264,6 +264,89 @@ impl NativeControllerGrantMutation<'_> {
     }
 }
 
+#[cfg(feature = "local-authorization")]
+impl NativeControllerGrantMutation<'_> {
+    /// Whether unfinished work under this custody references `reference`
+    /// anywhere in a complete applicable lineage: the controller lineage, any
+    /// lineage of the work authority basis (every selected target's, not only
+    /// one) and any lineage of each named contributor the source owner still
+    /// retains, for every original contributing to every attached driver's
+    /// unfinished input and every durable unfinished input. `originals` must be
+    /// the source owner installed in this machine's scoped composition; a
+    /// contributor it no longer holds can no longer authorize this work. Read
+    /// only: it vetoes nothing and grants nothing. A torn, busy or undecodable
+    /// scope, or a source owner that cannot answer, is `Unavailable`, never
+    /// "unreferenced".
+    pub fn unfinished_work_references_grant(
+        &self,
+        reference: &GrantLineageRef,
+        originals: &dyn super::scoped_original::AuthenticatedOriginalSource,
+    ) -> Result<bool, ControllerCustodyRefusal> {
+        let references = |original: &meerkat_authorization_contracts::work_association::InputAuthorityAssociation|
+         -> Result<bool, crate::traits::RuntimeDriverError> {
+            let candidate = original.candidate();
+            let in_basis = |basis: &meerkat_authorization_contracts::work_association::WorkAuthorityBasis| {
+                basis
+                    .grant_lineages()
+                    .any(|lineage| lineage.contains(reference))
+            };
+            if candidate.controller_grant_lineage.contains(reference)
+                || in_basis(&candidate.authority_basis)
+            {
+                return Ok(true);
+            }
+            for contributor in &candidate.contributing_work {
+                let retained = originals
+                    .retained_original(&candidate.ingress_namespace, contributor)
+                    .map_err(|_| crate::input_authority::unavailable())?;
+                if retained.as_ref().is_some_and(in_basis) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+        let any_contributor =
+            |contributors: &[crate::input_authority::RetainedInputAuthority]| {
+                for original in contributors {
+                    if references(original.association())? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            };
+        for driver in &self.drivers {
+            let referenced = Self::driver(driver)
+                .visit_unfinished_controller_inputs(|row| {
+                    any_contributor(&row.authority_contributors)
+                })
+                .map_err(|_| ControllerCustodyRefusal::Unavailable)?;
+            if referenced {
+                return Ok(true);
+            }
+        }
+        self.visit_durable_unfinished(|_, row| any_contributor(&row.state.authority_contributors))
+            .map_err(|_| ControllerCustodyRefusal::Unavailable)
+    }
+
+    /// Deferred cleanup of a superseded grant: run `revoke` (the grant owner's
+    /// existing revocation, handed this same custody) only when no unfinished
+    /// work references `reference`, without releasing custody between the
+    /// check and the revocation. `None` when it is still referenced; nothing
+    /// is revoked then. The existing controller veto still applies inside
+    /// `revoke`, and an explicit revocation does not need this.
+    pub fn revoke_if_unreferenced<T>(
+        &mut self,
+        reference: &GrantLineageRef,
+        originals: &dyn super::scoped_original::AuthenticatedOriginalSource,
+        revoke: impl FnOnce(&mut Self) -> T,
+    ) -> Result<Option<T>, ControllerCustodyRefusal> {
+        if self.unfinished_work_references_grant(reference, originals)? {
+            return Ok(None);
+        }
+        Ok(Some(revoke(self)))
+    }
+}
+
 impl ControllerGrantMutationCustody for NativeControllerGrantMutation<'_> {
     fn with_unreferenced_controller_grant<T, E>(
         &mut self,
@@ -352,11 +435,16 @@ impl MeerkatMachine {
                     .execution_custody
                     .as_deref()
                     .ok_or_else(crate::input_authority::unavailable)?;
-                store.try_controller_mutation_custody(claim).map_err(|_| {
-                    crate::meerkat_machine::credential_custody::unavailable(
-                        crate::traits::ControllerReadinessFailure::AuthorityUnavailable,
-                    )
-                })
+                store
+                    .try_controller_mutation_custody(claim)
+                    .map_err(|error| {
+                        crate::meerkat_machine::credential_custody::unavailable(match error {
+                            crate::store::RuntimeStoreError::ControllerCustodyBusy { .. } => {
+                                crate::traits::ControllerReadinessFailure::Busy
+                            }
+                            _ => crate::traits::ControllerReadinessFailure::AuthorityUnavailable,
+                        })
+                    })
             })
             .transpose()?;
         Ok(NativeControllerGrantMutation {

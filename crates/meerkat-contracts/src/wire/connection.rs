@@ -257,6 +257,10 @@ pub struct WireConnectorAuthTarget {
     pub scopes: Vec<String>,
     pub strategy_id: String,
     pub account_selection: WireConnectorAccountSelection,
+    /// Id of a client-auth profile the host installed for this issuer and
+    /// client; omitted for the default public-client forms. Never a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_auth_profile: Option<String>,
 }
 
 /// Connector arm of [`WireLoginTarget`].
@@ -354,6 +358,10 @@ pub enum WireAuthErrorReason {
     /// token exchange or refresh).
     UpstreamFailure,
     ConfigurationInvalid,
+    CredentialAccessDenied,
+    CredentialInteractionRequired,
+    CredentialAccessPending,
+    CredentialStoreUnavailable,
     /// An internal failure; its detail is only in protected diagnostics.
     Infrastructure,
 }
@@ -774,6 +782,10 @@ pub enum WireAuthError {
     HostOwnedUnavailable,
     Io { detail: String },
     Other { detail: String },
+    CredentialAccessDenied,
+    CredentialInteractionRequired,
+    CredentialAccessPending,
+    CredentialStoreUnavailable { detail: String },
 }
 
 impl From<meerkat_core::AuthError> for WireAuthError {
@@ -798,6 +810,14 @@ impl From<meerkat_core::AuthError> for WireAuthError {
             meerkat_core::AuthError::HostOwnedUnavailable => Self::HostOwnedUnavailable,
             meerkat_core::AuthError::Io(detail) => Self::Io { detail },
             meerkat_core::AuthError::Other(detail) => Self::Other { detail },
+            meerkat_core::AuthError::CredentialAccessDenied => Self::CredentialAccessDenied,
+            meerkat_core::AuthError::CredentialInteractionRequired => {
+                Self::CredentialInteractionRequired
+            }
+            meerkat_core::AuthError::CredentialAccessPending => Self::CredentialAccessPending,
+            meerkat_core::AuthError::CredentialStoreUnavailable(detail) => {
+                Self::CredentialStoreUnavailable { detail }
+            }
         }
     }
 }
@@ -1105,6 +1125,11 @@ pub struct WireAuthStatusDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
     pub has_refresh_token: bool,
+    /// Set when the credential store did not answer this non-blocking status
+    /// read. `state` then reflects the live lease alone and is never a claim
+    /// that the credential is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_observation: Option<meerkat_core::CredentialObservation>,
 }
 
 /// Secret-free authorization phase of an MCP server target.

@@ -19,6 +19,10 @@ pub struct RpcMethodCatalogOptions {
     /// `live-webrtc` feature; the catalog carries the same condition so
     /// advertise == dispatch in every build lane.
     pub live_webrtc_enabled: bool,
+    /// `approval/consent_notice` is delivered only by a connection that
+    /// serves R3 human consent (the stock governed stdio pipe); the plain
+    /// router never emits it.
+    pub consent_enabled: bool,
 }
 
 impl RpcMethodCatalogOptions {
@@ -36,6 +40,7 @@ impl RpcMethodCatalogOptions {
             workgraph_enabled: true,
             skills_enabled: true,
             live_webrtc_enabled: true,
+            consent_enabled: true,
         }
     }
 }
@@ -167,40 +172,40 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
             "JobsUnsubscribeResult",
         ),
         RpcMethodDescriptor::typed(
-            "mobkit/jobs/heartbeat",
+            "meta/jobs/heartbeat",
             "Renew a detached callback attempt lease under its current fence",
-            "MobkitJobHeartbeatParams",
-            "MobkitJobMutationResult",
+            "MetaJobHeartbeatParams",
+            "MetaJobMutationResult",
         ),
         RpcMethodDescriptor::typed(
-            "mobkit/jobs/progress",
+            "meta/jobs/progress",
             "Commit detached callback progress under its current fence",
-            "MobkitJobProgressParams",
-            "MobkitJobMutationResult",
+            "MetaJobProgressParams",
+            "MetaJobMutationResult",
         ),
         RpcMethodDescriptor::typed(
-            "mobkit/jobs/checkpoint",
+            "meta/jobs/checkpoint",
             "Commit a detached callback checkpoint under its current fence",
-            "MobkitJobCheckpointParams",
-            "MobkitJobMutationResult",
+            "MetaJobCheckpointParams",
+            "MetaJobMutationResult",
         ),
         RpcMethodDescriptor::typed(
-            "mobkit/jobs/complete",
+            "meta/jobs/complete",
             "Complete a detached callback attempt under its current fence",
-            "MobkitJobCompleteParams",
-            "MobkitJobMutationResult",
+            "MetaJobCompleteParams",
+            "MetaJobMutationResult",
         ),
         RpcMethodDescriptor::typed(
-            "mobkit/jobs/fail",
+            "meta/jobs/fail",
             "Fail a detached callback attempt under its current fence",
-            "MobkitJobFailParams",
-            "MobkitJobMutationResult",
+            "MetaJobFailParams",
+            "MetaJobMutationResult",
         ),
         RpcMethodDescriptor::typed(
-            "mobkit/jobs/cancel_ack",
+            "meta/jobs/cancel_ack",
             "Acknowledge detached callback cancellation under its current fence",
-            "MobkitJobCancelAckParams",
-            "MobkitJobMutationResult",
+            "MetaJobCancelAckParams",
+            "MetaJobMutationResult",
         ),
         RpcMethodDescriptor::typed(
             "session/create",
@@ -1244,6 +1249,13 @@ pub fn rpc_notification_catalog(
             RpcNotificationDescriptor::basic("mob/stream_event", "Mob stream event notification"),
             RpcNotificationDescriptor::basic("mob/stream_end", "Mob stream terminal notification"),
         ]);
+    }
+
+    if options.consent_enabled {
+        notifications.push(RpcNotificationDescriptor::basic(
+            crate::wire::CONSENT_NOTICE_NOTIFICATION,
+            "One recorded R3 human consent transition (requested, approved, denied, used, withdrawn) of an approval this connection's approver decides",
+        ));
     }
 
     if options.runtime_available && options.live_enabled && options.live_webrtc_enabled {

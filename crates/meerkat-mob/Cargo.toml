@@ -22,6 +22,7 @@ meerkat-comms = { workspace = true }
 meerkat = { workspace = true, features = ["comms", "skills", "session-compaction", "memory-store", "anthropic", "openai", "gemini"] }
 meerkat-session = { workspace = true, features = ["session-compaction", "runtime-machine"] }
 meerkat-client = { workspace = true }
+meerkat-authorization-contracts = { workspace = true }
 meerkat-runtime = { workspace = true }
 meerkat-machine-kernels = { workspace = true }
 meerkat-machine-dsl = { workspace = true }
@@ -83,7 +84,12 @@ async-stream = { workspace = true }
 reqwest = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 meerkat-core = { workspace = true, features = ["test-support"] }
-meerkat-runtime = { workspace = true, features = ["test-support", "sqlite-store"] }
+meerkat-runtime = { workspace = true, features = ["test-support", "sqlite-store", "local-authorization"] }
+# Governed ingress (tests/governed_ingress.rs): the real grant and admission
+# owners behind an embedder-bound scoped original.
+meerkat-authorization = { workspace = true }
+meerkat-authorization-contracts = { workspace = true }
+meerkat-llm-core = { workspace = true }
 meerkat-store = { workspace = true, features = ["jsonl", "sqlite"] }
 meerkat-machine-schema.workspace = true
 meerkat-machine-kernels = { workspace = true, features = ["test-oracle"] }

@@ -44,6 +44,7 @@ impl BuiltinTool for ShellJobsListTool {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Shell,
                 source_id: "shell".into(),
+                artifact: None,
             }),
         }
     }

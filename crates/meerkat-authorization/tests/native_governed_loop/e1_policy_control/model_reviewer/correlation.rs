@@ -386,7 +386,8 @@ fn persistent_service(
         2,
         bundle,
         std::env::temp_dir().join(format!("review-correlation-{}.toml", SessionId::new())),
-    );
+    )
+    .expect("compose the runtime-backed service");
     (service, machine, store, old_sessions)
 }
 
@@ -463,6 +464,7 @@ fn assert_feedback(body: &Value, allowed: Option<&str>) {
             let feedback = if allowed.is_some() {
                 ToolError::ReviewUnsatisfied {
                     kind: ReviewUnsatisfiedKind::Denied,
+                    approval_id: None,
                 }
             } else {
                 ToolError::ReviewUnavailable {
@@ -581,6 +583,8 @@ async fn exercise(
         Ok(())
     });
     let authorization = |original: &InputId| NativeGrantWorkConfiguration {
+        retained_resume: None,
+        require_scoped_destination: false,
         grants: grants.clone(),
         ingress: ingress.clone(),
         invocation_owner: Arc::new(InvocationOwner),
@@ -596,6 +600,7 @@ async fn exercise(
             source_checks: Arc::new(AtomicUsize::new(0)),
             model_probe: None,
         }),
+        configured_mcp_attachment: None,
     };
     let tokens = meerkat_core::auth::ProviderAuthPersistence::new(
         Arc::new(meerkat_auth_core::EphemeralTokenStore::new()),

@@ -248,6 +248,13 @@ impl Default for AppHooks {
 }
 #[async_trait]
 impl HookEngine for AppHooks {
+    fn mandatory_topology(
+        &self,
+        _overrides: Option<&HookRunOverrides>,
+    ) -> Result<meerkat_core::hooks::HookMandatoryTopology, HookEngineError> {
+        Ok(meerkat_core::hooks::HookMandatoryTopology::none())
+    }
+
     async fn execute(
         &self,
         invocation: HookInvocation,

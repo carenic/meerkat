@@ -377,3 +377,205 @@ async fn lifecycle_contract_failed_activation_uses_failed_phase_and_legacy_notic
 
     failed_adapter.shutdown().await;
 }
+
+#[tokio::test]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+async fn observation_reports_the_current_route_and_accepted_state() {
+    use meerkat_core::McpOperationObservation as Observation;
+    let server_path = mcp_test_server::fixture_binary();
+    let adapter = generated_adapter();
+
+    assert_eq!(
+        adapter.observe_operation("observed", "echo").await,
+        Observation::Absent
+    );
+    adapter
+        .stage_add(test_server_config("observed", &server_path))
+        .await
+        .expect("stage add");
+    assert_eq!(
+        adapter.observe_operation("observed", "echo").await,
+        Observation::Pending,
+        "a staged server is never callable"
+    );
+    adapter.apply_staged().await.expect("apply staged add");
+    wait_for_adapter_action(
+        &adapter,
+        "observed",
+        ToolConfigChangeOperation::Add,
+        McpLifecyclePhase::Applied,
+        Duration::from_secs(35),
+    )
+    .await;
+    adapter.refresh_tools().await.expect("refresh");
+    let Observation::Callable {
+        connection_generation: first,
+        connector: None,
+    } = adapter.observe_operation("observed", "echo").await
+    else {
+        panic!("the connected server's route is callable");
+    };
+    assert_eq!(
+        adapter
+            .observe_operation("observed", "not-an-operation")
+            .await,
+        Observation::Absent,
+        "an operation the server does not expose is absent"
+    );
+
+    // A staged replacement coexists with the live route it will replace.
+    adapter
+        .stage_reload("observed")
+        .await
+        .expect("stage reload");
+    assert_eq!(
+        adapter.observe_operation("observed", "echo").await,
+        Observation::Callable {
+            connection_generation: first,
+            connector: None,
+        },
+        "the current route stays callable while its replacement is staged"
+    );
+    adapter.apply_staged().await.expect("apply staged reload");
+    wait_for_adapter_action(
+        &adapter,
+        "observed",
+        ToolConfigChangeOperation::Reload,
+        McpLifecyclePhase::Applied,
+        Duration::from_secs(35),
+    )
+    .await;
+    adapter.refresh_tools().await.expect("refresh");
+    match adapter.observe_operation("observed", "echo").await {
+        Observation::Callable {
+            connection_generation,
+            ..
+        } => assert_ne!(
+            connection_generation, first,
+            "the replacement connection serves it now"
+        ),
+        other => panic!("the reloaded server is callable: {other:?}"),
+    }
+
+    // An accepted failure is read from current state after its notices drained.
+    adapter
+        .stage_add(invalid_server_config("broken"))
+        .await
+        .expect("stage broken add");
+    adapter
+        .apply_staged()
+        .await
+        .expect("apply staged broken add");
+    wait_for_adapter_action(
+        &adapter,
+        "broken",
+        ToolConfigChangeOperation::Add,
+        McpLifecyclePhase::Failed,
+        Duration::from_secs(35),
+    )
+    .await;
+    let _ = adapter.poll_lifecycle_actions().await;
+    assert_eq!(
+        adapter.observe_operation("broken", "echo").await,
+        Observation::Failed
+    );
+
+    adapter.shutdown().await;
+    assert_eq!(
+        adapter.observe_operation("observed", "echo").await,
+        Observation::Retired,
+        "a router taken for shutdown is retired"
+    );
+}
+
+/// A router that borrows its surface releases only what it staged when it
+/// shuts down, so the surface stays open for the next holder; a router that
+/// owns its surface shuts the whole surface down.
+#[tokio::test]
+#[allow(clippy::expect_used)]
+async fn shutdown_releases_a_borrowed_surface_and_closes_an_owned_one() {
+    use meerkat_core::{ExternalToolSurfaceBaseState, ExternalToolSurfaceGlobalPhase};
+    use meerkat_mcp::McpSurfaceOwnership;
+    let server_path = mcp_test_server::fixture_binary();
+    for ownership in [McpSurfaceOwnership::Borrowed, McpSurfaceOwnership::Owned] {
+        let surface = generated_surface_handle();
+        let adapter = McpRouterAdapter::new(
+            McpRouter::new_with_surface_handle(Arc::clone(&surface))
+                .with_surface_ownership(ownership),
+        );
+        adapter
+            .stage_add(test_server_config("held", &server_path))
+            .await
+            .expect("stage add");
+        adapter.apply_staged().await.expect("apply staged add");
+        wait_for_adapter_action(
+            &adapter,
+            "held",
+            ToolConfigChangeOperation::Add,
+            McpLifecyclePhase::Applied,
+            Duration::from_secs(35),
+        )
+        .await;
+        adapter.shutdown().await;
+
+        let phase = surface.diagnostic_snapshot().surface_phase;
+        let base = surface
+            .surface_snapshot("held")
+            .and_then(|entry| entry.base_state);
+        match ownership {
+            McpSurfaceOwnership::Borrowed => {
+                assert_eq!(phase, ExternalToolSurfaceGlobalPhase::Operating);
+                assert_eq!(base, Some(ExternalToolSurfaceBaseState::Removed));
+                // The next holder stages the same server.
+                let mut next = McpRouter::new_with_surface_handle(Arc::clone(&surface));
+                next.stage_add(test_server_config("held", &server_path))
+                    .expect("the next holder stages the released server");
+            }
+            McpSurfaceOwnership::Owned => {
+                assert_eq!(phase, ExternalToolSurfaceGlobalPhase::Shutdown);
+            }
+        }
+    }
+}
+
+/// A router built `Owned` on its private surface and later bound onto a
+/// session registration's surface borrows that surface: its shutdown releases
+/// only its own lineages there and leaves the registration's surface open.
+#[tokio::test]
+#[allow(clippy::expect_used)]
+async fn a_late_bind_onto_a_registration_surface_makes_the_router_borrow_it() {
+    use meerkat_core::{ExternalToolSurfaceBaseState, ExternalToolSurfaceGlobalPhase};
+    use meerkat_mcp::McpSurfaceOwnership;
+    let server_path = mcp_test_server::fixture_binary();
+    let registration = generated_surface_handle();
+    let adapter = McpRouterAdapter::new(
+        McpRouter::new_with_surface_handle(generated_surface_handle())
+            .with_surface_ownership(McpSurfaceOwnership::Owned),
+    );
+    adapter.bind_external_tool_surface_handle(Arc::clone(&registration));
+    adapter
+        .stage_add(test_server_config("bound", &server_path))
+        .await
+        .expect("stage add");
+    adapter.apply_staged().await.expect("apply staged add");
+    wait_for_adapter_action(
+        &adapter,
+        "bound",
+        ToolConfigChangeOperation::Add,
+        McpLifecyclePhase::Applied,
+        Duration::from_secs(35),
+    )
+    .await;
+    adapter.shutdown().await;
+    assert_eq!(
+        registration.diagnostic_snapshot().surface_phase,
+        ExternalToolSurfaceGlobalPhase::Operating,
+        "the registration's surface stays open"
+    );
+    assert_eq!(
+        registration
+            .surface_snapshot("bound")
+            .and_then(|entry| entry.base_state),
+        Some(ExternalToolSurfaceBaseState::Removed)
+    );
+}

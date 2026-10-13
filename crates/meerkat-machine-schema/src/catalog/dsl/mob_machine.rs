@@ -1344,8 +1344,8 @@ macro_rules! mob_catalog_machine_dsl {
             ClassifyFlowStepDispatch { run_id: RunId, step_id: StepId, target: AgentIdentity, overlay_present: bool },
             SessionIngressDetachedForMobDestroy { mob_id: MobId, agent_runtime_id: AgentRuntimeId },
             SessionIngressDetachFailedForMobDestroy { mob_id: MobId, agent_runtime_id: AgentRuntimeId, reason: String },
-            SubmitWork { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, work_id: WorkId, origin: Enum<WorkOrigin>, content_attribution: Enum<WorkContentAttribution> },
-            ResolveSubmitWorkRejection { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, origin: Enum<WorkOrigin> },
+            SubmitWork { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, expected_session_id: Option<SessionId>, work_id: WorkId, origin: Enum<WorkOrigin>, content_attribution: Enum<WorkContentAttribution> },
+            ResolveSubmitWorkRejection { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, expected_session_id: Option<SessionId>, origin: Enum<WorkOrigin> },
             // Generated composition refusal closure. Each input is bound by
             // `meerkat_mob_seam` to one concrete routed effect kind; the shell
             // supplies only the consumer's stable code + display detail.
@@ -9867,7 +9867,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         transition SubmitWorkRunningExternal {
-            on input SubmitWork { agent_identity, agent_runtime_id, fence_token, work_id, origin, content_attribution }
+            on input SubmitWork { agent_identity, agent_runtime_id, fence_token, expected_session_id, work_id, origin, content_attribution }
             guard { self.lifecycle_phase == Phase::Running }
             guard "placed_completion_origin_open" { self.placed_completion_lifecycle_quiescing == false }
             guard "active_members_present" { self.live_runtime_ids != EmptySet }
@@ -9876,6 +9876,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "fence_token_matches" { self.runtime_fence_tokens.get_copied(agent_runtime_id) == Some(fence_token) }
             guard "generation_binding_present" { self.identity_runtime_generations.get_copied(agent_identity) != None }
             guard "session_binding_present" { self.member_session_bindings.get_cloned(agent_identity) != None }
+            guard "expected_session_matches" { expected_session_id == None || self.member_session_bindings.get_cloned(agent_identity) == expected_session_id }
             guard "placed_carrier_binding_active_or_local" {
                 self.member_placement.contains_key(agent_identity) == false
                 || mob_machine_placed_carrier_binding_active(self.member_placement, self.current_placed_spawn_host_binding_generations, self.host_bind_phase, self.host_binding_generations, agent_identity)
@@ -9897,7 +9898,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         transition SubmitWorkRunningExternalPeerOnly {
-            on input SubmitWork { agent_identity, agent_runtime_id, fence_token, work_id, origin, content_attribution }
+            on input SubmitWork { agent_identity, agent_runtime_id, fence_token, expected_session_id, work_id, origin, content_attribution }
             guard { self.lifecycle_phase == Phase::Running }
             guard "placed_completion_origin_open" { self.placed_completion_lifecycle_quiescing == false }
             guard "active_members_present" { self.live_runtime_ids != EmptySet }
@@ -9906,6 +9907,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "fence_token_matches" { self.runtime_fence_tokens.get_copied(agent_runtime_id) == Some(fence_token) }
             guard "generation_binding_present" { self.identity_runtime_generations.get_copied(agent_identity) != None }
             guard "session_binding_absent" { self.member_session_bindings.get_cloned(agent_identity) == None }
+            guard "no_expected_session" { expected_session_id == None }
             guard "member_not_retiring" { self.member_state_markers.get_cloned(agent_runtime_id) != Some(MobMemberState::Retiring) }
             guard "external_origin" { origin == WorkOrigin::External }
             guard "runtime_externally_addressable" { self.externally_addressable_runtime_ids.contains(agent_runtime_id) }
@@ -9923,7 +9925,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         transition SubmitWorkRunningInternal {
-            on input SubmitWork { agent_identity, agent_runtime_id, fence_token, work_id, origin, content_attribution }
+            on input SubmitWork { agent_identity, agent_runtime_id, fence_token, expected_session_id, work_id, origin, content_attribution }
             guard { self.lifecycle_phase == Phase::Running }
             guard "placed_completion_origin_open" { self.placed_completion_lifecycle_quiescing == false }
             guard "active_members_present" { self.live_runtime_ids != EmptySet }
@@ -9932,6 +9934,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "fence_token_matches" { self.runtime_fence_tokens.get_copied(agent_runtime_id) == Some(fence_token) }
             guard "generation_binding_present" { self.identity_runtime_generations.get_copied(agent_identity) != None }
             guard "session_binding_present" { self.member_session_bindings.get_cloned(agent_identity) != None }
+            guard "expected_session_matches" { expected_session_id == None || self.member_session_bindings.get_cloned(agent_identity) == expected_session_id }
             guard "placed_carrier_binding_active_or_local" {
                 self.member_placement.contains_key(agent_identity) == false
                 || mob_machine_placed_carrier_binding_active(self.member_placement, self.current_placed_spawn_host_binding_generations, self.host_bind_phase, self.host_binding_generations, agent_identity)
@@ -9952,7 +9955,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         transition SubmitWorkRunningInternalPeerOnly {
-            on input SubmitWork { agent_identity, agent_runtime_id, fence_token, work_id, origin, content_attribution }
+            on input SubmitWork { agent_identity, agent_runtime_id, fence_token, expected_session_id, work_id, origin, content_attribution }
             guard { self.lifecycle_phase == Phase::Running }
             guard "placed_completion_origin_open" { self.placed_completion_lifecycle_quiescing == false }
             guard "active_members_present" { self.live_runtime_ids != EmptySet }
@@ -9961,6 +9964,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "fence_token_matches" { self.runtime_fence_tokens.get_copied(agent_runtime_id) == Some(fence_token) }
             guard "generation_binding_present" { self.identity_runtime_generations.get_copied(agent_identity) != None }
             guard "session_binding_absent" { self.member_session_bindings.get_cloned(agent_identity) == None }
+            guard "no_expected_session" { expected_session_id == None }
             guard "member_not_retiring" { self.member_state_markers.get_cloned(agent_runtime_id) != Some(MobMemberState::Retiring) }
             guard "internal_origin" { origin == WorkOrigin::Internal }
             guard "member_peer_registered" { self.member_peer_ids.contains_key(agent_identity) }
@@ -9977,7 +9981,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         transition ResolveSubmitWorkRejectionStopped {
-            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, origin }
+            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, expected_session_id, origin }
             guard { self.lifecycle_phase == Phase::Stopped }
             update {}
             to Stopped
@@ -9991,7 +9995,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         transition ResolveSubmitWorkRejectionCompleted {
-            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, origin }
+            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, expected_session_id, origin }
             guard { self.lifecycle_phase == Phase::Completed }
             update {}
             to Completed
@@ -10005,7 +10009,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         transition ResolveSubmitWorkRejectionDestroyed {
-            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, origin }
+            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, expected_session_id, origin }
             guard { self.lifecycle_phase == Phase::Destroyed }
             update {}
             to Destroyed
@@ -10019,7 +10023,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         transition ResolveSubmitWorkRejectionMemberNotFound {
-            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, origin }
+            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, expected_session_id, origin }
             guard { self.lifecycle_phase == Phase::Running }
             guard "identity_absent" { !self.identity_to_runtime.contains_key(agent_identity) }
             update {}
@@ -10034,7 +10038,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         transition ResolveSubmitWorkRejectionCurrentRuntimeNotLive {
-            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, origin }
+            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, expected_session_id, origin }
             guard { self.lifecycle_phase == Phase::Running }
             guard "identity_present" { self.identity_to_runtime.contains_key(agent_identity) }
             guard "current_runtime_not_live" { !self.live_runtime_ids.contains(self.identity_to_runtime.get_cloned(agent_identity).get("value")) }
@@ -10050,7 +10054,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         transition ResolveSubmitWorkRejectionStaleFenceToken {
-            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, origin }
+            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, expected_session_id, origin }
             guard { self.lifecycle_phase == Phase::Running }
             guard "identity_present" { self.identity_to_runtime.contains_key(agent_identity) }
             guard "current_runtime_live" { self.live_runtime_ids.contains(self.identity_to_runtime.get_cloned(agent_identity).get("value")) }
@@ -10070,7 +10074,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         transition ResolveSubmitWorkRejectionRetiringAsMemberNotFound {
-            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, origin }
+            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, expected_session_id, origin }
             guard { self.lifecycle_phase == Phase::Running }
             guard "identity_binding_matches" { self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id) }
             guard "runtime_live" { self.live_runtime_ids.contains(agent_runtime_id) }
@@ -10088,7 +10092,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         transition ResolveSubmitWorkRejectionNotExternallyAddressable {
-            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, origin }
+            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, expected_session_id, origin }
             guard { self.lifecycle_phase == Phase::Running }
             guard "identity_binding_matches" { self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id) }
             guard "runtime_live" { self.live_runtime_ids.contains(agent_runtime_id) }
@@ -10108,7 +10112,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         transition ResolveSubmitWorkRejectionPeerOnlyNotExternallyAddressable {
-            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, origin }
+            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, expected_session_id, origin }
             guard { self.lifecycle_phase == Phase::Running }
             guard "identity_binding_matches" { self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id) }
             guard "runtime_live" { self.live_runtime_ids.contains(agent_runtime_id) }
@@ -10123,6 +10127,30 @@ macro_rules! mob_catalog_machine_dsl {
                 agent_runtime_id: agent_runtime_id,
                 origin: origin,
                 reason: SubmitWorkRejectReasonKind::NotExternallyAddressable,
+                expected_fence_token: None,
+                actual_fence_token: None
+            }
+        }
+
+        // A scope-bound submit names the member session it was captured
+        // against. Runtime id and fence can stay current while the member's
+        // session binding moves (session recovery under the same runtime),
+        // so a mismatch is its own typed refusal, never a retarget. Declared
+        // after the other classifications: first match wins.
+        transition ResolveSubmitWorkRejectionStaleSessionBinding {
+            on input ResolveSubmitWorkRejection { agent_identity, agent_runtime_id, fence_token, expected_session_id, origin }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "identity_binding_matches" { self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id) }
+            guard "runtime_live" { self.live_runtime_ids.contains(agent_runtime_id) }
+            guard "fence_token_matches" { self.runtime_fence_tokens.get_copied(agent_runtime_id) == Some(fence_token) }
+            guard "expected_session_named" { expected_session_id != None }
+            guard "session_binding_differs" { self.member_session_bindings.get_cloned(agent_identity) != expected_session_id }
+            update {}
+            to Running
+            emit SubmitWorkRejected {
+                agent_runtime_id: agent_runtime_id,
+                origin: origin,
+                reason: SubmitWorkRejectReasonKind::StaleSessionBinding,
                 expected_fence_token: None,
                 actual_fence_token: None
             }
@@ -24157,6 +24185,9 @@ pub enum SubmitWorkRejectReasonKind {
     MemberNotFound,
     StaleFenceToken,
     NotExternallyAddressable,
+    /// A scope-bound submit named a member session that is no longer the
+    /// member's current session binding.
+    StaleSessionBinding,
 }
 
 /// Typed public rejection class for [`MobMachineInput::CancelAllWork`].

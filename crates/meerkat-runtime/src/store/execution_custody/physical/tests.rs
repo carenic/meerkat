@@ -161,3 +161,71 @@ fn sqlite_store_and_execution_owner_bind_the_same_canonical_database() {
         physical_owner(&alias).admission_path
     );
 }
+
+/// A governed claim retains another database's governed claim for exactly
+/// its own lifetime: that database's owners stay out while it lives, the
+/// association passes neither store's mutation authorization to the other
+/// store's owner, and both are free once it is dropped.
+#[test]
+fn an_associated_claim_is_held_with_its_claim_and_authorizes_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let host = SqliteRuntimeStore::new_whole_blob(directory.path().join("host.db")).unwrap();
+    let realm = SqliteRuntimeStore::new_whole_blob(directory.path().join("realm.sqlite3")).unwrap();
+    let associated = SqliteRuntimeStore::try_acquire_governed_execution_custody(
+        directory.path().join("realm.sqlite3"),
+    )
+    .unwrap();
+    assert!(!actual_custody(&realm).owns_governed_claim(&associated));
+    let mut claim = actual_custody(&host).try_acquire_governed().unwrap();
+    claim.retain_associated(associated).unwrap();
+
+    assert_admission_busy(&realm);
+    assert_admission_busy(&host);
+    assert!(actual_custody(&host).owns_governed_claim(&claim));
+    assert!(
+        !actual_custody(&realm).owns_governed_claim(&claim),
+        "the association is no authority over the associated store"
+    );
+    assert!(!actual_custody(&realm).binds_same_store(&claim));
+
+    drop(claim);
+    drop(actual_custody(&realm).try_acquire_governed().unwrap());
+    drop(actual_custody(&host).try_acquire_governed().unwrap());
+}
+
+/// A claim taken through another path to the same database binds that
+/// store; a machine over the store refuses it as its associated claim and
+/// releases it, so the store's own custody is free again.
+#[cfg(unix)]
+#[test]
+fn a_claim_on_the_same_database_by_another_path_is_never_associated() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("runtime.sqlite3");
+    let store = Arc::new(SqliteRuntimeStore::new_whole_blob(path.clone()).unwrap());
+    let alias = directory.path().join("alias.sqlite3");
+    std::os::unix::fs::symlink(&path, &alias).unwrap();
+    let aliased = SqliteRuntimeStore::try_acquire_governed_execution_custody(alias).unwrap();
+    assert!(actual_custody(&store).binds_same_store(&aliased));
+    assert!(
+        crate::MeerkatMachine::persistent_governed_staged_with_associated_custody(
+            Arc::clone(&store) as Arc<dyn RuntimeStore>,
+            None,
+            aliased,
+        )
+        .is_err(),
+        "the machine never admits itself through an alias"
+    );
+    drop(actual_custody(&store).try_acquire_governed().unwrap());
+}
+
+/// A missing database has no custody to take.
+#[test]
+fn a_missing_database_has_no_custody_to_take() {
+    let directory = tempfile::tempdir().unwrap();
+    assert!(matches!(
+        SqliteRuntimeStore::try_acquire_governed_execution_custody(
+            directory.path().join("absent.sqlite3")
+        ),
+        Err(CustodyError::Unavailable)
+    ));
+}

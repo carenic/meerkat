@@ -991,7 +991,8 @@ fn the_row_preparation_callback_preserves_every_durable_fact() {
         for (key, before) in &before {
             let after = &after[key];
             assert_eq!(
-                after["stored_input_state_version"], 5,
+                after["stored_input_state_version"],
+                meerkat_core::generated::session_persistence_version_authority::stored_input_state_version(),
                 "{label} {key}: a carried row must be left in the current encoding"
             );
             assert_eq!(

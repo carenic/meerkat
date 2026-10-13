@@ -161,6 +161,8 @@ struct Fixture {
     handle: MobHandle,
     identity: AgentIdentity,
     client: ScriptedClient,
+    service: Arc<Service>,
+    mob_service: Arc<dyn MobSessionService>,
 }
 
 impl Fixture {
@@ -233,7 +235,7 @@ impl Fixture {
             service.clone()
         };
         let handle = MobBuilder::new(definition, MobStorage::in_memory())
-            .with_session_service(mob_service)
+            .with_session_service(Arc::clone(&mob_service))
             .with_default_llm_client(Arc::new(client.clone()))
             .create()
             .await
@@ -293,6 +295,8 @@ impl Fixture {
             handle,
             identity,
             client,
+            service,
+            mob_service,
         }
     }
 
@@ -509,6 +513,41 @@ async fn a_decorator_that_does_not_forward_the_seam_is_refused_typed() {
         system_rows_with_body(fixture.client.requests().get(before).expect("next turn")),
         0
     );
+    fixture.finish().await;
+}
+
+/// A decorator that does not forward the controller pin under the turn
+/// boundary gets the trait's typed default: `Unsupported`, never a no-op pin,
+/// though it forwards the boundary itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_decorator_that_does_not_forward_the_controller_pin_is_refused_unsupported() {
+    let fixture = Fixture::restored_member_through(true).await;
+    let session_id = fixture
+        .handle
+        .resolve_bridge_session_id(&fixture.identity)
+        .await
+        .expect("the member's session");
+    let actor = fixture
+        .service
+        .live_session_actor_witness(&session_id)
+        .await
+        .expect("the member's actor");
+    let boundary = MobSessionService::acquire_runtime_turn_finalization_guard(
+        &*fixture.mob_service,
+        &session_id,
+    )
+    .await
+    .expect("the forwarded boundary");
+    let refused = fixture
+        .mob_service
+        .pin_controller_client_under_runtime_turn_boundary(&actor)
+        .await
+        .err();
+    assert!(
+        matches!(refused, Some(SessionError::Unsupported(_))),
+        "{refused:?}"
+    );
+    drop(boundary);
     fixture.finish().await;
 }
 

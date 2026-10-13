@@ -624,6 +624,7 @@ mod tests {
             last_seen_provenance: Some(meerkat_core::ToolProvenance {
                 kind: meerkat_core::ToolSourceKind::Builtin,
                 source_id: meerkat_core::ToolSourceId::new("builtin:view_image"),
+                artifact: None,
             }),
         };
         let view_image = meerkat_core::ToolName::from(meerkat_core::VIEW_IMAGE_TOOL_NAME);

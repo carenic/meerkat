@@ -41,11 +41,6 @@ requires_mixed_llms = pytest.mark.skipif(
     reason="need both ANTHROPIC_API_KEY and OPENAI_API_KEY",
 )
 
-requires_openai_realtime = pytest.mark.skipif(
-    not has_openai_api_key(),
-    reason="need OPENAI_API_KEY",
-)
-
 requires_anthropic_and_gemini = pytest.mark.skipif(
     not (has_anthropic_api_key() and has_gemini_api_key()),
     reason="need both ANTHROPIC_API_KEY and GEMINI_API_KEY",
@@ -569,7 +564,6 @@ if include_scenario(40):
 
 if include_scenario(57):
     @pytest.mark.asyncio
-    @requires_openai_realtime
     async def test_smoke_scenario_57_live_channel_session_helpers():
         # The Python SDK's `RealtimeChannel` was removed in the live-adapter
         # MVP. The replacement is the `live/*` RPC surface (open/send_input/
@@ -587,7 +581,9 @@ if include_scenario(57):
         # SDK helper serializes to the right JSON-RPC method and that the
         # negative path is honored end-to-end (SDK -> rkat-rpc subprocess).
         async with live_client(realm_id="env_default") as client:
-            session = await client.create_session(
+            # A deferred create stages the session without running a
+            # model turn, so no provider credential is needed.
+            session = await client.create_deferred_session(
                 "Reply with PY-LIVE-57-OK and nothing else.",
                 model=smoke_model(),
                 provider="anthropic",
@@ -613,7 +609,6 @@ if include_scenario(57):
 
 if include_scenario(58):
     @pytest.mark.asyncio
-    @requires_openai_realtime
     async def test_smoke_scenario_58_live_member_channel_helpers():
         # Mirrors scenario 57 for a mob-member session. Confirms the `live_*`
         # helpers route correctly when targeting a session created through
@@ -622,7 +617,9 @@ if include_scenario(58):
         # the smoke harness does not configure; that flow is exercised in
         # provider-specific live lanes, not here.
         async with live_client(realm_id="env_default") as client:
-            session = await client.create_session(
+            # A deferred create stages the session without running a
+            # model turn, so no provider credential is needed.
+            session = await client.create_deferred_session(
                 "Reply with PY-LIVE-58-OK and nothing else.",
                 model=smoke_model(),
                 provider="anthropic",
@@ -645,7 +642,6 @@ if include_scenario(58):
 
 if include_scenario(64):
     @pytest.mark.asyncio
-    @requires_openai_realtime
     async def test_smoke_scenario_64_live_channel_send_input_helpers():
         # Confirms the typed `live_send_input_*` helpers serialize through the
         # SDK transport. As with scenarios 57/58, the smoke harness does not
@@ -654,7 +650,9 @@ if include_scenario(64):
         # exchange. The original RealtimeChannel-based model-switch-continuity
         # assertion has no live-adapter MVP analogue at the typed-helper level.
         async with live_client(realm_id="env_default") as client:
-            session = await client.create_session(
+            # A deferred create stages the session without running a
+            # model turn, so no provider credential is needed.
+            session = await client.create_deferred_session(
                 "Reply with PY-LIVE-64-OK and nothing else.",
                 model=smoke_model(),
                 provider="anthropic",

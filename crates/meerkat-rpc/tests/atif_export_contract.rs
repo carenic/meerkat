@@ -95,7 +95,8 @@ async fn projection_backed_runtime_with_event_store(
         4,
         persistence,
         meerkat_rpc::router::NotificationSink::noop(),
-    );
+    )
+    .expect("compose the RPC session runtime");
     runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
     (Arc::new(runtime), event_store)
 }
@@ -156,7 +157,8 @@ fn projectionless_runtime(temp: &tempfile::TempDir) -> Arc<SessionRuntime> {
         )
         .expect("construct runtime authority"),
         meerkat_rpc::router::NotificationSink::noop(),
-    );
+    )
+    .expect("compose the RPC session runtime");
     runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
     Arc::new(runtime)
 }

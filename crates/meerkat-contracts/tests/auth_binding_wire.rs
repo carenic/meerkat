@@ -196,6 +196,7 @@ fn auth_status_detail_wire_flattens_binding_identity() {
         last_refresh_at: Some("2026-04-28T00:00:00Z".to_string()),
         account_id: Some("acct_42".to_string()),
         has_refresh_token: true,
+        credential_observation: None,
     };
     let value = serde_json::to_value(&status).unwrap();
     assert_eq!(value["realm_id"], "dev");

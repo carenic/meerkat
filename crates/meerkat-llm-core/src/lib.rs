@@ -29,7 +29,7 @@ pub mod streaming;
 pub mod test_client;
 pub mod types;
 
-pub use adapter::LlmClientAdapter;
+pub use adapter::{LateEventChannel, LlmClientAdapter};
 pub use block_assembler::{BlockAssembler, BlockKey, StreamAssemblyError};
 pub use error::{LlmError, TOOL_CHOICE_UNSUPPORTED_DETAILS_CLASS, ToolChoiceRefusal};
 pub use factory::FactoryError;

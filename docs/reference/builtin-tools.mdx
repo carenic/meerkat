@@ -354,7 +354,7 @@ grandchild keeps following its forker, whatever happened above it.
 it can deliver later, it has a runtime to admit the completion, and the caller
 can be made live again to receive it. A host built with a runtime adapter
 declares delivery by default (the JSON-RPC, REST, and MCP servers and
-MobKit), and so do `rkat run --keep-alive` and `rkat mob deploy --surface
+Meta), and so do `rkat run --keep-alive` and `rkat mob deploy --surface
 rpc`. The caller can be revived when it is a member of a mob the host manages
 (its mob revives it) or when the host installs a `DetachedOwnerHost` (the
 JSON-RPC host does). A `fork_off` caller is always a mob member. There
@@ -447,7 +447,7 @@ argument error instead of a silently ignored intent.
 forker session, start time, opt-in limit, fork prefix length, result bound,
 and, on a runtime-backed host, the stable delivery identity its job turn is
 admitted under) on its spawn event and roster entry. When a host restores its
-mobs, or inserts a restored mob handle as MobKit does, a one-time re-link pass
+mobs, or inserts a restored mob handle as Meta does, a one-time re-link pass
 settles every child whose job began in a previous process:
 
 - a child whose reply to the job is already in its durable transcript has
@@ -616,14 +616,14 @@ failure is reported, so a retry converges. The cascade lives in the core
 retire, so every path takes it: `mob_retire_member`, `retire_member`, the
 `max_run_secs` autokill, the retirement of a child whose turn failed,
 host-side retirement (`mob/retire` over JSON-RPC, `meerkat_mob_retire` over
-MCP), and `MobHandle::retire` itself, which MobKit's retire paths and idle
+MCP), and `MobHandle::retire` itself, which Meta's retire paths and idle
 sweep use. A descendant forked while its subtree is being retired is retired
 with it.
 
 A child whose own turn fails is retired automatically. A child whose turn
 completes stays seated, for inspection or further work, until its forker
 retires it. Meerkat adds no retention limit of its own; a host can apply one
-(MobKit's `idle_retire_secs`, for example).
+(Meta's `idle_retire_secs`, for example).
 
 Host/operator surfaces for placement, binding, grants, observation, live
 member sessions, and hard cancellation are control-plane APIs, not agent
@@ -886,13 +886,13 @@ Tool execution has layered deadlines; the narrowest applicable layer wins.
 | SDK/builder `ToolDispatcher` | 30 seconds | Enforced dispatcher-layer deadline when this wrapper is composed |
 | Schedule occurrence lease | 60 seconds | Scheduling/redelivery ownership lease; not a long-job execution deadline |
 | Normal Meerkat tool batch | 600 seconds | Agent-loop outer deadline; per-tool overrides may narrow it |
-| MobKit provider callback | 120 seconds | Public host-callback work window |
-| MobKit Python/TypeScript callback cancellation | 125 seconds | Host cancellation margin, not extra work time |
-| MobKit gateway callback wire | 130 seconds | Transport margin, not extra work time |
+| Meta provider callback | 120 seconds | Public host-callback work window |
+| Meta Python/TypeScript callback cancellation | 125 seconds | Host cancellation margin, not extra work time |
+| Meta gateway callback wire | 130 seconds | Transport margin, not extra work time |
 | LLM stream inactivity | 300 seconds | Provider-stream watchdog; unrelated to tool callbacks |
 
 Changing the normal Meerkat tool timeout cannot extend a narrower shell,
-SDK/builder `ToolDispatcher`, or MobKit callback deadline. The foreground shell
+SDK/builder `ToolDispatcher`, or Meta callback deadline. The foreground shell
 and dispatcher deadlines are distinct enforced layers, even though both
 defaults currently come from `ToolTimeoutPolicy`. Background shell submission
 returns within the normal tool call, but the spawned command keeps its own shell

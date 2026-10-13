@@ -228,6 +228,78 @@ exec "$SERVER"
         assert!(!fixture.root.join("outside").exists());
     }
 
+    /// Service-secret custody holding one value for `SERVICE_TOKEN`.
+    struct ConfinedCustody;
+
+    #[async_trait]
+    impl McpAuthResolver for ConfinedCustody {
+        async fn stored_bearer_token(
+            &self,
+            _target: &McpServerIdentity,
+        ) -> Result<Option<String>, McpOAuthError> {
+            Ok(None)
+        }
+
+        async fn interactive_login(
+            &self,
+            target: &McpServerIdentity,
+            _www_authenticate: Option<&str>,
+        ) -> Result<String, McpOAuthError> {
+            Err(McpOAuthError::HumanAuthorizationRequired {
+                server_name: target.server_name().to_owned(),
+            })
+        }
+
+        async fn stdio_service_secrets(
+            &self,
+            _server: &McpServerConfig,
+        ) -> Result<
+            meerkat_core::auth::McpServiceSecretValues,
+            meerkat_core::auth::McpServiceSecretRefusal,
+        > {
+            let mut values = meerkat_core::auth::McpServiceSecretValues::new();
+            values.insert("SERVICE_TOKEN", "confined-secret");
+            Ok(values)
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "Linux positive confinement acceptance lane; requires an eligible host"
+    )]
+    async fn required_mcp_launch_receives_resolved_service_secrets_in_its_explicit_environment() {
+        let fixture = Fixture::new();
+        let profile = fixture.profile();
+        let mut config = fixture.config("secret-bearing");
+        let McpTransportConfig::Stdio(stdio) = &mut config.transport else {
+            unreachable!()
+        };
+        stdio.secret_env.insert("SERVICE_TOKEN".into());
+        // The confined process sees the resolved value in its explicit
+        // environment; the configuration never holds it.
+        stdio.args[1] = format!(
+            "test \"$SERVICE_TOKEN\" = confined-secret || exit 85\n{}",
+            stdio.args[1]
+        );
+        let (connection, tools) = tokio::time::timeout(
+            BOUND,
+            McpConnection::connect_and_enumerate_with_services_and_stdio_profile(
+                &config,
+                McpAuthMode::Stored,
+                Some(Arc::new(ConfinedCustody)),
+                None,
+                &profile,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(tools.iter().any(|tool| tool.name == "echo"));
+        assert!(!format!("{:?}", connection.config()).contains("confined-secret"));
+        connection.close().await.unwrap();
+    }
+
     #[tokio::test]
     #[cfg_attr(
         target_os = "linux",
@@ -352,6 +424,9 @@ done
         })
         .await
         .unwrap();
+        // The retained reload target still exposes the fixture's raw tool
+        // names, and the router refuses colliding names, so the sibling
+        // exposes its echo under its own name.
         let mut sibling = fixture.config("sibling");
         sibling
             .tool_names
@@ -378,13 +453,22 @@ done
     async fn confined_mcp_cancelled_reap_retains_native_child_until_retry_completes() {
         let fixture = Fixture::new();
         let profile = fixture.profile();
-        let custody = StdioChildCustody::default();
+        // No grace, so the close escalates straight to its one direct kill.
+        let custody = StdioChildCustody::with_bounds(McpStdioCloseBounds::IMMEDIATE);
         let config = meerkat_core::mcp_config::McpStdioConfig {
             command: "/bin/sh".into(),
             args: vec!["-c".into(), "exec /bin/sleep 60".into()],
             env: HashMap::new(),
+            secret_env: std::collections::BTreeSet::new(),
         };
-        let pipes = custody.spawn(&config, &profile).await.unwrap();
+        let pipes = custody
+            .spawn(
+                &config,
+                &profile,
+                &mut crate::connection::PhysicalEntry::default(),
+            )
+            .await
+            .unwrap();
         let pid = custody.spawned_pid().await;
         let (entered, resume) = custody.pause_next_reap();
         let first = tokio::spawn({
@@ -395,12 +479,15 @@ done
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
         drop(resume);
-        let result = tokio::time::timeout(BOUND, custody.terminate()).await;
+        let result = tokio::time::timeout(BOUND, custody.terminate_or_join()).await;
         drop(pipes);
-        result
+        let receipt = result
             .expect("retained native child can be reaped")
-            .unwrap()
-            .unwrap();
+            .expect("the cancelled waiter leaves its receipt to be joined");
+        assert!(
+            matches!(receipt.leader, McpStdioLeaderOutcome::Reaped(_)),
+            "{receipt:?}"
+        );
         super::super::tests::assert_child_reaped(pid);
         assert_eq!(
             custody
@@ -408,7 +495,10 @@ done
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
-        assert!(custody.terminate().await.is_none());
+        assert_eq!(
+            custody.terminate().await.err(),
+            Some(CustodyNotHeld::ClosedElsewhere)
+        );
     }
 
     #[tokio::test]
@@ -436,6 +526,7 @@ done
                 None,
                 Some(custody.clone()),
                 &profile,
+                None,
             ),
         )
         .await
@@ -449,6 +540,9 @@ done
             .await
             .expect("failed handshake must have spawned a child before returning");
         super::super::tests::assert_child_reaped(pid);
-        assert!(custody.terminate().await.is_none());
+        assert_eq!(
+            custody.terminate().await.err(),
+            Some(CustodyNotHeld::ClosedElsewhere)
+        );
     }
 }

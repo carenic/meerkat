@@ -111,6 +111,7 @@ impl BuiltinTool for TaskCreateTool {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Builtin,
                 source_id: "builtin".into(),
+                artifact: None,
             }),
         }
     }

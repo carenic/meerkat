@@ -1,0 +1,293 @@
+//! The later effect of governed helper setup: the helper's child controller
+//! grant, issued from the independent parent of a [`ChildGrantIntent`] or
+//! recovered, under one non-waiting reservation of the grant publication.
+//!
+//! Every originating source (the source's own original, the originals it
+//! names and every further retained original) and the independent parent
+//! are checked currently against the actual setup operation inside that
+//! reservation; an earlier WorkGraph admission does not stand in for
+//! either. A recovered child (an earlier attempt landed) is returned only
+//! after the same current checks; a historical record alone is never
+//! permission.
+
+use std::sync::Arc;
+
+use meerkat_authorization::clock::LocalAuthorizationClock;
+use meerkat_authorization::grant_policy::GrantBackedWorkPolicy;
+use meerkat_authorization::grants::{
+    ChildGrantIntent, ChildGrantOutcome, ChildGrantRefusal, ChildGrantValidity, GrantRefusal,
+    LocalGrantAuthority,
+};
+use meerkat_authorization::work::{FurtherOriginals, RetainedOriginal};
+use meerkat_authorization_contracts::constraints::LifetimeBound;
+use meerkat_authorization_contracts::work_association::InputAuthorityAssociation;
+use meerkat_core::OperationAuthorizationError;
+use meerkat_core::authorization::{OperationRefusalKind, OperationRefused, PreparedOperationCheck};
+use meerkat_runtime::meerkat_machine::{
+    AuthenticatedOriginalSource, SourceOriginalBasis, original_operation_grant,
+    require_active_original,
+};
+
+use super::helper_admission::named_originals;
+
+/// Why governed helper child issuance has no usable child now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperChildIssuanceRefusal {
+    /// Not permitted now: the setup operation's current decision, an
+    /// originating source (cancelled, no longer retained, expired, or its
+    /// grant excludes the operation), the independent parent grant or the
+    /// requested bounds refuse it, or the intended id names another grant.
+    /// No child was appended.
+    Denied,
+    /// The owners cannot say now (contention, clock or custody). No child
+    /// was appended.
+    Unavailable,
+    /// Whether a child was appended is unknown: the grant owner's append
+    /// outcome was uncertain (the owner is then unavailable until restored),
+    /// or the dispatch's work owners ran and returned an outcome that is not
+    /// the grant owner's typed result, which cannot promise that nothing was
+    /// appended. Neither says an append started. Recover with the same
+    /// intent.
+    Uncertain,
+}
+
+/// One helper child issuance: for a setup operation the caller holds as a
+/// prepared check with the trusted native composition that prepared it
+/// ([`Self::new`]), or for a governed tool dispatch's own operation
+/// ([`Self::from_dispatch`]).
+pub struct GovernedHelperChildIssuance {
+    setup: Setup,
+    intent: ChildGrantIntent,
+}
+
+enum Setup {
+    Prepared(PreparedSetup),
+    /// The dispatch's own work owners check and issue under their own
+    /// reservation, with this dispatch's entered review custody.
+    Dispatch {
+        operation: meerkat_core::GovernedDispatchOperation,
+        further: FurtherOriginals,
+    },
+}
+
+struct PreparedSetup {
+    grants: Arc<LocalGrantAuthority>,
+    originals: Arc<dyn AuthenticatedOriginalSource>,
+    source: InputAuthorityAssociation,
+    complete_contributors: Arc<[RetainedOriginal]>,
+    setup_operation: PreparedOperationCheck,
+    operation_policy: Arc<GrantBackedWorkPolicy>,
+    clock: Arc<dyn LocalAuthorizationClock>,
+}
+
+impl GovernedHelperChildIssuance {
+    /// The issuance of `intent`. `source`, `complete_contributors`,
+    /// `setup_operation`, `operation_policy`, `grants`, `originals` and
+    /// `clock` are as for
+    /// [`GovernedHelperAdmissionFence::new`](super::helper_admission::GovernedHelperAdmissionFence::new);
+    /// `intent` is retained by the caller, with its stable id, before the
+    /// first attempt. The setup operation must be unreviewed (R1): a
+    /// prepared check carries no entered review custody.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        grants: Arc<LocalGrantAuthority>,
+        originals: Arc<dyn AuthenticatedOriginalSource>,
+        source: InputAuthorityAssociation,
+        complete_contributors: Arc<[RetainedOriginal]>,
+        setup_operation: PreparedOperationCheck,
+        operation_policy: Arc<GrantBackedWorkPolicy>,
+        clock: Arc<dyn LocalAuthorizationClock>,
+        intent: ChildGrantIntent,
+    ) -> Self {
+        Self {
+            setup: Setup::Prepared(PreparedSetup {
+                grants,
+                originals,
+                source,
+                complete_contributors,
+                setup_operation,
+                operation_policy,
+                clock,
+            }),
+            intent,
+        }
+    }
+
+    /// The issuance of `intent` from a governed tool dispatch: the setup
+    /// operation is the dispatch's own, matched against the actual borrowed
+    /// `call`, and it is checked and the child issued by that dispatch's own
+    /// work owners under their one reservation, with this dispatch's entered
+    /// review (R1, R2 or R3) custody. The caller supplies only the source
+    /// owner, the further retained originals and the intent.
+    ///
+    /// # Errors
+    /// An ungoverned or default context, or another call, refuses.
+    pub fn from_dispatch(
+        call: meerkat_core::ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+        originals: Arc<dyn AuthenticatedOriginalSource>,
+        complete_contributors: Arc<[RetainedOriginal]>,
+        intent: ChildGrantIntent,
+    ) -> Result<Self, HelperChildIssuanceRefusal> {
+        let operation = context
+            .governed_operation(call)
+            .map_err(|_| HelperChildIssuanceRefusal::Denied)?;
+        Ok(Self {
+            setup: Setup::Dispatch {
+                operation,
+                further: FurtherOriginals {
+                    originals: complete_contributors,
+                    source: Arc::new(SourceOriginalBasis::new(originals)),
+                },
+            },
+            intent,
+        })
+    }
+
+    /// The intent this issuance serves.
+    pub fn intent(&self) -> &ChildGrantIntent {
+        &self.intent
+    }
+
+    /// Issue or recover the intended child now.
+    ///
+    /// # Errors
+    /// See [`HelperChildIssuanceRefusal`].
+    pub fn issue_or_recover(&self) -> Result<ChildGrantOutcome, HelperChildIssuanceRefusal> {
+        let prepared = match &self.setup {
+            Setup::Prepared(prepared) => prepared,
+            Setup::Dispatch { operation, further } => {
+                return match operation.issue_child_if_current_within(further, &self.intent) {
+                    // The work owner's exact per-call outcome. Once the call
+                    // ran, an outcome that is not the grant owner's typed
+                    // result cannot promise that nothing was appended.
+                    Ok(boxed) => boxed
+                        .downcast::<Result<ChildGrantOutcome, ChildGrantRefusal>>()
+                        .map_or(Err(HelperChildIssuanceRefusal::Uncertain), |outcome| {
+                            (*outcome).map_err(child_refusal)
+                        }),
+                    Err(meerkat_core::ToolError::AuthorizationRefused { .. }) => {
+                        Err(HelperChildIssuanceRefusal::Denied)
+                    }
+                    Err(_) => Err(HelperChildIssuanceRefusal::Unavailable),
+                };
+            }
+        };
+        prepared
+            .grants
+            .issue_or_recover_child_under_exclusion(&self.intent, || {
+                prepared.originating().map_err(|error| match error {
+                    OperationAuthorizationError::Refused(_) => GrantRefusal::Denied,
+                    OperationAuthorizationError::Unavailable
+                    | OperationAuthorizationError::ObservationUnavailable(_) => {
+                        GrantRefusal::Unavailable
+                    }
+                })
+            })
+            .map_err(child_refusal)
+    }
+
+    /// The prepared path's conjunct ([`PreparedSetup::originating`]); a
+    /// dispatch is checked by its own work owners instead.
+    #[cfg(test)]
+    pub(crate) fn originating(&self) -> Result<ChildGrantValidity, OperationAuthorizationError> {
+        match &self.setup {
+            Setup::Prepared(prepared) => prepared.originating(),
+            Setup::Dispatch { .. } => Err(OperationAuthorizationError::Unavailable),
+        }
+    }
+}
+
+fn child_refusal(refusal: ChildGrantRefusal) -> HelperChildIssuanceRefusal {
+    match refusal {
+        ChildGrantRefusal::Denied => HelperChildIssuanceRefusal::Denied,
+        ChildGrantRefusal::Unavailable => HelperChildIssuanceRefusal::Unavailable,
+        ChildGrantRefusal::Uncertain => HelperChildIssuanceRefusal::Uncertain,
+    }
+}
+
+impl PreparedSetup {
+    /// The setup operation is currently permitted for the source and every
+    /// originating original, and the window in which that holds: the exact
+    /// window the native decision permitting the setup was compiled with
+    /// (every association's ceiling and policy, its monotonic cutoff
+    /// included), conjoined with the current allowance under every
+    /// originating grant. Runs inside the reservation, before the
+    /// grant-state mutex.
+    ///
+    /// A prepared check carries no entered review custody: only an
+    /// unreviewed (R1) decision issues here. An R2 or R3 setup operation
+    /// refuses until its actual entered review is carried.
+    fn originating(&self) -> Result<ChildGrantValidity, OperationAuthorizationError> {
+        let denied = || {
+            OperationAuthorizationError::from(OperationRefused::new(OperationRefusalKind::Denied))
+        };
+        let check = self.setup_operation.current()?;
+        check.require_unreviewed_entry().map_err(|_| denied())?;
+        // A decision whose owner does not state its window cannot bound the
+        // later effect.
+        let decision = check
+            .validity()
+            .ok_or(OperationAuthorizationError::Unavailable)?;
+        let now = self
+            .clock
+            .now()
+            .map_err(|_| OperationAuthorizationError::Unavailable)?;
+        let claims = self.source.candidate();
+        // The source's own original: its mandate is the association's own,
+        // so only its disposition is read.
+        require_active_original(
+            self.originals.as_ref(),
+            &claims.ingress_namespace,
+            &claims.original_work,
+        )?;
+        let mut further = Vec::new();
+        for retained in named_originals(&self.source, &self.complete_contributors) {
+            if let Some(grant) = original_operation_grant(
+                &self.grants,
+                self.originals.as_ref(),
+                &retained.namespace,
+                &retained.original,
+                check.binding(),
+                &claims.logical_executor,
+                claims.represented_subject.as_ref(),
+            )? {
+                further.push(grant);
+            }
+        }
+        let allowance = self.operation_policy.evaluate_operation_within(
+            &self.source,
+            check.binding(),
+            further.iter(),
+            now.unix_ms,
+        )?;
+        // The current allowance's complete lifetime: its expiry and the
+        // window its restrictions (every originating grant conjoined) bound.
+        let (allowance_not_before_ms, allowance_expires_at_ms) =
+            match allowance.restrictions.lifetime.bound() {
+                LifetimeBound::Unrestricted => (0, allowance.expires_at_ms),
+                LifetimeBound::Window {
+                    not_before_ms,
+                    expires_at_ms,
+                } => (not_before_ms, expires_at_ms.min(allowance.expires_at_ms)),
+                LifetimeBound::Empty => return Err(denied()),
+            };
+        let remaining_ms = allowance_expires_at_ms
+            .checked_sub(now.unix_ms)
+            .filter(|ms| *ms > 0)
+            .ok_or_else(denied)?;
+        let further_deadline = now
+            .monotonic
+            .checked_add(std::time::Duration::from_millis(remaining_ms))
+            .ok_or_else(denied)?;
+        let validity = ChildGrantValidity {
+            not_before_ms: decision.not_before_ms.max(allowance_not_before_ms),
+            expires_at_ms: decision.expires_at_ms.min(allowance_expires_at_ms),
+            deadline: decision.deadline.min(further_deadline),
+        };
+        if validity.not_before_ms >= validity.expires_at_ms {
+            return Err(denied());
+        }
+        Ok(validity)
+    }
+}

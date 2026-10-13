@@ -1642,6 +1642,79 @@ pub trait CoreExecutorPublicationHandle: Send + Sync {
         &self,
         events: &[AgentEvent],
     ) -> Result<Vec<CoreInteractionTerminalPublicationReceipt>, CoreExecutorError>;
+
+    /// The exact live session actor this capability publishes for, when it
+    /// is bound to one. The machine retains one capability per executor
+    /// attachment and replaces it only under that attachment's mutation
+    /// fence, so this names the actor the attachment serves. The default
+    /// binds none, and nothing that requires the binding accepts it.
+    fn actor_identity(&self) -> Option<CoreExecutorActorIdentity> {
+        None
+    }
+
+    /// The stable turn-finalization boundary (B) of this capability's
+    /// session: the owner's same endpoint the runtime loop holds across each
+    /// turn. The default has none.
+    fn turn_finalization_boundary(
+        &self,
+    ) -> Option<Arc<dyn CoreExecutorTurnFinalizationBoundaryHandle>> {
+        None
+    }
+
+    /// The controller client this capability's exact actor actually
+    /// selected, pinned while the caller holds the boundary of
+    /// [`Self::turn_finalization_boundary`]: a command to that actor, which
+    /// never reacquires the boundary. A replaced or retired actor is an
+    /// error, never its successor's pin. The default pins nothing.
+    async fn pin_actor_controller_under_turn_boundary(
+        &self,
+    ) -> Result<crate::ControllerModelClient, CoreExecutorError> {
+        Err(CoreExecutorError::control_failed_runtime(
+            "executor surface cannot pin its actor's controller under the turn boundary",
+        ))
+    }
+}
+
+/// One live session actor incarnation, as the session service that owns it
+/// reports it to executor attachments. Only that service implements it.
+#[doc(hidden)]
+pub trait CoreExecutorActorIncarnation: Send + Sync {
+    /// Whether the owning service has not revoked this incarnation.
+    fn is_live(&self) -> bool;
+}
+
+/// The exact live session actor an executor attachment's publication
+/// capability is bound to.
+///
+/// Opaque: it compares by identity only and carries no session data. The
+/// owning session service mints it from its own actor incarnation, never from
+/// a session id. It is not authority by itself.
+#[derive(Clone)]
+pub struct CoreExecutorActorIdentity(Arc<dyn CoreExecutorActorIncarnation>);
+
+impl CoreExecutorActorIdentity {
+    /// For the actor's owning session service only.
+    #[doc(hidden)]
+    pub fn new(incarnation: Arc<dyn CoreExecutorActorIncarnation>) -> Self {
+        Self(incarnation)
+    }
+
+    /// Whether both name the same actor incarnation.
+    pub fn is_same_actor(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Whether the owning service has not revoked that incarnation.
+    pub fn is_live(&self) -> bool {
+        self.0.is_live()
+    }
+}
+
+impl std::fmt::Debug for CoreExecutorActorIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoreExecutorActorIdentity")
+            .finish_non_exhaustive()
+    }
 }
 
 /// Registration-time declaration for durability-reload cleanup semantics.

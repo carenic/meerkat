@@ -300,7 +300,8 @@ async fn fallback_process_child() {
     .unwrap();
     let factory = AgentFactory::new(root.join("sessions")).builtins(false);
     let builder = FactoryAgentBuilder::new(factory, config);
-    let (service, runtime) = build_runtime_backed_service(builder, 4, persistence);
+    let (service, runtime) = build_runtime_backed_service(builder, 4, persistence)
+        .expect("compose the runtime-backed service");
     let service = Arc::new(service);
     let session = if phase == "write" {
         Session::new()

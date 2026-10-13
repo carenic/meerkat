@@ -180,7 +180,8 @@ mod tests {
         config.shell.security_mode = meerkat_core::types::SecurityMode::Unrestricted;
         let mut builder = FactoryAgentBuilder::new(factory, config);
         builder.default_llm_client = Some(client);
-        let (service, adapter) = build_runtime_backed_service(builder, 4, persistence);
+        let (service, adapter) = build_runtime_backed_service(builder, 4, persistence)
+            .expect("compose the runtime-backed service");
         (Arc::new(service), adapter)
     }
 
@@ -574,9 +575,24 @@ mod tests {
         let (session_id, input_id) = crash_gateway_mid_tool(root).await;
 
         // Next incarnation: the scripted model would call the tool again if
-        // the interrupted input were replayed.
+        // the interrupted input were replayed. Settling the interrupted run
+        // abandons its recovered input without a run, which the runtime tells
+        // its host once.
         let client = Arc::new(ScriptedShellClient::new(tool_command(root)));
-        let (service, adapter) = recover(root, Arc::clone(&client), &session_id).await;
+        let (service, adapter) = build_service(root, Arc::clone(&client)).await;
+        let runless_terminal_tells = Arc::new(AtomicUsize::new(0));
+        adapter.set_runless_input_terminal_hint(Arc::new({
+            let tells = Arc::clone(&runless_terminal_tells);
+            move || {
+                tells.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        let resume = service
+            .load_authoritative_session(&session_id)
+            .await
+            .expect("load after restart")
+            .expect("session survives the gateway");
+        materialize(&service, &adapter, resume).await;
 
         // An idle session gets the notice at attach, without queued input
         // and without a model call: the notice is not a turn of its own.
@@ -632,6 +648,11 @@ mod tests {
             abandoned.seed.last_run_id.as_ref(),
             Some(&interrupted_run),
             "no later run consumed the interrupted input"
+        );
+        assert_eq!(
+            runless_terminal_tells.load(Ordering::SeqCst),
+            1,
+            "settling the interrupted run tells the host once"
         );
     }
 

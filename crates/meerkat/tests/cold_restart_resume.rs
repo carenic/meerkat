@@ -138,7 +138,8 @@ mod tests {
         builder.default_llm_client = Some(Arc::new(TestClient::for_provider(
             meerkat_core::Provider::OpenAI,
         )));
-        let (service, adapter) = build_runtime_backed_service(builder, 4, persistence);
+        let (service, adapter) = build_runtime_backed_service(builder, 4, persistence)
+            .expect("compose the runtime-backed service");
         (Arc::new(service), adapter)
     }
 
@@ -247,7 +248,8 @@ mod tests {
             builder.default_llm_client = Some(Arc::new(TestClient::for_provider(
                 meerkat_core::Provider::OpenAI,
             )));
-            let (service, adapter) = build_runtime_backed_service(builder, 4, persistence);
+            let (service, adapter) = build_runtime_backed_service(builder, 4, persistence)
+                .expect("compose the runtime-backed service");
             let (service, adapter) = (Arc::new(service), adapter);
 
             let session = Session::new();

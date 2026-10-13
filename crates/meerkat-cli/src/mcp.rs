@@ -137,6 +137,9 @@ pub struct AddServerRequest {
     pub oauth_account: Option<String>,
     pub command: Vec<String>,
     pub env: Vec<String>,
+    /// The only raw operations the server may be called with; empty leaves
+    /// it unrestricted.
+    pub allowed_operations: Vec<String>,
     pub project_scope: bool,
 }
 
@@ -158,6 +161,12 @@ fn server_from_request(request: AddServerRequest) -> anyhow::Result<McpServerCon
         };
         http.oauth_account = Some(account);
         meerkat_auth_core::McpServerIdentity::from_config(&server)?;
+    }
+    if !request.allowed_operations.is_empty() {
+        server.access = Some(meerkat_core::McpServerAccess::allowing(
+            request.allowed_operations,
+        ));
+        server.validate_access()?;
     }
     Ok(server)
 }
@@ -597,6 +606,7 @@ mod tests {
                     oauth_account: Some(account.into()),
                     command: Vec::new(),
                     env: Vec::new(),
+                    allowed_operations: Vec::new(),
                     project_scope: false,
                 },
                 None,
@@ -633,6 +643,7 @@ mod tests {
                 oauth_account: None,
                 command: vec!["echo".to_string(), "hello".to_string()],
                 env: Vec::new(),
+                allowed_operations: Vec::new(),
                 project_scope: false,
             },
             Some(&context_root),
@@ -690,6 +701,7 @@ mod tests {
                 oauth_account: None,
                 command: vec!["realm-tools".to_string(), "--stdio".to_string()],
                 env: Vec::new(),
+                allowed_operations: Vec::new(),
                 project_scope: false,
             },
             &realm,
@@ -769,6 +781,7 @@ future_server_key = "preserve-too"
                 oauth_account: None,
                 command: vec!["echo".to_string()],
                 env: Vec::new(),
+                allowed_operations: Vec::new(),
                 project_scope: false,
             },
             Some(&context_root),

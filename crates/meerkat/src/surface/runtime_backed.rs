@@ -36,6 +36,19 @@ use meerkat_store::MemoryBlobStore;
 
 const DEFAULT_RUNTIME_BACKED_ARCHIVED_HISTORY_CAPACITY: usize = 1024;
 
+/// A runtime-backed composition that could not be built. Nothing was
+/// exposed, and the runtime keeps the registrations and owner-loss
+/// settlement it already had.
+#[cfg(feature = "session-store")]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RuntimeBackedCompositionError {
+    /// The factory routes R3 to human consent, and the runtime refused that
+    /// consent's issuing approval owner as its owner-loss settlement.
+    #[error("the factory's issuing consent owner cannot be installed on this runtime: {0}")]
+    ConsentOwnerRefused(#[from] meerkat_runtime::ConsentOwnerLossInstallRefused),
+}
+
 /// Exact actor-recovery callback invoked while the prepared executor
 /// attachment still owns its mutation fence. The callback may advance only
 /// executor-local publication authority bound to `attachment_witness` and
@@ -66,10 +79,13 @@ pub fn build_runtime_backed_service(
     builder: FactoryAgentBuilder,
     max_sessions: usize,
     persistence: crate::PersistenceBundle,
-) -> (
-    PersistentSessionService<FactoryAgentBuilder>,
-    Arc<MeerkatMachine>,
-) {
+) -> Result<
+    (
+        PersistentSessionService<FactoryAgentBuilder>,
+        Arc<MeerkatMachine>,
+    ),
+    RuntimeBackedCompositionError,
+> {
     build_runtime_backed_service_with_capacities(
         builder,
         max_sessions,
@@ -99,10 +115,13 @@ pub fn build_runtime_backed_service_with_default_reconfigure_host(
     max_sessions: usize,
     persistence: crate::PersistenceBundle,
     config_state_path: std::path::PathBuf,
-) -> (
-    Arc<PersistentSessionService<FactoryAgentBuilder>>,
-    Arc<MeerkatMachine>,
-) {
+) -> Result<
+    (
+        Arc<PersistentSessionService<FactoryAgentBuilder>>,
+        Arc<MeerkatMachine>,
+    ),
+    RuntimeBackedCompositionError,
+> {
     build_runtime_backed_service_with_capacities_and_default_reconfigure_host(
         builder,
         max_sessions,
@@ -121,10 +140,13 @@ pub fn build_runtime_backed_service_with_capacities_and_default_reconfigure_host
     archived_history_capacity: usize,
     persistence: crate::PersistenceBundle,
     config_state_path: std::path::PathBuf,
-) -> (
-    Arc<PersistentSessionService<FactoryAgentBuilder>>,
-    Arc<MeerkatMachine>,
-) {
+) -> Result<
+    (
+        Arc<PersistentSessionService<FactoryAgentBuilder>>,
+        Arc<MeerkatMachine>,
+    ),
+    RuntimeBackedCompositionError,
+> {
     // Captured BEFORE the builder moves into the service: the blueprint needs
     // the builder's factory, config store, and late-bound client/realm slots.
     //
@@ -155,7 +177,7 @@ pub fn build_runtime_backed_service_with_capacities_and_default_reconfigure_host
         active_session_capacity,
         archived_history_capacity,
         persistence,
-    );
+    )?;
     let service = Arc::new(service);
     // Every surface built through this composition applies durable job
     // deliveries; a surface that silently does not is a defect, not a mode.
@@ -174,7 +196,7 @@ pub fn build_runtime_backed_service_with_capacities_and_default_reconfigure_host
                 dyn crate::session_runtime::llm_reconfigure::SessionRuntimeLlmReconfigureService,
             >,
     );
-    (service, adapter)
+    Ok((service, adapter))
 }
 
 /// Runtime-backed sessions get interactive MCP auth by default: once the
@@ -182,14 +204,91 @@ pub fn build_runtime_backed_service_with_capacities_and_default_reconfigure_host
 /// source becomes the native authority bound to it and to the factory's
 /// provider-auth persistence. A host-supplied resolver wins; a factory
 /// without persistence gets none.
+///
+/// Whichever credential source results serves the realm service secrets of
+/// the builder's stdio servers ([`crate::RealmMcpServiceSecrets`]): the
+/// realms whose own documents define them, in the provider-auth
+/// persistence's credential store. A host-supplied resolver keeps every
+/// answer of its own, its own service-secret custody included.
 #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
 pub(crate) fn install_default_mcp_auth_resolver(
     builder: FactoryAgentBuilder,
     runtime_adapter: &Arc<MeerkatMachine>,
+    realm: Option<meerkat_core::RealmId>,
 ) -> FactoryAgentBuilder {
-    if builder.factory().has_mcp_auth_resolver() {
-        return builder;
-    }
+    install_mcp_auth_resolver_with_custody(
+        builder,
+        runtime_adapter,
+        realm,
+        |builder, token_store| {
+            Some(crate::RealmMcpServiceSecrets::from_effective_config_view(
+                builder.effective_config_view(),
+                token_store,
+            ))
+        },
+    )
+}
+
+/// [`install_default_mcp_auth_resolver`] for a host's builder whose sessions
+/// run in `storage`'s realm but whose configuration is a snapshot, without
+/// the head config store and realm inheritance that let the builder name a
+/// server's defining realm (such a builder's own custody answers every
+/// declared service secret with
+/// [`McpServiceSecretRefusal::NoOwner`](meerkat_core::auth::McpServiceSecretRefusal::NoOwner)).
+///
+/// The credential source is the same: a host-supplied resolver wins, else
+/// the default one bound to the runtime's AuthMachine owner and the
+/// factory's own provider-auth persistence, resolving `storage`'s realm's
+/// MCP credentials; a factory without persistence gets none. Its service
+/// secrets are those of the realm documents of `storage`, by the same
+/// realm-to-document projection the realm owner's writes
+/// ([`crate::set_mcp_service_secret`]) check, so a launch reads exactly the
+/// value stored for the definition its realm's own document currently
+/// lists, in the persistence's credential store. A realm whose own document
+/// has no location (the reserved `global` realm without a user-global
+/// document) serves none.
+#[cfg(all(
+    feature = "mcp",
+    feature = "local-authorization",
+    not(target_arch = "wasm32")
+))]
+pub fn install_default_mcp_auth_resolver_for_realm(
+    builder: FactoryAgentBuilder,
+    runtime_adapter: &Arc<MeerkatMachine>,
+    storage: &meerkat_core::storage_layout::ResolvedStorage,
+) -> FactoryAgentBuilder {
+    let realm = storage.locator.realm.clone();
+    let source = crate::governed_realm::stock::issuance::realm_config_source(storage);
+    install_mcp_auth_resolver_with_custody(
+        builder,
+        runtime_adapter,
+        Some(realm.clone()),
+        move |_, token_store| {
+            source.map(|source| {
+                crate::RealmMcpServiceSecrets::from_realm_source(
+                    Arc::new(source),
+                    realm,
+                    token_store,
+                )
+            })
+        },
+    )
+}
+
+/// The default MCP credential source and connector owner of
+/// [`install_default_mcp_auth_resolver`], serving the realm service secrets
+/// `custody` builds over the provider-auth persistence's credential store
+/// (none when it builds none).
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+fn install_mcp_auth_resolver_with_custody(
+    builder: FactoryAgentBuilder,
+    runtime_adapter: &Arc<MeerkatMachine>,
+    realm: Option<meerkat_core::RealmId>,
+    custody: impl FnOnce(
+        &FactoryAgentBuilder,
+        Arc<dyn meerkat_core::auth::TokenStore>,
+    ) -> Option<crate::RealmMcpServiceSecrets>,
+) -> FactoryAgentBuilder {
     let persistence = match builder.factory().resolution_provider_auth_persistence() {
         Ok(persistence) => persistence,
         Err(error) => {
@@ -200,26 +299,90 @@ pub(crate) fn install_default_mcp_auth_resolver(
             None
         }
     };
-    match crate::default_mcp_auth_resolver(
-        persistence,
-        runtime_adapter.provider_auth_runtime_authority(),
-    ) {
-        Some(resolver) => builder.with_mcp_auth_resolver(resolver),
-        None => builder,
+    let mut builder = builder;
+    if !builder.factory().has_connector_oauth_authority()
+        && let Some(persistence) = persistence.clone()
+    {
+        // The same connector owner `auth/login` connector calls use, so a
+        // runtime-backed build's connector-bound servers get its credentials.
+        // The connector clients are read from the realm's effective config
+        // at each login and refresh, so ones configured later still apply.
+        let view = builder.effective_config_view();
+        let fallback_realm = realm.clone();
+        let clients = crate::RealmConnectorClients::from_effective_config(move || {
+            let view = view.clone();
+            let fallback_realm = fallback_realm.clone();
+            Box::pin(async move {
+                let (config, head) = view.read().await.map_err(|error| error.to_string())?;
+                Ok(head.or(fallback_realm).map(|realm| (config, realm)))
+            })
+        });
+        match crate::HostAuthService::new(
+            persistence,
+            runtime_adapter.provider_auth_runtime_authority(),
+        )
+        .with_connector_client_source(Arc::new(clients))
+        .connector_oauth_authority()
+        {
+            Ok(authority) => builder = builder.with_connector_oauth_authority(authority),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "connector credential owner unavailable; connector-bound MCP servers get no credential"
+            ),
+        }
     }
+    let resolver = match builder.factory().installed_mcp_auth_resolver() {
+        Some(host) => Some(host),
+        None => {
+            // A realm's sessions resolve only that realm's MCP credentials.
+            let authority = runtime_adapter.provider_auth_runtime_authority();
+            match realm {
+                Some(realm) => {
+                    crate::default_mcp_auth_resolver_in_realm(persistence.clone(), authority, realm)
+                }
+                None => crate::default_mcp_auth_resolver(persistence.clone(), authority),
+            }
+        }
+    };
+    let Some(resolver) = resolver else {
+        return builder;
+    };
+    let resolver =
+        match persistence.and_then(|persistence| custody(&builder, persistence.token_store())) {
+            Some(custody) => custody.serve_for(resolver),
+            None => resolver,
+        };
+    builder.with_mcp_auth_resolver(resolver)
 }
 
+/// The runtime-backed composition every builder above shares.
+///
+/// When the factory routes R3 to human consent, the approval owner that
+/// issues that consent becomes the runtime's owner-loss settlement first,
+/// before anything else touches the runtime. A runtime that already has a
+/// registration or another settlement refuses it, and the composition fails
+/// with nothing exposed and the runtime unchanged. A factory without a human
+/// consent route installs nothing.
 #[cfg(feature = "session-store")]
 pub fn build_runtime_backed_service_with_capacities(
     mut builder: FactoryAgentBuilder,
     active_session_capacity: usize,
     archived_history_capacity: usize,
     persistence: crate::PersistenceBundle,
-) -> (
-    PersistentSessionService<FactoryAgentBuilder>,
-    Arc<MeerkatMachine>,
-) {
+) -> Result<
+    (
+        PersistentSessionService<FactoryAgentBuilder>,
+        Arc<MeerkatMachine>,
+    ),
+    RuntimeBackedCompositionError,
+> {
     let runtime_adapter = persistence.runtime_adapter();
+    // Consent owner loss: the approval owner that issues the factory's R3
+    // human consent settles what a lost runtime owner left in a session's
+    // scope before each registration that owes it publishes.
+    if let Some(settlement) = builder.factory().consent_owner_loss_settlement() {
+        runtime_adapter.install_consent_owner_loss_settlement(settlement)?;
+    }
     // Every attachment of a recovered session settles the session's
     // earlier-incarnation tool processes before it serves, whichever surface
     // attaches it and whether or not an agent was built first.
@@ -243,7 +406,8 @@ pub fn build_runtime_backed_service_with_capacities(
     builder = builder.with_image_generation_machine(runtime_adapter.clone());
     #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
     {
-        builder = install_default_mcp_auth_resolver(builder, &runtime_adapter);
+        builder =
+            install_default_mcp_auth_resolver(builder, &runtime_adapter, default_realm_id.clone());
     }
     builder.default_session_store = Some(Arc::new(meerkat_store::StoreAdapter::new(Arc::clone(
         &store,
@@ -279,7 +443,7 @@ pub fn build_runtime_backed_service_with_capacities(
     if let Some((event_store, projector)) = event_projection {
         service = service.with_event_projection(event_store, projector);
     }
-    (service, runtime_adapter)
+    Ok((service, runtime_adapter))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1430,7 +1594,7 @@ pub fn default_persistent_executor<B: SessionAgentBuilder + 'static>(
 
 /// Compile-time guard that the runtime-backed executor + schedule-host layer
 /// stay generic over the session-agent builder `B` (not re-pinned to a concrete
-/// `FactoryAgentBuilder`). Embedders with a custom builder — e.g. mobkit's
+/// `FactoryAgentBuilder`). Embedders with a custom builder — e.g. meta's
 /// callback builder that materializes/resumes sessions through their host SDK —
 /// must be able to drive runtime-backed sessions and scheduled firing through
 /// their own build path. If these are ever re-pinned to a concrete builder this
@@ -1538,6 +1702,32 @@ enum PersistentRuntimePublicationActor {
 }
 
 impl PersistentRuntimePublicationActor {
+    /// The session of the bound actor.
+    fn session_id(&self) -> &SessionId {
+        match self {
+            Self::Witness(witness) => witness.session_id(),
+            Self::Slot {
+                expected_session_id,
+                ..
+            } => expected_session_id,
+        }
+    }
+
+    /// The bound actor's identity: the witness, or the slot's once the service
+    /// published it for this session. Resolves and formats nothing.
+    fn actor_identity(&self) -> Option<meerkat_core::lifecycle::CoreExecutorActorIdentity> {
+        match self {
+            Self::Witness(witness) => Some(witness.executor_actor_identity()),
+            Self::Slot {
+                expected_session_id,
+                slot,
+            } => slot
+                .witness()
+                .filter(|witness| witness.session_id() == expected_session_id)
+                .map(|witness| witness.executor_actor_identity()),
+        }
+    }
+
     fn witness(&self) -> Result<crate::LiveSessionActorWitness, CoreExecutorError> {
         match self {
             Self::Witness(witness) => Ok(witness.clone()),
@@ -1883,6 +2073,31 @@ impl<B: SessionAgentBuilder + 'static> CoreExecutorPublicationHandle
         let witness = self.actor.witness()?;
         self.service
             .publish_interaction_terminals_exact_batch_for_actor(&witness, events)
+            .await
+            .map_err(CoreExecutorError::apply_failed_from_session_error)
+    }
+
+    fn actor_identity(&self) -> Option<meerkat_core::lifecycle::CoreExecutorActorIdentity> {
+        self.actor.actor_identity()
+    }
+
+    /// The service's own boundary of this actor's session, the endpoint the
+    /// persistent executor's runtime loop holds across each turn.
+    fn turn_finalization_boundary(
+        &self,
+    ) -> Option<Arc<dyn CoreExecutorTurnFinalizationBoundaryHandle>> {
+        Some(Arc::new(PersistentRuntimeTurnFinalizationBoundaryHandle {
+            service: Arc::clone(&self.service),
+            session_id: self.actor.session_id().clone(),
+        }))
+    }
+
+    async fn pin_actor_controller_under_turn_boundary(
+        &self,
+    ) -> Result<meerkat_core::ControllerModelClient, CoreExecutorError> {
+        let witness = self.actor.witness()?;
+        self.service
+            .pin_controller_client_for_actor_under_runtime_turn_boundary(&witness)
             .await
             .map_err(CoreExecutorError::apply_failed_from_session_error)
     }
@@ -2596,7 +2811,8 @@ mod tests {
         let factory = crate::AgentFactory::new(temp.path().join("sessions"));
         let mut builder = FactoryAgentBuilder::new(factory, crate::Config::default());
         builder.default_llm_client = Some(llm_client);
-        let (service, runtime_adapter) = build_runtime_backed_service(builder, 4, persistence);
+        let (service, runtime_adapter) = build_runtime_backed_service(builder, 4, persistence)
+            .expect("compose the runtime-backed service");
         (Arc::new(service), runtime_adapter)
     }
 
@@ -2616,7 +2832,8 @@ mod tests {
             meerkat_core::Provider::OpenAI,
         )));
         let (service, runtime_adapter) =
-            build_runtime_backed_service(builder, active_session_capacity, persistence);
+            build_runtime_backed_service(builder, active_session_capacity, persistence)
+                .expect("compose the runtime-backed service");
         (Arc::new(service), runtime_adapter)
     }
 
@@ -2646,7 +2863,8 @@ mod tests {
         builder.default_llm_client = Some(Arc::new(TestClient::for_provider(
             meerkat_core::Provider::OpenAI,
         )));
-        let (service, runtime_adapter) = build_runtime_backed_service(builder, 4, persistence);
+        let (service, runtime_adapter) = build_runtime_backed_service(builder, 4, persistence)
+            .expect("compose the runtime-backed service");
         (Arc::new(service), runtime_adapter)
     }
 
@@ -2738,7 +2956,8 @@ mod tests {
             *captured.lock().expect("capture lock") = Some(Arc::clone(&client));
             client
         }));
-        let (service, adapter) = build_runtime_backed_service(builder, 4, persistence);
+        let (service, adapter) = build_runtime_backed_service(builder, 4, persistence)
+            .expect("compose the runtime-backed service");
         (Arc::new(service), adapter)
     }
 
@@ -3170,11 +3389,268 @@ mod tests {
         let mut builder = FactoryAgentBuilder::new(factory, crate::Config::default());
         builder.default_llm_client = Some(Arc::new(TestClient::default()));
 
-        let (service, _runtime_adapter) = build_runtime_backed_service(builder, 4, persistence);
+        let (service, _runtime_adapter) = build_runtime_backed_service(builder, 4, persistence)
+            .expect("compose the runtime-backed service");
 
         assert!(
             service.has_event_projection(),
             "runtime-backed service must install the realm event projection bridge"
+        );
+    }
+
+    struct NoReviewer;
+
+    #[async_trait::async_trait]
+    impl meerkat_core::approval::review::OperationReviewer for NoReviewer {
+        async fn review(
+            &self,
+            _candidate: &meerkat_core::approval::review::ReviewCandidate<'_>,
+        ) -> Result<
+            meerkat_core::approval::review::ReviewVerdict,
+            meerkat_core::approval::review::ReviewerFailure,
+        > {
+            Err(meerkat_core::approval::review::ReviewerFailure::Unavailable)
+        }
+    }
+
+    struct NoConsentRoute;
+
+    impl meerkat_core::approval::consent::HumanConsentRoute for NoConsentRoute {
+        fn present(
+            &self,
+            _candidate: &meerkat_core::approval::consent::ConsentPresentationCandidate<'_>,
+        ) -> Result<
+            meerkat_core::approval::consent::ConsentPresentation,
+            meerkat_core::approval::consent::ConsentRouteUnavailable,
+        > {
+            Err(meerkat_core::approval::consent::ConsentRouteUnavailable)
+        }
+
+        fn eligibility(
+            &self,
+            _approver: &meerkat_core::approval::consent::AuthenticatedApprover,
+            _approval: &meerkat_core::ApprovalRecord,
+        ) -> Result<
+            Arc<dyn meerkat_core::approval::consent::ConsentEligibility>,
+            meerkat_core::approval::consent::ConsentIneligible,
+        > {
+            Err(meerkat_core::approval::consent::ConsentIneligible)
+        }
+
+        fn notice(&self, _notice: meerkat_core::approval::consent::ConsentNotice) {}
+    }
+
+    /// Operation review through `approvals`, with R3 routed to human
+    /// consent when `routed`.
+    fn operation_review(
+        approvals: meerkat_core::ApprovalService,
+        routed: bool,
+    ) -> Arc<meerkat_core::approval::review::BoundOperationReview> {
+        let review = meerkat_core::approval::review::BoundOperationReview::new(
+            Arc::new(NoReviewer),
+            approvals,
+            Duration::from_secs(30),
+        );
+        Arc::new(if routed {
+            review.with_human_consent(Arc::new(NoConsentRoute), Duration::from_secs(60))
+        } else {
+            review
+        })
+    }
+
+    /// The runtime of a runtime-backed composition over a sqlite realm under
+    /// `temp`, whose factory carries `review`.
+    /// The persistence of a sqlite realm under `temp`.
+    async fn consent_realm_persistence(temp: &TempDir) -> crate::PersistenceBundle {
+        let (_manifest, persistence) = crate::open_realm_persistence_in(
+            temp.path(),
+            "consent-realm",
+            Some(meerkat_store::RealmBackend::Sqlite),
+            Some(meerkat_store::RealmOrigin::Explicit),
+        )
+        .await
+        .expect("open realm persistence");
+        persistence
+    }
+
+    /// The runtime of a runtime-backed composition over `persistence`, whose
+    /// factory carries `review`.
+    fn compose_with_review(
+        temp: &TempDir,
+        persistence: crate::PersistenceBundle,
+        review: Arc<meerkat_core::approval::review::BoundOperationReview>,
+    ) -> Result<Arc<MeerkatMachine>, RuntimeBackedCompositionError> {
+        let factory =
+            crate::AgentFactory::new(temp.path().join("sessions")).with_operation_review(review);
+        let mut builder = FactoryAgentBuilder::new(factory, crate::Config::default());
+        builder.default_llm_client = Some(Arc::new(TestClient::default()));
+        build_runtime_backed_service(builder, 4, persistence)
+            .map(|(_service, runtime_adapter)| runtime_adapter)
+    }
+
+    /// The runtime of a runtime-backed composition over a fresh sqlite realm
+    /// under `temp`, whose factory carries `review`.
+    async fn runtime_composed_with(
+        temp: &TempDir,
+        review: Arc<meerkat_core::approval::review::BoundOperationReview>,
+    ) -> Arc<MeerkatMachine> {
+        compose_with_review(temp, consent_realm_persistence(temp).await, review)
+            .expect("compose the runtime-backed service")
+    }
+
+    /// Consent owner loss (3): the runtime-backed composition installs the
+    /// approval owner that issues the factory's R3 human consent as its
+    /// runtime's owner-loss settlement, and it is that very owner: while it
+    /// is unavailable, a registration whose claim lineage owes a settlement
+    /// is refused and nothing is published; while it is available, the
+    /// registration settles and records its settlement. Without a human
+    /// consent route nothing is installed, and nothing is recorded as
+    /// settled.
+    #[tokio::test]
+    async fn build_runtime_backed_service_installs_the_issuing_consent_owner() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let adapter = runtime_composed_with(
+            &temp,
+            operation_review(
+                meerkat_core::ApprovalService::unavailable("the issuing consent owner is down"),
+                true,
+            ),
+        )
+        .await;
+        assert!(adapter.has_consent_owner_loss_settlement());
+        let session_id = SessionId::new();
+        let refused = adapter
+            .register_session(session_id.clone())
+            .await
+            .expect_err("an unavailable issuing owner settles nothing");
+        assert!(
+            matches!(
+                &refused,
+                meerkat_runtime::RuntimeControlPlaneError::ConsentOwnerLossUnsettled {
+                    session_id: refused_id,
+                } if refused_id == &session_id
+            ),
+            "{refused:?}"
+        );
+        assert!(!adapter.contains_session(&session_id).await);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let adapter = runtime_composed_with(
+            &temp,
+            operation_review(meerkat_core::ApprovalService::new(), true),
+        )
+        .await;
+        let session_id = SessionId::new();
+        adapter
+            .register_session(session_id.clone())
+            .await
+            .expect("the issuing owner settles and the registration publishes");
+        assert!(
+            adapter
+                .session_owner_loss_proof(&session_id)
+                .await
+                .is_some(),
+            "the settlement is recorded"
+        );
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let adapter = runtime_composed_with(
+            &temp,
+            operation_review(meerkat_core::ApprovalService::new(), false),
+        )
+        .await;
+        assert!(!adapter.has_consent_owner_loss_settlement());
+        let session_id = SessionId::new();
+        adapter
+            .register_session(session_id.clone())
+            .await
+            .expect("registers without a consent owner");
+        assert!(
+            adapter
+                .session_owner_loss_proof(&session_id)
+                .await
+                .is_none(),
+            "nothing is recorded as settled"
+        );
+    }
+
+    /// Consent owner loss (3): over a shared persistence whose runtime
+    /// already registered a session, a composition whose factory routes R3
+    /// to human consent fails with the runtime's typed refusal before any
+    /// service is exposed, and the runtime keeps that registration and stays
+    /// without an issuing owner.
+    #[tokio::test]
+    async fn a_pre_registered_shared_runtime_fails_a_consent_composition() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let persistence = consent_realm_persistence(&temp).await;
+        let shared = persistence.runtime_adapter();
+        let registered = SessionId::new();
+        shared
+            .register_session(registered.clone())
+            .await
+            .expect("registered before the composition");
+
+        assert_eq!(
+            compose_with_review(
+                &temp,
+                persistence.clone(),
+                operation_review(meerkat_core::ApprovalService::new(), true),
+            )
+            .err(),
+            Some(RuntimeBackedCompositionError::ConsentOwnerRefused(
+                meerkat_runtime::ConsentOwnerLossInstallRefused::SessionsRegistered
+            )),
+            "the composition fails instead of serving"
+        );
+        assert!(
+            shared.contains_session(&registered).await,
+            "the existing registration stays"
+        );
+        assert!(
+            !shared.has_consent_owner_loss_settlement(),
+            "no issuing owner was installed"
+        );
+    }
+
+    /// Consent owner loss (3): over a shared persistence whose runtime
+    /// already installed one issuing consent owner, a composition with a
+    /// different issuing owner fails with the runtime's typed refusal before
+    /// any service is exposed; the first owner stays installed and still
+    /// settles the next registration.
+    #[tokio::test]
+    async fn a_conflicting_issuing_consent_owner_fails_the_composition() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let persistence = consent_realm_persistence(&temp).await;
+        let first = compose_with_review(
+            &temp,
+            persistence.clone(),
+            operation_review(meerkat_core::ApprovalService::new(), true),
+        )
+        .expect("the first issuing owner is installed");
+
+        assert_eq!(
+            compose_with_review(
+                &temp,
+                persistence.clone(),
+                operation_review(
+                    meerkat_core::ApprovalService::unavailable("a different issuing owner"),
+                    true,
+                ),
+            )
+            .err(),
+            Some(RuntimeBackedCompositionError::ConsentOwnerRefused(
+                meerkat_runtime::ConsentOwnerLossInstallRefused::AlreadyInstalled
+            )),
+            "the composition fails instead of replacing the issuing owner"
+        );
+        let session_id = SessionId::new();
+        first
+            .register_session(session_id.clone())
+            .await
+            .expect("the first issuing owner still settles");
+        assert!(
+            first.session_owner_loss_proof(&session_id).await.is_some(),
+            "the first issuing owner recorded the settlement"
         );
     }
 
@@ -3877,7 +4353,8 @@ mod tests {
             started: Arc::clone(&started),
             release: Arc::clone(&release),
         }));
-        let (service, adapter) = build_runtime_backed_service(builder, 4, persistence);
+        let (service, adapter) = build_runtime_backed_service(builder, 4, persistence)
+            .expect("compose the runtime-backed service");
         let service = Arc::new(service);
         let session = Session::new();
         let session_id = session.id().clone();
@@ -5552,7 +6029,7 @@ mod default_mcp_auth_tests {
             &self,
             _target: &meerkat_providers::mcp_oauth::McpServerIdentity,
         ) -> Result<Option<String>, meerkat_providers::mcp_oauth::McpOAuthError> {
-            Ok(None)
+            Ok(Some("host-token".to_owned()))
         }
 
         async fn interactive_login(
@@ -5566,6 +6043,46 @@ mod default_mcp_auth_tests {
                 },
             )
         }
+
+        fn credential_realm(&self) -> Option<meerkat_core::RealmId> {
+            meerkat_core::RealmId::parse("host-realm").ok()
+        }
+
+        async fn stdio_service_secrets(
+            &self,
+            _server: &meerkat_core::McpServerConfig,
+        ) -> Result<
+            meerkat_core::auth::McpServiceSecretValues,
+            meerkat_core::auth::McpServiceSecretRefusal,
+        > {
+            Err(meerkat_core::auth::McpServiceSecretRefusal::NotStored {
+                env: "HOST_ONLY".to_owned(),
+            })
+        }
+    }
+
+    fn secret_server() -> meerkat_core::McpServerConfig {
+        let mut server = meerkat_core::McpServerConfig::stdio(
+            "search",
+            "search-server",
+            Vec::new(),
+            std::collections::HashMap::new(),
+        );
+        if let meerkat_core::mcp_config::McpTransportConfig::Stdio(stdio) = &mut server.transport {
+            stdio.secret_env.insert("SEARCH_API_KEY".to_owned());
+        }
+        server
+    }
+
+    fn http_identity() -> meerkat_providers::mcp_oauth::McpServerIdentity {
+        meerkat_providers::mcp_oauth::McpServerIdentity::from_config(
+            &meerkat_core::McpServerConfig::streamable_http(
+                "remote",
+                "https://mcp.example.com/mcp",
+                std::collections::HashMap::new(),
+            ),
+        )
+        .expect("identity")
     }
 
     fn persistence() -> meerkat_providers::auth_store::ProviderAuthPersistence {
@@ -5584,6 +6101,7 @@ mod default_mcp_auth_tests {
         let builder = install_default_mcp_auth_resolver(
             FactoryAgentBuilder::new(factory, Config::default()),
             &runtime,
+            None,
         );
         assert!(
             builder.factory().has_mcp_auth_resolver(),
@@ -5591,8 +6109,8 @@ mod default_mcp_auth_tests {
         );
     }
 
-    #[test]
-    fn a_host_supplied_mcp_auth_resolver_wins() {
+    #[tokio::test]
+    async fn a_host_supplied_mcp_auth_resolver_wins() {
         let temp = tempfile::tempdir().unwrap();
         let runtime = Arc::new(MeerkatMachine::ephemeral());
         let host: Arc<dyn meerkat_mcp::McpAuthResolver> = Arc::new(HostResolver);
@@ -5602,12 +6120,53 @@ mod default_mcp_auth_tests {
         let builder = install_default_mcp_auth_resolver(
             FactoryAgentBuilder::new(factory, Config::default()),
             &runtime,
+            None,
         );
         let installed = builder
             .factory()
             .mcp_auth_resolver_for_test()
             .expect("resolver kept");
-        assert!(Arc::ptr_eq(installed, &host));
+        // Realm service-secret custody is added over the host's resolver,
+        // which keeps every answer of its own.
+        assert_eq!(
+            installed
+                .stored_bearer_token(&http_identity())
+                .await
+                .expect("host credential"),
+            Some("host-token".to_owned())
+        );
+        assert_eq!(installed.credential_realm(), host.credential_realm());
+        assert_eq!(
+            installed.stdio_service_secrets(&secret_server()).await,
+            Err(meerkat_core::auth::McpServiceSecretRefusal::NotStored {
+                env: "HOST_ONLY".to_owned()
+            }),
+            "the host's own service-secret answer stands"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_default_resolver_serves_realm_service_secret_custody() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MeerkatMachine::ephemeral());
+        let factory = crate::AgentFactory::new(temp.path().join("sessions"))
+            .with_provider_auth_persistence(persistence());
+        let builder = install_default_mcp_auth_resolver(
+            FactoryAgentBuilder::new(factory, Config::default()),
+            &runtime,
+            None,
+        );
+        let installed = builder
+            .factory()
+            .mcp_auth_resolver_for_test()
+            .expect("default resolver");
+        // The default credential source has custody: without a realm
+        // document defining the server it refuses as ownerless, never as
+        // a source without custody, and never from the host environment.
+        assert_eq!(
+            installed.stdio_service_secrets(&secret_server()).await,
+            Err(meerkat_core::auth::McpServiceSecretRefusal::NoOwner)
+        );
     }
 
     #[test]
@@ -5619,7 +6178,115 @@ mod default_mcp_auth_tests {
         let builder = install_default_mcp_auth_resolver(
             FactoryAgentBuilder::new(factory, Config::default()),
             &runtime,
+            None,
         );
         assert!(!builder.factory().has_mcp_auth_resolver());
+    }
+
+    /// The `team` realm's storage under `root`, as its owner's writes
+    /// resolve it.
+    #[cfg(feature = "local-authorization")]
+    fn realm_storage(root: &std::path::Path) -> meerkat_core::storage_layout::ResolvedStorage {
+        meerkat_core::storage_layout::ResolvedStorage {
+            layout: meerkat_core::storage_layout::StorageLayout::with_injected_roots(
+                root.to_path_buf(),
+                None,
+                None,
+                root.to_path_buf(),
+            ),
+            locator: meerkat_core::RealmLocator {
+                state_root: root.to_path_buf(),
+                realm: meerkat_core::RealmId::parse("team").expect("realm id"),
+            },
+            root_choice: meerkat_core::RealmRootChoice::Explicit,
+        }
+    }
+
+    /// A snapshot builder (no head config store, no realm inheritance) names
+    /// no server's defining realm from its own configuration. The realm
+    /// variant serves the value the realm's owner stored for the definition
+    /// the realm's own document lists, and nothing for any other definition.
+    #[cfg(feature = "local-authorization")]
+    #[tokio::test]
+    async fn a_snapshot_builder_serves_the_service_secret_its_realm_stored() {
+        const VALUE: &str = "sk-stored-for-the-reviewed-definition";
+        let temp = tempfile::tempdir().unwrap();
+        let storage = realm_storage(&temp.path().join("state"));
+        let document = crate::governed_realm::stock::issuance::realm_config_source(&storage)
+            .expect("projection")
+            .config_doc_path(&storage.locator.realm);
+        let config = meerkat_core::ConfigRuntime::new(
+            Arc::new(meerkat_core::FileConfigStore::new(
+                document.clone(),
+                meerkat_models::canonical(),
+            )),
+            document.with_file_name("config_state.json"),
+        );
+        let server = secret_server();
+        meerkat_core::McpRealmPersistTarget::new(&config)
+            .add(server.clone(), None)
+            .await
+            .expect("installed in the realm's own document");
+        let persistence = persistence();
+        crate::set_mcp_service_secret(&storage, &persistence, &server, "SEARCH_API_KEY", VALUE)
+            .await
+            .expect("stored for the current installation");
+
+        let runtime = Arc::new(MeerkatMachine::ephemeral());
+        let snapshot = || {
+            FactoryAgentBuilder::new(
+                crate::AgentFactory::new(temp.path().join("sessions"))
+                    .with_provider_auth_persistence(persistence.clone()),
+                Config::default(),
+            )
+        };
+        let builder = install_default_mcp_auth_resolver_for_realm(snapshot(), &runtime, &storage);
+        let installed = builder
+            .factory()
+            .mcp_auth_resolver_for_test()
+            .expect("default resolver");
+        assert_eq!(
+            installed
+                .stdio_service_secrets(&server)
+                .await
+                .expect("the stored value")
+                .into_env()
+                .collect::<Vec<_>>(),
+            vec![("SEARCH_API_KEY".to_owned(), VALUE.to_owned())]
+        );
+
+        // A definition the realm's own document does not list has no owner,
+        // and a changed one under the listed name is not the current one.
+        let mut unlisted = secret_server();
+        unlisted.name = "unlisted".to_owned();
+        assert_eq!(
+            installed.stdio_service_secrets(&unlisted).await,
+            Err(meerkat_core::auth::McpServiceSecretRefusal::NoOwner)
+        );
+        let mut changed = secret_server();
+        if let meerkat_core::mcp_config::McpTransportConfig::Stdio(stdio) = &mut changed.transport {
+            stdio.args.push("--changed".to_owned());
+        }
+        assert_eq!(
+            installed.stdio_service_secrets(&changed).await,
+            Err(meerkat_core::auth::McpServiceSecretRefusal::DefinitionChanged)
+        );
+
+        // Control: the same snapshot builder's own custody finds no owner
+        // for the stored definition.
+        let effective = install_default_mcp_auth_resolver(
+            snapshot(),
+            &runtime,
+            Some(storage.locator.realm.clone()),
+        );
+        assert_eq!(
+            effective
+                .factory()
+                .mcp_auth_resolver_for_test()
+                .expect("default resolver")
+                .stdio_service_secrets(&server)
+                .await,
+            Err(meerkat_core::auth::McpServiceSecretRefusal::NoOwner)
+        );
     }
 }

@@ -175,6 +175,16 @@ pub struct EphemeralRuntimeDriver {
     work_authorization_host: crate::input_authority::NativeWorkAuthorizationSlot,
     executor_supports_work_authorization: bool,
     work_durability_health: Option<crate::meerkat_machine::DurabilityHealthHandle>,
+    /// Whether a durable store, not only this live state, holds idempotency.
+    durable_replay_authority: bool,
+    /// The hosting domain of this runtime's store, when its claims are
+    /// cross-process: with the staged run's owner session it is the passive
+    /// scope a consent approval admitted in that run commits.
+    consent_scope_domain: Option<meerkat_core::session_hosting::HostingDomainRef>,
+    /// A lineage clone of the registration's hosting claim. A work context
+    /// staged with a consent scope carries a clone of it, which a consent
+    /// candidate admitted under that context keeps while it holds custody.
+    consent_hosting: Option<meerkat_core::session_hosting::HostingClaim>,
     runtime_id: LogicalRuntimeId,
     /// Shared coarse runtime projection owned by the machine/session entry.
     ///
@@ -320,6 +330,9 @@ impl EphemeralRuntimeDriver {
             work_authorization_host: Arc::new(std::sync::OnceLock::new()),
             executor_supports_work_authorization: false,
             work_durability_health: None,
+            durable_replay_authority: false,
+            consent_scope_domain: None,
+            consent_hosting: None,
             runtime_id,
             control,
             ledger: InputLedger::new(),
@@ -356,14 +369,72 @@ impl EphemeralRuntimeDriver {
         self.work_durability_health = Some(health);
     }
 
+    #[cfg(test)]
+    pub(crate) fn consent_scope_domain(
+        &self,
+    ) -> Option<&meerkat_core::session_hosting::HostingDomainRef> {
+        self.consent_scope_domain.as_ref()
+    }
+
+    pub(crate) fn set_consent_scope_domain(
+        &mut self,
+        domain: Option<meerkat_core::session_hosting::HostingDomainRef>,
+    ) {
+        self.consent_scope_domain = domain;
+    }
+
+    pub(crate) fn set_consent_hosting(
+        &mut self,
+        claim: Option<meerkat_core::session_hosting::HostingClaim>,
+    ) {
+        self.consent_hosting = claim;
+    }
+
     pub(crate) fn set_executor_work_authorization_support(&mut self, supported: bool) {
         self.executor_supports_work_authorization = supported;
     }
 
     pub(crate) fn authenticate_work(&self, input: &Input) -> Result<(), RuntimeDriverError> {
+        self.authenticate_work_with_replay(input, None)
+    }
+
+    /// The native replay lookup for `input` against this driver's live
+    /// admission state: the existing qualified-key preview and exact replay
+    /// verification. When the live state finds no holder but is not the whole
+    /// idempotency authority (a persistent driver's durable store also is),
+    /// the verdict is unresolved here.
+    fn live_replay_lookup(
+        &self,
+        input: &Input,
+    ) -> Result<Option<crate::input_authority::NativeReplayLookup>, RuntimeDriverError> {
+        use crate::input_authority::NativeReplayLookup;
+        let Some(key) = crate::input_authority::qualified_idempotency_key(input)? else {
+            return Ok(Some(NativeReplayLookup::FirstAuthentication));
+        };
+        match self.preview_idempotency(input.id(), Some(key.to_string()))? {
+            Some(existing_id) => {
+                let existing = self
+                    .stored_input_state(&existing_id)
+                    .ok_or_else(crate::input_authority::unavailable)?;
+                crate::input_authority::verify_retained_replay(&existing.state, input)?;
+                Ok(Some(NativeReplayLookup::RetainedReplay { existing_id }))
+            }
+            None if self.durable_replay_authority => Ok(None),
+            None => Ok(Some(NativeReplayLookup::FirstAuthentication)),
+        }
+    }
+
+    /// Authenticate `input` with the replay lookup verdict the caller already
+    /// resolved (`Some`), or the live lookup's (`None`).
+    pub(crate) fn authenticate_work_with_replay(
+        &self,
+        input: &Input,
+        resolved: Option<crate::input_authority::NativeReplayLookup>,
+    ) -> Result<(), RuntimeDriverError> {
         if let Some(row) = self.ledger.get(input.id()) {
             crate::input_authority::verify_retained_replay(row, input)?;
         }
+        self.check_scoped_context(input)?;
         if let Some(grant) = input.header().retained_resume.as_ref() {
             return self.authenticate_retained_resume(input, grant);
         }
@@ -394,8 +465,13 @@ impl EphemeralRuntimeDriver {
                 {
                     return Err(crate::input_authority::unavailable());
                 }
+                let replay = match resolved {
+                    Some(resolved) => Some(resolved),
+                    None => self.live_replay_lookup(input)?,
+                };
+                let ingress = ingress.with_replay_lookup(replay);
                 host.host()
-                    .authenticate_association(&self.runtime_id, input, ingress, association)
+                    .authenticate_association(&self.runtime_id, input, &ingress, association)
                     .map_err(RuntimeDriverError::from)?;
                 // A valid governed input still needs an executor that actually
                 // supports its context. This is pre-admission readiness only.
@@ -644,6 +720,7 @@ impl EphemeralRuntimeDriver {
                 execution_scope.clone(),
                 run_id.clone(),
                 &originals,
+                selected.retained_resume.is_some(),
             )
             .map_err(|_| crate::input_authority::unavailable())?;
         let batch = crate::input_authority::NativeWorkBatch {
@@ -666,7 +743,54 @@ impl EphemeralRuntimeDriver {
         // the previous run's identity, which the caller's active-run check
         // rejects.
         self.staged_retained_work.set(Some(identity.clone()));
-        Ok(Some(context.with_retained_work(identity)))
+        let context = context.with_retained_work(identity);
+        // The staged inputs that resume retained work, each with the run it
+        // resumes: the consent owner moves parked custody into this run only
+        // for an input its own committed notice receipt names.
+        let resumed = input_ids
+            .iter()
+            .filter_map(|input_id| {
+                let resumes = self.ledger.get(input_id)?.retained_resume.as_ref()?;
+                Some(meerkat_core::retained_work::ResumedInput {
+                    input_id: input_id.clone(),
+                    resumes: resumes.identity.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let context = if resumed.is_empty() {
+            context
+        } else {
+            context.with_resumed_inputs(resumed)
+        };
+        let context = match (&self.consent_scope_domain, &batch.execution_scope) {
+            (
+                Some(domain),
+                meerkat_core::exact_operation::OperationExecutionScope::RuntimeInput {
+                    owner_session_id,
+                    ..
+                },
+            ) => {
+                let context = context.with_consent_scope(meerkat_core::ApprovalConsentScope {
+                    domain: domain.clone(),
+                    session_id: owner_session_id.clone(),
+                });
+                // The scoped work carries the registration's claim lineage
+                // when that lineage holds exactly this run's session in this
+                // store's domain, so consent custody admitted under it keeps
+                // the session's claim held.
+                match &self.consent_hosting {
+                    Some(claim)
+                        if claim.session_id() == owner_session_id
+                            && claim.domain_ref().as_ref() == Some(domain) =>
+                    {
+                        context.with_consent_hosting(claim.clone())
+                    }
+                    _ => context,
+                }
+            }
+            _ => context,
+        };
+        Ok(Some(context))
     }
 
     /// The retained work identity of the last successfully staged work
@@ -1197,6 +1321,169 @@ impl EphemeralRuntimeDriver {
 
     fn dsl_key(input_id: &InputId) -> String {
         input_id.to_string()
+    }
+
+    /// A governed input is admitted only for the scoped destination this
+    /// session document currently serves, when one is bound.
+    fn check_scoped_context(&self, input: &Input) -> Result<(), RuntimeDriverError> {
+        let (current, ever_bound) = self.with_dsl_state(|state| {
+            (
+                state.scoped_context_binding.clone(),
+                state.scoped_context_generation > 0 || state.scoped_context_required,
+            )
+        });
+        match (
+            current,
+            crate::input_authority::input_context_target(input)?,
+        ) {
+            (Some(current), Some(target)) if current != target => {
+                Err(crate::input_authority::unavailable())
+            }
+            // A retired destination (or a required, not yet bound one) is
+            // never treated as never-bound.
+            (None, Some(_)) if ever_bound || self.requires_scoped_destination() => {
+                Err(crate::input_authority::unavailable())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn requires_scoped_destination(&self) -> bool {
+        self.work_authorization_host
+            .get()
+            .is_some_and(|host| host.host().requires_scoped_destination())
+    }
+
+    /// Record the destination an admitted governed input names. Attribution
+    /// only; staging requires it to be the current binding.
+    fn bind_input_context_target(
+        &mut self,
+        input_id: &InputId,
+        input: &Input,
+    ) -> Result<(), RuntimeDriverError> {
+        let Some(target) = crate::input_authority::input_context_target(input)? else {
+            return Ok(());
+        };
+        let key = Self::dsl_key(input_id);
+        let (governed, scoped) = self.with_dsl_state(|state| {
+            (
+                state.input_authority_bindings.contains_key(&key),
+                state.scoped_context_generation > 0 || state.scoped_context_binding.is_some(),
+            )
+        });
+        // Only a session document that serves (or requires) a scoped
+        // destination records one; unscoped governed work is unchanged.
+        if !governed || !(scoped || self.requires_scoped_destination()) {
+            return Ok(());
+        }
+        if self.requires_scoped_destination()
+            && !self.with_dsl_state(|state| state.scoped_context_required)
+        {
+            self.dsl_apply(
+                mm_dsl::MeerkatMachineInput::RequireScopedContext,
+                "RequireScopedContext",
+            )?;
+        }
+        self.dsl_apply(
+            mm_dsl::MeerkatMachineInput::BindInputContextTarget {
+                input_id: key,
+                target,
+            },
+            "BindInputContextTarget",
+        )
+    }
+
+    /// Restore the destination a recovered governed input was admitted
+    /// under, from its row's persisted witness. A reopened document is
+    /// unbound until its owner binds it again, so recovery's ordinary
+    /// recording skips it on a host where destinations are optional; the
+    /// input was still admitted for that destination. Restoring it records
+    /// attribution only: the input stages as before on such a host, and its
+    /// destination's currentness is decided against it at each use (its
+    /// destination-scoped operations and the disclosure of its result are
+    /// refused while the document is unbound or bound elsewhere, current once
+    /// that destination is bound again). This is fail-closed on purpose: on a
+    /// host that never binds the document again after a reopen, the
+    /// recovered input's destination-scoped operations stay refused, and the
+    /// input never runs as unscoped work.
+    fn restore_admitted_context_target(
+        &mut self,
+        input_id: &InputId,
+        witness: &crate::input_state::ScopedDestinationWitness,
+    ) -> Result<(), RuntimeDriverError> {
+        let crate::input_state::ScopedDestinationWitness::Bound { binding } = witness else {
+            return Ok(());
+        };
+        let key = Self::dsl_key(input_id);
+        let (governed, recorded) = self.with_dsl_state(|state| {
+            (
+                state.input_authority_bindings.contains_key(&key),
+                state.input_context_targets.contains_key(&key),
+            )
+        });
+        if !governed || recorded {
+            return Ok(());
+        }
+        self.dsl_apply(
+            mm_dsl::MeerkatMachineInput::BindInputContextTarget {
+                input_id: key,
+                target: binding.clone(),
+            },
+            "BindInputContextTarget(recovered witness)",
+        )
+    }
+
+    /// Bind this session document to one exact scoped destination, within
+    /// its binder's final decision: `within` runs while this document's DSL
+    /// authority is held and receives the binding's one transition, which it
+    /// runs at most once. Once the transition ran, its result is the outcome;
+    /// otherwise nothing changed and `within`'s refusal is returned.
+    pub(crate) fn bind_scoped_context_within(
+        &mut self,
+        binding: String,
+        scope: String,
+        generation: u64,
+        within: impl FnOnce(&mut dyn FnMut()) -> Result<(), RuntimeDriverError>,
+    ) -> Result<(), RuntimeDriverError> {
+        let mut input = Some(mm_dsl::MeerkatMachineInput::BindScopedContext {
+            binding,
+            scope,
+            generation,
+        });
+        let mut applied = None;
+        let decided = {
+            let mut authority = self.dsl.lock();
+            let mut commit = || {
+                if let Some(input) = input.take() {
+                    applied = Some(mm_dsl::MeerkatMachineMutator::apply(&mut *authority, input));
+                }
+            };
+            within(&mut commit)
+        };
+        match (applied, decided) {
+            (Some(applied), _) => {
+                let transition = applied.map_err(|err| {
+                    RuntimeDriverError::Internal(format!("DSL rejected BindScopedContext: {err:?}"))
+                })?;
+                self.absorb_dsl_effects(transition.effects());
+                Ok(())
+            }
+            (None, Err(refusal)) => Err(refusal),
+            (None, Ok(())) => Err(RuntimeDriverError::ValidationFailed {
+                reason: "the scoped context binder did not commit the binding".to_string(),
+            }),
+        }
+    }
+
+    /// Retire the current scoped destination of this session document.
+    pub(crate) fn retire_scoped_context(
+        &mut self,
+        generation: u64,
+    ) -> Result<(), RuntimeDriverError> {
+        self.dsl_apply(
+            mm_dsl::MeerkatMachineInput::RetireScopedContext { generation },
+            "RetireScopedContext",
+        )
     }
 
     pub(crate) fn with_dsl_state<R>(
@@ -1781,6 +2068,11 @@ impl EphemeralRuntimeDriver {
                     },
                     "BindInputAuthority(recovered row)",
                 )?;
+                self.bind_input_context_target(&work_id, persisted_input)?;
+                self.restore_admitted_context_target(
+                    &work_id,
+                    &recovered_state.scoped_destination,
+                )?;
             }
             (None, None) if recovered_state.authority_contributors.is_empty() => {}
             // A recovered resume of retained work is bound under its canonical
@@ -1804,6 +2096,11 @@ impl EphemeralRuntimeDriver {
                             .ok_or_else(crate::input_authority::unavailable)?,
                     },
                     "BindInputAuthority(recovered retained resume)",
+                )?;
+                self.bind_input_context_target(&work_id, persisted_input)?;
+                self.restore_admitted_context_target(
+                    &work_id,
+                    &recovered_state.scoped_destination,
                 )?;
             }
             _ => return Err(crate::input_authority::unavailable()),
@@ -3969,11 +4266,17 @@ impl EphemeralRuntimeDriver {
         let work_host = self.work_authorization_host.clone();
         let work_supported = self.executor_supports_work_authorization;
         let work_health = self.work_durability_health.clone();
+        let durable_replay_authority = self.durable_replay_authority;
+        let consent_scope_domain = self.consent_scope_domain.clone();
+        let consent_hosting = self.consent_hosting.clone();
 
         *self = Self::new_with_control(runtime_id, control);
         self.work_authorization_host = work_host;
         self.executor_supports_work_authorization = work_supported;
         self.work_durability_health = work_health;
+        self.durable_replay_authority = durable_replay_authority;
+        self.consent_scope_domain = consent_scope_domain;
+        self.consent_hosting = consent_hosting;
         self.ledger = ledger;
         self.dsl = preserved_dsl;
         self.admission_order = preserved_admission_order;
@@ -4626,8 +4929,23 @@ impl EphemeralRuntimeDriver {
         input: &Input,
         custody: &crate::meerkat_machine::credential_custody::NativeCredentialCustody,
     ) -> Result<(), RuntimeDriverError> {
-        self.authenticate_work(input)?;
+        self.authenticate_work_with_credential_replay(input, custody, None)
+    }
+
+    pub(crate) fn authenticate_work_with_credential_replay(
+        &self,
+        input: &Input,
+        custody: &crate::meerkat_machine::credential_custody::NativeCredentialCustody,
+        resolved: Option<crate::input_authority::NativeReplayLookup>,
+    ) -> Result<(), RuntimeDriverError> {
+        self.authenticate_work_with_replay(input, resolved)?;
         custody.validate(&self.work_authorization_host, input)
+    }
+
+    /// A persistent owner's durable store also holds idempotency: the live
+    /// lookup alone cannot rule out a retained replay.
+    pub(crate) fn set_durable_replay_authority(&mut self) {
+        self.durable_replay_authority = true;
     }
 
     #[cfg(test)]
@@ -4793,6 +5111,19 @@ impl EphemeralRuntimeDriver {
             Self::resolve_admission_plan_input(&authority),
             "ResolveAdmissionPlan",
         )?;
+        self.bind_input_context_target(&input_id, &input)?;
+        // The original destination witness, kept on the row for result
+        // disclosure after the machine forgets the input.
+        let posture = crate::meerkat_machine::scoped_context::scoped_host_posture(
+            &self.work_authorization_host,
+        );
+        state.scoped_destination = self.with_dsl_state(|dsl_state| {
+            crate::meerkat_machine::scoped_context::admitted_destination_witness(
+                dsl_state,
+                &Self::dsl_key(&input_id),
+                posture,
+            )
+        });
         let committed_resolved =
             self.resolved_admission_from_machine_effects(&input, authority, effects, true)?;
         if !resolved.semantically_equivalent_to(&committed_resolved) {
@@ -5512,6 +5843,43 @@ mod tests {
 
     fn prompt_input(text: &str) -> Input {
         Input::Prompt(PromptInput::new(text, None))
+    }
+
+    /// The binder's final decision runs with the document's DSL authority
+    /// already held: the authority cannot be taken while `within` decides,
+    /// so no wait for it can follow the decision. A refusing binder changes
+    /// nothing.
+    #[test]
+    fn bind_scoped_context_within_decides_with_the_dsl_authority_held() {
+        let mut driver =
+            EphemeralRuntimeDriver::new(LogicalRuntimeId::new("scoped-binding-within"));
+        let authority = driver.shared_dsl_authority();
+        driver
+            .bind_scoped_context_within("binding-1".into(), "scope".into(), 1, |commit| {
+                if authority.try_lock().is_ok() {
+                    return Err(RuntimeDriverError::ValidationFailed {
+                        reason: "the binder decided without the DSL authority held".into(),
+                    });
+                }
+                commit();
+                Ok(())
+            })
+            .expect("the binding commits under the held DSL authority");
+        driver.with_dsl_state(|state| {
+            assert_eq!(state.scoped_context_binding.as_deref(), Some("binding-1"));
+            assert_eq!(state.scoped_context_generation, 1);
+        });
+        let refused =
+            driver.bind_scoped_context_within("binding-2".into(), "scope".into(), 2, |_| {
+                Err(RuntimeDriverError::ValidationFailed {
+                    reason: "refused".into(),
+                })
+            });
+        assert!(refused.is_err());
+        driver.with_dsl_state(|state| {
+            assert_eq!(state.scoped_context_binding.as_deref(), Some("binding-1"));
+            assert_eq!(state.scoped_context_generation, 1);
+        });
     }
 
     fn operation_input() -> Input {

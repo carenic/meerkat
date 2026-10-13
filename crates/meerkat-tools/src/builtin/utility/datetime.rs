@@ -39,7 +39,7 @@ impl BuiltinTool for DateTimeTool {
             name: "datetime".into(),
             description: "Get the current date and time. Returns ISO 8601 formatted datetime and Unix timestamp.".into(),
             input_schema: empty_object_schema(),
-            provenance: Some(ToolProvenance { kind: ToolSourceKind::Builtin, source_id: "builtin".into() }),
+            provenance: Some(ToolProvenance { kind: ToolSourceKind::Builtin, source_id: "builtin".into(), artifact: None }),
         }
     }
 

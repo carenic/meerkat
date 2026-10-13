@@ -61,7 +61,7 @@ the factory boundary.
 | Mode | Intended use | Authority available |
 |------|--------------|---------------------|
 | `StandaloneEphemeral` | Direct embedded runs and tests | Local agent loop and explicitly supplied dependencies; no invented session-owned runtime handles |
-| `SessionOwned` | CLI, REST, RPC, MCP, SDK, and MobKit service sessions | Canonical session, auth lease, tool scope, operations lifecycle, model routing, event and completion feeds |
+| `SessionOwned` | CLI, REST, RPC, MCP, SDK, and Meta service sessions | Canonical session, auth lease, tool scope, operations lifecycle, model routing, event and completion feeds |
 
 Queue-only ephemeral services are useful substrates, but they are not a
 durable control plane. Features that require session-owned authority fail

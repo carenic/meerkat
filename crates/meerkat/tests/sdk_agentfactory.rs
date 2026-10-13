@@ -343,6 +343,13 @@ struct CountingHookEngine {
 
 #[async_trait]
 impl HookEngine for CountingHookEngine {
+    fn mandatory_topology(
+        &self,
+        _overrides: Option<&meerkat_core::HookRunOverrides>,
+    ) -> Result<meerkat_core::HookMandatoryTopology, meerkat_core::HookEngineError> {
+        Ok(meerkat_core::HookMandatoryTopology::none())
+    }
+
     fn matching_hooks(
         &self,
         _invocation: &HookInvocation,

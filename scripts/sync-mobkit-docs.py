@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Publish MobKit's canonical docs into the docs.rkat.ai source tree.
 
-MobKit authors its public documentation in the meerkat-mobkit repository. The
+MobKit authors its public documentation in the meerkat-meta repository. The
 Mintlify project for docs.rkat.ai deploys from this repository, so this script
 creates the namespaced snapshot consumed by the MobKit product navigation.
 
@@ -12,8 +12,8 @@ The generated manifest records the exact source commit and the MobKit
 workspace version at that commit as information, not as an identity.
 
 Usage:
-    python3 scripts/sync-mobkit-docs.py /path/to/meerkat-mobkit
-    python3 scripts/sync-mobkit-docs.py /path/to/meerkat-mobkit --check
+    python3 scripts/sync-mobkit-docs.py /path/to/meerkat-meta
+    python3 scripts/sync-mobkit-docs.py /path/to/meerkat-meta --check
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DESTINATION = ROOT / "docs" / "mobkit"
 SITE_CONFIG = ROOT / "docs" / "docs.json"
-SOURCE_REPOSITORY = "https://github.com/lukacf/meerkat-mobkit"
+SOURCE_REPOSITORY = "https://github.com/lukacf/meerkat-meta"
 ASSET_PATHS = ("images", "logo.png")
 ROOT_LINK_RE = re.compile(r'(?P<prefix>\]\(|(?:href|src)=["\'])/(?P<path>[^/])')
 REQUIRED_PAGE_ICONS = {
@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "source",
         type=Path,
-        help="path to a meerkat-mobkit checkout",
+        help="path to a meerkat-meta checkout",
     )
     parser.add_argument(
         "--check",

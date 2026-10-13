@@ -1499,7 +1499,7 @@ async fn reload_carries_the_audited_endpoint_divergence_typed() {
         "{data}"
     );
     // Reviving a Broken member after the operator's repair is the host's
-    // retire + resume path (MobKit's `reload_member` on a held identity); the
+    // retire + resume path (Meta's `reload_member` on a held identity); the
     // registration reload stays refused typed until then.
 }
 

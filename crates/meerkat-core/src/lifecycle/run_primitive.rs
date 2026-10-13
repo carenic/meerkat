@@ -169,6 +169,7 @@ impl CoreRenderable {
                     category: "runtime_notice".to_string(),
                     detail: Some(text),
                     payload: None,
+                    content: Vec::new(),
                 },
             ),
             Self::Blocks { blocks } => SystemNoticeMessage::with_block(
@@ -178,6 +179,7 @@ impl CoreRenderable {
                     category: "runtime_notice".to_string(),
                     detail: Some(crate::types::text_content(&blocks)),
                     payload: None,
+                    content: Vec::new(),
                 },
             ),
             Self::Json { value } => SystemNoticeMessage::with_block(
@@ -187,6 +189,7 @@ impl CoreRenderable {
                     category: "runtime_notice".to_string(),
                     detail: None,
                     payload: Some(value),
+                    content: Vec::new(),
                 },
             ),
             Self::Reference { uri, label } => SystemNoticeMessage::with_block(
@@ -196,6 +199,7 @@ impl CoreRenderable {
                     category: "runtime_notice".to_string(),
                     detail: Some(uri),
                     payload: None,
+                    content: Vec::new(),
                 },
             ),
         }
@@ -2407,7 +2411,7 @@ fn append_model_projection_blocks(
     match content {
         CoreRenderable::SystemNotice { kind, body, blocks } => {
             let projection = SystemNoticeMessage::with_blocks(*kind, body.clone(), blocks.clone())
-                .model_projection_text();
+                .model_projection_lead_text();
             if !projection.trim().is_empty() {
                 all_blocks.push(ContentBlock::Text { text: projection });
             }
@@ -2422,17 +2426,33 @@ fn append_system_notice_media_blocks(
     all_blocks: &mut Vec<crate::types::ContentBlock>,
 ) {
     for block in blocks {
-        let content = match block {
+        match block {
             SystemNoticeBlock::Comms { content, .. }
-            | SystemNoticeBlock::ExternalEvent { content, .. } => content,
-            _ => continue,
-        };
-        all_blocks.extend(
-            content
-                .iter()
-                .filter(|block| !matches!(block, crate::types::ContentBlock::Text { .. }))
-                .cloned(),
-        );
+            | SystemNoticeBlock::ExternalEvent { content, .. }
+            | SystemNoticeBlock::RuntimeNotice { content, .. } => {
+                if block.content_follows_notice_text() {
+                    // Runtime notice content and comms response blocks follow
+                    // the notice text in their own order, each block once.
+                    all_blocks.extend(content.iter().cloned());
+                } else {
+                    // The content's text is part of the notice text; only its
+                    // media follows it.
+                    all_blocks.extend(
+                        content
+                            .iter()
+                            .filter(|block| {
+                                matches!(
+                                    block,
+                                    crate::types::ContentBlock::Image { .. }
+                                        | crate::types::ContentBlock::Video { .. }
+                                )
+                            })
+                            .cloned(),
+                    );
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -2674,6 +2694,100 @@ mod tests {
             }
             other => panic!("expected typed notice projection with media blocks, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn comms_response_blocks_project_once() {
+        let block =
+            crate::types::ContentBlock::structured(&serde_json::json!({"block_marker_z9": 2}))
+                .expect("structured response block");
+        let p = make_staged(vec![ConversationAppend {
+            runtime_source: None,
+            role: ConversationAppendRole::SystemNotice,
+            identity: None,
+            content: CoreRenderable::SystemNotice {
+                kind: SystemNoticeKind::Comms,
+                body: None,
+                blocks: vec![SystemNoticeBlock::Comms {
+                    kind: crate::types::CommsNoticeKind::ResponseTerminal,
+                    direction: crate::types::SystemNoticeDirection::Incoming,
+                    peer: Some(crate::types::SystemNoticePeer {
+                        id: crate::comms::PeerId::new(),
+                        display_name: Some("operator".to_string()),
+                    }),
+                    sender_taint: None,
+                    request_id: Some("request-7".to_string()),
+                    intent: None,
+                    status: Some("completed".to_string()),
+                    summary: None,
+                    payload: Some(serde_json::json!({"result_marker_q7": true})),
+                    content: vec![block.clone()],
+                }],
+            },
+        }]);
+
+        let crate::types::ContentInput::Blocks(blocks) = p.model_projection_content_input() else {
+            panic!("a notice with a structured block projects as blocks");
+        };
+        assert_eq!(
+            blocks.len(),
+            2,
+            "the notice text, then the block: {blocks:?}"
+        );
+        assert!(matches!(
+            &blocks[0],
+            crate::types::ContentBlock::Text { text }
+                if text.matches("result_marker_q7").count() == 1
+                    && !text.contains("block_marker_z9")
+        ));
+        assert_eq!(blocks[1], block, "the response block, once");
+    }
+
+    #[test]
+    fn runtime_notice_content_projects_in_order_once() {
+        let image = |data: &str| crate::types::ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: crate::types::ImageData::Inline {
+                data: data.to_string(),
+            },
+        };
+        let content = vec![
+            crate::types::ContentBlock::Text {
+                text: "first".to_string(),
+            },
+            image("aW1hZ2Ux"),
+            crate::types::ContentBlock::Text {
+                text: "second".to_string(),
+            },
+            image("aW1hZ2Uy"),
+            crate::types::ContentBlock::structured(&serde_json::json!({"rows": 2}))
+                .expect("structured"),
+        ];
+        let p = make_staged(vec![ConversationAppend {
+            runtime_source: None,
+            role: ConversationAppendRole::SystemNotice,
+            identity: None,
+            content: CoreRenderable::SystemNotice {
+                kind: SystemNoticeKind::Generic,
+                body: Some("Correlated outcome".to_string()),
+                blocks: vec![SystemNoticeBlock::RuntimeNotice {
+                    category: "consent_attempt".to_string(),
+                    detail: Some("call-1".to_string()),
+                    payload: None,
+                    content: content.clone(),
+                }],
+            },
+        }]);
+
+        let mut expected = vec![crate::types::ContentBlock::Text {
+            text: "Correlated outcome\ncall-1".to_string(),
+        }];
+        expected.extend(content);
+        assert_eq!(
+            p.model_projection_content_input(),
+            crate::types::ContentInput::Blocks(expected),
+            "the notice text, then its content in order, each block once"
+        );
     }
 
     #[test]

@@ -132,6 +132,12 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `turn_tool_overlay_deny_names`: `Set<ToolName>`
 - `input_authority_bindings`: `Map<String, String>`
 - `input_authority_batch_keys`: `Map<String, String>`
+- `scoped_context_binding`: `Option<String>`
+- `scoped_context_scope`: `Option<String>`
+- `scoped_context_generation`: `u64`
+- `scoped_context_required`: `Bool`
+- `input_context_targets`: `Map<String, String>`
+- `run_context_binding`: `Option<String>`
 - `authority_staged_run`: `Option<RunId>`
 - `authority_staged_batch`: `Option<String>`
 - `input_phases`: `Map<String, InputPhase>`
@@ -395,6 +401,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `surface_pending_task_sequence`: `Map<String, u64>`
 - `next_pending_task_sequence`: `u64`
 - `surface_pending_lineage_sequence`: `Map<String, u64>`
+- `surface_active_lineage`: `Map<String, u64>`
 - `surface_inflight_calls`: `Map<String, u64>`
 - `surface_last_delta_operation`: `Map<String, ExternalToolSurfaceDeltaOperation>`
 - `surface_last_delta_phase`: `Map<String, ExternalToolSurfaceDeltaPhase>`
@@ -586,6 +593,10 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `JoinLiveBoundaryDurableAppend`(run_id: RunId, input_id: String)
 - `ResolveLiveBoundaryDurableAppendJoin`(run_id: RunId, input_id: String, lane: InputLane, observation: LiveBoundaryJoinObservation)
 - `BindInputAuthority`(input_id: String, authority_binding: String, authority_batch_key: String)
+- `BindScopedContext`(binding: String, scope: String, generation: u64)
+- `RetireScopedContext`(generation: u64)
+- `RequireScopedContext`
+- `BindInputContextTarget`(input_id: String, target: String)
 - `ResolveAdmissionPlan`(input_id: String, authority_binding: Option<String>, authority_batch_key: Option<String>, input_kind: AdmissionInputKind, requested_lane: Option<InputLane>, continuation_kind: AdmissionContinuationKind, turn_append_shape: AdmissionTurnAppendShape, silent_intent_match: Bool, existing_superseded_input_id: Option<String>, runtime_running: Bool, active_turn_boundary_available: Bool, without_wake: Bool)
 - `ResolveAdmissionValidation`(input_id: String, input_kind: AdmissionInputKind, input_origin: AdmissionInputOriginKind, durability: InputDurabilityKind, peer_handling_mode_valid: Bool, peer_response_terminal_structurally_valid: Bool, peer_response_terminal_observed_status: PeerResponseTerminalObservedStatus)
 - `ResolveAdmissionIdempotency`(input_id: String, idempotency_key: Option<String>)
@@ -822,6 +833,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `SurfaceFinalizeRemovalForced`(surface_id: String)
 - `SurfaceSnapshotAligned`(epoch: u64)
 - `SurfaceShutdown`
+- `SurfaceRelease`(surface_id: String, lineage: u64)
 - `McpServerConnectPending`(server_id: McpServerId)
 - `McpServerConnected`(server_id: McpServerId)
 - `McpServerFailed`(server_id: McpServerId, error: String)
@@ -1108,6 +1120,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RefreshVisibleSurfaceSet`(snapshot_epoch: u64)
 - `EmitExternalToolDelta`(surface_id: String, operation: ExternalToolSurfaceDeltaOperation, phase: ExternalToolSurfaceDeltaPhase, cause: Option<ExternalToolSurfaceFailureCause>)
 - `CloseSurfaceConnection`(surface_id: String)
+- `SurfaceStageRecorded`(surface_id: String, staged_intent_sequence: u64)
 - `RejectSurfaceCall`(surface_id: String, cause: ExternalToolSurfaceFailureCause)
 - `PublishSupervisorTrustEdge`(local_endpoint: Option<PeerEndpoint>, peer_id: String, name: String, address: String, signing_public_key: Option<String>, epoch: u64)
 - `RevokeSupervisorTrustEdge`(local_endpoint: Option<PeerEndpoint>, peer_id: String, epoch: u64)
@@ -1254,11 +1267,11 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Source Inputs: `StageForRun`
 - Transitions: `StageForRunIdle`, `StageForRunAttached`, `StageForRunRunning`, `StageForRunRetired`, `StageForRunStopped`
 - Guard Expansion:
-  - `StageForRunIdle`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `current_run_matches`, `homogeneous_run_authority`
-  - `StageForRunAttached`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `current_run_matches`, `homogeneous_run_authority`
-  - `StageForRunRunning`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `current_run_matches`, `homogeneous_run_authority`
-  - `StageForRunRetired`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `current_run_matches`, `homogeneous_run_authority`
-  - `StageForRunStopped`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `current_run_matches`, `homogeneous_run_authority`
+  - `StageForRunIdle`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `current_run_matches`, `homogeneous_run_authority`, `scoped_context_attached`
+  - `StageForRunAttached`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `current_run_matches`, `homogeneous_run_authority`, `scoped_context_attached`
+  - `StageForRunRunning`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `current_run_matches`, `homogeneous_run_authority`, `scoped_context_attached`
+  - `StageForRunRetired`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `current_run_matches`, `homogeneous_run_authority`, `scoped_context_attached`
+  - `StageForRunStopped`: `input_queued`, `input_lane_bound`, `input_sequence_bound`, `input_recovery_lane_bound`, `current_run_matches`, `homogeneous_run_authority`, `scoped_context_attached`
 - Emitted By Transitions: `RecordRunAssociation`
 
 ### `AuthorizedRuntimeLoopRunCommit`
@@ -1434,6 +1447,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `unregister_drain_obligations_require_draining`
 - `current_run_only_while_running_or_retired`
 - `current_run_has_pre_run_phase`
+- `input_context_targets_are_governed`
 - `input_authority_bindings_have_native_owner`
 - `staged_inputs_are_not_queued`
 - `staged_inputs_have_run_association`
@@ -5151,6 +5165,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `CancelAfterBoundaryForRun`(run_id, reason)
 - Guards:
   - `run_matches_current`
+  - `turn_cancellable`
   - `no_dispatch_outstanding`
 - Emits: `RequestCancellationAtBoundary`, `RuntimeEffectFact`
 - To: `Running`
@@ -5160,6 +5175,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `CancelAfterBoundaryForRun`(run_id, reason)
 - Guards:
   - `run_matches_current`
+  - `turn_cancellable`
   - `no_dispatch_outstanding`
 - Emits: `RequestCancellationAtBoundary`, `RuntimeEffectFact`
 - To: `Retired`
@@ -5169,6 +5185,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `CancelAfterBoundaryForRun`(run_id, reason)
 - Guards:
   - `run_matches_current`
+  - `turn_cancellable`
   - `dispatch_outstanding`
 - Emits: `BoundaryCancelAlreadyPending`
 - To: `Running`
@@ -5178,6 +5195,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `CancelAfterBoundaryForRun`(run_id, reason)
 - Guards:
   - `run_matches_current`
+  - `turn_cancellable`
   - `dispatch_outstanding`
 - Emits: `BoundaryCancelAlreadyPending`
 - To: `Retired`
@@ -9116,6 +9134,129 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `immutable_batch_key`
 - To: `Stopped`
 
+### `BindScopedContextIdle`
+- From: `Idle`
+- On: `BindScopedContext`(binding, scope, generation)
+- Guards:
+  - `nonempty_binding`
+  - `generation_advances`
+  - `stable_scope`
+- To: `Idle`
+
+### `BindScopedContextAttached`
+- From: `Attached`
+- On: `BindScopedContext`(binding, scope, generation)
+- Guards:
+  - `nonempty_binding`
+  - `generation_advances`
+  - `stable_scope`
+- To: `Attached`
+
+### `RequireScopedContextIdle`
+- From: `Idle`
+- On: `RequireScopedContext`()
+- To: `Idle`
+
+### `RequireScopedContextAttached`
+- From: `Attached`
+- On: `RequireScopedContext`()
+- To: `Attached`
+
+### `RequireScopedContextRunning`
+- From: `Running`
+- On: `RequireScopedContext`()
+- To: `Running`
+
+### `RequireScopedContextRetired`
+- From: `Retired`
+- On: `RequireScopedContext`()
+- To: `Retired`
+
+### `RequireScopedContextStopped`
+- From: `Stopped`
+- On: `RequireScopedContext`()
+- To: `Stopped`
+
+### `RetireScopedContextIdle`
+- From: `Idle`
+- On: `RetireScopedContext`(generation)
+- Guards:
+  - `current_generation`
+- To: `Idle`
+
+### `RetireScopedContextAttached`
+- From: `Attached`
+- On: `RetireScopedContext`(generation)
+- Guards:
+  - `current_generation`
+- To: `Attached`
+
+### `RetireScopedContextRunning`
+- From: `Running`
+- On: `RetireScopedContext`(generation)
+- Guards:
+  - `current_generation`
+- To: `Running`
+
+### `RetireScopedContextRetired`
+- From: `Retired`
+- On: `RetireScopedContext`(generation)
+- Guards:
+  - `current_generation`
+- To: `Retired`
+
+### `RetireScopedContextStopped`
+- From: `Stopped`
+- On: `RetireScopedContext`(generation)
+- Guards:
+  - `current_generation`
+- To: `Stopped`
+
+### `BindInputContextTargetIdle`
+- From: `Idle`
+- On: `BindInputContextTarget`(input_id, target)
+- Guards:
+  - `governed_input`
+  - `nonempty_target`
+  - `immutable_target`
+- To: `Idle`
+
+### `BindInputContextTargetAttached`
+- From: `Attached`
+- On: `BindInputContextTarget`(input_id, target)
+- Guards:
+  - `governed_input`
+  - `nonempty_target`
+  - `immutable_target`
+- To: `Attached`
+
+### `BindInputContextTargetRunning`
+- From: `Running`
+- On: `BindInputContextTarget`(input_id, target)
+- Guards:
+  - `governed_input`
+  - `nonempty_target`
+  - `immutable_target`
+- To: `Running`
+
+### `BindInputContextTargetRetired`
+- From: `Retired`
+- On: `BindInputContextTarget`(input_id, target)
+- Guards:
+  - `governed_input`
+  - `nonempty_target`
+  - `immutable_target`
+- To: `Retired`
+
+### `BindInputContextTargetStopped`
+- From: `Stopped`
+- On: `BindInputContextTarget`(input_id, target)
+- Guards:
+  - `governed_input`
+  - `nonempty_target`
+  - `immutable_target`
+- To: `Stopped`
+
 ### `ResolveAdmissionPlanRequestedTerminalQueueIdle`
 - From: `Idle`
 - On: `ResolveAdmissionPlan`(input_id, authority_binding, authority_batch_key, input_kind, requested_lane, continuation_kind, turn_append_shape, silent_intent_match, existing_superseded_input_id, runtime_running, active_turn_boundary_available, without_wake)
@@ -10789,6 +10930,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `SurfaceStageAdd`(surface_id, now_ms)
 - Guards:
   - `surface_operating`
+- Emits: `SurfaceStageRecorded`
 - To: `Idle`
 
 ### `SurfaceStageAddAttached`
@@ -10796,6 +10938,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `SurfaceStageAdd`(surface_id, now_ms)
 - Guards:
   - `surface_operating`
+- Emits: `SurfaceStageRecorded`
 - To: `Attached`
 
 ### `SurfaceStageAddRunning`
@@ -10803,6 +10946,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `SurfaceStageAdd`(surface_id, now_ms)
 - Guards:
   - `surface_operating`
+- Emits: `SurfaceStageRecorded`
 - To: `Running`
 
 ### `SurfaceStageRemoveIdle`
@@ -10810,6 +10954,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `SurfaceStageRemove`(surface_id, now_ms)
 - Guards:
   - `surface_operating`
+- Emits: `SurfaceStageRecorded`
 - To: `Idle`
 
 ### `SurfaceStageRemoveAttached`
@@ -10817,6 +10962,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `SurfaceStageRemove`(surface_id, now_ms)
 - Guards:
   - `surface_operating`
+- Emits: `SurfaceStageRecorded`
 - To: `Attached`
 
 ### `SurfaceStageRemoveRunning`
@@ -10824,6 +10970,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `SurfaceStageRemove`(surface_id, now_ms)
 - Guards:
   - `surface_operating`
+- Emits: `SurfaceStageRecorded`
 - To: `Running`
 
 ### `SurfaceSetRemovalTimeoutIdle`
@@ -10853,6 +11000,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `surface_operating`
   - `surface_active`
+- Emits: `SurfaceStageRecorded`
 - To: `Idle`
 
 ### `SurfaceStageReloadAttached`
@@ -10861,6 +11009,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `surface_operating`
   - `surface_active`
+- Emits: `SurfaceStageRecorded`
 - To: `Attached`
 
 ### `SurfaceStageReloadRunning`
@@ -10869,6 +11018,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `surface_operating`
   - `surface_active`
+- Emits: `SurfaceStageRecorded`
 - To: `Running`
 
 ### `SurfaceApplyBoundaryAddIdle`
@@ -11244,6 +11394,41 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - From: `Running`
 - On: `SurfaceShutdown`()
 - To: `Running`
+
+### `SurfaceReleaseIdle`
+- From: `Idle`
+- On: `SurfaceRelease`(surface_id, lineage)
+- Guards:
+  - `release_holds_lineage`
+- To: `Idle`
+
+### `SurfaceReleaseAttached`
+- From: `Attached`
+- On: `SurfaceRelease`(surface_id, lineage)
+- Guards:
+  - `release_holds_lineage`
+- To: `Attached`
+
+### `SurfaceReleaseRunning`
+- From: `Running`
+- On: `SurfaceRelease`(surface_id, lineage)
+- Guards:
+  - `release_holds_lineage`
+- To: `Running`
+
+### `SurfaceReleaseStopped`
+- From: `Stopped`
+- On: `SurfaceRelease`(surface_id, lineage)
+- Guards:
+  - `release_holds_lineage`
+- To: `Stopped`
+
+### `SurfaceReleaseRetired`
+- From: `Retired`
+- On: `SurfaceRelease`(surface_id, lineage)
+- Guards:
+  - `release_holds_lineage`
+- To: `Retired`
 
 ### `CommitRunningToIdle`
 - From: `Running`
@@ -11808,6 +11993,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `input_recovery_lane_bound`
   - `current_run_matches`
   - `homogeneous_run_authority`
+  - `scoped_context_attached`
 - Emits: `RecordRunAssociation`
 - To: `Idle`
 
@@ -11821,6 +12007,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `input_recovery_lane_bound`
   - `current_run_matches`
   - `homogeneous_run_authority`
+  - `scoped_context_attached`
 - Emits: `RecordRunAssociation`
 - To: `Attached`
 
@@ -11834,6 +12021,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `input_recovery_lane_bound`
   - `current_run_matches`
   - `homogeneous_run_authority`
+  - `scoped_context_attached`
 - Emits: `RecordRunAssociation`
 - To: `Running`
 
@@ -11847,6 +12035,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `input_recovery_lane_bound`
   - `current_run_matches`
   - `homogeneous_run_authority`
+  - `scoped_context_attached`
 - Emits: `RecordRunAssociation`
 - To: `Retired`
 
@@ -11860,6 +12049,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `input_recovery_lane_bound`
   - `current_run_matches`
   - `homogeneous_run_authority`
+  - `scoped_context_attached`
 - Emits: `RecordRunAssociation`
 - To: `Stopped`
 

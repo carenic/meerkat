@@ -26,6 +26,17 @@ impl PreparedOperationAuthorization for Allowed {
 struct Owner;
 
 impl WorkAuthorization for Owner {
+    /// This test owner has no review material: explicitly not applicable.
+    fn review_operation_context(
+        &self,
+        _binding: &crate::authorization::PreparedAuthorizationBinding,
+    ) -> Result<
+        crate::authorization::ReviewOperationContextResolution,
+        crate::authorization::OperationAuthorizationError,
+    > {
+        Ok(crate::authorization::ReviewOperationContextResolution::NotApplicable)
+    }
+
     fn prepare(
         &self,
         _binding: &PreparedAuthorizationBinding,
@@ -283,6 +294,17 @@ async fn started_observation_precedes_review_and_failure_keeps_the_reviewer_unen
     }
     struct StagingWork(Arc<Staging>);
     impl WorkAuthorization for StagingWork {
+        /// This test owner has no review material: explicitly not applicable.
+        fn review_operation_context(
+            &self,
+            _binding: &crate::authorization::PreparedAuthorizationBinding,
+        ) -> Result<
+            crate::authorization::ReviewOperationContextResolution,
+            crate::authorization::OperationAuthorizationError,
+        > {
+            Ok(crate::authorization::ReviewOperationContextResolution::NotApplicable)
+        }
+
         fn prepare(
             &self,
             _: &PreparedAuthorizationBinding,
@@ -381,6 +403,7 @@ async fn started_observation_precedes_review_and_failure_keeps_the_reviewer_unen
                 result,
                 Err(crate::ToolError::ReviewUnsatisfied {
                     kind: super::super::ReviewUnsatisfiedKind::Denied,
+                    approval_id: None,
                 })
             ));
             assert_eq!(staging.calls.load(Ordering::SeqCst), 1);

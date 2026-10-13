@@ -123,7 +123,8 @@ async fn build_runtime(root: &Path, client: Arc<TextClient>) -> Arc<SessionRunti
         10,
         persistence,
         meerkat_rpc::router::NotificationSink::noop(),
-    );
+    )
+    .expect("compose the RPC session runtime");
     runtime.set_default_llm_client(Some(client));
     runtime.set_realm_context(
         Some(meerkat_core::connection::RealmId::parse(REALM).expect("realm id")),

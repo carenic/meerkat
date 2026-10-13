@@ -77,17 +77,95 @@ pub enum WorkAuthorityBasis {
         commissioning_actor: PrincipalRef,
         occurrence: EvidenceId,
     },
+    /// Exact grant lineages selected per typed operation target. Each value is
+    /// one complete root-to-leaf lineage resolved on its own, at use, for
+    /// operations on that target. `base`, when selected, is the optional
+    /// lineage of operations without a typed target (for example a catalog
+    /// read); it is never admission authority and never a fallback for a
+    /// target. Lineages of different targets are alternatives: they are never
+    /// concatenated, combined or intersected. A target without a selected
+    /// lineage has none, whatever any other target or `base` holds. Selecting
+    /// nothing at all is controller-only work: no operation has a lineage.
+    TargetedGrantLineages {
+        base: Option<Vec<GrantLineageRef>>,
+        targets: Vec<TargetGrantLineage>,
+    },
+}
+
+/// The typed target an operation's grant lineage is selected by.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
+pub enum GrantTarget {
+    /// One registered MCP server, by its configured name.
+    McpServer { server: String },
+    /// One operation of the Rust tool bundle a trusted host registered
+    /// under the stable name `bundle`: the target of the owner-produced
+    /// `RegisteredToolBundleOperation`. Each operation is its own target, so
+    /// its lineage expires and is revoked on its own.
+    RegisteredToolBundleOperation { bundle: String, operation: String },
+    /// The raw operations of the registered MCP server `server` reached
+    /// through the checked route a trusted host registered under the stable
+    /// name `route`: the target of the owner-produced
+    /// `CheckedMcpServerOperation`. Its lineage never covers the server's
+    /// ordinary operations, and the server's lineage never covers it.
+    CheckedMcpRoute { route: String, server: String },
+}
+
+/// One target's selected exact lineage.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetGrantLineage {
+    pub target: GrantTarget,
+    pub lineage: Vec<GrantLineageRef>,
+}
+
+fn validate_lineage(lineage: &[GrantLineageRef]) -> Result<(), AssociationError> {
+    if lineage.is_empty() || lineage.len() > MAX_ASSOCIATION_REFERENCES {
+        return Err(AssociationError::Shape);
+    }
+    for grant in lineage {
+        grant.validate()?;
+    }
+    Ok(())
 }
 
 impl WorkAuthorityBasis {
     fn validate(&self) -> Result<(), AssociationError> {
         match self {
-            Self::GrantLineage { lineage } => {
-                if lineage.is_empty() || lineage.len() > MAX_ASSOCIATION_REFERENCES {
+            Self::GrantLineage { lineage } => validate_lineage(lineage)?,
+            Self::TargetedGrantLineages { base, targets } => {
+                if let Some(base) = base {
+                    validate_lineage(base)?;
+                }
+                // Selecting nothing is valid: controller-only work holds no
+                // operation grant, so every operation is refused while the
+                // separately admitted controller lineage still applies.
+                if targets.len() > MAX_ASSOCIATION_REFERENCES {
                     return Err(AssociationError::Shape);
                 }
-                for grant in lineage {
-                    grant.validate()?;
+                // One canonical form: targets strictly ordered, so each target
+                // occurs once and equal selections have equal bytes.
+                if targets
+                    .windows(2)
+                    .any(|pair| pair[0].target >= pair[1].target)
+                {
+                    return Err(AssociationError::Shape);
+                }
+                for selected in targets {
+                    let named = match &selected.target {
+                        GrantTarget::McpServer { server } => !server.is_empty(),
+                        GrantTarget::RegisteredToolBundleOperation { bundle, operation } => {
+                            !bundle.is_empty() && !operation.is_empty()
+                        }
+                        GrantTarget::CheckedMcpRoute { route, server } => {
+                            !route.is_empty() && !server.is_empty()
+                        }
+                    };
+                    if !named {
+                        return Err(AssociationError::Shape);
+                    }
+                    validate_lineage(&selected.lineage)?;
                 }
             }
             Self::HostPolicy { policy } => qualified(&policy.resource.domain.authority)?,
@@ -101,6 +179,35 @@ impl WorkAuthorityBasis {
             }
         }
         Ok(())
+    }
+
+    /// The exact grant lineage this basis selects for an operation on
+    /// `target` (`None` for an operation without a typed target). A single
+    /// `GrantLineage` is the lineage of every operation. `None` when the
+    /// basis is not a grant lineage, or selected none for that target (or no
+    /// optional base): a missing target never falls back to the base.
+    pub fn lineage_for(&self, target: Option<&GrantTarget>) -> Option<&[GrantLineageRef]> {
+        match (self, target) {
+            (Self::GrantLineage { lineage }, _) => Some(lineage),
+            (Self::TargetedGrantLineages { base, .. }, None) => base.as_deref(),
+            (Self::TargetedGrantLineages { targets, .. }, Some(target)) => targets
+                .iter()
+                .find(|selected| &selected.target == target)
+                .map(|selected| selected.lineage.as_slice()),
+            (Self::HostPolicy { .. } | Self::ServiceMandate { .. }, _) => None,
+        }
+    }
+
+    /// Every grant lineage this basis holds, each complete and separate.
+    pub fn grant_lineages(&self) -> impl Iterator<Item = &[GrantLineageRef]> {
+        let (first, targets): (Option<&[GrantLineageRef]>, &[TargetGrantLineage]) = match self {
+            Self::GrantLineage { lineage } => (Some(lineage), &[]),
+            Self::TargetedGrantLineages { base, targets } => (base.as_deref(), targets),
+            Self::HostPolicy { .. } | Self::ServiceMandate { .. } => (None, &[]),
+        };
+        first
+            .into_iter()
+            .chain(targets.iter().map(|selected| selected.lineage.as_slice()))
     }
 }
 
@@ -454,6 +561,8 @@ protected_debug!(
     OriginalWorkRef,
     QualifiedIngressNamespace,
     WorkAuthorityBasis,
+    GrantTarget,
+    TargetGrantLineage,
     InputAuthorityAssociationCandidate,
     InputAuthorityAssociation,
     QualifiedInputKey
@@ -995,5 +1104,282 @@ mod tests {
             changed["authority_basis"][extra] = serde_json::Value::Null;
             assert!(serde_json::from_value::<InputAuthorityAssociation>(changed).is_err());
         }
+    }
+
+    fn server(name: &str) -> GrantTarget {
+        GrantTarget::McpServer {
+            server: name.into(),
+        }
+    }
+
+    fn targeted(
+        base: Option<Vec<GrantLineageRef>>,
+        targets: Vec<(GrantTarget, Vec<GrantLineageRef>)>,
+    ) -> WorkAuthorityBasis {
+        WorkAuthorityBasis::TargetedGrantLineages {
+            base,
+            targets: targets
+                .into_iter()
+                .map(|(target, lineage)| TargetGrantLineage { target, lineage })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn targeted_lineages_select_each_target_separately_and_round_trip() {
+        let mut value = candidate();
+        let chain = fixture_lineage_mut(&mut value).to_vec();
+        let mut other = chain.clone();
+        other[0].grant_id = id("other-grant");
+        value.authority_basis = targeted(
+            Some(chain.clone()),
+            vec![
+                (server("alpha"), chain.clone()),
+                (server("beta"), other.clone()),
+            ],
+        );
+        let association = InputAuthorityAssociation::new(value).expect("association");
+        let basis = &association.candidate().authority_basis;
+        assert_eq!(basis.lineage_for(None), Some(chain.as_slice()));
+        assert_eq!(
+            basis.lineage_for(Some(&server("alpha"))),
+            Some(chain.as_slice())
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&server("beta"))),
+            Some(other.as_slice())
+        );
+        assert_eq!(basis.lineage_for(Some(&server("gamma"))), None);
+        assert_eq!(basis.grant_lineages().count(), 3);
+
+        let wire = serde_json::to_value(&association).expect("wire");
+        let decoded: InputAuthorityAssociation =
+            serde_json::from_value(wire.clone()).expect("decode");
+        assert_eq!(decoded, association);
+        let mut unknown = wire;
+        unknown["authority_basis"]["targets"][0]["extra"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<InputAuthorityAssociation>(unknown).is_err());
+
+        // A single lineage still selects itself for every target.
+        let legacy = candidate();
+        let legacy_chain = legacy
+            .authority_basis
+            .lineage_for(None)
+            .expect("lineage")
+            .to_vec();
+        assert_eq!(
+            legacy.authority_basis.lineage_for(Some(&server("alpha"))),
+            Some(legacy_chain.as_slice())
+        );
+    }
+
+    #[test]
+    fn targeted_lineages_have_one_canonical_valid_shape() {
+        let mut value = candidate();
+        let chain = fixture_lineage_mut(&mut value).to_vec();
+        for basis in [
+            targeted(Some(Vec::new()), vec![(server("alpha"), chain.clone())]),
+            targeted(Some(chain.clone()), vec![(server("alpha"), Vec::new())]),
+            targeted(Some(chain.clone()), vec![(server(""), chain.clone())]),
+            targeted(
+                Some(chain.clone()),
+                vec![
+                    (server("beta"), chain.clone()),
+                    (server("alpha"), chain.clone()),
+                ],
+            ),
+            targeted(
+                Some(chain.clone()),
+                vec![
+                    (server("alpha"), chain.clone()),
+                    (server("alpha"), chain.clone()),
+                ],
+            ),
+        ] {
+            let mut invalid = value.clone();
+            invalid.authority_basis = basis;
+            assert_eq!(
+                InputAuthorityAssociation::new(invalid),
+                Err(AssociationError::Shape)
+            );
+        }
+        let mut base_only = value.clone();
+        base_only.authority_basis = targeted(Some(chain.clone()), Vec::new());
+        assert!(InputAuthorityAssociation::new(base_only).is_ok());
+        // No optional base: a target-only selection is complete on its own,
+        // and an operation without a target has no lineage.
+        let mut target_only = value;
+        target_only.authority_basis = targeted(None, vec![(server("alpha"), chain)]);
+        let target_only = InputAuthorityAssociation::new(target_only).expect("target only");
+        assert_eq!(
+            target_only.candidate().authority_basis.lineage_for(None),
+            None
+        );
+        // Selecting nothing is controller-only work: no operation lineage.
+        let mut controller_only = candidate();
+        controller_only.authority_basis = targeted(None, Vec::new());
+        let controller_only =
+            InputAuthorityAssociation::new(controller_only).expect("controller only");
+        let basis = &controller_only.candidate().authority_basis;
+        assert_eq!(basis.lineage_for(None), None);
+        assert_eq!(basis.lineage_for(Some(&server("alpha"))), None);
+        assert_eq!(basis.grant_lineages().count(), 0);
+    }
+
+    fn bundle_operation(bundle: &str, operation: &str) -> GrantTarget {
+        GrantTarget::RegisteredToolBundleOperation {
+            bundle: bundle.into(),
+            operation: operation.into(),
+        }
+    }
+
+    /// A registered bundle's operation is a target of its own: each exact
+    /// (bundle, operation) selects only its own lineage, never the base, a
+    /// sibling operation or a same-named server, and both names are required.
+    #[test]
+    fn bundle_operation_targets_select_only_their_own_lineage() {
+        let mut value = candidate();
+        let chain = fixture_lineage_mut(&mut value).to_vec();
+        let mut read = chain.clone();
+        read[0].grant_id = id("mail-read");
+        value.authority_basis = targeted(
+            Some(chain.clone()),
+            vec![
+                (server("mail"), chain.clone()),
+                (bundle_operation("mail", "read_mail"), read.clone()),
+            ],
+        );
+        let association = InputAuthorityAssociation::new(value.clone()).expect("association");
+        let basis = &association.candidate().authority_basis;
+        assert_eq!(
+            basis.lineage_for(Some(&bundle_operation("mail", "read_mail"))),
+            Some(read.as_slice())
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&bundle_operation("mail", "send_draft"))),
+            None,
+            "a sibling operation has no lineage"
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&bundle_operation("other", "read_mail"))),
+            None,
+            "another bundle has no lineage"
+        );
+        let wire = serde_json::to_value(&association).expect("wire");
+        assert_eq!(
+            wire["authority_basis"]["targets"][1]["target"],
+            serde_json::json!({
+                "kind": "registered_tool_bundle_operation",
+                "bundle": "mail",
+                "operation": "read_mail",
+            })
+        );
+        let decoded: InputAuthorityAssociation = serde_json::from_value(wire).expect("decode");
+        assert_eq!(decoded, association);
+
+        for target in [
+            bundle_operation("", "read_mail"),
+            bundle_operation("mail", ""),
+        ] {
+            let mut invalid = value.clone();
+            invalid.authority_basis = targeted(None, vec![(target, chain.clone())]);
+            assert_eq!(
+                InputAuthorityAssociation::new(invalid),
+                Err(AssociationError::Shape)
+            );
+        }
+        // One canonical order across target kinds.
+        let mut unordered = value;
+        unordered.authority_basis = targeted(
+            None,
+            vec![
+                (bundle_operation("mail", "read_mail"), read),
+                (server("mail"), chain),
+            ],
+        );
+        assert_eq!(
+            InputAuthorityAssociation::new(unordered),
+            Err(AssociationError::Shape)
+        );
+    }
+
+    fn checked_route(route: &str, server: &str) -> GrantTarget {
+        GrantTarget::CheckedMcpRoute {
+            route: route.into(),
+            server: server.into(),
+        }
+    }
+
+    /// A checked route to a server's raw operations is a target of its own:
+    /// it selects only its own lineage, never the server's ordinary lineage
+    /// or another route's, the server's ordinary operations never select
+    /// it, and both names are required.
+    #[test]
+    fn checked_route_targets_select_only_their_own_lineage() {
+        let mut value = candidate();
+        let chain = fixture_lineage_mut(&mut value).to_vec();
+        let mut checked = chain.clone();
+        checked[0].grant_id = id("setup-checked");
+        value.authority_basis = targeted(
+            None,
+            vec![
+                (server("setup"), chain.clone()),
+                (checked_route("checked", "setup"), checked.clone()),
+            ],
+        );
+        let association = InputAuthorityAssociation::new(value.clone()).expect("association");
+        let basis = &association.candidate().authority_basis;
+        assert_eq!(
+            basis.lineage_for(Some(&checked_route("checked", "setup"))),
+            Some(checked.as_slice())
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&server("setup"))),
+            Some(chain.as_slice()),
+            "the server's ordinary operations keep their own lineage"
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&checked_route("other", "setup"))),
+            None,
+            "another route has no lineage"
+        );
+        assert_eq!(
+            basis.lineage_for(Some(&checked_route("checked", "other"))),
+            None,
+            "the route to another server has no lineage"
+        );
+        let wire = serde_json::to_value(&association).expect("wire");
+        assert_eq!(
+            wire["authority_basis"]["targets"][1]["target"],
+            serde_json::json!({
+                "kind": "checked_mcp_route",
+                "route": "checked",
+                "server": "setup",
+            })
+        );
+        let decoded: InputAuthorityAssociation = serde_json::from_value(wire).expect("decode");
+        assert_eq!(decoded, association);
+
+        for target in [checked_route("", "setup"), checked_route("checked", "")] {
+            let mut invalid = value.clone();
+            invalid.authority_basis = targeted(None, vec![(target, chain.clone())]);
+            assert_eq!(
+                InputAuthorityAssociation::new(invalid),
+                Err(AssociationError::Shape)
+            );
+        }
+        // One canonical order across target kinds.
+        let mut unordered = value;
+        unordered.authority_basis = targeted(
+            None,
+            vec![
+                (checked_route("checked", "setup"), checked),
+                (server("setup"), chain),
+            ],
+        );
+        assert_eq!(
+            InputAuthorityAssociation::new(unordered),
+            Err(AssociationError::Shape)
+        );
     }
 }

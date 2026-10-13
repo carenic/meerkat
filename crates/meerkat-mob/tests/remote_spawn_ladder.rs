@@ -538,3 +538,120 @@ async fn mobless_profile_mounts_no_forwarding_dispatcher() {
 
     fixture.shutdown().await;
 }
+
+/// A host whose member substrate carries a registration hook: records each
+/// member it is asked about and selects (or refuses) that member's own
+/// session document as its destination.
+struct PlacedMemberHost {
+    seen: std::sync::Mutex<Vec<String>>,
+    refuse: bool,
+}
+
+#[async_trait::async_trait]
+impl meerkat_mob::MemberRuntimeRegistrationHook for PlacedMemberHost {
+    async fn select_destination(
+        &self,
+        identity: &meerkat_mob::MemberRuntimeBuildIdentity,
+    ) -> Result<meerkat_mob::MemberDestinationSelection, MobError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push(identity.member().member.clone());
+        if self.refuse {
+            return Err(MobError::WiringError(
+                "host refused the placed member".into(),
+            ));
+        }
+        let owner = meerkat_core::auth::PrincipalRef::new(
+            meerkat_core::auth::PrincipalKind::SharedAgent,
+            identity.member().member.clone(),
+        )
+        .unwrap();
+        Ok(meerkat_mob::MemberDestinationSelection {
+            logical_owner: owner.clone(),
+            context: identity.session_document().clone(),
+            context_generation: 1,
+            audience: meerkat_mob::AudienceRef::Principal { principal: owner },
+        })
+    }
+
+    async fn expected_destination(
+        &self,
+        _identity: &meerkat_mob::MemberRuntimeBuildIdentity,
+    ) -> Result<meerkat_mob::MemberDestinationSelection, MobError> {
+        Err(MobError::WiringError("not used by these tests".into()))
+    }
+
+    async fn verify_member_surface(
+        &self,
+        _identity: &meerkat_mob::MemberRuntimeBuildIdentity,
+        _surface: &[meerkat_core::ToolDef],
+    ) -> Result<(), MobError> {
+        Ok(())
+    }
+}
+
+async fn placed_spawn_through_hook(
+    name: &str,
+    refuse: bool,
+) -> (
+    Result<meerkat_mob::SpawnResult, MobError>,
+    std::sync::Arc<PlacedMemberHost>,
+) {
+    let host = std::sync::Arc::new(PlacedMemberHost {
+        seen: std::sync::Mutex::new(Vec::new()),
+        refuse,
+    });
+    let fixture = spawn_host_daemon_fixture(HostFixtureOptions {
+        member_runtime_registration_hook: Some(host.clone()),
+        ..HostFixtureOptions::named(name).with_member_build()
+    })
+    .await
+    .expect("spawn member-build host fixture");
+    let controlling = create_controlling_mob(name).await;
+    let report = controlling.bind_fixture(&fixture).await;
+    let result = controlling
+        .spawn_placed("worker", "placed", &report.host_id)
+        .await;
+    (result, host)
+}
+
+/// A host-placed member registers through the serving host's hook: the hook
+/// selects the placed member's destination, and the placed spawn does not
+/// commit. (The fixture's member substrate installs no governed work host,
+/// which a scoped destination requires; this test asserts the refusal, not
+/// its remote reason.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placed_member_registers_through_the_host_hook() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let (result, host) = placed_spawn_through_hook("ladder-hook-host", false).await;
+    assert!(
+        result.is_err(),
+        "the placed spawn does not commit an unscoped member"
+    );
+    assert!(
+        host.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|member| member == "placed"),
+        "the serving host's hook selected the placed member's destination"
+    );
+}
+
+/// A host hook that refuses a placed member refuses the placed spawn: no
+/// host-placed member bypasses the host's selection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_hook_refusal_refuses_the_placed_member() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let (result, host) = placed_spawn_through_hook("ladder-hook-refusing-host", true).await;
+    assert!(result.is_err(), "a refused placed member does not commit");
+    assert!(
+        host.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|member| member == "placed"),
+        "the refusal came from the serving host's hook"
+    );
+}

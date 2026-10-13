@@ -116,13 +116,13 @@ import {
   type MobAdoptMemberIdentityDeclarationParams,
   type MobAdoptMemberIdentityDeclarationResult,
   type MobResolveIdentityConvergenceBlockResult,
-  type MobkitJobCancelAckParams,
-  type MobkitJobCheckpointParams,
-  type MobkitJobCompleteParams,
-  type MobkitJobFailParams,
-  type MobkitJobHeartbeatParams,
-  type MobkitJobMutationResult,
-  type MobkitJobProgressParams,
+  type MetaJobCancelAckParams,
+  type MetaJobCheckpointParams,
+  type MetaJobCompleteParams,
+  type MetaJobFailParams,
+  type MetaJobHeartbeatParams,
+  type MetaJobMutationResult,
+  type MetaJobProgressParams,
   type MobSpawnManyParams,
   type MobSpawnManyResult,
   type WireLiveAdapterObservation,
@@ -160,6 +160,11 @@ import {
   parseLiveNotification,
   type LiveNotificationListener,
 } from "./live_webrtc.js";
+import {
+  CONSENT_NOTICE_NOTIFICATION,
+  parseConsentNotice,
+  type ConsentNoticeListener,
+} from "./consent.js";
 import type {
   ApprovalDecideParams as RpcApprovalDecideParams,
   ApprovalGetParams as RpcApprovalGetParams,
@@ -945,6 +950,7 @@ export class MeerkatClient {
   >();
   private eventQueues = new Map<string, AsyncQueue<Record<string, unknown> | null>>();
   private liveNotificationListeners = new Set<LiveNotificationListener>();
+  private consentNoticeListeners = new Set<ConsentNoticeListener>();
   private streamQueues = new Map<string, AsyncQueue<Record<string, unknown> | null>>();
   // Per-request_id stream subscriptions for createSessionStreaming calls whose
   // session_id is not yet bound. Keyed by the JSON-RPC request id so concurrent
@@ -1894,40 +1900,40 @@ export class MeerkatClient {
     return this.request("monitors/start", { ...params }) as Promise<MonitorsStartResult>;
   }
 
-  async mobkitJobHeartbeat(
-    params: MobkitJobHeartbeatParams,
-  ): Promise<MobkitJobMutationResult> {
-    return this.request("mobkit/jobs/heartbeat", { ...params }) as Promise<MobkitJobMutationResult>;
+  async metaJobHeartbeat(
+    params: MetaJobHeartbeatParams,
+  ): Promise<MetaJobMutationResult> {
+    return this.request("meta/jobs/heartbeat", { ...params }) as Promise<MetaJobMutationResult>;
   }
 
-  async mobkitJobProgress(
-    params: MobkitJobProgressParams,
-  ): Promise<MobkitJobMutationResult> {
-    return this.request("mobkit/jobs/progress", { ...params }) as Promise<MobkitJobMutationResult>;
+  async metaJobProgress(
+    params: MetaJobProgressParams,
+  ): Promise<MetaJobMutationResult> {
+    return this.request("meta/jobs/progress", { ...params }) as Promise<MetaJobMutationResult>;
   }
 
-  async mobkitJobCheckpoint(
-    params: MobkitJobCheckpointParams,
-  ): Promise<MobkitJobMutationResult> {
-    return this.request("mobkit/jobs/checkpoint", { ...params }) as Promise<MobkitJobMutationResult>;
+  async metaJobCheckpoint(
+    params: MetaJobCheckpointParams,
+  ): Promise<MetaJobMutationResult> {
+    return this.request("meta/jobs/checkpoint", { ...params }) as Promise<MetaJobMutationResult>;
   }
 
-  async mobkitJobComplete(
-    params: MobkitJobCompleteParams,
-  ): Promise<MobkitJobMutationResult> {
-    return this.request("mobkit/jobs/complete", { ...params }) as Promise<MobkitJobMutationResult>;
+  async metaJobComplete(
+    params: MetaJobCompleteParams,
+  ): Promise<MetaJobMutationResult> {
+    return this.request("meta/jobs/complete", { ...params }) as Promise<MetaJobMutationResult>;
   }
 
-  async mobkitJobFail(
-    params: MobkitJobFailParams,
-  ): Promise<MobkitJobMutationResult> {
-    return this.request("mobkit/jobs/fail", { ...params }) as Promise<MobkitJobMutationResult>;
+  async metaJobFail(
+    params: MetaJobFailParams,
+  ): Promise<MetaJobMutationResult> {
+    return this.request("meta/jobs/fail", { ...params }) as Promise<MetaJobMutationResult>;
   }
 
-  async mobkitJobCancelAck(
-    params: MobkitJobCancelAckParams,
-  ): Promise<MobkitJobMutationResult> {
-    return this.request("mobkit/jobs/cancel_ack", { ...params }) as Promise<MobkitJobMutationResult>;
+  async metaJobCancelAck(
+    params: MetaJobCancelAckParams,
+  ): Promise<MetaJobMutationResult> {
+    return this.request("meta/jobs/cancel_ack", { ...params }) as Promise<MetaJobMutationResult>;
   }
 
   async requestApproval(
@@ -4294,6 +4300,35 @@ export class MeerkatClient {
     };
   }
 
+  /**
+   * Receive each `approval/consent_notice`: one recorded R3 human consent
+   * transition of an approval this connection's approver decides (served
+   * by a stock governed pipe). Returns an unsubscribe function. Notices
+   * that arrive with no listener are dropped, a malformed one or a kind
+   * this SDK build does not know is ignored, and a throwing listener does
+   * not stop the others or the transport. A notice grants nothing.
+   */
+  onConsentNotice(listener: ConsentNoticeListener): () => void {
+    this.consentNoticeListeners.add(listener);
+    return () => {
+      this.consentNoticeListeners.delete(listener);
+    };
+  }
+
+  private dispatchConsentNotice(params: unknown): void {
+    const notice = parseConsentNotice(params);
+    if (notice === undefined) {
+      return;
+    }
+    for (const listener of [...this.consentNoticeListeners]) {
+      try {
+        listener(notice);
+      } catch {
+        // A listener fault is the listener's own; the transport goes on.
+      }
+    }
+  }
+
   private dispatchLiveNotification(method: string, params: unknown): void {
     const notification = parseLiveNotification(method, params);
     if (notification === undefined) {
@@ -4738,6 +4773,12 @@ export class MeerkatClient {
         this.dispatchLiveNotification(method, params);
         return;
       }
+      if (method === CONSENT_NOTICE_NOTIFICATION) {
+        // Consent notices carry no session_id either: they go to
+        // onConsentNotice listeners only.
+        this.dispatchConsentNotice(params);
+        return;
+      }
       if (method === "session/stream_event" || method === "mob/stream_event") {
         const streamId = String(params.stream_id ?? "");
         const queue = this.streamQueues.get(streamId);
@@ -5077,9 +5118,37 @@ export class MeerkatClient {
       MeerkatClient.requirePresentStringField(raw, "text", context);
     } else if (type === "image") {
       MeerkatClient.requirePresentStringField(raw, "media_type", context);
+      if (systemNoticeContent) {
+        // Notice content carries Core content blocks unchanged: its media
+        // names its source and carries that source's payload.
+        const source = MeerkatClient.requireClosedStringField(
+          raw,
+          "source",
+          ["inline", "blob"],
+          context,
+        );
+        if (source === "inline") {
+          MeerkatClient.requirePresentStringField(raw, "data", context);
+        } else {
+          MeerkatClient.requireStringField(raw, "blob_id", context);
+        }
+      }
     } else if (type === "video") {
       MeerkatClient.requirePresentStringField(raw, "media_type", context);
       MeerkatClient.requireNonNegativeIntegerField(raw, "duration_ms", context);
+      if (systemNoticeContent) {
+        const source = MeerkatClient.requireClosedStringField(
+          raw,
+          "source",
+          ["inline", "uri"],
+          context,
+        );
+        if (source === "inline") {
+          MeerkatClient.requirePresentStringField(raw, "data", context);
+        } else {
+          MeerkatClient.requireStringField(raw, "uri", context);
+        }
+      }
     } else if (type === "structured") {
       MeerkatClient.requireOwnField(raw, "data", context);
     } else if (type === "skill_context") {
@@ -5321,6 +5390,7 @@ export class MeerkatClient {
     } else if (type === "runtime_notice") {
       MeerkatClient.requirePresentStringField(raw, "category", context);
       MeerkatClient.validateOptionalStringField(raw, "detail", context);
+      validateContent();
     } else {
       MeerkatClient.validateOptionalStringField(raw, "summary", context);
     }

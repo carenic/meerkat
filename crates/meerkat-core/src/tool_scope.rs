@@ -848,6 +848,7 @@ mod generated_visibility_test_owner {
         Ok(crate::types::ToolProvenance {
             kind,
             source_id: source_id.into(),
+            artifact: None,
         })
     }
 
@@ -1722,6 +1723,7 @@ impl ToolScope {
             &mut filter_authority_catalog,
             visibility_state,
         );
+        pin_inherited_ceiling_witnesses(&mut filter_authority_catalog, visibility_state);
         self.visibility_owner
             .replace_filter_tool_authority_catalog(filter_authority_catalog)?;
 
@@ -1892,8 +1894,14 @@ impl ToolScope {
         let Some(witness) = witness else {
             return true;
         };
+        // Visibility identity is the source (kind and source_id): the
+        // artifact is attribution and must not unbind a filter or a
+        // deferral witnessed before it was known.
         if let Some(expected_provenance) = witness.last_seen_provenance.as_ref()
-            && tool.provenance.as_ref() != Some(expected_provenance)
+            && !tool
+                .provenance
+                .as_ref()
+                .is_some_and(|provenance| provenance.same_source(expected_provenance))
         {
             return false;
         }
@@ -2089,6 +2097,7 @@ impl ToolScope {
             &mut filter_authority_catalog,
             &visibility_state,
         );
+        pin_inherited_ceiling_witnesses(&mut filter_authority_catalog, &visibility_state);
         self.visibility_owner
             .replace_filter_tool_authority_catalog(filter_authority_catalog)?;
         self.visibility_owner
@@ -2706,7 +2715,10 @@ fn filter_witness_matches_catalog(
     expected: &ToolVisibilityWitness,
 ) -> bool {
     if let Some(provenance) = witness.last_seen_provenance.as_ref()
-        && expected.last_seen_provenance.as_ref() != Some(provenance)
+        && !expected
+            .last_seen_provenance
+            .as_ref()
+            .is_some_and(|expected| expected.same_source(provenance))
     {
         return false;
     }
@@ -2768,29 +2780,46 @@ fn extend_deferred_authority_catalog_from_visibility_state(
     }
 }
 
+/// Back every identity-bearing retained filter witness whose name has no
+/// entry in the filter authority catalog. A ceiling or filter name whose
+/// source is still connecting or was removed, and the retained witness of a
+/// name a handoff narrowed away, stay authorized by the identity they were
+/// witnessed with. A name the catalog already holds keeps that entry, and
+/// projection still matches each mounted tool's source against its witness.
 fn extend_filter_authority_catalog_from_visibility_state(
     catalog: &mut std::collections::BTreeMap<ToolName, ToolVisibilityWitness>,
     visibility_state: &SessionToolVisibilityState,
 ) {
-    for witness_names in [
-        visibility_state.inherited_base_filter.names(),
-        visibility_state.active_filter.names(),
-        visibility_state.staged_filter.names(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        for name in witness_names {
-            if catalog.contains_key(name.as_str()) {
-                continue;
-            }
-            if let Some(witness) = visibility_state
-                .filter_witnesses
-                .get(name.as_str())
-                .filter(|witness| witness.has_identity_witness())
-            {
-                catalog.insert(name.clone(), witness.clone());
-            }
+    for (name, witness) in &visibility_state.filter_witnesses {
+        if catalog.contains_key(name.as_str()) || !witness.has_identity_witness() {
+            continue;
+        }
+        catalog.insert(name.clone(), witness.clone());
+    }
+}
+
+/// Keep each inherited-ceiling name of the target visibility state on its
+/// retained identity witness, over the entry a same-name tool of another
+/// source put in the catalog. The mounted tool definitions and the source
+/// comparison are unchanged: an inherited allow still hides that tool, and
+/// an inherited deny still applies only to the witnessed identity. Each later
+/// boundary still finds every retained ceiling witness backed by the catalog
+/// instead of failing the whole tool set closed. Names outside the inherited
+/// ceiling (active and staged filter names) keep the catalog's entry.
+fn pin_inherited_ceiling_witnesses(
+    catalog: &mut std::collections::BTreeMap<ToolName, ToolVisibilityWitness>,
+    visibility_state: &SessionToolVisibilityState,
+) {
+    let Some(ceiling_names) = visibility_state.inherited_base_filter.names() else {
+        return;
+    };
+    for name in ceiling_names {
+        if let Some(witness) = visibility_state
+            .filter_witnesses
+            .get(name.as_str())
+            .filter(|witness| witness.has_identity_witness())
+        {
+            catalog.insert(name.clone(), witness.clone());
         }
     }
 }
@@ -2965,6 +2994,7 @@ mod tests {
                     provenance: Some(ToolProvenance {
                         kind: ToolSourceKind::Callback,
                         source_id: (*name).into(),
+                        artifact: None,
                     }),
                 })
             })
@@ -2981,6 +3011,7 @@ mod tests {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Callback,
                 source_id: source_id.into(),
+                artifact: None,
             }),
         })
     }
@@ -3037,6 +3068,7 @@ mod tests {
                     .with_provenance(ToolProvenance {
                         kind: ToolSourceKind::Callback,
                         source_id: name.into(),
+                        artifact: None,
                     }),
             )
         })
@@ -3441,6 +3473,7 @@ mod tests {
                 last_seen_provenance: Some(ToolProvenance {
                     kind: ToolSourceKind::Callback,
                     source_id: "forged".into(),
+                    artifact: None,
                 }),
             },
         );
@@ -3763,6 +3796,7 @@ mod tests {
                         last_seen_provenance: Some(ToolProvenance {
                             kind: ToolSourceKind::Callback,
                             source_id: "owner-b".into(),
+                            artifact: None,
                         }),
                     },
                 )]
@@ -3858,6 +3892,7 @@ mod tests {
                     last_seen_provenance: Some(ToolProvenance {
                         kind: ToolSourceKind::Callback,
                         source_id: "owner-b".into(),
+                        artifact: None,
                     }),
                 },
             )])
@@ -3899,6 +3934,7 @@ mod tests {
                         last_seen_provenance: Some(ToolProvenance {
                             kind: ToolSourceKind::Callback,
                             source_id: "forged".into(),
+                            artifact: None,
                         }),
                     },
                 ),
@@ -3959,7 +3995,18 @@ mod tests {
 
     #[test]
     fn filter_witness_mismatch_prevents_rebinding_a_dormant_filter_name() {
-        let original = tool_with_provenance("a", "owner-a");
+        // The original carries a verified artifact; the staged witness
+        // projection does not encode it, and must still bind the deny.
+        let original = {
+            let tool = tool_with_provenance("a", "owner-a");
+            let mut def = (*tool).clone();
+            def.provenance = def.provenance.map(|provenance| {
+                provenance.with_artifact(
+                    crate::types::ToolArtifactRef::new("ext.a", "sha256:aa").unwrap(),
+                )
+            });
+            Arc::new(def)
+        };
         let rebound = tool_with_provenance("a", "owner-b");
         let visible = tool_with_provenance("b", "owner-b");
         let scope = scope_with_generated_visibility(
@@ -4056,6 +4103,66 @@ mod tests {
         assert!(
             scope.visible_tool_names().unwrap().is_empty(),
             "a different owner must not inherit prior inherited-base visibility intent"
+        );
+    }
+
+    /// While another source serves an inherited ceiling name, the ceiling's
+    /// witnessed identity stays the filter authority for that name: every
+    /// later boundary applies (that tool hidden, the rest of the ceiling
+    /// visible) instead of failing the whole tool set closed, and the
+    /// witnessed tool lists again when its own source returns.
+    #[test]
+    fn inherited_witness_stays_the_filter_authority_while_another_source_serves_its_name() {
+        let original = tool_with_provenance("a", "owner-a");
+        let rebound = tool_with_provenance("a", "owner-b");
+        let sibling = tool_with_provenance("b", "owner-sibling");
+        let scope = scope_with_generated_visibility(
+            vec![Arc::clone(&original), Arc::clone(&sibling)].into(),
+        );
+        let witness = |tool: &Arc<ToolDef>| ToolVisibilityWitness {
+            last_seen_provenance: tool.provenance.clone(),
+        };
+        scope
+            .set_visibility_state(crate::SessionToolVisibilityState {
+                inherited_base_filter: ToolFilter::Allow(set(&["a", "b"])),
+                filter_witnesses: [
+                    ("a".into(), witness(&original)),
+                    ("b".into(), witness(&sibling)),
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        for boundary in 1..=3 {
+            let applied =
+                scope.apply_staged(vec![Arc::clone(&rebound), Arc::clone(&sibling)].into());
+            assert!(
+                applied.is_ok(),
+                "boundary {boundary} with another source serving `a` applies: {:?}",
+                applied.err()
+            );
+            assert_eq!(
+                scope.visible_tool_names().unwrap(),
+                ["b".into()].into_iter().collect(),
+                "boundary {boundary}: the other source's `a` stays hidden and the rest of the \
+                 ceiling stays visible"
+            );
+        }
+
+        scope
+            .apply_staged(vec![Arc::clone(&original), Arc::clone(&sibling)].into())
+            .expect("the witnessed source returns at a boundary");
+        assert_eq!(
+            scope.visible_tool_names().unwrap(),
+            ["a".into(), "b".into()].into_iter().collect(),
+            "the witnessed tool lists again once its own source returns"
+        );
+        assert_eq!(
+            scope.visibility_state().unwrap().filter_witnesses.get("a"),
+            Some(&witness(&original)),
+            "the ceiling's identity is never reinterpreted"
         );
     }
 

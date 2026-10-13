@@ -8,7 +8,7 @@ icon: "book"
 
 ```python
 from meerkat import CONTRACT_VERSION
-print(CONTRACT_VERSION)  # "0.8.52"
+print(CONTRACT_VERSION)  # "0.9.0"
 ```
 
 ## Primary handles
@@ -261,8 +261,8 @@ resolves the declared binding in its authorized realm.
 The public job wrappers are `jobs_get`, `jobs_list`, `jobs_cancel`,
 `jobs_progress`, `jobs_result`, `jobs_artifacts`, `jobs_retry`, `jobs_health`,
 `jobs_subscribe`, and `jobs_unsubscribe`. `monitors_start` creates a detached
-monitor job. MobKit worker implementations additionally use the six
-`mobkit_job_*` authority-checked mutation methods.
+monitor job. Meta worker implementations additionally use the six
+`meta_job_*` authority-checked mutation methods.
 
 Every public Python RPC wrapper binds its request and result transport boundary
 to generated RPC-schema contracts. The job request and result dataclasses in

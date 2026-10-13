@@ -36,7 +36,7 @@ use meerkat_providers::NormalizedAuthMethod;
 use meerkat_providers::auth_oauth::{OAuthError, PkcePair, exchange_authorization_code_with_state};
 use meerkat_providers::auth_store::{
     CredentialMutationError, CredentialMutationOutcome, PersistedAuthMode, PersistedTokens,
-    ProviderAuthPersistence, RefreshCoordinator, TokenKey, TokenStore,
+    ProviderAuthPersistence, RefreshCoordinator, TokenKey, TokenStore, TokenStoreAccess,
     credential_source_uses_persisted_store, persisted_auth_mode_is_oauth_login,
 };
 use meerkat_providers::oauth_flow::{
@@ -190,10 +190,14 @@ fn write_owner_error_status(error: &WriteOwnerError) -> StatusCode {
 }
 
 fn host_auth_service(state: &AppState) -> meerkat::HostAuthService {
+    // MCP logins, status and logout address this host realm's own slot.
     meerkat::HostAuthService::new(
         state.provider_auth_persistence.clone(),
         state.runtime_adapter.provider_auth_runtime_authority(),
     )
+    .with_mcp_realm(state.realm.clone())
+    .with_connector_client_auth_profiles(state.connector_client_auth_profiles.iter().cloned())
+    .with_realm_connector_clients(Arc::clone(&state.realm_config_source), state.realm.clone())
 }
 
 /// Resolve a requested MCP target against this host's configured MCP servers:
@@ -260,9 +264,14 @@ fn host_auth_error_response(error: meerkat::HostAuthError) -> axum::response::Re
         meerkat::HostAuthError::ConnectorTarget(_) => StatusCode::BAD_REQUEST,
     };
     let reason = error.reason();
-    if reason == meerkat_contracts::WireAuthErrorReason::Infrastructure {
+    if error.withholds_detail() {
         // Protected diagnostics only: the public text is fixed.
-        tracing::warn!(target: "meerkat::auth", error = %error, "auth infrastructure failure");
+        tracing::warn!(
+            target: "meerkat::auth",
+            error = %error,
+            reason = ?reason,
+            "auth failure; detail withheld from the public text"
+        );
     }
     (
         status,
@@ -532,7 +541,14 @@ async fn save_marked_token_commit_unlocked(
             return Err((StatusCode::INTERNAL_SERVER_ERROR, message));
         }
     };
-    if let Err(e) = token_store.save(&commit.key, &committed_tokens).await {
+    if let Err(e) = token_store
+        .save_for(
+            &commit.key,
+            &committed_tokens,
+            TokenStoreAccess::Interactive,
+        )
+        .await
+    {
         let message = match rollback_token_commit(token_store, auth_lease, commit).await {
             Ok(()) => {
                 format!("TokenStore save failed{failure_context}: {e}; acquired lease rolled back")
@@ -618,7 +634,7 @@ async fn rollback_token_commit(
                     .release_credential_lifecycle(&commit.lease_key)
                     .map_err(|e| format!("AuthMachine lifecycle rollback release failed: {e}"))?;
                 token_store
-                    .save(&commit.key, previous)
+                    .save_for(&commit.key, previous, TokenStoreAccess::Interactive)
                     .await
                     .map_err(|e| format!("TokenStore rollback save failed: {e}"))?;
                 let restored_transition = meerkat_core::restore_token_lifecycle_snapshot(
@@ -635,7 +651,11 @@ async fn rollback_token_commit(
                         )
                         .map_err(|e| format!("AuthMachine rollback marker handoff failed: {e}"))?;
                     token_store
-                        .save(&commit.key, &restored_previous)
+                        .save_for(
+                            &commit.key,
+                            &restored_previous,
+                            TokenStoreAccess::Interactive,
+                        )
                         .await
                         .map_err(|e| format!("TokenStore rollback marker save failed: {e}"))?;
                 }
@@ -645,7 +665,7 @@ async fn rollback_token_commit(
                     .release_credential_lifecycle(&commit.lease_key)
                     .map_err(|e| format!("AuthMachine lifecycle rollback release failed: {e}"))?;
                 token_store
-                    .save(&commit.key, previous)
+                    .save_for(&commit.key, previous, TokenStoreAccess::Interactive)
                     .await
                     .map_err(|e| format!("TokenStore rollback save failed: {e}"))?;
             }
@@ -655,7 +675,7 @@ async fn rollback_token_commit(
                 .release_credential_lifecycle(&commit.lease_key)
                 .map_err(|e| format!("AuthMachine lifecycle rollback release failed: {e}"))?;
             token_store
-                .clear(&commit.key)
+                .clear_for(&commit.key, TokenStoreAccess::Interactive)
                 .await
                 .map_err(|e| format!("TokenStore rollback clear failed: {e}"))?;
         }
@@ -763,9 +783,9 @@ async fn save_tokens_and_consume_device_flow(
                     .await
                     .map_err(|(_, message)| CredentialMutationError::Operation(message))?;
                     let committed = token_store
-                        .load(&load_key)
+                        .load_for(&load_key, TokenStoreAccess::Interactive)
                         .await
-                        .map_err(|error| CredentialMutationError::TokenStore(error.to_string()))?
+                        .map_err(CredentialMutationError::from_token_store)?
                         .ok_or_else(|| {
                             CredentialMutationError::TokenStore(
                                 "successful device login left no persisted credential".to_string(),
@@ -881,9 +901,9 @@ async fn save_tokens_and_consume_browser_flow(
                     .await
                     .map_err(|(_, message)| CredentialMutationError::Operation(message))?;
                     let committed = token_store
-                        .load(&load_key)
+                        .load_for(&load_key, TokenStoreAccess::Interactive)
                         .await
-                        .map_err(|error| CredentialMutationError::TokenStore(error.to_string()))?
+                        .map_err(CredentialMutationError::from_token_store)?
                         .ok_or_else(|| {
                             CredentialMutationError::TokenStore(
                                 "successful browser login left no persisted credential".to_string(),
@@ -1444,6 +1464,10 @@ pub async fn complete_login(
                         account_verification = ?completed.account_verification,
                         "MCP OAuth login completed via REST"
                     );
+                    // Wake the exact operation awaiting this target in this
+                    // server's sessions; it retries at its next boundary.
+                    #[cfg(feature = "mcp")]
+                    crate::mcp_credential_landed(&state, &completed.target).await;
                     (
                         StatusCode::OK,
                         Json(WireLoginReady {
@@ -1475,6 +1499,7 @@ pub async fn complete_login(
                                 redirect_uri: body.redirect_uri,
                                 state: body.state,
                                 code: body.code,
+                                host_attempt_handle: None,
                             },
                         )
                         .await
@@ -1803,45 +1828,49 @@ pub async fn get_auth_status(
         .unwrap_or(false);
     let phase = meerkat_core::AuthStatusPhase::from_lease_snapshot(now, &snapshot);
     let mut stored = None;
+    let mut credential_observation = None;
     if source_uses_store {
-        if phase.is_no_live_lease() {
-            if let Some(expected_mode) = expected_mode {
-                // A store fault during rehydration is a real error, not
-                // absent credentials: collapsing it would report a store
-                // failure as "no credentials"/Unknown status.
-                match meerkat_core::rehydrate_marked_tokens_for_status_for_identity(
-                    state.token_store().as_ref(),
-                    &state.auth_lease,
-                    &credential_identity,
-                    expected_mode,
-                    now,
-                )
-                .await
-                {
-                    Ok(Some(rehydrated)) => {
-                        stored = Some(rehydrated);
-                        snapshot = state.auth_lease.snapshot(&lease_key);
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(serde_json::json!({
-                                "error": format!("TokenStore rehydration failed: {err}")
-                            })),
-                        )
-                            .into_response();
+        // Status never waits behind credential work and never starts an
+        // operating-system credential read. A store fault is a real error,
+        // not absent credentials, and an unanswered read is reported as such.
+        let read = if phase.is_no_live_lease() {
+            match expected_mode {
+                Some(expected_mode) => {
+                    match meerkat_core::observe_marked_tokens_for_status_for_identity(
+                        state.token_store().as_ref(),
+                        &state.auth_lease,
+                        &credential_identity,
+                        expected_mode,
+                        now,
+                    )
+                    .await
+                    {
+                        Ok(read) => {
+                            snapshot = state.auth_lease.snapshot(&lease_key);
+                            Some(read)
+                        }
+                        Err(err) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({
+                                    "error": format!("TokenStore rehydration failed: {err}")
+                                })),
+                            )
+                                .into_response();
+                        }
                     }
                 }
+                None => None,
             }
         } else {
-            // A store-load fault is a real error, not absent credentials.
-            stored = match state
+            match state
                 .token_store()
-                .load(&TokenKey::from_credential_identity(&credential_identity))
+                .observe_status(&TokenKey::from_credential_identity(&credential_identity))
                 .await
             {
-                Ok(stored) => stored,
+                Ok(observation) => Some(meerkat_core::CredentialStatusRead::from_observation(
+                    observation,
+                )),
                 Err(err) => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1851,7 +1880,11 @@ pub async fn get_auth_status(
                     )
                         .into_response();
                 }
-            };
+            }
+        };
+        if let Some(read) = read {
+            credential_observation = read.observation();
+            stored = read.into_tokens();
         }
     }
     if stored
@@ -1902,6 +1935,7 @@ pub async fn get_auth_status(
             last_refresh_at: tokens.and_then(|t| t.last_refresh.map(|e| e.to_rfc3339())),
             account_id: tokens.and_then(|t| t.account_id.clone()),
             has_refresh_token: tokens.map(|t| t.refresh_token.is_some()).unwrap_or(false),
+            credential_observation,
         }),
     )
         .into_response()
@@ -2317,6 +2351,19 @@ mod tests {
 
         fn backend_name(&self) -> &'static str {
             "load_failing"
+        }
+
+        /// The same fault answers a status observation.
+        async fn observe_status(
+            &self,
+            _key: &TokenKey,
+        ) -> Result<
+            meerkat_providers::auth_store::TokenStoreObservation,
+            meerkat_providers::auth_store::TokenStoreError,
+        > {
+            Err(meerkat_providers::auth_store::TokenStoreError::Serde(
+                "malformed token fixture".into(),
+            ))
         }
     }
 
@@ -3186,9 +3233,12 @@ mod tests {
             oauth_account: Some(SUBJECT.to_string()),
             oauth_account_selection: None,
         };
+        // REST's host auth service serves the state's realm, so the login
+        // attempt is keyed by the realm-scoped target.
         let target = meerkat::McpServerIdentity::from_server_config("canary", fixture.mcp_url())
             .with_expected_account(SUBJECT)
-            .unwrap();
+            .unwrap()
+            .in_realm(state.realm.clone());
         let identity: meerkat_core::AuthCredentialIdentity =
             target.auth_binding_ref().unwrap().into();
         let mut canaries: Vec<String> = ISSUED_SECRET_CANARIES
@@ -4741,6 +4791,153 @@ mod tests {
         assert_eq!(detail.last_refresh_at, None);
         assert_eq!(detail.account_id, None);
         assert!(!detail.has_refresh_token);
+    }
+
+    /// A store whose plain reads (an interactive mutation reads through them)
+    /// park until released, counting every read and every status observation.
+    struct ParkedReadTokenStore {
+        inner: meerkat_providers::auth_store::EphemeralTokenStore,
+        reads: std::sync::atomic::AtomicUsize,
+        observations: std::sync::atomic::AtomicUsize,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl ParkedReadTokenStore {
+        fn new() -> Self {
+            Self {
+                inner: meerkat_providers::auth_store::EphemeralTokenStore::new(),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+                observations: std::sync::atomic::AtomicUsize::new(0),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_providers::auth_store::TokenStore for ParkedReadTokenStore {
+        async fn load(
+            &self,
+            key: &meerkat_providers::auth_store::TokenKey,
+        ) -> Result<
+            Option<meerkat_providers::auth_store::PersistedTokens>,
+            meerkat_providers::auth_store::TokenStoreError,
+        > {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.entered.notify_one();
+            let _permit = self.release.acquire().await;
+            self.inner.load(key).await
+        }
+
+        async fn save(
+            &self,
+            key: &meerkat_providers::auth_store::TokenKey,
+            tokens: &meerkat_providers::auth_store::PersistedTokens,
+        ) -> Result<(), meerkat_providers::auth_store::TokenStoreError> {
+            self.inner.save(key, tokens).await
+        }
+
+        async fn clear(
+            &self,
+            key: &meerkat_providers::auth_store::TokenKey,
+        ) -> Result<(), meerkat_providers::auth_store::TokenStoreError> {
+            self.inner.clear(key).await
+        }
+
+        async fn list(
+            &self,
+        ) -> Result<
+            Vec<meerkat_providers::auth_store::TokenKey>,
+            meerkat_providers::auth_store::TokenStoreError,
+        > {
+            self.inner.list().await
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "parked_read"
+        }
+
+        async fn observe_status(
+            &self,
+            key: &meerkat_providers::auth_store::TokenKey,
+        ) -> Result<
+            meerkat_providers::auth_store::TokenStoreObservation,
+            meerkat_providers::auth_store::TokenStoreError,
+        > {
+            self.observations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.observe_status(key).await
+        }
+    }
+
+    /// T1 at the public REST status entry: an interactive save holds the
+    /// actual lifecycle guard while its durable read is in flight. Status
+    /// answers at once that the owner is busy, and reads nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rest_auth_status_with_the_owner_busy_answers_at_once_without_reading() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = AppState::load_from(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        install_ephemeral_auth_state(&mut state);
+        let store = Arc::new(ParkedReadTokenStore::new());
+        state.provider_auth_persistence =
+            ProviderAuthPersistence::new(store.clone(), Arc::new(InMemoryCoordinator::new()));
+        // Its own realm: the lifecycle owner registry is process wide.
+        let mut config = config_with_openai_managed_store_binding();
+        let section = config.realm.remove("dev").unwrap();
+        config.realm.insert("t1-rest".into(), section);
+        state.config_runtime.set(config, None).await.unwrap();
+        let auth_binding = AuthBindingRef {
+            realm: RealmId::parse("t1-rest").unwrap(),
+            binding: BindingId::parse("default_openai").unwrap(),
+            profile: None,
+            origin: meerkat_core::connection::BindingOrigin::Configured,
+        };
+        let save = save_tokens_and_publish_lifecycle(
+            state.provider_auth_persistence.clone(),
+            state.auth_lease.clone(),
+            auth_binding,
+            api_key_tokens(),
+        );
+        tokio::pin!(save);
+        tokio::select! {
+            _ = &mut save => panic!("the save cannot finish while its read is parked"),
+            () = store.entered.notified() => {}
+        }
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            get_auth_status(
+                State(state.clone()),
+                Path(BindingId::parse("default_openai").unwrap()),
+                Query(RealmQuery {
+                    realm_id: RealmId::parse("t1-rest").unwrap(),
+                    profile_id: None,
+                }),
+            ),
+        )
+        .await
+        .expect("status answers at once, without waiting for the interactive save");
+
+        let detail = auth_status_detail(response).await;
+        assert_eq!(
+            detail.credential_observation,
+            Some(meerkat_core::CredentialObservation::OwnerBusy)
+        );
+        assert_eq!(
+            store.observations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "status read nothing"
+        );
+        assert_eq!(
+            store.reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the interactive save read the store"
+        );
+        store.release.add_permits(1);
+        assert!(save.await.is_ok(), "the interactive save completes");
     }
 
     #[tokio::test]

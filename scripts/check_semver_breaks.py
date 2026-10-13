@@ -324,6 +324,9 @@ STRUCTURAL_EXTRACTORS = {
     "auto_trait_impl_removed": _symbols_auto_trait_impl_removed,
     "constructible_struct_adds_field": _symbols_constructible_struct_adds_field,
     "constructible_struct_adds_private_field": _symbols_constructible_struct_adds_field,
+    # "enum {{enum_name}} in <file>:<line>" (v0.51.0 template; first seen on
+    # the 0.9.0 readiness report for DslRejectionKind). Names only the enum.
+    "enum_discriminants_undefined_non_unit_variant": _symbols_enum_missing,
     "enum_no_repr_variant_discriminant_changed": (
         _symbols_enum_no_repr_variant_discriminant_changed
     ),
@@ -335,6 +338,9 @@ STRUCTURAL_EXTRACTORS = {
     # "enum <path>, previously in file <file>:<line>" (v0.51.0 template;
     # first seen on the 0.8.52 main-push report).
     "enum_missing": _symbols_enum_missing,
+    # "enum {{name}} in <file>:<line>" (v0.51.0 template; first seen on the
+    # 0.9.0 readiness report for TokenStoreError). Names only the enum.
+    "enum_marked_non_exhaustive": _symbols_enum_missing,
     "enum_variant_added": _symbols_enum_variant_added,
     "enum_variant_missing": _symbols_enum_variant_missing,
     "derive_trait_impl_removed": _symbols_derive_trait_impl_removed,

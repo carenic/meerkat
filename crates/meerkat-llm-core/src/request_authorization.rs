@@ -20,6 +20,24 @@ pub struct ResolvedModelAuthorizationTarget {
     backend_profile_id: Arc<str>,
     backend_kind: Arc<str>,
     credential: AuthCredentialIdentity,
+    credential_requirement: meerkat_core::ControllerCredentialRequirement,
+}
+
+/// The credential requirement the actual resolved connection reports: only a
+/// connection its resolver resolved to no credential material is authless.
+fn resolved_credential_requirement(
+    connection: &crate::provider_runtime::binding::ResolvedConnection,
+) -> meerkat_core::ControllerCredentialRequirement {
+    match connection.auth_lease.kind() {
+        meerkat_core::auth::ResolvedAuthKind::None => {
+            meerkat_core::ControllerCredentialRequirement::Authless
+        }
+        meerkat_core::auth::ResolvedAuthKind::InlineSecret(_)
+        | meerkat_core::auth::ResolvedAuthKind::StaticHeaders(_)
+        | meerkat_core::auth::ResolvedAuthKind::DynamicAuthorizer(_) => {
+            meerkat_core::ControllerCredentialRequirement::Required
+        }
+    }
 }
 
 impl ResolvedModelAuthorizationTarget {
@@ -29,6 +47,7 @@ impl ResolvedModelAuthorizationTarget {
             backend_profile_id: Arc::from(target.connection().backend_profile.id.as_str()),
             backend_kind: Arc::from(target.connection().backend.as_str()),
             credential: target.connection().credential_identity.clone(),
+            credential_requirement: resolved_credential_requirement(target.connection()),
         }
     }
 
@@ -39,6 +58,7 @@ impl ResolvedModelAuthorizationTarget {
             self.backend_profile_id.to_string(),
             self.backend_kind.to_string(),
         )
+        .with_credential_requirement(self.credential_requirement)
     }
 
     pub(crate) fn facts(
@@ -68,6 +88,30 @@ impl std::fmt::Debug for ResolvedModelAuthorizationTarget {
     }
 }
 
+/// Give `inner`, a client the factory built outside the registry's text
+/// target path (a self-hosted OpenAI-compatible server), the same selected
+/// target projection as a registry-built client: `identity` exactly as
+/// selected, and the actual resolved connection's backend profile, backend
+/// kind and stable credential owner. An authless server keeps its resolved
+/// binding as the credential owner; no account is invented. Nothing secret
+/// is retained.
+pub fn select_resolved_connection(
+    inner: Arc<dyn LlmClient>,
+    identity: SessionLlmIdentity,
+    connection: &crate::provider_runtime::binding::ResolvedConnection,
+) -> Arc<dyn LlmClient> {
+    Arc::new(SelectedTargetClient::new(
+        inner,
+        ResolvedModelAuthorizationTarget {
+            identity: Arc::new(identity),
+            backend_profile_id: Arc::from(connection.backend_profile.id.as_str()),
+            backend_kind: Arc::from(connection.backend.as_str()),
+            credential: connection.credential_identity.clone(),
+            credential_requirement: resolved_credential_requirement(connection),
+        },
+    ))
+}
+
 pub(crate) struct SelectedTargetClient {
     inner: Arc<dyn LlmClient>,
     target: Arc<ResolvedModelAuthorizationTarget>,
@@ -87,6 +131,10 @@ impl SelectedTargetClient {
 impl LlmClient for SelectedTargetClient {
     async fn prepare_controller_credential(&self) -> Result<(), meerkat_core::auth::AuthError> {
         self.inner.prepare_controller_credential().await
+    }
+
+    fn output_token_limit(&self) -> Option<u32> {
+        self.inner.output_token_limit()
     }
 
     fn controller_model_selection(&self) -> Option<meerkat_core::ControllerModelSelection> {

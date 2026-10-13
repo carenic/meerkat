@@ -362,12 +362,56 @@ Failed in:
                 "crates/meerkat-mob/src/runtime/session_service.rs:1433",
                 ("MobSessionService", "runtime_adapter"),
             ),
+            "enum_discriminants_undefined_non_unit_variant": (
+                "enum DslRejectionKind in crates/meerkat-core/src/handles.rs:756",
+                ("DslRejectionKind",),
+            ),
+            "enum_marked_non_exhaustive": (
+                "enum TokenStoreError in crates/meerkat-core/src/auth/token_store.rs:607",
+                ("TokenStoreError",),
+            ),
         }
         for lint_id, (item, expected) in cases.items():
             with self.subTest(lint_id=lint_id):
                 symbols, structural = gate.extract_symbols(lint_id, gate.strip_location(item))
                 self.assertTrue(structural)
                 self.assertEqual(symbols, expected)
+
+    def test_enum_level_shapes_require_the_enum_name(self) -> None:
+        # Both v0.51.0 templates name only the enum, first seen on the 0.9.0
+        # readiness report: they are read in full, so they no longer fail
+        # check_recognized, and the enum itself must be declared.
+        report = """\
+    Checking meerkat-core v0.8.52 -> v0.9.0 (assume patch change)
+--- failure enum_discriminants_undefined_non_unit_variant: enum's variants no longer have defined discriminants due to non-unit variant ---
+Failed in:
+  enum DslRejectionKind in crates/meerkat-core/src/handles.rs:756
+--- failure enum_marked_non_exhaustive: enum marked #[non_exhaustive] ---
+Failed in:
+  enum TokenStoreError in crates/meerkat-core/src/auth/token_store.rs:607
+     Summary semver requires new major version: 2 major and 0 minor checks failed
+    Finished [   0.100s] meerkat-core
+"""
+        parsed = gate.parse_report(report)
+        self.assertEqual(
+            [(f.lint_id, f.symbols, f.structural) for f in parsed.findings],
+            [
+                ("enum_discriminants_undefined_non_unit_variant", ("DslRejectionKind",), True),
+                ("enum_marked_non_exhaustive", ("TokenStoreError",), True),
+            ],
+        )
+        self.assertEqual(gate.check_recognized(parsed), [])
+
+        def section(body: str) -> "gate.Section":
+            return gate.Section(
+                "## [9.9.9] - 2026-01-01", "9.9.9", " - 2026-01-01", f"\n### Breaking\n\n- {body}\n"
+            )
+
+        errors = gate.check_named(parsed, section("`TokenStoreError` is `#[non_exhaustive]`."))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("missing: `DslRejectionKind`", errors[0])
+        declared = "`TokenStoreError` is `#[non_exhaustive]`; `DslRejectionKind` gains a tuple variant."
+        self.assertEqual(gate.check_named(parsed, section(declared)), [])
 
     def test_unrecognized_shape_fails_closed_naming_the_lint(self) -> None:
         item = "type Widget is now sealed by trait Sealed"

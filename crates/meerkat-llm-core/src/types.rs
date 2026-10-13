@@ -134,6 +134,14 @@ pub trait LlmClient: Send + Sync {
         })
     }
 
+    /// The most output tokens one request may ask for on this client's
+    /// selected account and model, when the provider states one (for
+    /// example a Copilot account's per-model limit). `None` states none.
+    /// Wrappers delegate to the client they wrap.
+    fn output_token_limit(&self) -> Option<u32> {
+        None
+    }
+
     /// Return an exact witness for the largest serialized JSON body this
     /// invocation may send. The default is unavailable for custom providers.
     fn request_pressure(
@@ -858,6 +866,32 @@ mod tests {
                         event_type: "image".to_string(),
                         summary: None,
                         body: None,
+                        payload: None,
+                        content: vec![meerkat_core::ContentBlock::Image {
+                            media_type: "image/png".to_string(),
+                            data: meerkat_core::ImageData::Inline {
+                                data: "IMAGE_BYTES".to_string(),
+                            },
+                        }],
+                    },
+                ),
+            )],
+        );
+
+        assert!(request.has_images());
+    }
+
+    #[test]
+    fn request_image_detection_includes_runtime_notice_content() {
+        let request = LlmRequest::new(
+            "model",
+            vec![Message::SystemNotice(
+                meerkat_core::SystemNoticeMessage::with_block(
+                    meerkat_core::SystemNoticeKind::Generic,
+                    None,
+                    meerkat_core::SystemNoticeBlock::RuntimeNotice {
+                        category: "consent_attempt".to_string(),
+                        detail: None,
                         payload: None,
                         content: vec![meerkat_core::ContentBlock::Image {
                             media_type: "image/png".to_string(),

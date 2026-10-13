@@ -70,7 +70,7 @@ pub(crate) fn resolve_profile_mob_operator_access(
 /// these keys, and a fork-derived member inherits every source label except
 /// these (see `ForkBuildInheritance`), because they name a member: `mob_id`,
 /// `role`, `profile_name`, and `meerkat_id` / `agent_identity`, which an
-/// embedder may also use as the member's durable identity (MobKit does).
+/// embedder may also use as the member's durable identity (Meta does).
 pub(crate) const STANDARD_MOB_MEMBER_LABEL_KEYS: [&str; 5] = [
     "mob_id",
     "role",
@@ -995,7 +995,7 @@ fn resumed_member_segment_matches_current_or_legacy(current: &str, stored: &str)
 
 /// Recover the durable identity proved by one raw or comms-safe member segment.
 ///
-/// MobKit previously persisted runtime aliases in typed member bindings. Those
+/// Meta previously persisted runtime aliases in typed member bindings. Those
 /// aliases carry one exact durable identity plus an incidental generation. The
 /// generation is not part of the durable member identity, but it must still be
 /// a canonical `u64` before the alias can authorize resume compatibility.
@@ -1446,6 +1446,7 @@ mod tests {
             tool.with_provenance(meerkat_core::types::ToolProvenance {
                 kind: meerkat_core::types::ToolSourceKind::Callback,
                 source_id: name.into(),
+                artifact: None,
             })
         } else {
             tool
@@ -2784,7 +2785,7 @@ mod tests {
             .unwrap();
         let session_id = SessionId::new();
         let resumed_session = resumed_session_with_metadata(session_id.clone());
-        let current_prompt = "current MobKit-assembled system prompt";
+        let current_prompt = "current Meta-assembled system prompt";
         let additional_instructions = vec![
             "customizer section alpha".to_string(),
             "customizer section beta".to_string(),
@@ -2857,7 +2858,7 @@ mod tests {
             .as_inline()
             .unwrap();
         let session_id = SessionId::new();
-        let current_prompt = "current MobKit-assembled system prompt";
+        let current_prompt = "current Meta-assembled system prompt";
         let mut resumed_session = resumed_session_with_metadata(session_id.clone());
         resumed_session.append_system_message(current_prompt.to_string());
 
@@ -2996,6 +2997,7 @@ mod tests {
                     last_seen_provenance: Some(meerkat_core::ToolProvenance {
                         kind: meerkat_core::ToolSourceKind::Callback,
                         source_id: "deferred_active".into(),
+                        artifact: None,
                     }),
                 },
             )]
@@ -3007,6 +3009,7 @@ mod tests {
                     last_seen_provenance: Some(meerkat_core::ToolProvenance {
                         kind: meerkat_core::ToolSourceKind::Callback,
                         source_id: "active_secret".into(),
+                        artifact: None,
                     }),
                 },
             )]

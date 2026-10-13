@@ -9,7 +9,7 @@ use crate::{MobId, RunId, StepId};
 use meerkat_contracts::wire::supervisor_bridge::{BridgeRejectionCause, BridgeRejectionReply};
 use meerkat_contracts::wire::{
     WireHostUnavailableDetail, WireMobErrorDetail, WireScopeDeniedDetail, WireStaleCursorDetail,
-    WireStaleFenceDetail,
+    WireStaleDeliveryScopeDetail, WireStaleFenceDetail,
 };
 use std::sync::Arc;
 
@@ -356,6 +356,22 @@ pub enum MobError {
         input_id: meerkat_core::InputId,
     },
 
+    /// The member session's native admission refused or could not decide an
+    /// input. `error` is the runtime's own verdict, unchanged.
+    #[error("member session {session_id} did not admit the input: {error}")]
+    MemberInputRefused {
+        session_id: meerkat_core::SessionId,
+        error: meerkat_runtime::RuntimeDriverError,
+    },
+
+    /// A governed submission must carry its caller-bound authority
+    /// association and trusted ingress observation; the mob never supplies
+    /// or substitutes either.
+    #[error(
+        "governed input for mob member '{member_id}' is not bound to an authority association and ingress observation"
+    )]
+    GovernedInputUnbound { member_id: AgentIdentity },
+
     /// A durable session could not serve a resume — typed so surfaces can
     /// distinguish archived-but-intact from genuinely absent instead of
     /// parsing prose out of an internal error.
@@ -385,6 +401,16 @@ pub enum MobError {
     SpawnCanceled {
         member_id: AgentIdentity,
         reason: String,
+    },
+
+    /// The mob's admission is closed (D67): it was closed when idle, its last
+    /// public owner released it, or its embedder stood it down. Admitted work
+    /// is unaffected; Stop, Shutdown, Destroy, retirement, cancellation and
+    /// reads remain available.
+    #[error("mob '{mob_id}' admission is closed ({reason})")]
+    AdmissionClosed {
+        mob_id: MobId,
+        reason: crate::runtime::MobAdmissionCloseReason,
     },
 
     /// Desired member material is committed but its replacement executor is
@@ -649,11 +675,47 @@ pub enum MobError {
     /// archived, or the session service holds no durable sessions). The
     /// member stays degraded and repairable instead of being marked Broken
     /// by a revival that could only fail.
+    /// A held spawn ([`crate::MobHandle::spawn_held_until`]) was refused: only a
+    /// fresh, locally provisioned member through a provisioner that
+    /// supports holding can be held.
+    #[error("held spawn unsupported: {reason}")]
+    HeldSpawnUnsupported { reason: String },
+
+    /// A held spawn was aborted before activation: by the caller, because its
+    /// handle was dropped, or because its caller went away while the setup
+    /// was still being constructed. The member was not published.
+    /// `cleanup` is `None` when the abort confirmed its cleanup (or nothing
+    /// existed to clean up yet), or the abort's own error (cleanup uncertain
+    /// or failed).
+    #[error("held spawn of '{member}' was aborted before activation{}", held_cleanup_suffix(cleanup.as_deref()))]
+    HeldSpawnAborted {
+        member: String,
+        cleanup: Option<Box<MobError>>,
+    },
+
+    /// A held spawn reached the caller's setup deadline without an accepted
+    /// activation, before or at its hold point; its setup was stopped and
+    /// aborted, and the member was not published. A spawn whose command was
+    /// still waiting for admission was never delivered, so nothing existed
+    /// to clean up. `cleanup` as for [`MobError::HeldSpawnAborted`].
+    #[error("held spawn of '{member}' expired at its setup deadline without activation{}", held_cleanup_suffix(cleanup.as_deref()))]
+    HeldSpawnExpired {
+        member: String,
+        cleanup: Option<Box<MobError>>,
+    },
+
     #[error("member session {session_id} reload refused: {reason}")]
     MemberReloadRefused {
         session_id: meerkat_core::types::SessionId,
         reason: String,
     },
+
+    /// A member was asked to be held before its publication where holding
+    /// is not supported: by this provisioner, or for this provision (only a
+    /// fresh runtime-backed member whose host selects its registration is
+    /// held). Nothing was provisioned.
+    #[error("held member provision unsupported: {reason}")]
+    HeldProvisionUnsupported { reason: String },
 
     /// `reload_member_registration` did not finish `stage` within
     /// `MEMBER_RELOAD_TOTAL_TIMEOUT`. Every completed step is durable and
@@ -1053,6 +1115,28 @@ pub enum MobError {
         actual: FenceToken,
     },
 
+    /// A scope-bound submit named a member session that is no longer the
+    /// member's current session binding. Generated SubmitWork authority
+    /// refused it before any admission effect; nothing was delivered, and
+    /// the submit was never retargeted to the current session.
+    #[error(
+        "stale delivery scope for {agent_identity}: expected session {expected_session}, current {}",
+        actual_session.as_ref().map_or_else(|| "none".to_string(), ToString::to_string)
+    )]
+    StaleDeliveryScope {
+        agent_identity: AgentIdentity,
+        expected_session: meerkat_core::types::SessionId,
+        actual_session: Option<meerkat_core::types::SessionId>,
+    },
+
+    /// A delivery scope cannot be captured for this member (for example a
+    /// peer-only member with no session binding to scope a delivery to).
+    #[error("delivery scope unavailable for {agent_identity}: {reason}")]
+    DeliveryScopeUnavailable {
+        agent_identity: AgentIdentity,
+        reason: String,
+    },
+
     /// A durable remote member-operator request reached actor execution after
     /// its exact placed residency was superseded.
     #[error("stale member-operator execution authority for {member_id}: {reason}")]
@@ -1361,6 +1445,13 @@ impl std::fmt::Display for ForkSourceUnavailableCause {
     }
 }
 
+fn held_cleanup_suffix(cleanup: Option<&MobError>) -> String {
+    match cleanup {
+        None => String::new(),
+        Some(error) => format!("; its abort did not confirm cleanup: {error}"),
+    }
+}
+
 fn format_diagnostics(diagnostics: &[Diagnostic]) -> String {
     diagnostics
         .iter()
@@ -1431,10 +1522,59 @@ impl From<BridgeRejectionReply> for MobError {
 }
 
 impl MobError {
+    /// Structured-data `kind` of [`Self::held_before_activation`].
+    pub const HELD_BEFORE_ACTIVATION_KIND: &'static str = "mob_held_before_activation";
+
+    /// A persisted mob its host holds before activation: restore has not
+    /// started it, because the owner session it is bound to is unresolved
+    /// (`reason`, a host-defined token). Projected under the
+    /// runtime-unavailable class, never as a missing mob.
+    ///
+    /// A one-way report only. The host decides activation, destroy admission
+    /// and retry from its own typed hold and the mob's durable history,
+    /// never from this projection. `content_retained` and `retryable` are
+    /// what the lookup observed (the store was kept; asking again may
+    /// answer differently), not cleanup or lease guarantees.
+    #[doc(hidden)]
+    pub fn held_before_activation(
+        mob_id: &MobId,
+        owner: &meerkat_core::types::SessionId,
+        reason: &'static str,
+    ) -> Self {
+        Self::SessionError(meerkat_core::service::SessionError::FailedWithData {
+            message: format!(
+                "mob {mob_id} is held before activation: its owner session {owner} is unresolved ({reason})"
+            ),
+            data: serde_json::json!({
+                "kind": Self::HELD_BEFORE_ACTIVATION_KIND,
+                "code": "SESSION_RUNTIME_UNAVAILABLE",
+                "mob_id": mob_id.to_string(),
+                "owner_session_id": owner.to_string(),
+                "reason": reason,
+                "content_retained": true,
+                "retryable": true,
+            }),
+        })
+    }
+
+    /// Whether this is a [`Self::held_before_activation`] answer.
+    pub fn is_held_before_activation(&self) -> bool {
+        match self {
+            Self::SessionError(meerkat_core::service::SessionError::FailedWithData {
+                data,
+                ..
+            }) => {
+                data.get("kind").and_then(serde_json::Value::as_str)
+                    == Some(Self::HELD_BEFORE_ACTIVATION_KIND)
+            }
+            _ => false,
+        }
+    }
+
     /// Structured data carried by an underlying domain error.
     ///
     /// Session materialization failures use this to preserve typed
-    /// provider-auth causes through MobKit and RPC without teaching the mob
+    /// provider-auth causes through Meta and RPC without teaching the mob
     /// layer to reclassify authentication itself.
     pub fn structured_data(&self) -> Option<serde_json::Value> {
         match self {
@@ -1626,7 +1766,7 @@ impl MobError {
     /// in-process `SessionError` carrier, through the shared retirement /
     /// lifecycle failure wrappers a joined observer receives, or off the
     /// structured `durable_resume_hold` wire token; never off display text.
-    /// Hosts classify on this instead of parsing prose (MobKit parks the
+    /// Hosts classify on this instead of parsing prose (Meta parks the
     /// member with the exact repair commands on `AuditedEndpointDivergence`).
     pub fn durable_resume_hold(&self) -> Option<meerkat_core::service::DurableResumeHold> {
         match self {
@@ -1660,6 +1800,14 @@ impl MobError {
                 ) => Some(meerkat_contracts::ErrorCode::SessionRuntimeUnavailable),
                 Self::SessionError(meerkat_core::SessionError::CapabilityUnavailable(_)) => {
                     Some(meerkat_contracts::ErrorCode::CapabilityUnavailable)
+                }
+                // A member that cannot be scope-bound (no native session
+                // binding) does not support scope-bound delivery at all.
+                Self::DeliveryScopeUnavailable { .. } => {
+                    Some(meerkat_contracts::ErrorCode::CapabilityUnavailable)
+                }
+                error if error.is_held_before_activation() => {
+                    Some(meerkat_contracts::ErrorCode::SessionRuntimeUnavailable)
                 }
                 Self::RetirementInProgress { .. }
                 | Self::MemberRetirementInProgress { .. }
@@ -1840,6 +1988,7 @@ impl MobError {
             | Self::MemberRuntimeDetached { .. }
             | Self::DirectMemberAdoptionPending { .. }
             | Self::WorkInputIdempotencyConflict { .. }
+            | Self::MemberInputRefused { .. }
             | Self::RuntimeEffectRefused { .. } => MobFailureClass::RuntimeRejected,
             _ => MobFailureClass::MobRejected,
         }
@@ -1884,6 +2033,20 @@ impl MobError {
                 expected: Some(expected.get()),
                 actual: Some(actual.get()),
             })),
+            // The member's runtime id and fence are current; only its session
+            // binding moved. Its own code, never StaleFence: the caller
+            // re-captures the scope instead of re-resolving the member.
+            Self::StaleDeliveryScope {
+                agent_identity,
+                expected_session,
+                actual_session,
+            } => Some(WireMobErrorDetail::StaleDeliveryScope(
+                WireStaleDeliveryScopeDetail {
+                    agent_identity: agent_identity.to_string(),
+                    expected_session_id: expected_session.to_string(),
+                    actual_session_id: actual_session.as_ref().map(ToString::to_string),
+                },
+            )),
             Self::StaleMemberOperatorAuthority { .. } => {
                 Some(WireMobErrorDetail::StaleFence(WireStaleFenceDetail {
                     runtime_id: None,
@@ -2471,6 +2634,38 @@ mod tests {
     /// console codes — every `Some` arm with its detail field values
     /// (including all four `BridgeCommandRejected` causes) — and the pinned
     /// non-mappings return `None`.
+    #[test]
+    fn a_moved_session_scope_is_not_a_stale_fence_and_an_unscopable_member_is_unsupported() {
+        let expected = meerkat_core::types::SessionId::new();
+        let actual = meerkat_core::types::SessionId::new();
+        let moved = MobError::StaleDeliveryScope {
+            agent_identity: crate::ids::AgentIdentity::from("worker"),
+            expected_session: expected.clone(),
+            actual_session: Some(actual.clone()),
+        };
+        match moved.wire_detail() {
+            Some(WireMobErrorDetail::StaleDeliveryScope(detail)) => {
+                assert_eq!(detail.agent_identity, "worker");
+                assert_eq!(detail.expected_session_id, expected.to_string());
+                assert_eq!(detail.actual_session_id, Some(actual.to_string()));
+            }
+            other => panic!("StaleDeliveryScope must project its own detail, got {other:?}"),
+        }
+        assert_eq!(
+            moved.wire_error_code(),
+            Some(meerkat_contracts::ErrorCode::StaleDeliveryScope)
+        );
+        let unscopable = MobError::DeliveryScopeUnavailable {
+            agent_identity: crate::ids::AgentIdentity::from("peer"),
+            reason: "no native session binding".to_string(),
+        };
+        assert!(unscopable.wire_detail().is_none());
+        assert_eq!(
+            unscopable.wire_error_code(),
+            Some(meerkat_contracts::ErrorCode::CapabilityUnavailable)
+        );
+    }
+
     #[test]
     fn wire_detail_maps_exactly_the_four_codes() {
         use meerkat_contracts::wire::WireControlScope;

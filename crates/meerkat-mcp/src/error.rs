@@ -5,6 +5,16 @@ use meerkat_core::handles::DslTransitionError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
+    /// A connection's client close did not finish within its bound.
+    #[error("MCP server '{server}' close did not finish within {bound:?}")]
+    CloseTimedOut {
+        server: String,
+        bound: std::time::Duration,
+    },
+    /// The governed attachment control refused this server, at staging or at
+    /// the connection's physical entry. Nothing was spawned or contacted.
+    #[error("MCP attachment refused: {0}")]
+    AttachmentRefused(meerkat_core::mcp_attachment::McpAttachmentRefusal),
     /// Mechanical local-process isolation refused before the MCP target ran.
     /// This never grants or denies caller authority and carries no host secrets.
     #[error(transparent)]
@@ -25,6 +35,25 @@ pub enum McpError {
     },
     #[error("Connection failed: {reason}")]
     ConnectionFailed { reason: String },
+
+    /// The host's required HTTP egress profile refused this server's
+    /// destination (its scheme, host or port, a resolved or literal address,
+    /// a redirect hop, or an SSE message endpoint). Nothing was sent to it.
+    #[error("MCP server '{server}' HTTP egress refused: {refusal}")]
+    EgressRefused {
+        server: String,
+        refusal: meerkat_auth_core::http_egress::HttpEgressRefusal,
+    },
+
+    /// The host's required HTTP egress profile cannot be enforced for this
+    /// server (an invalid policy, an unbuildable client, or a credential
+    /// owner not bound to the same profile). Nothing was sent; nothing fell
+    /// back to a trusted-host client.
+    #[error("MCP server '{server}' HTTP egress enforcement unavailable: {reason}")]
+    EgressUnavailable {
+        server: String,
+        reason: meerkat_auth_core::http_egress::HttpEgressUnavailable,
+    },
 
     /// The server dropped the connection's session (HTTP 404) while a
     /// `tools/call` was in flight. The call was not re-sent and the session
@@ -65,6 +94,32 @@ pub enum McpError {
 
     #[error("Tool not found: {0}")]
     ToolNotFound(String),
+
+    /// The server's host access policy does not admit this operation. Refused
+    /// before anything was sent.
+    #[error(
+        "MCP server '{server}' does not permit operation '{operation}' under its access policy"
+    )]
+    OperationNotPermitted { server: String, operation: String },
+
+    /// The server's configured access policy is invalid. No lifecycle or
+    /// transport effect has been admitted for it.
+    #[error(transparent)]
+    InvalidAccessPolicy(#[from] meerkat_core::McpServerAccessError),
+
+    /// The server's `secret_env` declaration is invalid. No lifecycle or
+    /// transport effect has been admitted for it.
+    #[error(transparent)]
+    InvalidSecretEnv(#[from] meerkat_core::McpSecretEnvDeclarationError),
+
+    /// The server's declared service secrets were not resolved for its
+    /// launch. Its process was never spawned, and no value was taken from
+    /// the host environment instead.
+    #[error("MCP server '{server}' was not launched: {refusal}")]
+    ServiceSecretRefused {
+        server: String,
+        refusal: meerkat_core::auth::McpServiceSecretRefusal,
+    },
 
     #[error("Server '{server}' is not accepting new calls (state: {state})")]
     ServerUnavailable { server: String, state: String },
@@ -119,6 +174,37 @@ pub enum McpError {
         server: String,
         limit: ToolDiscoveryLimit,
     },
+}
+
+impl McpError {
+    /// The typed MCP outcome of a required egress profile that did not admit
+    /// an effect for `server`.
+    pub fn from_egress(
+        server: &str,
+        error: meerkat_auth_core::http_egress::HttpEgressError,
+    ) -> Self {
+        use meerkat_auth_core::http_egress::HttpEgressError;
+        match error {
+            HttpEgressError::Refused(refusal) => Self::EgressRefused {
+                server: server.to_owned(),
+                refusal,
+            },
+            HttpEgressError::Unavailable(reason) => Self::EgressUnavailable {
+                server: server.to_owned(),
+                reason,
+            },
+        }
+    }
+
+    /// The egress outcome this error carries, if it is one.
+    pub fn egress_error(&self) -> Option<meerkat_auth_core::http_egress::HttpEgressError> {
+        use meerkat_auth_core::http_egress::HttpEgressError;
+        match self {
+            Self::EgressRefused { refusal, .. } => Some(HttpEgressError::Refused(*refusal)),
+            Self::EgressUnavailable { reason, .. } => Some(HttpEgressError::Unavailable(*reason)),
+            _ => None,
+        }
+    }
 }
 
 /// The declared tool discovery bound a server exceeded.

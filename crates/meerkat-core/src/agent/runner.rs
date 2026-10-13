@@ -63,6 +63,7 @@ where
     ) -> Self {
         agent.tool_dispatch_context =
             crate::ToolDispatchContext::default().with_work_authorization(context);
+        agent.run_consent_attempts = Default::default();
         Self { agent }
     }
 }
@@ -74,7 +75,18 @@ where
     S: AgentSessionStore + ?Sized,
 {
     fn drop(&mut self) {
-        self.agent.tool_dispatch_context = crate::ToolDispatchContext::default();
+        let closed = std::mem::take(&mut self.agent.tool_dispatch_context);
+        self.agent.run_consent_attempts = Default::default();
+        // The admitting run closed (returned, failed or was dropped): its
+        // unspent human consent is parked for a resumed run of its work or
+        // withdrawn now, without waiting for the approval owner. Nothing it
+        // admitted can be spent by this run afterwards.
+        if let (Some(review), Some(work)) = (
+            self.agent.operation_review.as_ref(),
+            closed.work_authorization(),
+        ) {
+            review.close_consent_for_work(work);
+        }
     }
 }
 
@@ -515,6 +527,22 @@ where
             handle.clear_turn_overlay()?;
         }
         Ok(())
+    }
+
+    /// Install this member's live MCP attachment surface (its
+    /// construction's own router). Only its construction calls this.
+    pub fn set_live_mcp_attachment(
+        &mut self,
+        surface: Arc<dyn crate::mcp_attachment::LiveMcpAttachmentSurface>,
+    ) {
+        self.live_mcp_attachment = Some(surface);
+    }
+
+    /// This member's live MCP attachment surface, if it has one.
+    pub fn live_mcp_attachment(
+        &self,
+    ) -> Option<&Arc<dyn crate::mcp_attachment::LiveMcpAttachmentSurface>> {
+        self.live_mcp_attachment.as_ref()
     }
 
     pub fn set_runtime_execution_kind(
@@ -1695,6 +1723,48 @@ where
         Ok(())
     }
 
+    /// Validate the exact mandatory hook topology this run would execute,
+    /// including run overrides and a custom engine's own attestation, before
+    /// RunStarted hooks, run publication and the user append. The check reads
+    /// the engine and overrides the run will use, so a changed gate set is
+    /// validated again rather than authorized by an earlier run. Rejection is
+    /// an unsupported configuration, not a policy denial or a failed run.
+    /// The validated topology is retained for the run, so recovery honours
+    /// exactly the gates admission accepted.
+    fn admit_mandatory_hook_topology(&mut self) -> Result<(), AgentError> {
+        self.admitted_hook_topology = crate::hooks::HookMandatoryTopology::none();
+        let Some(engine) = self.hook_engine.as_ref() else {
+            // Without an engine nothing executes run overrides, so a
+            // mandatory override would be silently skipped: reject it.
+            if let Some(entry) = self.hook_run_overrides.entries.iter().find(|entry| {
+                entry.enabled && entry.capability == crate::hooks::HookCapability::Guardrail
+            }) {
+                return Err(AgentError::HookConfigInvalid {
+                    reason: format!(
+                        "mandatory hook override '{}' at {:?} has no hook engine to run it",
+                        entry.id, entry.point
+                    ),
+                });
+            }
+            return Ok(());
+        };
+        let topology = engine
+            .mandatory_topology(Some(&self.hook_run_overrides))
+            .map_err(crate::hooks::HookEngineError::into_agent_error)?;
+        let controller_retained = self
+            .tool_dispatch_context
+            .work_authorization()
+            .and_then(|work| work.controller_client())
+            .is_some();
+        topology
+            .validate_admission(controller_retained)
+            .map_err(|error| AgentError::HookConfigInvalid {
+                reason: error.to_string(),
+            })?;
+        self.admitted_hook_topology = topology;
+        Ok(())
+    }
+
     async fn run_started_hooks(
         &mut self,
         input: &RunInput,
@@ -2430,6 +2500,10 @@ where
             self.clear_runtime_execution_kind();
             return Err(err);
         }
+        if let Err(err) = self.admit_mandatory_hook_topology() {
+            self.clear_runtime_execution_kind();
+            return Err(err);
+        }
         if let Err(error) = self.prepare_compaction_ingress().await {
             self.clear_runtime_execution_kind();
             return Err(error);
@@ -2632,6 +2706,10 @@ where
         if let Err(err) = self
             .require_runtime_execution_kind(crate::lifecycle::RuntimeExecutionKind::ResumePending)
         {
+            self.clear_runtime_execution_kind();
+            return Err(err);
+        }
+        if let Err(err) = self.admit_mandatory_hook_topology() {
             self.clear_runtime_execution_kind();
             return Err(err);
         }
@@ -3066,6 +3144,7 @@ impl Agent<dyn AgentLlmClient, dyn AgentToolDispatcher, dyn AgentSessionStore> {
             comms_runtime: None,
             hook_engine: None,
             hook_run_overrides: self.hook_run_overrides.clone(),
+            admitted_hook_topology: crate::hooks::HookMandatoryTopology::none(),
             post_commit_hooks,
             compactor: None,
             compaction_curator: None,
@@ -3126,6 +3205,7 @@ impl Agent<dyn AgentLlmClient, dyn AgentToolDispatcher, dyn AgentSessionStore> {
             active_turn_request_contexts: Vec::new(),
             active_turn_request_reasoning: None,
             external_tool_surface_handle: None,
+            live_mcp_attachment: None,
             auth_lease_handle: None,
             auth_credential_identity: self.auth_credential_identity.clone(),
             mcp_server_lifecycle_handle: None,
@@ -3138,12 +3218,16 @@ impl Agent<dyn AgentLlmClient, dyn AgentToolDispatcher, dyn AgentSessionStore> {
             last_pending_catalog_sources: Default::default(),
             tool_dispatch_context: Default::default(),
             operation_review: self.operation_review.clone(),
+            run_consent_attempts: Default::default(),
             live_bridge_dispatch_admission: Some(dispatch_admission),
             live_bridge_tool_defs: Some(frozen_tool_defs),
             noncommitting_live_bridge_run: true,
             turn_tool_dispatch_metadata: Default::default(),
             turn_tool_choice_plan: Vec::new(),
             tools_config: self.tools_config.clone(),
+            // The operation agent borrows this agent's resources; it never
+            // releases them.
+            owned_releases: Vec::new(),
         };
 
         Ok(Box::pin(async move {
@@ -4010,6 +4094,13 @@ mod skill_activation_effect_tests {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl crate::HookEngine for DenySkillTurn {
+        fn mandatory_topology(
+            &self,
+            _overrides: Option<&crate::config::HookRunOverrides>,
+        ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError> {
+            Ok(crate::hooks::HookMandatoryTopology::none())
+        }
+
         async fn execute(
             &self,
             invocation: crate::HookInvocation,
@@ -4606,6 +4697,13 @@ mod skill_activation_effect_tests {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl crate::HookEngine for AppActionHooks {
+        fn mandatory_topology(
+            &self,
+            _overrides: Option<&crate::config::HookRunOverrides>,
+        ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError> {
+            Ok(crate::hooks::HookMandatoryTopology::none())
+        }
+
         async fn execute(
             &self,
             invocation: HookInvocation,
@@ -5279,6 +5377,18 @@ mod skill_activation_effect_tests {
 
     struct AppReviewAuthorization;
     impl crate::WorkAuthorization for AppReviewAuthorization {
+        // R2 review reads the owner's passive context before any attempt; an
+        // owner without it settles as context unavailable before the reviewer.
+        fn review_operation_context(
+            &self,
+            _: &crate::PreparedAuthorizationBinding,
+        ) -> Result<
+            crate::authorization::ReviewOperationContextResolution,
+            crate::OperationAuthorizationError,
+        > {
+            Ok(crate::authorization::ReviewOperationContextResolution::NotApplicable)
+        }
+
         fn prepare(
             &self,
             _: &crate::PreparedAuthorizationBinding,
@@ -5398,6 +5508,13 @@ mod skill_activation_effect_tests {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl crate::HookEngine for NoticeFailureHooks {
+        fn mandatory_topology(
+            &self,
+            _overrides: Option<&crate::config::HookRunOverrides>,
+        ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError> {
+            Ok(crate::hooks::HookMandatoryTopology::none())
+        }
+
         async fn execute(
             &self,
             invocation: HookInvocation,
@@ -5794,6 +5911,169 @@ mod skill_activation_effect_tests {
                 .tool_dispatch_context
                 .prepared_authorization()
                 .is_none()
+        );
+    }
+
+    /// The run scope is the admitting run's lifetime: when it closes, the
+    /// unspent human consent admitted under its work context is withdrawn
+    /// (cancelled, recorded and announced), so a late decision cannot
+    /// approve it.
+    #[tokio::test]
+    async fn a_closed_run_scope_withdraws_the_consent_it_admitted() {
+        use crate::approval::consent::{
+            AuthenticatedApprover, ConsentEligibility, ConsentIneligible, ConsentNotice,
+            ConsentNoticeKind, ConsentPresentation, ConsentRouteUnavailable, HumanConsentRoute,
+        };
+        use crate::approval::review::{
+            BoundOperationReview, OperationReviewer, ReviewCandidate, ReviewEntrySupport,
+            ReviewVerdict, ReviewerFailure, admit_operation_review,
+        };
+        use crate::authorization::{
+            AuthorizationOperation, OperationAuthorizationError, OperationAuthorizationFacts,
+            OperationReviewTier, PreparedAuthorizationBinding, PreparedOperationAuthorization,
+            PreparedOperationCheck, SourceAuthorizationFacts, SourceAuthorizationTarget,
+            SourceAuthorizationUse, WorkAuthorization,
+        };
+
+        struct R3;
+        impl PreparedOperationAuthorization for R3 {
+            fn review_tier(&self) -> OperationReviewTier {
+                OperationReviewTier::R3
+            }
+            fn check_current(
+                &self,
+                _binding: &PreparedAuthorizationBinding,
+            ) -> Result<(), OperationAuthorizationError> {
+                Ok(())
+            }
+        }
+        struct R3Work;
+        impl WorkAuthorization for R3Work {
+            /// This test owner has no review material: explicitly not applicable.
+            fn review_operation_context(
+                &self,
+                _binding: &crate::authorization::PreparedAuthorizationBinding,
+            ) -> Result<
+                crate::authorization::ReviewOperationContextResolution,
+                crate::authorization::OperationAuthorizationError,
+            > {
+                Ok(crate::authorization::ReviewOperationContextResolution::NotApplicable)
+            }
+
+            fn prepare(
+                &self,
+                _binding: &PreparedAuthorizationBinding,
+            ) -> Result<Arc<dyn PreparedOperationAuthorization>, OperationAuthorizationError>
+            {
+                Ok(Arc::new(R3))
+            }
+        }
+        struct NoReviewer;
+        #[async_trait::async_trait]
+        impl OperationReviewer for NoReviewer {
+            async fn review(
+                &self,
+                _candidate: &ReviewCandidate<'_>,
+            ) -> Result<ReviewVerdict, ReviewerFailure> {
+                Err(ReviewerFailure::Unavailable)
+            }
+        }
+        #[derive(Default)]
+        struct Route(std::sync::Mutex<Vec<ConsentNoticeKind>>);
+        impl HumanConsentRoute for Route {
+            fn present(
+                &self,
+                _candidate: &crate::approval::consent::ConsentPresentationCandidate<'_>,
+            ) -> Result<ConsentPresentation, ConsentRouteUnavailable> {
+                Ok(ConsentPresentation {
+                    requester: crate::ApprovalPrincipalId::new("human:child").unwrap(),
+                    risk: crate::ApprovalRisk::High,
+                    metadata: crate::SurfaceMetadata::default(),
+                })
+            }
+            fn eligibility(
+                &self,
+                _approver: &AuthenticatedApprover,
+                _approval: &crate::ApprovalRecord,
+            ) -> Result<Arc<dyn ConsentEligibility>, ConsentIneligible> {
+                Err(ConsentIneligible)
+            }
+            fn notice(&self, notice: ConsentNotice) {
+                self.0.lock().unwrap().push(notice.kind);
+            }
+        }
+
+        let approvals = crate::ApprovalService::new();
+        let route = Arc::new(Route::default());
+        let review = Arc::new(
+            BoundOperationReview::new(
+                Arc::new(NoReviewer),
+                approvals.clone(),
+                std::time::Duration::from_secs(30),
+            )
+            .with_human_consent(route.clone(), std::time::Duration::from_secs(3600)),
+        );
+        let mut agent =
+            with_test_turn_state_handle(AgentBuilder::new().with_operation_review(review.clone()))
+                .build_standalone(
+                    Arc::new(StaticLlmClient),
+                    Arc::new(NoTools),
+                    Arc::new(NoopStore),
+                )
+                .await;
+        let work = crate::WorkAuthorizationContext::new(
+            Arc::new(R3Work),
+            crate::OperationExecutionScope::Domain,
+        );
+        let binding = PreparedAuthorizationBinding::new(OperationAuthorizationFacts {
+            operation_id: crate::ops::OperationId::new(),
+            execution_scope: crate::OperationExecutionScope::Domain,
+            run_id: None,
+            context_revision: None,
+            operation: AuthorizationOperation::Source(SourceAuthorizationFacts {
+                target: SourceAuthorizationTarget::Memory(
+                    crate::memory::MemorySearchScope::for_session(crate::types::SessionId::new()),
+                ),
+                usage: SourceAuthorizationUse::Read,
+            }),
+        });
+        let check = PreparedOperationCheck::prepare(work.clone(), binding).unwrap();
+        let args = serde_json::value::RawValue::from_string("{}".into()).unwrap();
+        let call = crate::ToolCallView {
+            id: "call-1",
+            name: "send_message",
+            args: &args,
+        };
+        let approval_id = {
+            let _run = WorkAuthorizationRunScope::new(&mut agent, Some(work.clone()));
+            match admit_operation_review(
+                Some(&review),
+                ReviewEntrySupport::ConsumesAtEntry,
+                call,
+                &check,
+                &work,
+            )
+            .await
+            {
+                Err(crate::ToolError::ReviewUnsatisfied {
+                    approval_id: Some(approval_id),
+                    ..
+                }) => approval_id,
+                other => panic!("expected a consent request, got {other:?}"),
+            }
+        };
+        let record = approvals.get(&approval_id).unwrap();
+        assert_eq!(record.status, crate::ApprovalStatus::Cancelled);
+        assert_eq!(
+            record
+                .consent
+                .and_then(|consent| consent.withdrawal)
+                .map(|withdrawal| withdrawal.reason),
+            Some(crate::approval::ApprovalConsentWithdrawalReason::RunEnded)
+        );
+        assert_eq!(
+            *route.0.lock().unwrap(),
+            vec![ConsentNoticeKind::Requested, ConsentNoticeKind::Withdrawn]
         );
     }
 
@@ -6668,6 +6948,7 @@ mod skill_activation_effect_tests {
                             last_seen_provenance: Some(crate::ToolProvenance {
                                 kind: crate::ToolSourceKind::Callback,
                                 source_id: "bridge-effect-test".into(),
+                                artifact: None,
                             }),
                         },
                     )],

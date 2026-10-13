@@ -249,11 +249,10 @@ fn confinement_probe_process() {
     let argument = std::env::var("MEERKAT_PROBE_ARGUMENT").unwrap_or_default();
     match mode.as_str() {
         "tcp-denied" => {
-            let endpoint = argument.parse().unwrap();
-            denied(std::net::TcpStream::connect_timeout(
-                &endpoint,
-                Duration::from_secs(2),
-            ));
+            // A blocking connect, so only the IP policy can refuse it:
+            // connect_timeout's nonblocking setup is a separate operation.
+            let endpoint: std::net::SocketAddr = argument.parse().unwrap();
+            denied(std::net::TcpStream::connect(endpoint));
         }
         "tcp-selective" => {
             let (allowed, forbidden) = argument.split_once(',').unwrap();

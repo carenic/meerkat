@@ -5,7 +5,7 @@ use meerkat_contracts::{
     JobExecutionActivity, JobExecutionActivityKind, JobHealthCoverage, JobHealthStatus,
     JobHealthSummary, JobIdempotencyScope, JobPhase, JobProgress, JobRestartClass, JobRunner,
     JobSummary, JobTerminalResult, JobsArtifactsResult, JobsGetResult, JobsHealthResult,
-    JobsProgressResult, JobsResultResult, JobsRetryParams, MobkitJobProgressParams,
+    JobsProgressResult, JobsResultResult, JobsRetryParams, MetaJobProgressParams,
     MonitorOutputProtocol, MonitorsStartParams,
 };
 
@@ -15,7 +15,7 @@ fn app_job_projection_never_serializes_attempt_fence_worker_or_credentials() {
         job: JobSummary {
             job_id: "job_01".into(),
             runner: JobRunner {
-                name: "mobkit_callback".into(),
+                name: "meta_callback".into(),
                 version: "1".into(),
             },
             phase: JobPhase::Running,
@@ -77,7 +77,7 @@ fn callback_registration_carries_private_detached_execution_metadata() {
         "input_schema": {"type": "object"},
         "execution": {
             "mode": "detached",
-            "runner": {"name": "mobkit_callback", "version": "1"},
+            "runner": {"name": "meta_callback", "version": "1"},
             "restart_class": "non_resumable",
             "idempotency_scope": "interaction_and_arguments",
             "submission_timeout_ms": 30000,
@@ -98,7 +98,7 @@ fn callback_registration_carries_private_detached_execution_metadata() {
 
 #[test]
 fn host_progress_mutation_carries_exact_attempt_write_authority() {
-    let params = MobkitJobProgressParams {
+    let params = MetaJobProgressParams {
         authority: JobAttemptAuthority {
             job_id: "job_01".into(),
             attempt_id: "attempt_02".into(),

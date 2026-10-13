@@ -13,9 +13,10 @@ use std::sync::Arc;
 use meerkat_core::SessionId;
 use meerkat_core::session_hosting::session_hosting_lock_path;
 use meerkat_runtime::{
-    ColdDeliveryOwnership, HostingCapability, HostingOwner, HostingPaths, HostingRefused,
-    ServedElsewhere, SessionServing, grant_session_hosting, local_session_serving,
-    spawn_blocking_holding_claim, try_cold_delivery_ownership, with_write_hosting,
+    ColdDeliveryOwnership, HostingAcquisition, HostingCapability, HostingOwner, HostingPaths,
+    HostingRefused, OwnerLossAttachment, ServedElsewhere, SessionServing, grant_session_hosting,
+    local_session_serving, spawn_blocking_holding_claim, try_cold_delivery_ownership,
+    with_write_hosting,
 };
 
 fn capability(root: &std::path::Path) -> HostingCapability {
@@ -146,6 +147,87 @@ fn local_serving_reads_the_registry_and_never_takes_the_lock() {
     );
     drop(peer);
     grant_session_hosting(&capability, &owner, &session).expect("free once the peer released it");
+}
+
+/// Consent owner loss (3): each grant reports the branch it took. A lineage
+/// a cross-process grant began fresh carries one owner-loss proof for its
+/// session in its domain. Any claim of the lineage reaches it, because the
+/// grant that began the lineage need not be the one a registration attaches,
+/// and it is taken once for the whole lineage. Once every claim of the
+/// lineage is dropped, the next grant begins a new lineage with a new proof.
+#[test]
+fn a_lineage_begun_fresh_carries_one_owner_loss_proof() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let capability = capability(dir.path());
+    let owner = HostingOwner::mint();
+    let session = SessionId::new();
+    let fresh = grant_session_hosting(&capability, &owner, &session).expect("fresh claim");
+    assert_eq!(fresh.acquisition(), HostingAcquisition::AcquiredFresh);
+    let joined = grant_session_hosting(&capability, &owner, &session).expect("joined claim");
+    assert_eq!(joined.acquisition(), HostingAcquisition::Joined);
+
+    let OwnerLossAttachment::Reserved(reservation) = joined.reserve_owner_loss() else {
+        panic!("a joined claim reaches the lineage's owed settlement");
+    };
+    let proof = reservation.complete();
+    assert_eq!(proof.acquisition(), HostingAcquisition::AcquiredFresh);
+    assert_eq!(proof.session_id(), &session);
+    assert_eq!(Some(proof.domain()), capability.domain_ref().as_ref());
+    assert!(
+        matches!(fresh.reserve_owner_loss(), OwnerLossAttachment::Settled),
+        "the lineage's settlement is owed once"
+    );
+    let later = grant_session_hosting(&capability, &owner, &session).expect("joined claim");
+    assert_eq!(later.acquisition(), HostingAcquisition::Joined);
+    assert!(
+        matches!(later.reserve_owner_loss(), OwnerLossAttachment::Settled),
+        "joining a settled lineage owes nothing"
+    );
+
+    drop((fresh, joined, later));
+    let next = grant_session_hosting(&capability, &owner, &session).expect("a new lineage");
+    assert_eq!(next.acquisition(), HostingAcquisition::AcquiredFresh);
+    assert!(
+        matches!(next.reserve_owner_loss(), OwnerLossAttachment::Reserved(_)),
+        "a new lineage owes its own settlement"
+    );
+}
+
+/// Consent owner loss (3): while a peer process holds the session's lock,
+/// nothing is granted here. Once the peer is gone (an issuer that died is a
+/// peer whose lock the kernel released), the grant takes the lock afresh and
+/// its lineage proves the owner loss. Process-local and claim-less stores
+/// never prove one.
+#[test]
+fn only_a_cross_process_exclusion_proves_owner_loss() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let capability = capability(dir.path());
+    let owner = HostingOwner::mint();
+    let session = SessionId::new();
+    let peer = open_lock_file(&capability, &session);
+    peer.try_lock().expect("the peer holds the session's lock");
+    assert_eq!(
+        grant_session_hosting(&capability, &owner, &session).expect_err("the peer holds it"),
+        HostingRefused::ServedElsewhere(ServedElsewhere {
+            session_id: session.clone()
+        })
+    );
+    drop(peer);
+    let claim = grant_session_hosting(&capability, &owner, &session).expect("the peer is gone");
+    assert_eq!(claim.acquisition(), HostingAcquisition::AcquiredFresh);
+    let OwnerLossAttachment::Reserved(reservation) = claim.reserve_owner_loss() else {
+        panic!("excluding the gone peer proves the owner loss");
+    };
+    assert_eq!(reservation.proof().session_id(), &session);
+
+    for unclaimed in [HostingCapability::ProcessLocal, HostingCapability::None] {
+        let claim = grant_session_hosting(&unclaimed, &owner, &session).expect("granted");
+        assert_eq!(claim.acquisition(), HostingAcquisition::Unclaimed);
+        assert!(
+            matches!(claim.reserve_owner_loss(), OwnerLossAttachment::Settled),
+            "an unclaimed grant proves no owner loss"
+        );
+    }
 }
 
 #[test]

@@ -2355,7 +2355,11 @@
           "interactive_login_required",
           "host_owned_unavailable",
           "io",
-          "other"
+          "other",
+          "credential_access_denied",
+          "credential_interaction_required",
+          "credential_access_pending",
+          "credential_store_unavailable"
         ],
         "type": "string"
       },
@@ -4885,7 +4889,7 @@
           },
           {
             "additionalProperties": false,
-            "description": "The current run was cancelled at its next boundary.",
+            "description": "A cancel at its next boundary was recorded for the current run. The\nreply does not wait for the run to reach that boundary.",
             "properties": {
               "run": {
                 "const": "cancelled_at_boundary",
@@ -8337,6 +8341,17 @@
           "budget": true,
           "comms": true,
           "compaction": true,
+          "governance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GovernanceConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Readable through the ordinary config surfaces; an ordinary write\ncannot change it (governance is administered by the realm's trusted\nhost)."
+          },
           "hooks": true,
           "limits": true,
           "max_tokens": {
@@ -9032,6 +9047,18 @@
         "description": "Opaque slug identifying one shared credential account inside a realm.",
         "type": "string"
       },
+      "CredentialObservation": {
+        "description": "What a non-blocking status read could not observe about a stored\ncredential. A status carries it only when the credential store did not\nanswer, and then the status phase reflects the live lease alone: it is\nnever a statement that the credential is absent.\n\n`not_observed`: no operating-system read was attempted. `owner_busy`: the\ncredential's lifecycle owner was busy, so nothing was read. `pending`: an\nowner-held lookup is in flight. `denied` and `interaction_required`:\nbackend evidence from an earlier lookup. `unavailable`: the store could\nnot answer.",
+        "enum": [
+          "not_observed",
+          "owner_busy",
+          "pending",
+          "denied",
+          "interaction_required",
+          "unavailable"
+        ],
+        "type": "string"
+      },
       "CumulativeUsage": {
         "$ref": "#/components/schemas/Usage",
         "description": "Cumulative usage across committed turns. Cache detail counters and\nreasoning are aggregated as provider-normalized subsets: see\n[`CumulativeUsage::add_turn`].\n\nThis value is **already a total**, and the total is session-scoped: on the\nevent stream it is `Session::total_usage()`, which is persisted with the\nsession and restored on resume, so `run_completed.usage` on the second run of\na session already contains the first run's calls. Adding it to per-call\nusage, or summing the values observed on two runs, double-counts. It also\nintentionally carries no [`crate::ProviderTokenAccounting`], because one\nsession may span providers and models and so cannot truthfully claim a\nsingle per-call convention; per-model attribution is read from the per-call\nrows (`turn_completed.usage` and the extraction events' `request_usage`)."
@@ -9494,6 +9521,26 @@
             "const": "SESSION_RUNTIME_UNAVAILABLE",
             "description": "Runtime authority is unavailable before a session operation starts.",
             "type": "string"
+          },
+          {
+            "const": "APPROVAL_STORE_UNAVAILABLE",
+            "description": "The approval store committed nothing (unavailable or contended). An\nexplicitly attempted retry through fresh checks is valid.",
+            "type": "string"
+          },
+          {
+            "const": "APPROVAL_CONFLICT",
+            "description": "Another owner of the approval store changed the approval first; it\nis reconciled before reuse.",
+            "type": "string"
+          },
+          {
+            "const": "APPROVAL_COMMIT_UNKNOWN",
+            "description": "The approval store cannot confirm whether the commit happened; the\napproval is reconciled from the store before reuse, never resent.",
+            "type": "string"
+          },
+          {
+            "const": "STALE_DELIVERY_SCOPE",
+            "description": "A scope-bound mob submit named a member session that is no longer the\nmember's current session binding: the session rotated under a still\ncurrent runtime incarnation and fence. Distinct from\n[`Self::StaleFence`] (a superseded incarnation): the recovery is to\nre-capture the delivery scope, not to re-resolve the member.",
+            "type": "string"
           }
         ]
       },
@@ -9796,6 +9843,17 @@
         "title": "GoalStatusResult",
         "type": "object"
       },
+      "GovernanceConfig": {
+        "additionalProperties": false,
+        "description": "Governance of a realm's native composition. Empty by default: a stock\ngoverned realm keeps every operation at its local R1 tier and calls no\nreviewer. A present section ([`crate::Config::governance`]), even an\nempty one, replaces an inherited one as a whole.",
+        "properties": {
+          "review": {
+            "$ref": "#/components/schemas/StockReviewConfig",
+            "description": "The review the stock governed host requires."
+          }
+        },
+        "type": "object"
+      },
       "HandlingMode": {
         "description": "Handling mode for ordinary content-bearing work.\n\n`Queue` means outer-loop / next-turn handling and leaves the current run\nuntouched.\n`Steer` means inner-loop handling and requests injection at the earliest\nadmissible cooperative boundary, while remaining ordinary work rather than\nan out-of-band control-plane command.",
         "enum": [
@@ -10074,6 +10132,10 @@
             "$ref": "#/components/schemas/HookExecutionMode",
             "default": "foreground"
           },
+          "model_operations": {
+            "$ref": "#/components/schemas/HookModelOperationScope",
+            "description": "Which model operations this entry governs. Only meaningful at\n`pre_llm_request` and `post_llm_response`; absent means every model\nrequest, including the separate controller-feedback request."
+          },
           "point": {
             "$ref": "#/components/schemas/HookPoint",
             "default": "turn_boundary"
@@ -10216,6 +10278,14 @@
           }
         },
         "type": "object"
+      },
+      "HookModelOperationScope": {
+        "description": "Which model operations a hook entry governs at `PreLlmRequest` and\n`PostLlmResponse`.\n\nThe default governs every model request. `OrdinaryOnly` is the policy\nowner's explicit statement that its prerequisite does not govern the\nseparate controller-feedback request the agent sends after a mandatory\nprerequisite withheld an ordinary operation. It never applies implicitly.",
+        "enum": [
+          "all",
+          "ordinary_only"
+        ],
+        "type": "string"
       },
       "HookPoint": {
         "description": "Hook points available in V1.",
@@ -11230,6 +11300,13 @@
         ],
         "type": "string"
       },
+      "McpAccountDeclaration": {
+        "description": "A host's declaration of the account an MCP server's operations act with.",
+        "enum": [
+          "none"
+        ],
+        "type": "string"
+      },
       "McpAddParams": {
         "additionalProperties": false,
         "description": "Request payload for `mcp/add`.",
@@ -11250,6 +11327,94 @@
           "server_config"
         ],
         "title": "McpAddParams",
+        "type": "object"
+      },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
+      "McpConnectorBinding": {
+        "additionalProperties": false,
+        "description": "The connector credential a trusted MCP server installation's calls need:\nthe slot, the verified account and stable context the credential must be\nbound to, and each raw operation's required scopes and destination.",
+        "properties": {
+          "account": {
+            "description": "The provider-verified account subject (the strategy's canonical\naccount id) the credential must be bound to.",
+            "type": "string"
+          },
+          "client": {
+            "type": "string"
+          },
+          "issuer": {
+            "type": "string"
+          },
+          "operations": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/McpConnectorOperation"
+            },
+            "description": "Every raw operation the server exposes; an unlisted one is refused.",
+            "type": "object"
+          },
+          "realm_id": {
+            "type": "string"
+          },
+          "resource": {
+            "type": "string"
+          },
+          "slot_id": {
+            "type": "string"
+          },
+          "strategy_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "realm_id",
+          "slot_id",
+          "issuer",
+          "client",
+          "resource",
+          "strategy_id",
+          "account",
+          "operations"
+        ],
+        "type": "object"
+      },
+      "McpConnectorOperation": {
+        "additionalProperties": false,
+        "description": "One raw operation of a connector-bound installation.",
+        "properties": {
+          "destination_origin": {
+            "description": "`scheme://host[:port]` of the connector API the operation calls.",
+            "type": "string"
+          },
+          "read_only": {
+            "description": "The host's typed declaration that this operation only reads. Absent\n(`false`), the operation is undeclared, never inferred read-only from\nits name, the server's annotations or an access ceiling.",
+            "type": "boolean"
+          },
+          "required_scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "destination_origin"
+        ],
         "type": "object"
       },
       "McpHttpConfig": {
@@ -11462,6 +11627,24 @@
         "title": "McpRemoveParams",
         "type": "object"
       },
+      "McpServerAccess": {
+        "additionalProperties": false,
+        "description": "Host access ceiling for one MCP server, enforced by the connection that\ncalls it.\n\nOnly the raw MCP operations in `allowed_operations` may be called. The\nrouter does not offer any other under any name, and the connection\nrefuses any other before anything is sent.\nThe ceiling only narrows access. It does not certify that the listed\noperations are reads: session read-only policy still requires a trusted\nhost declaration for the exact destination and operation. Nothing is\ninferred from operation names or from the server's annotations.",
+        "properties": {
+          "allowed_operations": {
+            "description": "The raw MCP operation names that may be called.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "allowed_operations"
+        ],
+        "type": "object"
+      },
       "McpServerConfig": {
         "anyOf": [
           {
@@ -11473,6 +11656,28 @@
         ],
         "description": "Configuration for a single MCP server",
         "properties": {
+          "access": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/McpServerAccess"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Host access ceiling for this server's operations. Absent, every\noperation the server lists is callable (subject to session tool\npolicy). The server's own tool annotations never set or widen it."
+          },
+          "account": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/McpAccountDeclaration"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The host's declaration of the account this server's operations act\nwith, stated to review and consent: `none` declares that they act\nwith no selected account. Absent, the account is the connector\nbinding's or the OAuth account selection's, and otherwise unavailable:\na server without either never states that it has none. It conflicts\nwith both. Only host configuration sets it."
+          },
           "connect_timeout_secs": {
             "description": "Connection timeout in seconds (connect + handshake + list_tools).\nDefaults to 10 seconds when not specified.",
             "format": "uint32",
@@ -11481,6 +11686,17 @@
               "integer",
               "null"
             ]
+          },
+          "connector": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/McpConnectorBinding"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Trusted connector credential binding of a stdio server installation:\neach listed operation's calls carry the connector credential that\nsatisfies it, and the server gets the expected account binding at\nstartup. Only host configuration sets it."
           },
           "name": {
             "description": "Server name (must be unique within scope)",
@@ -11522,6 +11738,14 @@
             "default": {},
             "description": "Environment variables",
             "type": "object"
+          },
+          "secret_env": {
+            "description": "Names of environment variables whose values the realm that defines\nthis server keeps in its protected credential store. Only the names\nare configuration: each value is read for this exact definition when\nthe server is launched, and never from the host environment.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": true
           }
         },
         "required": [
@@ -13469,6 +13693,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "args": {
                 "items": {
                   "type": "string"
@@ -13513,6 +13748,17 @@
           {
             "additionalProperties": false,
             "properties": {
+              "access": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/McpServerAccess"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Exact access ceiling: only these raw operations may be called.\n`None` means no ceiling. Omitted when `None`, so a profile without\none keeps its digest-covered bytes, and a host too old to know the\nfield rejects it (`deny_unknown_fields`) instead of widening."
+              },
               "connect_timeout_secs": {
                 "format": "uint64",
                 "minimum": 0,
@@ -17688,6 +17934,160 @@
         "additionalProperties": true,
         "type": "object"
       },
+      "StockConsentAssurance": {
+        "description": "The weakest authenticated approver assurance an R3 rule's human consent\naccepts. Ordered by strength: where several R3 rules match one operation,\nthe strongest they state applies. A delegated service credential never\ndecides human consent, whatever a rule states.",
+        "enum": [
+          "device_trusted",
+          "person_authenticated"
+        ],
+        "type": "string"
+      },
+      "StockReviewConfig": {
+        "additionalProperties": false,
+        "description": "The stock governed host's review requirements: owner-selected rules that\nraise the review tier of exact native operation targets above the stock\nrules' own R1, and the explicit model that reviews R2 operations.\n\nA rule only raises a tier. It never allows an operation the stock rules\nrefuse or leave unmapped, and it never lowers the tier another owner\nrequires; the strictest requirement of every matching rule and owner\napplies. Without a reviewer an R2 operation is refused locally with typed\nfeedback; nothing falls back to R1 or to another model.",
+        "properties": {
+          "reviewer": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StockReviewerSelection"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/StockReviewRule"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "StockReviewRule": {
+        "additionalProperties": false,
+        "description": "One owner-selected rule: the review tier `target`'s operations require,\nand for R3 the weakest approver assurance its human consent accepts.",
+        "properties": {
+          "consent_assurance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StockConsentAssurance"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Required for an R3 rule and refused for an R2 rule."
+          },
+          "target": {
+            "$ref": "#/components/schemas/StockReviewTarget"
+          },
+          "tier": {
+            "$ref": "#/components/schemas/StockReviewTier"
+          }
+        },
+        "required": [
+          "target",
+          "tier"
+        ],
+        "type": "object"
+      },
+      "StockReviewTarget": {
+        "description": "An exact native operation target, by the names its owner registers it\nunder, never a model-facing display name. A selector may name a server\nor bundle that is connected or registered only later: nothing is\nresolved or discovered when the configuration loads.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "Every operation of one configured MCP server, by its configured name.",
+            "properties": {
+              "kind": {
+                "const": "mcp_server",
+                "type": "string"
+              },
+              "server": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "server"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "One raw operation of one configured MCP server.",
+            "properties": {
+              "kind": {
+                "const": "mcp_operation",
+                "type": "string"
+              },
+              "operation": {
+                "type": "string"
+              },
+              "server": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "server",
+              "operation"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "One operation of a tool bundle a trusted host registered under its\nstable name.",
+            "properties": {
+              "bundle": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "tool_bundle_operation",
+                "type": "string"
+              },
+              "operation": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "bundle",
+              "operation"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "StockReviewTier": {
+        "description": "A required review tier above the stock rules' own R1.",
+        "enum": [
+          "r2",
+          "r3"
+        ],
+        "type": "string"
+      },
+      "StockReviewerSelection": {
+        "additionalProperties": false,
+        "description": "The explicit model that reviews R2 operations: a session LLM identity\n(model, provider and its configured route or auth binding) and its\noutput budget. There is no default model.",
+        "properties": {
+          "identity": {
+            "$ref": "#/components/schemas/SessionLlmIdentity",
+            "description": "Read strictly: a misspelled field anywhere in the identity is\nrefused, never dropped."
+          },
+          "max_output_tokens": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "identity",
+          "max_output_tokens"
+        ],
+        "type": "object"
+      },
       "StopReason": {
         "description": "Why the model stopped generating",
         "oneOf": [
@@ -18168,13 +18568,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/components/schemas/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -18966,6 +19375,17 @@
               },
               "phase": {
                 "$ref": "#/components/schemas/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -20578,6 +20998,17 @@
           "binding_id": {
             "type": "string"
           },
+          "credential_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CredentialObservation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Set when the credential store did not answer this non-blocking status\nread. `state` then reflects the live lease alone and is never a claim\nthat the credential is absent."
+          },
           "expires_at": {
             "type": [
               "string",
@@ -20736,6 +21167,13 @@
           },
           "client": {
             "type": "string"
+          },
+          "client_auth_profile": {
+            "description": "Id of a client-auth profile the host installed for this issuer and\nclient; omitted for the default public-client forms. Never a secret.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "issuer": {
             "type": "string"
@@ -26332,7 +26770,7 @@
   },
   "info": {
     "title": "Meerkat REST API",
-    "version": "0.8.52"
+    "version": "0.9.0"
   },
   "openapi": "3.1.0",
   "paths": {

@@ -355,6 +355,11 @@ impl SpawnActivationWorkerContext {
                     "turn-driven spawn kickoff for '{agent_identity}' resolved to a tracked completion delivery"
                 )))
             }
+            SubmitWorkDispatchCompletion::AwaitGovernedAdmission { .. } => {
+                Err(MobError::Internal(format!(
+                    "turn-driven spawn kickoff for '{agent_identity}' resolved to a governed input"
+                )))
+            }
         }
     }
 
@@ -2873,6 +2878,7 @@ impl MobActor {
                 agent_identity: dsl_identity.clone(),
                 agent_runtime_id: dsl_runtime_id.clone(),
                 fence_token: dsl_fence_token,
+                expected_session_id: None,
                 work_id: dsl_work_id.clone(),
                 origin: dsl_origin,
                 content_attribution: mob_dsl::WorkContentAttribution::Conversational,
@@ -2886,6 +2892,7 @@ impl MobActor {
                     &dsl_identity,
                     &dsl_runtime_id,
                     dsl_fence_token,
+                    None,
                     agent_runtime_id,
                     origin,
                     agent_identity,
@@ -2912,6 +2919,7 @@ impl MobActor {
                 &entry,
                 ingress_authority,
                 SubmitWorkDispatchRequest {
+                    governed_input: None,
                     content,
                     system_prompt: None,
                     // Spawn kickoff is mob-internal coordination content; the

@@ -354,6 +354,9 @@ enum FixtureRuntime {
     /// [`Self::RuntimeBacked`], with every member build waiting for its MCP
     /// servers to finish connecting before its first turn.
     RuntimeBackedWaitingForMcp,
+    /// [`Self::RuntimeBacked`], with a delivery owner that also retries
+    /// blocked rows on the continuation bindings' source hint.
+    RuntimeBackedWithSourceHints,
     /// No explicitly supplied adapter; the session service supplies its owner.
     ImplicitOnly,
 }
@@ -432,11 +435,28 @@ fn persistent_service(
     runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
     client: Arc<dyn LlmClient>,
 ) -> Arc<meerkat_session::PersistentSessionService<meerkat::FactoryAgentBuilder>> {
+    persistent_service_with_mob_tools_slot(root, runtime_store, client).0
+}
+
+/// The service's slot for the default mob tools factory, which a surface
+/// fills once its mob state exists (as `wire_mob_tools` does).
+type MobToolsSlot = Arc<std::sync::RwLock<Option<Arc<dyn meerkat_core::service::MobToolsFactory>>>>;
+
+/// [`persistent_service`] with its mob-tools slot.
+fn persistent_service_with_mob_tools_slot(
+    root: &std::path::Path,
+    runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+    client: Arc<dyn LlmClient>,
+) -> (
+    Arc<meerkat_session::PersistentSessionService<meerkat::FactoryAgentBuilder>>,
+    MobToolsSlot,
+) {
     let (builder, store, project_root) = fixture_builder(root, client);
+    let mob_tools_slot = Arc::clone(&builder.default_mob_tools);
     let store_dyn: Arc<dyn meerkat::SessionStore> = store;
     let blob_store: Arc<dyn meerkat_core::BlobStore> =
         Arc::new(meerkat_store::MemoryBlobStore::default());
-    Arc::new(event_projection(
+    let service = Arc::new(event_projection(
         meerkat_session::PersistentSessionService::new(
             builder,
             32,
@@ -445,7 +465,8 @@ fn persistent_service(
             blob_store,
         ),
         &project_root,
-    ))
+    ));
+    (service, mob_tools_slot)
 }
 
 /// Where a host submits detached completions: a runtime delivery inbox over
@@ -456,6 +477,8 @@ fn persistent_service(
 pub struct FixtureContinuations {
     pub inbox: meerkat_runtime::RuntimeDeliveryInbox,
     pub bindings: Arc<meerkat::ContinuationHostBindings>,
+    /// The armed delivery owner's pass reports.
+    pub passes: tokio::sync::watch::Receiver<meerkat::RuntimeDeliveryPass>,
     /// The generation of the state that holds the bindings now: a restarted
     /// state takes them over from it, as a host that rebuilds its mob state
     /// does.
@@ -468,8 +491,30 @@ impl FixtureContinuations {
         service: &Arc<meerkat_session::PersistentSessionService<meerkat::FactoryAgentBuilder>>,
         runtime: &Arc<meerkat_runtime::MeerkatMachine>,
         runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+        source_hints: bool,
     ) -> Self {
-        let inbox = meerkat_runtime::RuntimeDeliveryInbox::new(runtime_store);
+        Self::arm_over(
+            service,
+            runtime,
+            meerkat_runtime::RuntimeDeliveryInbox::new(runtime_store),
+            source_hints,
+        )
+    }
+
+    /// Arm a delivery owner for any session `service` and its `runtime` over
+    /// `inbox`, the way the product surfaces arm theirs. With `source_hints`
+    /// it also retries blocked rows when the bindings announce a source
+    /// change ([`meerkat::ContinuationHostBindings::source_custody_changed`]),
+    /// as the RPC host's owner does.
+    pub fn arm_over<S>(
+        service: &Arc<S>,
+        runtime: &Arc<meerkat_runtime::MeerkatMachine>,
+        inbox: meerkat_runtime::RuntimeDeliveryInbox,
+        source_hints: bool,
+    ) -> Self
+    where
+        S: meerkat_core::service::SessionServiceControlExt + Send + Sync + 'static,
+    {
         let bindings = Arc::new(meerkat::ContinuationHostBindings::default());
         let job_store: Arc<dyn meerkat::DetachedJobStore> =
             Arc::new(meerkat::MemoryDetachedJobStore::new());
@@ -482,15 +527,19 @@ impl FixtureContinuations {
             )
             .with_continuation_bindings(Arc::clone(&bindings)),
         );
-        meerkat::RuntimeDeliveryOwner::new(job_store, inbox.clone())
+        let mut owner = meerkat::RuntimeDeliveryOwner::new(job_store, inbox.clone())
             .with_attachment_commits(runtime.subscribe_attachment_commits())
-            .with_run_settlements(runtime.subscribe_run_settlements())
-            .arm(host)
-            .expect("arm the fixture's delivery owner")
-            .detach();
+            .with_run_settlements(runtime.subscribe_run_settlements());
+        if source_hints {
+            owner = owner.with_source_changes(bindings.subscribe_source_changes());
+        }
+        let owner = owner.arm(host).expect("arm the fixture's delivery owner");
+        let passes = owner.subscribe_passes();
+        owner.detach();
         Self {
             inbox,
             bindings,
+            passes,
             holder: Arc::default(),
         }
     }
@@ -510,6 +559,30 @@ impl FixtureContinuations {
             Ok(()) => *holder = state.continuation_binding_generation(),
             Err(meerkat_mob_mcp::BindContinuationsError::NoRuntime) => {}
             Err(error) => panic!("bind the fixture's continuations: {error}"),
+        }
+    }
+}
+
+/// The first pass report of a delivery owner that satisfies `predicate`
+/// (the current one included), within a bound; it panics with the last
+/// report when none does.
+pub async fn wait_for_pass(
+    passes: &mut tokio::sync::watch::Receiver<meerkat::RuntimeDeliveryPass>,
+    what: &str,
+    predicate: impl FnMut(&meerkat::RuntimeDeliveryPass) -> bool,
+) -> meerkat::RuntimeDeliveryPass {
+    let reached = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        passes.wait_for(predicate),
+    )
+    .await
+    .map(|pass| pass.map(|pass| pass.clone()));
+    match reached {
+        Ok(Ok(pass)) => pass,
+        Ok(Err(_)) => panic!("the owner's pass channel closed before: {what}"),
+        Err(_) => {
+            let last = passes.borrow().clone();
+            panic!("the delivery owner never reached: {what}; last pass {last:?}")
         }
     }
 }
@@ -535,7 +608,8 @@ fn runtime_backed_service(
         32,
         meerkat::PersistenceBundle::new(store_dyn, runtime_store, blob_store)
             .expect("construct runtime authority"),
-    );
+    )
+    .expect("compose the runtime-backed service");
     (Arc::new(event_projection(service, &project_root)), runtime)
 }
 
@@ -561,7 +635,8 @@ pub fn agent_mob_tools_state(
             Arc::new(meerkat_store::MemoryBlobStore::default()),
         )
         .expect("persistence bundle"),
-    );
+    )
+    .expect("compose the runtime-backed service");
     let state = Arc::new(configure(
         MobMcpState::new_with_runtime_adapter(
             Arc::new(service),
@@ -670,6 +745,21 @@ impl CouncilFixture {
         )
     }
 
+    /// [`Self::new_runtime_backed_with_runtime_store`] whose delivery owner
+    /// also retries blocked rows when the continuation bindings announce a
+    /// source change, as the RPC host's owner does.
+    pub fn new_runtime_backed_with_source_hints(
+        script: impl Fn(&LlmRequest) -> ScriptedTurn + Send + Sync + 'static,
+        runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+    ) -> Self {
+        Self::build(
+            script,
+            |state, _root| state,
+            FixtureRuntime::RuntimeBackedWithSourceHints,
+            Some(runtime_store),
+        )
+    }
+
     fn build(
         script: impl Fn(&LlmRequest) -> ScriptedTurn + Send + Sync + 'static,
         customize: impl FnOnce(MobMcpState, &std::path::Path) -> MobMcpState,
@@ -685,7 +775,9 @@ impl CouncilFixture {
             runtime_store.unwrap_or_else(|| Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()));
         let (service, runtime_adapter) = if matches!(
             runtime,
-            FixtureRuntime::RuntimeBacked | FixtureRuntime::RuntimeBackedWaitingForMcp
+            FixtureRuntime::RuntimeBacked
+                | FixtureRuntime::RuntimeBackedWaitingForMcp
+                | FixtureRuntime::RuntimeBackedWithSourceHints
         ) {
             let (service, runtime) = runtime_backed_service(
                 &root,
@@ -721,8 +813,10 @@ impl CouncilFixture {
                 .ok()
                 .flatten()
         });
-        let continuations = delivery_runtime
-            .map(|runtime| FixtureContinuations::arm(&service, &runtime, runtime_store.clone()));
+        let source_hints = runtime == FixtureRuntime::RuntimeBackedWithSourceHints;
+        let continuations = delivery_runtime.map(|machine| {
+            FixtureContinuations::arm(&service, &machine, runtime_store.clone(), source_hints)
+        });
         if let Some(continuations) = &continuations {
             continuations.bind(&state);
         }
@@ -898,6 +992,47 @@ impl CouncilFixture {
             .try_with_persistent_storage_root(Some(state_root))
             .expect("reopen rooted council + capability custody")
             .into_shared();
+    }
+
+    /// [`Self::restart_cold_with`], with the new service's members mounting
+    /// the real agent mob tools: its default mob-tools slot holds the
+    /// generated `AgentMobToolSurfaceFactory` over the restarted state, as
+    /// `wire_mob_tools` wires a product surface. A restored member that mounts
+    /// the `mob` family builds its tools through that factory during restore.
+    pub async fn restart_cold_with_agent_mob_tools(
+        &mut self,
+        script: impl Fn(&LlmRequest) -> ScriptedTurn + Send + Sync + 'static,
+        customize: impl FnOnce(MobMcpState, &std::path::Path) -> MobMcpState,
+    ) {
+        assert!(
+            self.runtime_adapter.is_none(),
+            "a cold restart of a runtime-backed fixture is not modelled here"
+        );
+        for (_, handle) in self.state.mob_handles_snapshot().await.unwrap_or_default() {
+            handle
+                .shutdown()
+                .await
+                .expect("shut the previous lifetime's mob down");
+        }
+        self.service
+            .try_shutdown()
+            .await
+            .expect("shut the previous lifetime's sessions down");
+        let client = Arc::new(ScriptedCouncilClient::new(script));
+        self.calls = client.calls();
+        let (service, mob_tools_slot) =
+            persistent_service_with_mob_tools_slot(&self.root, self.runtime_store.clone(), client);
+        self.service = service;
+        let state_root = self.root.join("state");
+        self.state = customize(Self::state_over(&self.service, None), &state_root)
+            .try_with_persistent_storage_root(Some(state_root))
+            .expect("reopen rooted council + capability custody")
+            .into_shared();
+        *mob_tools_slot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
+            meerkat_mob_mcp::AgentMobToolSurfaceFactory::new(Arc::clone(&self.state)),
+        ));
     }
 
     /// A second session service over the SAME durable stores, with no live

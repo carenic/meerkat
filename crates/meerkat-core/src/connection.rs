@@ -2110,6 +2110,56 @@ pub struct RealmConfigSection {
     /// realm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<RealmId>,
+    /// Connector OAuth clients this realm's hosts use for connector login and
+    /// refresh, by profile id (`[realm.<id>.connector_client.<profile>]`).
+    /// Inherited through the realm chain like `auth`; the nearest realm
+    /// defining an id wins. Never holds a client secret.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub connector_client: BTreeMap<String, ConnectorClientConfig>,
+}
+
+/// How a connector OAuth client authenticates to its token endpoint.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorClientAuthMethod {
+    /// A public client: no client credential is sent.
+    #[default]
+    None,
+    /// `client_secret` is sent on the code exchange and every refresh. The
+    /// secret is held by the realm's credential store, not by this config.
+    ClientSecretPost,
+}
+
+/// Serialized connector OAuth client profile (non-secret).
+///
+/// Hosts map it into their connector client-auth profile; the fields keep
+/// that profile's meaning exactly, in order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorClientConfig {
+    /// The profile applies only to this issuer and client id.
+    pub issuer: String,
+    pub client: String,
+    #[serde(default)]
+    pub client_auth: ConnectorClientAuthMethod,
+    /// Extra authorize-request parameters, in order, as `[name, value]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authorize_params: Vec<(String, String)>,
+    /// Whether the RFC 8707 `resource` parameter is sent.
+    #[serde(default = "default_true")]
+    pub resource_indicator: bool,
+    /// The provider protocol this client speaks, by id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    /// Exact `https` redirect URIs registered for this client.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registered_redirect_uris: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl RealmConfigSection {
@@ -2206,6 +2256,7 @@ impl RealmConfigSection {
             binding,
             default_binding,
             parent: None,
+            connector_client: BTreeMap::new(),
         }
     }
 }

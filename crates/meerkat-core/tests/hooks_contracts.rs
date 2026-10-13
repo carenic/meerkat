@@ -73,6 +73,7 @@ fn hook_invocation_outcome_roundtrip_contract() -> Result<(), Box<dyn std::error
                 },
             ),
             message_count: 2,
+            operation: meerkat_core::HookModelOperation::Ordinary { sequence: 1 },
         }),
         llm_response: None,
         tool_call: None,

@@ -3028,6 +3028,56 @@ async fn scan_durable_terminals(
     })
 }
 
+/// How the directed turn's known completion is read before its durable
+/// terminal is selected.
+#[derive(Debug)]
+enum DirectedCompletionRead {
+    /// The released outcome names the terminal to select and its result.
+    Released(CompletionTerminalExpectation),
+    /// No completion result is read (a recovered unbounded turn): the exact
+    /// terminal is selected by identity.
+    Unread,
+    /// The input completed but its result may not be disclosed to this
+    /// reader. The exact terminal is selected by identity and only its
+    /// body-free lifecycle class is recorded, with no bounded result.
+    Withheld,
+}
+
+/// The tracked-turn outcome and bounded result recorded for the selected
+/// durable terminal. A withheld result records only the terminal's
+/// body-free completion class: a result is withheld only from a completion
+/// class, so a failure class disagrees with the refusal.
+fn selected_terminal_record(
+    tracking_kind: DirectedTurnTrackingKind,
+    candidate: &DurableTerminalCandidate,
+    read: &DirectedCompletionRead,
+    bounded_result_spec: Option<&BridgeBoundedResultSpec>,
+    session: &SessionId,
+) -> Result<(WireFlowTurnOutcome, Option<BridgeBoundedTurnResult>), String> {
+    let outcome = wire_outcome_from_terminal(
+        tracking_kind,
+        candidate.terminal.kind,
+        &candidate.terminal.outcome,
+    )?;
+    match read {
+        DirectedCompletionRead::Released(expectation) => Ok((
+            outcome,
+            expectation.bounded_result(bounded_result_spec, session)?,
+        )),
+        DirectedCompletionRead::Unread => Ok((outcome, None)),
+        DirectedCompletionRead::Withheld => match outcome {
+            WireFlowTurnOutcome::RunCompleted
+            | WireFlowTurnOutcome::ExtractionSucceeded
+            | WireFlowTurnOutcome::InteractionComplete
+            | WireFlowTurnOutcome::InteractionCallbackPending => Ok((outcome, None)),
+            _ => Err(format!(
+                "a withheld completion result disagrees with its durable failure terminal {}",
+                candidate.terminal.kind
+            )),
+        },
+    }
+}
+
 enum TerminalSelection<'a> {
     Selected(&'a DurableTerminalCandidate),
     AwaitMore,
@@ -3377,8 +3427,13 @@ async fn run_directed_turn_watcher(
     } else {
         initial_attribution
     };
-    let expectation = match completion_result {
-        Some(Ok(outcome)) => Some(CompletionTerminalExpectation::from_completion(outcome)),
+    let read = match completion_result {
+        Some(Ok(outcome)) => DirectedCompletionRead::Released(
+            CompletionTerminalExpectation::from_completion(outcome),
+        ),
+        // A refused disclosure is not a waiter failure: the input completed
+        // and its result is preserved, but this reader may not receive it.
+        Some(Err(error)) if error.is_disclosure_refused() => DirectedCompletionRead::Withheld,
         Some(Err(error)) => {
             tracing::error!(
                 session_id = %session,
@@ -3406,8 +3461,13 @@ async fn run_directed_turn_watcher(
                 .input_terminal_completion(&session, &attribution.runtime_input_id)
                 .await
             {
-                Ok(Some(outcome)) => Some(CompletionTerminalExpectation::from_completion(outcome)),
-                Ok(None) if bounded_result_spec.is_none() => None,
+                Ok(Some(outcome)) => DirectedCompletionRead::Released(
+                    CompletionTerminalExpectation::from_completion(outcome),
+                ),
+                Ok(None) if bounded_result_spec.is_none() => DirectedCompletionRead::Unread,
+                Err(meerkat_runtime::RuntimeDriverError::ScopedResultWithheld { .. }) => {
+                    DirectedCompletionRead::Withheld
+                }
                 Ok(None) => {
                     tracing::warn!(
                         session_id = %session,
@@ -3455,24 +3515,29 @@ async fn run_directed_turn_watcher(
                         expected_content_digest = %attribution.expected_content_digest,
                         matching_run_starts = scan.matching_run_starts,
                         terminals = ?scan.terminals,
-                        expectation = ?expectation,
+                        read = ?read,
                         "directed-turn durable terminal scan"
                     );
                     traced_watermark = Some(scan.watermark);
                 }
-                let selection = if let Some(expectation) = &expectation {
-                    select_completion_terminal(&scan, expectation, &attribution, interaction_id)
-                } else {
-                    select_recovered_terminal(&scan, &attribution, interaction_id)
+                let selection = match &read {
+                    DirectedCompletionRead::Released(expectation) => {
+                        select_completion_terminal(&scan, expectation, &attribution, interaction_id)
+                    }
+                    DirectedCompletionRead::Unread | DirectedCompletionRead::Withheld => {
+                        select_recovered_terminal(&scan, &attribution, interaction_id)
+                    }
                 };
                 match selection {
                     TerminalSelection::Selected(candidate) => {
-                        let outcome = match wire_outcome_from_terminal(
+                        let (outcome, bounded_result) = match selected_terminal_record(
                             attribution.tracking_kind,
-                            candidate.terminal.kind,
-                            &candidate.terminal.outcome,
+                            candidate,
+                            &read,
+                            bounded_result_spec.as_ref(),
+                            &session,
                         ) {
-                            Ok(outcome) => outcome,
+                            Ok(record) => record,
                             Err(reason) => {
                                 tracing::error!(
                                     session_id = %session,
@@ -3480,25 +3545,7 @@ async fn run_directed_turn_watcher(
                                     tracking_kind = ?attribution.tracking_kind,
                                     terminal_kind = %candidate.terminal.kind,
                                     reason,
-                                    "selected directed terminal violates its persisted tracking family; retaining Pending"
-                                );
-                                return;
-                            }
-                        };
-                        let bounded_result = match expectation
-                            .as_ref()
-                            .map(|expected| {
-                                expected.bounded_result(bounded_result_spec.as_ref(), &session)
-                            })
-                            .transpose()
-                        {
-                            Ok(result) => result.flatten(),
-                            Err(reason) => {
-                                tracing::error!(
-                                    session_id = %session,
-                                    input_id = %input_id,
-                                    reason,
-                                    "exact bounded result projection failed; retaining Pending"
+                                    "selected directed terminal cannot be recorded; retaining Pending"
                                 );
                                 return;
                             }
@@ -5811,6 +5858,88 @@ mod tests {
             selected,
             TerminalSelection::Selected(candidate) if candidate.terminal_seq == 51
         ));
+    }
+
+    /// A refused result disclosure is a known completion, not a waiter
+    /// failure: the exact terminal is selected by identity and recorded as
+    /// its body-free completion class, with no bounded result even when one
+    /// was requested. A failure terminal disagrees with the refusal and is
+    /// not recorded.
+    #[test]
+    fn withheld_disclosure_records_the_body_free_completion_class() {
+        use meerkat_runtime::completion::CompletionWaitError;
+        use meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionObservedOutcome;
+
+        let refused = CompletionWaitError::DisclosureRefused {
+            observed: RuntimeCompletionObservedOutcome::Completed,
+        };
+        assert!(refused.is_disclosure_refused());
+        assert!(
+            refused.wait_failure_observation().is_none(),
+            "a refused disclosure is not a waiter failure"
+        );
+        let session = SessionId::new();
+        let spec = BridgeBoundedResultSpec {
+            label: "placed_result".to_string(),
+            max_text_bytes: 4096,
+        };
+        let interaction_id = interaction(1);
+        let scan = DurableTerminalScan {
+            terminals: vec![
+                completed_candidate(41, "withheld-result", true, true),
+                interaction_completed_candidate(42, "withheld-result", interaction_id),
+            ],
+            matching_run_starts: 1,
+            watermark: 42,
+        };
+        for (attribution, expected) in [
+            (terminal_attribution(0), WireFlowTurnOutcome::RunCompleted),
+            (
+                peer_terminal_attribution(0),
+                WireFlowTurnOutcome::InteractionComplete,
+            ),
+        ] {
+            let TerminalSelection::Selected(candidate) =
+                select_recovered_terminal(&scan, &attribution, interaction_id)
+            else {
+                panic!("the exact terminal is selected by identity");
+            };
+            let (outcome, bounded_result) = selected_terminal_record(
+                attribution.tracking_kind,
+                candidate,
+                &DirectedCompletionRead::Withheld,
+                Some(&spec),
+                &session,
+            )
+            .expect("a withheld completion records its lifecycle class");
+            assert_eq!(outcome, expected);
+            assert!(bounded_result.is_none(), "no result is fabricated");
+            let record = serde_json::to_string(&outcome).expect("wire outcome");
+            assert!(!record.contains("withheld-result"));
+        }
+
+        let failed = terminal_candidate(
+            43,
+            meerkat_core::turn_terminal::ClassifiedTurnTerminal {
+                kind: meerkat_core::turn_terminal::TurnTerminalKind::RunFailed,
+                outcome: meerkat_core::turn_terminal::TurnTerminalOutcome::Failed {
+                    reason: "failed".to_string(),
+                },
+            },
+            true,
+            Some(interaction_id),
+        );
+        assert!(
+            selected_terminal_record(
+                DirectedTurnTrackingKind::FlowStep,
+                &failed,
+                &DirectedCompletionRead::Withheld,
+                Some(&spec),
+                &session,
+            )
+            .is_err(),
+            "a withheld result never relabels a failure terminal"
+        );
     }
 
     #[tokio::test(start_paused = true)]

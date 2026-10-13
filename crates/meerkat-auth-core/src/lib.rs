@@ -26,7 +26,12 @@ mod browser_login;
 pub mod connector_login;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod connector_oauth;
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "oauth")]
+pub mod connector_protocol;
 pub mod github_copilot;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod http_egress;
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(feature = "oauth")]
 pub mod mcp_oauth;
@@ -66,10 +71,10 @@ pub use browser_login::{
 pub use mcp_oauth::{
     CredentialHttpClientUnavailable, MCP_INTERACTIVE_LOGIN_TIMEOUT, MCP_OAUTH_CALLBACK_PATH,
     McpAccountSelection, McpAuthMode, McpOAuthAccountStrategy, McpOAuthAttemptCleanup,
-    McpOAuthAuthority, McpOAuthBrowserLaunch, McpOAuthCallback, McpOAuthCeremonyContext,
-    McpOAuthError, McpOAuthListenerCleanup, McpOAuthLoginComplete, McpOAuthLoginDisposition,
-    McpOAuthLoginStart, McpOAuthLoopbackBegin, McpOAuthPendingAttempt, McpOAuthPendingClose,
-    McpOAuthPendingLogin, McpServerIdentity, OidcUserInfoAccountStrategy,
+    McpOAuthAuthority, McpOAuthBrowserLaunch, McpOAuthCallback, McpOAuthCancelHandle,
+    McpOAuthCeremonyContext, McpOAuthError, McpOAuthListenerCleanup, McpOAuthLoginComplete,
+    McpOAuthLoginDisposition, McpOAuthLoginStart, McpOAuthLoopbackBegin, McpOAuthPendingAttempt,
+    McpOAuthPendingClose, McpOAuthPendingLogin, McpServerIdentity, OidcUserInfoAccountStrategy,
     UNVERIFIED_RESOURCE_STRATEGY_ID, stored_credential_matches_selection,
 };
 #[cfg(not(target_arch = "wasm32"))]

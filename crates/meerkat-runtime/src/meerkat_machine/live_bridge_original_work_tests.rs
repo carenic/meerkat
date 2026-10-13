@@ -182,6 +182,121 @@ async fn stage_run(fixture: &GovernedBridge, inputs: &[InputId]) -> RetainedWork
     minted
 }
 
+/// A staged work context carries the passive consent scope only when the
+/// driver has a cross-process hosting domain: that domain with the staged
+/// run's owner session. Without one it stages no scope.
+#[tokio::test]
+async fn the_staged_context_carries_the_consent_scope_of_its_hosting_domain() {
+    let fixture = governed_bridge().await;
+    let first = admit_original(&fixture, "original-requester").await;
+    let run = RunId::new();
+    let mut driver = fixture.driver.lock().await;
+    let DriverEntry::Ephemeral(driver) = &mut *driver else {
+        panic!("storeless")
+    };
+    let unscoped = driver
+        .batch_work_authorization(&run, std::slice::from_ref(&first))
+        .expect("staged batch")
+        .expect("work context");
+    assert!(
+        unscoped.consent_scope().is_none(),
+        "no hosting domain, no scope"
+    );
+
+    let domain = meerkat_core::session_hosting::HostingPaths {
+        hosting_lock_dir: "realm-a/hosting".into(),
+        cold_delivery_lock: "realm-a/hosting/cold-delivery.lock".into(),
+        database: None,
+    }
+    .domain_ref();
+    driver.set_consent_scope_domain(Some(domain.clone()));
+    let scoped = driver
+        .batch_work_authorization(&run, &[first])
+        .expect("staged batch")
+        .expect("work context");
+    assert_eq!(
+        scoped.consent_scope(),
+        Some(&meerkat_core::ApprovalConsentScope {
+            domain,
+            session_id: fixture.session_id.clone(),
+        })
+    );
+}
+
+/// Consent owner loss (3): a work context staged with a consent scope
+/// carries a lineage clone of the registration's hosting claim, which keeps
+/// the session's claim held after the driver lets its own clone go. Unscoped
+/// work carries none.
+#[cfg(not(target_arch = "wasm32"))]
+#[tokio::test]
+async fn the_scoped_staged_context_carries_the_registration_claim_lineage() {
+    use meerkat_core::session_hosting::{
+        HostingCapability, HostingOwner, HostingPaths, SessionServing, grant_session_hosting,
+        local_session_serving,
+    };
+    let fixture = governed_bridge().await;
+    let first = admit_original(&fixture, "original-requester").await;
+    let run = RunId::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = HostingPaths {
+        hosting_lock_dir: dir.path().join("hosting"),
+        cold_delivery_lock: dir.path().join("cold-delivery.lock"),
+        database: None,
+    };
+    let capability = HostingCapability::OsLock(Arc::new(paths.clone()));
+    let owner = HostingOwner::mint();
+    let claim = grant_session_hosting(&capability, &owner, &fixture.session_id).expect("claim");
+    let foreign = grant_session_hosting(&capability, &owner, &SessionId::new()).expect("claim");
+    let mut driver = fixture.driver.lock().await;
+    let DriverEntry::Ephemeral(driver) = &mut *driver else {
+        panic!("storeless")
+    };
+    driver.set_consent_hosting(Some(foreign));
+    driver.set_consent_scope_domain(Some(paths.domain_ref()));
+    let mismatched = driver
+        .batch_work_authorization(&run, std::slice::from_ref(&first))
+        .expect("staged batch")
+        .expect("work context");
+    assert!(
+        mismatched.consent_scope().is_some() && mismatched.consent_hosting().is_none(),
+        "a lineage of another session is never attached to this run's scope"
+    );
+    driver.set_consent_scope_domain(None);
+    driver.set_consent_hosting(Some(claim));
+    let unscoped = driver
+        .batch_work_authorization(&run, std::slice::from_ref(&first))
+        .expect("staged batch")
+        .expect("work context");
+    assert!(
+        unscoped.consent_hosting().is_none(),
+        "unscoped work carries no claim lineage"
+    );
+
+    driver.set_consent_scope_domain(Some(paths.domain_ref()));
+    let scoped = driver
+        .batch_work_authorization(&run, &[first])
+        .expect("staged batch")
+        .expect("work context");
+    let carried = scoped
+        .consent_hosting()
+        .expect("scoped work carries the claim lineage");
+    assert_eq!(carried.session_id(), &fixture.session_id);
+    assert_eq!(carried.owner(), &owner);
+    driver.set_consent_hosting(None);
+    drop(unscoped);
+    assert_eq!(
+        local_session_serving(&capability, &owner, &fixture.session_id),
+        SessionServing::HeldHere,
+        "the scoped work's lineage keeps the session's claim held"
+    );
+    drop(scoped);
+    assert_eq!(
+        local_session_serving(&capability, &owner, &fixture.session_id),
+        SessionServing::NotHeldInThisProcess,
+        "the claim is released with its last lineage holder"
+    );
+}
+
 /// End `run` the way a completed turn does (run terminal, then the service
 /// turn commit), so a later run can be prepared and staged.
 async fn finish_run(fixture: &GovernedBridge, run: &RunId) {
@@ -768,4 +883,177 @@ fn binding_errors_keep_infrastructure_transient_and_absent_authority_unavailable
     for error in unavailable {
         assert!(matches!(B::from(error), B::Unavailable(_)));
     }
+}
+
+/// A same-registration rebuild that finishes while an observer is read.
+enum Rebuild {
+    /// The rebuild installs its own MCP adapter.
+    WithMcp(
+        meerkat_core::McpObservationSlot,
+        Arc<dyn meerkat_core::McpOperationObserver>,
+    ),
+    /// The rebuild has no declarative MCP servers.
+    WithoutMcp(meerkat_core::McpObservationSlot),
+}
+
+/// An observer whose answer is fixed, optionally replaced in its slot by a
+/// same-registration rebuild while it is being read.
+struct ObservedAdapter {
+    answer: meerkat_core::McpOperationObservation,
+    rebuild_into: Option<Rebuild>,
+}
+
+#[async_trait::async_trait]
+impl meerkat_core::McpOperationObserver for ObservedAdapter {
+    async fn observe_operation(&self, _: &str, _: &str) -> meerkat_core::McpOperationObservation {
+        match &self.rebuild_into {
+            Some(Rebuild::WithMcp(slot, rebuilt)) => {
+                slot.install(Arc::clone(rebuilt))
+                    .expect("the registration is live");
+            }
+            Some(Rebuild::WithoutMcp(slot)) => slot.clear(),
+            None => {}
+        }
+        self.answer.clone()
+    }
+}
+
+/// The original selects its registration's current installed adapter; a
+/// same-registration rebuild during the read, a non-current destination and
+/// an ended registration are refused rather than reported.
+#[tokio::test]
+async fn the_original_observes_its_registrations_current_mcp_adapter() {
+    use super::McpObservationRefusal as Refusal;
+    use meerkat_core::McpOperationObservation as Observation;
+    let fixture = governed_bridge().await;
+    let input = admit_original(&fixture, "original-requester").await;
+    let staged = stage_run(&fixture, &[input]).await;
+    let slot = {
+        let sessions = fixture.machine.sessions.read().await;
+        sessions
+            .get(&fixture.session_id)
+            .expect("session")
+            .mcp_observation
+            .clone()
+    };
+    let observe = || {
+        fixture
+            .machine
+            .observe_original_mcp_operation(&staged, "calendar", "list_events")
+    };
+
+    assert_eq!(observe().await, Err(Refusal::NotInstalled));
+    let callable = Observation::Callable {
+        connection_generation: 7,
+        connector: None,
+    };
+    // Each returned Arc stands for the agent that owns the installed
+    // adapter; the slot holds it weakly.
+    let install = |observer: ObservedAdapter| {
+        let observer: Arc<dyn meerkat_core::McpOperationObserver> = Arc::new(observer);
+        slot.install(Arc::clone(&observer))
+            .expect("live registration");
+        observer
+    };
+    let _first = install(ObservedAdapter {
+        answer: callable.clone(),
+        rebuild_into: None,
+    });
+    assert_eq!(observe().await, Ok(callable.clone()));
+
+    let rebuilt: Arc<dyn meerkat_core::McpOperationObserver> = Arc::new(ObservedAdapter {
+        answer: Observation::Absent,
+        rebuild_into: None,
+    });
+    let replaced = install(ObservedAdapter {
+        answer: callable.clone(),
+        rebuild_into: Some(Rebuild::WithMcp(slot.clone(), Arc::clone(&rebuilt))),
+    });
+    assert_eq!(
+        observe().await,
+        Err(Refusal::Rebound),
+        "a same-registration rebuild during the read is refused"
+    );
+    assert_eq!(
+        observe().await,
+        Ok(Observation::Absent),
+        "the rebuilt adapter is the one observed next"
+    );
+
+    // The agent owning the installed adapter is gone: its router went with it.
+    drop(replaced);
+    drop(rebuilt);
+    assert_eq!(
+        observe().await,
+        Ok(Observation::Retired),
+        "the slot never keeps a released router observable as live"
+    );
+
+    // A rebuild without MCP servers ends the installation it replaces.
+    let _without = install(ObservedAdapter {
+        answer: callable,
+        rebuild_into: Some(Rebuild::WithoutMcp(slot.clone())),
+    });
+    assert_eq!(
+        observe().await,
+        Err(Refusal::Rebound),
+        "a rebuild without MCP during the read is refused"
+    );
+    assert_eq!(
+        observe().await,
+        Err(Refusal::NotInstalled),
+        "nothing is observed after a rebuild without MCP"
+    );
+    let _later = install(ObservedAdapter {
+        answer: Observation::Absent,
+        rebuild_into: None,
+    });
+
+    // A later run is staged with other work: the original cannot claim it.
+    finish_run(&fixture, staged.run_id()).await;
+    let later = admit_original(&fixture, "original-requester").await;
+    let later = stage_run(&fixture, &[later]).await;
+    assert_eq!(
+        observe().await,
+        Ok(Observation::Absent),
+        "the completed original still selects its registration"
+    );
+    let claimed = with(&staged, Some(later.run_id().clone()), None, None);
+    assert_eq!(
+        fixture
+            .machine
+            .observe_original_mcp_operation(&claimed, "calendar", "list_events")
+            .await,
+        Err(Refusal::OriginalUnavailable),
+        "work naming the current staged run must be that run's own"
+    );
+    assert_eq!(
+        fixture
+            .machine
+            .observe_original_mcp_operation(&later, "calendar", "list_events")
+            .await,
+        Ok(Observation::Absent)
+    );
+
+    let elsewhere = RetainedWorkIdentity::new(
+        MeerkatMachine::logical_runtime_id(&SessionId::new()).to_string(),
+        staged.run_id().clone(),
+        staged.contributors().to_vec(),
+        staged.selected_input_bindings().clone(),
+        staged.controller().cloned(),
+    );
+    assert_eq!(
+        fixture
+            .machine
+            .observe_original_mcp_operation(&elsewhere, "calendar", "list_events")
+            .await,
+        Err(Refusal::Retired),
+        "an original whose registration is not live here is retired"
+    );
+    slot.retire();
+    assert_eq!(
+        observe().await,
+        Err(Refusal::NotInstalled),
+        "an ended registration's slot observes nothing"
+    );
 }

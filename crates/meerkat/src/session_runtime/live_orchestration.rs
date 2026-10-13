@@ -297,6 +297,9 @@ pub fn should_fire_live_propagation(
 pub enum LiveHotSwapSkipReason {
     /// The session's current model already matches the new global model, or a
     /// session-scoped override is in effect — the swap would be a no-op.
+    /// A live channel opened under an independently selected execution
+    /// profile is skipped with this reason too: a session identity change
+    /// does not govern it.
     NoOpOrOverride,
     /// The session's live LLM identity could not be looked up.
     IdentityLookupFailed(String),
@@ -476,11 +479,11 @@ impl RealtimeSessionOpenProjection {
         self.member_turn_reasoning = preference;
     }
 
-    // Read only by the live orchestrator, which needs `session-store` and `live`.
-    #[cfg_attr(
-        not(all(feature = "session-store", feature = "live")),
-        allow(dead_code)
-    )]
+    #[cfg(all(
+        feature = "session-store",
+        feature = "live",
+        not(target_arch = "wasm32")
+    ))]
     fn member_turn_reasoning(
         &self,
     ) -> Option<meerkat_core::lifecycle::run_primitive::RequestReasoningPreference> {
@@ -557,6 +560,30 @@ pub enum ExperimentalLiveChannelOpenError {
         binding: crate::experimental_gpt_live::ExperimentalLiveOpenAuthorityError,
         cleanup: String,
     },
+}
+
+/// The strict open flow's projection of a live-open failure. A refused
+/// execution profile selection keeps its own error; a failed abandonment of
+/// the open admission it rode on is reported as a binding cleanup failure,
+/// like a failed close of a channel that was already published.
+#[cfg(feature = "openai-live")]
+fn experimental_live_open_error(
+    error: crate::session_runtime::errors::LiveOpenError,
+) -> ExperimentalLiveChannelOpenError {
+    use crate::experimental_gpt_live::ExperimentalLiveOpenAuthorityError;
+    use crate::session_runtime::errors::{LiveExecutionProfileAdmissionError, LiveOpenError};
+    match error {
+        LiveOpenError::ExecutionProfileAdmission(LiveExecutionProfileAdmissionError::Refused(
+            refusal,
+        )) => ExperimentalLiveChannelOpenError::ExecutionProfile(refusal.to_string()),
+        LiveOpenError::ExecutionProfileAdmission(
+            LiveExecutionProfileAdmissionError::AbandonmentFailed { abandonment, .. },
+        ) => ExperimentalLiveChannelOpenError::BindingCleanup {
+            binding: ExperimentalLiveOpenAuthorityError::ChannelBindingFailed,
+            cleanup: abandonment.to_string(),
+        },
+        error => ExperimentalLiveChannelOpenError::Open(error),
+    }
 }
 
 /// Opaque pending-phase carrier returned by the shared strict open flow.
@@ -786,6 +813,7 @@ pub fn builtin_tool_visibility_witness() -> meerkat_core::ToolVisibilityWitness 
     let provenance = meerkat_core::ToolProvenance {
         kind: meerkat_core::ToolSourceKind::Builtin,
         source_id: "builtin".into(),
+        artifact: None,
     };
     meerkat_core::ToolVisibilityWitness {
         last_seen_provenance: Some(provenance),
@@ -881,7 +909,8 @@ mod orchestrator {
         StagedCapacityAdmissions, take_staged_capacity_admission,
     };
     use crate::session_runtime::errors::{
-        LiveChannelVerbError, LiveIngressError, LiveOpenError, LiveOpenPrecheckError,
+        LiveChannelVerbError, LiveExecutionProfileAdmissionError, LiveIngressError, LiveOpenError,
+        LiveOpenPrecheckError,
     };
     use crate::session_runtime::recovery::{RecoveryContext, RecoveryRuntimeBindingMode};
     use crate::session_runtime::runtime_state::ArchiveRuntimeCleanup;
@@ -898,15 +927,6 @@ mod orchestrator {
         Explicit,
         ContextRecovery,
         ResultRecovery,
-    }
-
-    /// Which snapshot a non-waiting live projection was built from.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum ProjectionBoundary {
-        /// No turn was in flight; the ordinary guarded snapshot.
-        Settled,
-        /// A turn was in flight; the RuntimeStore-committed boundary.
-        Committed,
     }
 
     /// Surface-agnostic live-channel orchestrator.
@@ -1678,21 +1698,16 @@ mod orchestrator {
                 seed_window,
             )
             .await
-            .map(|(projection, _boundary)| projection)
         }
 
         /// The open projection behind
-        /// [`Self::realtime_session_open_projection_for_mirrored_channel`],
-        /// with which snapshot it was built from.
+        /// [`Self::realtime_session_open_projection_for_mirrored_channel`].
         async fn realtime_open_projection_without_waiting_for_turn(
             &self,
             session_id: &SessionId,
             turning_mode: meerkat_contracts::RealtimeTurningMode,
             seed_window: Option<LiveSeedWindow>,
-        ) -> Result<
-            (RealtimeSessionOpenProjection, ProjectionBoundary),
-            RealtimeSessionOpenProjectionError,
-        > {
+        ) -> Result<RealtimeSessionOpenProjection, RealtimeSessionOpenProjectionError> {
             let open_projection_lease = realtime_open_projection_admission(self.service)
                 .try_acquire()
                 .map_err(|error| {
@@ -1713,83 +1728,55 @@ mod orchestrator {
                 }
                 Err(error) => return Err(error.into()),
             };
-            let (session, canonical_user_image_decoded_bytes, visible_tools, boundary) =
-                match snapshot {
-                    meerkat_session::RealtimeOpenSnapshot::Settled {
-                        session,
-                        canonical_user_image_decoded_bytes,
-                    } => {
-                        let visible_tools = self.service.live_visible_tool_defs(session_id).await?;
-                        (
-                            session,
-                            canonical_user_image_decoded_bytes,
-                            visible_tools,
-                            ProjectionBoundary::Settled,
-                        )
-                    }
-                    meerkat_session::RealtimeOpenSnapshot::CommittedBoundary {
-                        session,
-                        canonical_user_image_decoded_bytes,
-                    } => {
-                        let visible_tools = self
-                            .service
-                            .published_live_visible_tool_defs(session_id)
-                            .await?;
-                        (
-                            session,
-                            canonical_user_image_decoded_bytes,
-                            visible_tools,
-                            ProjectionBoundary::Committed,
-                        )
-                    }
-                };
-            let projection = self
-                .realtime_open_projection_from_snapshot(
-                    session_id,
-                    turning_mode,
-                    seed_window,
-                    open_projection_lease,
+            let (session, canonical_user_image_decoded_bytes, visible_tools) = match snapshot {
+                meerkat_session::RealtimeOpenSnapshot::Settled {
                     session,
                     canonical_user_image_decoded_bytes,
-                    visible_tools,
-                )
-                .await?;
-            Ok((projection, boundary))
-        }
-
-        /// The open config `live/refresh` stamps onto one channel, never
-        /// waiting behind the member's running turn. With no turn in flight it
-        /// is exactly [`Self::realtime_session_open_config`]. With a turn in
-        /// flight it is built from the committed boundary and the published
-        /// tool definitions, and the durable resync the ordinary path performs
-        /// is deferred to the turn boundary
-        /// ([`Self::release_live_resync_at_turn_boundary`]).
-        pub async fn live_refresh_open_config_for_channel(
-            &self,
-            session_id: &SessionId,
-            channel_id: &LiveChannelId,
-            turning_mode: meerkat_contracts::RealtimeTurningMode,
-        ) -> Result<RealtimeSessionOpenConfig, RealtimeSessionOpenProjectionError> {
-            let (projection, boundary) = self
-                .realtime_open_projection_without_waiting_for_turn(session_id, turning_mode, None)
-                .await?;
-            if boundary == ProjectionBoundary::Committed {
-                self.release_live_resync_at_turn_boundary(session_id, channel_id);
-            }
-            Ok(projection.open_config)
+                } => {
+                    let visible_tools = self.service.live_visible_tool_defs(session_id).await?;
+                    (session, canonical_user_image_decoded_bytes, visible_tools)
+                }
+                meerkat_session::RealtimeOpenSnapshot::CommittedBoundary {
+                    session,
+                    canonical_user_image_decoded_bytes,
+                } => {
+                    let visible_tools = self
+                        .service
+                        .published_live_visible_tool_defs(session_id)
+                        .await?;
+                    (session, canonical_user_image_decoded_bytes, visible_tools)
+                }
+            };
+            self.realtime_open_projection_from_snapshot(
+                session_id,
+                turning_mode,
+                seed_window,
+                open_projection_lease,
+                session,
+                canonical_user_image_decoded_bytes,
+                visible_tools,
+            )
+            .await
         }
 
         /// The config-only refresh projection for one channel, never waiting
-        /// behind the member's running turn. With no turn in flight it is
-        /// exactly [`Self::live_refresh_config_for_session`]. With a turn in
-        /// flight it is built from the committed boundary and the published
-        /// tool definitions, and the durable resync is deferred to the turn
+        /// behind the member's running turn. It reads the history-free refresh
+        /// export: canonical System drift data, content identities and
+        /// tombstones and the rewrite generation, but no Open reservation, no
+        /// media hydration and no replay seed. With a turn in flight it is
+        /// built from the committed boundary and the published tool
+        /// definitions, and the durable resync is deferred to the turn
         /// boundary ([`Self::release_live_resync_at_turn_boundary`]).
+        ///
+        /// `llm_identity` is the identity the channel is bound to
+        /// ([`MeerkatMachine::live_channel_binding`]); the session's text
+        /// identity is never substituted for it.
         pub async fn live_refresh_config_for_channel(
             &self,
             session_id: &SessionId,
             channel_id: &LiveChannelId,
             turning_mode: meerkat_contracts::RealtimeTurningMode,
+            llm_identity: SessionLlmIdentity,
         ) -> Result<RealtimeSessionOpenConfig, RealtimeSessionOpenProjectionError> {
             Box::pin(self.recover_live_session_for_realtime_open(session_id)).await?;
             let snapshot = match self
@@ -1822,7 +1809,6 @@ mod orchestrator {
                     (session, visible_tools)
                 }
             };
-            let llm_identity = self.service.live_session_llm_identity(session_id).await?;
             Self::refresh_config_from_session(turning_mode, llm_identity, visible_tools, &session)
         }
 
@@ -2271,8 +2257,11 @@ mod orchestrator {
         /// identity changes in a way the provider session cannot refresh in
         /// place. This is the session-scoped sibling of
         /// `propagate_config_to_live_channels`: both paths compare the
-        /// generated live-open bound identity against the new session identity
-        /// and close through generated live-close authority.
+        /// generated live-open bound identity of a session-following channel
+        /// against the new session identity and close through generated
+        /// live-close authority. A channel opened under an independently
+        /// selected execution profile is governed by that profile, not by the
+        /// session identity, and is left as it is.
         pub async fn close_live_channels_for_identity_change(
             &self,
             session_id: &SessionId,
@@ -2294,12 +2283,12 @@ mod orchestrator {
                 if &channel_session_id != session_id {
                     continue;
                 }
-                let bound_identity = match self
+                let binding = match self
                     .runtime_adapter
-                    .live_channel_bound_llm_identity(session_id, &channel_id)
+                    .live_channel_binding(session_id, &channel_id)
                     .await
                 {
-                    Ok(Some(identity)) => identity,
+                    Ok(Some(binding)) => binding,
                     Ok(None) => {
                         let reason = meerkat_core::live_adapter::LiveConfigRejectionReason::Other {
                             detail: "missing generated live-channel bound identity authority"
@@ -2346,14 +2335,21 @@ mod orchestrator {
                         continue;
                     }
                 };
-                if !live_channel_requires_close_for_identity_change(&bound_identity, new_identity) {
+                if !binding.follows_session_identity() {
                     report
                         .skipped
                         .push((session_id.clone(), LiveHotSwapSkipReason::NoOpOrOverride));
                     continue;
                 }
-                let reason = live_channel_identity_swap_reason(&bound_identity, new_identity);
-                let context = live_channel_identity_swap_context(&bound_identity, new_identity);
+                let bound_identity = binding.identity();
+                if !live_channel_requires_close_for_identity_change(bound_identity, new_identity) {
+                    report
+                        .skipped
+                        .push((session_id.clone(), LiveHotSwapSkipReason::NoOpOrOverride));
+                    continue;
+                }
+                let reason = live_channel_identity_swap_reason(bound_identity, new_identity);
+                let context = live_channel_identity_swap_context(bound_identity, new_identity);
                 match self
                     .close_live_channel_for_config_rejection(
                         host,
@@ -2373,7 +2369,10 @@ mod orchestrator {
 
         /// Fan out `Refresh` (or `Close` if the new resolved model is no
         /// longer realtime-capable, or if the model/provider was
-        /// swapped) to every active live channel. Per-channel faults are
+        /// swapped) to every active live channel that follows its session's
+        /// identity. A channel opened under an independently selected
+        /// execution profile is skipped: its identity is governed by that
+        /// profile, not by the session. Per-channel faults are
         /// recorded as typed entries in the returned
         /// [`LiveConfigPropagationReport`] (`swap_failed`, `refresh_failed`,
         /// `close_failed`) — never swallowed via tracing alone.
@@ -2473,61 +2472,19 @@ mod orchestrator {
                         continue;
                     }
                 };
-                if let Err(precheck_err) = Box::pin(self.precheck_live_open(&session_id)).await {
-                    tracing::info!(
-                        target: "meerkat::session_runtime::live_orchestration",
-                        ?channel_id,
-                        ?session_id,
-                        ?precheck_err,
-                        "closing live channel: new resolution not realtime-capable"
-                    );
-                    let reason = meerkat_core::live_adapter::LiveConfigRejectionReason::NonRealtimeResolution {
-                        detail: format!("{precheck_err:?}"),
-                    };
-                    match self
-                        .close_live_channel_for_config_rejection(
-                            host,
-                            &session_id,
-                            &channel_id,
-                            reason,
-                            "non_realtime",
-                        )
-                        .await
-                    {
-                        Ok(()) => report.closed.push(session_id.clone()),
-                        Err(failure) => report.close_failed.push((session_id.clone(), failure)),
-                    }
-                    continue;
-                }
-                let open_config = match Box::pin(self.live_refresh_config_for_channel(
-                    &session_id,
-                    &channel_id,
-                    meerkat_contracts::RealtimeTurningMode::ProviderManaged,
-                ))
-                .await
-                {
-                    Ok(config) => config,
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "meerkat::session_runtime::live_orchestration",
-                            ?channel_id,
-                            ?session_id,
-                            ?err,
-                            "failed to build refreshed open_config for live channel"
-                        );
-                        report.refresh_failed.push((
-                            session_id.clone(),
-                            LiveChannelRefreshFailure::OpenConfigBuildFailed(err.to_string()),
-                        ));
-                        continue;
-                    }
-                };
-                let bound_identity = match self
+                // The generated binding classifies the channel. A channel
+                // opened under an independently selected execution profile is
+                // governed by that profile's own model, provider and binding:
+                // a session text-model change neither retargets nor closes
+                // it, and a change of its selected account, route or binding
+                // goes through the existing close/reopen authority, never
+                // through this refresh.
+                let binding = match self
                     .runtime_adapter
-                    .live_channel_bound_llm_identity(&session_id, &channel_id)
+                    .live_channel_binding(&session_id, &channel_id)
                     .await
                 {
-                    Ok(Some(identity)) => identity,
+                    Ok(Some(binding)) => binding,
                     Ok(None) => {
                         tracing::warn!(
                             target: "meerkat::session_runtime::live_orchestration",
@@ -2586,32 +2543,88 @@ mod orchestrator {
                         continue;
                     }
                 };
+                if !binding.follows_session_identity() {
+                    tracing::debug!(
+                        target: "meerkat::session_runtime::live_orchestration",
+                        ?channel_id,
+                        ?session_id,
+                        execution_profile = ?binding.execution_profile_id(),
+                        "live channel is governed by its selected execution profile; not propagated"
+                    );
+                    report
+                        .skipped
+                        .push((session_id.clone(), LiveHotSwapSkipReason::NoOpOrOverride));
+                    continue;
+                }
+                if let Err(precheck_err) = Box::pin(self.precheck_live_open(&session_id)).await {
+                    tracing::info!(
+                        target: "meerkat::session_runtime::live_orchestration",
+                        ?channel_id,
+                        ?session_id,
+                        ?precheck_err,
+                        "closing live channel: new resolution not realtime-capable"
+                    );
+                    let reason = meerkat_core::live_adapter::LiveConfigRejectionReason::NonRealtimeResolution {
+                        detail: format!("{precheck_err:?}"),
+                    };
+                    match self
+                        .close_live_channel_for_config_rejection(
+                            host,
+                            &session_id,
+                            &channel_id,
+                            reason,
+                            "non_realtime",
+                        )
+                        .await
+                    {
+                        Ok(()) => report.closed.push(session_id.clone()),
+                        Err(failure) => report.close_failed.push((session_id.clone(), failure)),
+                    }
+                    continue;
+                }
+                // A session-following channel is compared with the session's
+                // resolved identity, never with its own bound identity.
+                let session_identity =
+                    match self.service.live_session_llm_identity(&session_id).await {
+                        Ok(identity) => identity,
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "meerkat::session_runtime::live_orchestration",
+                                ?channel_id,
+                                ?session_id,
+                                ?err,
+                                "failed to resolve the session identity for a live channel"
+                            );
+                            report.refresh_failed.push((
+                                session_id.clone(),
+                                LiveChannelRefreshFailure::OpenConfigBuildFailed(err.to_string()),
+                            ));
+                            continue;
+                        }
+                    };
+                let bound_identity = binding.into_identity();
                 if live_channel_requires_close_for_identity_change(
                     &bound_identity,
-                    &open_config.llm_identity,
+                    &session_identity,
                 ) {
-                    let context = live_channel_identity_swap_context(
-                        &bound_identity,
-                        &open_config.llm_identity,
-                    );
+                    let context =
+                        live_channel_identity_swap_context(&bound_identity, &session_identity);
                     tracing::info!(
                         target: "meerkat::session_runtime::live_orchestration",
                         %channel_id,
                         %session_id,
                         old_model_id = %bound_identity.model,
-                        new_model_id = %open_config.llm_identity.model,
+                        new_model_id = %session_identity.model,
                         old_provider_id = ?bound_identity.provider,
-                        new_provider_id = ?open_config.llm_identity.provider,
+                        new_provider_id = ?session_identity.provider,
                         old_auth_binding = ?bound_identity.auth_binding,
-                        new_auth_binding = ?open_config.llm_identity.auth_binding,
+                        new_auth_binding = ?session_identity.auth_binding,
                         reason = context,
                         "closing live channel: resolved live identity changed; \
                          SDK must reopen against new identity"
                     );
-                    let reason = live_channel_identity_swap_reason(
-                        &bound_identity,
-                        &open_config.llm_identity,
-                    );
+                    let reason =
+                        live_channel_identity_swap_reason(&bound_identity, &session_identity);
                     match self
                         .close_live_channel_for_config_rejection(
                             host,
@@ -2627,6 +2640,30 @@ mod orchestrator {
                     }
                     continue;
                 }
+                let open_config = match Box::pin(self.live_refresh_config_for_channel(
+                    &session_id,
+                    &channel_id,
+                    meerkat_contracts::RealtimeTurningMode::ProviderManaged,
+                    bound_identity,
+                ))
+                .await
+                {
+                    Ok(config) => config,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "meerkat::session_runtime::live_orchestration",
+                            ?channel_id,
+                            ?session_id,
+                            ?err,
+                            "failed to build refreshed open_config for live channel"
+                        );
+                        report.refresh_failed.push((
+                            session_id.clone(),
+                            LiveChannelRefreshFailure::OpenConfigBuildFailed(err.to_string()),
+                        ));
+                        continue;
+                    }
+                };
                 let mut snapshot =
                     build_live_projection_snapshot_for_runtime(&session_id, &open_config);
                 match host.next_snapshot_version(&channel_id).await {
@@ -2916,48 +2953,20 @@ mod orchestrator {
             }
             pending.apply_execution_identity(&mut projection);
             let canonical_seed_cursor = projection.open_config.canonical_message_cursor();
+            let execution_profile = pending.execution_profile().clone();
             let result = self
-                .open_live_channel_from_projection(
+                .open_live_channel_from_projection_with_execution_profile(
                     host,
                     transport_ctx,
                     pending.session_factory(),
                     session_id,
                     projection,
                     requested_transport,
-                )
-                .await
-                .map_err(super::ExperimentalLiveChannelOpenError::Open)?;
-            let channel_id = LiveChannelId::new(&result.channel_id);
-            let execution_profile = pending.execution_profile().clone();
-            if let Err(error) = self
-                .runtime_adapter
-                .resolve_live_execution_profile_admission(
-                    session_id,
-                    &channel_id,
                     &execution_profile,
                 )
                 .await
-            {
-                let binding = crate::experimental_gpt_live::ExperimentalLiveOpenAuthorityError::ChannelBindingFailed;
-                authority.unbind_channel(&channel_id, session_id).await;
-                if let Err(cleanup) = self
-                    .close_live_channel_for(
-                        host,
-                        &channel_id,
-                        Some(session_id),
-                        meerkat_core::LiveChannelCloseReason::OpenAbandoned,
-                    )
-                    .await
-                {
-                    return Err(super::ExperimentalLiveChannelOpenError::BindingCleanup {
-                        binding,
-                        cleanup: cleanup.to_string(),
-                    });
-                }
-                return Err(super::ExperimentalLiveChannelOpenError::ExecutionProfile(
-                    error.to_string(),
-                ));
-            }
+                .map_err(super::experimental_live_open_error)?;
+            let channel_id = LiveChannelId::new(&result.channel_id);
             let staged = match (&pre_open, boundary_cursor) {
                 // The summary missed the bound: the boundary stays a
                 // preparation obligation delivered after the first user turn.
@@ -3724,6 +3733,37 @@ mod orchestrator {
                 prepared_projection,
                 requested_transport,
                 None,
+                None,
+            )
+            .await
+        }
+
+        /// Strict variant for a channel opened under an independently selected
+        /// execution profile. The sealed selection is admitted inside the
+        /// open custody, after the generated open admission and before the
+        /// host publishes the channel, so the published channel is never
+        /// observable as session-following.
+        #[cfg(feature = "openai-live")]
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) async fn open_live_channel_from_projection_with_execution_profile(
+            &self,
+            host: &LiveAdapterHost,
+            transport_ctx: LiveTransportContext<'_>,
+            session_factory: &dyn RealtimeSessionFactory,
+            session_id: &SessionId,
+            prepared_projection: RealtimeSessionOpenProjection,
+            requested_transport: Option<LiveOpenTransport>,
+            execution_profile: &meerkat_runtime::live_execution::LiveExecutionProfileSelection,
+        ) -> Result<LiveOpenResult, LiveOpenError> {
+            self.open_live_channel_from_projection_with_candidate(
+                host,
+                transport_ctx,
+                session_factory,
+                session_id,
+                prepared_projection,
+                requested_transport,
+                None,
+                Some(execution_profile),
             )
             .await
         }
@@ -3741,6 +3781,7 @@ mod orchestrator {
             prepared_projection: RealtimeSessionOpenProjection,
             requested_transport: Option<LiveOpenTransport>,
             recovery: &meerkat_runtime::live_execution::LiveContextAmbiguityRecoveryAuthority,
+            execution_profile: &meerkat_runtime::live_execution::LiveExecutionProfileSelection,
         ) -> Result<LiveOpenResult, LiveOpenError> {
             if recovery.session_id() != session_id {
                 return Err(LiveOpenError::SessionStateFault(SessionError::Unsupported(
@@ -3755,6 +3796,7 @@ mod orchestrator {
                 prepared_projection,
                 requested_transport,
                 Some(recovery.replacement_channel_id().clone()),
+                Some(execution_profile),
             )
             .await
         }
@@ -3773,6 +3815,7 @@ mod orchestrator {
             prepared_projection: RealtimeSessionOpenProjection,
             requested_transport: Option<LiveOpenTransport>,
             recovery: &meerkat_runtime::live_execution::LiveDelegationResultAmbiguityRecoveryAuthority,
+            execution_profile: &meerkat_runtime::live_execution::LiveExecutionProfileSelection,
         ) -> Result<LiveOpenResult, LiveOpenError> {
             if recovery.session_id() != session_id {
                 return Err(LiveOpenError::SessionStateFault(SessionError::Unsupported(
@@ -3787,6 +3830,7 @@ mod orchestrator {
                 prepared_projection,
                 requested_transport,
                 Some(recovery.replacement_channel_id().clone()),
+                Some(execution_profile),
             )
             .await
         }
@@ -3801,6 +3845,9 @@ mod orchestrator {
             prepared_projection: RealtimeSessionOpenProjection,
             requested_transport: Option<LiveOpenTransport>,
             sealed_candidate_channel_id: Option<LiveChannelId>,
+            execution_profile: Option<
+                &meerkat_runtime::live_execution::LiveExecutionProfileSelection,
+            >,
         ) -> Result<LiveOpenResult, LiveOpenError> {
             if prepared_projection.owner_session_id != *session_id {
                 return Err(LiveOpenError::OpenConfig(
@@ -3884,6 +3931,36 @@ mod orchestrator {
                     }
                     None => LiveOpenError::AdmissionRejectedNoReason,
                 });
+            }
+
+            // S5b: a channel opened under an independently selected execution
+            // profile records that selection inside this open custody, before
+            // S6 publishes the channel, so no observer of the published
+            // channel can classify it as session-following.
+            if let Some(execution_profile) = execution_profile
+                && let Err(refusal) = self
+                    .runtime_adapter
+                    .resolve_live_execution_profile_admission(
+                        session_id,
+                        &candidate_channel_id,
+                        execution_profile,
+                    )
+                    .await
+            {
+                // Nothing was published, so abandoning the open admission is
+                // the whole cleanup. If it fails, the generated binding may
+                // remain, and that failure is reported with the refusal.
+                let abandoned = self
+                    .runtime_adapter
+                    .abandon_live_open_admission(session_id, &candidate_channel_id)
+                    .await;
+                return Err(LiveOpenError::ExecutionProfileAdmission(match abandoned {
+                    Ok(()) => LiveExecutionProfileAdmissionError::Refused(refusal),
+                    Err(abandonment) => LiveExecutionProfileAdmissionError::AbandonmentFailed {
+                        refusal,
+                        abandonment,
+                    },
+                }));
             }
 
             // S6 — host channel open; failure evicts the generated
@@ -5045,9 +5122,10 @@ mod orchestrator {
                 .map_err(|message| LiveChannelVerbError::ResultProjection { message })
         }
 
-        /// `live/refresh` (R7/R8): rebuild the open config, stamp the
-        /// host's monotonic snapshot version, enqueue `Refresh`; the public
-        /// `queued` status is generated-authority truth.
+        /// `live/refresh` (R7/R8): rebuild the channel's configuration from
+        /// the history-free refresh export under the identity the channel is
+        /// bound to, stamp the host's monotonic snapshot version, enqueue
+        /// `Refresh`; the public `queued` status is generated-authority truth.
         pub async fn refresh_live_channel(
             &self,
             host: &LiveAdapterHost,
@@ -5066,11 +5144,32 @@ mod orchestrator {
             };
             Self::check_session_pin(channel_id, &session_id, expected_session)?;
 
+            // The generated binding read is not a reservation: a channel that
+            // retired since the owner lookup gets the same local unbound
+            // refusal, never a refresh under the session's text identity.
+            let binding = match self
+                .runtime_adapter
+                .live_channel_binding(&session_id, channel_id)
+                .await
+            {
+                Ok(Some(binding)) => binding,
+                Ok(None) => {
+                    return Err(self
+                        .record_unbound_channel_request(channel_id, request)
+                        .await);
+                }
+                Err(error) => {
+                    return Err(LiveChannelVerbError::ResultAuthority {
+                        message: format!("live channel binding authority lookup failed: {error}"),
+                    });
+                }
+            };
             let open_config = self
-                .live_refresh_open_config_for_channel(
+                .live_refresh_config_for_channel(
                     &session_id,
                     channel_id,
                     RealtimeTurningMode::ProviderManaged,
+                    binding.into_identity(),
                 )
                 .await
                 .map_err(LiveChannelVerbError::RefreshConfig)?;
@@ -6186,5 +6285,51 @@ mod prompt_truth_tests {
         .expect("ordinary dialogue must be representable");
         let snapshot = build_live_projection_snapshot_for_runtime(&SessionId::new(), &open_config);
         assert!(snapshot.canonical_system_messages.is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "openai-live"))]
+mod experimental_live_open_error_tests {
+    use super::{ExperimentalLiveChannelOpenError, experimental_live_open_error};
+    use crate::experimental_gpt_live::ExperimentalLiveOpenAuthorityError;
+    use crate::session_runtime::errors::{LiveExecutionProfileAdmissionError, LiveOpenError};
+    use meerkat_runtime::RuntimeDriverError;
+
+    fn synthetic(reason: &str) -> RuntimeDriverError {
+        RuntimeDriverError::ValidationFailed {
+            reason: reason.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_failed_abandonment_after_a_refused_profile_is_a_binding_cleanup_failure() {
+        let refused = experimental_live_open_error(LiveOpenError::ExecutionProfileAdmission(
+            LiveExecutionProfileAdmissionError::Refused(synthetic("synthetic profile refusal")),
+        ));
+        assert!(
+            matches!(
+                &refused,
+                ExperimentalLiveChannelOpenError::ExecutionProfile(detail)
+                    if detail.contains("synthetic profile refusal")
+            ),
+            "an abandoned admission keeps the refusal: {refused:?}"
+        );
+
+        let unabandoned = experimental_live_open_error(LiveOpenError::ExecutionProfileAdmission(
+            LiveExecutionProfileAdmissionError::AbandonmentFailed {
+                refusal: synthetic("synthetic profile refusal"),
+                abandonment: synthetic("synthetic abandonment failure"),
+            },
+        ));
+        assert!(
+            matches!(
+                &unabandoned,
+                ExperimentalLiveChannelOpenError::BindingCleanup {
+                    binding: ExperimentalLiveOpenAuthorityError::ChannelBindingFailed,
+                    cleanup,
+                } if cleanup.contains("synthetic abandonment failure")
+            ),
+            "a failed abandonment is reported, never claimed done: {unabandoned:?}"
+        );
     }
 }

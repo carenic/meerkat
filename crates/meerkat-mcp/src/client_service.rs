@@ -125,6 +125,15 @@ impl ConnectedClient {
             Self::Host(service) => service.cancel().await,
         }
     }
+
+    /// A handle that cancels this running service without owning it; its
+    /// end is then observed by the owner's later close.
+    pub(crate) fn cancellation_token(&self) -> rmcp::service::RunningServiceCancellationToken {
+        match self {
+            Self::Default(service) => service.cancellation_token(),
+            Self::Host(service) => service.cancellation_token(),
+        }
+    }
 }
 
 pub(crate) struct FormClient {

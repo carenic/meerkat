@@ -549,23 +549,27 @@ async fn unknown_delivery_reports_typed_unknown_by_deadline_and_for_retired_memb
     let mut fixture = Fixture::new().await;
     let never_sent = delivery("terminal-never-sent");
 
+    // The slice must outlast the first runtime read on a loaded host: a read
+    // that cannot finish before the slice ends reports NotObservedByDeadline
+    // instead (covered by the past-deadline wait below), so a short slice
+    // proves nothing about an unknown key. The wait keeps a 100 ms evidence
+    // floor back from the deadline for its final read.
+    const SLICE: Duration = Duration::from_secs(3);
     let started = std::time::Instant::now();
-    let report = wait_delivery(
-        &fixture,
-        &never_sent,
-        &bound(),
-        started + Duration::from_millis(500),
-    )
-    .await;
+    let report = wait_delivery(&fixture, &never_sent, &bound(), started + SLICE).await;
     let elapsed = started.elapsed();
-    assert!(matches!(
-        report.work(),
-        DeliveryTerminalWait::Unknown {
-            cause: DeliveryUnknownCause::NotAdmittedByDeadline
-        }
-    ));
     assert!(
-        elapsed >= Duration::from_millis(350),
+        matches!(
+            report.work(),
+            DeliveryTerminalWait::Unknown {
+                cause: DeliveryUnknownCause::NotAdmittedByDeadline
+            }
+        ),
+        "an unknown key is read and found unadmitted: {:?}",
+        report.work()
+    );
+    assert!(
+        elapsed >= SLICE.saturating_sub(Duration::from_millis(150)),
         "an unknown key is polled until the wait slice ends: {elapsed:?}"
     );
 

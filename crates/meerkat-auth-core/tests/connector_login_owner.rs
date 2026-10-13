@@ -16,11 +16,14 @@ use axum::{Form, Json, Router};
 use meerkat_auth_core::auth_oauth::OAuthTokenResult;
 use meerkat_auth_core::auth_store::{
     CredentialMutationError, CredentialSlotRefusal, PersistedAuthMode, PersistedTokens,
-    ProviderAuthPersistence, RefreshCoordinator, TokenKey, TokenStore,
+    ProviderAuthPersistence, RefreshCoordinator, TokenKey, TokenStore, TokenStoreAccess,
+    TokenStoreError, TokenStoreRefusal,
 };
 use meerkat_auth_core::connector_login::{
-    ConnectorAccountStrategy, ConnectorAuthPhase, ConnectorLoginError, ConnectorOAuthAuthority,
-    ConnectorOAuthCallback, ConnectorOAuthTarget, ConnectorStrategies,
+    ConnectorAccountStrategy, ConnectorAuthPhase, ConnectorCallEntry, ConnectorCallExpectation,
+    ConnectorClientAuthProfile, ConnectorClientAuthSource, ConnectorClientSecret,
+    ConnectorLoginError, ConnectorOAuthAuthority, ConnectorOAuthCallback, ConnectorOAuthTarget,
+    ConnectorStrategies, clear_connector_client_secret, save_connector_client_secret,
 };
 use meerkat_auth_core::connector_oauth::{
     AccountSelection, ConnectorAccountObservation, ConnectorCredentialMetadata,
@@ -49,6 +52,8 @@ struct Issuer {
     refresh_rejected: std::sync::atomic::AtomicBool,
     refresh_requests: std::sync::atomic::AtomicUsize,
     expires_in: Mutex<u64>,
+    /// Every token-endpoint form received, in order.
+    forms: Mutex<Vec<HashMap<String, String>>>,
 }
 
 async fn metadata(State((issuer, _)): State<(String, Arc<Issuer>)>) -> Json<Value> {
@@ -64,6 +69,7 @@ async fn token(
     State((_, state)): State<(String, Arc<Issuer>)>,
     Form(form): Form<HashMap<String, String>>,
 ) -> (axum::http::StatusCode, Json<Value>) {
+    state.forms.lock().push(form.clone());
     if form.get("grant_type").map(String::as_str) == Some("refresh_token") {
         state
             .refresh_requests
@@ -252,6 +258,7 @@ impl Fixture {
             scopes: ["files.read".to_owned()].into(),
             strategy_id: STRATEGY.into(),
             account,
+            client_auth_profile: None,
         }
     }
 
@@ -294,6 +301,7 @@ impl Fixture {
                     redirect_uri: redirect(port),
                     state: state.to_owned(),
                     code: code.to_owned(),
+                    host_attempt_handle: None,
                 },
             )
             .await
@@ -777,6 +785,217 @@ async fn login_expiring(fx: &Fixture, work: &CredentialAccountRef) {
     *fx.state.expires_in.lock() = 3600;
 }
 
+/// A store that refuses chosen reads and writes with a typed
+/// credential-access refusal: the next save, every read once armed and the
+/// token endpoint saw a refresh, or one numbered read.
+#[derive(Default)]
+struct RefusingStore {
+    inner: EphemeralTokenStore,
+    loads: std::sync::atomic::AtomicUsize,
+    refuse_load: std::sync::atomic::AtomicUsize,
+    saves: std::sync::atomic::AtomicUsize,
+    refuse_next_save: std::sync::atomic::AtomicBool,
+    refuse_reads_after_refresh: std::sync::atomic::AtomicBool,
+    issuer: std::sync::OnceLock<Arc<Issuer>>,
+}
+
+impl RefusingStore {
+    fn refused(&self, detail: &str) -> TokenStoreError {
+        TokenStoreError::refused(
+            self.backend_name(),
+            TokenStoreAccess::Unattended,
+            TokenStoreRefusal::InteractionRequired,
+            detail,
+        )
+    }
+}
+
+#[async_trait]
+impl TokenStore for RefusingStore {
+    async fn load(&self, key: &TokenKey) -> Result<Option<PersistedTokens>, TokenStoreError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let number = self.loads.fetch_add(1, SeqCst) + 1;
+        if self.refuse_load.load(SeqCst) == number {
+            return Err(self.refused("rehydration read needs credential interaction"));
+        }
+        if self.refuse_reads_after_refresh.load(SeqCst)
+            && self
+                .issuer
+                .get()
+                .is_some_and(|issuer| issuer.refresh_requests.load(SeqCst) > 0)
+        {
+            return Err(self.refused("post-exchange read needs credential interaction"));
+        }
+        self.inner.load(key).await
+    }
+    async fn save(&self, key: &TokenKey, tokens: &PersistedTokens) -> Result<(), TokenStoreError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.saves.fetch_add(1, SeqCst);
+        if self.refuse_next_save.swap(false, SeqCst) {
+            return Err(self.refused("publication save needs credential interaction"));
+        }
+        self.inner.save(key, tokens).await
+    }
+    async fn clear(&self, key: &TokenKey) -> Result<(), TokenStoreError> {
+        self.inner.clear(key).await
+    }
+    async fn list(&self) -> Result<Vec<TokenKey>, TokenStoreError> {
+        self.inner.list().await
+    }
+    fn backend_name(&self) -> &'static str {
+        "test-connector-store"
+    }
+    async fn observe_status(
+        &self,
+        key: &TokenKey,
+    ) -> Result<meerkat_auth_core::auth_store::TokenStoreObservation, TokenStoreError> {
+        self.inner.observe_status(key).await
+    }
+}
+
+fn credential_access_cause(error: &ConnectorLoginError) -> Option<(TokenStoreRefusal, &str)> {
+    match error {
+        ConnectorLoginError::CredentialAccess { refusal, detail } => Some((*refusal, detail)),
+        _ => None,
+    }
+}
+
+/// A refused publication save after the refresh exchange rolls the
+/// credential back, and the completed rollback keeps the typed store cause.
+#[tokio::test]
+async fn a_refused_refresh_publication_keeps_its_typed_cause_after_rollback() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let store = Arc::new(RefusingStore::default());
+    let fx = fixture_with(store.clone(), Arc::new(InMemoryCoordinator::new())).await;
+    let work = slot("tenant-a", "drive-refresh-save");
+    login_expiring(&fx, &work).await;
+    let before = fx.stored(&work).await.unwrap();
+    *fx.state.refresh.lock() = Some(("access-a2".into(), None, None));
+    fx.subjects
+        .lock()
+        .insert("access-a2".into(), "subject-a".into());
+    store.saves.store(0, SeqCst);
+    store.refuse_next_save.store(true, SeqCst);
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        fx.authority.bearer_token(&work),
+    )
+    .await
+    .expect("the refresh finishes")
+    .expect_err("a refused publication yields no bearer");
+    assert_eq!(
+        fx.state.refresh_requests.load(SeqCst),
+        1,
+        "the refresh reached HTTP"
+    );
+    assert_eq!(
+        store.saves.load(SeqCst),
+        2,
+        "one refused publication and one rollback save"
+    );
+    let restored = fx.stored(&work).await.unwrap();
+    assert_eq!(restored.primary_secret, before.primary_secret);
+    assert_eq!(restored.refresh_token, before.refresh_token);
+    assert_eq!(
+        credential_access_cause(&error),
+        Some((
+            TokenStoreRefusal::InteractionRequired,
+            "publication save needs credential interaction"
+        )),
+        "the completed rollback keeps the typed store cause: {error:?}"
+    );
+}
+
+/// A refused reread after the refresh exchange closes the refresh, keeps
+/// the stored credential and keeps the typed store cause.
+#[tokio::test]
+async fn a_refused_post_exchange_read_closes_the_refresh_with_its_typed_cause() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let store = Arc::new(RefusingStore::default());
+    let fx = fixture_with(store.clone(), Arc::new(InMemoryCoordinator::new())).await;
+    let _ = store.issuer.set(fx.state.clone());
+    let work = slot("tenant-a", "drive-post-exchange");
+    login_expiring(&fx, &work).await;
+    let before = fx.stored(&work).await.unwrap();
+    *fx.state.refresh.lock() = Some(("access-a2".into(), None, None));
+    fx.subjects
+        .lock()
+        .insert("access-a2".into(), "subject-a".into());
+    store.refuse_reads_after_refresh.store(true, SeqCst);
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        fx.authority.bearer_token(&work),
+    )
+    .await
+    .expect("the refresh finishes")
+    .expect_err("a refused reread yields no bearer");
+    store.refuse_reads_after_refresh.store(false, SeqCst);
+    assert_eq!(
+        fx.state.refresh_requests.load(SeqCst),
+        1,
+        "the refresh reached HTTP"
+    );
+    assert_eq!(
+        credential_access_cause(&error),
+        Some((
+            TokenStoreRefusal::InteractionRequired,
+            "post-exchange read needs credential interaction"
+        )),
+        "the closed refresh keeps the typed store cause: {error:?}"
+    );
+    assert_eq!(
+        fx.stored(&work).await,
+        Some(before),
+        "nothing was published"
+    );
+}
+
+/// A refused read while a fresh owner rehydrates the stored credential keeps
+/// the typed store cause through the real admission.
+#[tokio::test]
+async fn a_refused_rehydration_read_keeps_its_typed_cause() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let store = Arc::new(RefusingStore::default());
+    let fx = fixture_with(store.clone(), Arc::new(InMemoryCoordinator::new())).await;
+    let work = slot("tenant-a", "drive-rehydrate");
+    fx.grant("code-a", "access-a", "subject-a", Some("files.read"));
+    fx.login(&work, AccountSelection::Discover, "code-a")
+        .await
+        .unwrap();
+    // A fresh process-local owner has no lifecycle: its admission reads the
+    // stored credential, then rehydrates it with a second read.
+    let flows = Arc::new(RuntimeOAuthFlowHandle::new_with_auth_lease(
+        std::time::Duration::from_secs(300),
+        Arc::new(meerkat_runtime::RuntimeAuthLeaseHandle::new()),
+    ));
+    let cold = ConnectorOAuthAuthority::with_http(
+        fx.persistence.clone(),
+        flows,
+        ConnectorStrategies::default().with(fx.strategy.clone()),
+        reqwest::Client::new(),
+    )
+    .unwrap();
+    store.loads.store(0, SeqCst);
+    store.refuse_load.store(2, SeqCst);
+    let error = tokio::time::timeout(std::time::Duration::from_secs(10), cold.bearer_token(&work))
+        .await
+        .expect("the admission finishes")
+        .expect_err("a refused rehydration yields no bearer");
+    assert_eq!(
+        store.loads.load(SeqCst),
+        2,
+        "the admitted read, then the refused rehydration read"
+    );
+    assert_eq!(
+        credential_access_cause(&error),
+        Some((
+            TokenStoreRefusal::InteractionRequired,
+            "rehydration read needs credential interaction"
+        )),
+        "the rehydration keeps the typed store cause: {error:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_refresh_without_scope_retains_the_original_grant_by_reference() {
     let fx = fixture().await;
@@ -1042,6 +1261,16 @@ impl TokenStore for FailClearStore {
     fn backend_name(&self) -> &'static str {
         "fail-clear"
     }
+    /// An in-memory store: status may read it.
+    async fn observe_status(
+        &self,
+        key: &TokenKey,
+    ) -> Result<
+        meerkat_auth_core::auth_store::TokenStoreObservation,
+        meerkat_auth_core::auth_store::TokenStoreError,
+    > {
+        self.0.observe_status(key).await
+    }
 }
 
 #[tokio::test]
@@ -1147,6 +1376,28 @@ async fn bearer_across_a_replacement(
     Fixture,
     CredentialAccountRef,
 ) {
+    across_a_replacement(
+        replacement_subject,
+        replacement_client,
+        |authority, work| async move { authority.bearer_token(&work).await },
+    )
+    .await
+}
+
+/// Run `admit` on an expiring credential for subject-a, replacing the slot
+/// (logout + discover) before the refresh reload runs.
+async fn across_a_replacement<T, Fut>(
+    replacement_subject: &str,
+    replacement_client: &str,
+    admit: impl FnOnce(ConnectorOAuthAuthority, CredentialAccountRef) -> Fut,
+) -> (
+    Result<T, ConnectorLoginError>,
+    Fixture,
+    CredentialAccountRef,
+)
+where
+    Fut: std::future::Future<Output = Result<T, ConnectorLoginError>>,
+{
     let coordinator = Arc::new(InterleavingCoordinator {
         inner: InMemoryCoordinator::new(),
         before_refresh: Mutex::new(None),
@@ -1177,12 +1428,13 @@ async fn bearer_across_a_replacement(
                     redirect_uri: redirect(41009),
                     state: start.state,
                     code: "code-r".into(),
+                    host_attempt_handle: None,
                 },
             )
             .await
             .unwrap();
     }));
-    let result = fx.authority.bearer_token(&work).await;
+    let result = admit(fx.authority.clone(), work.clone()).await;
     (result, fx, work)
 }
 
@@ -1213,4 +1465,1123 @@ async fn bearer_holds_to_the_admitted_binding_across_a_slot_replacement() {
             ConnectorOAuthRefusal::AccountMismatch
         ))
     ));
+}
+
+// --- Client-auth profile (desktop-app clients) ------------------------------
+
+const DESKTOP_SECRET: &str = "desktop-client-secret-canary";
+
+fn desktop_profile(fx: &Fixture, id: &str) -> ConnectorClientAuthProfile {
+    ConnectorClientAuthProfile {
+        id: id.into(),
+        issuer: fx.issuer.clone(),
+        client: "connector-client".into(),
+        client_secret: Some(DESKTOP_SECRET.into()),
+        authorize_params: vec![
+            ("access_type".into(), "offline".into()),
+            ("prompt".into(), "consent".into()),
+        ],
+        resource_indicator: false,
+        protocol: None,
+        registered_redirect_uris: Vec::new(),
+    }
+}
+
+fn with_profiles(fx: &mut Fixture, profiles: Vec<ConnectorClientAuthProfile>) {
+    fx.authority = fx
+        .authority
+        .clone()
+        .with_client_auth_profiles(profiles)
+        .expect("valid profiles");
+}
+
+fn desktop_target(fx: &Fixture, slot: &CredentialAccountRef, id: &str) -> ConnectorOAuthTarget {
+    ConnectorOAuthTarget {
+        client_auth_profile: Some(id.into()),
+        ..fx.target(slot, AccountSelection::Discover)
+    }
+}
+
+#[tokio::test]
+async fn without_a_profile_the_request_forms_are_unchanged() {
+    let fx = fixture().await;
+    let work = slot("tenant-a", "default-forms");
+    let target = fx.target(&work, AccountSelection::Discover);
+    let (_, authorize_url) = fx.start(&target, 41001).await;
+    assert!(authorize_url.contains("resource="));
+    assert!(!authorize_url.contains("access_type"));
+    login_expiring(&fx, &work).await;
+    *fx.state.refresh.lock() = Some(("access-a2".into(), None, None));
+    fx.subjects
+        .lock()
+        .insert("access-a2".into(), "subject-a".into());
+    fx.authority.bearer_token(&work).await.unwrap();
+    let forms = fx.state.forms.lock().clone();
+    assert_eq!(forms.len(), 2);
+    for form in &forms {
+        assert!(form.contains_key("resource"), "{form:?}");
+        assert!(!form.contains_key("client_secret"), "{form:?}");
+    }
+    let metadata =
+        ConnectorCredentialMetadata::from_tokens(&fx.stored(&work).await.unwrap()).unwrap();
+    assert_eq!(metadata.client_auth_profile, None);
+}
+
+#[tokio::test]
+async fn a_profile_drives_start_completion_and_refresh_consistently() {
+    let mut fx = fixture().await;
+    let profile = desktop_profile(&fx, "desktop");
+    with_profiles(&mut fx, vec![profile.clone()]);
+    assert!(!format!("{profile:?}").contains(DESKTOP_SECRET));
+    let work = slot("tenant-a", "desktop-forms");
+    let target = desktop_target(&fx, &work, "desktop");
+
+    *fx.state.expires_in.lock() = 30;
+    fx.grant("code-d", "access-d", "subject-d", Some("files.read"));
+    let (state, authorize_url) = fx.start(&target, 41001).await;
+    assert!(
+        authorize_url.contains("access_type=offline"),
+        "{authorize_url}"
+    );
+    assert!(authorize_url.contains("prompt=consent"), "{authorize_url}");
+    assert!(!authorize_url.contains("resource="), "{authorize_url}");
+    assert!(!authorize_url.contains(DESKTOP_SECRET));
+    fx.complete(&work, &state, "code-d", 41001).await.unwrap();
+    *fx.state.expires_in.lock() = 3600;
+
+    let stored = fx.stored(&work).await.unwrap();
+    assert!(
+        !serde_json::to_string(&stored.metadata)
+            .unwrap()
+            .contains(DESKTOP_SECRET)
+    );
+    assert_eq!(
+        ConnectorCredentialMetadata::from_tokens(&stored)
+            .unwrap()
+            .client_auth_profile,
+        Some(profile.binding()),
+        "the credential binds the profile's canonical meaning"
+    );
+
+    *fx.state.refresh.lock() = Some(("access-d2".into(), None, None));
+    fx.subjects
+        .lock()
+        .insert("access-d2".into(), "subject-d".into());
+    assert_eq!(
+        fx.authority.bearer_token(&work).await.unwrap().as_deref(),
+        Some("access-d2")
+    );
+    let forms = fx.state.forms.lock().clone();
+    assert_eq!(forms.len(), 2, "one code exchange and one refresh");
+    for form in &forms {
+        assert_eq!(
+            form.get("client_secret").map(String::as_str),
+            Some(DESKTOP_SECRET)
+        );
+        assert!(!form.contains_key("resource"), "{form:?}");
+    }
+}
+
+/// A host source whose profiles the test changes between uses.
+struct ScriptedProfiles(Mutex<Vec<ConnectorClientAuthProfile>>);
+
+#[async_trait]
+impl ConnectorClientAuthSource for ScriptedProfiles {
+    async fn current_profiles(
+        &self,
+    ) -> Result<Vec<ConnectorClientAuthProfile>, ConnectorLoginError> {
+        Ok(self.0.lock().clone())
+    }
+}
+
+#[tokio::test]
+async fn source_profiles_are_read_at_each_use() {
+    let mut fx = fixture().await;
+    let source = Arc::new(ScriptedProfiles(Mutex::new(Vec::new())));
+    fx.authority = fx
+        .authority
+        .clone()
+        .with_client_auth_source(Arc::clone(&source) as Arc<dyn ConnectorClientAuthSource>);
+    let work = slot("tenant-a", "sourced");
+    let target = desktop_target(&fx, &work, "desktop");
+    let refused = fx.authority.login_start(&target, &redirect(41001)).await;
+    assert!(
+        matches!(
+            refused,
+            Err(ConnectorLoginError::Verification(
+                ConnectorOAuthRefusal::InvalidDescriptor
+            ))
+        ),
+        "not configured yet: {refused:?}"
+    );
+
+    // Configured after the authority was built: start, completion and
+    // refresh all use it.
+    source.0.lock().push(desktop_profile(&fx, "desktop"));
+    *fx.state.expires_in.lock() = 30;
+    fx.grant("code-s", "access-s", "subject-s", Some("files.read"));
+    let (state, authorize_url) = fx.start(&target, 41001).await;
+    assert!(
+        authorize_url.contains("access_type=offline"),
+        "{authorize_url}"
+    );
+    fx.complete(&work, &state, "code-s", 41001).await.unwrap();
+    *fx.state.expires_in.lock() = 3600;
+    *fx.state.refresh.lock() = Some(("access-s2".into(), None, None));
+    fx.subjects
+        .lock()
+        .insert("access-s2".into(), "subject-s".into());
+    assert_eq!(
+        fx.authority.bearer_token(&work).await.unwrap().as_deref(),
+        Some("access-s2")
+    );
+    let forms = fx.state.forms.lock().clone();
+    assert_eq!(forms.len(), 2, "one code exchange and one refresh");
+    for form in &forms {
+        assert_eq!(
+            form.get("client_secret").map(String::as_str),
+            Some(DESKTOP_SECRET)
+        );
+    }
+}
+
+fn stored_secret_profile(fx: &Fixture, realm: &RealmId) -> ConnectorClientAuthProfile {
+    ConnectorClientAuthProfile {
+        client_secret: Some(ConnectorClientSecret::RealmStore {
+            realm: realm.clone(),
+        }),
+        ..desktop_profile(fx, "desktop")
+    }
+}
+
+fn sent_secrets(fx: &Fixture) -> Vec<Option<String>> {
+    fx.state
+        .forms
+        .lock()
+        .iter()
+        .map(|form| form.get("client_secret").cloned())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_stored_client_secret_is_read_at_each_use_and_rotates() {
+    let mut fx = fixture().await;
+    let realm = RealmId::parse("tenant-a").unwrap();
+    let profile = stored_secret_profile(&fx, &realm);
+    let binding = profile.binding();
+    with_profiles(&mut fx, vec![profile]);
+    let work = slot("tenant-a", "stored-secret");
+    let target = desktop_target(&fx, &work, "desktop");
+
+    // The profile exists but its secret does not (for example a crash
+    // between writing the configuration and the secret): typed refusal,
+    // nothing sent.
+    let refused = fx.authority.login_start(&target, &redirect(41001)).await;
+    assert!(
+        matches!(
+            &refused,
+            Err(ConnectorLoginError::ClientSecretUnavailable { profile }) if profile == "desktop"
+        ),
+        "{refused:?}"
+    );
+    assert!(fx.state.forms.lock().is_empty());
+
+    save_connector_client_secret(fx.store.as_ref(), &realm, &binding, "secret-one")
+        .await
+        .unwrap();
+    *fx.state.expires_in.lock() = 30;
+    fx.grant("code-r", "access-r1", "subject-r", Some("files.read"));
+    let (state, _) = fx.start(&target, 41001).await;
+    fx.complete(&work, &state, "code-r", 41001).await.unwrap();
+    let stored = fx.stored(&work).await.unwrap();
+    assert!(
+        !serde_json::to_string(&stored)
+            .unwrap()
+            .contains("secret-one")
+    );
+
+    // Rotated in the store: the next refresh sends the new secret, and the
+    // credential minted under the old one stays valid.
+    save_connector_client_secret(fx.store.as_ref(), &realm, &binding, "secret-two")
+        .await
+        .unwrap();
+    *fx.state.refresh.lock() = Some(("access-r2".into(), None, None));
+    fx.subjects
+        .lock()
+        .insert("access-r2".into(), "subject-r".into());
+    assert_eq!(
+        fx.authority.bearer_token(&work).await.unwrap().as_deref(),
+        Some("access-r2")
+    );
+    assert_eq!(
+        sent_secrets(&fx),
+        vec![Some("secret-one".to_owned()), Some("secret-two".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_without_the_stored_secret_sends_nothing_and_keeps_the_credential() {
+    let mut fx = fixture().await;
+    let realm = RealmId::parse("tenant-a").unwrap();
+    let profile = stored_secret_profile(&fx, &realm);
+    let binding = profile.binding();
+    with_profiles(&mut fx, vec![profile]);
+    let work = slot("tenant-a", "secret-cleared");
+    let target = desktop_target(&fx, &work, "desktop");
+    save_connector_client_secret(fx.store.as_ref(), &realm, &binding, "secret-one")
+        .await
+        .unwrap();
+    *fx.state.expires_in.lock() = 30;
+    fx.grant("code-c", "access-c1", "subject-c", Some("files.read"));
+    let (state, _) = fx.start(&target, 41001).await;
+    fx.complete(&work, &state, "code-c", 41001).await.unwrap();
+    let before = fx.stored(&work).await.unwrap();
+
+    clear_connector_client_secret(fx.store.as_ref(), &realm, &binding)
+        .await
+        .unwrap();
+    // No refreshed token: either a refusal or the still-unexpired one.
+    let result = fx.authority.bearer_token(&work).await;
+    assert!(
+        result
+            .as_ref()
+            .map_or(true, |token| token.as_deref() == Some("access-c1")),
+        "{result:?}"
+    );
+    assert_eq!(
+        sent_secrets(&fx).len(),
+        1,
+        "only the code exchange was sent"
+    );
+    assert_eq!(
+        fx.stored(&work).await,
+        Some(before),
+        "the credential is kept"
+    );
+}
+
+fn refused_for_missing_secret(
+    result: &Result<meerkat_auth_core::connector_login::ConnectorLoginStart, ConnectorLoginError>,
+) -> bool {
+    matches!(
+        result,
+        Err(ConnectorLoginError::ClientSecretUnavailable { profile }) if profile == "desktop"
+    )
+}
+
+#[tokio::test]
+async fn a_retargeted_client_never_reads_the_previous_clients_secret() {
+    let mut fx = fixture().await;
+    let realm = RealmId::parse("tenant-a").unwrap();
+    let original = stored_secret_profile(&fx, &realm);
+    save_connector_client_secret(fx.store.as_ref(), &realm, &original.binding(), "secret-a")
+        .await
+        .unwrap();
+    // Same id, another client: its meaning (and so its key) differs.
+    let retargeted = ConnectorClientAuthProfile {
+        client: "replacement-client".into(),
+        ..original.clone()
+    };
+    assert_ne!(original.binding(), retargeted.binding());
+    with_profiles(&mut fx, vec![retargeted]);
+    let work = slot("tenant-a", "retargeted");
+    let target = ConnectorOAuthTarget {
+        client: "replacement-client".into(),
+        ..desktop_target(&fx, &work, "desktop")
+    };
+    let refused = fx.authority.login_start(&target, &redirect(41001)).await;
+    assert!(refused_for_missing_secret(&refused), "{refused:?}");
+    assert!(fx.state.forms.lock().is_empty());
+}
+
+#[tokio::test]
+async fn an_inherited_or_shadowed_client_reads_only_its_defining_realms_secret() {
+    let mut fx = fixture().await;
+    let parent = RealmId::parse("tenant-parent").unwrap();
+    let child = RealmId::parse("tenant-child").unwrap();
+    let parent_profile = stored_secret_profile(&fx, &parent);
+    save_connector_client_secret(
+        fx.store.as_ref(),
+        &parent,
+        &parent_profile.binding(),
+        "parent-secret",
+    )
+    .await
+    .unwrap();
+    // A child-defined client with the same id and meaning has its own slot:
+    // the parent's secret never stands in for it.
+    let child_profile = stored_secret_profile(&fx, &child);
+    with_profiles(&mut fx, vec![child_profile]);
+    let work = slot("tenant-a", "shadowed");
+    let refused = fx
+        .authority
+        .login_start(&desktop_target(&fx, &work, "desktop"), &redirect(41001))
+        .await;
+    assert!(refused_for_missing_secret(&refused), "{refused:?}");
+}
+
+#[tokio::test]
+async fn a_row_of_another_mode_or_binding_under_the_secret_key_is_not_a_secret() {
+    let mut fx = fixture().await;
+    let realm = RealmId::parse("tenant-a").unwrap();
+    let profile = stored_secret_profile(&fx, &realm);
+    let key = TokenKey::connector_client_secret(realm.clone(), &profile.binding()).unwrap();
+    with_profiles(&mut fx, vec![profile.clone()]);
+    let work = slot("tenant-a", "wrong-mode");
+    let target = desktop_target(&fx, &work, "desktop");
+    // A provider credential row.
+    fx.store
+        .save(&key, &PersistedTokens::api_key("not-a-client-secret"))
+        .await
+        .unwrap();
+    let refused = fx.authority.login_start(&target, &redirect(41001)).await;
+    assert!(refused_for_missing_secret(&refused), "{refused:?}");
+    // A client-secret row stored for another meaning.
+    let mut foreign = PersistedTokens::api_key("foreign-secret");
+    foreign.auth_mode = PersistedAuthMode::ConnectorClientSecret;
+    foreign.metadata = json!({ "connector_client_binding": "desktop@other" });
+    fx.store.save(&key, &foreign).await.unwrap();
+    let refused = fx.authority.login_start(&target, &redirect(41001)).await;
+    assert!(refused_for_missing_secret(&refused), "{refused:?}");
+}
+
+#[tokio::test]
+async fn a_source_profile_reusing_an_installed_id_is_a_configuration_error() {
+    let mut fx = fixture().await;
+    let profile = desktop_profile(&fx, "desktop");
+    with_profiles(&mut fx, vec![profile.clone()]);
+    let source = Arc::new(ScriptedProfiles(Mutex::new(vec![profile])));
+    fx.authority = fx.authority.clone().with_client_auth_source(source);
+    let work = slot("tenant-a", "sourced-twice");
+    let refused = fx
+        .authority
+        .login_start(&desktop_target(&fx, &work, "desktop"), &redirect(41001))
+        .await;
+    assert!(
+        matches!(refused, Err(ConnectorLoginError::ClientConfig(_))),
+        "{refused:?}"
+    );
+    assert!(fx.state.forms.lock().is_empty());
+}
+
+#[tokio::test]
+async fn a_profile_for_another_issuer_or_client_or_an_unknown_id_refuses_the_start() {
+    let mut fx = fixture().await;
+    let mut other_client = desktop_profile(&fx, "other-client");
+    other_client.client = "another-client".into();
+    let mut other_issuer = desktop_profile(&fx, "other-issuer");
+    other_issuer.issuer = "https://issuer.elsewhere.example".into();
+    with_profiles(&mut fx, vec![other_client, other_issuer]);
+    let work = slot("tenant-a", "desktop-refused");
+    for id in ["other-client", "other-issuer", "not-installed"] {
+        let refused = fx
+            .authority
+            .login_start(&desktop_target(&fx, &work, id), &redirect(41001))
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(ConnectorLoginError::Verification(
+                    ConnectorOAuthRefusal::InvalidDescriptor
+                ))
+            ),
+            "{id}: {refused:?}"
+        );
+    }
+    assert!(fx.state.forms.lock().is_empty());
+}
+
+#[tokio::test]
+async fn a_completion_naming_another_profile_is_refused() {
+    let mut fx = fixture().await;
+    let second = ConnectorClientAuthProfile {
+        id: "desktop-b".into(),
+        ..desktop_profile(&fx, "desktop-b")
+    };
+    let first = desktop_profile(&fx, "desktop");
+    with_profiles(&mut fx, vec![first, second]);
+    let work = slot("tenant-a", "desktop-crossed");
+    fx.grant("code-x", "access-x", "subject-x", Some("files.read"));
+    let (state, _) = fx
+        .start(&desktop_target(&fx, &work, "desktop"), 41001)
+        .await;
+    let crossed = fx
+        .authority
+        .login_complete_for_target(
+            &desktop_target(&fx, &work, "desktop-b"),
+            ConnectorOAuthCallback {
+                redirect_uri: redirect(41001),
+                state,
+                code: "code-x".into(),
+                host_attempt_handle: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            crossed,
+            Err(ConnectorLoginError::Verification(
+                ConnectorOAuthRefusal::DescriptorMismatch
+            ))
+        ),
+        "{crossed:?}"
+    );
+    assert!(fx.state.forms.lock().is_empty(), "no code exchange");
+}
+
+#[tokio::test]
+async fn a_refresh_whose_profile_is_gone_fails_locally_and_never_sends_without_it() {
+    let mut fx = fixture().await;
+    let profile = desktop_profile(&fx, "desktop");
+    with_profiles(&mut fx, vec![profile]);
+    let work = slot("tenant-a", "desktop-uninstalled");
+    *fx.state.expires_in.lock() = 30;
+    fx.grant("code-u", "access-u", "subject-u", Some("files.read"));
+    let (state, _) = fx
+        .start(&desktop_target(&fx, &work, "desktop"), 41001)
+        .await;
+    fx.complete(&work, &state, "code-u", 41001).await.unwrap();
+    *fx.state.expires_in.lock() = 3600;
+    let before = fx.stored(&work).await.unwrap();
+
+    // The host no longer installs the profile (or installs another one).
+    let mut swapped = desktop_profile(&fx, "desktop-other");
+    swapped.id = "desktop-other".into();
+    with_profiles(&mut fx, vec![swapped]);
+    let refused = fx.authority.bearer_token(&work).await;
+    assert!(
+        matches!(refused, Err(ConnectorLoginError::AuthLifecycle(_))),
+        "{refused:?}"
+    );
+    assert_eq!(
+        fx.state.forms.lock().len(),
+        1,
+        "only the code exchange was sent"
+    );
+    assert_eq!(fx.stored(&work).await, Some(before));
+}
+
+#[test]
+fn a_profile_setting_a_login_owned_parameter_is_refused_at_install() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let fx = runtime.block_on(fixture());
+    for reserved in [
+        "state",
+        "redirect_uri",
+        "Scope",
+        "resource",
+        "code_challenge",
+    ] {
+        let mut profile = desktop_profile(&fx, "bad");
+        profile.authorize_params.push((reserved.into(), "x".into()));
+        assert!(
+            fx.authority
+                .clone()
+                .with_client_auth_profiles(vec![profile])
+                .is_err(),
+            "{reserved}"
+        );
+    }
+    // Names are single tokens: an encoded or composite name is refused.
+    for smuggled in [
+        "x=1&client_id",
+        "cl%69ent_id",
+        "Client_Secret",
+        "a b",
+        "code_verifier",
+    ] {
+        let mut profile = desktop_profile(&fx, "bad");
+        profile.authorize_params.push((smuggled.into(), "x".into()));
+        assert!(
+            fx.authority
+                .clone()
+                .with_client_auth_profiles(vec![profile])
+                .is_err(),
+            "{smuggled}"
+        );
+    }
+    for bad_id in ["", "desk@top", "a&b"] {
+        assert!(
+            fx.authority
+                .clone()
+                .with_client_auth_profiles(vec![desktop_profile(&fx, bad_id)])
+                .is_err(),
+            "{bad_id:?}"
+        );
+    }
+    let duplicate = vec![desktop_profile(&fx, "dup"), desktop_profile(&fx, "dup")];
+    assert!(fx.authority.with_client_auth_profiles(duplicate).is_err());
+}
+
+#[test]
+fn stored_metadata_without_a_profile_field_still_loads() {
+    let metadata: ConnectorCredentialMetadata = serde_json::from_value(json!({
+        "issuer": "https://issuer.example",
+        "client": "connector-client",
+        "resource": "https://api.service.example",
+        "strategy_id": STRATEGY,
+        "requested_scopes": ["files.read"],
+        "token_endpoint": "https://issuer.example/token",
+        "stable_context": "connector-context:00",
+        "scope_evidence": { "kind": "token_endpoint_response" },
+        "granted_at_epoch_secs": 1,
+    }))
+    .expect("metadata stored before client-auth profiles");
+    assert_eq!(metadata.client_auth_profile, None);
+}
+
+impl Fixture {
+    /// What a call expects of `work`'s credential, as logged in by the fixture.
+    fn expectation(&self, work: &CredentialAccountRef, account: &str) -> ConnectorCallExpectation {
+        ConnectorCallExpectation {
+            slot: work.clone(),
+            account: account.to_owned(),
+            issuer: self.issuer.clone(),
+            client: "connector-client".into(),
+            resource: "https://api.service.example".into(),
+            strategy_id: STRATEGY.into(),
+            required_scopes: ["files.read".to_owned()].into(),
+        }
+    }
+}
+
+fn admitted_token(result: Result<ConnectorCallEntry, ConnectorLoginError>) -> String {
+    result
+        .expect("the call credential is admitted")
+        .credential()
+        .expose_access_token()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn a_call_credential_binds_the_expected_account_context_and_scopes() {
+    let fx = fixture().await;
+    let work = slot("tenant-a", "drive-work");
+    let expect = fx.expectation(&work, "subject-a");
+    assert!(matches!(
+        fx.authority.admit_call_credential(&expect).await,
+        Err(ConnectorLoginError::ReauthRequired)
+    ));
+    fx.grant("code-a", "access-a", "subject-a", Some("files.read"));
+    fx.login(&work, AccountSelection::Discover, "code-a")
+        .await
+        .unwrap();
+
+    let entry = fx.authority.admit_call_credential(&expect).await.unwrap();
+    let credential = entry.credential();
+    assert_eq!(credential.expose_access_token(), "access-a");
+    assert_eq!(credential.account(), "subject-a");
+    assert_eq!(credential.scopes(), ["files.read".to_owned()]);
+    assert!(
+        !format!("{entry:?}").contains("access-a"),
+        "the entry's Debug shows the token"
+    );
+    entry.recheck().unwrap();
+    drop(entry);
+
+    let mut other = expect.clone();
+    other.account = "subject-b".into();
+    assert!(matches!(
+        fx.authority.admit_call_credential(&other).await,
+        Err(ConnectorLoginError::Verification(
+            ConnectorOAuthRefusal::AccountMismatch
+        ))
+    ));
+    let mut other = expect.clone();
+    other.client = "another-client".into();
+    assert_eq!(
+        slot_refusal(fx.authority.admit_call_credential(&other).await),
+        CredentialSlotRefusal::ContextMismatch
+    );
+    let mut other = expect;
+    other.required_scopes.insert("files.write".into());
+    assert!(matches!(
+        fx.authority.admit_call_credential(&other).await,
+        Err(ConnectorLoginError::Verification(
+            ConnectorOAuthRefusal::MissingScopes
+        ))
+    ));
+}
+
+/// While a call holds its admitted credential, a rotation (a compatible
+/// reconnect) or a logout of the slot waits: the final recheck observes the
+/// admitted credential's marker, freshness and use admission coherently, and
+/// cannot classify a replacement. Once the entry is dropped the rotation
+/// lands and a later call admits the current credential. (Fails-old: the
+/// recheck read the marker and then the slot's freshness and use separately,
+/// with a replacement able to land in between.)
+#[tokio::test]
+async fn a_held_call_credential_holds_off_rotation_and_logout_until_dropped() {
+    let fx = fixture().await;
+    let work = slot("tenant-a", "drive-work");
+    let expect = fx.expectation(&work, "subject-a");
+    fx.grant("code-a", "access-a", "subject-a", Some("files.read"));
+    fx.login(&work, AccountSelection::Discover, "code-a")
+        .await
+        .unwrap();
+    fx.grant("code-a2", "access-a2", "subject-a", Some("files.read"));
+    let target = fx.target(&work, AccountSelection::Known("subject-a".into()));
+    let (state, _) = fx.start(&target, 41003).await;
+    let before = fx.authority.admit_call_credential(&expect).await.unwrap();
+    let rotation = {
+        let authority = fx.authority.clone();
+        let work = work.clone();
+        tokio::spawn(async move {
+            authority
+                .login_complete(
+                    &work,
+                    ConnectorOAuthCallback {
+                        redirect_uri: redirect(41003),
+                        state,
+                        code: "code-a2".into(),
+                        host_attempt_handle: None,
+                    },
+                )
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !rotation.is_finished(),
+        "the rotation waited for the held call"
+    );
+    before.recheck().unwrap();
+    assert_eq!(before.credential().expose_access_token(), "access-a");
+    drop(before);
+    rotation.await.unwrap().unwrap();
+
+    let rotated = fx.authority.admit_call_credential(&expect).await.unwrap();
+    assert_eq!(rotated.credential().expose_access_token(), "access-a2");
+    let logout = {
+        let authority = fx.authority.clone();
+        let work = work.clone();
+        tokio::spawn(async move { authority.logout(&work).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!logout.is_finished(), "the logout waited for the held call");
+    rotated.recheck().unwrap();
+    drop(rotated);
+    logout.await.unwrap().unwrap();
+    assert!(matches!(
+        fx.authority.admit_call_credential(&expect).await,
+        Err(ConnectorLoginError::ReauthRequired)
+    ));
+}
+
+/// An expiring credential is refreshed for the call, and the call gets the
+/// exact refreshed credential, still current at its recheck.
+#[tokio::test]
+async fn a_call_credential_is_the_refreshed_one_when_it_expires() {
+    let fx = fixture().await;
+    let work = slot("tenant-a", "drive-work");
+    login_expiring(&fx, &work).await;
+    *fx.state.refresh.lock() = Some(("access-a2".into(), None, None));
+    fx.subjects
+        .lock()
+        .insert("access-a2".into(), "subject-a".into());
+    let expect = fx.expectation(&work, "subject-a");
+
+    let entry = fx.authority.admit_call_credential(&expect).await.unwrap();
+
+    assert_eq!(entry.credential().expose_access_token(), "access-a2");
+    entry.recheck().unwrap();
+    drop(entry);
+    assert_eq!(
+        admitted_token(fx.authority.admit_call_credential(&expect).await),
+        "access-a2"
+    );
+    assert_eq!(
+        fx.state
+            .refresh_requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the second call reused the refreshed credential"
+    );
+}
+
+/// A grant lost during the call's refresh (a permanent `invalid_grant`)
+/// refuses the call instead of handing out the expiring credential.
+#[tokio::test]
+async fn a_call_credential_is_refused_when_its_grant_is_lost_during_refresh() {
+    let fx = fixture().await;
+    let work = slot("tenant-a", "drive-work");
+    login_expiring(&fx, &work).await;
+    fx.state
+        .refresh_rejected
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let result = fx
+        .authority
+        .admit_call_credential(&fx.expectation(&work, "subject-a"))
+        .await;
+
+    assert!(
+        matches!(result, Err(ConnectorLoginError::ReauthRequired)),
+        "{result:?}"
+    );
+}
+
+/// A slot replaced while the call's refresh waits: the call gets the
+/// replacement only when it still has the expected account and context.
+#[tokio::test]
+async fn a_call_credential_holds_to_its_expectation_across_a_slot_replacement() {
+    let call = |authority: ConnectorOAuthAuthority, work: CredentialAccountRef| async move {
+        let issuer = authority_issuer(&authority, &work).await;
+        authority
+            .admit_call_credential(&ConnectorCallExpectation {
+                slot: work.clone(),
+                account: "subject-a".into(),
+                issuer,
+                client: "connector-client".into(),
+                resource: "https://api.service.example".into(),
+                strategy_id: STRATEGY.into(),
+                required_scopes: ["files.read".to_owned()].into(),
+            })
+            .await
+    };
+    let (result, _, _) = across_a_replacement("subject-a", "connector-client", call).await;
+    assert_eq!(admitted_token(result), "access-r");
+
+    let (result, _, _) = across_a_replacement("subject-a", "another-client", call).await;
+    assert_eq!(slot_refusal(result), CredentialSlotRefusal::ContextMismatch);
+
+    let (result, _, _) = across_a_replacement("subject-b", "connector-client", call).await;
+    assert!(matches!(
+        result,
+        Err(ConnectorLoginError::Verification(
+            ConnectorOAuthRefusal::AccountMismatch
+        ))
+    ));
+}
+
+/// The issuer `work`'s credential was granted under, read before the call.
+async fn authority_issuer(
+    authority: &ConnectorOAuthAuthority,
+    work: &CredentialAccountRef,
+) -> String {
+    authority
+        .status(work)
+        .await
+        .unwrap()
+        .verified_account
+        .expect("logged in")
+        .issuer
+}
+
+/// Freshness is observed again at the recheck: a credential admitted just
+/// outside its refresh window and rechecked after it opened is refused, and
+/// the next call refreshes it.
+#[tokio::test]
+async fn a_call_credential_entering_its_refresh_window_is_refused_at_the_recheck() {
+    let fx = fixture().await;
+    let work = slot("tenant-a", "drive-work");
+    *fx.state.expires_in.lock() = 63;
+    fx.grant("code-a", "access-a", "subject-a", Some("files.read"));
+    fx.login(&work, AccountSelection::Discover, "code-a")
+        .await
+        .unwrap();
+    let expect = fx.expectation(&work, "subject-a");
+    let entry = fx.authority.admit_call_credential(&expect).await.unwrap();
+    assert_eq!(entry.credential().expose_access_token(), "access-a");
+
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+
+    assert!(matches!(
+        entry.recheck(),
+        Err(ConnectorLoginError::ReauthRequired)
+    ));
+    drop(entry);
+    *fx.state.refresh.lock() = Some(("access-a2".into(), None, None));
+    fx.subjects
+        .lock()
+        .insert("access-a2".into(), "subject-a".into());
+    assert_eq!(
+        admitted_token(fx.authority.admit_call_credential(&expect).await),
+        "access-a2"
+    );
+}
+
+/// A changed meaning under the same id (here the resource choice) neither
+/// completes the admitted login nor refreshes the credential; rotating only
+/// the secret value keeps working and sends the new secret.
+#[tokio::test]
+async fn a_changed_profile_meaning_under_the_same_id_is_refused_but_secret_rotation_is_not() {
+    let mut fx = fixture().await;
+    let profile = desktop_profile(&fx, "desktop");
+    with_profiles(&mut fx, vec![profile.clone()]);
+    let work = slot("tenant-a", "desktop-meaning");
+    *fx.state.expires_in.lock() = 30;
+    fx.grant("code-m", "access-m", "subject-m", Some("files.read"));
+    let (state, _) = fx
+        .start(&desktop_target(&fx, &work, "desktop"), 41001)
+        .await;
+
+    // Same id, different meaning: the admitted completion is refused before
+    // any exchange.
+    let mut changed = profile.clone();
+    changed.resource_indicator = true;
+    with_profiles(&mut fx, vec![changed]);
+    let refused = fx.complete(&work, &state, "code-m", 41001).await;
+    assert!(
+        matches!(
+            refused,
+            Err(ConnectorLoginError::Verification(
+                ConnectorOAuthRefusal::InvalidDescriptor
+            ))
+        ),
+        "{refused:?}"
+    );
+    assert!(fx.state.forms.lock().is_empty());
+
+    // The original meaning completes a fresh login.
+    with_profiles(&mut fx, vec![profile.clone()]);
+    let (state, _) = fx
+        .start(&desktop_target(&fx, &work, "desktop"), 41001)
+        .await;
+    fx.complete(&work, &state, "code-m", 41001).await.unwrap();
+    *fx.state.expires_in.lock() = 3600;
+
+    // A changed meaning fails the refresh locally, twice (the lifecycle is
+    // closed, not left refreshing), and nothing is sent.
+    let mut extras = profile.clone();
+    extras
+        .authorize_params
+        .push(("include_granted_scopes".into(), "true".into()));
+    with_profiles(&mut fx, vec![extras]);
+    for _ in 0..2 {
+        let refused = fx.authority.bearer_token(&work).await;
+        assert!(
+            matches!(refused, Err(ConnectorLoginError::AuthLifecycle(_))),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(fx.state.forms.lock().len(), 1, "only the code exchange");
+
+    // Rotating only the secret value keeps the meaning: the refresh runs
+    // and sends the new secret.
+    let mut rotated = profile.clone();
+    rotated.client_secret = Some("rotated-secret".into());
+    assert_eq!(rotated.binding(), profile.binding());
+    with_profiles(&mut fx, vec![rotated]);
+    *fx.state.refresh.lock() = Some(("access-m2".into(), None, None));
+    fx.subjects
+        .lock()
+        .insert("access-m2".into(), "subject-m".into());
+    assert_eq!(
+        fx.authority.bearer_token(&work).await.unwrap().as_deref(),
+        Some("access-m2")
+    );
+    let forms = fx.state.forms.lock().clone();
+    assert_eq!(
+        forms
+            .last()
+            .and_then(|form| form.get("client_secret"))
+            .map(String::as_str),
+        Some("rotated-secret")
+    );
+}
+
+// --- Remote (https) callback under host custody ---------------------------
+
+/// A redirect registered for a web-application client, as host config.
+/// Tested with a loopback-shaped https host: no listener is involved, the
+/// host hands the callback to the owner.
+const REMOTE_REDIRECT: &str = "https://127.0.0.1:8443/connector/oauth/callback";
+
+fn remote_profile(fx: &Fixture, id: &str) -> ConnectorClientAuthProfile {
+    ConnectorClientAuthProfile {
+        registered_redirect_uris: vec![REMOTE_REDIRECT.into()],
+        ..desktop_profile(fx, id)
+    }
+}
+
+fn remote_callback(state: &str, code: &str, handle: Option<String>) -> ConnectorOAuthCallback {
+    ConnectorOAuthCallback {
+        redirect_uri: REMOTE_REDIRECT.into(),
+        state: state.into(),
+        code: code.into(),
+        host_attempt_handle: handle,
+    }
+}
+
+/// An exactly registered https redirect is admitted, and its completion
+/// needs the host's retained attempt handle: none or a forged one is
+/// refused without consuming the attempt, the real one completes, and a
+/// replay is refused.
+#[tokio::test]
+async fn a_registered_https_redirect_completes_only_from_the_hosts_custody() {
+    let mut fx = fixture().await;
+    let profile = remote_profile(&fx, "web");
+    with_profiles(&mut fx, vec![profile]);
+    let work = slot("tenant-a", "remote-web");
+    fx.grant("code-r", "access-r", "subject-r", Some("files.read"));
+    let start = fx
+        .authority
+        .login_start(&desktop_target(&fx, &work, "web"), REMOTE_REDIRECT)
+        .await
+        .expect("a registered https redirect is admitted");
+    let handle = start
+        .host_attempt_handle
+        .clone()
+        .expect("a remote attempt has a host handle");
+    assert!(
+        !start.authorize_url.contains(&handle),
+        "the handle never reaches the browser"
+    );
+
+    for missing in [None, Some("forged".to_owned())] {
+        let refused = fx
+            .authority
+            .login_complete(&work, remote_callback(&start.state, "code-r", missing))
+            .await;
+        assert!(
+            matches!(refused, Err(ConnectorLoginError::RemoteCustodyRequired)),
+            "{refused:?}"
+        );
+    }
+    // A handle for another slot does not complete this one.
+    let other = slot("tenant-a", "remote-other");
+    let foreign = fx
+        .authority
+        .login_complete(
+            &other,
+            remote_callback(&start.state, "code-r", Some(handle.clone())),
+        )
+        .await;
+    assert!(foreign.is_err());
+
+    let done = fx
+        .authority
+        .login_complete(
+            &work,
+            remote_callback(&start.state, "code-r", Some(handle.clone())),
+        )
+        .await
+        .expect("the retained custody completes the attempt");
+    assert_eq!(done.verified_account.subject, "subject-r");
+    let replay = fx
+        .authority
+        .login_complete(&work, remote_callback(&start.state, "code-r", Some(handle)))
+        .await;
+    assert!(replay.is_err(), "a consumed attempt cannot be replayed");
+}
+
+/// An https redirect that is not exactly registered (another host, path,
+/// port, scheme or query), or one without a profile, is refused before any
+/// discovery; a loopback attempt is unchanged and has no handle.
+#[tokio::test]
+async fn unregistered_https_redirects_are_refused_and_loopback_is_unchanged() {
+    let mut fx = fixture().await;
+    let profile = remote_profile(&fx, "web");
+    with_profiles(&mut fx, vec![profile]);
+    let work = slot("tenant-a", "remote-refused");
+    for redirect in [
+        "https://127.0.0.2:8443/connector/oauth/callback",
+        "https://127.0.0.1:8443/connector/oauth/other",
+        "https://127.0.0.1:9443/connector/oauth/callback",
+        "https://127.0.0.1:8443/connector/oauth/callback?x=1",
+        "http://app.example/connector/oauth/callback",
+    ] {
+        let refused = fx
+            .authority
+            .login_start(&desktop_target(&fx, &work, "web"), redirect)
+            .await;
+        assert!(
+            matches!(refused, Err(ConnectorLoginError::InvalidRedirect)),
+            "{redirect}: {refused:?}"
+        );
+    }
+    let no_profile = fx
+        .authority
+        .login_start(
+            &fx.target(&work, AccountSelection::Discover),
+            REMOTE_REDIRECT,
+        )
+        .await;
+    assert!(matches!(
+        no_profile,
+        Err(ConnectorLoginError::InvalidRedirect)
+    ));
+
+    let start = fx
+        .authority
+        .login_start(
+            &fx.target(&work, AccountSelection::Discover),
+            &redirect(41001),
+        )
+        .await
+        .expect("loopback as before");
+    assert_eq!(start.host_attempt_handle, None);
+}
+
+/// A registered redirect that is not an absolute https URL is refused at
+/// install, and registered redirects are part of the profile's meaning.
+#[tokio::test]
+async fn registered_redirects_are_validated_and_bound() {
+    let fx = fixture().await;
+    for bad in [
+        "http://127.0.0.1:8443/connector/oauth/callback",
+        "https://127.0.0.1:8443/connector/oauth/callback#frag",
+        "https://user@127.0.0.1:8443/connector/oauth/callback",
+        "not a url",
+    ] {
+        let profile = ConnectorClientAuthProfile {
+            registered_redirect_uris: vec![bad.into()],
+            ..desktop_profile(&fx, "web")
+        };
+        assert!(
+            fx.authority
+                .clone()
+                .with_client_auth_profiles(vec![profile])
+                .is_err(),
+            "{bad}"
+        );
+    }
+    assert_ne!(
+        remote_profile(&fx, "web").binding(),
+        desktop_profile(&fx, "web").binding()
+    );
+}
+
+/// A profile whose registered redirect was replaced by an authorize
+/// parameter carrying the same text has another meaning, so an attempt
+/// admitted under the registration does not complete after that
+/// replacement, even with its original handle.
+#[tokio::test]
+async fn a_registration_replaced_by_a_lookalike_parameter_refuses_the_completion() {
+    let mut fx = fixture().await;
+    let registered = remote_profile(&fx, "web");
+    let mut lookalike = desktop_profile(&fx, "web");
+    lookalike
+        .authorize_params
+        .push(("redirect".into(), REMOTE_REDIRECT.into()));
+    assert_ne!(registered.binding(), lookalike.binding());
+
+    with_profiles(&mut fx, vec![registered]);
+    let work = slot("tenant-a", "remote-replaced");
+    fx.grant("code-x", "access-x", "subject-x", Some("files.read"));
+    let start = fx
+        .authority
+        .login_start(&desktop_target(&fx, &work, "web"), REMOTE_REDIRECT)
+        .await
+        .expect("a registered https redirect is admitted");
+    let handle = start.host_attempt_handle.clone().expect("remote handle");
+
+    with_profiles(&mut fx, vec![lookalike]);
+    let forms_before = fx.state.forms.lock().len();
+    let refused = fx
+        .authority
+        .login_complete(&work, remote_callback(&start.state, "code-x", Some(handle)))
+        .await;
+    assert!(
+        matches!(refused, Err(ConnectorLoginError::Verification(_))),
+        "{refused:?}"
+    );
+    assert_eq!(
+        fx.state.forms.lock().len(),
+        forms_before,
+        "refused before the code exchange"
+    );
+    let status = fx.authority.status(&work).await.expect("status");
+    assert_eq!(status.phase, ConnectorAuthPhase::AuthorizationRequired);
 }

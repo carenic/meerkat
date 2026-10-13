@@ -1630,7 +1630,7 @@ mod tests {
     }
 
     /// Transcript content revisions recur: two deterministic compactions of
-    /// one session can produce the same rewritten transcript (MobKit #488,
+    /// one session can produce the same rewritten transcript (Meta #488,
     /// where a repeated summary wedged the second auto-compaction). Each
     /// adopted rewrite must therefore land on its own occurrence strand, not
     /// on the strand named by the recurring revision digest.

@@ -34,10 +34,11 @@ Be concise and structured. Prioritize information the next context needs to act,
 const SUMMARIZATION_SOURCE_BUDGET_DENOMINATOR: u64 = 4;
 const RETAINED_HISTORY_BUDGET_DENOMINATOR: u64 = 2;
 const MIN_SUMMARIZATION_SOURCE_BUDGET_BYTES: u64 = 4 * 1024;
-const OVERSIZED_SOURCE_PREFIX: &str = "[Bounded compaction source excerpt. The current projected transcript is larger than the safe summarization window. Its middle is intentionally omitted.]\n";
-const OVERSIZED_SOURCE_GAP: &str =
-    "\n[... middle of projected transcript omitted for provider capacity ...]\n";
-const OVERSIZED_SOURCE_SUFFIX: &str = "\n[End of bounded excerpt. The active rewrite retains only recent turns that fit its safety budget.]";
+/// The smallest a trimmed text is cut to while bounding a summarization
+/// source; below it, the next role is trimmed instead.
+const MIN_TRIMMED_TEXT_BYTES: usize = 512;
+const TRIMMED_TEXT_MARKER: &str = "\n[... trimmed for the compaction source ...]\n";
+const REQUESTS_ONLY_SOURCE_PREFIX: &str = "[Bounded compaction source. The projected transcript is larger than the safe summarization window even with every tool result and message trimmed. The user requests are kept, newest included; everything else is omitted.]\n";
 
 /// Default compaction strategy implementation.
 pub struct DefaultCompactor {
@@ -174,15 +175,186 @@ fn project_messages_for_summarization(messages: &[Message]) -> Vec<Message> {
         .collect()
 }
 
-/// Collapse an oversized typed projection to one bounded textual excerpt.
-///
-/// Keeping the ordinary typed projection when it fits preserves the richest
-/// provider input. The fallback uses one user message so truncating in the
-/// middle of an assistant/tool exchange cannot create an invalid provider
-/// message sequence. The original session messages are never mutated.
+/// What a bounding pass trims, in order: large tool results go first, then
+/// the other context (System rows, assistant text and tool arguments), and
+/// user rows only last.
+#[derive(Clone, Copy, Debug)]
+enum TrimRole {
+    ToolResults,
+    Context,
+    User,
+}
+
+fn serialized_len(messages: &[Message]) -> Result<usize, serde_json::Error> {
+    serde_json::to_vec(messages).map(|encoded| encoded.len())
+}
+
+/// Cut `text` to at most `cap` bytes, keeping its head and tail around an
+/// omission marker.
+fn trim_text(text: &mut String, cap: usize) {
+    if text.len() <= cap {
+        return;
+    }
+    let keep = cap.saturating_sub(TRIMMED_TEXT_MARKER.len());
+    let mut head_end = keep / 2;
+    while head_end > 0 && !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = text.len().saturating_sub(keep - keep / 2);
+    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    *text = format!(
+        "{}{TRIMMED_TEXT_MARKER}{}",
+        &text[..head_end],
+        &text[tail_start..]
+    );
+}
+
+fn trim_blocks(blocks: &mut [ContentBlock], cap: usize) {
+    for block in blocks {
+        if let ContentBlock::Text { text } = block {
+            trim_text(text, cap);
+        }
+    }
+}
+
+/// Trim every text of `role` in `messages` to at most `cap` bytes. Message
+/// and block structure is kept, so the source stays a provider-legal
+/// sequence.
+fn trim_role(messages: &mut [Message], role: TrimRole, cap: usize) {
+    for message in messages {
+        match (role, message) {
+            (TrimRole::ToolResults, Message::ToolResults { results, .. }) => {
+                for result in results {
+                    trim_blocks(&mut result.content, cap);
+                }
+            }
+            (TrimRole::Context, Message::System(system)) => trim_text(&mut system.content, cap),
+            (TrimRole::Context, Message::BlockAssistant(assistant)) => {
+                for block in &mut assistant.blocks {
+                    match block {
+                        AssistantBlock::Text { text, .. }
+                        | AssistantBlock::Transcript { text, .. } => trim_text(text, cap),
+                        AssistantBlock::ToolUse { args, .. } if args.get().len() > cap => {
+                            let omitted = serde_json::json!({
+                                "arguments_trimmed_for_compaction_source_bytes": args.get().len()
+                            });
+                            if let Ok(replacement) =
+                                serde_json::value::RawValue::from_string(omitted.to_string())
+                            {
+                                *args = replacement;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (TrimRole::User, Message::User(user)) => trim_blocks(&mut user.content, cap),
+            _ => {}
+        }
+    }
+}
+
+/// The largest text `role` holds in `messages`, in bytes.
+fn largest_text(messages: &[Message], role: TrimRole) -> usize {
+    let blocks = |blocks: &[ContentBlock]| {
+        blocks
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text { text } => text.len(),
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    messages
+        .iter()
+        .map(|message| match (role, message) {
+            (TrimRole::ToolResults, Message::ToolResults { results, .. }) => results
+                .iter()
+                .map(|result| blocks(&result.content))
+                .max()
+                .unwrap_or(0),
+            (TrimRole::Context, Message::System(system)) => system.content.len(),
+            (TrimRole::Context, Message::BlockAssistant(assistant)) => assistant
+                .blocks
+                .iter()
+                .map(|block| match block {
+                    AssistantBlock::Text { text, .. } | AssistantBlock::Transcript { text, .. } => {
+                        text.len()
+                    }
+                    AssistantBlock::ToolUse { args, .. } => args.get().len(),
+                    _ => 0,
+                })
+                .max()
+                .unwrap_or(0),
+            (TrimRole::User, Message::User(user)) => blocks(&user.content),
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The last-resort source: only the user requests, newest first while the
+/// source's final serialized size (envelope and JSON escaping included)
+/// stays within `budget`, in transcript order. The newest request is always
+/// kept, cut further if it alone does not fit.
+fn requests_only_source(messages: &[Message], budget: usize) -> Vec<Message> {
+    let source = |newest_first: &[String]| {
+        let lines: String = newest_first.iter().rev().map(String::as_str).collect();
+        vec![Message::User(meerkat_core::types::UserMessage::text(
+            format!("{REQUESTS_ONLY_SOURCE_PREFIX}{lines}"),
+        ))]
+    };
+    let fits = |candidate: &[Message]| serialized_len(candidate).is_ok_and(|len| len <= budget);
+    // The exact source that was measured is the one returned: a rebuilt
+    // message carries a new timestamp, whose serialized width varies.
+    let mut kept: Vec<String> = Vec::new();
+    let mut checked = source(&kept);
+    for user in messages.iter().rev().filter_map(|message| match message {
+        Message::User(user) if !user.transcript_role.is_compaction_summary() => Some(user),
+        _ => None,
+    }) {
+        let mut text = user.text_content();
+        trim_text(&mut text, MIN_TRIMMED_TEXT_BYTES);
+        let mut candidate = kept.clone();
+        candidate.push(format!("- {text}\n"));
+        let built = source(&candidate);
+        if fits(&built) {
+            kept = candidate;
+            checked = built;
+            continue;
+        }
+        if kept.is_empty() {
+            // The newest request alone does not fit: cut it until it does
+            // (down to the omission marker).
+            let mut cap = MIN_TRIMMED_TEXT_BYTES;
+            loop {
+                cap /= 2;
+                trim_text(&mut text, cap);
+                let built = source(&[format!("- {text}\n")]);
+                if fits(&built) || cap <= TRIMMED_TEXT_MARKER.len() {
+                    checked = built;
+                    break;
+                }
+            }
+        }
+        break;
+    }
+    checked
+}
+
+/// Bound an oversized typed projection to `budget` serialized bytes, by
+/// role: large tool results are trimmed first, then the other context, and
+/// user rows only last, so every user request (including one in the middle
+/// of the transcript) still reaches the summarizer. Messages are never
+/// dropped from the typed projection; only a source that cannot fit even
+/// fully trimmed falls back to the user requests alone. The original
+/// session messages are never mutated.
 fn bound_summarization_projection(messages: Vec<Message>, budget: usize) -> Vec<Message> {
-    let serialized = match serde_json::to_string(&messages) {
-        Ok(serialized) => serialized,
+    let projected_bytes = match serialized_len(&messages) {
+        Ok(projected_bytes) => projected_bytes,
         Err(error) => {
             return vec![Message::User(meerkat_core::types::UserMessage::text(
                 format!(
@@ -191,38 +363,43 @@ fn bound_summarization_projection(messages: Vec<Message>, budget: usize) -> Vec<
             ))];
         }
     };
-    if serialized.len() <= budget {
+    if projected_bytes <= budget {
         return messages;
     }
-
+    let user_rows = messages
+        .iter()
+        .filter(|message| matches!(message, Message::User(_)))
+        .count();
+    let mut bounded = messages;
+    for role in [TrimRole::ToolResults, TrimRole::Context, TrimRole::User] {
+        let mut cap = largest_text(&bounded, role);
+        while cap > MIN_TRIMMED_TEXT_BYTES {
+            cap = (cap / 2).max(MIN_TRIMMED_TEXT_BYTES);
+            trim_role(&mut bounded, role, cap);
+            if let Ok(bounded_bytes) = serialized_len(&bounded)
+                && bounded_bytes <= budget
+            {
+                tracing::warn!(
+                    projected_bytes,
+                    bounded_bytes,
+                    budget_bytes = budget,
+                    messages = bounded.len(),
+                    user_rows,
+                    trimmed_through = ?role,
+                    "bounded oversized compaction summarization source by trimming"
+                );
+                return bounded;
+            }
+        }
+    }
     tracing::warn!(
-        projected_bytes = serialized.len(),
+        projected_bytes,
         budget_bytes = budget,
-        "bounding oversized compaction summarization source"
+        messages = bounded.len(),
+        user_rows,
+        "compaction summarization source exceeds its budget even fully trimmed; summarizing the user requests only"
     );
-    let framing_bytes = OVERSIZED_SOURCE_PREFIX
-        .len()
-        .saturating_add(OVERSIZED_SOURCE_GAP.len())
-        .saturating_add(OVERSIZED_SOURCE_SUFFIX.len());
-    let excerpt_budget = budget.saturating_sub(framing_bytes);
-    let head_budget = excerpt_budget / 2;
-    let tail_budget = excerpt_budget.saturating_sub(head_budget);
-    let mut head_end = head_budget.min(serialized.len());
-    while head_end > 0 && !serialized.is_char_boundary(head_end) {
-        head_end -= 1;
-    }
-    let mut tail_start = serialized.len().saturating_sub(tail_budget);
-    while tail_start < serialized.len() && !serialized.is_char_boundary(tail_start) {
-        tail_start += 1;
-    }
-    let bounded = format!(
-        "{OVERSIZED_SOURCE_PREFIX}{}{OVERSIZED_SOURCE_GAP}{}{OVERSIZED_SOURCE_SUFFIX}",
-        &serialized[..head_end],
-        &serialized[tail_start..]
-    );
-    vec![Message::User(meerkat_core::types::UserMessage::text(
-        bounded,
-    ))]
+    requests_only_source(&bounded, budget)
 }
 
 impl Compactor for DefaultCompactor {
@@ -409,30 +586,61 @@ impl Compactor for DefaultCompactor {
                 .recent_turn_budget
                 .min(turn_starts.len().saturating_sub(1))
         };
+        // The retention budget bounds the verbatim turns only. System rows
+        // are kept whatever their size and are not part of what the rewrite
+        // can shrink, so they never count against it: counting them let a
+        // System-heavy session retain no turn at all.
         let retention_budget = self.retained_history_budget_bytes(pressure);
+        let turn_bytes = |range: std::ops::Range<usize>| {
+            messages[range]
+                .iter()
+                .filter(|message| !matches!(message, Message::System(_)))
+                .try_fold(0usize, |total, message| {
+                    serde_json::to_vec(message)
+                        .ok()
+                        .and_then(|encoded| total.checked_add(encoded.len()))
+                })
+                .unwrap_or(usize::MAX)
+        };
         let retain_from = loop {
             let candidate = if retain_turn_count == 0 {
                 messages.len()
             } else {
                 turn_starts[turn_starts.len() - retain_turn_count]
             };
-            let retained_bytes = messages
-                .iter()
-                .enumerate()
-                .filter(|(source_offset, message)| {
-                    !superseded_system_prompts.contains(source_offset)
-                        && (matches!(message, Message::System(_)) || *source_offset >= candidate)
-                })
-                .try_fold(0usize, |total, (_, message)| {
-                    serde_json::to_vec(message)
-                        .ok()
-                        .and_then(|encoded| total.checked_add(encoded.len()))
-                })
-                .unwrap_or(usize::MAX);
-            if retained_bytes <= retention_budget || retain_turn_count == 0 {
+            if turn_bytes(candidate..messages.len()) <= retention_budget || retain_turn_count == 0 {
                 break candidate;
             }
             retain_turn_count -= 1;
+        };
+        // The in-flight turn's request bundle (its conversational user row
+        // plus the injected context glued before it) stays verbatim even
+        // when the whole turn does not fit: a mid-turn rewrite must not drop
+        // the request the turn is answering. Only the rest of that turn is
+        // summarized. A bundle that alone exceeds the retention budget
+        // (a large request, or a short one behind large injected context)
+        // cannot be resent as is; it is summarized instead, and the
+        // summarizer source keeps user rows to the last.
+        let pinned_request = turn_starts
+            .last()
+            .copied()
+            .filter(|start| *start < retain_from)
+            .and_then(|start| {
+                let request = (start..messages.len()).find(|offset| {
+                    matches!(
+                        &messages[*offset],
+                        Message::User(user) if user.transcript_role.is_conversational()
+                    )
+                })?;
+                (turn_bytes(start..request + 1) <= retention_budget).then_some(start..request + 1)
+            });
+        let keep = |source_offset: usize, message: &Message| {
+            !superseded_system_prompts.contains(&source_offset)
+                && (matches!(message, Message::System(_))
+                    || source_offset >= retain_from
+                    || pinned_request
+                        .as_ref()
+                        .is_some_and(|request| request.contains(&source_offset)))
         };
 
         // Unkeyed System rows and the latest version for each prompt key are
@@ -444,9 +652,7 @@ impl Compactor for DefaultCompactor {
             .iter()
             .enumerate()
             .find_map(|(source_offset, message)| {
-                (superseded_system_prompts.contains(&source_offset)
-                    || (!matches!(message, Message::System(_)) && source_offset < retain_from))
-                    .then_some(source_offset)
+                (!keep(source_offset, message)).then_some(source_offset)
             })
             .unwrap_or(messages.len());
         let mut summary_mapping = None;
@@ -458,9 +664,7 @@ impl Compactor for DefaultCompactor {
                 ));
                 rebuilt.push(summary_message.clone());
             }
-            let retain = !superseded_system_prompts.contains(&source_offset)
-                && (matches!(message, Message::System(_)) || source_offset >= retain_from);
-            if retain {
+            if keep(source_offset, message) {
                 retained.push(meerkat_core::compact::CompactionRetained::new(
                     u64::try_from(source_offset).unwrap_or(u64::MAX),
                     u64::try_from(rebuilt.len()).unwrap_or(u64::MAX),
@@ -483,6 +687,17 @@ impl Compactor for DefaultCompactor {
             mapping
         });
 
+        if retain_turn_count == 0 {
+            tracing::warn!(
+                source_messages = messages.len(),
+                retained = retained.len(),
+                discarded = discarded.len(),
+                retained_turns = 0,
+                in_flight_request_kept = pinned_request.is_some(),
+                retention_budget_bytes = retention_budget,
+                "compaction retained no complete turn"
+            );
+        }
         CompactionResult {
             messages: rebuilt,
             summary: summary_mapping,
@@ -1387,7 +1602,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rebuild_zero_budget_discards_all() {
+    fn test_rebuild_zero_budget_keeps_only_the_in_flight_request() {
         let c = DefaultCompactor::new(CompactionConfig {
             recent_turn_budget: 0,
             ..make_config()
@@ -1398,10 +1613,13 @@ mod tests {
             Message::User(UserMessage::text("c")),
         ];
         let result = c.rebuild_history(&messages, "summary");
-        // Only the summary message should remain
-        assert_eq!(result.messages.len(), 1);
-        // All original messages should be discarded
-        assert_eq!(result.discarded.len(), 3);
+        // No complete turn is retained; the in-flight request stays verbatim.
+        assert_eq!(result.messages.len(), 2);
+        assert!(matches!(
+            &result.messages[1],
+            Message::User(user) if user.text_content() == "c"
+        ));
+        assert_eq!(result.discarded.len(), 2);
     }
 
     #[test]
@@ -1428,13 +1646,17 @@ mod tests {
         let result = c.rebuild_history(&messages, "bounded summary");
         assert_eq!(
             result.messages.len(),
-            1,
-            "an individually oversized newest turn must be summarized, not retained verbatim"
+            2,
+            "an individually oversized newest turn is summarized; only its request is retained verbatim"
         );
-        assert_eq!(result.discarded.len(), messages.len());
+        assert_eq!(result.discarded.len(), messages.len() - 1);
         assert!(matches!(
             &result.messages[0],
             Message::User(user) if user.transcript_role.is_compaction_summary()
+        ));
+        assert!(matches!(
+            &result.messages[1],
+            Message::User(user) if user.text_content() == "inspect the large result"
         ));
     }
 
@@ -1658,26 +1880,70 @@ mod tests {
         ];
 
         let prepared = c.prepare_for_summarization(&messages);
-        assert_eq!(prepared.len(), 1);
-        let Message::User(excerpt) = &prepared[0] else {
-            panic!("oversized projection must become one provider-legal user excerpt");
+        assert_eq!(
+            prepared.len(),
+            messages.len(),
+            "the oversized source keeps its typed rows; their content is trimmed"
+        );
+        assert!(matches!(
+            &prepared[0],
+            Message::User(user) if user.text_content() == "inspect the large result"
+        ));
+        let Message::ToolResults { results, .. } = &prepared[1] else {
+            panic!("the tool result row stays a tool result");
         };
-        let excerpt = excerpt.text_content();
-        assert!(excerpt.contains("Bounded compaction source excerpt"));
-        assert!(excerpt.contains("intentionally omitted"));
-        assert!(excerpt.contains("middle of projected transcript omitted"));
-        assert!(excerpt.contains("End of bounded excerpt"));
+        let ContentBlock::Text { text } = &results[0].content[0] else {
+            panic!("the trimmed tool result keeps its text block");
+        };
+        assert!(text.contains("trimmed for the compaction source"));
+        let bounded = serde_json::to_vec(&prepared).unwrap().len();
         assert!(
-            excerpt.len() <= c.summarization_source_budget_bytes(),
-            "bounded source was {} bytes for a {} byte budget",
-            excerpt.len(),
+            bounded <= c.summarization_source_budget_bytes(),
+            "bounded source was {bounded} bytes for a {} byte budget",
             c.summarization_source_budget_bytes()
         );
+
+        // The last-resort source (user requests only) is bounded in the same
+        // unit: its final serialized size, envelope and JSON escaping
+        // included. Eight user rows of control characters, each already at
+        // the trimming floor, escape to six bytes per character.
+        let c = DefaultCompactor::new(CompactionConfig {
+            auto_compact_threshold: 1_000,
+            ..make_config()
+        });
+        let budget = c.summarization_source_budget_bytes();
+        let messages: Vec<Message> = (0..8)
+            .map(|n| {
+                Message::User(UserMessage::text(format!(
+                    "req-{n} {}",
+                    "\u{1}".repeat(MIN_TRIMMED_TEXT_BYTES - 6)
+                )))
+            })
+            .collect();
+        assert!(serde_json::to_vec(&messages).unwrap().len() > budget);
+        let prepared = c.prepare_for_summarization(&messages);
+        let source = serde_json::to_string(&prepared).unwrap();
         assert!(
-            serde_json::to_vec(&prepared).unwrap().len()
-                < 2 * c.summarization_source_budget_bytes(),
-            "JSON escaping must retain at least half the model-context safety margin"
+            source.len() <= budget,
+            "the requests-only source was {} bytes for a {budget} byte budget",
+            source.len()
         );
+        assert!(source.contains("req-7"), "the newest request is kept");
+
+        // The returned source is the exact message that was measured: at a
+        // budget equal to one measured source, every returned source stays
+        // within it (a rebuilt message would carry a new timestamp of
+        // varying serialized width).
+        let tight = serde_json::to_vec(&requests_only_source(&messages[7..], usize::MAX))
+            .unwrap()
+            .len();
+        for _ in 0..500 {
+            let returned = requests_only_source(&messages, tight);
+            assert!(
+                serde_json::to_vec(&returned).unwrap().len() <= tight,
+                "the returned requests-only source exceeds the budget it was checked against"
+            );
+        }
     }
 
     #[test]
@@ -2122,5 +2388,212 @@ mod tests {
         );
         assert!(matches!(&prepared[0], Message::User(u) if u.text_content() == "First"));
         assert!(matches!(&prepared[1], Message::User(u) if u.text_content() == "Second"));
+    }
+
+    fn texts_of(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(user) => Some(user.text_content()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A downstream app's mid-turn rewrite: System rows larger than the retention
+    /// budget must not crowd out the in-flight turn. Its request stays
+    /// verbatim whether the whole turn fits (kept whole) or not (the request
+    /// row kept, the rest of the turn summarized).
+    #[test]
+    fn a_system_heavy_session_keeps_the_in_flight_request() {
+        use meerkat_core::types::{AssistantBlock, BlockAssistantMessage, StopReason, ToolResult};
+
+        let c = DefaultCompactor::new(CompactionConfig {
+            auto_compact_threshold: 100_000,
+            recent_turn_budget: 2,
+            ..make_config()
+        });
+        let request = "please refactor the parser and keep the public API";
+        let in_flight = |result_bytes: usize| {
+            let mut messages: Vec<Message> = (0..5)
+                .map(|n| Message::System(SystemMessage::new(format!("{n}{}", "s".repeat(20_000)))))
+                .collect();
+            messages.push(Message::User(UserMessage::text("an earlier request")));
+            messages.push(Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::Text {
+                    text: "done earlier".into(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+            )));
+            messages.push(Message::User(UserMessage::text(request)));
+            messages.push(Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::ToolUse {
+                    id: "tc_read".into(),
+                    name: "read".into(),
+                    args: serde_json::value::RawValue::from_string("{}".into()).unwrap(),
+                    meta: None,
+                }],
+                StopReason::ToolUse,
+            )));
+            messages.push(Message::tool_results(vec![ToolResult::new(
+                "tc_read".into(),
+                "r".repeat(result_bytes),
+                false,
+            )]));
+            messages
+        };
+
+        // The in-flight turn fits: it is kept whole.
+        let messages = in_flight(1_000);
+        let result = c.rebuild_history(&messages, "summary");
+        let kept = texts_of(&result.messages);
+        assert!(
+            kept.iter().any(|text| text == request),
+            "the in-flight request survives a System-heavy rewrite: {kept:?}"
+        );
+        assert_eq!(
+            result.messages.len(),
+            5 + 1 + 3,
+            "System rows, the summary and the whole in-flight turn"
+        );
+        assert!(
+            result
+                .discarded
+                .iter()
+                .any(|discard| discard.source_offset == 5),
+            "the earlier turn is summarized"
+        );
+
+        // The in-flight turn's tool result alone is larger than any retention
+        // budget: the request row is still kept verbatim.
+        let messages = in_flight(1_000_000);
+        let result = c.rebuild_history(&messages, "summary");
+        let kept = texts_of(&result.messages);
+        assert!(
+            kept.iter().any(|text| text == request),
+            "the in-flight request survives even when its turn cannot: {kept:?}"
+        );
+        assert!(
+            matches!(result.messages.last(), Some(Message::User(user)) if user.text_content() == request),
+            "the request is the last row, its oversized turn tail summarized"
+        );
+        assert!(
+            result
+                .discarded
+                .iter()
+                .any(|discard| matches!(discard.message, Message::ToolResults { .. })),
+            "the oversized tool result is summarized, not retained"
+        );
+    }
+
+    /// The single active instruction of a turn whose tool exchanges are
+    /// oversized (small System, no earlier turn) survives the rewrite of
+    /// that same vector verbatim, with exact source/rebuilt mappings: the
+    /// System row and the instruction keep their offsets, the summary takes
+    /// the first discarded position, and every tool exchange is discarded.
+    #[test]
+    fn the_single_active_instruction_survives_oversized_tool_exchanges() {
+        use meerkat_core::types::{AssistantBlock, BlockAssistantMessage, StopReason, ToolResult};
+
+        let c = DefaultCompactor::new(CompactionConfig {
+            auto_compact_threshold: 100_000,
+            recent_turn_budget: 2,
+            ..make_config()
+        });
+        let instruction = "audit every invoice from last quarter";
+        let mut messages = vec![
+            Message::System(SystemMessage::new("You are helpful.")),
+            Message::User(UserMessage::text(instruction)),
+        ];
+        for n in 0..2 {
+            let id = format!("tc_{n}");
+            messages.push(Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::ToolUse {
+                    id: id.clone(),
+                    name: "fetch".into(),
+                    args: serde_json::value::RawValue::from_string("{}".into()).unwrap(),
+                    meta: None,
+                }],
+                StopReason::ToolUse,
+            )));
+            messages.push(Message::tool_results(vec![ToolResult::new(
+                id,
+                "i".repeat(200_000),
+                false,
+            )]));
+        }
+
+        let result = c.rebuild_history(&messages, "summary");
+        let retained: Vec<(u64, u64)> = result
+            .retained
+            .iter()
+            .map(|retention| (retention.source_offset, retention.rebuilt_offset))
+            .collect();
+        assert_eq!(
+            retained,
+            vec![(0, 0), (1, 1)],
+            "the System row and the instruction keep their exact offsets"
+        );
+        assert!(matches!(
+            &result.messages[1],
+            Message::User(user) if user.text_content() == instruction
+        ));
+        assert_eq!(result.summary.rebuilt_offset, 2);
+        assert_eq!(result.messages.len(), 3);
+        assert_eq!(
+            result
+                .discarded
+                .iter()
+                .map(|discard| discard.source_offset)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4, 5],
+            "every tool exchange is discarded"
+        );
+    }
+
+    /// A user request in the middle of an oversized transcript (a large
+    /// System prompt before it, a large tool result after it) reaches the
+    /// summarizer within the source budget.
+    #[test]
+    fn a_middle_user_request_reaches_the_summarizer_source() {
+        use meerkat_core::types::{AssistantBlock, BlockAssistantMessage, StopReason, ToolResult};
+
+        let c = DefaultCompactor::new(CompactionConfig {
+            auto_compact_threshold: 100_000,
+            ..make_config()
+        });
+        let request = "migrate the billing tables to the new schema";
+        let messages = vec![
+            Message::System(SystemMessage::new("p".repeat(600_000))),
+            Message::User(UserMessage::text(request)),
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::ToolUse {
+                    id: "tc_dump".into(),
+                    name: "dump".into(),
+                    args: serde_json::value::RawValue::from_string("{}".into()).unwrap(),
+                    meta: None,
+                }],
+                StopReason::ToolUse,
+            )),
+            Message::tool_results(vec![ToolResult::new(
+                "tc_dump".into(),
+                "d".repeat(2_000_000),
+                false,
+            )]),
+        ];
+
+        let prepared = c.prepare_for_summarization(&messages);
+        let source = serde_json::to_string(&prepared).unwrap();
+        assert!(
+            source.contains(request),
+            "the middle request reaches the summarizer source"
+        );
+        assert!(
+            source.len() <= c.summarization_source_budget_bytes(),
+            "the source ({} bytes) stays within its budget ({} bytes)",
+            source.len(),
+            c.summarization_source_budget_bytes()
+        );
     }
 }

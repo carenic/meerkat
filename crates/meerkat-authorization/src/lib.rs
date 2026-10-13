@@ -3,13 +3,15 @@
 //! The generated grant owner is the sole mutable grant authority. Native work
 //! and policy owners supply independent current facts; prepared decisions remain
 //! disposable projections bound to the same local publication and clock.
-//! These checks do not track semantic information flow or provide persistence,
-//! consent or operating-system confinement.
+//! These checks do not track semantic information flow or provide consent or
+//! operating-system confinement. The only persistence is the grant owner's
+//! optional restart custody; prepared decisions are never persisted.
 
 mod audit;
 pub mod clock;
 pub mod grant_policy;
 pub mod grants;
+pub mod mcp_installation;
 pub mod policy;
 pub mod publication;
 pub mod work;

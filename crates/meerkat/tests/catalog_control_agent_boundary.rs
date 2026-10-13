@@ -153,6 +153,7 @@ fn session_tool(name: &str, description: &str) -> Arc<ToolDef> {
         provenance: Some(ToolProvenance {
             kind: ToolSourceKind::Callback,
             source_id: "test".into(),
+            artifact: None,
         }),
     })
 }
@@ -170,6 +171,7 @@ async fn agent_boundary_routes_tool_catalog_load_authority_from_control_plane() 
                 ToolProvenance {
                     kind: ToolSourceKind::Callback,
                     source_id: "test".into(),
+                    artifact: None,
                 },
             ),
             ToolCatalogEntry::session_deferred(
@@ -178,6 +180,7 @@ async fn agent_boundary_routes_tool_catalog_load_authority_from_control_plane() 
                 ToolProvenance {
                     kind: ToolSourceKind::Callback,
                     source_id: "test".into(),
+                    artifact: None,
                 },
             ),
         ]

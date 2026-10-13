@@ -193,7 +193,8 @@ async fn build_runtime(root: &Path, client: Arc<ScriptedShellClient>) -> Arc<Ses
         10,
         persistence,
         meerkat_rpc::router::NotificationSink::noop(),
-    );
+    )
+    .expect("compose the RPC session runtime");
     runtime.set_default_llm_client(Some(client));
     let config_store: Arc<dyn meerkat_core::ConfigStore> =
         Arc::new(MemoryConfigStore::new(config, meerkat_models::canonical()));

@@ -613,6 +613,80 @@ async fn memory_and_sqlite_share_pending_outbox_ack_conformance() {
     .await;
 }
 
+async fn submission_key_read_conformance(store: Arc<dyn DetachedJobStore>, key: &str) {
+    let service = DetachedJobService::new(store.clone());
+    let admitted = service
+        .submit(spec(key, RestartClass::NonResumable))
+        .await
+        .expect("admit");
+    let mut other_realm = spec(key, RestartClass::NonResumable);
+    other_realm.realm_id = "realm-b".to_string();
+    let other = service
+        .submit(other_realm)
+        .await
+        .expect("admit the same key in another realm");
+    let submission_key = JobSubmissionKey::new(key).expect("key");
+
+    let read = store
+        .get_by_submission_key("realm-a", &submission_key)
+        .await
+        .expect("read")
+        .expect("the admitted job");
+    assert_eq!(read.job_id, admitted.job_id);
+    assert_eq!(read.spec.submission_key, submission_key);
+    let read_other = store
+        .get_by_submission_key("realm-b", &submission_key)
+        .await
+        .expect("read")
+        .expect("the other realm's job");
+    assert_eq!(read_other.job_id, other.job_id);
+    assert!(
+        store
+            .get_by_submission_key("realm-c", &submission_key)
+            .await
+            .expect("read an unknown realm")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_by_submission_key(
+                "realm-a",
+                &JobSubmissionKey::new(format!("{key}-absent")).expect("key"),
+            )
+            .await
+            .expect("read an unknown key")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn memory_and_sqlite_read_the_admitted_job_by_exact_submission_key() {
+    submission_key_read_conformance(
+        Arc::new(MemoryDetachedJobStore::new()),
+        "memory-submission-key-read",
+    )
+    .await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("jobs.sqlite3");
+    submission_key_read_conformance(
+        Arc::new(SqliteDetachedJobStore::open(&path).expect("sqlite open")),
+        "sqlite-submission-key-read",
+    )
+    .await;
+    // The read is the durable submission index, so it survives a reopen.
+    let reopened = SqliteDetachedJobStore::open(&path).expect("sqlite reopen");
+    assert!(
+        reopened
+            .get_by_submission_key(
+                "realm-a",
+                &JobSubmissionKey::new("sqlite-submission-key-read").expect("key"),
+            )
+            .await
+            .expect("read after reopen")
+            .is_some()
+    );
+}
+
 /// A `census_live` column that disagrees with the document fails the read.
 ///
 /// The column is a projection of the phase, and a projection with no staleness

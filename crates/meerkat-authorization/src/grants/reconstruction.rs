@@ -71,7 +71,7 @@ impl LocalGrantAuthority {
     }
 }
 
-fn verify_lineages(
+pub(super) fn verify_lineages(
     owner: &super::dsl::GrantAuthorityMachineAuthority,
 ) -> Result<(), GrantReconstructionError> {
     use super::dsl::GrantAuthorityPhase;

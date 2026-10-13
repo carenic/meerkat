@@ -9,9 +9,10 @@
 //! staging until just before it hands the run to the executor, and a Stop's
 //! hold and cancel take that same gate.
 //!
-//! The scripted model answers the member's first call with a tool call, so a
-//! turn that is not cancelled runs the tool and calls the model again. A turn
-//! cancelled at its first boundary stops after the first call.
+//! The scripted model answers the member's first call with a call to a real
+//! tool the member has (`datetime`), so a turn that is not cancelled runs the
+//! tool and calls the model again. A turn cancelled at its first boundary
+//! (after that tool batch) stops after the first call.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 mod support;
@@ -48,6 +49,8 @@ async fn autonomous_member(fixture: &CouncilFixture) -> MobHandle {
     for binding in definition.profiles.values_mut() {
         if let meerkat_mob::ProfileBinding::Inline(profile) = binding {
             profile.external_addressable = true;
+            // A real tool for the member's first call.
+            profile.tools.builtins = true;
         }
     }
     fixture
@@ -86,7 +89,7 @@ async fn stop_cancels_a_run_staged_before_the_agent_claimed_its_turn() {
         if first {
             ScriptedTurn::ToolCall {
                 id: "staged-run-call".to_string(),
-                name: "no_such_tool".to_string(),
+                name: "datetime".to_string(),
                 args: serde_json::json!({}),
             }
         } else {
@@ -140,7 +143,9 @@ async fn stop_cancels_a_run_staged_before_the_agent_claimed_its_turn() {
         dispatches.wait_for(|dispatches| *dispatches >= 1),
     )
     .await
-    .expect("the Stop's boundary cancel is dispatched")
+    // The counter records the runtime's dispatch only; whether the agent
+    // latched the cancel is shown by the model-call count below.
+    .expect("the runtime dispatches the Stop's boundary cancel")
     .expect("dispatch watch open");
     release.send(()).expect("release the staged run");
 
@@ -155,13 +160,13 @@ async fn stop_cancels_a_run_staged_before_the_agent_claimed_its_turn() {
         .unwrap_or_else(|| panic!("the stop reports the member: {report:?}"));
     assert!(
         matches!(outcome.run, MemberStopRun::CancelledAtBoundary { .. }),
-        "the stop cancelled the staged run at its boundary: {report:?}"
+        "the stop reports the staged run as cancelled at its boundary: {report:?}"
     );
     assert_eq!(
         *calls_rx.borrow(),
         1,
-        "the cancelled turn ends at its first boundary: the tool call never \
-         runs and the model is not called again"
+        "the cancelled turn ends at its first boundary: the model is not \
+         called again after the tool batch"
     );
     fixture.teardown().await;
 }

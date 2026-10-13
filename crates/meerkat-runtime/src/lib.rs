@@ -578,6 +578,7 @@ pub use input_state::{
     verify_exact_resume_replay,
 };
 pub use meerkat_core::types::HandlingMode;
+pub use meerkat_machine::McpObservationRefusal;
 #[cfg(not(target_arch = "wasm32"))]
 pub use meerkat_machine::ProviderAuthRuntimeAuthority;
 #[cfg(feature = "test-support")]
@@ -585,23 +586,25 @@ pub use meerkat_machine::UnregisterTeardownWaitWitness;
 pub use meerkat_machine::{
     AdmittedWork, ArchivedSessionActorMaterializationAuthorization,
     AuthorizedArchivedResumeCommitLease, CommittedRuntimeExecutorAttachmentPublicationLease,
-    CommsDrainMode, CommsDrainPhase, DrainExitReason, EnsureRuntimeExecutorAttachment,
-    LocalSessionMaterializationMode, MachineServiceTurnCommitLease, MachineServiceTurnIdentity,
-    MachineSessionArchiveLease, MachineSessionArchivePostCommitHook,
-    MachineSessionControlAuthority, MaterializationClaimObservation, MeerkatConsumerSurface,
-    MeerkatMachine, PeerIngressOwner, PendingExecutorAttachmentAbortCompletion,
-    PendingRuntimeExecutorAttachment, PreparedArchivedResumeCommitLease,
-    PreparedAttachedSessionActorRecovery, PreparedRuntimeExecutorAttachmentRetirement,
-    PreparedSessionMaterialization, ReloadRequiredRegistrationDisposition,
-    ReloadRequiredRegistrationSettlement, RunStartHoldReason, RunStartsHold, RuntimeBindingsError,
+    CommsDrainMode, CommsDrainPhase, ConsentOwnerLossInstallRefused, DrainExitReason,
+    EnsureRuntimeExecutorAttachment, LocalSessionMaterializationMode,
+    MachineServiceTurnCommitLease, MachineServiceTurnIdentity, MachineSessionArchiveLease,
+    MachineSessionArchivePostCommitHook, MachineSessionControlAuthority,
+    MaterializationClaimObservation, MeerkatConsumerSurface, MeerkatMachine, PeerIngressOwner,
+    PendingExecutorAttachmentAbortCompletion, PendingRuntimeExecutorAttachment,
+    PreparedArchivedResumeCommitLease, PreparedAttachedSessionActorRecovery,
+    PreparedRuntimeExecutorAttachmentRetirement, PreparedSessionMaterialization,
+    ReloadRequiredRegistrationDisposition, ReloadRequiredRegistrationSettlement,
+    RunStartHoldReason, RunStartsHold, RunlessInputTerminalHint, RuntimeBindingsError,
     RuntimeCleanupTaskSpawner, RuntimeDetachedUnregister,
     RuntimeExecutorAttachmentRetirementCompletion, RuntimeExecutorAttachmentWitness,
-    RuntimeLifecycleFacts, RuntimeLoopQueueAdmissionPlan, RuntimeOwnerlessRegistrationAdmission,
-    RuntimeOwnerlessRegistrationLease, RuntimeSessionAttachmentState,
-    RuntimeSessionLifecycleObservation, RuntimeSessionRegistrationOutcome,
+    RuntimeLifecycleFacts, RuntimeLoopQueueAdmissionPlan, RuntimeOwnerIdentity,
+    RuntimeOwnerlessRegistrationAdmission, RuntimeOwnerlessRegistrationLease,
+    RuntimeSessionAttachmentState, RuntimeSessionLifecycleObservation,
+    RuntimeSessionQuiescentClose, RuntimeSessionRegistrationOutcome,
     RuntimeSessionRegistrationWitness, RuntimeSessionUnregisterAdmission,
-    RuntimeSessionUnregisterObserver, SessionDurabilityReloadRequired,
-    StandaloneSessionRuntimeAuthorities, classify_runtime_lifecycle_state,
+    RuntimeSessionUnregisterObserver, SessionDurabilityReloadRequired, StagedCustodyRelease,
+    StagedMeerkatMachine, StandaloneSessionRuntimeAuthorities, classify_runtime_lifecycle_state,
     classify_runtime_loop_queue_admission, standalone_session_runtime_authorities,
     standalone_tool_visibility_owner,
 };
@@ -641,10 +644,11 @@ pub use run_stop::{RunStopContributor, RunStopReceipt};
 #[cfg(not(target_arch = "wasm32"))]
 pub use session_hosting::spawn_blocking_holding_claim;
 pub use session_hosting::{
-    ColdDeliveryOwnership, HostingCapability, HostingClaim, HostingClaimUnavailable, HostingOwner,
-    HostingPaths, HostingRefused, ServedElsewhere, SessionHostingAuthority, SessionServing,
-    grant_session_hosting, local_session_serving, os_lock_if_trusted, try_cold_delivery_ownership,
-    with_write_hosting,
+    ColdDeliveryOwnership, HostingAcquisition, HostingCapability, HostingClaim,
+    HostingClaimUnavailable, HostingOwner, HostingOwnerLossProof, HostingPaths, HostingRefused,
+    OwnerLossAttachment, OwnerLossReservation, ServedElsewhere, SessionHostingAuthority,
+    SessionServing, grant_session_hosting, local_session_serving, os_lock_if_trusted,
+    try_cold_delivery_ownership, with_write_hosting,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use session_hosting::{DELIVERY_STORE_SWEEP, DeliveryStoreWatch, watch_delivery_store};

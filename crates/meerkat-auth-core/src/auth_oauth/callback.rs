@@ -357,6 +357,20 @@ impl LoopbackHandle {
         waited.into_result()
     }
 
+    /// Borrowed [`wait`](Self::wait): the same legacy tie (the callback and
+    /// drain are polled once before `deadline` is consulted) and the same
+    /// joined retirement on return, but the handle stays with the caller.
+    /// Dropping this future loses nothing: the caller can still
+    /// [`close`](Self::close) the handle for a joined receipt.
+    pub(crate) async fn wait_poll_first(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<LoopbackOutcome, OAuthError> {
+        let waited = self.wait_step(deadline, EntryTie::PollFirst).await;
+        self.server.join(true).await?;
+        waited.into_result()
+    }
+
     /// Borrowed, cancel-safe wait. Dropping this future loses nothing: the
     /// receiver, a callback already taken from it and the server all stay in
     /// the handle, and the caller can still [`close`](Self::close) it for a

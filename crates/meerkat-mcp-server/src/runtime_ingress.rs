@@ -2908,7 +2908,8 @@ mod tests {
             meerkat_core::Provider::Anthropic,
         )));
         let (service, runtime_adapter) =
-            build_runtime_backed_service(builder, active_session_capacity, persistence);
+            build_runtime_backed_service(builder, active_session_capacity, persistence)
+                .expect("compose the runtime-backed service");
         let config_store = Arc::new(MemoryConfigStore::new(
             Config::default(),
             meerkat_models::canonical(),

@@ -109,7 +109,7 @@ fn control_plane_contract_only_runtime_loop_handoff_can_terminalize_stop() {
         "direct executor effect helper must reject stop effects"
     );
     assert_eq!(
-        direct_body.matches("terminalize_async_stop(").count(),
+        direct_body.matches("terminalize_async_stop").count(),
         0,
         "direct executor effect helper must have no stop terminalizer"
     );
@@ -127,9 +127,14 @@ fn control_plane_contract_only_runtime_loop_handoff_can_terminalize_stop() {
          {offenders:?}"
     );
     assert_eq!(
-        body.matches("terminalize_async_stop(").count(),
+        body.matches("terminalize_async_stop_announcing(").count(),
         1,
-        "{path} should call terminalize_async_stop exactly once"
+        "{path} should call terminalize_async_stop_announcing exactly once"
+    );
+    assert_eq!(
+        body.matches("terminalize_async_stop(").count(),
+        0,
+        "{path} should tell the host about the inputs its stop terminalizes"
     );
 }
 
@@ -319,6 +324,190 @@ async fn control_plane_contract_stop_runtime_executor_preempts_queued_progress_w
             reason: InputAbandonReason::Stopped,
         })
     ));
+}
+
+/// Counts the runless-terminal tells of `machine`.
+fn count_runless_terminal_tells(machine: &MeerkatMachine) -> Arc<AtomicUsize> {
+    let tells = Arc::new(AtomicUsize::new(0));
+    machine.set_runless_input_terminal_hint(Arc::new({
+        let tells = Arc::clone(&tells);
+        move || {
+            tells.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+    tells
+}
+
+#[tokio::test]
+async fn control_plane_contract_a_stop_that_terminalizes_queued_work_tells_the_host_once() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let runtime: &dyn SessionServiceRuntimeExt = &*adapter;
+    let sid = SessionId::new();
+    let tells = count_runless_terminal_tells(&adapter);
+    adapter
+        .register_session_with_executor(
+            sid.clone(),
+            Box::new(RecordingExecutor {
+                apply_calls: Arc::new(AtomicUsize::new(0)),
+                stop_calls: Arc::new(AtomicUsize::new(0)),
+                terminal: Some(CoreApplyTerminal::RunResult(Box::new(make_run_result(
+                    "should not run",
+                )))),
+            }),
+        )
+        .await
+        .expect("runtime executor registration should succeed");
+
+    let (outcome, handle) = runtime
+        .accept_input_with_completion(&sid, make_progress_input("stop-tells"))
+        .await
+        .unwrap();
+    assert!(outcome.is_accepted());
+    assert_eq!(tells.load(Ordering::SeqCst), 0, "admission tells nothing");
+
+    adapter
+        .stop_runtime_executor(&sid, "stop tells the host")
+        .await
+        .unwrap();
+    let result = handle
+        .unwrap()
+        .wait()
+        .await
+        .expect("completion waiter should resolve");
+    assert!(matches!(
+        result,
+        CompletionOutcome::RuntimeTerminated { .. }
+    ));
+    assert_eq!(
+        tells.load(Ordering::SeqCst),
+        1,
+        "the stop that terminalizes the queued input tells the host once"
+    );
+}
+
+#[tokio::test]
+async fn control_plane_contract_a_retirement_without_runtime_loop_tells_the_host_once() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let runtime: &dyn SessionServiceRuntimeExt = &*adapter;
+    let sid = SessionId::new();
+    let tells = count_runless_terminal_tells(&adapter);
+    adapter
+        .register_session(sid.clone())
+        .await
+        .expect("register session");
+
+    let (outcome, _handle) = runtime
+        .accept_input_with_completion(&sid, make_progress_input("retire-tells"))
+        .await
+        .unwrap();
+    assert!(outcome.is_accepted());
+
+    let report = runtime.retire_runtime(&sid).await.unwrap();
+    assert_eq!(report.inputs_abandoned, 1);
+    assert_eq!(
+        tells.load(Ordering::SeqCst),
+        1,
+        "the retirement that abandons the queued input tells the host once"
+    );
+}
+
+fn persistent_contract_machine() -> Arc<MeerkatMachine> {
+    Arc::new(
+        MeerkatMachine::persistent_without_blobs(
+            Arc::new(InMemoryRuntimeStore::new()) as Arc<dyn RuntimeStore>
+        )
+        .expect("persistent machine"),
+    )
+}
+
+async fn reset_tells_its_newly_terminal_inputs_once(adapter: Arc<MeerkatMachine>) {
+    let runtime: &dyn SessionServiceRuntimeExt = &*adapter;
+    let sid = SessionId::new();
+    let tells = count_runless_terminal_tells(&adapter);
+    adapter
+        .register_session(sid.clone())
+        .await
+        .expect("register session");
+    runtime
+        .reset_runtime(&sid)
+        .await
+        .expect("reset with nothing queued");
+    assert_eq!(
+        tells.load(Ordering::SeqCst),
+        0,
+        "a reset that abandons nothing tells nothing"
+    );
+
+    let (outcome, _handle) = runtime
+        .accept_input_with_completion(&sid, make_progress_input("reset-tells"))
+        .await
+        .unwrap();
+    assert!(outcome.is_accepted());
+    runtime
+        .reset_runtime(&sid)
+        .await
+        .expect("reset the queued input");
+    assert_eq!(
+        tells.load(Ordering::SeqCst),
+        1,
+        "the reset that abandons the queued input tells the host once"
+    );
+}
+
+#[tokio::test]
+async fn control_plane_contract_a_reset_that_terminalizes_queued_work_tells_the_host_once() {
+    reset_tells_its_newly_terminal_inputs_once(Arc::new(MeerkatMachine::ephemeral())).await;
+    reset_tells_its_newly_terminal_inputs_once(persistent_contract_machine()).await;
+}
+
+async fn destroy_tells_its_newly_terminal_inputs_once(adapter: Arc<MeerkatMachine>) {
+    let runtime: &dyn SessionServiceRuntimeExt = &*adapter;
+    let tells = count_runless_terminal_tells(&adapter);
+    let idle = SessionId::new();
+    adapter
+        .register_session(idle.clone())
+        .await
+        .expect("register the idle session");
+    meerkat_runtime::traits::RuntimeControlPlane::destroy(
+        &*adapter,
+        &LogicalRuntimeId::for_session(&idle),
+    )
+    .await
+    .expect("destroy with nothing queued");
+    assert_eq!(
+        tells.load(Ordering::SeqCst),
+        0,
+        "a destroy that abandons nothing tells nothing"
+    );
+
+    let sid = SessionId::new();
+    adapter
+        .register_session(sid.clone())
+        .await
+        .expect("register session");
+    let (outcome, _handle) = runtime
+        .accept_input_with_completion(&sid, make_progress_input("destroy-tells"))
+        .await
+        .unwrap();
+    assert!(outcome.is_accepted());
+    let report = meerkat_runtime::traits::RuntimeControlPlane::destroy(
+        &*adapter,
+        &LogicalRuntimeId::for_session(&sid),
+    )
+    .await
+    .expect("destroy the queued input");
+    assert_eq!(report.inputs_abandoned, 1);
+    assert_eq!(
+        tells.load(Ordering::SeqCst),
+        1,
+        "the destroy that abandons the queued input tells the host once"
+    );
+}
+
+#[tokio::test]
+async fn control_plane_contract_a_destroy_that_terminalizes_queued_work_tells_the_host_once() {
+    destroy_tells_its_newly_terminal_inputs_once(Arc::new(MeerkatMachine::ephemeral())).await;
+    destroy_tells_its_newly_terminal_inputs_once(persistent_contract_machine()).await;
 }
 
 #[tokio::test]

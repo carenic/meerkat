@@ -1951,6 +1951,55 @@ impl MobDestroyReport {
     }
 }
 
+/// Observes how a mob's actor task ends. Holds no store handle, so it can
+/// outlive every handle it was taken from.
+#[derive(Debug, Clone)]
+pub struct MobActorTaskWatch {
+    rx: tokio::sync::watch::Receiver<super::ActorTaskEnd>,
+}
+
+/// How waiting for a mob's actor task ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MobActorTaskWait {
+    /// The actor future returned: the actor, and every store handle it
+    /// owned, has dropped.
+    Returned,
+    /// The task ended without its future returning (a panic or an abort):
+    /// what it held is not attested.
+    Lost,
+    /// The member lifecycle hang guard elapsed first; the task may still be
+    /// running.
+    Pending,
+}
+
+impl MobActorTaskWatch {
+    /// Wait for the actor task to end, bounded by the member lifecycle hang
+    /// guard. It sends the actor nothing, so a destroyed mob is fine; a
+    /// caller running inside that actor's lifecycle work is cancelled by the
+    /// actor's own teardown rather than waited on.
+    pub async fn wait(&mut self) -> MobActorTaskWait {
+        let ended = tokio::time::timeout(
+            DEFAULT_KICKOFF_WAIT_TIMEOUT,
+            self.rx.wait_for(|end| *end != super::ActorTaskEnd::Running),
+        )
+        .await;
+        match ended {
+            Ok(Ok(end)) if *end == super::ActorTaskEnd::Returned => MobActorTaskWait::Returned,
+            Ok(_) => MobActorTaskWait::Lost,
+            Err(_) => MobActorTaskWait::Pending,
+        }
+    }
+
+    /// Whether this watch observes the actor task behind `handle`. Every
+    /// handle of one mob instance shares that task; another instance, such
+    /// as a mob registered under the same id, has its own.
+    pub fn observes(&self, handle: &MobHandle) -> bool {
+        self.rx
+            .same_channel(&handle.lifecycle_observations.subscribe_actor_task())
+    }
+}
+
 /// Structured error returned by mob destroy.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -2105,7 +2154,9 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         | MobError::MemberSessionNotLive { .. }
         | MobError::AgentEventCursorRejected { .. }
         | MobError::RuntimeOwnerConflict
-        | MobError::ToolBundleUnavailable { .. } => {
+        | MobError::ToolBundleUnavailable { .. }
+        | MobError::HeldProvisionUnsupported { .. }
+        | MobError::DeliveryScopeUnavailable { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
         MobError::ProfileNotFound(_) => {
@@ -2205,10 +2256,15 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         // verdict.
         MobError::MemberAdmissionBacklogFull { .. }
         | MobError::WorkInputIdempotencyConflict { .. }
+        | MobError::MemberInputRefused { .. }
+        | MobError::GovernedInputUnbound { .. }
         | MobError::WorkInputCompletionUnavailable { .. }
         | MobError::ActorCommandTimedOut { .. }
         | MobError::MemberReloadRefused { .. }
-        | MobError::MemberReloadTimedOut { .. } => {
+        | MobError::MemberReloadTimedOut { .. }
+        | MobError::HeldSpawnUnsupported { .. }
+        | MobError::HeldSpawnAborted { .. }
+        | MobError::HeldSpawnExpired { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
         MobError::RuntimeEffectRefused { kind, .. } => match kind {
@@ -2274,7 +2330,9 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::CallbackPending { .. } | MobError::CallbackBatchPending { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::CallbackPending
         }
-        MobError::StaleFenceToken { .. } | MobError::StaleMemberOperatorAuthority { .. } => {
+        MobError::StaleFenceToken { .. }
+        | MobError::StaleDeliveryScope { .. }
+        | MobError::StaleMemberOperatorAuthority { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::StaleFenceToken
         }
         MobError::StaleEventCursor { .. } => {
@@ -2321,6 +2379,8 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::IdentityConvergenceAdmissionClosed { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
+        // A closed mob refuses the whole batch before any row is provisioned.
+        MobError::AdmissionClosed { .. } => mob_dsl::MobSpawnManyFailureObservationKind::Internal,
         MobError::MemberRetirementInProgress { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
@@ -2782,6 +2842,89 @@ impl MemberTurnOptions {
     }
 }
 
+/// The member session's canonical admission of a governed input.
+///
+/// Forwarded unchanged from the native admission outcome of `session_id`:
+/// `input_id` is the id the session admitted, or the existing id an exact
+/// replay matched, in which case `deduplicated` is true. It is observed at
+/// admission, so a later completion failure never retracts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MemberInputAdmission {
+    pub session_id: SessionId,
+    pub input_id: meerkat_core::lifecycle::InputId,
+    pub deduplicated: bool,
+}
+
+pub(crate) type MemberInputAdmissionSender = tokio::sync::oneshot::Sender<MemberInputAdmission>;
+
+/// A host's custody of a governed input's reserved resources, carried to the
+/// member session's native admission, which settles it exactly once:
+/// `Admitted`, `NotAdmitted` or `Uncertain`. Settlement reports native
+/// admission only; it is not the canonical admission (see
+/// [`MemberInputAdmission`]), since `Admitted` also covers an exact replay.
+///
+/// A delivery that ends before native admission is attempted (refused by the
+/// mob, abandoned while parked, or failing before the native call) settles
+/// `NotAdmitted` when this is dropped. Once handed to native admission, only
+/// native admission settles it, so an `Uncertain` outcome is never withdrawn.
+pub struct GovernedInputCustody(
+    // Held in the member lane's shared actor state, which must be `Sync`;
+    // only `into_native` and `drop` reach it, each with exclusive access.
+    std::sync::Mutex<
+        Option<Box<dyn meerkat_runtime::input_admission_custody::NativeInputAdmissionCustody>>,
+    >,
+);
+
+impl GovernedInputCustody {
+    pub fn new(
+        custody: Box<dyn meerkat_runtime::input_admission_custody::NativeInputAdmissionCustody>,
+    ) -> Self {
+        Self(std::sync::Mutex::new(Some(custody)))
+    }
+
+    /// Hand the custody to native admission, which then owns its settlement.
+    pub fn into_native(
+        mut self,
+    ) -> Option<Box<dyn meerkat_runtime::input_admission_custody::NativeInputAdmissionCustody>>
+    {
+        self.0
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+impl Drop for GovernedInputCustody {
+    fn drop(&mut self) {
+        if let Some(custody) = self
+            .0
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = custody.settle(
+                meerkat_runtime::input_admission_custody::NativeInputAdmissionSettlement::NotAdmitted,
+            );
+        }
+    }
+}
+
+impl std::fmt::Debug for GovernedInputCustody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GovernedInputCustody")
+            .field(
+                "held",
+                &self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some(),
+            )
+            .finish()
+    }
+}
+
 /// Completion-bearing handle for an admitted member turn.
 ///
 /// The receipt proves canonical mob admission. [`Self::wait`] resolves only
@@ -2796,11 +2939,19 @@ pub struct MemberTurnHandle {
     llm_identity_applied_rx: Option<
         tokio::sync::oneshot::Receiver<Result<Option<meerkat_core::SessionLlmIdentity>, MobError>>,
     >,
+    admission: Option<MemberInputAdmission>,
 }
 
 impl MemberTurnHandle {
     pub fn receipt(&self) -> &MemberDeliveryReceipt {
         &self.receipt
+    }
+
+    /// The member session's canonical admission of a governed input. Set
+    /// only for [`MobHandle::start_governed_input`]; every other turn
+    /// returns `None`.
+    pub fn admission(&self) -> Option<MemberInputAdmission> {
+        self.admission.clone()
     }
 
     /// Bridge session admitted for this exact member runtime binding.
@@ -2908,6 +3059,7 @@ fn submit_work_payload(
     let crate::mob_machine::SubmitWorkCommand {
         runtime_id,
         fence_token,
+        expected_session_id,
         work_ref,
         spec,
         handling_mode,
@@ -2946,6 +3098,7 @@ fn submit_work_payload(
     Ok(Box::new(super::state::SubmitWorkPayload {
         runtime_id,
         fence_token,
+        expected_session_id,
         work_ref,
         content: spec.content,
         origin: spec.origin,
@@ -2962,6 +3115,7 @@ fn submit_work_payload(
         llm_identity_applied_tx,
         ack_mode,
         content_attribution,
+        governed_input: None,
     }))
 }
 
@@ -3145,6 +3299,34 @@ impl MemberAdmissionBacklogGauge {
     }
 }
 
+/// The acknowledgement stage a [`WorkDeliveryReceipt`] proves, and nothing
+/// more. No stage claims durable runtime-input acceptance: that needs a
+/// committed store witness (see
+/// [`crate::ScopedWorkState::InFlight::durable_witness`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WorkAdmissionStage {
+    /// The member's work lane accepted the delivery at ingress. For an
+    /// autonomous member this can precede the runtime input itself.
+    IngressAccepted,
+    /// The member runtime admitted the exact input.
+    RuntimeInputAccepted,
+    /// The member's turn for this work completed before the receipt was
+    /// returned.
+    TurnCompleted,
+}
+
+impl WorkAdmissionStage {
+    fn from_ack(ack_mode: crate::mob_machine::SubmitWorkAckMode) -> Self {
+        match ack_mode {
+            crate::mob_machine::SubmitWorkAckMode::IngressAccepted => Self::IngressAccepted,
+            crate::mob_machine::SubmitWorkAckMode::ExactInputAccepted => Self::RuntimeInputAccepted,
+            crate::mob_machine::SubmitWorkAckMode::TurnCompleted => Self::TurnCompleted,
+        }
+    }
+}
+
 /// Receipt confirming that a unit of work was accepted by the work lane.
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
@@ -3154,6 +3336,12 @@ pub struct WorkDeliveryReceipt {
     /// Binding-era atom: bridge-internal, `pub(crate)` + `#[serde(skip)]`.
     #[serde(skip)]
     pub(crate) runtime_id: AgentRuntimeId,
+    /// The acknowledgement stage this receipt proves.
+    pub stage: WorkAdmissionStage,
+    /// The member session the delivery was admitted to, when the submit was
+    /// scope-bound (generated authority validated it at admission); `None`
+    /// for an unscoped submit, whose session is not part of the receipt.
+    pub session_id: Option<SessionId>,
 }
 
 /// Completion-bearing handle for one admitted unit of internal work.
@@ -5310,6 +5498,18 @@ pub struct MobHandle {
     /// actor is the sole writer; a durable fork reads its source's overlay
     /// here to seat the child with the source's exact tool set.
     pub(super) per_spawn_external_tools: PerSpawnExternalTools,
+    /// The public-owner token (D67). Every exported clone carries it; the
+    /// actor's own clones and read-only views hold `None`
+    /// ([`MobHandle::non_owning`]), so only exported capabilities keep the mob
+    /// open for its owners.
+    pub(super) public_owner: Option<Arc<super::admission_close::MobPublicOwner>>,
+    /// Owner presence and the Closing state, shared with the actor, which
+    /// decides every close under its lock.
+    pub(super) ownership: Arc<super::admission_close::MobOwnership>,
+    /// Read-only projection of the actor's Closing admission state; the
+    /// actor is the sole writer.
+    pub(super) admission_closed_rx:
+        tokio::sync::watch::Receiver<Option<super::admission_close::MobAdmissionCloseReason>>,
 }
 
 /// Per-member retained per-spawn tool overlays (`SpawnMemberSpec::external_tools`)
@@ -5341,6 +5541,95 @@ impl MobHandle {
     ) -> MobHandle {
         self.command_authority = authority;
         self
+    }
+
+    /// A clone that does not carry the public-owner token. The actor's own
+    /// clones (flow executor, event pumps, recovery drivers) and read-only
+    /// views use it so they never keep the mob open for its owners.
+    #[must_use]
+    pub(crate) fn non_owning(&self) -> MobHandle {
+        let mut handle = self.clone();
+        handle.public_owner = None;
+        handle
+    }
+
+    /// Give this handle the mob's root public-owner token. Called once, on
+    /// the handle a builder returns; every exported clone then carries it.
+    #[must_use]
+    pub(super) fn with_root_owner(mut self) -> MobHandle {
+        self.public_owner = Some(self.ownership.mint_root());
+        self
+    }
+
+    /// An owning handle for a foreground operation started on behalf of an
+    /// owner (repair, bootstrap, hydration), callable from any handle,
+    /// [`MobHandle::observer`] included. The lease keeps the mob owned, and
+    /// an idle close answers busy, until the returned handle and its clones
+    /// drop. It is decided under the same lock as every close: after the
+    /// close it is refused with [`MobError::AdmissionClosed`]. Ownership
+    /// grants no authority: the handle keeps this handle's command lane. Not
+    /// for timers or sweepers, which would keep a mob alive after its real
+    /// owners left.
+    pub fn acquire_owner(&self) -> Result<MobHandle, MobError> {
+        let owner = self
+            .ownership
+            .acquire_lease()
+            .map_err(|reason| MobError::AdmissionClosed {
+                mob_id: self.definition.id.clone(),
+                reason,
+            })?;
+        let mut handle = self.clone();
+        handle.public_owner = Some(owner);
+        Ok(handle)
+    }
+
+    /// A clone that does not keep the mob open for its owners: an embedder
+    /// that observes [`MobHandle::admission_closed`] and then tears the mob
+    /// down holds one. It carries no owner token; it can take a new owner
+    /// lease with [`MobHandle::acquire_owner`] only while admission is open.
+    #[must_use]
+    pub fn observer(&self) -> MobHandle {
+        self.non_owning()
+    }
+
+    /// Whether this handle carries the public-owner token.
+    #[must_use]
+    pub fn is_public_owner(&self) -> bool {
+        self.public_owner.is_some()
+    }
+
+    /// The mob's Closing admission state: `None` while admission is open,
+    /// then the reason it closed. It never reopens for this actor.
+    #[must_use]
+    pub fn admission_closed(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<super::admission_close::MobAdmissionCloseReason>> {
+        self.admission_closed_rx.clone()
+    }
+
+    /// Close admission if the mob is idle (D67). The actor decides on its
+    /// serialized admission path, in the same step that closes: a command it
+    /// admitted earlier makes the mob busy, and a mutating command it
+    /// receives later is refused with [`MobError::AdmissionClosed`]. A busy
+    /// mob is left untouched. Closing does not stop or tear down anything;
+    /// use Stop, Shutdown or Destroy afterwards.
+    pub async fn close_if_idle(
+        &self,
+    ) -> Result<super::admission_close::CloseIfIdleOutcome, MobError> {
+        self.send_actor_command(|reply_tx| MobCommand::CloseIfIdle { reply_tx })
+            .await?
+    }
+
+    /// Close admission unconditionally, into the same Closing state as
+    /// [`MobHandle::close_if_idle`]. Admitted work continues; the answer is
+    /// what was still in flight (`None` when the mob was idle). Idempotent:
+    /// the first reason is kept.
+    pub async fn close_admission(
+        &self,
+        reason: super::admission_close::MobAdmissionCloseReason,
+    ) -> Result<Option<super::admission_close::MobBusy>, MobError> {
+        self.send_actor_command(|reply_tx| MobCommand::CloseAdmission { reason, reply_tx })
+            .await?
     }
 
     /// Lane introspection for pins/audit (T-LS4).
@@ -7284,6 +7573,7 @@ impl MobHandle {
                         spawn_source,
                         owner_bridge_session_id,
                         ops_registry,
+                        held: None,
                         reply_tx,
                     })
                     .await??;
@@ -7602,7 +7892,7 @@ impl MobHandle {
                 // external field; the set is the machine's placement facts.
                 authority.external_members = external_members;
                 Ok(MobMachineCommandResult::MobEventRouter(
-                    super::event_router::spawn_event_router(self.clone(), authority).await,
+                    super::event_router::spawn_event_router(self.non_owning(), authority).await,
                 ))
             }
             MobMachineCommand::PollEvents {
@@ -7803,6 +8093,13 @@ impl MobHandle {
     /// has registered cancels the hold its registration would apply. A member
     /// that does not hold `reason` is an Ok no-op; a non-member is
     /// [`MobError::MemberNotFound`].
+    ///
+    /// Known limit: this release is a send-class command, so a mob whose
+    /// admission is closed refuses it with [`MobError::AdmissionClosed`]. A
+    /// member still held when admission closes (for example by an
+    /// unconditional `close_admission`) stays held until the mob is shut down
+    /// or destroyed (a Stop keeps the hold and a Resume is refused); do not
+    /// rely on releasing it after the close.
     pub async fn release_member_run_starts(
         &self,
         agent_identity: &AgentIdentity,
@@ -8051,7 +8348,7 @@ impl MobHandle {
                 .collect()
         };
         // Project under the watch borrow instead of cloning the whole
-        // MobMachineState: interval observers (mobkit's stream reconcilers,
+        // MobMachineState: interval observers (meta's stream reconcilers,
         // taint observer, console polling) call this at sub-second cadence,
         // and on restore-scale mobs the full-state clone dominated idle CPU.
         // Watch-borrow discipline: the guard stays inside this sync block and
@@ -9981,6 +10278,171 @@ impl MobHandle {
             .and_then(|entry| entry.member_ref.bridge_session_id().cloned())
     }
 
+    /// Submit one already-bound governed input to a member's current
+    /// session through its native admission.
+    ///
+    /// `input` must already carry its authority association and trusted
+    /// ingress observation (for example from
+    /// `meerkat_runtime::meerkat_machine::bind_scoped_original`). The mob
+    /// forwards it exactly as bound: it never mints, alters or drops the
+    /// association or its contributors, and never retargets it. It is
+    /// ordinary external work to the mob: the same MobMachine SubmitWork
+    /// admission and ingress effect, and the same bounded per-member
+    /// admission lane, ordering and settlement; only the realization admits
+    /// the bound input instead of building a turn. Like other tracked
+    /// deliveries, this returns once native admission answers; a native
+    /// refusal is returned unchanged as [`MobError::MemberInputRefused`].
+    /// Only local session-backed members accept governed input.
+    #[cfg(feature = "runtime-adapter")]
+    pub async fn start_governed_input(
+        &self,
+        identity: &AgentIdentity,
+        input: meerkat_runtime::Input,
+    ) -> Result<MemberTurnHandle, MobError> {
+        self.start_governed_input_inner(identity, input, None, WorkOrigin::External)
+            .await
+    }
+
+    /// [`Self::start_governed_input`], carrying the host's custody of the
+    /// input's reserved resources to the member session's native admission,
+    /// which settles it exactly once (see [`GovernedInputCustody`]).
+    ///
+    /// The custody is guarded before the future is returned, so dropping the
+    /// future before it is first polled still settles it `NotAdmitted`.
+    #[cfg(feature = "runtime-adapter")]
+    pub fn start_governed_input_with_custody<'a>(
+        &'a self,
+        identity: &'a AgentIdentity,
+        input: meerkat_runtime::Input,
+        custody: Box<dyn meerkat_runtime::input_admission_custody::NativeInputAdmissionCustody>,
+    ) -> impl std::future::Future<Output = Result<MemberTurnHandle, MobError>> + Send + 'a {
+        // Construct before returning: even a never-polled future owns it.
+        let custody = GovernedInputCustody::new(custody);
+        self.start_governed_input_inner(identity, input, Some(custody), WorkOrigin::External)
+    }
+
+    /// [`Self::start_governed_input_with_custody`] as internal work, for the
+    /// trusted host composition only: the host delivering its own retained,
+    /// already-bound input to a member it composed, whether or not that
+    /// member's profile admits external work.
+    ///
+    /// Everything else is the same: the bound input is forwarded exactly as
+    /// bound, through the member's current runtime and fence, the MobMachine
+    /// SubmitWork admission, the member admission lane and its ordering, and
+    /// the member session's native admission, which settles the custody
+    /// exactly once. Only the SubmitWork origin is `Internal`, so external
+    /// addressability is not required. A member the machine cannot admit
+    /// internal work for (for example one without a session binding) is
+    /// still refused. External and wire-facing callers never use this: they
+    /// use [`Self::start_governed_input_with_custody`], which stays external
+    /// work and refuses a member that is not externally addressable with
+    /// [`MobError::NotExternallyAddressable`].
+    ///
+    /// The custody is guarded before the future is returned, so dropping the
+    /// future before it is first polled still settles it `NotAdmitted`.
+    #[cfg(feature = "runtime-adapter")]
+    pub fn start_internal_governed_input_with_custody<'a>(
+        &'a self,
+        identity: &'a AgentIdentity,
+        input: meerkat_runtime::Input,
+        custody: Box<dyn meerkat_runtime::input_admission_custody::NativeInputAdmissionCustody>,
+    ) -> impl std::future::Future<Output = Result<MemberTurnHandle, MobError>> + Send + 'a {
+        // Construct before returning: even a never-polled future owns it.
+        let custody = GovernedInputCustody::new(custody);
+        self.start_governed_input_inner(identity, input, Some(custody), WorkOrigin::Internal)
+    }
+
+    #[cfg(feature = "runtime-adapter")]
+    async fn start_governed_input_inner(
+        &self,
+        identity: &AgentIdentity,
+        input: meerkat_runtime::Input,
+        custody: Option<GovernedInputCustody>,
+        origin: WorkOrigin,
+    ) -> Result<MemberTurnHandle, MobError> {
+        let header = input.header();
+        if header.authority_association.is_none() || header.ingress_context.is_none() {
+            return Err(MobError::GovernedInputUnbound {
+                member_id: identity.clone(),
+            });
+        }
+        let handling_mode = input.handling_mode().unwrap_or(HandlingMode::Queue);
+        let domain_identity = AgentIdentity::from(identity.as_str());
+        let machine_state = self.machine_state_watch_rx.borrow().clone();
+        let Some((runtime_id, fence_token)) = machine_state
+            .member_runtime_material_for_identity(&mob_dsl::AgentIdentity::from_domain(
+                &domain_identity,
+            ))
+            .map(|material| material.to_domain_for_identity(&domain_identity))
+        else {
+            let context = match origin {
+                WorkOrigin::External => "start_governed_input",
+                WorkOrigin::Internal => "start_internal_governed_input",
+            };
+            return Err(self
+                .resolve_submit_work_missing_runtime_rejection(identity, origin, context)
+                .await);
+        };
+        let session_id =
+            Self::machine_bridge_session_id_for_identity(&domain_identity, &machine_state)
+                .ok_or_else(|| MobError::UnsupportedForMode {
+                    mode: crate::MobRuntimeMode::TurnDriven,
+                    reason: "governed input requires a local session-backed member".to_string(),
+                })?;
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let (admission_tx, admission_rx) = tokio::sync::oneshot::channel();
+        // The same SubmitWork admission, member lane and settlement as any
+        // work of this origin; only the realization carries the bound input.
+        let payload = Box::new(super::state::SubmitWorkPayload {
+            runtime_id: runtime_id.clone(),
+            fence_token,
+            work_ref: WorkRef::new(),
+            content: meerkat_core::types::ContentInput::Text(String::new()),
+            origin,
+            system_prompt: None,
+            injected_context: Vec::new(),
+            interaction_id: None,
+            objective_id: None,
+            handling_mode,
+            external_delivery_identity: None,
+            turn_metadata: None,
+            event_tx: None,
+            completion_tx: Some(completion_tx),
+            bounded_result_spec: None,
+            llm_identity_applied_tx: None,
+            ack_mode: crate::mob_machine::SubmitWorkAckMode::IngressAccepted,
+            content_attribution: crate::mob_machine::WorkContentAttribution::Conversational,
+            // Governed input is bound to the session read above: the
+            // admission refuses it if the member's binding moved since.
+            expected_session_id: Some(session_id.clone()),
+            governed_input: Some(Box::new(super::state::GovernedInputDelivery {
+                input,
+                admission_tx,
+                custody,
+            })),
+        });
+        self.send_actor_command(|reply_tx| MobCommand::SubmitWork { payload, reply_tx })
+            .await??;
+        // The member lane forwards the native admission before it answers.
+        let admission = admission_rx.await.map_err(|_| {
+            MobError::Internal(
+                "governed input was admitted without its canonical admission".to_string(),
+            )
+        })?;
+        Ok(MemberTurnHandle {
+            receipt: MemberDeliveryReceipt {
+                identity: identity.clone(),
+                agent_runtime_id: runtime_id,
+                fence_token,
+                handling_mode,
+            },
+            session_id: Some(session_id),
+            completion_rx,
+            llm_identity_applied_rx: None,
+            admission: Some(admission),
+        })
+    }
+
     /// Acquire a capability-bearing handle for a specific member.
     pub async fn member(&self, identity: &AgentIdentity) -> Result<MemberHandle, MobError> {
         if let Some(diag) = self.restore_failure_for(identity).await {
@@ -9998,7 +10460,7 @@ impl MobHandle {
     /// Access a read-only events view for polling, replay, and subscription.
     pub fn events(&self) -> MobEventsView {
         MobEventsView {
-            handle: self.clone(),
+            handle: self.non_owning(),
         }
     }
 
@@ -10821,6 +11283,154 @@ impl MobHandle {
             agent_runtime_id: entry.agent_runtime_id,
             fence_token: entry.fence_token,
         })
+    }
+
+    #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+    /// Spawn a member up to its producer hold point within the caller's
+    /// setup deadline, which bounds this whole call.
+    ///
+    /// Returns [`HeldSpawnStart::Held`] once a held member is delivered
+    /// before the deadline: its construction is finished, but it is not
+    /// published. Read [`HeldSpawn::finished_surface`], then
+    /// [`HeldSpawn::activate`] or [`HeldSpawn::abort`] it. `setup_deadline`
+    /// is the caller's one native deadline for its whole setup pass: a member
+    /// neither activated nor aborted by then is aborted and fails with
+    /// [`MobError::HeldSpawnExpired`].
+    ///
+    /// Nothing in this call waits past the deadline, checked first: command
+    /// admission, the wait for the held member's delivery, and the wait for a
+    /// spawn that ended before its hold point. A deadline that passes before
+    /// the command is admitted fails with [`MobError::HeldSpawnExpired`]
+    /// without `cleanup`: the command was never delivered, so nothing exists
+    /// to settle. After admission the mob's spawn task owns the setup. A
+    /// deadline that is ready before a held member is delivered returns
+    /// [`HeldSpawnStart::Unsettled`] at once, also when the member already
+    /// reached its hold point and both are ready together; its construction
+    /// may have started and have effects. The spawn task stops the setup at
+    /// its next bound check (a step in flight is never interrupted), lets an
+    /// undelivered hold expire, and settles it;
+    /// [`HeldSpawnSettlement::settled`] awaits that settlement. A spawn that
+    /// fails before its hold point within the deadline returns its typed
+    /// failure.
+    ///
+    /// Dropping this future, or the [`HeldSpawn`] it returns before an
+    /// activation is accepted, is the caller's loss: the spawn task observes
+    /// it at its next check and aborts the setup, awaiting the abort. After
+    /// an accepted activation the caller's loss aborts nothing.
+    ///
+    /// Only a fresh locally provisioned member can be held; placed, resumed
+    /// and identity-reconciled members refuse with
+    /// [`MobError::HeldSpawnUnsupported`], and a provisioner that cannot hold
+    /// the member refuses with [`MobError::HeldProvisionUnsupported`].
+    pub async fn spawn_held_until(
+        &self,
+        mut spec: SpawnMemberSpec,
+        setup_deadline: super::held_spawn::HeldSpawnDeadline,
+    ) -> Result<HeldSpawnStart, MobError> {
+        if matches!(
+            self.command_authority_kind(),
+            crate::control_policy::CommandAuthorityKind::AgentLane
+        ) {
+            spec.mark_agent_creation();
+        }
+        let identity = spec.identity.to_string();
+        let spawn_source = SpawnSource::for_launch_mode(SpawnSource::Consumer, &spec.launch_mode);
+        let (caller, bound) = super::held_spawn::HeldProvisionBound::new(&identity, setup_deadline);
+        let (ready_tx, mut ready_rx) = oneshot::channel();
+        let (reply_tx, mut completion_rx) = oneshot::channel();
+        let command = super::scope_gate::RoutedMobCommand {
+            authority: self.command_authority.clone(),
+            cmd: MobCommand::Spawn {
+                spec: Box::new(spec),
+                spawn_source,
+                owner_bridge_session_id: None,
+                ops_registry: None,
+                held: Some(super::held_spawn::HeldSpawnRequest { ready_tx, bound }),
+                reply_tx,
+            },
+        };
+        // Admission, deadline first (by the clock, so a tie with a timer that
+        // has not fired yet still goes to the deadline). A send given up at
+        // the deadline never delivered its command (an mpsc send is
+        // cancel-safe): nothing was admitted, so nothing exists to settle.
+        tokio::select! {
+            biased;
+            () = super::held_spawn::deadline_reached(setup_deadline) => {
+                return Err(MobError::HeldSpawnExpired {
+                    member: identity,
+                    cleanup: None,
+                });
+            }
+            sent = self.command_tx.send(command) => {
+                sent.map_err(|_| MobError::ActorCommandChannelClosed)?;
+            }
+        }
+        // The mob's spawn task owns the setup from here.
+        let ready = tokio::select! {
+            biased;
+            () = super::held_spawn::deadline_reached(setup_deadline) => None,
+            ready = &mut ready_rx => Some(ready),
+        };
+        match ready {
+            Some(Ok(ready)) => Ok(HeldSpawnStart::Held(HeldSpawn::new(
+                self.clone(),
+                identity,
+                ready,
+                completion_rx,
+                caller,
+            ))),
+            None => Ok(HeldSpawnStart::Unsettled(HeldSpawnSettlement::new(
+                identity,
+                completion_rx,
+            ))),
+            // The spawn ended before its hold point: its completion carries
+            // the typed failure, awaited within the same deadline.
+            Some(Err(_)) => {
+                let completion = tokio::select! {
+                    biased;
+                    () = super::held_spawn::deadline_reached(setup_deadline) => None,
+                    completion = &mut completion_rx => Some(completion),
+                };
+                match completion {
+                    Some(completion) => Err(HeldSpawnSettlement::failure_of(&identity, completion)),
+                    None => Ok(HeldSpawnStart::Unsettled(HeldSpawnSettlement::new(
+                        identity,
+                        completion_rx,
+                    ))),
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+    /// [`Self::spawn_held_until`], returning the held member or the typed
+    /// failure. Unlike it, this call is not bounded by the deadline: when the
+    /// deadline is ready before a held member is delivered, it then waits,
+    /// unbounded, for the spawn task to settle the setup (as
+    /// [`HeldSpawnSettlement::settled`] does). A clean settlement is returned
+    /// as [`MobError::HeldSpawnExpired`] without `cleanup`; an actual
+    /// settlement error (an unconfirmed cleanup, the construction's own
+    /// failure) is returned as it is.
+    pub async fn spawn_held_within(
+        &self,
+        spec: SpawnMemberSpec,
+        setup_deadline: super::held_spawn::HeldSpawnDeadline,
+    ) -> Result<HeldSpawn, MobError> {
+        match self.spawn_held_until(spec, setup_deadline).await? {
+            HeldSpawnStart::Held(held) => Ok(held),
+            HeldSpawnStart::Unsettled(settlement) => {
+                let member = settlement.member().to_string();
+                Err(match settlement.settled().await {
+                    // The deadline came first, so a clean settlement is
+                    // that setup's expiry.
+                    Ok(()) => MobError::HeldSpawnExpired {
+                        member,
+                        cleanup: None,
+                    },
+                    Err(error) => error,
+                })
+            }
+        }
     }
 
     /// Spawn a member while binding child operations to a machine-minted owner context.
@@ -12176,6 +12786,7 @@ impl MobHandle {
             llm_identity_applied_tx: observers.llm_identity_applied_tx,
             ack_mode: crate::mob_machine::SubmitWorkAckMode::IngressAccepted,
             content_attribution: crate::mob_machine::WorkContentAttribution::Conversational,
+            expected_session_id: None,
         });
         self.execute_machine_command(MobMachineCommand::SubmitWork(cmd))
             .await?;
@@ -12208,6 +12819,7 @@ impl MobHandle {
             llm_identity_applied_tx: None,
             ack_mode: crate::mob_machine::SubmitWorkAckMode::TurnCompleted,
             content_attribution: crate::mob_machine::WorkContentAttribution::Conversational,
+            expected_session_id: None,
         });
         self.execute_machine_command(MobMachineCommand::SubmitWork(cmd))
             .await?;
@@ -12243,6 +12855,7 @@ impl MobHandle {
                 agent_identity: mob_dsl::AgentIdentity::from_domain(&domain_identity),
                 agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&declared_runtime_id),
                 fence_token: mob_dsl::FenceToken::from_domain(declared_fence_token),
+                expected_session_id: None,
                 origin: mob_dsl::WorkOrigin::from(origin),
             })
             .await
@@ -12280,6 +12893,13 @@ impl MobHandle {
                 expected: declared_fence_token,
                 actual: declared_fence_token,
             },
+            // No expected session was named on this resolution, so the
+            // generated authority cannot classify it as a stale session.
+            mob_dsl::SubmitWorkRejectReasonKind::StaleSessionBinding => {
+                MobError::Internal(format!(
+                    "{context} resolved a stale session binding for '{agent_identity}' without an expected session"
+                ))
+            }
             mob_dsl::SubmitWorkRejectReasonKind::MobNotRunning => MobError::InvalidTransition {
                 // Error rendering only: the machine already rejected; the
                 // watch observation avoids a principal-gated QueryPhase
@@ -12288,6 +12908,73 @@ impl MobHandle {
                 to: MobState::Running,
             },
         }
+    }
+
+    /// The mob machine's own answer to work for a retiring member, read
+    /// through the generated SubmitWork rejection with the work's exact
+    /// runtime binding, fence and origin: the typed rejection its SubmitWork
+    /// admission gives a retiring member (`MemberNotFound`), or the stale
+    /// fence or stopped mob it finds instead. `None` when the machine records
+    /// no rejection for that work.
+    async fn retiring_member_submit_work_rejection(
+        &self,
+        runtime_id: &AgentRuntimeId,
+        fence_token: FenceToken,
+        origin: WorkOrigin,
+    ) -> Result<Option<MobError>, MobError> {
+        let dsl_runtime_id = mob_dsl::AgentRuntimeId::from_domain(runtime_id);
+        let dsl_origin = mob_dsl::WorkOrigin::from(origin);
+        let effects = self
+            .apply_machine_input_effects(mob_dsl::MobMachineInput::ResolveSubmitWorkRejection {
+                agent_identity: mob_dsl::AgentIdentity::from_domain(&runtime_id.identity),
+                agent_runtime_id: dsl_runtime_id.clone(),
+                fence_token: mob_dsl::FenceToken::from_domain(fence_token),
+                expected_session_id: None,
+                origin: dsl_origin,
+            })
+            .await?;
+        Ok(effects.into_iter().find_map(|effect| match effect {
+            mob_dsl::MobMachineEffect::SubmitWorkRejected {
+                agent_runtime_id,
+                origin: effect_origin,
+                reason,
+                expected_fence_token,
+                actual_fence_token,
+            } if agent_runtime_id == dsl_runtime_id && effect_origin == dsl_origin => {
+                Some(match reason {
+                    mob_dsl::SubmitWorkRejectReasonKind::MemberNotFound => {
+                        MobError::MemberNotFound(runtime_id.identity.clone())
+                    }
+                    mob_dsl::SubmitWorkRejectReasonKind::NotExternallyAddressable => {
+                        MobError::NotExternallyAddressable(runtime_id.identity.clone())
+                    }
+                    mob_dsl::SubmitWorkRejectReasonKind::StaleFenceToken => {
+                        match (expected_fence_token, actual_fence_token) {
+                            (Some(expected), Some(actual)) => MobError::StaleFenceToken {
+                                runtime_id: runtime_id.clone(),
+                                expected: FenceToken::new(expected.0),
+                                actual: FenceToken::new(actual.0),
+                            },
+                            _ => MobError::Internal(
+                                "MobMachine rejected SubmitWork as stale without fence-token feedback"
+                                    .into(),
+                            ),
+                        }
+                    }
+                    mob_dsl::SubmitWorkRejectReasonKind::StaleSessionBinding => MobError::Internal(
+                        "MobMachine resolved a stale session binding for a retiring member without an expected session"
+                            .into(),
+                    ),
+                    mob_dsl::SubmitWorkRejectReasonKind::MobNotRunning => {
+                        MobError::InvalidTransition {
+                            from: self.status_observation_snapshot(),
+                            to: MobState::Running,
+                        }
+                    }
+                })
+            }
+            _ => None,
+        }))
     }
 
     // -----------------------------------------------------------------
@@ -12777,16 +13464,32 @@ impl MobHandle {
         ack_mode: crate::mob_machine::SubmitWorkAckMode,
         content_attribution: crate::mob_machine::WorkContentAttribution,
     ) -> Result<WorkTurnHandle, MobError> {
-        let admitted_session_id = {
+        let (admitted_session_id, retiring) = {
             let machine_state = self.machine_state_watch_rx.borrow();
-            Self::machine_bridge_session_id_for_identity(&runtime_id.identity, &machine_state)
-        }
-        .ok_or_else(|| {
-            MobError::Internal(format!(
+            (
+                Self::machine_bridge_session_id_for_identity(&runtime_id.identity, &machine_state),
+                Self::member_lifecycle_from_machine_state(&runtime_id.identity, &machine_state)
+                    .status
+                    == mob_dsl::MobMemberLifecycleStatus::Retiring,
+            )
+        };
+        let Some(admitted_session_id) = admitted_session_id else {
+            // A retirement releases the member's session binding while the
+            // member is still Retiring. Its work gets the machine's own typed
+            // SubmitWork rejection, as with the binding still in place. Any
+            // other member without a binding is an invariant failure.
+            if retiring
+                && let Some(refusal) = self
+                    .retiring_member_submit_work_rejection(&runtime_id, fence_token, spec.origin)
+                    .await?
+            {
+                return Err(refusal);
+            }
+            return Err(MobError::Internal(format!(
                 "tracked work admission for '{}' has no machine-owned session binding",
                 runtime_id.identity
-            ))
-        })?;
+            )));
+        };
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let cmd = Box::new(crate::mob_machine::SubmitWorkCommand {
             runtime_id: runtime_id.clone(),
@@ -12802,6 +13505,7 @@ impl MobHandle {
             llm_identity_applied_tx: None,
             ack_mode,
             content_attribution,
+            expected_session_id: None,
         });
         match self
             .execute_machine_command(MobMachineCommand::SubmitWork(cmd))
@@ -12813,6 +13517,8 @@ impl MobHandle {
                 receipt: WorkDeliveryReceipt {
                     work_ref: admitted_ref,
                     runtime_id,
+                    stage: WorkAdmissionStage::from_ack(ack_mode),
+                    session_id: None,
                 },
                 session_id: admitted_session_id,
                 completion_rx,
@@ -12851,6 +13557,7 @@ impl MobHandle {
             llm_identity_applied_tx: None,
             ack_mode: crate::mob_machine::SubmitWorkAckMode::IngressAccepted,
             content_attribution: crate::mob_machine::WorkContentAttribution::Conversational,
+            expected_session_id: None,
         });
         match self
             .execute_machine_command(MobMachineCommand::SubmitWork(cmd))
@@ -12859,6 +13566,8 @@ impl MobHandle {
             MobMachineCommandResult::WorkReceipt { work_ref: ref_out } => Ok(WorkDeliveryReceipt {
                 work_ref: ref_out,
                 runtime_id,
+                stage: WorkAdmissionStage::IngressAccepted,
+                session_id: None,
             }),
             _ => Err(MobError::Internal(
                 "unexpected command result variant".into(),
@@ -12899,6 +13608,7 @@ impl MobHandle {
             llm_identity_applied_tx: None,
             ack_mode: crate::mob_machine::SubmitWorkAckMode::IngressAccepted,
             content_attribution: crate::mob_machine::WorkContentAttribution::Conversational,
+            expected_session_id: None,
         });
         match self
             .execute_machine_command(MobMachineCommand::SubmitWork(cmd))
@@ -12907,6 +13617,8 @@ impl MobHandle {
             MobMachineCommandResult::WorkReceipt { work_ref: ref_out } => Ok(WorkDeliveryReceipt {
                 work_ref: ref_out,
                 runtime_id,
+                stage: WorkAdmissionStage::IngressAccepted,
+                session_id: None,
             }),
             _ => Err(MobError::Internal(
                 "unexpected command result variant".into(),
@@ -12951,31 +13663,47 @@ impl MobHandle {
             llm_identity_applied_tx: None,
             ack_mode: crate::mob_machine::SubmitWorkAckMode::IngressAccepted,
             content_attribution: crate::mob_machine::WorkContentAttribution::Conversational,
+            expected_session_id: None,
         });
         self.submit_work_command_bounded(cmd, deadline).await
     }
 
-    /// [`Self::submit_work_with_mode_and_delivery_identity`] with a caller
-    /// deadline; see [`Self::submit_work_with_mode_bounded`].
+    /// Submit one delivery to the exact member session a host captured with
+    /// [`Self::capture_member_delivery_scope`] and persisted beforehand, with
+    /// a caller deadline (see [`Self::submit_work_with_mode_bounded`] for the
+    /// deadline contract).
+    ///
+    /// The scope's runtime id, fence and session are validated by generated
+    /// SubmitWork authority inside the actor's admission, atomically with the
+    /// admission itself. A moved session binding is refused as
+    /// [`MobError::StaleDeliveryScope`], a stale incarnation as
+    /// [`MobError::StaleFenceToken`]; the delivery is never repaired,
+    /// retargeted to today's session, or resubmitted. The work reference is
+    /// derived from the delivery's stable idempotency key.
+    ///
+    /// The receipt proves [`WorkAdmissionStage::IngressAccepted`] and names
+    /// the admitted session; it is not a durable runtime-input claim. Recover
+    /// a lost reply with [`Self::recover_bounded_work_at_scope`] and the same
+    /// scope.
     pub async fn submit_work_with_mode_and_delivery_identity_bounded(
         &self,
-        runtime_id: AgentRuntimeId,
-        fence_token: FenceToken,
+        scope: &super::MemberDeliveryScope,
         spec: WorkSpec,
         handling_mode: HandlingMode,
         delivery_identity: crate::store::MobDeliveryIdentity,
         deadline: Instant,
     ) -> Result<WorkDeliveryReceipt, MobError> {
         delivery_identity.validate()?;
+        let runtime_id = scope.runtime_id().clone();
         let work_ref = WorkRef::for_delivery(
             &self.definition.id,
             &runtime_id.identity,
             &delivery_identity.idempotency_key,
         );
         let cmd = Box::new(crate::mob_machine::SubmitWorkCommand {
-            runtime_id: runtime_id.clone(),
-            fence_token,
-            work_ref: work_ref.clone(),
+            runtime_id,
+            fence_token: scope.fence_token(),
+            work_ref,
             spec,
             handling_mode,
             external_delivery_identity: Some(delivery_identity),
@@ -12986,6 +13714,7 @@ impl MobHandle {
             llm_identity_applied_tx: None,
             ack_mode: crate::mob_machine::SubmitWorkAckMode::IngressAccepted,
             content_attribution: crate::mob_machine::WorkContentAttribution::Conversational,
+            expected_session_id: Some(scope.session_id().clone()),
         });
         self.submit_work_command_bounded(cmd, deadline).await
     }
@@ -13219,6 +13948,7 @@ impl MobHandle {
             llm_identity_applied_tx: None,
             ack_mode: crate::mob_machine::SubmitWorkAckMode::IngressAccepted,
             content_attribution: crate::mob_machine::WorkContentAttribution::HostHuman,
+            expected_session_id: None,
         }))
     }
 
@@ -13229,6 +13959,10 @@ impl MobHandle {
     ) -> Result<WorkDeliveryReceipt, MobError> {
         let runtime_id = cmd.runtime_id.clone();
         let work_ref = cmd.work_ref.clone();
+        let stage = WorkAdmissionStage::from_ack(cmd.ack_mode);
+        // Generated SubmitWork authority admitted this exact session when one
+        // was named (it refuses a moved binding as StaleSessionBinding).
+        let session_id = cmd.expected_session_id.clone();
         let payload = submit_work_payload(cmd)?;
         self.send_actor_command_until(deadline, |reply_tx| MobCommand::SubmitWork {
             payload,
@@ -13238,6 +13972,8 @@ impl MobHandle {
         Ok(WorkDeliveryReceipt {
             work_ref,
             runtime_id,
+            stage,
+            session_id,
         })
     }
 
@@ -13543,6 +14279,14 @@ impl MobHandle {
         }
     }
 
+    /// Observe how this mob's actor task ends: after a destroy the actor
+    /// replies first and drops its stores afterwards.
+    pub fn actor_task_watch(&self) -> MobActorTaskWatch {
+        MobActorTaskWatch {
+            rx: self.lifecycle_observations.subscribe_actor_task(),
+        }
+    }
+
     #[cfg(test)]
     pub async fn debug_flow_tracker_counts(&self) -> Result<(usize, usize), MobError> {
         match self
@@ -13794,6 +14538,49 @@ impl MobHandle {
             "member status read test gate already armed for this identity"
         );
         (entered_rx, release_tx)
+    }
+
+    /// Hold the next member turn admission of `identity` at `stage`. The
+    /// first receiver resolves when an admission reaches the gate; sending on
+    /// (or dropping) the returned sender lets it go on. Test builds only.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn arm_member_turn_admission_test_gate(
+        identity: AgentIdentity,
+        stage: MemberTurnAdmissionTestStage,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let replaced = MEMBER_TURN_ADMISSION_TEST_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((identity, stage), (entered_tx, release_rx));
+        assert!(
+            replaced.is_none(),
+            "member turn admission test gate already armed for this identity and stage"
+        );
+        (entered_rx, release_tx)
+    }
+
+    /// Move `identity`'s session binding to `session_id` under its current
+    /// runtime id, through the generated `RecoverMemberSessionBinding`
+    /// signal. Test builds only.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub async fn rebind_member_session_for_test(
+        &self,
+        identity: &AgentIdentity,
+        session_id: SessionId,
+    ) -> Result<(), MobError> {
+        self.send_actor_command(|reply_tx| MobCommand::RebindMemberSessionForTest {
+            agent_identity: identity.clone(),
+            session_id,
+            reply_tx,
+        })
+        .await?
     }
 
     /// Test witness that crash-stop acknowledgement followed actor teardown.
@@ -17395,6 +18182,7 @@ impl MemberHandle {
             session_id: Some(session_id),
             completion_rx,
             llm_identity_applied_rx: Some(llm_identity_applied_rx),
+            admission: None,
         })
     }
 
@@ -17444,6 +18232,7 @@ impl MemberHandle {
             session_id: Some(session_id),
             completion_rx,
             llm_identity_applied_rx: Some(llm_identity_applied_rx),
+            admission: None,
         })
     }
 
@@ -17478,6 +18267,45 @@ impl MemberHandle {
             fence_token,
             handling_mode,
         })
+    }
+
+    /// Submit an already-bound governed input to this member. See
+    /// [`MobHandle::start_governed_input`].
+    #[cfg(feature = "runtime-adapter")]
+    pub async fn start_governed_input(
+        &self,
+        input: meerkat_runtime::Input,
+    ) -> Result<MemberTurnHandle, MobError> {
+        self.mob
+            .start_governed_input(&self.agent_identity, input)
+            .await
+    }
+
+    /// [`MobHandle::start_governed_input_with_custody`] for this member. It
+    /// delegates synchronously, so the custody is guarded before the future
+    /// is returned.
+    #[cfg(feature = "runtime-adapter")]
+    pub fn start_governed_input_with_custody(
+        &self,
+        input: meerkat_runtime::Input,
+        custody: Box<dyn meerkat_runtime::input_admission_custody::NativeInputAdmissionCustody>,
+    ) -> impl std::future::Future<Output = Result<MemberTurnHandle, MobError>> + Send + '_ {
+        self.mob
+            .start_governed_input_with_custody(&self.agent_identity, input, custody)
+    }
+
+    /// [`MobHandle::start_internal_governed_input_with_custody`] for this
+    /// member: internal governed work, for the trusted host composition only.
+    /// It delegates synchronously, so the custody is guarded before the
+    /// future is returned.
+    #[cfg(feature = "runtime-adapter")]
+    pub fn start_internal_governed_input_with_custody(
+        &self,
+        input: meerkat_runtime::Input,
+        custody: Box<dyn meerkat_runtime::input_admission_custody::NativeInputAdmissionCustody>,
+    ) -> impl std::future::Future<Output = Result<MemberTurnHandle, MobError>> + Send + '_ {
+        self.mob
+            .start_internal_governed_input_with_custody(&self.agent_identity, input, custody)
     }
 
     /// Send typed peer communication from this member to another mob member.
@@ -18479,6 +19307,7 @@ mod tests {
                 session_id: Some(session_id),
                 completion_rx,
                 llm_identity_applied_rx: None,
+                admission: None,
             },
         )
     }
@@ -18812,6 +19641,8 @@ mod tests {
         let receipt = WorkDeliveryReceipt {
             work_ref: WorkRef::new(),
             runtime_id: AgentRuntimeId::new(identity, Generation::new(8)),
+            stage: WorkAdmissionStage::TurnCompleted,
+            session_id: None,
         };
         let expected_work_ref = receipt.work_ref.clone();
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
@@ -19122,6 +19953,42 @@ type MemberStatusReadTestGate = (
 static MEMBER_STATUS_READ_TEST_GATE: std::sync::Mutex<
     std::collections::BTreeMap<AgentIdentity, MemberStatusReadTestGate>,
 > = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Where a test holds one member turn admission (see
+/// [`MobHandle::arm_member_turn_admission_test_gate`]).
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MemberTurnAdmissionTestStage {
+    /// After MobMachine admitted the SubmitWork and the member lane finished
+    /// readiness, before the runtime input is admitted.
+    BeforeRuntimeAdmission,
+    /// After the runtime admitted the input, before the admission reply.
+    AfterRuntimeAdmission,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+static MEMBER_TURN_ADMISSION_TEST_GATE: std::sync::Mutex<
+    std::collections::BTreeMap<
+        (AgentIdentity, MemberTurnAdmissionTestStage),
+        MemberStatusReadTestGate,
+    >,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(any(test, feature = "test-support"))]
+pub(super) async fn run_member_turn_admission_test_gate(
+    identity: &AgentIdentity,
+    stage: MemberTurnAdmissionTestStage,
+) {
+    let armed = MEMBER_TURN_ADMISSION_TEST_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(identity.clone(), stage));
+    if let Some((entered_tx, release_rx)) = armed {
+        let _ = entered_tx.send(());
+        let _ = release_rx.await;
+    }
+}
 
 #[cfg(any(test, feature = "test-support"))]
 async fn run_member_status_read_test_gate(identity: &AgentIdentity) {

@@ -114,6 +114,33 @@ impl PreparedOperationCheck {
         self.0.decision.policy_observation()
     }
 
+    /// The prepared owner's own coherent current check of this exact retained
+    /// decision, and nothing else: no re-preparation, no observation, no
+    /// callback. Owners hold their commit reservations only across this; a
+    /// failure is observed later through
+    /// [`Self::observe_retained_check_failure`], once every lock is released.
+    pub(crate) fn check_retained_current(&self) -> Result<(), OperationAuthorizationError> {
+        self.0.decision.check_current(&self.0.binding)
+    }
+
+    /// Observe a failure [`Self::check_retained_current`] returned, outside
+    /// every owner lock. A re-preparation request is not observed (the
+    /// retained decision is simply no longer current), as on the
+    /// [`Self::current`] path.
+    pub(crate) fn observe_retained_check_failure(
+        &self,
+        error: OperationAuthorizationError,
+    ) -> OperationAuthorizationError {
+        match error {
+            OperationAuthorizationError::Refused(refusal)
+                if refusal.kind() == OperationRefusalKind::ReprepareRequired =>
+            {
+                error
+            }
+            error => self.observe_check_failure(error),
+        }
+    }
+
     fn observe_check_failure(
         &self,
         error: OperationAuthorizationError,
@@ -131,6 +158,13 @@ impl PreparedOperationCheck {
             Ok(()) => error,
             Err(error) => error.into(),
         }
+    }
+
+    /// The exact temporal window of this decision, when its owner bounds it
+    /// (see [`super::PreparedOperationAuthorization::validity`]).
+    #[must_use]
+    pub fn validity(&self) -> Option<super::OperationValidity> {
+        self.0.decision.validity()
     }
 
     /// Owner-resolved review tier retained by this exact decision. A
@@ -222,6 +256,26 @@ impl PreparedOperationCheck {
             return Err(malformed().into());
         }
         self.current()
+    }
+
+    /// Prepare this exact retained operation again for a resumed run of its
+    /// work: the same operation (its id, call and plan by identity) under
+    /// `work`'s execution scope as `run_id`, decided afresh by that work's
+    /// own owners. This is the only cross-run association: the consent owner
+    /// uses it to move parked custody into the resumed run its committed
+    /// notice reached. A review child's operation never moves.
+    pub(crate) fn prepare_for_resumed_run(
+        &self,
+        work: WorkAuthorizationContext,
+        run_id: &crate::RunId,
+    ) -> Result<Self, OperationAuthorizationError> {
+        if self.0.binding.review_attribution().is_some() {
+            return Err(OperationRefused::new(OperationRefusalKind::MalformedFacts).into());
+        }
+        let mut facts = self.0.binding.facts().clone();
+        facts.execution_scope = work.execution_scope().clone();
+        facts.run_id = Some(run_id.clone());
+        Self::prepare(work, PreparedAuthorizationBinding::new(facts))
     }
 
     pub(crate) fn tool_dispatch_parts(

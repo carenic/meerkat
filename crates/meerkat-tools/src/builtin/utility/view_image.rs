@@ -107,7 +107,7 @@ impl BuiltinTool for ViewImageTool {
             name: self.name().into(),
             description: "Read an image file from the project and return its contents. Supports PNG, JPEG, GIF, WebP, and SVG formats up to 5 MB.".into(),
             input_schema: crate::schema::schema_for::<ViewImageArgs>(),
-            provenance: Some(ToolProvenance { kind: ToolSourceKind::Builtin, source_id: "builtin".into() }),
+            provenance: Some(ToolProvenance { kind: ToolSourceKind::Builtin, source_id: "builtin".into(), artifact: None }),
         }
     }
 

@@ -239,6 +239,7 @@ impl BundleProvenanceDispatcher {
             provenance: ToolProvenance {
                 kind: ToolSourceKind::RustBundle,
                 source_id: meerkat_core::types::ToolSourceId::new(bundle),
+                artifact: None,
             },
         }
     }
@@ -1469,6 +1470,7 @@ fn tool_def(
         provenance: Some(ToolProvenance {
             kind,
             source_id: "mob".into(),
+            artifact: None,
         }),
     })
 }
@@ -2024,6 +2026,7 @@ mod application_target_tests {
                         .with_provenance(meerkat_core::ToolProvenance {
                             kind: ToolSourceKind::Mcp,
                             source_id: source.into(),
+                            artifact: None,
                         }),
                 )
             })

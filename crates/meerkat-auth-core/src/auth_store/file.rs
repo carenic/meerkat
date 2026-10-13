@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
+use meerkat_core::auth::token_store::TokenStoreObservation;
+
 use super::{PersistedTokens, TokenKey, TokenStore, TokenStoreError};
 
 pub struct FileTokenStore {
@@ -35,6 +37,22 @@ impl FileTokenStore {
         let stem = key.storage_stem();
         self.realm_dir(key.realm().as_str())
             .join(format!("{stem}.json"))
+    }
+
+    /// Remove `key`'s file synchronously, for cleanup that runs on a thread
+    /// with no async runtime (after an Auto keychain write). A missing file is
+    /// already clean.
+    #[cfg(feature = "keyring")]
+    pub(crate) fn evict_blocking(
+        &self,
+        key: &TokenKey,
+    ) -> impl FnOnce() -> Result<(), TokenStoreError> + Send + 'static {
+        let path = self.path_for(key);
+        move || match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(TokenStoreError::from(error)),
+        }
     }
 }
 
@@ -74,6 +92,17 @@ impl TokenStore for FileTokenStore {
         }
     }
 
+    /// A file read never raises operating-system UI: status reads the file.
+    async fn observe_status(
+        &self,
+        key: &TokenKey,
+    ) -> Result<TokenStoreObservation, TokenStoreError> {
+        Ok(match self.load(key).await? {
+            Some(tokens) => TokenStoreObservation::Present(Box::new(tokens)),
+            None => TokenStoreObservation::Missing,
+        })
+    }
+
     async fn list(&self) -> Result<Vec<TokenKey>, TokenStoreError> {
         let mut out = Vec::new();
         let mut realms = match tokio::fs::read_dir(&self.root).await {
@@ -110,6 +139,13 @@ impl TokenStore for FileTokenStore {
                     Some(s) => s,
                     None => continue,
                 };
+                if let Some(key) = TokenKey::connector_client_secret_from_stem(&realm, stem)
+                    .or_else(|| TokenKey::mcp_attachment_identity_key_from_stem(&realm, stem))
+                    .or_else(|| TokenKey::mcp_service_secret_from_stem(&realm, stem))
+                {
+                    out.push(key);
+                    continue;
+                }
                 if let Some(account_raw) = stem.strip_prefix("account~") {
                     let account =
                         match meerkat_core::connection::CredentialAccountId::parse(account_raw) {
@@ -257,6 +293,40 @@ mod tests {
                 .join("account~github_copilot.json")
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn connector_client_secret_round_trips_and_lists_beside_a_legacy_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileTokenStore::new(dir.path());
+        let realm = RealmId::parse("global").unwrap();
+        let secret_key = TokenKey::connector_client_secret(
+            realm.clone(),
+            &format!("desktop@{}", "b".repeat(64)),
+        )
+        .unwrap();
+        // The legacy binding name a reserved key would have overwritten.
+        let legacy = TokenKey::new_with_profile(
+            realm,
+            BindingId::parse("connector-client").unwrap(),
+            Some(meerkat_core::connection::ProfileId::parse("desktop").unwrap()),
+        );
+        store
+            .save(&secret_key, &token("client-secret"))
+            .await
+            .unwrap();
+        store.save(&legacy, &token("legacy")).await.unwrap();
+        assert_eq!(
+            store
+                .load(&legacy)
+                .await
+                .unwrap()
+                .and_then(|tokens| tokens.primary_secret),
+            Some("legacy".to_string())
+        );
+        let listed = store.list().await.unwrap();
+        assert!(listed.contains(&secret_key));
+        assert!(listed.contains(&legacy));
     }
 
     // RCT-17: an inherited binding (owner = the defining realm, stamped by the

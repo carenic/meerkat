@@ -1,9 +1,9 @@
 // Generated wire types for Meerkat SDK
-// Contract version: 0.8.52
+// Contract version: 0.9.0
 
 import { MeerkatError } from "./errors.js";
 
-export const CONTRACT_VERSION = "0.8.52";
+export const CONTRACT_VERSION = "0.9.0";
 
 export type Value = unknown;
 
@@ -263,6 +263,7 @@ export interface McpStdioConfig {
   args?: string[];
   command: string;
   env?: Record<string, string>;
+  secret_env?: string[];
 }
 
 export interface McpHttpConfig {
@@ -540,6 +541,7 @@ export type WireConnectorAccountSelection = WireConnectorAccountSelectionKnown |
 export interface WireConnectorAuthTarget {
   account_selection: WireConnectorAccountSelection;
   client: string;
+  client_auth_profile?: string | null;
   issuer: string;
   resource: string;
   scopes: string[];
@@ -564,7 +566,7 @@ export interface WireScopeEvidenceRetainedOnRefresh {
 
 export type WireScopeEvidence = WireScopeEvidenceTokenEndpointResponse | WireScopeEvidenceRetainedOnRefresh;
 
-export type WireAuthErrorReason = "realm_not_found" | "binding_not_found" | "mcp_server_not_configured" | "account_selection_required" | "unknown_strategy" | "device_poll_in_progress" | "device_code_already_admitted" | "device_expiry_invalid" | "missing_scopes" | "slot_occupied" | "slot_account_mismatch" | "slot_context_mismatch" | "slot_mode_mismatch" | "unverified_connector_publication" | "reauth_required" | "configuration_invalid" | "invalid_target" | "binding_invalid" | "binding_inherited" | "flow_unsupported" | "mcp_server_mismatch" | "attempt_missing" | "attempt_mismatch" | "account_mismatch" | "credential_mismatch" | "verification_unavailable" | "authorization_required" | "callback_unavailable" | "upstream_failure" | "infrastructure";
+export type WireAuthErrorReason = "realm_not_found" | "binding_not_found" | "mcp_server_not_configured" | "account_selection_required" | "unknown_strategy" | "device_poll_in_progress" | "device_code_already_admitted" | "device_expiry_invalid" | "missing_scopes" | "slot_occupied" | "slot_account_mismatch" | "slot_context_mismatch" | "slot_mode_mismatch" | "unverified_connector_publication" | "reauth_required" | "configuration_invalid" | "credential_access_denied" | "credential_interaction_required" | "credential_access_pending" | "credential_store_unavailable" | "invalid_target" | "binding_invalid" | "binding_inherited" | "flow_unsupported" | "mcp_server_mismatch" | "attempt_missing" | "attempt_mismatch" | "account_mismatch" | "credential_mismatch" | "verification_unavailable" | "authorization_required" | "callback_unavailable" | "upstream_failure" | "infrastructure";
 
 export interface WireAuthErrorData {
   reason: WireAuthErrorReason;
@@ -574,6 +576,8 @@ export interface WireAuthErrorBody {
   error: string;
   reason: WireAuthErrorReason;
 }
+
+export type ConsentNoticeKind = "requested" | "approved" | "denied" | "used" | "withdrawn";
 
 export type InstructionActivationDisposition = unknown;
 
@@ -792,6 +796,7 @@ export interface WireAuthStatusResultAuthStatusDetail {
   auth_binding: WireAuthBindingRef;
   auth_method: string;
   binding_id: string;
+  credential_observation?: "not_observed" | "owner_busy" | "pending" | "denied" | "interaction_required" | "unavailable" | null;
   expires_at?: string | null;
   has_refresh_token: boolean;
   last_refresh_at?: string | null;
@@ -862,6 +867,7 @@ export interface ApprovalListResult {
 export interface ApprovalRecord {
   allowed_decisions: ("approve" | "deny")[];
   approval_id: string;
+  consent?: Record<string, unknown> | null;
   created_at: string;
   decision?: Record<string, unknown> | null;
   expires_at?: string | null;
@@ -947,6 +953,22 @@ export interface BlobPayload {
   blob_id: BlobId;
   data: string;
   media_type: string;
+}
+
+export interface ConsentNoticeParams {
+  approval_id: string;
+  kind: ConsentNoticeKind;
+  presentation?: Record<string, unknown> | null;
+  tool_call_id: string;
+}
+
+export interface ConsentPresentationParams {
+  accepted_assurance: "device_trusted" | "person_authenticated";
+  account?: string | null;
+  action: Record<string, unknown>;
+  expires_at: string;
+  mandate?: string | null;
+  risk: "low" | "medium" | "high" | "critical";
 }
 
 export interface CreateProfileParams {
@@ -1589,41 +1611,41 @@ export interface JobsUnsubscribeResult {
   job: JobSummary;
 }
 
-export interface MobkitJobCancelAckParams {
+export interface MetaJobCancelAckParams {
   acknowledged_at_ms: number;
   authority: JobAttemptAuthority;
 }
 
-export interface MobkitJobCheckpointParams {
+export interface MetaJobCheckpointParams {
   authority: JobAttemptAuthority;
   checkpoint_ref: string;
   observed_at_ms: number;
 }
 
-export interface MobkitJobCompleteParams {
+export interface MetaJobCompleteParams {
   authority: JobAttemptAuthority;
   completed_at_ms: number;
   result_ref?: string | null;
 }
 
-export interface MobkitJobFailParams {
+export interface MetaJobFailParams {
   authority: JobAttemptAuthority;
   code: string;
   detail_ref?: string | null;
   failed_at_ms: number;
 }
 
-export interface MobkitJobHeartbeatParams {
+export interface MetaJobHeartbeatParams {
   authority: JobAttemptAuthority;
   heartbeat_at_ms: number;
   lease_expires_at_ms: number;
 }
 
-export interface MobkitJobMutationResult {
+export interface MetaJobMutationResult {
   job: JobSummary;
 }
 
-export interface MobkitJobProgressParams {
+export interface MetaJobProgressParams {
   authority: JobAttemptAuthority;
   cursor: number;
   detail: string;
@@ -3411,7 +3433,7 @@ export interface WireFlowTurnOutcomeInteractionFailed {
 
 export type WireFlowTurnOutcome = "run_completed" | "extraction_succeeded" | "interaction_complete" | "interaction_callback_pending" | "channel_closed" | WireFlowTurnOutcomeExtractionFailed | WireFlowTurnOutcomeRunFailed | WireFlowTurnOutcomeInteractionFailed;
 
-export type AuthErrorKind = "missing_secret" | "unsupported_combination" | "missing_required_metadata" | "workspace_mismatch" | "stale_credential" | "refresh_required" | "lease_absent" | "user_reauth_required" | "expired" | "refresh_failed" | "resolve_required" | "interactive_login_required" | "host_owned_unavailable" | "io" | "other";
+export type AuthErrorKind = "missing_secret" | "unsupported_combination" | "missing_required_metadata" | "workspace_mismatch" | "stale_credential" | "refresh_required" | "lease_absent" | "user_reauth_required" | "expired" | "refresh_failed" | "resolve_required" | "interactive_login_required" | "host_owned_unavailable" | "io" | "other" | "credential_access_denied" | "credential_interaction_required" | "credential_access_pending" | "credential_store_unavailable";
 
 export type ConnectionTargetErrorKind = "missing_realm" | "unknown_realm" | "missing_default_binding" | "invalid_realm_id" | "invalid_binding_id" | "realm_config_invalid" | "binding_invalid" | "provider_mismatch" | "realm_chain";
 
@@ -3462,6 +3484,8 @@ export type ExternalToolDeltaPhase = "pending" | "applied" | "draining" | "force
 
 export type ConfinementRefusal = "invalid_requirement" | "invalid_launch" | "unsupported_requirement" | "backend_unavailable" | "preparation_failed";
 
+export type McpAttachmentRestoreWireOutcome = "suppressed" | "retired" | "rebound" | "account_changed" | "denied" | "unavailable" | "not_current" | "review_required" | "mismatch" | "stage_failed" | "renewal_required";
+
 export interface ToolConfigChangeStatusBoundaryApplied {
   base_changed: boolean;
   kind: "boundary_applied";
@@ -3486,6 +3510,7 @@ export interface ToolConfigChangeStatusExternalToolDelta {
   detail?: string | null;
   kind: "external_tool_delta";
   phase: ExternalToolDeltaPhase;
+  restore?: McpAttachmentRestoreWireOutcome | null;
 }
 
 export type ToolConfigChangeStatus = ToolConfigChangeStatusBoundaryApplied | ToolConfigChangeStatusDeferredCatalogDelta | ToolConfigChangeStatusWarningFailedClosed | ToolConfigChangeStatusExternalToolDelta;
@@ -4054,6 +4079,7 @@ export type ModelFallbackTrigger = "capacity" | "provider_unavailable" | "transp
 export type MeerkatSchema = unknown;
 
 export interface PortableMcpDeclStdio {
+  access?: { allowed_operations: string[] } | null;
   args?: string[];
   command: string;
   connect_timeout_secs?: number | null;
@@ -4063,6 +4089,7 @@ export interface PortableMcpDeclStdio {
 }
 
 export interface PortableMcpDeclHttp {
+  access?: { allowed_operations: string[] } | null;
   connect_timeout_secs?: number | null;
   http_transport?: McpHttpTransport | null;
   oauth_account?: string | null;
@@ -6456,6 +6483,7 @@ export interface WireAuthStatusDetail {
   auth_binding: WireAuthBindingRef;
   auth_method: string;
   binding_id: string;
+  credential_observation?: "not_observed" | "owner_busy" | "pending" | "denied" | "interaction_required" | "unavailable" | null;
   expires_at?: string | null;
   has_refresh_token: boolean;
   last_refresh_at?: string | null;
@@ -6532,7 +6560,24 @@ export interface WireAuthErrorOther {
   kind: "other";
 }
 
-export type WireAuthError = WireAuthErrorMissingSecret | WireAuthErrorUnsupportedCombination | WireAuthErrorMissingRequiredMetadata | WireAuthErrorWorkspaceMismatch | WireAuthErrorExpired | WireAuthErrorStaleCredential | WireAuthErrorRefreshRequired | WireAuthErrorLeaseAbsent | WireAuthErrorUserReauthRequired | WireAuthErrorRefreshFailed | WireAuthErrorResolveRequired | WireAuthErrorInteractiveLoginRequired | WireAuthErrorHostOwnedUnavailable | WireAuthErrorIo | WireAuthErrorOther;
+export interface WireAuthErrorCredentialAccessDenied {
+  kind: "credential_access_denied";
+}
+
+export interface WireAuthErrorCredentialInteractionRequired {
+  kind: "credential_interaction_required";
+}
+
+export interface WireAuthErrorCredentialAccessPending {
+  kind: "credential_access_pending";
+}
+
+export interface WireAuthErrorCredentialStoreUnavailable {
+  detail: string;
+  kind: "credential_store_unavailable";
+}
+
+export type WireAuthError = WireAuthErrorMissingSecret | WireAuthErrorUnsupportedCombination | WireAuthErrorMissingRequiredMetadata | WireAuthErrorWorkspaceMismatch | WireAuthErrorExpired | WireAuthErrorStaleCredential | WireAuthErrorRefreshRequired | WireAuthErrorLeaseAbsent | WireAuthErrorUserReauthRequired | WireAuthErrorRefreshFailed | WireAuthErrorResolveRequired | WireAuthErrorInteractiveLoginRequired | WireAuthErrorHostOwnedUnavailable | WireAuthErrorIo | WireAuthErrorOther | WireAuthErrorCredentialAccessDenied | WireAuthErrorCredentialInteractionRequired | WireAuthErrorCredentialAccessPending | WireAuthErrorCredentialStoreUnavailable;
 
 export type WireProvider = "anthropic" | "openai" | "gemini" | "self_hosted" | "other" | "unknown";
 
@@ -6808,6 +6853,7 @@ export interface SystemNoticeBlockAuth {
 
 export interface SystemNoticeBlockRuntimeNotice {
   category: string;
+  content?: ContentBlock[];
   detail?: string | null;
   payload?: unknown;
   type: "runtime_notice";

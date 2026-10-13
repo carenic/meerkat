@@ -10,19 +10,110 @@ use std::sync::Arc;
 
 use meerkat_authorization_contracts::constraints::{ExecutionRestrictions, LifetimeBound};
 use meerkat_authorization_contracts::work_association::{
-    InputAuthorityAssociation, WorkAuthorityBasis,
+    GrantTarget, InputAuthorityAssociation, WorkAuthorityBasis,
 };
 use meerkat_core::authorization::{
-    AuthorizationOperation, ModelAuthorizationUse, OperationRefusalKind, OperationRefused,
-    PreparedAuthorizationBinding, WorkAuthorizationContext,
+    AuthorizationOperation, OperationAuthorizationFacts, OperationRefusalKind, OperationRefused,
+    PreparedAuthorizationBinding, ToolAuthorizationTarget, WorkAuthorizationContext,
 };
 use meerkat_core::exact_operation::OperationExecutionScope;
+use meerkat_core::tool_execution::{ResolvedToolExecutionPlan, ToolOperationTarget};
 
 use crate::grants::{GrantRefusal, LocalGrantAuthority, ResolvedGrant};
 use crate::policy::{
     LocalOperationValues, LocalPolicyAllowance, LocalPolicyPurpose, LocalWorkPolicy,
 };
 use crate::publication::{LocalPublicationGuard, PublicationError};
+
+/// The one owner-produced operation target of a dispatched tool plan, if any.
+///
+/// # Errors
+/// A plan naming more than one owner target is ambiguous and unavailable.
+pub fn single_tool_operation_target(
+    plan: &ResolvedToolExecutionPlan,
+) -> Result<Option<&ToolOperationTarget>, meerkat_core::OperationAuthorizationError> {
+    let mut targets = plan
+        .owner_witnesses()
+        .iter()
+        .filter_map(|witness| witness.operation_target());
+    match (targets.next(), targets.next()) {
+        (target, None) => Ok(target),
+        (_, Some(_)) => Err(meerkat_core::OperationAuthorizationError::Unavailable),
+    }
+}
+
+/// The typed target an operation's grant lineage is selected by: the single
+/// MCP server a dispatched tool operates on, the exact checked route to that
+/// server it was reached through, the exact registered tool bundle operation
+/// it runs, or `None` for an operation with no typed target or a tool
+/// catalog control, which uses the basis's base lineage. Raw operation
+/// meaning is untouched; this only says which selected lineage applies.
+///
+/// # Errors
+/// An ambiguous tool plan target is unavailable.
+pub fn operation_grant_target(
+    facts: &OperationAuthorizationFacts,
+) -> Result<Option<GrantTarget>, meerkat_core::OperationAuthorizationError> {
+    let AuthorizationOperation::Tool(tool) = &facts.operation else {
+        return Ok(None);
+    };
+    let ToolAuthorizationTarget::Dispatcher(plan) = &tool.target else {
+        return Ok(None);
+    };
+    match single_tool_operation_target(plan)? {
+        None => Ok(None),
+        Some(ToolOperationTarget::McpServerOperation { server, .. }) => {
+            Ok(Some(GrantTarget::McpServer {
+                server: server.clone(),
+            }))
+        }
+        // The session's own tool catalog has no grant target of its own: it
+        // is base work, so it uses the basis's base lineage (and is denied
+        // when the basis has none).
+        Some(ToolOperationTarget::CatalogControl { .. }) => Ok(None),
+        // A registered tool bundle's operation is its own target: it uses
+        // only the lineage selected for exactly that bundle and operation,
+        // never the base (a catalog grant does not cover it) and never a
+        // sibling operation's.
+        Some(ToolOperationTarget::RegisteredToolBundleOperation {
+            bundle, operation, ..
+        }) => Ok(Some(GrantTarget::RegisteredToolBundleOperation {
+            bundle: bundle.clone(),
+            operation: operation.clone(),
+        })),
+        // An MCP operation reached through a host's checked route uses only
+        // the lineage selected for exactly that route to that server: never
+        // the server's ordinary lineage, which keeps refusing the identical
+        // raw operation, and never the base.
+        Some(ToolOperationTarget::CheckedMcpServerOperation { route, server, .. }) => {
+            Ok(Some(GrantTarget::CheckedMcpRoute {
+                route: route.clone(),
+                server: server.clone(),
+            }))
+        }
+        // Any other target kind selects nothing: unavailable.
+        Some(_) => Err(meerkat_core::OperationAuthorizationError::Unavailable),
+    }
+}
+
+/// The grant lineages native admission and retained resume resolve before any
+/// operation exists. A single `GrantLineage` is the work's common authority and
+/// is resolved as before. A targeted selection has no common grant lineage:
+/// each target's lineage, and the optional base, are resolved only at use on
+/// their own operations, so a revoked or expired one refuses only those
+/// operations and never admission, resume or another target. Ingress
+/// authentication and controller authority are checked by their own owners.
+pub fn admission_grant_lineages(
+    basis: &WorkAuthorityBasis,
+) -> impl Iterator<Item = &[meerkat_authorization_contracts::work_association::GrantLineageRef]> {
+    match basis {
+        WorkAuthorityBasis::GrantLineage { lineage } => Some(lineage.as_slice()),
+        WorkAuthorityBasis::TargetedGrantLineages { .. }
+        | WorkAuthorityBasis::HostPolicy { .. }
+        | WorkAuthorityBasis::ServiceMandate { .. } => None,
+    }
+    .into_iter()
+}
 
 /// Current owner bounds, not a capability, cached acceptance or wire DTO.
 ///
@@ -85,6 +176,19 @@ pub trait AdmittedWorkPolicyOwner: Send + Sync {
         Err(meerkat_core::OperationAuthorizationError::Unavailable)
     }
 
+    /// Resolve the actual authenticated MCP attachment control: its exact
+    /// requester, actor, realm, destination and server descriptor against the
+    /// real owner, for the one effect `binding` names. Unsupported owners
+    /// fail closed.
+    fn authorize_mcp_attachment(
+        &self,
+        _control: &meerkat_core::mcp_attachment_control::McpAttachmentControlRequest,
+        _binding: &PreparedAuthorizationBinding,
+        _now_ms: u64,
+    ) -> Result<WorkOwnerAllowance, meerkat_core::OperationAuthorizationError> {
+        Err(meerkat_core::OperationAuthorizationError::Unavailable)
+    }
+
     fn authorize_admitted_work(
         &self,
         association: &InputAuthorityAssociation,
@@ -92,6 +196,22 @@ pub trait AdmittedWorkPolicyOwner: Send + Sync {
         purpose: LocalPolicyPurpose,
         now_ms: u64,
     ) -> Result<WorkOwnerAllowance, meerkat_core::OperationAuthorizationError>;
+
+    /// The actual current mandate behind this admitted work, as bounded
+    /// passive text for review and consent presentation. Read from the same
+    /// owner records and publication as `authorize_admitted_work`; never an
+    /// explanation reconstructed from identifiers or history. `Ok(None)`
+    /// means explicitly not applicable. Fail closed: an owner that does not
+    /// implement this, or requires a mandate it cannot read, is
+    /// `Unavailable`.
+    fn review_mandate(
+        &self,
+        _association: &InputAuthorityAssociation,
+        _binding: &PreparedAuthorizationBinding,
+        _now_ms: u64,
+    ) -> Result<Option<String>, meerkat_core::OperationAuthorizationError> {
+        Err(meerkat_core::OperationAuthorizationError::Unavailable)
+    }
 }
 
 /// Existing resource, peer, account and sink policy composition.
@@ -137,6 +257,20 @@ pub trait OperationPolicyOwner: Send + Sync {
         Err(meerkat_core::OperationAuthorizationError::Unavailable)
     }
 
+    /// Resolve the exact server, destination or configuration entry of one
+    /// MCP attachment effect for the authenticated control. Called for every
+    /// operation of the effect (server hydrate and destination publication
+    /// for a live attachment; configuration retain for a persisted one), in
+    /// one coherent native publication observation.
+    fn authorize_mcp_attachment(
+        &self,
+        _control: &meerkat_core::mcp_attachment_control::McpAttachmentControlRequest,
+        _binding: &PreparedAuthorizationBinding,
+        _now_ms: u64,
+    ) -> Result<LocalPolicyAllowance, meerkat_core::OperationAuthorizationError> {
+        Err(meerkat_core::OperationAuthorizationError::Unavailable)
+    }
+
     /// Authorize this exact plain controller before native admission. The native
     /// ingress owner separately checks the current authenticated caller's right
     /// to invoke the mandate. No operation, run or transcript exists yet.
@@ -163,6 +297,21 @@ pub trait OperationPolicyOwner: Send + Sync {
         purpose: LocalPolicyPurpose,
         now_ms: u64,
     ) -> Result<LocalPolicyAllowance, meerkat_core::OperationAuthorizationError>;
+
+    /// The action account this owner actually selected for the bound
+    /// operation's sink, as bounded passive text for review and consent
+    /// presentation. A credential or auth-binding reference is not the
+    /// selected account. `Ok(None)` means explicitly not applicable. Fail
+    /// closed: an owner that does not implement this, or requires an account
+    /// it cannot read, is `Unavailable`.
+    fn review_action_account(
+        &self,
+        _association: &InputAuthorityAssociation,
+        _binding: &PreparedAuthorizationBinding,
+        _now_ms: u64,
+    ) -> Result<Option<String>, meerkat_core::OperationAuthorizationError> {
+        Err(meerkat_core::OperationAuthorizationError::Unavailable)
+    }
 }
 
 /// Current correlated controller rules lasting for admitted work.
@@ -236,6 +385,22 @@ impl GrantBackedWorkPolicy {
     ) -> WorkAuthorizationContext {
         WorkAuthorizationContext::new(
             Arc::new(ContextControlAuthorization {
+                policy: Arc::clone(self),
+                control,
+            }),
+            OperationExecutionScope::Domain,
+        )
+    }
+
+    /// Non-input MCP attachment control over these same installed owners.
+    /// Each prepared effect conjoins the work-owner mandate with the
+    /// operation owner's allowance for every operation of that effect.
+    pub fn mcp_attachment_authorization(
+        self: &Arc<Self>,
+        control: Arc<meerkat_core::mcp_attachment_control::McpAttachmentControlRequest>,
+    ) -> WorkAuthorizationContext {
+        WorkAuthorizationContext::new(
+            Arc::new(McpAttachmentAuthorization {
                 policy: Arc::clone(self),
                 control,
             }),
@@ -351,19 +516,27 @@ impl GrantBackedWorkPolicy {
     fn resolve_grant(
         &self,
         association: &InputAuthorityAssociation,
+        binding: &PreparedAuthorizationBinding,
         controller: bool,
     ) -> Result<Option<ResolvedGrant>, meerkat_core::OperationAuthorizationError> {
         let candidate = association.candidate();
-        let lineage = if controller {
+        let lineage: &[_] = if controller {
             &candidate.controller_grant_lineage
         } else {
             match &candidate.authority_basis {
-                WorkAuthorityBasis::GrantLineage { lineage } => lineage,
                 // Only reached after the trusted work owner resolved this
                 // exact policy or occurrence. No implicit grant is synthesized.
                 WorkAuthorityBasis::HostPolicy { .. }
                 | WorkAuthorityBasis::ServiceMandate { .. } => {
                     return Ok(None);
+                }
+                // One lineage for every operation, as recorded.
+                WorkAuthorityBasis::GrantLineage { lineage } => lineage,
+                // The lineage selected for this operation's typed target
+                // only; a target without one is denied for this operation.
+                basis @ WorkAuthorityBasis::TargetedGrantLineages { .. } => {
+                    let target = operation_grant_target(binding.facts())?;
+                    basis.lineage_for(target.as_ref()).ok_or_else(denied)?
                 }
             }
         };
@@ -384,16 +557,90 @@ impl GrantBackedWorkPolicy {
     }
 }
 
+impl GrantBackedWorkPolicy {
+    /// The generated grant owner this policy resolves grants in.
+    pub fn grants(&self) -> &Arc<LocalGrantAuthority> {
+        &self.grants
+    }
+
+    /// This policy's Operation answer for `binding`, conjoined with each of
+    /// `further` grants (restrictions and expiry), with every actual
+    /// operation tuple required within the conjunction at `now_ms`. For a
+    /// trusted native composition that must also carry the ceilings of
+    /// originals an association does not name itself; it adds no authority.
+    ///
+    /// # Errors
+    /// Any refusal of the policy, an expired conjunction, or a tuple outside
+    /// it is denied; unavailable owners are unavailable.
+    pub fn evaluate_operation_within<'a>(
+        &self,
+        association: &InputAuthorityAssociation,
+        binding: &PreparedAuthorizationBinding,
+        further: impl IntoIterator<Item = &'a ResolvedGrant>,
+        now_ms: u64,
+    ) -> Result<LocalPolicyAllowance, meerkat_core::OperationAuthorizationError> {
+        let mut allowance =
+            self.evaluate_for(association, binding, LocalPolicyPurpose::Operation, now_ms)?;
+        for grant in further {
+            allowance.restrictions = allowance.restrictions.conjoin(grant.restrictions());
+            allowance.expires_at_ms = allowance.expires_at_ms.min(grant.expires_at_ms());
+        }
+        if allowance.operation_values.is_empty() || allowance.expires_at_ms <= now_ms {
+            return Err(denied().into());
+        }
+        for values in &allowance.operation_values {
+            allowance
+                .restrictions
+                .check_bounds(values.at(now_ms))
+                .map_err(|_| denied())?;
+        }
+        Ok(allowance)
+    }
+}
+
 impl LocalWorkPolicy for GrantBackedWorkPolicy {
+    fn grant_backed(self: Arc<Self>) -> Option<Arc<GrantBackedWorkPolicy>> {
+        Some(self)
+    }
+
+    fn review_context(
+        &self,
+        association: &InputAuthorityAssociation,
+        binding: &PreparedAuthorizationBinding,
+        now_ms: u64,
+    ) -> Result<
+        meerkat_core::authorization::ReviewOperationContextResolution,
+        meerkat_core::OperationAuthorizationError,
+    > {
+        use meerkat_core::authorization::{
+            ReviewOperationContext, ReviewOperationContextResolution,
+        };
+        let action_account =
+            self.operation_owner
+                .review_action_account(association, binding, now_ms)?;
+        let mandate = self
+            .work_owner
+            .review_mandate(association, binding, now_ms)?;
+        if action_account.is_none() && mandate.is_none() {
+            return Ok(ReviewOperationContextResolution::NotApplicable);
+        }
+        // Owner text outside the bound is not truncated or dropped: the
+        // required material is unavailable.
+        ReviewOperationContext::new(action_account, mandate)
+            .map(ReviewOperationContextResolution::Material)
+            .map_err(|_| meerkat_core::OperationAuthorizationError::Unavailable)
+    }
+
     fn evaluate(
         &self,
         association: &InputAuthorityAssociation,
         binding: &PreparedAuthorizationBinding,
         now_ms: u64,
     ) -> Result<LocalPolicyAllowance, meerkat_core::OperationAuthorizationError> {
+        let controller_model = association.candidate().controller_model.as_ref();
         let purpose = match &binding.facts().operation {
             AuthorizationOperation::Model(facts)
-                if facts.usage == ModelAuthorizationUse::ControllerInference =>
+                if crate::work::controller_route(facts, controller_model) =>
             {
                 // The legacy single-allowance method cannot encode independent
                 // model and hosted-capability bounds. The compiler invokes
@@ -417,7 +664,10 @@ impl LocalWorkPolicy for GrantBackedWorkPolicy {
     ) -> Result<LocalPolicyAllowance, meerkat_core::OperationAuthorizationError> {
         let controller = match &binding.facts().operation {
             AuthorizationOperation::Model(facts)
-                if facts.usage == ModelAuthorizationUse::ControllerInference =>
+                if crate::work::controller_route(
+                    facts,
+                    association.candidate().controller_model.as_ref(),
+                ) =>
             {
                 Some(facts)
             }
@@ -445,13 +695,17 @@ impl LocalWorkPolicy for GrantBackedWorkPolicy {
                 return Err(denied().into());
             }
         }
-        let grant = self.resolve_grant(association, purpose == LocalPolicyPurpose::Controller)?;
+        let grant = self.resolve_grant(
+            association,
+            binding,
+            purpose == LocalPolicyPurpose::Controller,
+        )?;
         let mut operation =
             self.operation_owner
                 .authorize_operation(association, binding, purpose, now_ms)?;
         operation.restrictions = owner.restrictions.conjoin(&operation.restrictions);
         operation.expires_at_ms = owner.expires_at_ms.min(operation.expires_at_ms);
-        if let Some(grant) = grant {
+        if let Some(grant) = &grant {
             operation.restrictions = operation.restrictions.conjoin(grant.restrictions());
             operation.expires_at_ms = operation.expires_at_ms.min(grant.expires_at_ms());
         }
@@ -462,6 +716,29 @@ impl LocalWorkPolicy for GrantBackedWorkPolicy {
         // or unresolved required facts. The work compiler separately conjoins
         // the purpose's retained admitted ceiling and every original input.
         for values in &operation.operation_values {
+            // A connector approval is the work's own grant's record, listed
+            // explicitly: a wildcard bound does not approve one, and a grant
+            // that records none for the server is missing evidence, not a
+            // verdict.
+            if values.action.feature == crate::mcp_installation::MCP_CONNECTOR_FEATURE {
+                let recorded = grant.as_ref().map(|grant| {
+                    crate::mcp_installation::lineage_connector_bound(
+                        grant.lineage_restrictions(),
+                        grant.restrictions(),
+                        &values.action,
+                        &values.resource_domain,
+                    )
+                });
+                match recorded {
+                    Some(crate::mcp_installation::McpConnectorBound::Approved) => {}
+                    Some(crate::mcp_installation::McpConnectorBound::Other) => {
+                        return Err(denied().into());
+                    }
+                    Some(crate::mcp_installation::McpConnectorBound::Unrecorded) | None => {
+                        return Err(meerkat_core::OperationAuthorizationError::Unavailable);
+                    }
+                }
+            }
             operation
                 .restrictions
                 .check_bounds(values.at(now_ms))
@@ -481,7 +758,7 @@ fn grant_refusal(refusal: GrantRefusal) -> meerkat_core::OperationAuthorizationE
         // ControllerInUse belongs to administration and is preserved by revoke.
         // Current resolution cannot produce it; never invent policy denial if
         // a future resolver reports an unsupported operational condition.
-        GrantRefusal::ControllerInUse | GrantRefusal::Unavailable => {
+        GrantRefusal::ControllerInUse | GrantRefusal::Duplicate | GrantRefusal::Unavailable => {
             meerkat_core::OperationAuthorizationError::Unavailable
         }
     }
@@ -489,6 +766,65 @@ fn grant_refusal(refusal: GrantRefusal) -> meerkat_core::OperationAuthorizationE
 
 #[cfg(test)]
 mod tests;
+
+/// One exact attachment control; each prepared effect covers all of its
+/// operations under one observation.
+struct McpAttachmentAuthorization {
+    policy: Arc<GrantBackedWorkPolicy>,
+    control: Arc<meerkat_core::mcp_attachment_control::McpAttachmentControlRequest>,
+}
+
+impl meerkat_core::authorization::WorkAuthorization for McpAttachmentAuthorization {
+    fn prepare(
+        &self,
+        binding: &PreparedAuthorizationBinding,
+    ) -> Result<
+        Arc<dyn meerkat_core::PreparedOperationAuthorization>,
+        meerkat_core::OperationAuthorizationError,
+    > {
+        self.prepare_observed(binding).result
+    }
+
+    fn prepare_observed(
+        &self,
+        binding: &PreparedAuthorizationBinding,
+    ) -> meerkat_core::authorization::ObservedAuthorizationResult<
+        Arc<dyn meerkat_core::PreparedOperationAuthorization>,
+    > {
+        let Some(effect) = self.control.effect_of(binding) else {
+            return meerkat_core::authorization::ObservedAuthorizationResult::unobserved(Err(
+                denied().into(),
+            ));
+        };
+        let operations = self
+            .control
+            .effect_operations(effect)
+            .into_iter()
+            .map(|operation| self.control.binding_for(operation))
+            .collect::<Vec<_>>();
+        self.policy
+            .grants
+            .compile_context_control(binding, |now_ms| {
+                let mandate = self.policy.work_owner.authorize_mcp_attachment(
+                    &self.control,
+                    binding,
+                    now_ms,
+                )?;
+                let mut allowances = Vec::with_capacity(operations.len());
+                for operation in &operations {
+                    let mut allowance = self.policy.operation_owner.authorize_mcp_attachment(
+                        &self.control,
+                        operation,
+                        now_ms,
+                    )?;
+                    allowance.restrictions = allowance.restrictions.conjoin(&mandate.restrictions);
+                    allowance.expires_at_ms = allowance.expires_at_ms.min(mandate.expires_at_ms);
+                    allowances.push(allowance);
+                }
+                Ok(allowances)
+            })
+    }
+}
 
 struct ToolApplicationAuthorization {
     policy: Arc<GrantBackedWorkPolicy>,

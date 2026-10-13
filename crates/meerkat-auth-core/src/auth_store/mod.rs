@@ -23,16 +23,20 @@ pub use command::{CommandCredentialError, CommandCredentialRunner, CommandCreden
 pub use ephemeral::EphemeralTokenStore;
 pub use file::FileTokenStore;
 #[cfg(feature = "keyring")]
-pub use keyring::KeyringTokenStore;
+pub use keyring::{KEYCHAIN_OPERATION_CAPACITY, KeyringTokenStore};
 #[cfg(feature = "file-lock")]
 pub use refresh::FileLockCoordinator;
 pub use refresh::InMemoryCoordinator;
+pub use refresh::{
+    CREDENTIAL_ADMISSION_WAIT, CredentialSettlement, settle_in_flight_credential_mutations,
+};
 
 // Re-exports from meerkat-core (trait + types moved there in B2 split).
 pub use meerkat_core::auth::token_store::{
     CredentialMutationError, CredentialMutationFn, CredentialMutationOutcome,
     CredentialSlotRefusal, PersistedAuthMode, PersistedTokens, ProviderAuthPersistence,
-    RefreshCoordinator, RefreshError, RefreshFn, TokenKey, TokenStore, TokenStoreError,
+    RefreshCoordinator, RefreshError, RefreshFn, TokenKey, TokenStore, TokenStoreAccess,
+    TokenStoreError, TokenStoreObservation, TokenStoreRefusal,
 };
 
 pub fn credential_source_uses_persisted_store(source: &CredentialSourceSpec) -> bool {
@@ -105,6 +109,18 @@ impl TokenStoreBackend {
         }
     }
 
+    /// Whether this backend's operations can wait on the operating system
+    /// (an OS keychain), so its coordinator must retain custody of admitted
+    /// work beyond a dropped caller and bound admission.
+    pub fn may_wait_on_operating_system(&self) -> bool {
+        match self {
+            Self::File { .. } | Self::Ephemeral => false,
+            #[cfg(feature = "keyring")]
+            Self::Keyring { .. } => true,
+            Self::Auto { .. } => cfg!(feature = "keyring"),
+        }
+    }
+
     pub fn open(self) -> Result<Arc<dyn TokenStore>, TokenStoreError> {
         match self {
             Self::File { root } => Ok(Arc::new(FileTokenStore::new(root))),
@@ -134,7 +150,11 @@ impl TokenStoreBackend {
                 })?;
                 #[cfg(feature = "file-lock")]
                 {
-                    Arc::new(FileLockCoordinator::new(lock_dir))
+                    if self.may_wait_on_operating_system() {
+                        Arc::new(FileLockCoordinator::retaining_custody(lock_dir))
+                    } else {
+                        Arc::new(FileLockCoordinator::new(lock_dir))
+                    }
                 }
                 #[cfg(not(feature = "file-lock"))]
                 {

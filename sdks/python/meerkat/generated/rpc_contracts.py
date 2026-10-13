@@ -113,6 +113,13 @@ from .types import (
     McpLiveOpResponse,
     McpReloadParams,
     McpRemoveParams,
+    MetaJobCancelAckParams,
+    MetaJobCheckpointParams,
+    MetaJobCompleteParams,
+    MetaJobFailParams,
+    MetaJobHeartbeatParams,
+    MetaJobMutationResult,
+    MetaJobProgressParams,
     MobAdoptMemberIdentityDeclarationParams,
     MobAdoptMemberIdentityDeclarationResult,
     MobAppendSystemContextParams,
@@ -218,13 +225,6 @@ from .types import (
     MobWireMembersBatchResult,
     MobWireParams,
     MobWireResult,
-    MobkitJobCancelAckParams,
-    MobkitJobCheckpointParams,
-    MobkitJobCompleteParams,
-    MobkitJobFailParams,
-    MobkitJobHeartbeatParams,
-    MobkitJobMutationResult,
-    MobkitJobProgressParams,
     ModelsCatalogResponse,
     MonitorsStartParams,
     MonitorsStartResult,
@@ -405,50 +405,50 @@ class RpcRequest(Protocol):
     @overload
     def __call__(
         self,
-        method: Literal["mobkit/jobs/heartbeat"],
-        params: MobkitJobHeartbeatParams,
+        method: Literal["meta/jobs/heartbeat"],
+        params: MetaJobHeartbeatParams,
         /,
-    ) -> Awaitable[MobkitJobMutationResult]: ...
+    ) -> Awaitable[MetaJobMutationResult]: ...
 
     @overload
     def __call__(
         self,
-        method: Literal["mobkit/jobs/progress"],
-        params: MobkitJobProgressParams,
+        method: Literal["meta/jobs/progress"],
+        params: MetaJobProgressParams,
         /,
-    ) -> Awaitable[MobkitJobMutationResult]: ...
+    ) -> Awaitable[MetaJobMutationResult]: ...
 
     @overload
     def __call__(
         self,
-        method: Literal["mobkit/jobs/checkpoint"],
-        params: MobkitJobCheckpointParams,
+        method: Literal["meta/jobs/checkpoint"],
+        params: MetaJobCheckpointParams,
         /,
-    ) -> Awaitable[MobkitJobMutationResult]: ...
+    ) -> Awaitable[MetaJobMutationResult]: ...
 
     @overload
     def __call__(
         self,
-        method: Literal["mobkit/jobs/complete"],
-        params: MobkitJobCompleteParams,
+        method: Literal["meta/jobs/complete"],
+        params: MetaJobCompleteParams,
         /,
-    ) -> Awaitable[MobkitJobMutationResult]: ...
+    ) -> Awaitable[MetaJobMutationResult]: ...
 
     @overload
     def __call__(
         self,
-        method: Literal["mobkit/jobs/fail"],
-        params: MobkitJobFailParams,
+        method: Literal["meta/jobs/fail"],
+        params: MetaJobFailParams,
         /,
-    ) -> Awaitable[MobkitJobMutationResult]: ...
+    ) -> Awaitable[MetaJobMutationResult]: ...
 
     @overload
     def __call__(
         self,
-        method: Literal["mobkit/jobs/cancel_ack"],
-        params: MobkitJobCancelAckParams,
+        method: Literal["meta/jobs/cancel_ack"],
+        params: MetaJobCancelAckParams,
         /,
-    ) -> Awaitable[MobkitJobMutationResult]: ...
+    ) -> Awaitable[MetaJobMutationResult]: ...
 
     @overload
     def __call__(

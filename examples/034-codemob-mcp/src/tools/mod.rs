@@ -122,7 +122,7 @@ pub fn tools_list() -> Vec<Value> {
                     "skills": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Skill names to load into the agent's context. Each skill adds domain knowledge to the system prompt. Available: meerkat-platform, meerkat-architecture, meerkat-wasm, rct-methodology, rust-cicd-pipeline, skill-creator, mobkit-platform. Only used when creating a new session."
+                        "description": "Skill names to load into the agent's context. Each skill adds domain knowledge to the system prompt. Available: meerkat-platform, meerkat-architecture, meerkat-wasm, rct-methodology, rust-cicd-pipeline, skill-creator, meta-platform. Only used when creating a new session."
                     }
                 },
                 "required": ["question"]

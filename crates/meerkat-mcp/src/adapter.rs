@@ -22,6 +22,7 @@ use tokio::sync::RwLock as AsyncRwLock;
 
 use crate::{McpApplyResult, McpError, McpReloadTarget, McpRouter};
 use meerkat_core::McpServerConfig;
+use meerkat_core::mcp_attachment::McpAttachmentAuthority;
 
 // Process-local namespace for pre-dispatch witnesses only. Router recovery or
 // reconstruction must resolve a new plan rather than restore this identity.
@@ -76,6 +77,63 @@ pub struct McpReloadFailure {
     pub error: McpError,
 }
 
+/// What an [`McpRouterShutdownObserver`] read of its adapter's router
+/// shutdown.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum McpRouterShutdownObservation {
+    /// The router's shutdown finished, with what every close it owned
+    /// observed.
+    Reported(Arc<crate::McpRouterShutdownReport>),
+    /// The shutdown can no longer report: the adapter was dropped without
+    /// shutting its router down, or the shutdown task was dropped before it
+    /// reported (its runtime shut down).
+    Abandoned,
+}
+
+/// The one shutdown of an [`McpRouterAdapter`]'s router, observed from
+/// outside the adapter ([`McpRouterAdapter::shutdown_observer`]). It outlives
+/// the adapter, and every clone observes the same shutdown.
+#[derive(Debug, Clone)]
+pub struct McpRouterShutdownObserver {
+    report: tokio::sync::watch::Receiver<Option<Arc<crate::McpRouterShutdownReport>>>,
+}
+
+impl McpRouterShutdownObserver {
+    /// Wait until the shutdown reports, or can no longer report.
+    pub async fn observe(&mut self) -> McpRouterShutdownObservation {
+        match self.report.wait_for(Option::is_some).await {
+            Ok(published) => published
+                .as_ref()
+                .map_or(McpRouterShutdownObservation::Abandoned, |report| {
+                    McpRouterShutdownObservation::Reported(Arc::clone(report))
+                }),
+            Err(_) => McpRouterShutdownObservation::Abandoned,
+        }
+    }
+
+    /// The observation now, without waiting: `None` while the shutdown has
+    /// neither reported nor been abandoned.
+    #[must_use]
+    pub fn current(&self) -> Option<McpRouterShutdownObservation> {
+        let reported = || {
+            self.report
+                .borrow()
+                .as_ref()
+                .map(|report| McpRouterShutdownObservation::Reported(Arc::clone(report)))
+        };
+        if let Some(reported) = reported() {
+            return Some(reported);
+        }
+        // A closed channel publishes nothing more; a report sent just before
+        // it closed is read again first.
+        self.report
+            .has_changed()
+            .is_err()
+            .then(|| reported().unwrap_or(McpRouterShutdownObservation::Abandoned))
+    }
+}
+
 /// Adapter that wraps an [`McpRouter`] to implement [`AgentToolDispatcher`].
 ///
 /// Tool visibility and routing come from the router's atomically published
@@ -99,8 +157,32 @@ pub struct McpRouterAdapter {
     /// runtime-backed session builds replace the slot with the session-owned
     /// handle.
     external_surface_handle: Option<Arc<StdRwLock<Arc<dyn ExternalToolSurfaceHandle>>>>,
+    /// The lineages the router staged on its surface. A rebind replaces
+    /// them with the lineages it re-derives on the new surface.
+    held_surface_lineages: crate::HeldSurfaceLineages,
+    /// How the router holds its surface. A rebind onto another owner's
+    /// surface (a session registration's) makes it `Borrowed`.
+    surface_ownership: crate::SurfaceOwnershipSlot,
     execution_authority_id: u64,
     execution_binding_epoch: AtomicU64,
+    /// Publishes the router's shutdown report to every observer
+    /// ([`Self::shutdown_observer`]). Created with the adapter; the sender
+    /// moves into the shutdown task when the router is taken, so a later
+    /// shutdown joins that same work after an earlier call was dropped. A
+    /// sender dropped without a report (the adapter dropped before shutting
+    /// its router down, or the shutdown task dropped) reads as Abandoned.
+    shutdown_report: std::sync::Mutex<
+        Option<tokio::sync::watch::Sender<Option<Arc<crate::McpRouterShutdownReport>>>>,
+    >,
+    shutdown_observer: McpRouterShutdownObserver,
+    /// The router's close index, outside the router lock
+    /// ([`Self::begin_close`]). Once it is closing, dispatch and every
+    /// staging entry refuse before taking a router guard.
+    close_index: crate::connection::CloseIndex,
+    /// Test-only acknowledgement sent just before a bind's first read of the
+    /// surface handle slot (it reads the slot, then claims it to write).
+    #[cfg(test)]
+    bind_claim_attempt: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 /// Fail-closed MCP server-lifecycle mirror installed when the pre-bind seed
@@ -355,6 +437,10 @@ impl McpRouterAdapter {
         let surface_snapshot = McpRouter::external_tool_surface_snapshot(&router);
         let mcp_lifecycle_handle = router.mcp_lifecycle_handle_slot();
         let external_surface_handle = router.external_surface_handle_slot();
+        let held_surface_lineages = router.held_surface_lineages();
+        let surface_ownership = router.surface_ownership_slot();
+        let close_index = router.close_index();
+        let (shutdown_report, report) = tokio::sync::watch::channel(None);
         Self {
             router: AsyncRwLock::new(Some(router)),
             has_pending: AtomicBool::new(has_pending),
@@ -364,13 +450,50 @@ impl McpRouterAdapter {
             surface_snapshot_cache: StdRwLock::new(Some(surface_snapshot)),
             mcp_lifecycle_handle,
             external_surface_handle,
+            held_surface_lineages,
+            surface_ownership,
             execution_authority_id: NEXT_MCP_EXECUTION_AUTHORITY_ID.fetch_add(1, Ordering::Relaxed),
             execution_binding_epoch: AtomicU64::new(0),
+            shutdown_report: std::sync::Mutex::new(Some(shutdown_report)),
+            shutdown_observer: McpRouterShutdownObserver { report },
+            close_index,
+            #[cfg(test)]
+            bind_claim_attempt: std::sync::Mutex::new(None),
         }
     }
 
     fn execution_authority_key(&self) -> String {
         format!("mcp-router-adapter:{}", self.execution_authority_id)
+    }
+
+    /// The router this adapter owns, for a checked route over it.
+    pub(crate) fn router_lock(&self) -> &AsyncRwLock<Option<McpRouter>> {
+        &self.router
+    }
+
+    /// A trusted host's checked route over this adapter's router to exactly
+    /// `spec.operations` of `spec.server`, registered under the stable name
+    /// `spec.route`, for `session`: the construction's actual session, as
+    /// the factory passes it to its MCP adapter composer. The route offers
+    /// those operations under their genuine definitions even when the
+    /// server's access ceiling excludes them, and runs only plans it resolved
+    /// itself, under actual bound work and a prepared authorization for that
+    /// session, once per resolved plan, while it is open; the ordinary
+    /// projection and every other entry keep the ceiling. Creating it grants
+    /// nothing: each call still needs the work's grant selected for exactly
+    /// this route to this server, and that grant is route authority only,
+    /// never proof that the host's own checks ran. Hand the route only to
+    /// the host's own checked wrapper; it is never a session tool surface of
+    /// its own.
+    ///
+    /// # Errors
+    /// An empty route name, server name or operation, or no operation.
+    pub fn checked_route(
+        self: &Arc<Self>,
+        session: meerkat_core::types::SessionId,
+        spec: crate::CheckedMcpRouteSpec,
+    ) -> Result<Arc<crate::CheckedMcpRoute>, crate::CheckedMcpRouteError> {
+        crate::CheckedMcpRoute::new(Arc::clone(self), session, spec).map(Arc::new)
     }
 
     fn live_binding_fingerprint(
@@ -401,12 +524,33 @@ impl McpRouterAdapter {
             .ok_or_else(|| meerkat_core::ToolExecutionResolutionError::NotFound {
                 tool_name: tool_name.to_string(),
             })?;
-        meerkat_core::ToolExecutionOwnerWitness::new(
+        let witness = meerkat_core::ToolExecutionOwnerWitness::new(
             self.execution_authority_key(),
             tool_name,
             fingerprint,
         )
-        .map_err(meerkat_core::ToolExecutionResolutionError::from)
+        .map_err(meerkat_core::ToolExecutionResolutionError::from)?;
+        // The exact server registration and raw operation, under the same
+        // router read: the operation owner's fact, revalidated at dispatch.
+        Ok(match router.operation_target(tool_name) {
+            Some(target) => witness.with_operation_target(target),
+            None => witness,
+        })
+    }
+
+    /// The plan's operation target is still the one this live router
+    /// resolves the call to (same server registration, connection
+    /// generation and raw operation).
+    fn operation_target_matches(
+        &self,
+        router: &McpRouter,
+        tool_name: &str,
+        plan: &meerkat_core::ResolvedToolExecutionPlan,
+    ) -> bool {
+        plan.owner_witness(&self.execution_authority_key())
+            .is_some_and(|witness| {
+                witness.operation_target() == router.operation_target(tool_name).as_ref()
+            })
     }
 
     fn binding_witness_matches(
@@ -508,15 +652,55 @@ impl McpRouterAdapter {
         Ok(())
     }
 
+    /// What this adapter's router exposes now for one exact raw operation;
+    /// `Retired` once the router has been taken for shutdown.
+    pub async fn observe_operation(
+        &self,
+        server: &str,
+        raw_operation: &str,
+    ) -> meerkat_core::McpOperationObservation {
+        match self.router.read().await.as_ref() {
+            Some(router) => router.observe_operation(server, raw_operation),
+            None => meerkat_core::McpOperationObservation::Retired,
+        }
+    }
+
     /// Gracefully shutdown the MCP router.
     ///
-    /// Takes the router out of the adapter and shuts it down.
-    /// After this call, tool calls will fail.
+    /// [`Self::shutdown_with_report`], discarding the observation.
     pub async fn shutdown(&self) {
+        let _ = self.shutdown_with_report().await;
+    }
+
+    /// Gracefully shut down the MCP router, and return what its shutdown
+    /// observed of every close it owned ([`crate::McpRouter::shutdown_with_report`]).
+    ///
+    /// Takes the router out of the adapter and shuts it down in a task of its
+    /// own, so dropping this call stops only the wait: the taken router still
+    /// finishes its shutdown, and a later call waits for that same shutdown
+    /// and reads the same report. After this call, tool calls will fail.
+    pub async fn shutdown_with_report(&self) -> McpRouterShutdownObservation {
+        // Every close starts now, without the router lock: an in-flight call
+        // that holds a router guard does not delay it.
+        drop(self.begin_close());
         let mut router = self.router.write().await;
         if let Some(router) = router.take() {
             self.execution_binding_epoch.fetch_add(1, Ordering::AcqRel);
-            router.shutdown().await;
+            let report = self
+                .shutdown_report
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            tokio::spawn(async move {
+                let shutdown = router.shutdown_with_report().await;
+                if let Some(report) = report {
+                    report.send_replace(Some(Arc::new(shutdown)));
+                }
+            });
+        }
+        let observation = self.shutdown_observer().observe().await;
+        if matches!(observation, McpRouterShutdownObservation::Abandoned) {
+            tracing::error!("MCP router shutdown task ended without finishing");
         }
         self.has_pending.store(false, Ordering::Release);
         self.set_tools_cache(Arc::from([]));
@@ -525,6 +709,41 @@ impl McpRouterAdapter {
         self.set_catalog_cache(Arc::from([]));
         self.set_pending_sources_cache(Arc::from([]));
         self.set_surface_snapshot_cache(None);
+        observation
+    }
+
+    /// Close admission and start, now, every close the router owns, without
+    /// the router lock or any in-flight dispatch: from here on dispatch and
+    /// every staging entry refuse before taking a router guard, a connect
+    /// attempt stops and spawns or connects nothing more, each held stdio
+    /// server's client is closed and then its process under its own
+    /// bounds, and each remote connection's client is closed. A close
+    /// already running is joined. A later call returns a ticket over the
+    /// same closes, and [`Self::shutdown_with_report`] joins them for the
+    /// same outcomes. Call it within a Tokio runtime.
+    pub fn begin_close(&self) -> crate::McpCloseTicket {
+        self.close_index.begin_close()
+    }
+
+    /// Whether the router's close began ([`Self::begin_close`]).
+    pub(crate) fn is_closing(&self) -> bool {
+        self.close_index.is_closing()
+    }
+
+    fn refuse_if_closing(&self) -> Result<(), String> {
+        if self.is_closing() {
+            return Err("MCP router is closing".to_string());
+        }
+        Ok(())
+    }
+
+    /// An observer of this adapter's one router shutdown, whoever starts it.
+    /// It outlives the adapter: dropped without shutting its router down, the
+    /// adapter leaves its observers reading
+    /// [`McpRouterShutdownObservation::Abandoned`].
+    #[must_use]
+    pub fn shutdown_observer(&self) -> McpRouterShutdownObserver {
+        self.shutdown_observer.clone()
     }
 
     /// Read collision diagnostics from the router's current projection owner.
@@ -542,6 +761,7 @@ impl McpRouterAdapter {
 
     /// Stage an MCP server add operation.
     pub async fn stage_add(&self, config: McpServerConfig) -> Result<(), String> {
+        self.refuse_if_closing()?;
         let mut router = self.router.write().await;
         let router = router
             .as_mut()
@@ -551,6 +771,87 @@ impl McpRouterAdapter {
             .map_err(|error| error.to_string())?;
         self.sync_router_projection(router);
         Ok(())
+    }
+
+    /// Stage a governed MCP server add under a prepared attachment control.
+    ///
+    /// The router installs the exact descriptor and its control together,
+    /// under one borrow; the control is for this descriptor only and is asked
+    /// once, at the connection's physical entry after preparation. A refusal
+    /// there fails that connection before any spawn or request.
+    pub async fn stage_add_governed(
+        &self,
+        config: McpServerConfig,
+        authority: Arc<dyn McpAttachmentAuthority>,
+    ) -> Result<(), String> {
+        self.refuse_if_closing()?;
+        let mut router = self.router.write().await;
+        let router = router
+            .as_mut()
+            .ok_or_else(|| "MCP router has been shut down".to_string())?;
+        router
+            .stage_add_governed(config, authority)
+            .map_err(|error| error.to_string())?;
+        self.sync_router_projection(router);
+        Ok(())
+    }
+
+    /// [`Self::stage_add_governed`], returning the exact attempt this add
+    /// starts, observed against this adapter's own router (see
+    /// [`meerkat_core::mcp_attachment::McpAttachmentAttempt`]). The attempt
+    /// holds this adapter weakly: it is never a strong owner of the router (a
+    /// read upgrades it only for that read) and never owns its cleanup.
+    pub async fn stage_add_governed_observed(
+        self: &Arc<Self>,
+        config: McpServerConfig,
+        authority: Arc<dyn McpAttachmentAuthority>,
+    ) -> Result<meerkat_core::mcp_attachment::McpAttachmentAttempt, String> {
+        self.refuse_if_closing()?;
+        let server = config.name.clone();
+        let mut router = self.router.write().await;
+        let router = router
+            .as_mut()
+            .ok_or_else(|| "MCP router has been shut down".to_string())?;
+        let state = router
+            .stage_add_governed_attempt(config, authority)
+            .map_err(|error| error.to_string())?;
+        self.sync_router_projection(router);
+        Ok(meerkat_core::mcp_attachment::McpAttachmentAttempt::new(
+            server.clone(),
+            Arc::new(crate::attempt::RouterAttemptObserver::new(
+                Arc::downgrade(self),
+                server,
+                state,
+            )),
+        ))
+    }
+
+    /// Process arrived connection results as lifecycle polling does, leaving
+    /// their notices queued for the normal delivery, and return the wait for
+    /// the router's next progress (taken before processing, so a result
+    /// delivered meanwhile wakes it). `None` once the router is gone.
+    pub(crate) async fn progress_pending(&self) -> Option<crate::router::McpProgressWait> {
+        let mut router = self.router.write().await;
+        let router = router.as_mut()?;
+        let next = router.progress_wait();
+        router.progress_pending();
+        self.sync_router_projection(router);
+        Some(next)
+    }
+
+    /// See [`McpRouter::installed_operation`]; `None` once the router is
+    /// gone.
+    pub(crate) async fn installed_operation(
+        &self,
+        server: &str,
+        connection_generation: u64,
+        tool: &str,
+    ) -> Option<crate::router::InstalledOperation> {
+        self.router
+            .read()
+            .await
+            .as_ref()
+            .map(|router| router.installed_operation(server, connection_generation, tool))
     }
 
     /// Stage an MCP server remove operation.
@@ -588,8 +889,48 @@ impl McpRouterAdapter {
         }
     }
 
+    /// After a successful login for `target`, stage again the failed
+    /// operation awaiting exactly that target ([`McpRouter::retry_authorized`]).
+    /// It takes the router write lock that shutdown takes, so a router
+    /// already shut down is [`AuthorizedRetry::RouterClosed`] and nothing is
+    /// reinstalled from a detached adapter.
+    pub async fn retry_authorized(
+        &self,
+        target: &meerkat_auth_core::McpServerIdentity,
+    ) -> Result<crate::AuthorizedRetry, crate::McpError> {
+        if self.is_closing() {
+            return Ok(crate::AuthorizedRetry::RouterClosed);
+        }
+        let mut router = self.router.write().await;
+        let Some(router) = router.as_mut() else {
+            return Ok(crate::AuthorizedRetry::RouterClosed);
+        };
+        let retried = router.retry_authorized(target);
+        self.sync_router_projection(router);
+        retried
+    }
+
+    /// After the credential for `target` was released (signed out), stop
+    /// offering every connected server that uses exactly it
+    /// ([`McpRouter::credential_released`]). It takes the router write lock
+    /// that shutdown takes, so a router already shut down is
+    /// [`crate::ReleasedCredential::RouterClosed`].
+    pub async fn credential_released(
+        &self,
+        target: &meerkat_auth_core::McpServerIdentity,
+    ) -> Result<crate::ReleasedCredential, crate::McpError> {
+        let mut router = self.router.write().await;
+        let Some(router) = router.as_mut() else {
+            return Ok(crate::ReleasedCredential::RouterClosed);
+        };
+        let released = router.credential_released(target);
+        self.sync_router_projection(router);
+        released
+    }
+
     /// Stage an MCP server reload operation.
     pub async fn stage_reload<T: Into<McpReloadTarget>>(&self, target: T) -> Result<(), String> {
+        self.refuse_if_closing()?;
         let mut router = self.router.write().await;
         let router = router
             .as_mut()
@@ -603,6 +944,7 @@ impl McpRouterAdapter {
 
     /// Apply staged MCP operations.
     pub async fn apply_staged(&self) -> Result<McpApplyResult, String> {
+        self.refuse_if_closing()?;
         let mut router = self.router.write().await;
         let router = router
             .as_mut()
@@ -832,6 +1174,9 @@ impl McpRouterAdapter {
     /// non-clean report as a typed wire fault, instead of hand-rolling
     /// per-server stage loops that abort halfway with partial staging.
     pub async fn stage_reload_all(&self) -> Result<McpReloadReport, McpError> {
+        if self.is_closing() {
+            return Err(McpError::RouterShutDown);
+        }
         let mut router = self.router.write().await;
         let router = router.as_mut().ok_or(McpError::RouterShutDown)?;
         let mut report = McpReloadReport::default();
@@ -912,10 +1257,36 @@ impl McpRouterAdapter {
     /// tool servers BEFORE the agent build delivers the session bind)
     /// poisoned the surface permanently and every external tool call was
     /// rejected thereafter.
+    /// Stage `input` on `new` and return the exact lineage it recorded.
+    fn stage_recording_lineage(
+        new: &dyn ExternalToolSurfaceHandle,
+        input: meerkat_core::handles::ExternalToolSurfaceInput,
+    ) -> Result<u64, String> {
+        let transition = new
+            .apply_surface_input(input)
+            .map_err(|error| error.to_string())?;
+        transition
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                meerkat_core::handles::ExternalToolSurfaceEffect::StageRecorded {
+                    staged_intent_sequence,
+                    ..
+                } => Some(*staged_intent_sequence),
+                _ => None,
+            })
+            .ok_or_else(|| "session authority recorded no staged lineage".to_string())
+    }
+
+    /// Re-derive the pre-bind surface facts on `new` and return the lineages
+    /// the re-derivation staged there, which the router now holds.
     fn seed_pre_bind_surface_facts(
         snapshot: &ExternalToolSurfaceSnapshot,
         new: &dyn ExternalToolSurfaceHandle,
-    ) -> Result<(), String> {
+    ) -> Result<std::collections::BTreeMap<String, BTreeSet<u64>>, String> {
+        use meerkat_core::handles::ExternalToolSurfaceInput as SeedInput;
+        let mut held: std::collections::BTreeMap<String, BTreeSet<u64>> =
+            std::collections::BTreeMap::new();
         use meerkat_core::{
             ExternalToolSurfaceBaseState as Base, ExternalToolSurfacePendingOp as Pending,
             ExternalToolSurfaceStagedOp as Staged,
@@ -946,25 +1317,30 @@ impl McpRouterAdapter {
                 && entry.pending_op == Pending::None
                 && entry.staged_op == Staged::Add;
 
+            let mut added_seq = None;
             if needs_applied_add || staged_add_only {
-                new.stage_add(surface_id.clone(), now_ms)
-                    .map_err(|error| seed_err("stage_add", &error))?;
+                let seq = Self::stage_recording_lineage(
+                    new,
+                    SeedInput::StageAdd {
+                        surface_id: surface_id.clone(),
+                        now_ms,
+                    },
+                )
+                .map_err(|error| seed_err("stage_add", &error))?;
+                held.entry(surface_id.clone()).or_default().insert(seq);
+                added_seq = Some(seq);
             }
             let mut applied_staged_seq = None;
             if needs_applied_add {
-                // Capture the staged sequence BEFORE ApplyBoundary consumes
-                // it — completion inputs carry the sequence pair from the
-                // boundary application, exactly like the router's
-                // ScheduleSurfaceCompletion effects do.
-                let staged_seq = new
-                    .surface_snapshot(&surface_id)
-                    .and_then(|seeded| seeded.staged_intent_sequence)
-                    .ok_or_else(|| {
-                        seed_err(
-                            "stage_add",
-                            &"session authority recorded no staged sequence",
-                        )
-                    })?;
+                // The stage's own recorded lineage: completion inputs carry
+                // the sequence pair from the boundary application, exactly
+                // like the router's ScheduleSurfaceCompletion effects do.
+                let staged_seq = added_seq.ok_or_else(|| {
+                    seed_err(
+                        "stage_add",
+                        &"session authority recorded no staged sequence",
+                    )
+                })?;
                 new.apply_boundary(surface_id.clone(), now_ms, staged_seq, 0)
                     .map_err(|error| seed_err("apply_boundary", &error))?;
                 applied_staged_seq = Some(staged_seq);
@@ -992,25 +1368,37 @@ impl McpRouterAdapter {
             }
 
             // Re-derive any live follow-up intent on the Active base.
-            match entry.staged_op {
-                Staged::Remove => new
-                    .stage_remove(surface_id.clone(), now_ms)
-                    .map_err(|error| seed_err("stage_remove", &error))?,
-                Staged::Reload => new
-                    .stage_reload(surface_id.clone(), now_ms)
-                    .map_err(|error| seed_err("stage_reload", &error))?,
-                Staged::Add | Staged::None => {}
+            let follow_up = match entry.staged_op {
+                Staged::Remove => Some((
+                    "stage_remove",
+                    SeedInput::StageRemove {
+                        surface_id: surface_id.clone(),
+                        now_ms,
+                    },
+                )),
+                Staged::Reload => Some((
+                    "stage_reload",
+                    SeedInput::StageReload {
+                        surface_id: surface_id.clone(),
+                        now_ms,
+                    },
+                )),
+                Staged::Add | Staged::None => None,
+            };
+            let mut follow_up_seq = None;
+            if let Some((stage, input)) = follow_up {
+                let seq = Self::stage_recording_lineage(new, input)
+                    .map_err(|error| seed_err(stage, &error))?;
+                held.entry(surface_id.clone()).or_default().insert(seq);
+                follow_up_seq = Some(seq);
             }
             if entry.base_state == Base::Removing {
-                let staged_seq = new
-                    .surface_snapshot(&surface_id)
-                    .and_then(|seeded| seeded.staged_intent_sequence)
-                    .ok_or_else(|| {
-                        seed_err(
-                            "stage_remove",
-                            &"session authority recorded no removal sequence",
-                        )
-                    })?;
+                let staged_seq = follow_up_seq.ok_or_else(|| {
+                    seed_err(
+                        "stage_remove",
+                        &"session authority recorded no removal sequence",
+                    )
+                })?;
                 new.apply_boundary(surface_id.clone(), now_ms, staged_seq, 0)
                     .map_err(|error| seed_err("apply_boundary(remove)", &error))?;
             }
@@ -1033,7 +1421,7 @@ impl McpRouterAdapter {
                 })?;
             }
         }
-        Ok(())
+        Ok(held)
     }
 }
 
@@ -1126,6 +1514,9 @@ impl AgentToolDispatcher for McpRouterAdapter {
         call: ToolCallView<'_>,
         context: &meerkat_core::ToolDispatchContext,
     ) -> Result<meerkat_core::ops::ToolDispatchOutcome, ToolError> {
+        if self.is_closing() {
+            return Err(ToolError::execution_failed("MCP router is closing"));
+        }
         let guard = self.router.read().await;
         match &*guard {
             Some(router) => router.dispatch_with_context(call, context).await,
@@ -1139,6 +1530,9 @@ impl AgentToolDispatcher for McpRouterAdapter {
         context: &meerkat_core::ToolDispatchContext,
         plan: &meerkat_core::ResolvedToolExecutionPlan,
     ) -> Result<meerkat_core::ops::ToolDispatchOutcome, ToolError> {
+        if self.is_closing() {
+            return Err(ToolError::execution_failed("MCP router is closing"));
+        }
         let guard = self.router.read().await;
         match &*guard {
             Some(router) => {
@@ -1146,7 +1540,8 @@ impl AgentToolDispatcher for McpRouterAdapter {
                     call.name,
                     self.live_binding_fingerprint(router, call.name),
                     plan,
-                ) {
+                ) || !self.operation_target_matches(router, call.name, plan)
+                {
                     return Err(ToolError::unavailable(
                         call.name,
                         meerkat_core::ToolUnavailableReason::ExecutionOwnerChanged,
@@ -1294,6 +1689,15 @@ impl AgentToolDispatcher for McpRouterAdapter {
         let Some(slot) = &self.external_surface_handle else {
             return;
         };
+        #[cfg(test)]
+        if let Some(attempt) = self
+            .bind_claim_attempt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = attempt.send(());
+        }
         let current = match slot.read() {
             Ok(slot) => Arc::clone(&*slot),
             Err(poisoned) => {
@@ -1308,6 +1712,9 @@ impl AgentToolDispatcher for McpRouterAdapter {
             return;
         }
         let mut poisoned_handle = None;
+        // Lineages staged on the old surface mean nothing on the new one;
+        // the router holds only what the re-derivation stages there.
+        let mut rebound_lineages = std::collections::BTreeMap::new();
         // Live snapshot: the cached copy can predate connection completions
         // that already landed on the pre-bind authority.
         let pre_bind_snapshot = self
@@ -1322,7 +1729,8 @@ impl AgentToolDispatcher for McpRouterAdapter {
             // the session machine re-validates every fact. Only a machine
             // REFUSAL poisons fail-closed.
             match Self::seed_pre_bind_surface_facts(&snapshot, handle.as_ref()) {
-                Ok(()) => {
+                Ok(held) => {
+                    rebound_lineages = held;
                     tracing::info!(
                         surfaces = snapshot.entries.len(),
                         "re-derived pre-bind external tool surface facts onto session authority"
@@ -1349,9 +1757,60 @@ impl AgentToolDispatcher for McpRouterAdapter {
                 poisoned.into_inner()
             }
         };
+        // The handle, its ownership and the held lineages change together
+        // under the slot's write lock; the router stages (recording a
+        // lineage) under a read hold of it and ends its hold under one
+        // exclusive claim of it. The bound surface belongs to the binder
+        // (the session registration), not to this router: shutting the
+        // router down must release only its own lineages there, never shut
+        // that surface down.
+        let published = self
+            .surface_ownership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .rebind_borrowed();
+        if !published {
+            // The router already ended its hold: publish nothing to it, and
+            // release what the re-derivation staged on the new surface.
+            drop(guard);
+            crate::router::release_lineages(handle.as_ref(), rebound_lineages);
+            return;
+        }
+        *self
+            .held_surface_lineages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = rebound_lineages;
         *guard = poisoned_handle.unwrap_or(handle);
+        drop(guard);
     }
 }
+
+/// The agent that owns this adapter's router releases it when it ends: a
+/// borrowed surface has the router's own lineages released, an owned one is
+/// shut down.
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl meerkat_core::AgentOwnedRelease for McpRouterAdapter {
+    async fn release(&self) {
+        self.shutdown().await;
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl meerkat_core::McpOperationObserver for McpRouterAdapter {
+    async fn observe_operation(
+        &self,
+        server: &str,
+        raw_operation: &str,
+    ) -> meerkat_core::McpOperationObservation {
+        McpRouterAdapter::observe_operation(self, server, raw_operation).await
+    }
+}
+
+#[cfg(test)]
+#[path = "shutdown_observer_tests.rs"]
+mod shutdown_observer_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1360,6 +1819,7 @@ mod tests {
     use crate::McpRouter;
     use crate::connection::McpConnection;
     use meerkat_core::ExternalToolSurfacePendingOp;
+    use meerkat_core::mcp_attachment::McpAttachmentRefusal;
     use meerkat_runtime::RuntimeExternalToolSurfaceHandle;
     use std::collections::HashMap;
     use std::path::Path;
@@ -1544,6 +2004,888 @@ mod tests {
         fn snapshot_aligned_epoch(&self) -> u64 {
             0
         }
+    }
+
+    /// A prepared attachment control whose apply decision the test sets.
+    struct TestAttachment {
+        server: meerkat_core::McpServerConfig,
+        apply: Result<(), McpAttachmentRefusal>,
+        apply_checks: std::sync::atomic::AtomicUsize,
+    }
+
+    impl McpAttachmentAuthority for TestAttachment {
+        fn server(&self) -> &meerkat_core::McpServerConfig {
+            &self.server
+        }
+        fn authorize_apply(&self) -> Result<(), McpAttachmentRefusal> {
+            self.apply_checks.fetch_add(1, Ordering::SeqCst);
+            self.apply.clone()
+        }
+        fn authorize_persist(
+            &self,
+            _scope: meerkat_core::mcp_config::McpScope,
+        ) -> Result<(), McpAttachmentRefusal> {
+            Err(McpAttachmentRefusal::Denied)
+        }
+    }
+
+    fn test_attachment(
+        server: &meerkat_core::McpServerConfig,
+        apply: Result<(), McpAttachmentRefusal>,
+    ) -> Arc<TestAttachment> {
+        Arc::new(TestAttachment {
+            server: server.clone(),
+            apply,
+            apply_checks: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn marker_server(name: &str, marker: &Path) -> meerkat_core::McpServerConfig {
+        meerkat_core::McpServerConfig::stdio(
+            name,
+            "/bin/sh".to_string(),
+            vec!["-c".to_string(), format!("touch '{}'", marker.display())],
+            HashMap::new(),
+        )
+    }
+
+    /// Wait until the background connection has asked `control` at its
+    /// physical entry, then let a refused attempt settle.
+    async fn until_entry_asked(control: &TestAttachment) {
+        tokio::time::timeout(async_connect_test_timeout(), async {
+            while control.apply_checks.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the connection reaches its physical entry");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    #[tokio::test]
+    async fn governed_control_is_staged_with_its_payload_and_asked_only_at_physical_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("spawned");
+        let adapter = McpRouterAdapter::new(generated_surface_router());
+        let server = marker_server("refused", &marker);
+        let control = test_attachment(&server, Err(McpAttachmentRefusal::Denied));
+        adapter
+            .stage_add_governed(server, control.clone())
+            .await
+            .expect("stage under a prepared control");
+        // Staging and enqueueing ask nothing; the control travels with the
+        // exact payload.
+        assert_eq!(control.apply_checks.load(Ordering::SeqCst), 0);
+        adapter
+            .apply_staged()
+            .await
+            .expect("apply boundary enqueues");
+        until_entry_asked(&control).await;
+        assert_eq!(control.apply_checks.load(Ordering::SeqCst), 1);
+        assert!(!marker.exists(), "a refused entry never spawns the server");
+    }
+
+    #[tokio::test]
+    async fn an_allowed_entry_is_asked_exactly_once() {
+        let adapter = McpRouterAdapter::new(generated_surface_router());
+        let server = test_server_config("allowed", Path::new("/nonexistent/mcp-server"));
+        let control = test_attachment(&server, Ok(()));
+        adapter
+            .stage_add_governed(server, control.clone())
+            .await
+            .expect("stage under a prepared control");
+        adapter
+            .apply_staged()
+            .await
+            .expect("apply boundary enqueues");
+        until_entry_asked(&control).await;
+        assert_eq!(control.apply_checks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_same_name_replacement_never_applies_under_the_earlier_control() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker_a = dir.path().join("a");
+        let marker_b = dir.path().join("b");
+        let adapter = McpRouterAdapter::new(generated_surface_router());
+        let server_a = marker_server("same", &marker_a);
+        let server_b = marker_server("same", &marker_b);
+        let control_a = test_attachment(&server_a, Ok(()));
+        let control_b = test_attachment(&server_b, Err(McpAttachmentRefusal::Denied));
+        adapter
+            .stage_add_governed(server_a, control_a.clone())
+            .await
+            .expect("stage A");
+        adapter
+            .stage_add_governed(server_b, control_b.clone())
+            .await
+            .expect("stage B replaces A with its own control");
+        adapter
+            .apply_staged()
+            .await
+            .expect("apply boundary enqueues");
+        until_entry_asked(&control_b).await;
+        assert_eq!(control_a.apply_checks.load(Ordering::SeqCst), 0);
+        assert_eq!(control_b.apply_checks.load(Ordering::SeqCst), 1);
+        assert!(!marker_a.exists() && !marker_b.exists());
+    }
+
+    #[tokio::test]
+    async fn a_governed_name_never_changes_without_a_control() {
+        let adapter = McpRouterAdapter::new(generated_surface_router());
+        let server = test_server_config("governed", Path::new("/nonexistent/mcp-server"));
+        let other = test_server_config("governed", Path::new("/nonexistent/other-server"));
+        adapter
+            .stage_add_governed(server.clone(), test_attachment(&server, Ok(())))
+            .await
+            .expect("stage under a prepared control");
+        let plain = adapter.stage_add(other.clone()).await;
+        assert!(
+            plain.is_err(),
+            "a plain add cannot replace a governed payload"
+        );
+        let reload = adapter
+            .stage_reload(crate::McpReloadTarget::Config(other))
+            .await;
+        assert!(
+            reload.is_err(),
+            "a reload cannot replace a governed payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn governed_add_refuses_a_control_for_another_descriptor() {
+        let adapter = McpRouterAdapter::new(generated_surface_router());
+        let server = test_server_config("one", Path::new("/nonexistent/mcp-server"));
+        let other = test_server_config("one", Path::new("/nonexistent/other-server"));
+        let control = test_attachment(&other, Ok(()));
+        let error = adapter
+            .stage_add_governed(server, control.clone())
+            .await
+            .expect_err("a control covers only its exact descriptor");
+        assert!(
+            error.contains(&McpAttachmentRefusal::Mismatch.to_string()),
+            "{error}"
+        );
+        let result = adapter.apply_staged().await.expect("apply boundary");
+        assert!(result.delta.lifecycle_actions.is_empty());
+        assert_eq!(control.apply_checks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_staged_removal_keeps_a_withdrawn_governed_add_governed_until_its_boundary() {
+        let mut router = generated_surface_router();
+        let server = test_server_config("governed", Path::new("/nonexistent/mcp-server"));
+        let other = test_server_config("governed", Path::new("/nonexistent/other-server"));
+        router
+            .stage_add_governed(server.clone(), test_attachment(&server, Ok(())))
+            .expect("stage under a prepared control");
+        router.stage_remove("governed").expect("stage the removal");
+        // The removal is intent only: a plain add cannot replace it before
+        // its boundary.
+        assert!(matches!(
+            router.stage_add(other.clone()),
+            Err(McpError::AttachmentRefused(McpAttachmentRefusal::Mismatch))
+        ));
+        router.apply_staged().await.expect("apply boundary");
+        // The withdrawn add never attached: after the boundary the name is
+        // available to an ungoverned add.
+        router
+            .stage_add(other)
+            .expect("an ungoverned add after the removal's disposition");
+        router.shutdown().await;
+    }
+
+    /// The real surface handle, except that the next removal boundary first
+    /// meets another holder's newer staged removal of the same surface, so the
+    /// router's captured sequence is stale and the boundary is rejected.
+    struct StaleRemovalBoundary {
+        inner: Arc<dyn ExternalToolSurfaceHandle>,
+        armed: AtomicBool,
+    }
+
+    impl ExternalToolSurfaceHandle for StaleRemovalBoundary {
+        fn apply_surface_input(
+            &self,
+            input: ExternalToolSurfaceInput,
+        ) -> Result<ExternalToolSurfaceTransition, DslTransitionError> {
+            if let ExternalToolSurfaceInput::ApplyBoundary { surface_id, .. } = &input
+                && self.armed.swap(false, Ordering::SeqCst)
+            {
+                self.inner.stage_remove(surface_id.clone(), 0)?;
+            }
+            self.inner.apply_surface_input(input)
+        }
+        fn register(&self, surface_id: String) -> Result<(), DslTransitionError> {
+            self.inner.register(surface_id)
+        }
+        fn stage_add(&self, surface_id: String, now_ms: u64) -> Result<(), DslTransitionError> {
+            self.inner.stage_add(surface_id, now_ms)
+        }
+        fn stage_remove(&self, surface_id: String, now_ms: u64) -> Result<(), DslTransitionError> {
+            self.inner.stage_remove(surface_id, now_ms)
+        }
+        fn stage_reload(&self, surface_id: String, now_ms: u64) -> Result<(), DslTransitionError> {
+            self.inner.stage_reload(surface_id, now_ms)
+        }
+        fn apply_boundary(
+            &self,
+            surface_id: String,
+            now_ms: u64,
+            staged_intent_sequence: u64,
+            applied_at_turn: u64,
+        ) -> Result<(), DslTransitionError> {
+            self.inner
+                .apply_boundary(surface_id, now_ms, staged_intent_sequence, applied_at_turn)
+        }
+        fn mark_pending_succeeded(
+            &self,
+            surface_id: String,
+            pending_task_sequence: u64,
+            staged_intent_sequence: u64,
+        ) -> Result<(), DslTransitionError> {
+            self.inner.mark_pending_succeeded(
+                surface_id,
+                pending_task_sequence,
+                staged_intent_sequence,
+            )
+        }
+        fn mark_pending_failed(
+            &self,
+            surface_id: String,
+            pending_task_sequence: u64,
+            staged_intent_sequence: u64,
+            cause: ExternalToolSurfaceFailureCause,
+        ) -> Result<(), DslTransitionError> {
+            self.inner.mark_pending_failed(
+                surface_id,
+                pending_task_sequence,
+                staged_intent_sequence,
+                cause,
+            )
+        }
+        fn call_started(&self, surface_id: String) -> Result<(), DslTransitionError> {
+            self.inner.call_started(surface_id)
+        }
+        fn call_finished(&self, surface_id: String) -> Result<(), DslTransitionError> {
+            self.inner.call_finished(surface_id)
+        }
+        fn finalize_removal_clean(&self, surface_id: String) -> Result<(), DslTransitionError> {
+            self.inner.finalize_removal_clean(surface_id)
+        }
+        fn finalize_removal_forced(&self, surface_id: String) -> Result<(), DslTransitionError> {
+            self.inner.finalize_removal_forced(surface_id)
+        }
+        fn snapshot_aligned(&self, epoch: u64) -> Result<(), DslTransitionError> {
+            self.inner.snapshot_aligned(epoch)
+        }
+        fn shutdown_surface(&self) -> Result<(), DslTransitionError> {
+            self.inner.shutdown_surface()
+        }
+        fn surface_snapshot(&self, surface_id: &str) -> Option<SurfaceSnapshot> {
+            self.inner.surface_snapshot(surface_id)
+        }
+        fn diagnostic_snapshot(&self) -> SurfaceDiagnosticSnapshot {
+            self.inner.diagnostic_snapshot()
+        }
+        fn visible_surfaces(&self) -> BTreeSet<String> {
+            self.inner.visible_surfaces()
+        }
+        fn removing_surfaces(&self) -> BTreeSet<String> {
+            self.inner.removing_surfaces()
+        }
+        fn pending_surfaces(&self) -> BTreeSet<String> {
+            self.inner.pending_surfaces()
+        }
+        fn has_pending_or_staged(&self) -> bool {
+            self.inner.has_pending_or_staged()
+        }
+        fn snapshot_epoch(&self) -> u64 {
+            self.inner.snapshot_epoch()
+        }
+        fn snapshot_aligned_epoch(&self) -> u64 {
+            self.inner.snapshot_aligned_epoch()
+        }
+    }
+
+    /// The real surface handle, except that the first input `gate_on`
+    /// matches reports itself entered and then waits to be let through.
+    struct GatedSurface {
+        inner: Arc<dyn ExternalToolSurfaceHandle>,
+        gate_on: fn(&ExternalToolSurfaceInput) -> bool,
+        entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        go: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl GatedSurface {
+        fn new(
+            gate_on: fn(&ExternalToolSurfaceInput) -> bool,
+        ) -> (
+            Arc<Self>,
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (go_tx, go_rx) = std::sync::mpsc::channel();
+            let gated = Arc::new(Self {
+                inner: generated_surface_handle(),
+                gate_on,
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                go: std::sync::Mutex::new(go_rx),
+            });
+            (gated, entered_rx, go_tx)
+        }
+    }
+
+    impl ExternalToolSurfaceHandle for GatedSurface {
+        fn apply_surface_input(
+            &self,
+            input: ExternalToolSurfaceInput,
+        ) -> Result<ExternalToolSurfaceTransition, DslTransitionError> {
+            if (self.gate_on)(&input)
+                && let Some(entered) = self.entered.lock().unwrap().take()
+            {
+                entered.send(()).unwrap();
+                self.go.lock().unwrap().recv().unwrap();
+            }
+            self.inner.apply_surface_input(input)
+        }
+        fn register(&self, surface_id: String) -> Result<(), DslTransitionError> {
+            self.inner.register(surface_id)
+        }
+        fn stage_add(&self, surface_id: String, now_ms: u64) -> Result<(), DslTransitionError> {
+            self.inner.stage_add(surface_id, now_ms)
+        }
+        fn stage_remove(&self, surface_id: String, now_ms: u64) -> Result<(), DslTransitionError> {
+            self.inner.stage_remove(surface_id, now_ms)
+        }
+        fn stage_reload(&self, surface_id: String, now_ms: u64) -> Result<(), DslTransitionError> {
+            self.inner.stage_reload(surface_id, now_ms)
+        }
+        fn apply_boundary(
+            &self,
+            surface_id: String,
+            now_ms: u64,
+            staged_intent_sequence: u64,
+            applied_at_turn: u64,
+        ) -> Result<(), DslTransitionError> {
+            self.inner
+                .apply_boundary(surface_id, now_ms, staged_intent_sequence, applied_at_turn)
+        }
+        fn mark_pending_succeeded(
+            &self,
+            surface_id: String,
+            pending_task_sequence: u64,
+            staged_intent_sequence: u64,
+        ) -> Result<(), DslTransitionError> {
+            self.inner.mark_pending_succeeded(
+                surface_id,
+                pending_task_sequence,
+                staged_intent_sequence,
+            )
+        }
+        fn mark_pending_failed(
+            &self,
+            surface_id: String,
+            pending_task_sequence: u64,
+            staged_intent_sequence: u64,
+            cause: ExternalToolSurfaceFailureCause,
+        ) -> Result<(), DslTransitionError> {
+            self.inner.mark_pending_failed(
+                surface_id,
+                pending_task_sequence,
+                staged_intent_sequence,
+                cause,
+            )
+        }
+        fn call_started(&self, surface_id: String) -> Result<(), DslTransitionError> {
+            self.inner.call_started(surface_id)
+        }
+        fn call_finished(&self, surface_id: String) -> Result<(), DslTransitionError> {
+            self.inner.call_finished(surface_id)
+        }
+        fn finalize_removal_clean(&self, surface_id: String) -> Result<(), DslTransitionError> {
+            self.inner.finalize_removal_clean(surface_id)
+        }
+        fn finalize_removal_forced(&self, surface_id: String) -> Result<(), DslTransitionError> {
+            self.inner.finalize_removal_forced(surface_id)
+        }
+        fn snapshot_aligned(&self, epoch: u64) -> Result<(), DslTransitionError> {
+            self.inner.snapshot_aligned(epoch)
+        }
+        fn shutdown_surface(&self) -> Result<(), DslTransitionError> {
+            self.inner.shutdown_surface()
+        }
+        fn surface_snapshot(&self, surface_id: &str) -> Option<SurfaceSnapshot> {
+            self.inner.surface_snapshot(surface_id)
+        }
+        fn diagnostic_snapshot(&self) -> SurfaceDiagnosticSnapshot {
+            self.inner.diagnostic_snapshot()
+        }
+        fn visible_surfaces(&self) -> BTreeSet<String> {
+            self.inner.visible_surfaces()
+        }
+        fn removing_surfaces(&self) -> BTreeSet<String> {
+            self.inner.removing_surfaces()
+        }
+        fn pending_surfaces(&self) -> BTreeSet<String> {
+            self.inner.pending_surfaces()
+        }
+        fn has_pending_or_staged(&self) -> bool {
+            self.inner.has_pending_or_staged()
+        }
+        fn snapshot_epoch(&self) -> u64 {
+            self.inner.snapshot_epoch()
+        }
+        fn snapshot_aligned_epoch(&self) -> u64 {
+            self.inner.snapshot_aligned_epoch()
+        }
+    }
+
+    /// A bind racing an owned router's shutdown waits for the shutdown's
+    /// claim: the shutdown reaches only the router's own private surface,
+    /// never the registration surface the bind publishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bind_racing_an_owned_shutdown_waits_for_its_claim() {
+        let (private, entered, go) =
+            GatedSurface::new(|input| matches!(input, ExternalToolSurfaceInput::Shutdown));
+        let adapter = Arc::new(McpRouterAdapter::new(
+            McpRouter::new_with_surface_handle(private.clone())
+                .with_surface_ownership(crate::McpSurfaceOwnership::Owned),
+        ));
+        let shutting = tokio::spawn({
+            let adapter = Arc::clone(&adapter);
+            async move { adapter.shutdown().await }
+        });
+        // The shutdown is inside its claim, applying Shutdown to the
+        // private surface.
+        tokio::task::spawn_blocking(move || entered.recv())
+            .await
+            .unwrap()
+            .expect("the shutdown reached its surface");
+        let registration = generated_surface_handle();
+        let (attempted, bind_attempt) = std::sync::mpsc::channel();
+        *adapter.bind_claim_attempt.lock().unwrap() = Some(attempted);
+        let binding = std::thread::spawn({
+            let adapter = Arc::clone(&adapter);
+            let registration = Arc::clone(&registration);
+            move || adapter.bind_external_tool_surface_handle(registration)
+        });
+        // The acknowledgement is sent just before the bind's first read of
+        // the slot, so the bind thread has started and reached that point;
+        // it removes the "not yet started" ambiguity, not all scheduling
+        // ambiguity. The gated claim still holds the slot, so the bind
+        // cannot have read or published anything while it is held.
+        bind_attempt
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the bind reached its claim attempt");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!binding.is_finished(), "the bind waits for the claim");
+        go.send(()).unwrap();
+        shutting.await.unwrap();
+        binding.join().unwrap();
+        assert_eq!(
+            private.diagnostic_snapshot().surface_phase,
+            meerkat_core::ExternalToolSurfaceGlobalPhase::Shutdown
+        );
+        assert_eq!(
+            registration.diagnostic_snapshot().surface_phase,
+            meerkat_core::ExternalToolSurfaceGlobalPhase::Operating,
+            "the owned shutdown never reaches the rebound surface"
+        );
+    }
+
+    /// A bind racing a borrowed router's lineage release waits for the
+    /// release's claim: the release consumes exactly the lineages the router
+    /// held on the surface it claimed, and the rebound surface is untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bind_racing_a_borrowed_release_waits_for_its_claim() {
+        let (claimed, entered, go) =
+            GatedSurface::new(|input| matches!(input, ExternalToolSurfaceInput::Release { .. }));
+        let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new_with_surface_handle(
+            claimed.clone(),
+        )));
+        adapter
+            .stage_add(test_server_config(
+                "held",
+                Path::new("/nonexistent/mcp-server"),
+            ))
+            .await
+            .expect("a lineage the router holds");
+        let releasing = tokio::spawn({
+            let adapter = Arc::clone(&adapter);
+            async move { adapter.shutdown().await }
+        });
+        tokio::task::spawn_blocking(move || entered.recv())
+            .await
+            .unwrap()
+            .expect("the release reached its claimed surface");
+        let rebound = generated_surface_handle();
+        let (attempted, bind_attempt) = std::sync::mpsc::channel();
+        *adapter.bind_claim_attempt.lock().unwrap() = Some(attempted);
+        let binding = std::thread::spawn({
+            let adapter = Arc::clone(&adapter);
+            let rebound = Arc::clone(&rebound);
+            move || adapter.bind_external_tool_surface_handle(rebound)
+        });
+        // The acknowledgement is sent just before the bind's first read of
+        // the slot, so the bind thread has started and reached that point;
+        // it removes the "not yet started" ambiguity, not all scheduling
+        // ambiguity. The gated claim still holds the slot, so the bind
+        // cannot have read or published anything while it is held.
+        bind_attempt
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the bind reached its claim attempt");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!binding.is_finished(), "the bind waits for the claim");
+        go.send(()).unwrap();
+        releasing.await.unwrap();
+        binding.join().unwrap();
+        assert_eq!(
+            claimed
+                .surface_snapshot("held")
+                .map(|entry| entry.staged_op),
+            Some(ExternalToolSurfaceStagedOp::None),
+            "the claimed surface's own lineage is released"
+        );
+        assert_eq!(
+            claimed.diagnostic_snapshot().surface_phase,
+            meerkat_core::ExternalToolSurfaceGlobalPhase::Operating,
+            "a borrowed surface is never shut down"
+        );
+        assert!(
+            rebound
+                .surface_snapshot("held")
+                .is_none_or(|entry| entry.staged_op == ExternalToolSurfaceStagedOp::None),
+            "the rebound surface keeps nothing of the ended router"
+        );
+    }
+
+    /// A bind that began re-deriving its pre-bind facts before the router
+    /// ended its hold publishes nothing afterwards and releases what it
+    /// staged on the registration surface.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bind_finishing_after_the_router_ended_publishes_nothing() {
+        let adapter = Arc::new(McpRouterAdapter::new(
+            McpRouter::new_with_surface_handle(generated_surface_handle())
+                .with_surface_ownership(crate::McpSurfaceOwnership::Owned),
+        ));
+        adapter
+            .stage_add(test_server_config(
+                "raced",
+                Path::new("/nonexistent/mcp-server"),
+            ))
+            .await
+            .expect("a pre-bind staged fact");
+        let (registration, entered, go) =
+            GatedSurface::new(|input| matches!(input, ExternalToolSurfaceInput::StageAdd { .. }));
+        let binding = std::thread::spawn({
+            let adapter = Arc::clone(&adapter);
+            let registration: Arc<dyn ExternalToolSurfaceHandle> = registration.clone();
+            move || adapter.bind_external_tool_surface_handle(registration)
+        });
+        // The bind is re-deriving the staged fact on the registration.
+        tokio::task::spawn_blocking(move || entered.recv())
+            .await
+            .unwrap()
+            .expect("the bind re-derives its pre-bind fact");
+        adapter.shutdown().await;
+        go.send(()).unwrap();
+        binding.join().unwrap();
+        assert_eq!(
+            registration
+                .surface_snapshot("raced")
+                .map(|entry| entry.staged_op),
+            Some(ExternalToolSurfaceStagedOp::None),
+            "the ended router's re-derived staging is released"
+        );
+        assert_eq!(
+            registration.diagnostic_snapshot().surface_phase,
+            meerkat_core::ExternalToolSurfaceGlobalPhase::Operating
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_removal_boundary_keeps_the_governed_name() {
+        let handle = Arc::new(StaleRemovalBoundary {
+            inner: generated_surface_handle(),
+            armed: AtomicBool::new(false),
+        });
+        let mut router = McpRouter::new_with_surface_handle(handle.clone());
+        let server = test_server_config("governed", Path::new("/nonexistent/mcp-server"));
+        let other = test_server_config("governed", Path::new("/nonexistent/other-server"));
+        router
+            .stage_add_governed(server.clone(), test_attachment(&server, Ok(())))
+            .expect("stage under a prepared control");
+        router.stage_remove("governed").expect("stage the removal");
+        handle.armed.store(true, Ordering::SeqCst);
+        let applied = router.apply_staged().await.expect("apply boundary");
+        assert!(
+            applied
+                .delta
+                .rejected_boundaries
+                .iter()
+                .any(|rejection| rejection.server == "governed"),
+            "the stale removal boundary is rejected"
+        );
+        // The rejected removal did not dispose of the name.
+        assert!(matches!(
+            router.stage_add(other.clone()),
+            Err(McpError::AttachmentRefused(McpAttachmentRefusal::Mismatch))
+        ));
+        // The newer removal's own accepted boundary disposes of it.
+        router
+            .apply_staged()
+            .await
+            .expect("apply the current removal");
+        router
+            .stage_add(other)
+            .expect("an ungoverned add after the accepted removal");
+        router.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_active_governed_server_keeps_its_requirement_until_its_removal_finalizes() {
+        let server_path = mcp_test_server::fixture_binary();
+        let server = test_server_config("governed", &server_path);
+        let mut replacement = server.clone();
+        replacement.connect_timeout_secs = Some(30);
+        let control = test_attachment(&server, Ok(()));
+        let mut router = generated_surface_router();
+        router
+            .stage_add_governed(server, control.clone())
+            .expect("stage under a prepared control");
+        router.apply_staged().await.expect("apply the governed add");
+        let adapter = McpRouterAdapter::new(router);
+        adapter
+            .wait_until_ready(async_connect_test_timeout())
+            .await
+            .expect("the governed server connects");
+        assert_eq!(control.apply_checks.load(Ordering::SeqCst), 1);
+
+        adapter
+            .stage_remove("governed")
+            .await
+            .expect("stage the removal");
+        let mismatch = McpAttachmentRefusal::Mismatch.to_string();
+        let replaced = adapter
+            .stage_add(replacement.clone())
+            .await
+            .expect_err("a plain add cannot overwrite the staged removal of a governed server");
+        assert!(replaced.contains(&mismatch), "{replaced}");
+        // Hold the removal in Removing with in-flight work: the name stays
+        // governed after the applied boundary, until finalization.
+        adapter
+            .set_inflight_calls_for_testing("governed", 1)
+            .await
+            .expect("hold an in-flight call");
+        adapter.apply_staged().await.expect("apply the removal");
+        let held = adapter
+            .stage_add(replacement.clone())
+            .await
+            .expect_err("still governed while the removal drains");
+        assert!(held.contains(&mismatch), "{held}");
+        adapter
+            .set_inflight_calls_for_testing("governed", 0)
+            .await
+            .expect("release the in-flight call");
+        adapter.apply_staged().await.expect("finalize the removal");
+        assert!(
+            adapter
+                .wait_removals_finalized(async_connect_test_timeout())
+                .await,
+            "the removal finalizes"
+        );
+        adapter
+            .stage_add(replacement)
+            .await
+            .expect("an ungoverned add after the removal finalized");
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_immediate_add_path_refuses_a_governed_name() {
+        let mut router = generated_surface_router();
+        let server = test_server_config("governed", Path::new("/nonexistent/mcp-server"));
+        let other = test_server_config("governed", Path::new("/nonexistent/other-server"));
+        router
+            .stage_add_governed(server.clone(), test_attachment(&server, Ok(())))
+            .expect("stage under a prepared control");
+        assert!(matches!(
+            router.add_server(other).await,
+            Err(McpError::AttachmentRefused(McpAttachmentRefusal::Mismatch))
+        ));
+        router.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_resolved_mcp_plan_carries_its_registration_and_raw_operation() {
+        let server_path = mcp_test_server::fixture_binary();
+        let mut router = generated_surface_router();
+        router
+            .stage_add(test_server_config("srv", &server_path))
+            .expect("stage add");
+        router.apply_staged().await.expect("apply staged");
+        let adapter = McpRouterAdapter::new(router);
+        adapter
+            .wait_until_ready(async_connect_test_timeout())
+            .await
+            .expect("the server connects");
+        let args = serde_json::value::RawValue::from_string("{}".to_string()).expect("args");
+        let call = ToolCallView {
+            id: "call-1",
+            name: "echo",
+            args: &args,
+        };
+        let plan = AgentToolDispatcher::resolve_execution_plan(
+            &adapter,
+            call,
+            &meerkat_core::ToolDispatchContext::default(),
+            &meerkat_core::ToolExecutionResolutionContext::new(
+                meerkat_core::ToolDeadlineChain::new(vec![
+                    meerkat_core::ToolDeadlineContributor::finite(
+                        meerkat_core::ToolDeadlineOwner::CoreToolDispatch,
+                        Duration::from_secs(600),
+                    ),
+                ])
+                .expect("deadline chain"),
+            ),
+        )
+        .expect("a resolved plan");
+        let witness = plan
+            .owner_witness(&adapter.execution_authority_key())
+            .expect("the adapter's witness");
+        assert!(
+            matches!(
+                witness.operation_target(),
+                Some(meerkat_core::ToolOperationTarget::McpServerOperation {
+                    server,
+                    raw_operation,
+                    connector,
+                    account,
+                    ..
+                }) if server == "srv"
+                    && raw_operation == "echo"
+                    && *connector == meerkat_core::McpConnectorApproval::NoConnector
+                    && **account == meerkat_core::OperationAccount::Unavailable
+            ),
+            "the plan carries its exact registration, raw operation, connector approval \
+             and account: a server that declares none is unavailable, never \"no account\""
+        );
+        {
+            let guard = adapter.router.read().await;
+            let router = guard.as_ref().expect("router");
+            assert!(adapter.operation_target_matches(router, "echo", &plan));
+            // A plan whose target is not the live router's is not dispatched.
+            // (A synthetic stale-generation comparison, not a held
+            // asynchronous replacement.)
+            let stale = witness.clone().with_operation_target(
+                meerkat_core::ToolOperationTarget::McpServerOperation {
+                    server: "srv".to_string(),
+                    connection_generation: u64::MAX,
+                    raw_operation: "echo".to_string(),
+                    connector: meerkat_core::McpConnectorApproval::NoConnector,
+                    account: Arc::new(meerkat_core::OperationAccount::Unavailable),
+                },
+            );
+            let stale_plan = meerkat_core::ToolExecutionContract::default()
+                .resolve_default(
+                    meerkat_core::ToolDeadlineChain::new(vec![
+                        meerkat_core::ToolDeadlineContributor::finite(
+                            meerkat_core::ToolDeadlineOwner::CoreToolDispatch,
+                            Duration::from_secs(600),
+                        ),
+                    ])
+                    .expect("deadline chain"),
+                )
+                .expect("plan")
+                .with_owner_witness(stale)
+                .expect("stale witness");
+            assert!(!adapter.operation_target_matches(router, "echo", &stale_plan));
+        }
+        adapter.shutdown().await;
+    }
+
+    /// The account rides on the exact live binding: a server whose host
+    /// declares it acts with no account states `DeclaredNone` on its plans,
+    /// and once the binding is replaced (here by the same server without the
+    /// declaration) a plan resolved before the change is no longer the live
+    /// router's and is not dispatched, while a fresh plan states the new
+    /// binding's account. Nothing else records the account.
+    #[tokio::test]
+    async fn a_changed_binding_changes_the_operations_account_and_retires_old_plans() {
+        let server_path = mcp_test_server::fixture_binary();
+        let mut declared = test_server_config("srv", &server_path);
+        declared.account = Some(meerkat_core::McpAccountDeclaration::NoAccount);
+        let mut router = generated_surface_router();
+        router.stage_add(declared).expect("stage add");
+        router.apply_staged().await.expect("apply staged");
+        let adapter = McpRouterAdapter::new(router);
+        adapter
+            .wait_until_ready(async_connect_test_timeout())
+            .await
+            .expect("the server connects");
+        let args = serde_json::value::RawValue::from_string("{}".to_string()).expect("args");
+        let call = ToolCallView {
+            id: "call-1",
+            name: "echo",
+            args: &args,
+        };
+        let resolve = || {
+            AgentToolDispatcher::resolve_execution_plan(
+                &adapter,
+                call,
+                &meerkat_core::ToolDispatchContext::default(),
+                &meerkat_core::ToolExecutionResolutionContext::new(
+                    meerkat_core::ToolDeadlineChain::new(vec![
+                        meerkat_core::ToolDeadlineContributor::finite(
+                            meerkat_core::ToolDeadlineOwner::CoreToolDispatch,
+                            Duration::from_secs(600),
+                        ),
+                    ])
+                    .expect("deadline chain"),
+                ),
+            )
+            .expect("a resolved plan")
+        };
+        let account_of = |plan: &meerkat_core::ResolvedToolExecutionPlan| {
+            plan.owner_witness(&adapter.execution_authority_key())
+                .and_then(|witness| witness.operation_target())
+                .and_then(|target| target.account().cloned())
+        };
+        let before = resolve();
+        assert_eq!(
+            account_of(&before),
+            Some(meerkat_core::OperationAccount::DeclaredNone)
+        );
+
+        // The host replaces the binding: the same server, now undeclared.
+        adapter.stage_remove("srv").await.expect("stage remove");
+        adapter.apply_staged().await.expect("apply removal");
+        adapter
+            .stage_add(test_server_config("srv", &server_path))
+            .await
+            .expect("stage the replacement");
+        adapter.apply_staged().await.expect("apply replacement");
+        adapter
+            .wait_until_ready(async_connect_test_timeout())
+            .await
+            .expect("the replacement connects");
+        {
+            let guard = adapter.router.read().await;
+            let router = guard.as_ref().expect("router");
+            assert!(
+                !adapter.operation_target_matches(router, "echo", &before),
+                "a plan resolved on the replaced binding is not the live router's"
+            );
+        }
+        let after = resolve();
+        assert_eq!(
+            account_of(&after),
+            Some(meerkat_core::OperationAccount::Unavailable),
+            "the fresh plan states the live binding's account"
+        );
+        adapter.shutdown().await;
     }
 
     #[tokio::test]
@@ -1881,7 +3223,7 @@ mod tests {
             self.push("reload", server_id);
             Ok(())
         }
-        fn pending_server_ids(&self) -> std::collections::BTreeSet<String> {
+        fn pending_server_ids(&self) -> BTreeSet<String> {
             std::collections::BTreeSet::new()
         }
     }
@@ -2179,7 +3521,7 @@ mod tests {
     }
 
     /// An established wrapped server that keeps running past stdin EOF is
-    /// terminated with its whole process group, without a grace window, and
+    /// terminated with its whole process group once its close grace ends, and
     /// has exited when shutdown returns. (Fails-old: rmcp gave the wrapper up
     /// to 3 s after EOF from a detached task, then killed only the wrapper.)
     #[cfg(target_os = "linux")]
@@ -2212,6 +3554,50 @@ mod tests {
             process_exited(server),
             "established server's grandchild {server} outlived adapter shutdown"
         );
+    }
+
+    /// A shutdown dropped while its router is still closing servers does not
+    /// cut that work short, and a later shutdown waits for the same work
+    /// before returning. (Fails-old: the later call found no router and
+    /// returned while the servers were still in their close grace.)
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_repeated_shutdown_joins_the_dropped_one() {
+        use crate::stdio_test_fixture::{PidReport, process_exited, sh_mcp_server_args};
+        let mut report = PidReport::new("repeat-shutdown");
+        let bounds = crate::McpStdioCloseBounds::new(
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(10),
+        )
+        .expect("bounds within the maximum");
+        let mut router = generated_surface_router().with_stdio_close_bounds(bounds);
+        router
+            .stage_add(meerkat_core::McpServerConfig::stdio(
+                "eof-ignoring",
+                "/bin/sh",
+                sh_mcp_server_args(Some(report.path())),
+                HashMap::new(),
+            ))
+            .expect("stage add");
+        router.apply_staged().await.expect("apply staged");
+        let adapter = McpRouterAdapter::new(router);
+        let pids = report.pids().await;
+        adapter
+            .wait_until_ready(async_connect_test_timeout())
+            .await
+            .expect("fixture server completes the handshake");
+
+        let dropped =
+            tokio::time::timeout(std::time::Duration::from_millis(100), adapter.shutdown()).await;
+        assert!(dropped.is_err(), "the server was still in its EOF grace");
+        adapter.shutdown().await;
+
+        for pid in pids {
+            assert!(
+                process_exited(pid),
+                "stdio process {pid} outlived the repeated shutdown"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2300,9 +3686,47 @@ mod tests {
                 "injected lifecycle mirror rejection",
             ))
         }
-        fn pending_server_ids(&self) -> std::collections::BTreeSet<String> {
+        fn pending_server_ids(&self) -> BTreeSet<String> {
             std::collections::BTreeSet::new()
         }
+    }
+
+    #[tokio::test]
+    async fn retry_after_shutdown_is_router_closed_and_reinstalls_nothing() {
+        let (router, target, resolver, _server) =
+            crate::router::tests::router_awaiting_authorization().await;
+        *resolver.stored_token_for_testing() = Some("interactive-token".into());
+        let adapter = Arc::new(McpRouterAdapter::new(router));
+        // A detached snapshot of the adapter, as a session-map read takes.
+        let snapshot = Arc::clone(&adapter);
+        adapter.shutdown().await;
+        assert_eq!(
+            snapshot.retry_authorized(&target).await.unwrap(),
+            crate::AuthorizedRetry::RouterClosed
+        );
+        assert!(snapshot.active_server_names().await.is_empty());
+        assert!(snapshot.servers_awaiting_authorization().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retry_staged_before_shutdown_is_discarded_by_shutdown() {
+        let (router, target, resolver, _server) =
+            crate::router::tests::router_awaiting_authorization().await;
+        *resolver.stored_token_for_testing() = Some("interactive-token".into());
+        let adapter = Arc::new(McpRouterAdapter::new(router));
+        let snapshot = Arc::clone(&adapter);
+        assert_eq!(
+            snapshot.retry_authorized(&target).await.unwrap(),
+            crate::AuthorizedRetry::Staged
+        );
+        adapter.shutdown().await;
+        // The staged retry died with the router; nothing applies it later.
+        assert!(snapshot.apply_staged().await.is_err());
+        assert!(snapshot.active_server_names().await.is_empty());
+        assert_eq!(
+            snapshot.retry_authorized(&target).await.unwrap(),
+            crate::AuthorizedRetry::RouterClosed
+        );
     }
 
     #[tokio::test]
@@ -2749,5 +4173,187 @@ mod tests {
             entry.last_delta_phase,
             meerkat_core::ExternalToolSurfaceDeltaPhase::None
         );
+    }
+
+    /// The exact attempt of one governed live add (ADR membermcp observe
+    /// review r1): only that attempt's own accepted outcome answers it.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::panic)]
+    mod attempt_observation {
+        use super::*;
+        use meerkat_core::mcp_attachment::McpAttachmentReadiness;
+
+        fn listing_server(name: &str, tools: &[&str]) -> meerkat_core::McpServerConfig {
+            meerkat_core::McpServerConfig::stdio(
+                name,
+                "/bin/sh".to_string(),
+                crate::stdio_test_fixture::sh_mcp_server_args_listing("", tools),
+                HashMap::new(),
+            )
+        }
+
+        fn shell_server(name: &str, script: &str) -> meerkat_core::McpServerConfig {
+            meerkat_core::McpServerConfig::stdio(
+                name,
+                "/bin/sh".to_string(),
+                vec!["-c".to_string(), script.to_string()],
+                HashMap::new(),
+            )
+        }
+
+        async fn stage(
+            adapter: &Arc<McpRouterAdapter>,
+            server: &meerkat_core::McpServerConfig,
+        ) -> meerkat_core::mcp_attachment::McpAttachmentAttempt {
+            adapter
+                .stage_add_governed_observed(server.clone(), test_attachment(server, Ok(())))
+                .await
+                .expect("stage under a prepared control")
+        }
+
+        /// Usable only once the attempt's own connection is installed, and
+        /// only for an operation its published routes serve; the lifecycle
+        /// notice of that install is still delivered to the normal poll.
+        #[tokio::test]
+        async fn an_installed_attempt_is_usable_only_for_its_routed_operation() {
+            let adapter = Arc::new(McpRouterAdapter::new(generated_surface_router()));
+            let server = listing_server("tools", &["echo"]);
+            let attempt = stage(&adapter, &server).await;
+            assert_eq!(
+                attempt.observe("echo").await,
+                McpAttachmentReadiness::Pending
+            );
+            adapter.apply_staged().await.expect("apply boundary");
+            let ready = attempt.wait("echo", async_connect_test_timeout()).await;
+            let McpAttachmentReadiness::Usable {
+                connection_generation,
+            } = ready
+            else {
+                panic!("the installed attempt serves its operation: {ready:?}");
+            };
+            assert_eq!(
+                attempt.observe("missing").await,
+                McpAttachmentReadiness::ToolNotRouted {
+                    connection_generation
+                }
+            );
+            let update = adapter.poll_external_updates().await;
+            assert!(
+                update.notices.iter().any(|notice| notice.target == "tools"),
+                "the wait left the install notice for the normal delivery: {:?}",
+                update.notices
+            );
+            adapter.shutdown().await;
+            assert_eq!(
+                attempt.observe("echo").await,
+                McpAttachmentReadiness::Retired
+            );
+        }
+
+        /// A connection that never completes the handshake is the attempt's
+        /// own accepted failure, never usable.
+        #[tokio::test]
+        async fn a_failed_attempt_is_failed_and_never_usable() {
+            let adapter = Arc::new(McpRouterAdapter::new(generated_surface_router()));
+            let attempt = stage(&adapter, &shell_server("broken", "exit 3")).await;
+            adapter.apply_staged().await.expect("apply boundary");
+            let outcome = attempt.wait("echo", async_connect_test_timeout()).await;
+            assert!(
+                matches!(outcome, McpAttachmentReadiness::Failed { .. }),
+                "{outcome:?}"
+            );
+            assert_eq!(attempt.observe("echo").await, outcome);
+        }
+
+        /// An attempt replaced before its boundary is superseded, and stays
+        /// so when the replacement's same-name connection becomes usable.
+        #[tokio::test]
+        async fn an_attempt_replaced_before_its_boundary_is_superseded() {
+            let adapter = Arc::new(McpRouterAdapter::new(generated_surface_router()));
+            let first = stage(&adapter, &listing_server("same", &["echo"])).await;
+            let second = stage(&adapter, &listing_server("same", &["echo"])).await;
+            assert_eq!(
+                first.observe("echo").await,
+                McpAttachmentReadiness::Superseded
+            );
+            adapter.apply_staged().await.expect("apply boundary");
+            assert!(matches!(
+                second.wait("echo", async_connect_test_timeout()).await,
+                McpAttachmentReadiness::Usable { .. }
+            ));
+            assert_eq!(
+                first.observe("echo").await,
+                McpAttachmentReadiness::Superseded
+            );
+        }
+
+        /// The wait deadline bounds router lock acquisition too: a router
+        /// held elsewhere answers Pending at the deadline instead of waiting
+        /// on the lock.
+        #[tokio::test]
+        async fn a_wait_deadline_bounds_router_lock_acquisition() {
+            let adapter = Arc::new(McpRouterAdapter::new(generated_surface_router()));
+            let attempt = stage(&adapter, &listing_server("held", &["echo"])).await;
+            let held = adapter.router.write().await;
+            let answered = tokio::time::timeout(
+                Duration::from_secs(5),
+                attempt.wait("echo", Duration::from_millis(200)),
+            )
+            .await
+            .expect("the wait returns at its own deadline while the router is held");
+            assert_eq!(answered, McpAttachmentReadiness::Pending);
+            drop(held);
+
+            // A tool held mid-dispatch keeps the router's read lock across
+            // its server call: the wait's write acquisition is bounded too.
+            let dispatching = adapter.router.read().await;
+            let answered = tokio::time::timeout(
+                Duration::from_secs(5),
+                attempt.wait("echo", Duration::from_millis(200)),
+            )
+            .await
+            .expect("the wait returns at its own deadline while a dispatch holds the router");
+            assert_eq!(answered, McpAttachmentReadiness::Pending);
+            drop(dispatching);
+        }
+
+        /// While a newer same-name attempt is still connecting, the older
+        /// current connection serves the operation; it does not satisfy the
+        /// newer attempt, which stays pending.
+        #[tokio::test]
+        async fn a_current_same_name_connection_does_not_satisfy_a_newer_attempt() {
+            let adapter = Arc::new(McpRouterAdapter::new(generated_surface_router()));
+            let first = stage(&adapter, &listing_server("same", &["echo"])).await;
+            adapter.apply_staged().await.expect("apply first");
+            let McpAttachmentReadiness::Usable {
+                connection_generation,
+            } = first.wait("echo", async_connect_test_timeout()).await
+            else {
+                panic!("the first attempt installs");
+            };
+            // Never answers the handshake: stays connecting.
+            let second = stage(&adapter, &shell_server("same", "sleep 60")).await;
+            adapter.apply_staged().await.expect("apply second");
+            assert!(matches!(
+                adapter.observe_operation("same", "echo").await,
+                meerkat_core::McpOperationObservation::Callable { .. }
+            ));
+            assert_eq!(
+                second.observe("echo").await,
+                McpAttachmentReadiness::Pending
+            );
+            assert_eq!(
+                second.wait("echo", Duration::from_millis(300)).await,
+                McpAttachmentReadiness::Pending,
+                "a deadline is a local not-ready answer"
+            );
+            assert_eq!(
+                first.observe("echo").await,
+                McpAttachmentReadiness::Usable {
+                    connection_generation
+                }
+            );
+            adapter.shutdown().await;
+        }
     }
 }

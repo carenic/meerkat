@@ -1411,6 +1411,9 @@ impl MeerkatMachine {
         )>,
         allow_late_compaction_binding: bool,
         runtime_authority: Arc<dyn std::any::Any + Send + Sync>,
+        agent_binding: super::SessionAgentBinding,
+        tool_surface_gate: meerkat_core::ToolSurfaceGateSlot,
+        mcp_observation: meerkat_core::McpObservationSlot,
     ) -> Result<meerkat_core::SessionRuntimeBindings, RuntimeDriverError> {
         let compaction_runtime_epoch_id = dsl::RuntimeEpochId::from_domain(&epoch_id);
         let shared_handle_authority = Arc::new(
@@ -1430,64 +1433,76 @@ impl MeerkatMachine {
             as Arc<dyn meerkat_core::ToolVisibilityOwner>)
         .map_err(RuntimeDriverError::Internal)?;
 
-        Ok(
-            meerkat_core::SessionRuntimeBindings::__from_runtime_authority(
-                session_id.clone(),
-                epoch_id,
-                ops_lifecycle as Arc<dyn meerkat_core::OpsLifecycleRegistry>,
-                cursor_state,
-                generated_visibility_owner,
-                Arc::new(crate::handles::RuntimeTurnStateHandle::new(Arc::clone(
-                    &shared_handle_authority,
-                ))),
-                Arc::new(crate::handles::RuntimeCommsDrainHandle::new(Arc::clone(
-                    &shared_handle_authority,
-                ))),
-                Arc::new(crate::handles::RuntimeExternalToolSurfaceHandle::new(
+        // A governed machine's installed host decides every configured MCP
+        // server of this session before discovery, spawn or first use.
+        let configured_mcp_attachment =
+            self.native_work_authorization_host.get().map(|attachment| {
+                attachment
+                    .host()
+                    .configured_mcp_attachment_for_agent(&session_id, agent_binding.clone())
+            });
+        let bindings = meerkat_core::SessionRuntimeBindings::__from_runtime_authority(
+            session_id.clone(),
+            epoch_id,
+            ops_lifecycle as Arc<dyn meerkat_core::OpsLifecycleRegistry>,
+            cursor_state,
+            generated_visibility_owner,
+            Arc::new(crate::handles::RuntimeTurnStateHandle::new(Arc::clone(
+                &shared_handle_authority,
+            ))),
+            Arc::new(crate::handles::RuntimeCommsDrainHandle::new(Arc::clone(
+                &shared_handle_authority,
+            ))),
+            Arc::new(crate::handles::RuntimeExternalToolSurfaceHandle::new(
+                Arc::clone(&shared_handle_authority),
+            )),
+            peer_comms_install,
+            Arc::new(crate::handles::RuntimeSessionAdmissionHandle::new(
+                Arc::clone(&shared_handle_authority),
+            )),
+            Arc::new(
+                crate::handles::RuntimeModelRoutingHandle::new_with_visibility_owner(
                     Arc::clone(&shared_handle_authority),
-                )),
-                peer_comms_install,
-                Arc::new(crate::handles::RuntimeSessionAdmissionHandle::new(
-                    Arc::clone(&shared_handle_authority),
-                )),
-                Arc::new(
-                    crate::handles::RuntimeModelRoutingHandle::new_with_visibility_owner(
-                        Arc::clone(&shared_handle_authority),
-                        Arc::clone(&tool_visibility_owner),
-                    )
-                    .with_reconfigure_host_readiness(Arc::clone(&self.reconfigure_host_ready)),
-                ),
-                Arc::new(RuntimeStickyModelFallbackCommitCoordinator {
-                    session_id: session_id.clone(),
-                    store: self.store.clone(),
-                    execution_custody: Ok(self.execution_custody.clone()),
-                }),
-                self.generated_auth_lease_handle(),
-                Arc::new(crate::handles::RuntimeMcpServerLifecycleHandle::new(
-                    Arc::clone(&shared_handle_authority),
-                )),
-                Arc::new(crate::handles::RuntimePeerInteractionHandle::new(
-                    Arc::clone(&shared_handle_authority),
-                )),
-                Arc::new(crate::handles::RuntimeSessionContextHandle::new(
-                    Arc::clone(&shared_handle_authority),
-                )),
-                self.session_claim_handle(),
-                Arc::new(crate::handles::RuntimeInteractionStreamHandle::new(
-                    Arc::clone(&shared_handle_authority),
-                )),
-                Arc::new(RuntimeCompactionCommitCoordinator {
-                    session_id,
-                    runtime_binding: std::sync::Mutex::new(compaction_runtime_binding),
-                    runtime_epoch_id: std::sync::Mutex::new(compaction_runtime_epoch_id),
-                    allow_late_binding: allow_late_compaction_binding,
-                    dsl_authority: shared_handle_authority,
-                    store: self.store.clone(),
-                }),
-                post_commit_hooks,
-                runtime_authority,
+                    Arc::clone(&tool_visibility_owner),
+                )
+                .with_reconfigure_host_readiness(Arc::clone(&self.reconfigure_host_ready)),
             ),
+            Arc::new(RuntimeStickyModelFallbackCommitCoordinator {
+                session_id: session_id.clone(),
+                store: self.store.clone(),
+                execution_custody: Ok(self.execution_custody.clone()),
+            }),
+            self.generated_auth_lease_handle(),
+            Arc::new(crate::handles::RuntimeMcpServerLifecycleHandle::new(
+                Arc::clone(&shared_handle_authority),
+            )),
+            Arc::new(crate::handles::RuntimePeerInteractionHandle::new(
+                Arc::clone(&shared_handle_authority),
+            )),
+            Arc::new(crate::handles::RuntimeSessionContextHandle::new(
+                Arc::clone(&shared_handle_authority),
+            )),
+            self.session_claim_handle(),
+            Arc::new(crate::handles::RuntimeInteractionStreamHandle::new(
+                Arc::clone(&shared_handle_authority),
+            )),
+            Arc::new(RuntimeCompactionCommitCoordinator {
+                session_id,
+                runtime_binding: std::sync::Mutex::new(compaction_runtime_binding),
+                runtime_epoch_id: std::sync::Mutex::new(compaction_runtime_epoch_id),
+                allow_late_binding: allow_late_compaction_binding,
+                dsl_authority: shared_handle_authority,
+                store: self.store.clone(),
+            }),
+            post_commit_hooks,
+            runtime_authority,
         )
+        .__with_tool_surface_gate(tool_surface_gate)
+        .__with_mcp_observation_slot(mcp_observation);
+        Ok(match configured_mcp_attachment {
+            Some(authority) => bindings.__with_configured_mcp_attachment(authority),
+            None => bindings,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1508,7 +1523,14 @@ impl MeerkatMachine {
         allow_late_compaction_binding: bool,
         runtime_authority: Arc<dyn std::any::Any + Send + Sync>,
     ) -> Result<meerkat_core::SessionRuntimeBindings, RuntimeDriverError> {
-        let (cached, durability_health, post_commit_hooks) = {
+        let (
+            cached,
+            durability_health,
+            post_commit_hooks,
+            agent_binding,
+            tool_surface_gate,
+            mcp_observation,
+        ) = {
             let sessions = self.sessions.read().await;
             let entry = sessions
                 .get(&session_id)
@@ -1532,6 +1554,9 @@ impl MeerkatMachine {
                 entry.canonical_runtime_bindings.clone(),
                 entry.durability_health.clone(),
                 Arc::clone(&entry.post_commit_hooks),
+                entry.agent_binding.clone(),
+                entry.tool_surface_gate.clone(),
+                entry.mcp_observation.clone(),
             )
         };
         if let Some(cached) = cached {
@@ -1551,6 +1576,9 @@ impl MeerkatMachine {
             compaction_runtime_binding,
             allow_late_compaction_binding,
             Arc::clone(&runtime_authority),
+            agent_binding,
+            tool_surface_gate,
+            mcp_observation,
         )?;
         let canonical = candidate
             .__clone_with_runtime_authority(Arc::new(()) as Arc<dyn std::any::Any + Send + Sync>);

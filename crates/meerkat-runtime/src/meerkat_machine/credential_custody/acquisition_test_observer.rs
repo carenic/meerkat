@@ -64,8 +64,8 @@ fn record(input: &InputId, stage: Stage) {
 
 pub(super) async fn observe(
     input: &InputId,
-    acquisition: impl Future<Output = AuthLoginLifecycleGuard>,
-) -> AuthLoginLifecycleGuard {
+    acquisition: impl Future<Output = Option<AuthLoginLifecycleGuard>>,
+) -> Option<AuthLoginLifecycleGuard> {
     let mut acquisition = std::pin::pin!(acquisition);
     let mut reported_wait = false;
     poll_fn(|cx| match acquisition.as_mut().poll(cx) {
@@ -79,7 +79,9 @@ pub(super) async fn observe(
         Poll::Ready(guard) => {
             // Sending is synchronous. Do not suspend between owner acquisition
             // and returning the guard to the real admission implementation.
-            record(input, Stage::Acquired);
+            if guard.is_some() {
+                record(input, Stage::Acquired);
+            }
             Poll::Ready(guard)
         }
     })

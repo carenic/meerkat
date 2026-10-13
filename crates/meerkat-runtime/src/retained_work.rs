@@ -26,6 +26,28 @@ fn hex(bytes: &[u8]) -> String {
     rendered
 }
 
+/// The `association_digest` a [`RetainedContributorRef`] carries for an
+/// input with this exact authority association: the lowercase hex SHA-256 of
+/// `serde_json::to_vec(association)`. It is the one calculation the runtime
+/// uses both to mint a retained reference and to compare a reread original
+/// row against it. It is not
+/// [`canonical_bytes`](meerkat_authorization_contracts::work_association::InputAuthorityAssociation::canonical_bytes),
+/// which is a different encoding.
+///
+/// Identity only: a matching digest shows association equality and nothing
+/// more. It is not proof of the same submitted input, of a complete run
+/// identity, of admitted custody or of any current permission, and it grants
+/// nothing. Complete retained-work resolution still checks the runtime and
+/// run context, contributor identity and order, the submission digest, the
+/// selected-row bindings and the current owner.
+pub fn retained_association_digest(
+    association: &meerkat_authorization_contracts::work_association::InputAuthorityAssociation,
+) -> Result<String, RuntimeDriverError> {
+    let bytes =
+        serde_json::to_vec(association).map_err(|_| crate::input_authority::unavailable())?;
+    Ok(hex(&Sha256::digest(bytes)))
+}
+
 /// The identity of the run `batch` stages: its runtime and run, its retained
 /// original contributors in staged order, its selected-row bindings and its
 /// controller selection.
@@ -54,11 +76,9 @@ pub(crate) fn identity_from(
     let contributors = contributors
         .iter()
         .map(|retained| {
-            let association = serde_json::to_vec(retained.association())
-                .map_err(|_| crate::input_authority::unavailable())?;
             Ok(RetainedContributorRef {
                 input_id: retained.input_id().clone(),
-                association_digest: hex(&Sha256::digest(association)),
+                association_digest: retained_association_digest(retained.association())?,
                 submission_digest: hex(retained.replay_digest()),
             })
         })
@@ -305,9 +325,7 @@ pub(crate) fn resolve_contributors(
             .iter()
             .find(|retained| retained.input_id() == &contributor.input_id)
             .ok_or_else(|| refused(RetainedResumeRefusal::NoAdmissibleWorkBinding))?;
-        let association = serde_json::to_vec(own.association())
-            .map_err(|_| crate::input_authority::unavailable())?;
-        if hex(&Sha256::digest(association)) != contributor.association_digest
+        if retained_association_digest(own.association())? != contributor.association_digest
             || hex(own.replay_digest()) != contributor.submission_digest
         {
             return Err(refused(RetainedResumeRefusal::NoAdmissibleWorkBinding));

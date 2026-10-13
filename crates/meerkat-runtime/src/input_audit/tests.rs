@@ -94,7 +94,7 @@ fn exact_scope_and_run_are_required_before_append() {
     assert!(audit.is_empty());
     assert!(
         audit
-            .bind(&input_id(), scope(), sink.run_id.clone(), &[])
+            .bind(&input_id(), scope(), sink.run_id.clone(), &[], false)
             .is_err()
     );
 }
@@ -138,7 +138,7 @@ fn restored_payload_is_data_and_frozen_store_candidates_cannot_gain_live_sink() 
     assert_eq!(count(&frozen), 1);
     assert!(
         frozen
-            .bind(&input_id(), scope(), sink.run_id.clone(), &[])
+            .bind(&input_id(), scope(), sink.run_id.clone(), &[], false)
             .is_err()
     );
 }
@@ -497,4 +497,75 @@ fn observation_infrastructure_reserve_error_injection_is_not_policy_denial() {
         Arc::new(ReserveFailure),
         event(&sink),
     ));
+}
+
+/// A mandatory-hook withholding staged on the actual row persists through the
+/// existing atomic input commit with its candidate id and retained
+/// contributors, is written as stored input state v6, and cannot appear in a
+/// row stamped with an older version.
+#[tokio::test]
+async fn mandatory_hook_withholding_persists_on_the_actual_row_as_v6() {
+    use crate::input_state::{InputStatePersistenceRecord, StoredInputState};
+    use crate::store::{InMemoryRuntimeStore, RuntimeStore};
+    let store = InMemoryRuntimeStore::new();
+    let runtime = crate::identifiers::LogicalRuntimeId::new("audit-hook-withholding");
+    let (audit, sink) = fixture();
+    let mut row = StoredInputState::new_accepted(input_id());
+    row.state.authorization_audit = audit.clone();
+    let candidate = OperationId::new();
+    let withholding = meerkat_core::MandatoryHookWithholding {
+        sequence: 1,
+        hook_id: Some(meerkat_core::HookId::new("gate")),
+        hook_id_omitted: false,
+        point: meerkat_core::HookPoint::PreLlmRequest,
+        cause: meerkat_core::MandatoryHookCause::Denied {
+            reason_code: meerkat_core::HookReasonCode::PolicyViolation,
+        },
+        effect: meerkat_core::MandatoryHookWithheldEffect::RequestNotSent,
+    };
+    sink.append(AuthorizationAuditObservation {
+        operation_id: candidate.clone(),
+        observation: AuditObservation::MandatoryHookWithheld {
+            withholding: withholding.clone(),
+        },
+        ..event(&sink)
+    })
+    .unwrap();
+    assert!(audit.has_mandatory_hook_withholding());
+    let record = InputStatePersistenceRecord::from_machine_snapshot(row).unwrap();
+    store
+        .persist_input_states_atomically(&runtime, &[record])
+        .await
+        .unwrap();
+    let committed = store
+        .load_input_state(&runtime, &input_id())
+        .await
+        .unwrap()
+        .unwrap();
+    let stored = serde_json::to_value(&committed).unwrap();
+    assert_eq!(stored["stored_input_state_version"], 6);
+    let records = serde_json::to_value(&committed.state.authorization_audit).unwrap();
+    assert_eq!(records.as_array().unwrap().len(), 1);
+    assert_eq!(
+        records[0]["observation"]["operation_id"],
+        serde_json::json!(candidate)
+    );
+    assert_eq!(
+        records[0]["observation"]["observation"]["kind"],
+        "mandatory_hook_withheld"
+    );
+    assert_eq!(records[0]["contributors"].as_array().unwrap().len(), 1);
+    let reread: StoredInputState = serde_json::from_value(stored.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&reread).unwrap(), stored);
+
+    let mut older = stored.clone();
+    older["stored_input_state_version"] = serde_json::json!(5);
+    assert!(
+        serde_json::from_value::<StoredInputState>(older).is_err(),
+        "a pre-v6 row cannot carry the withholding record"
+    );
+    let mut unknown = stored;
+    unknown["authorization_audit"][0]["observation"]["observation"]["kind"] =
+        serde_json::json!("future_hook_kind");
+    assert!(serde_json::from_value::<StoredInputState>(unknown).is_err());
 }

@@ -68,6 +68,21 @@ pub enum ErrorCode {
     InputNotReady,
     /// Runtime authority is unavailable before a session operation starts.
     SessionRuntimeUnavailable,
+    /// The approval store committed nothing (unavailable or contended). An
+    /// explicitly attempted retry through fresh checks is valid.
+    ApprovalStoreUnavailable,
+    /// Another owner of the approval store changed the approval first; it
+    /// is reconciled before reuse.
+    ApprovalConflict,
+    /// The approval store cannot confirm whether the commit happened; the
+    /// approval is reconciled from the store before reuse, never resent.
+    ApprovalCommitUnknown,
+    /// A scope-bound mob submit named a member session that is no longer the
+    /// member's current session binding: the session rotated under a still
+    /// current runtime incarnation and fence. Distinct from
+    /// [`Self::StaleFence`] (a superseded incarnation): the recovery is to
+    /// re-capture the delivery scope, not to re-resolve the member.
+    StaleDeliveryScope,
 }
 
 impl ErrorCode {
@@ -98,6 +113,10 @@ impl ErrorCode {
             Self::InputRefused => -32030,
             Self::InputNotReady => -32031,
             Self::SessionRuntimeUnavailable => -32032,
+            Self::ApprovalStoreUnavailable => -32033,
+            Self::ApprovalConflict => -32034,
+            Self::ApprovalCommitUnknown => -32035,
+            Self::StaleDeliveryScope => -32036,
         }
     }
 
@@ -128,6 +147,10 @@ impl ErrorCode {
             -32030 => Some(Self::InputRefused),
             -32031 => Some(Self::InputNotReady),
             -32032 => Some(Self::SessionRuntimeUnavailable),
+            -32033 => Some(Self::ApprovalStoreUnavailable),
+            -32034 => Some(Self::ApprovalConflict),
+            -32035 => Some(Self::ApprovalCommitUnknown),
+            -32036 => Some(Self::StaleDeliveryScope),
             _ => None,
         }
     }
@@ -141,16 +164,21 @@ impl ErrorCode {
             | Self::DuplicateInput
             | Self::SupervisorRotationIncomplete
             | Self::StaleFence
-            | Self::MemberReloadRequired => 409,
+            | Self::MemberReloadRequired
+            | Self::ApprovalConflict
+            | Self::StaleDeliveryScope => 409,
             Self::RequestCancelled => 499,
             Self::ProviderError => 502,
             Self::BudgetExhausted => 429,
             Self::HookDenied | Self::ScopeDenied | Self::InputRefused => 403,
-            Self::AgentError | Self::InternalError => 500,
+            Self::AgentError | Self::InternalError | Self::ApprovalCommitUnknown => 500,
             Self::CapabilityUnavailable => 501,
             Self::SkillResolutionFailed => 422,
             Self::InvalidParams => 400,
-            Self::HostUnavailable | Self::InputNotReady | Self::SessionRuntimeUnavailable => 503,
+            Self::HostUnavailable
+            | Self::InputNotReady
+            | Self::SessionRuntimeUnavailable
+            | Self::ApprovalStoreUnavailable => 503,
             Self::StaleCursor => 410,
         }
     }
@@ -182,6 +210,10 @@ impl ErrorCode {
             Self::InputRefused => 50,
             Self::InputNotReady => 51,
             Self::SessionRuntimeUnavailable => 52,
+            Self::ApprovalStoreUnavailable => 53,
+            Self::ApprovalConflict => 54,
+            Self::ApprovalCommitUnknown => 55,
+            Self::StaleDeliveryScope => 56,
         }
     }
 }
@@ -232,7 +264,8 @@ impl ErrorCode {
             | Self::SupervisorRotationIncomplete
             | Self::StaleCursor
             | Self::StaleFence
-            | Self::MemberReloadRequired => ErrorCategory::Session,
+            | Self::MemberReloadRequired
+            | Self::StaleDeliveryScope => ErrorCategory::Session,
             Self::RequestCancelled => ErrorCategory::Request,
             // Provider is the transient-upstream-failure class (502-family);
             // an unreachable member host is the same retryable class and
@@ -247,7 +280,12 @@ impl ErrorCode {
             }
             Self::SkillNotFound | Self::SkillResolutionFailed => ErrorCategory::Skill,
             Self::InvalidParams => ErrorCategory::Validation,
-            Self::InternalError => ErrorCategory::Internal,
+            // Approval store outcomes: an unavailable store is capability
+            // unavailability; a conflict is conflict-class like a stale
+            // fence; an unknown commit is internal until reconciled.
+            Self::ApprovalStoreUnavailable => ErrorCategory::Capability,
+            Self::ApprovalConflict => ErrorCategory::Session,
+            Self::InternalError | Self::ApprovalCommitUnknown => ErrorCategory::Internal,
         }
     }
 }
@@ -614,6 +652,13 @@ mod tests {
                 -32028,
                 409,
                 48,
+                ErrorCategory::Session,
+            ),
+            (
+                ErrorCode::StaleDeliveryScope,
+                -32036,
+                409,
+                56,
                 ErrorCategory::Session,
             ),
         ];

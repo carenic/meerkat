@@ -475,6 +475,7 @@ impl AgentToolDispatcher for BuiltinPeer {
         tool.provenance = Some(meerkat_core::ToolProvenance {
             kind: meerkat_core::ToolSourceKind::Builtin,
             source_id: "builtin-fixture".into(),
+            artifact: None,
         });
         Arc::from([Arc::new(tool)])
     }

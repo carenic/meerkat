@@ -1121,6 +1121,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl meerkat_core::HookEngine for RecordingPostCommitHook {
+        fn mandatory_topology(
+            &self,
+            _overrides: Option<&meerkat_core::HookRunOverrides>,
+        ) -> Result<meerkat_core::HookMandatoryTopology, meerkat_core::HookEngineError> {
+            Ok(meerkat_core::HookMandatoryTopology::none())
+        }
+
         async fn execute(
             &self,
             invocation: meerkat_core::HookInvocation,

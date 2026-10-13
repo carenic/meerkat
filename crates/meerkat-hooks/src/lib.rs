@@ -52,8 +52,8 @@ use meerkat_core::hooks::{
 use meerkat_core::time_compat::Duration;
 use meerkat_core::{
     HookCapability, HookDecision, HookEngine, HookEngineError, HookEntryConfig, HookExecutionMode,
-    HookExecutionReport, HookId, HookInvocation, HookLaunchRefusal, HookOutcome, HookRunOverrides,
-    HooksConfig,
+    HookExecutionReport, HookId, HookInvocation, HookLaunchRefusal, HookMandatoryTopology,
+    HookOutcome, HookRunOverrides, HooksConfig,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use meerkat_sandbox::ProcessChild;
@@ -704,6 +704,15 @@ impl<'a> ResolvedEntries<'a> {
     }
 }
 
+/// One applicability predicate for matching and execution alike: an entry
+/// scoped to ordinary model operations never runs on the controller-feedback
+/// request, and every other entry is governed by point as before.
+fn entry_applies(entry: &HookEntryConfig, invocation: &HookInvocation) -> bool {
+    entry.enabled
+        && entry.point == invocation.point
+        && entry.model_operations.admits(invocation.model_operation())
+}
+
 /// Deterministic hook engine used by all control surfaces.
 #[derive(Clone)]
 pub struct DefaultHookEngine {
@@ -984,6 +993,9 @@ impl DefaultHookEngine {
                 entry.id
             )));
         }
+
+        meerkat_core::validate_hook_entry_scope(entry)
+            .map_err(|error| HookEngineError::InvalidConfiguration(error.to_string()))?;
 
         Ok(())
     }
@@ -1490,9 +1502,17 @@ impl HookEngine for DefaultHookEngine {
         Ok(entries
             .entries()
             .iter()
-            .filter(|entry| entry.enabled && entry.point == invocation.point)
+            .filter(|entry| entry_applies(entry, invocation))
             .map(|entry| entry.id.clone())
             .collect())
+    }
+
+    fn mandatory_topology(
+        &self,
+        overrides: Option<&HookRunOverrides>,
+    ) -> Result<HookMandatoryTopology, HookEngineError> {
+        let entries = self.effective_entries(overrides)?;
+        Ok(HookMandatoryTopology::from_entries(entries.entries()))
     }
 
     async fn execute(
@@ -1509,7 +1529,7 @@ impl HookEngine for DefaultHookEngine {
         for (registration_index, entry) in resolved
             .entries()
             .iter()
-            .filter(|entry| entry.enabled && entry.point == invocation.point)
+            .filter(|entry| entry_applies(entry, &invocation))
             .cloned()
             .enumerate()
         {
@@ -1871,6 +1891,7 @@ mod tests {
                         temperature: None,
                         provider_params: None,
                         message_count: 1,
+                        operation: Default::default(),
                     }),
                     llm_response: None,
                     tool_call: None,
@@ -1892,6 +1913,82 @@ mod tests {
             vec![&HookId::new("hook-b"), &HookId::new("hook-a")]
         );
         assert!(matches!(report.decision, Some(HookDecision::Allow)));
+    }
+
+    #[tokio::test]
+    async fn ordinary_only_scope_filters_matching_and_execution_alike() {
+        let config = HooksConfig {
+            entries: vec![
+                HookEntryConfig {
+                    id: HookId::new("ordinary-gate"),
+                    point: HookPoint::PreLlmRequest,
+                    capability: HookCapability::Guardrail,
+                    model_operations: meerkat_core::HookModelOperationScope::OrdinaryOnly,
+                    runtime: runtime_in_process("gate"),
+                    ..Default::default()
+                },
+                HookEntryConfig {
+                    id: HookId::new("every-request-observer"),
+                    point: HookPoint::PreLlmRequest,
+                    runtime: runtime_in_process("observer"),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let engine = DefaultHookEngine::new(config);
+        for name in ["gate", "observer"] {
+            engine
+                .register_in_process_handler(
+                    name,
+                    static_handler(RuntimeHookResponse { decision: None }),
+                )
+                .await
+                .expect("in-process handler registration must succeed");
+        }
+        let invocation = |operation| HookInvocation {
+            llm_request: Some(HookLlmRequest {
+                max_tokens: 256,
+                temperature: None,
+                provider_params: None,
+                message_count: 1,
+                operation,
+            }),
+            ..HookInvocation::new(HookPoint::PreLlmRequest, SessionId::new())
+        };
+        let ordinary = invocation(meerkat_core::HookModelOperation::Ordinary { sequence: 3 });
+        let feedback = invocation(meerkat_core::HookModelOperation::ControllerFeedback {
+            sequence: 2,
+            withheld: meerkat_core::HookWithheldModelOperation {
+                sequence: 1,
+                hook_id: HookId::new("ordinary-gate"),
+                point: HookPoint::PreLlmRequest,
+            },
+        });
+        let both = vec![
+            HookId::new("ordinary-gate"),
+            HookId::new("every-request-observer"),
+        ];
+        let observer_only = vec![HookId::new("every-request-observer")];
+        assert_eq!(engine.matching_hooks(&ordinary, None).unwrap(), both);
+        assert_eq!(
+            engine.matching_hooks(&feedback, None).unwrap(),
+            observer_only
+        );
+        assert_eq!(engine.execute(ordinary, None).await.unwrap().started, both);
+        assert_eq!(
+            engine.execute(feedback, None).await.unwrap().started,
+            observer_only,
+            "execution applies the same scope as matching"
+        );
+        assert_eq!(
+            engine.mandatory_topology(None).unwrap().gates(),
+            [meerkat_core::HookMandatoryGate {
+                hook_id: HookId::new("ordinary-gate"),
+                point: HookPoint::PreLlmRequest,
+                model_operations: meerkat_core::HookModelOperationScope::OrdinaryOnly,
+            }]
+        );
     }
 
     #[tokio::test]
@@ -2064,6 +2161,7 @@ mod tests {
                         temperature: None,
                         provider_params: None,
                         message_count: 1,
+                        operation: Default::default(),
                     }),
                     llm_response: None,
                     tool_call: None,
@@ -2135,6 +2233,7 @@ mod tests {
                         temperature: None,
                         provider_params: None,
                         message_count: 1,
+                        operation: Default::default(),
                     }),
                     llm_response: None,
                     tool_call: None,

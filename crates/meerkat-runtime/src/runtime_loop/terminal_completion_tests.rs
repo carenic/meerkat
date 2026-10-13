@@ -149,9 +149,14 @@ impl Fixture {
             assert_eq!(batch.input_ids().len(), 2);
             let run_id = RunId::new();
             assert!(matches!(
-                owner::prepare_runtime_loop_batch_start(driver, run_id.clone(), batch)
-                    .await
-                    .unwrap(),
+                owner::prepare_runtime_loop_batch_start(
+                    driver,
+                    run_id.clone(),
+                    batch,
+                    crate::meerkat_machine::RunlessTerminalAnnouncement::default()
+                )
+                .await
+                .unwrap(),
                 owner::RuntimeLoopBatchStart::Started
             ));
             if attempt == 2 {
@@ -516,6 +521,7 @@ async fn stage_refusal_terminal_remains_recoverable_after_a_prior_abandoned_fail
             &fixture.driver,
             run_id.clone(),
             owner::test_authorized_runtime_loop_batch(vec![input_id.clone(), InputId::new()]),
+            crate::meerkat_machine::RunlessTerminalAnnouncement::default(),
         )
         .await
         .expect("staging refusal must remain a typed non-fatal outcome");
@@ -1597,9 +1603,14 @@ async fn retained_live_boundary_join_without_observers_finalizes_before_return()
     let batch = owner::machine_authorize_runtime_loop_batch(&*driver.lock().await).unwrap();
     let run_id = RunId::new();
     assert!(matches!(
-        owner::prepare_runtime_loop_batch_start(&driver, run_id.clone(), batch)
-            .await
-            .unwrap(),
+        owner::prepare_runtime_loop_batch_start(
+            &driver,
+            run_id.clone(),
+            batch,
+            crate::meerkat_machine::RunlessTerminalAnnouncement::default()
+        )
+        .await
+        .unwrap(),
         owner::RuntimeLoopBatchStart::Started
     ));
     let shared = driver.lock().await.shared_dsl_authority();

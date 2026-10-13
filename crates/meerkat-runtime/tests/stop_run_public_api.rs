@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 //! Public-API contract for the run-fenced Stop as an embedding host reaches
-//! it: an `Option<Arc<MeerkatMachine>>` runtime handle (the shape a MobKit
+//! it: an `Option<Arc<MeerkatMachine>>` runtime handle (the shape a Meta
 //! gateway keeps as its session runtime) calling `stop_run` directly, with the
 //! receipt types taken only from the crate root. A stale run id is the
 //! `NotCurrent` receipt, which such a host treats as a no-op; it must never be

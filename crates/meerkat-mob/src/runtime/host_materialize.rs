@@ -106,6 +106,10 @@ pub trait MaterializePreflightProbe: ProviderPresenceProbe {
 pub struct HostMemberSubstrate {
     pub session_service: Arc<dyn MobSessionService>,
     pub runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
+    /// Optional host selection of each served member's destination, installed
+    /// on the member's exact registration on `runtime_adapter`. A refusal or
+    /// failed install refuses the member.
+    pub member_runtime_registration_hook: Option<Arc<dyn super::MemberRuntimeRegistrationHook>>,
     /// Process-local provider registry used to bind exact application policy
     /// identities during member construction. Policy content is never carried
     /// in the portable member spec.
@@ -156,6 +160,9 @@ pub enum MaterializeDecompileError {
     McpHeaderNamesUnsupported { server: String },
     #[error("MCP connect timeout for server '{server}' exceeds the supported range")]
     McpTimeoutOutOfRange { server: String },
+    /// A carried access ceiling is invalid; it is refused, never stripped.
+    #[error(transparent)]
+    McpAccessInvalid(#[from] meerkat_core::McpServerAccessError),
 }
 
 /// Typed materialize serving failure with its wire projection.
@@ -485,6 +492,7 @@ fn decompile_mcp_servers(
                 required_env_keys,
                 connect_timeout_secs,
                 tool_names,
+                access,
             } => {
                 // Values never travel (A10): declared stdio env keys are
                 // satisfied from the HOST's own process environment; a
@@ -507,6 +515,7 @@ fn decompile_mcp_servers(
                     env,
                 );
                 server.tool_names = tool_names.clone();
+                server.access = access.clone();
                 if let Some(secs) = connect_timeout_secs {
                     server.connect_timeout_secs = Some(u32::try_from(*secs).map_err(|_| {
                         MaterializeDecompileError::McpTimeoutOutOfRange {
@@ -514,6 +523,7 @@ fn decompile_mcp_servers(
                         }
                     })?);
                 }
+                server.validate_access()?;
                 servers.push(server);
             }
             PortableMcpDecl::Http {
@@ -523,6 +533,7 @@ fn decompile_mcp_servers(
                 required_header_names,
                 connect_timeout_secs,
                 tool_names,
+                access,
             } => {
                 // v1 compiles header names empty (spec-compiler rule); a
                 // non-empty set has no host-side value source — fail closed,
@@ -532,7 +543,7 @@ fn decompile_mcp_servers(
                         server: name.clone(),
                     });
                 }
-                servers.push(meerkat_core::mcp_config::McpServerConfig {
+                let server = meerkat_core::mcp_config::McpServerConfig {
                     name: name.clone(),
                     transport: meerkat_core::mcp_config::McpTransportConfig::Http(
                         meerkat_core::mcp_config::McpHttpConfig {
@@ -544,6 +555,10 @@ fn decompile_mcp_servers(
                         },
                     ),
                     tool_names: tool_names.clone(),
+                    access: access.clone(),
+                    // Portable HTTP servers never carry a connector binding.
+                    connector: None,
+                    account: None,
                     connect_timeout_secs: connect_timeout_secs
                         .map(|seconds| {
                             u32::try_from(seconds).map_err(|_| {
@@ -553,7 +568,9 @@ fn decompile_mcp_servers(
                             })
                         })
                         .transpose()?,
-                });
+                };
+                server.validate_access()?;
+                servers.push(server);
             }
         }
     }
@@ -2022,7 +2039,20 @@ impl HostMemberMaterializer {
         )
         .map_err(MaterializeServeError::Build)?;
         let (created, actor_transaction) = actor_transaction
-            .create_owned_with_route(req, route)
+            .create_owned_with_route(
+                req,
+                route,
+                self.substrate
+                    .member_runtime_registration_hook
+                    .as_ref()
+                    .map(|hook| {
+                        (
+                            Arc::clone(&self.substrate.runtime_adapter),
+                            Arc::clone(hook),
+                        )
+                    }),
+                None,
+            )
             .await
             .map_err(|error| classify_materialize_create_error(error, spec))?;
         if created.session_id != session_id {
@@ -2594,7 +2624,20 @@ impl HostMemberMaterializer {
         )
         .map_err(MaterializeServeError::Build)?;
         let (created, actor_transaction) = actor_transaction
-            .create_owned_with_route(req, route)
+            .create_owned_with_route(
+                req,
+                route,
+                self.substrate
+                    .member_runtime_registration_hook
+                    .as_ref()
+                    .map(|hook| {
+                        (
+                            Arc::clone(&self.substrate.runtime_adapter),
+                            Arc::clone(hook),
+                        )
+                    }),
+                None,
+            )
             .await
             .map_err(|error| classify_materialize_create_error(error, spec))?;
         if created.session_id != session_id {
@@ -3389,6 +3432,7 @@ mod tests {
                 required_header_names: vec!["authorization".to_string()],
                 connect_timeout_secs: None,
                 tool_names: BTreeMap::new(),
+                access: None,
             },
         );
         assert!(matches!(
@@ -3409,6 +3453,7 @@ mod tests {
                 required_header_names: Vec::new(),
                 connect_timeout_secs: Some(23),
                 tool_names: BTreeMap::new(),
+                access: None,
             },
         );
 
@@ -3439,6 +3484,7 @@ mod tests {
                     required_env_keys: vec![],
                     connect_timeout_secs: None,
                     tool_names: names.clone(),
+                    access: None,
                 },
             ),
             (
@@ -3450,6 +3496,7 @@ mod tests {
                     required_header_names: vec![],
                     connect_timeout_secs: None,
                     tool_names: names.clone(),
+                    access: None,
                 },
             ),
         ]);
@@ -3470,6 +3517,7 @@ mod tests {
                 required_header_names: Vec::new(),
                 connect_timeout_secs: None,
                 tool_names: BTreeMap::new(),
+                access: None,
             },
         );
 

@@ -64,6 +64,22 @@ pub enum AuthError {
     /// to another variant.
     #[error("auth error: {0}")]
     Other(String),
+    /// The operating-system credential store reported that the user denied
+    /// access to the stored credential. Not absence.
+    #[error("credential access denied")]
+    CredentialAccessDenied,
+    /// The operating-system credential store reported that reading the
+    /// stored credential needs user interaction. Not absence.
+    #[error("credential access requires user interaction")]
+    CredentialInteractionRequired,
+    /// A lookup for this credential is already in flight; no new
+    /// operating-system call was started.
+    #[error("credential access pending")]
+    CredentialAccessPending,
+    /// The credential store cannot answer now (busy, at capacity, not
+    /// observed or failed). Not absence.
+    #[error("credential store unavailable: {0}")]
+    CredentialStoreUnavailable(String),
 }
 
 impl AuthError {
@@ -85,6 +101,10 @@ impl AuthError {
             Self::HostOwnedUnavailable => AuthErrorKind::HostOwnedUnavailable,
             Self::Io(_) => AuthErrorKind::Io,
             Self::Other(_) => AuthErrorKind::Other,
+            Self::CredentialAccessDenied => AuthErrorKind::CredentialAccessDenied,
+            Self::CredentialInteractionRequired => AuthErrorKind::CredentialInteractionRequired,
+            Self::CredentialAccessPending => AuthErrorKind::CredentialAccessPending,
+            Self::CredentialStoreUnavailable(_) => AuthErrorKind::CredentialStoreUnavailable,
         }
     }
 }
@@ -110,6 +130,10 @@ pub enum AuthErrorKind {
     HostOwnedUnavailable,
     Io,
     Other,
+    CredentialAccessDenied,
+    CredentialInteractionRequired,
+    CredentialAccessPending,
+    CredentialStoreUnavailable,
 }
 
 impl AuthErrorKind {
@@ -130,6 +154,10 @@ impl AuthErrorKind {
             Self::HostOwnedUnavailable => "host_owned_unavailable",
             Self::Io => "io",
             Self::Other => "other",
+            Self::CredentialAccessDenied => "credential_access_denied",
+            Self::CredentialInteractionRequired => "credential_interaction_required",
+            Self::CredentialAccessPending => "credential_access_pending",
+            Self::CredentialStoreUnavailable => "credential_store_unavailable",
         }
     }
 }

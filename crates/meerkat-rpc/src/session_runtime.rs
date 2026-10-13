@@ -19,10 +19,8 @@ mod governed;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-#[cfg(feature = "mcp")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak};
-#[cfg(feature = "mcp")]
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -75,6 +73,36 @@ use meerkat_runtime::{
 use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc};
 
 use crate::callback_dispatcher::CallbackRequestEnvelope;
+
+/// How long shutdown waits for the MCP login attempt sweep.
+const MCP_ATTEMPT_SWEEP_GRACE: Duration = Duration::from_secs(10);
+
+/// How long shutdown waits for the mob state's owned work to settle.
+#[cfg(feature = "mob")]
+const MOB_STATE_STAND_DOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// How long shutdown waits for the delivery owner's task to stop.
+const DELIVERY_OWNER_RETIREMENT_GRACE: Duration = Duration::from_secs(10);
+
+/// Shutdown could not confirm the retirement of every wire-admitted MCP
+/// login attempt. The unresolved work stays with its existing native owner
+/// (a flow record may no longer exist for it); the attempts are named by
+/// non-secret reference.
+#[derive(Debug, thiserror::Error)]
+#[error("MCP login attempts were not all retired at shutdown: {unresolved:?}")]
+pub struct McpAttemptSweepIncomplete {
+    pub unresolved: Vec<String>,
+}
+
+/// Shutdown could not confirm that the mob state's owned work settled. The
+/// runtime keeps the state, and the mob tools that reach it, so a later
+/// shutdown joins the same work and releases them only once it settled.
+#[cfg(feature = "mob")]
+#[derive(Debug, thiserror::Error)]
+#[error("the mob state did not settle at shutdown: {unsettled:?}")]
+pub struct MobStateStandDownIncomplete {
+    pub unsettled: Vec<String>,
+}
 use crate::error;
 use crate::protocol::RpcError;
 #[cfg(feature = "mcp")]
@@ -1129,6 +1157,16 @@ impl SessionService for RpcMobSessionService {
             .await
     }
 
+    async fn update_session_mcp_attachment_intent(
+        &self,
+        id: &SessionId,
+        mutation: meerkat_core::McpAttachmentIntentMutation,
+    ) -> Result<meerkat_core::McpAttachmentIntentRecorded, SessionError> {
+        Arc::clone(&self.service)
+            .update_session_mcp_attachment_intent_owned(id, mutation)
+            .await
+    }
+
     async fn has_live_session(&self, id: &SessionId) -> Result<bool, SessionError> {
         self.service.has_live_session(id).await
     }
@@ -2107,6 +2145,144 @@ struct SessionMcpState {
     lifecycle_tx: mpsc::UnboundedSender<McpLifecycleAction>,
     lifecycle_rx: mpsc::UnboundedReceiver<McpLifecycleAction>,
     drain_task_running: Arc<AtomicBool>,
+    /// The session document's revision of each server's durable attachment
+    /// intent, as last recorded or restored: the fence a fresh explicit login
+    /// reinstates a logout-suppressed intent against.
+    intent_revisions: HashMap<String, u64>,
+    /// A governed resume's durable intents, kept until the resuming
+    /// connection has bound the session's destination: only then can the
+    /// native owners prepare their controls.
+    pending_restore: Vec<meerkat_core::McpSessionAttachmentIntent>,
+    /// Orders this session's durable attachment-intent changes with the
+    /// staging each one gates (add, remove, sign-out, login reinstatement and
+    /// restore): a restore's read, stage and post-check never interleave with
+    /// another change of the same session's attachments, so what it stages
+    /// and may unstage is its own.
+    intent_order: Arc<Mutex<()>>,
+}
+
+/// An entered change of a session's durable attachment intents, owned until
+/// it settles: the session's intent order, the persistent owner that records
+/// the change and the session's live MCP state. It runs in a task of its own
+/// ([`SessionRuntime::settle_mcp_intent_transition`]), so a caller that
+/// leaves after entry does not release the order before the durable change
+/// and the live stage or compensation it gates are done.
+#[cfg(feature = "mcp")]
+struct McpIntentTransition {
+    session_id: SessionId,
+    _order: Option<tokio::sync::OwnedMutexGuard<()>>,
+    service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    mcp_sessions: Arc<RwLock<std::collections::HashMap<SessionId, SessionMcpState>>>,
+    /// A staged session has no durable document to record into yet.
+    staged: bool,
+    #[cfg(test)]
+    settlement_hook: Arc<StdMutex<Option<Arc<PendingPromotionPreTurnHook>>>>,
+}
+
+#[cfg(feature = "mcp")]
+impl McpIntentTransition {
+    /// Record `mutation` through the persistent owner and keep the session's
+    /// last recorded revision of that server.
+    async fn record(
+        &self,
+        mutation: meerkat_core::McpAttachmentIntentMutation,
+    ) -> Result<(), RpcError> {
+        if self.staged {
+            return Ok(());
+        }
+        // The persistent owner applies and persists the change in a task it
+        // owns, so this caller's cancellation cannot strand it.
+        let recorded = Arc::clone(&self.service)
+            .update_session_mcp_attachment_intent_owned(&self.session_id, mutation)
+            .await
+            .map_err(|error| RpcError {
+                code: error::INTERNAL_ERROR,
+                message: format!("failed to record the session's MCP attachment intent: {error}"),
+                data: None,
+            })?;
+        if let Some(state) = self.mcp_sessions.write().await.get_mut(&self.session_id) {
+            match recorded.revision {
+                Some(revision) => {
+                    state
+                        .intent_revisions
+                        .insert(recorded.server_name, revision);
+                }
+                None => {
+                    state.intent_revisions.remove(&recorded.server_name);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A fresh explicit login landed for a server this live session awaited:
+    /// reinstate a logout-suppressed durable intent, fenced by the revision
+    /// this session last recorded. Best effort: the login stands.
+    async fn reinstate_awaited(&self, server_name: &str) {
+        let expected_revision = self
+            .mcp_sessions
+            .read()
+            .await
+            .get(&self.session_id)
+            .and_then(|state| state.intent_revisions.get(server_name).copied());
+        let Some(expected_revision) = expected_revision else {
+            return;
+        };
+        if let Err(error) = self
+            .record(meerkat_core::McpAttachmentIntentMutation::Reinstate {
+                server_name: server_name.to_owned(),
+                expected_revision,
+            })
+            .await
+        {
+            tracing::warn!(
+                session_id = %self.session_id,
+                server = server_name,
+                error = %error.message,
+                "could not reinstate the session's MCP attachment intent after the login"
+            );
+        }
+    }
+
+    /// Reinstate a logout-suppressed intent after an exact login and hand the
+    /// reinstated request to the session's restore queue (`pending_restore`)
+    /// in the same owned settlement, so a caller that leaves after entry
+    /// cannot strand it: a governed session restores it at its next bound
+    /// turn, an ungoverned one at once or at its next boundary.
+    async fn reinstate_and_hand_off(
+        self,
+        reinstate: meerkat_core::McpAttachmentIntentMutation,
+        server_name: String,
+    ) -> Result<(), RpcError> {
+        self.record(reinstate).await?;
+        #[cfg(test)]
+        self.settlement_hook().await;
+        let Some(after) =
+            SessionRuntime::read_durable_mcp_attachment_intents(&self.service, &self.session_id)
+                .await
+        else {
+            // Unread, it is not handed off here; the durable request still
+            // restores when the session is next resumed.
+            return Ok(());
+        };
+        let reinstated: Vec<_> = after
+            .into_iter()
+            .filter(|intent| {
+                intent.descriptor.server_name == server_name
+                    && intent.disposition == meerkat_core::McpAttachmentIntentDisposition::Requested
+            })
+            .collect();
+        if let Some(state) = self.mcp_sessions.write().await.get_mut(&self.session_id) {
+            state.pending_restore.extend(reinstated);
+        }
+        Ok(())
+    }
+
+    /// Test hook between an entered durable change and its live settlement.
+    #[cfg(test)]
+    async fn settlement_hook(&self) {
+        SessionRuntime::wait_pending_promotion_pre_turn_hook(&self.settlement_hook).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2208,12 +2384,22 @@ enum RpcExecutorActorAuthority {
     },
 }
 
-fn gate_runtime_completion_outcome(
-    outcome: meerkat_runtime::CompletionOutcome,
+fn gate_runtime_completion_outcome<T>(
+    outcome: T,
     cleanup_result: Result<Option<bool>, RuntimeCompletionCleanupFailure>,
-) -> Result<(meerkat_runtime::CompletionOutcome, Option<bool>), RuntimeCompletionCleanupFailure> {
+) -> Result<(T, Option<bool>), RuntimeCompletionCleanupFailure> {
     cleanup_result.map(|cleanup_authority| (outcome, cleanup_authority))
 }
+
+/// A trusted host's binding of a session's actual new registration, run by
+/// the owned no-turn materialization before the agent is constructed.
+pub(crate) type BeforeConstruction = Box<
+    dyn FnOnce(
+            Arc<meerkat_runtime::MeerkatMachine>,
+            SessionId,
+        ) -> futures::future::BoxFuture<'static, Result<(), RpcError>>
+        + Send,
+>;
 
 /// Core runtime that manages agent sessions.
 ///
@@ -2228,8 +2414,12 @@ pub struct SessionRuntime {
     /// state binds for the delivery owner once it exists.
     continuation_bindings: Arc<meerkat::ContinuationHostBindings>,
     /// The library delivery owner over `job_store` and
-    /// `runtime_delivery_inbox`, once armed.
+    /// `runtime_delivery_inbox`, once armed. A retiring owner stays here
+    /// until its task is joined.
     runtime_delivery_owner: std::sync::Mutex<Option<meerkat::RuntimeDeliveryOwnerHandle>>,
+    /// Set, under the owner slot's lock, once shutdown starts retiring the
+    /// delivery owner: no owner is armed after it.
+    runtime_delivery_owner_retired: AtomicBool,
     monitor_job_managers: Mutex<HashMap<SessionId, Arc<meerkat_tools::builtin::shell::JobManager>>>,
     schedule_service: ScheduleService,
     workgraph_store: Arc<dyn meerkat::WorkGraphStore>,
@@ -2258,6 +2448,18 @@ pub struct SessionRuntime {
     runtime_routed_pre_promotion_hook: Arc<StdMutex<Option<Arc<PendingPromotionPreTurnHook>>>>,
     #[cfg(test)]
     staged_archive_after_service_hook: Arc<StdMutex<Option<Arc<PendingPromotionPreTurnHook>>>>,
+    /// Holds a continuation's application at its start, inside the delivery
+    /// owner's pass.
+    #[cfg(test)]
+    continuation_admit_hook: Arc<StdMutex<Option<Arc<PendingPromotionPreTurnHook>>>>,
+    #[cfg(all(test, feature = "mcp"))]
+    mcp_intent_settlement_hook: Arc<StdMutex<Option<Arc<PendingPromotionPreTurnHook>>>>,
+    /// Held by a governed restore right after it took its batch.
+    #[cfg(all(test, feature = "mcp"))]
+    mcp_restore_batch_hook: Arc<StdMutex<Option<Arc<PendingPromotionPreTurnHook>>>>,
+    /// Signalled when a session's intent order is taken while held.
+    #[cfg(all(test, feature = "mcp"))]
+    mcp_intent_order_contended: Arc<Notify>,
     #[cfg(test)]
     create_session_after_prepare_bindings_error: Arc<StdMutex<Option<String>>>,
     #[cfg(test)]
@@ -2305,6 +2507,36 @@ pub struct SessionRuntime {
     mob_actor_witnesses: RpcMobActorWitnesses,
     #[cfg(feature = "mcp")]
     mcp_sessions: Arc<RwLock<std::collections::HashMap<SessionId, SessionMcpState>>>,
+    /// The governed host's MCP attachment identity-key custody. Only the
+    /// attachment identity paths read it, and only when the factory has no
+    /// provider-auth persistence (see `mcp_attachment_identity_persistence`):
+    /// never provider or MCP credential resolution, nor
+    /// `provider_auth_persistence`.
+    #[cfg(feature = "mcp")]
+    mcp_attachment_identity_key_custody:
+        Option<meerkat_providers::auth_store::ProviderAuthPersistence>,
+    /// Connector client-auth profiles the embedding host installed from its
+    /// own configuration.
+    connector_client_auth_profiles: StdRwLock<Vec<meerkat::ConnectorClientAuthProfile>>,
+    /// Wire-admitted MCP login attempts this runtime started and has not
+    /// seen reach a terminal disposition, keyed by their state. Shutdown
+    /// retires what is left through the flow owner.
+    mcp_wire_attempts: Arc<StdMutex<BTreeMap<String, meerkat::McpServerIdentity>>>,
+    /// MCP login admission gate. A wire start holds it shared across
+    /// admission and custody recording; shutdown takes it exclusively and
+    /// closes it before sweeping, so no admission crosses the sweep.
+    mcp_attempt_admission: Arc<RwLock<bool>>,
+    /// Set when shutdown starts, before it waits for the admission gate, so
+    /// no admission begins after that even if the wait times out.
+    mcp_shutting_down: Arc<AtomicBool>,
+    /// Set when shutdown starts: the mob-state and mob-tools slots refuse a
+    /// new value from then on, so a composition racing the shutdown cannot
+    /// refill what it releases.
+    mob_composition_closed: AtomicBool,
+    /// Request handlers a connection aborted at its drain bound. Work they
+    /// handed off may still be running, so an attempt the sweep finds absent
+    /// is unresolved, not retired.
+    unsettled_requests: Arc<std::sync::atomic::AtomicUsize>,
     /// The process-default callback route: the pre-created stdio/embedded
     /// channel from [`Self::init_callback_channel`] (or the deprecated
     /// [`Self::set_callback_channel`]). Connection-owned routes (one per TCP
@@ -2377,6 +2609,9 @@ impl meerkat::ContinuationDeliverySink for SessionRuntimeContinuationSink {
         session: &SessionId,
         input: meerkat_runtime::Input,
     ) -> Result<meerkat_core::lifecycle::InputId, String> {
+        #[cfg(test)]
+        SessionRuntime::wait_pending_promotion_pre_turn_hook(&self.runtime.continuation_admit_hook)
+            .await;
         let adapter = Arc::clone(&self.runtime.runtime_adapter);
         let executing = adapter
             .session_has_executor(session)
@@ -2696,42 +2931,6 @@ fn session_metadata_marks_mob_member(session: &Session) -> bool {
         .session_metadata()
         .and_then(|metadata| metadata.peer_meta)
         .is_some_and(|peer_meta| peer_meta.labels.contains_key("mob_id"))
-}
-
-fn approval_service_from_persistence(
-    persistence: &PersistenceBundle,
-) -> meerkat_core::ApprovalService {
-    let Some(store_path) = persistence.store_path() else {
-        return meerkat_core::ApprovalService::new();
-    };
-    let path = store_path.join("approvals.json");
-    match meerkat_store::FileApprovalStore::open(&path) {
-        Ok(store) => match meerkat_core::ApprovalService::with_store(Arc::new(store)) {
-            Ok(service) => service,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    path = %path.display(),
-                    "failed to load approval records; approval service unavailable and failing closed"
-                );
-                meerkat_core::ApprovalService::unavailable(format!(
-                    "failed to load approval records from {}: {err}",
-                    path.display()
-                ))
-            }
-        },
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                path = %path.display(),
-                "failed to open approval store; approval service unavailable and failing closed"
-            );
-            meerkat_core::ApprovalService::unavailable(format!(
-                "failed to open approval store {}: {err}",
-                path.display()
-            ))
-        }
-    }
 }
 
 /// Construct the wire replay envelope from the durable stored-event identity.
@@ -3150,7 +3349,7 @@ impl SessionRuntime {
         max_sessions: usize,
         persistence: PersistenceBundle,
         notification_sink: crate::router::NotificationSink,
-    ) -> Self {
+    ) -> Result<Self, meerkat::surface::RuntimeBackedCompositionError> {
         let job_store = persistence.job_store();
         let runtime_delivery_inbox = persistence.runtime_delivery_inbox();
         let continuation_bindings = persistence.continuation_bindings();
@@ -3179,14 +3378,16 @@ impl SessionRuntime {
             workgraph_store.clone(),
             workgraph_default_realm_id(&persistence),
         );
-        let approval_service = approval_service_from_persistence(&persistence);
+        // The persistence's one approval issuer, never a second owner over
+        // its approvals file.
+        let approval_service = persistence.approval_issuer();
         let (service, runtime_adapter) =
             meerkat::surface::build_runtime_backed_service_with_capacities(
                 builder,
                 max_sessions,
                 DEFAULT_RUNTIME_ARCHIVED_HISTORY_CAPACITY,
                 persistence,
-            );
+            )?;
         let service = Arc::new(service);
         let reconfigure_auth_lease = runtime_adapter.generated_auth_lease_handle();
         runtime_adapter.set_session_llm_reconfigure_host(Arc::new(
@@ -3230,13 +3431,14 @@ impl SessionRuntime {
             .with_skill_identity_user_root_slot(Arc::clone(&skill_identity_user_root))
             .build(),
         );
-        Self {
+        Ok(Self {
             factory: factory_clone,
             service,
             job_store,
             runtime_delivery_inbox,
             continuation_bindings,
             runtime_delivery_owner: std::sync::Mutex::new(None),
+            runtime_delivery_owner_retired: AtomicBool::new(false),
             monitor_job_managers: Mutex::new(HashMap::new()),
             schedule_service,
             workgraph_store,
@@ -3256,6 +3458,14 @@ impl SessionRuntime {
             runtime_routed_pre_promotion_hook: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             staged_archive_after_service_hook: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            continuation_admit_hook: Arc::new(StdMutex::new(None)),
+            #[cfg(all(test, feature = "mcp"))]
+            mcp_intent_settlement_hook: Arc::new(StdMutex::new(None)),
+            #[cfg(all(test, feature = "mcp"))]
+            mcp_restore_batch_hook: Arc::new(StdMutex::new(None)),
+            #[cfg(all(test, feature = "mcp"))]
+            mcp_intent_order_contended: Arc::new(Notify::new()),
             #[cfg(test)]
             create_session_after_prepare_bindings_error: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
@@ -3280,6 +3490,14 @@ impl SessionRuntime {
             mob_actor_witnesses: Arc::new(StdRwLock::new(HashMap::new())),
             #[cfg(feature = "mcp")]
             mcp_sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            #[cfg(feature = "mcp")]
+            mcp_attachment_identity_key_custody: None,
+            connector_client_auth_profiles: StdRwLock::new(Vec::new()),
+            mcp_wire_attempts: Arc::new(StdMutex::new(BTreeMap::new())),
+            mcp_attempt_admission: Arc::new(RwLock::new(false)),
+            mcp_shutting_down: Arc::new(AtomicBool::new(false)),
+            mob_composition_closed: AtomicBool::new(false),
+            unsettled_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             default_callback_route: StdRwLock::new(None),
             session_callback_routes: StdRwLock::new(HashMap::new()),
             builder_mob_tools_slot,
@@ -3288,7 +3506,7 @@ impl SessionRuntime {
             approval_service,
             live_adapter_host,
             inner,
-        }
+        })
     }
 
     /// Create a runtime that resolves config from a shared config store.
@@ -3299,7 +3517,7 @@ impl SessionRuntime {
         max_sessions: usize,
         persistence: PersistenceBundle,
         notification_sink: crate::router::NotificationSink,
-    ) -> Self {
+    ) -> Result<Self, meerkat::surface::RuntimeBackedCompositionError> {
         let job_store = persistence.job_store();
         let runtime_delivery_inbox = persistence.runtime_delivery_inbox();
         let continuation_bindings = persistence.continuation_bindings();
@@ -3329,14 +3547,16 @@ impl SessionRuntime {
             workgraph_store.clone(),
             workgraph_default_realm_id(&persistence),
         );
-        let approval_service = approval_service_from_persistence(&persistence);
+        // The persistence's one approval issuer, never a second owner over
+        // its approvals file.
+        let approval_service = persistence.approval_issuer();
         let (service, runtime_adapter) =
             meerkat::surface::build_runtime_backed_service_with_capacities(
                 builder,
                 max_sessions,
                 DEFAULT_RUNTIME_ARCHIVED_HISTORY_CAPACITY,
                 persistence,
-            );
+            )?;
         let service = Arc::new(service);
         let reconfigure_auth_lease = runtime_adapter.generated_auth_lease_handle();
         runtime_adapter.set_session_llm_reconfigure_host(Arc::new(
@@ -3380,13 +3600,14 @@ impl SessionRuntime {
             .with_skill_identity_user_root_slot(Arc::clone(&skill_identity_user_root))
             .build(),
         );
-        Self {
+        Ok(Self {
             factory: factory_clone,
             service,
             job_store,
             runtime_delivery_inbox,
             continuation_bindings,
             runtime_delivery_owner: std::sync::Mutex::new(None),
+            runtime_delivery_owner_retired: AtomicBool::new(false),
             monitor_job_managers: Mutex::new(HashMap::new()),
             schedule_service,
             workgraph_store,
@@ -3406,6 +3627,14 @@ impl SessionRuntime {
             runtime_routed_pre_promotion_hook: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             staged_archive_after_service_hook: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            continuation_admit_hook: Arc::new(StdMutex::new(None)),
+            #[cfg(all(test, feature = "mcp"))]
+            mcp_intent_settlement_hook: Arc::new(StdMutex::new(None)),
+            #[cfg(all(test, feature = "mcp"))]
+            mcp_restore_batch_hook: Arc::new(StdMutex::new(None)),
+            #[cfg(all(test, feature = "mcp"))]
+            mcp_intent_order_contended: Arc::new(Notify::new()),
             #[cfg(test)]
             create_session_after_prepare_bindings_error: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
@@ -3430,6 +3659,14 @@ impl SessionRuntime {
             mob_actor_witnesses: Arc::new(StdRwLock::new(HashMap::new())),
             #[cfg(feature = "mcp")]
             mcp_sessions: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            #[cfg(feature = "mcp")]
+            mcp_attachment_identity_key_custody: None,
+            connector_client_auth_profiles: StdRwLock::new(Vec::new()),
+            mcp_wire_attempts: Arc::new(StdMutex::new(BTreeMap::new())),
+            mcp_attempt_admission: Arc::new(RwLock::new(false)),
+            mcp_shutting_down: Arc::new(AtomicBool::new(false)),
+            mob_composition_closed: AtomicBool::new(false),
+            unsettled_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             default_callback_route: StdRwLock::new(None),
             session_callback_routes: StdRwLock::new(HashMap::new()),
             builder_mob_tools_slot,
@@ -3438,12 +3675,22 @@ impl SessionRuntime {
             approval_service,
             live_adapter_host,
             inner,
-        }
+        })
     }
 
     #[cfg(feature = "local-authorization")]
     pub(crate) fn use_commissioned_config_store(&mut self, store: Arc<dyn ConfigStore>) {
         self.commissioned_config_store = Some(store);
+    }
+
+    /// Install the governed host's MCP attachment identity-key custody (see
+    /// `mcp_attachment_identity_persistence`); nothing else reads it.
+    #[cfg(all(feature = "local-authorization", feature = "mcp"))]
+    pub(crate) fn use_mcp_attachment_identity_key_custody(
+        &mut self,
+        custody: Option<meerkat_providers::auth_store::ProviderAuthPersistence>,
+    ) {
+        self.mcp_attachment_identity_key_custody = custody;
     }
 
     /// Attach realm context defaults used for session metadata.
@@ -3492,11 +3739,17 @@ impl SessionRuntime {
     /// Writes through the shared slot to the `FactoryAgentBuilder` inside the
     /// session service — the builder that actually creates agents. The runtime's
     /// own `factory` clone is NOT used for session creation.
+    /// Refused, and logged, once shutdown has started.
     pub fn set_mob_tools(&self, factory: Arc<dyn meerkat_core::service::MobToolsFactory>) {
-        *self
+        let mut slot = self
             .builder_mob_tools_slot
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(factory);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.mob_composition_closed.load(Ordering::SeqCst) {
+            tracing::warn!("mob tools not set: the runtime is shutting down");
+            return;
+        }
+        *slot = Some(factory);
     }
 
     /// Surface-agnostic core. Phase 4 R1 will collapse the duplicate
@@ -4115,6 +4368,17 @@ impl SessionRuntime {
         error: meerkat_runtime::completion::CompletionWaitError,
         session_id: &SessionId,
     ) -> RpcError {
+        // Not a waiter failure: the input completed and its cleanup ran.
+        if error.is_disclosure_refused() {
+            return RpcError {
+                code: meerkat_contracts::ErrorCode::ScopeDenied.jsonrpc_code(),
+                message: error.to_string(),
+                data: Some(serde_json::json!({
+                    "session_id": session_id.to_string(),
+                    "reason": "result_disclosure_refused",
+                })),
+            };
+        }
         match self
             .runtime_adapter
             .resolve_runtime_completion_wait_failure(session_id, &error)
@@ -4165,19 +4429,21 @@ impl SessionRuntime {
         tokio::spawn(async move {
             let completion = handle.try_wait_with_cleanup_observation().await;
             match completion {
-                Ok((outcome, cleanup_observation)) => {
+                Ok((release, cleanup_observation)) => {
                     let cleanup_result = runtime
                         .cleanup_runtime_after_completion_outcome(&session_id, cleanup_observation)
                         .await;
-                    match gate_runtime_completion_outcome(outcome, cleanup_result) {
-                        Ok((outcome, cleanup_authority)) => {
+                    match gate_runtime_completion_outcome(release, cleanup_result) {
+                        Ok((release, cleanup_authority)) => {
                             if cleanup_authority == Some(true) {
                                 runtime.restore_or_release_runtime_pre_admission(
                                     &session_id,
                                     &input_id,
                                 );
                             }
-                            let _ = outcome_tx.send(Ok(outcome));
+                            // The result payload is released (or its
+                            // disclosure refused) only after cleanup.
+                            let _ = outcome_tx.send(release.release().await);
                         }
                         Err(cleanup_failure) => {
                             if cleanup_failure.releases_pre_admission {
@@ -4546,6 +4812,25 @@ impl SessionRuntime {
         self.runtime_adapter.oauth_flow_authority()
     }
 
+    /// Install the host's connector client-auth profiles (from host
+    /// configuration; a request never supplies a secret).
+    pub fn set_connector_client_auth_profiles(
+        &self,
+        profiles: Vec<meerkat::ConnectorClientAuthProfile>,
+    ) {
+        *self
+            .connector_client_auth_profiles
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = profiles;
+    }
+
+    pub fn connector_client_auth_profiles(&self) -> Vec<meerkat::ConnectorClientAuthProfile> {
+        self.connector_client_auth_profiles
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub fn provider_auth_runtime_authority(&self) -> meerkat_runtime::ProviderAuthRuntimeAuthority {
         self.runtime_adapter.provider_auth_runtime_authority()
     }
@@ -4561,7 +4846,14 @@ impl SessionRuntime {
                 None
             }
         };
-        meerkat::default_mcp_auth_resolver(persistence, self.provider_auth_runtime_authority())
+        // A realm's sessions resolve only that realm's MCP credentials.
+        let authority = self.provider_auth_runtime_authority();
+        match self.realm_id() {
+            Some(realm) => {
+                meerkat::default_mcp_auth_resolver_in_realm(persistence, authority, realm)
+            }
+            None => meerkat::default_mcp_auth_resolver(persistence, authority),
+        }
     }
 
     /// Override the shared default LLM client used by this runtime.
@@ -5558,6 +5850,10 @@ impl SessionRuntime {
         if slot.is_some() {
             return;
         }
+        if self.runtime_delivery_owner_retired.load(Ordering::SeqCst) {
+            tracing::warn!("durable job delivery owner not armed: the runtime is shutting down");
+            return;
+        }
         let Some(realm_id) = self.realm_id() else {
             tracing::warn!(
                 "durable job delivery requires an active realm; no delivery owner armed"
@@ -5574,6 +5870,7 @@ impl SessionRuntime {
         )
         .with_attachment_commits(self.runtime_adapter.subscribe_attachment_commits())
         .with_run_settlements(self.runtime_adapter.subscribe_run_settlements())
+        .with_source_changes(self.continuation_bindings.subscribe_source_changes())
         .arm(host)
         {
             Ok(handle) => *slot = Some(handle),
@@ -6859,9 +7156,14 @@ impl SessionRuntime {
             .await
     }
 
+    /// Refused, and logged, once shutdown has started.
     #[cfg(feature = "mob")]
     pub fn set_mob_state(&self, mob_state: Arc<meerkat_mob_mcp::MobMcpState>) {
         if let Ok(mut slot) = self.mob_state.write() {
+            if self.mob_composition_closed.load(Ordering::SeqCst) {
+                tracing::warn!("mob state not set: the runtime is shutting down");
+                return;
+            }
             *slot = Some(mob_state);
         }
     }
@@ -7139,6 +7441,68 @@ impl SessionRuntime {
             })
     }
 
+    /// Whether work this runtime routes to `witness`, a session's committed
+    /// executor attachment on `adapter`, reaches an owner that publishes it:
+    /// this runtime, through its exact publication authority for that
+    /// attachment, or, for a mob member, the member's own mob runtime, whose
+    /// exact publisher for the attachment serves the live actor the mob
+    /// published to this runtime. An attachment served by neither is refused.
+    async fn require_attachment_publication_authority(
+        self: &Arc<Self>,
+        adapter: &Arc<MeerkatMachine>,
+        witness: &meerkat_runtime::RuntimeExecutorAttachmentWitness,
+    ) -> Result<(), RpcError> {
+        let missing = match self.runtime_publication_handle_for_attachment(witness) {
+            Ok(_) => return Ok(()),
+            Err(missing) => missing,
+        };
+        #[cfg(feature = "mob")]
+        if self.mob_actor_publishes_attachment(adapter, witness).await {
+            return Ok(());
+        }
+        #[cfg(not(feature = "mob"))]
+        let _ = adapter;
+        Err(missing)
+    }
+
+    /// Whether `witness` is the attachment a mob member's own mob runtime
+    /// published for the live actor the mob published to this runtime. The
+    /// mob must own the session, and the machine's exact publisher for the
+    /// attachment (same machine, epoch and attachment, with its retained
+    /// capability) must serve that very actor. The publisher and the actor's
+    /// liveness are read after the awaited ownership queries, so an
+    /// attachment replaced or an actor revoked meanwhile is refused.
+    #[cfg(feature = "mob")]
+    async fn mob_actor_publishes_attachment(
+        self: &Arc<Self>,
+        adapter: &Arc<MeerkatMachine>,
+        witness: &meerkat_runtime::RuntimeExecutorAttachmentWitness,
+    ) -> bool {
+        let session_id = witness.session_id();
+        let Some(mob_state) = self.mob_state() else {
+            return false;
+        };
+        let Ok(actor_witness) = self.mob_actor_witness(session_id) else {
+            return false;
+        };
+        let owned = mob_state.owns_live_bridge_session(session_id).await
+            || mob_state.owns_persisted_bridge_session(session_id).await;
+        if !owned {
+            return false;
+        }
+        let Ok(publisher) = adapter
+            .publication_handle_for_executor_attachment(witness)
+            .await
+        else {
+            return false;
+        };
+        let actor = actor_witness.executor_actor_identity();
+        publisher
+            .actor_identity()
+            .is_some_and(|serving| serving.is_same_actor(&actor))
+            && actor.is_live()
+    }
+
     fn actor_publication_refresh_callback(
         &self,
         session_id: &SessionId,
@@ -7387,11 +7751,28 @@ impl SessionRuntime {
         // Check for a live executor (not just registration). Sessions
         // registered via `prepare_bindings()` exist in the adapter map but
         // have no RuntimeLoop — inputs would queue without being processed.
+        //
+        // Executor presence is not readiness: reuse needs the same exact
+        // committed attachment and publication authority the boundary-held
+        // path below checks (this runtime's, or a mob member's own runtime's).
+        // An attachment still pending its commit, or one without that
+        // authority, joins that path, which waits for the attaching owner and
+        // checks again. This check takes no turn boundary: a running turn
+        // holds it for its whole lap, and input admission must not queue
+        // behind the turn.
         if adapter
             .session_has_executor(session_id)
             .await
             .map_err(runtime_driver_error_to_rpc)?
+            && let Some(witness) = adapter
+                .current_executor_attachment_witness(session_id)
+                .await
+            && self
+                .require_attachment_publication_authority(adapter, &witness)
+                .await
+                .is_ok()
         {
+            self.continuation_bindings.source_custody_changed();
             return Ok(());
         }
 
@@ -7438,7 +7819,9 @@ impl SessionRuntime {
                     ),
                     data: None,
                 })?;
-            self.runtime_publication_handle_for_attachment(&witness)?;
+            self.require_attachment_publication_authority(adapter, &witness)
+                .await?;
+            self.continuation_bindings.source_custody_changed();
             return Ok(());
         }
 
@@ -7477,9 +7860,14 @@ impl SessionRuntime {
                 }
             }
             meerkat_runtime::EnsureRuntimeExecutorAttachment::Existing(witness) => {
-                self.runtime_publication_handle_for_attachment(&witness)?;
+                self.require_attachment_publication_authority(adapter, &witness)
+                    .await?;
             }
         }
+        // Fresh or reused, the session is served by the exact attachment this
+        // runtime published. Delivery owners retry what they hold blocked; the
+        // announcement grants nothing, they read the actual owners again.
+        self.continuation_bindings.source_custody_changed();
         Ok(())
     }
 
@@ -8901,9 +9289,47 @@ impl SessionRuntime {
             }
             None => self.reserve_active_turn(session_id).await?.into_admission(),
         };
-        let recovered_create = self
+        #[cfg(feature = "mcp")]
+        let mcp_attachment_intents = stored_session
+            .build_state()
+            .map(|state| state.mcp_attachment_intents)
+            .unwrap_or_default();
+        #[cfg_attr(not(feature = "mcp"), allow(unused_mut))]
+        let mut recovered_create = self
             .recovered_create_request(session_id, stored_session, recovery_overrides)
             .await?;
+        // A cold resume builds the session's live MCP adapter here, as the
+        // materializing paths do, and restores its durable attachment
+        // intents onto it.
+        #[cfg(feature = "mcp")]
+        {
+            let (event_tx, _) = mpsc::channel(1);
+            let build =
+                AgentBuildConfig::from_create_session_request(&recovered_create.request, event_tx);
+            let build = match self
+                .attach_mcp_adapter_for_pending_session(
+                    session_id.clone(),
+                    build,
+                    mcp_attachment_intents,
+                )
+                .await
+            {
+                Ok(build) => build,
+                Err(primary) => {
+                    return Err(self
+                        .combine_with_recovered_runtime_cleanup(
+                            session_id,
+                            recovered_create.runtime_was_registered,
+                            primary,
+                            "clean up newly recovered runtime after MCP adapter attachment failure",
+                        )
+                        .await);
+                }
+            };
+            if let Some(options) = recovered_create.request.build.as_mut() {
+                options.external_tools = build.external_tools;
+            }
+        }
         if let Err(primary) = self.ensure_runtime_executor(session_id).await {
             drop(active_turn);
             return Err(self
@@ -9045,6 +9471,35 @@ impl SessionRuntime {
         labels: Option<BTreeMap<String, String>>,
         resume_overrides: SurfaceSessionRecoveryOverrides,
     ) -> Result<SessionId, RpcError> {
+        self.create_or_resume_session_without_turn_bound(
+            build_config,
+            resume_id,
+            labels,
+            resume_overrides,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::create_or_resume_session_without_turn`] with a trusted host's
+    /// binding of the actual new registration, run after the exact
+    /// materialization claim prepared it and before the session's agent is
+    /// constructed or anything is restored. A binding failure rolls back this
+    /// operation's claim like any other failure. `cancelled`, when given,
+    /// resolves once the caller's request is cancelled: the binding or the
+    /// construction in progress is abandoned and compensated as for a caller
+    /// that stopped waiting (the claim rolled back, the session's MCP state
+    /// entry removed), and the result is a cancellation.
+    pub(crate) async fn create_or_resume_session_without_turn_bound(
+        self: &Arc<Self>,
+        build_config: AgentBuildConfig,
+        resume_id: Option<SessionId>,
+        labels: Option<BTreeMap<String, String>>,
+        resume_overrides: SurfaceSessionRecoveryOverrides,
+        before_construction: Option<BeforeConstruction>,
+        cancelled: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<SessionId, RpcError> {
         let runtime = Arc::clone(self);
         let (mut result_tx, result_rx) = tokio::sync::oneshot::channel();
         // Keep the registration fence until exact compensation has finished,
@@ -9110,13 +9565,50 @@ impl SessionRuntime {
                         message: error.to_string(),
                         data: None,
                     })?;
-                let materialized = tokio::select! {
-                    biased;
-                    () = result_tx.closed() => None,
-                    result = runtime.materialize_without_turn(
-                        session, build_config, labels, resume_id.is_some(),
-                        resume_overrides, &mut prepared, admission,
-                    ) => Some(result),
+                // A cancelled request abandons the step in progress; the
+                // claim is rolled back below like any other failure.
+                let mut cancelled = cancelled;
+                let request_cancelled =
+                    async |cancelled: &mut Option<tokio::sync::watch::Receiver<bool>>| {
+                        match cancelled.as_mut() {
+                            Some(receiver) => {
+                                if receiver.wait_for(|cancelled| *cancelled).await.is_err() {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
+                            None => std::future::pending::<()>().await,
+                        }
+                    };
+                let cancellation = || RpcError {
+                    code: error::REQUEST_CANCELLED,
+                    message: "request cancelled during session recovery".into(),
+                    data: None,
+                };
+                // The host binds the actual new registration first: its
+                // agent and anything restored decide under that binding.
+                let bound = match before_construction {
+                    Some(bind) => {
+                        tokio::select! {
+                            biased;
+                            () = result_tx.closed() => None,
+                            () = request_cancelled(&mut cancelled) => Some(Err(cancellation())),
+                            result = bind(runtime.runtime_adapter(), id.clone()) => Some(result),
+                        }
+                    }
+                    None => Some(Ok(())),
+                };
+                let materialized = match bound {
+                    Some(Ok(())) => tokio::select! {
+                        biased;
+                        () = result_tx.closed() => None,
+                        () = request_cancelled(&mut cancelled) => Some(Err(cancellation())),
+                        result = runtime.materialize_without_turn(
+                            session, build_config, labels, resume_id.is_some(),
+                            resume_overrides, &mut prepared, admission,
+                        ) => Some(result),
+                    },
+                    Some(Err(error)) => Some(Err(error)),
+                    None => None,
                 };
                 match materialized {
                     Some(Ok(actor_slot)) => {
@@ -9234,8 +9726,12 @@ impl SessionRuntime {
         {
             let (event_tx, _) = mpsc::channel(1);
             let build = AgentBuildConfig::from_create_session_request(&request, event_tx);
+            let intents = session
+                .build_state()
+                .map(|state| state.mcp_attachment_intents)
+                .unwrap_or_default();
             let build = self
-                .attach_mcp_adapter_for_pending_session(session.id().clone(), build)
+                .attach_mcp_adapter_for_pending_session(session.id().clone(), build, intents)
                 .await?;
             if let Some(options) = request.build.as_mut() {
                 options.external_tools = build.external_tools;
@@ -9399,7 +9895,7 @@ impl SessionRuntime {
 
         #[cfg(feature = "mcp")]
         let build_config = match self
-            .attach_mcp_adapter_for_pending_session(session_id.clone(), build_config)
+            .attach_mcp_adapter_for_pending_session(session_id.clone(), build_config, Vec::new())
             .await
         {
             Ok(build_config) => build_config,
@@ -11719,8 +12215,24 @@ impl SessionRuntime {
 
     /// Shut down the runtime, returning a typed session teardown failure.
     ///
-    /// MCP and comms cleanup still run when session teardown fails.
+    /// MCP and comms cleanup still run when session teardown fails. A
+    /// delivery owner that does not stop within its bound stops the shutdown
+    /// before any teardown that depends on it, with its typed incomplete
+    /// result; a retried shutdown joins the same owner and continues.
     pub async fn try_shutdown(&self) -> Result<(), meerkat_core::SessionError> {
+        // From here no composition refills the mob slots this shutdown
+        // releases.
+        self.mob_composition_closed.store(true, Ordering::SeqCst);
+
+        // Close MCP login admission, then retire every wire-admitted attempt
+        // still pending. The caller's request drains reported their outcome
+        // (which does not mean every request owner settled); an unresolved
+        // attempt is reported after the rest of the teardown.
+        let attempt_sweep = self
+            .retire_mcp_wire_attempts(MCP_ATTEMPT_SWEEP_GRACE)
+            .await
+            .map_err(|incomplete| meerkat_core::SessionError::Store(Box::new(incomplete)));
+
         // Clear pending sessions.
         self.staged_sessions.clear().await;
         self.runtime_pre_admissions
@@ -11735,6 +12247,27 @@ impl SessionRuntime {
 
         self.shutdown_schedule_host().await;
 
+        // Retire the delivery owner and join its task before registration
+        // teardown takes its final snapshot, so no delivery pass admits work
+        // into a session being torn down. A pass that is not joined may still
+        // admit work, so an owner that does not stop within its bound stops
+        // the shutdown here, before the registration, service, mob, MCP and
+        // comms teardown: the owner stays in its slot and a retried shutdown
+        // joins it.
+        if let Err(incomplete) = self
+            .retire_runtime_delivery_owner(DELIVERY_OWNER_RETIREMENT_GRACE)
+            .await
+        {
+            if let Err(unresolved) = &attempt_sweep {
+                // A retried shutdown sweeps the recorded attempts again.
+                tracing::warn!(
+                    error = %unresolved,
+                    "MCP login attempts unresolved at an incomplete runtime shutdown"
+                );
+            }
+            return Err(incomplete);
+        }
+
         // Each runtime registration owns its session's hosting claim (#1813),
         // and its executor holds this runtime, so the claim outlives a drop.
         // Tear every registration down to terminal (which also joins its
@@ -11743,6 +12276,14 @@ impl SessionRuntime {
 
         // Shut down the service.
         let service_shutdown = self.service.try_shutdown().await;
+
+        #[cfg(feature = "mob")]
+        let mob_release = self
+            .release_mob_state()
+            .await
+            .map_err(|incomplete| meerkat_core::SessionError::Store(Box::new(incomplete)));
+        #[cfg(not(feature = "mob"))]
+        let mob_release = Ok(());
 
         #[cfg(feature = "mcp")]
         {
@@ -11762,7 +12303,454 @@ impl SessionRuntime {
         if let Err(error) = self.runtime_adapter.abort_comms_drains().await {
             tracing::warn!(%error, "failed to abort comms drains during runtime shutdown");
         }
-        registration_teardown.and(service_shutdown)
+        registration_teardown
+            .and(service_shutdown)
+            .and(mob_release)
+            .and(attempt_sweep)
+    }
+
+    /// Retire the delivery owner and join its task within `bound`, refusing
+    /// any later arming. The owner stays in its slot until its task is
+    /// joined: a concurrent retirement joins the same task, and a wait that
+    /// ends early, past its bound or cancelled, leaves the owner there for
+    /// the next retirement.
+    async fn retire_runtime_delivery_owner(
+        &self,
+        bound: Duration,
+    ) -> Result<(), meerkat_core::SessionError> {
+        let retirement = {
+            let slot = self
+                .runtime_delivery_owner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.runtime_delivery_owner_retired
+                .store(true, Ordering::SeqCst);
+            match slot.as_ref() {
+                Some(owner) => owner.retire(),
+                // Never armed, or joined by an earlier retirement.
+                None => return Ok(()),
+            }
+        };
+        retirement
+            .join(bound)
+            .await
+            .map_err(|incomplete| meerkat_core::SessionError::Store(Box::new(incomplete)))?;
+        // Joined: release the stopped owner, unless a concurrent retirement
+        // already did.
+        let stopped = self
+            .runtime_delivery_owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|owner| owner.is_stopped());
+        drop(stopped);
+        Ok(())
+    }
+
+    /// Stand the mob state down and release this runtime's hold on it.
+    ///
+    /// The state's session service holds this runtime's mob-state slot, and
+    /// that service's builder holds the mob-tools slot, both of which hold
+    /// the state: left filled, they keep the state, and through it the
+    /// machine, referenced after this runtime is dropped.
+    ///
+    /// Runs after the session service shut down, so no live session's mob
+    /// tools still hold the state; the closed composition flag keeps both
+    /// slots from being refilled. Only a clean stand-down empties them: an
+    /// unsettled one leaves the state in its slot and reports it, so a later
+    /// shutdown joins the same owned work instead of abandoning it. A
+    /// poisoned slot is read through, so it never skips the stand-down.
+    ///
+    /// This does not shut down the state's managed mobs.
+    #[cfg(feature = "mob")]
+    async fn release_mob_state(&self) -> Result<(), MobStateStandDownIncomplete> {
+        let current = self
+            .mob_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(state) = current {
+            let deadline = std::time::Instant::now() + MOB_STATE_STAND_DOWN_GRACE;
+            match state.stand_down(deadline).await {
+                meerkat_mob_mcp::MobStateStandDown::Clean => {}
+                meerkat_mob_mcp::MobStateStandDown::Unsettled { reasons } => {
+                    return Err(MobStateStandDownIncomplete { unsettled: reasons });
+                }
+                other => {
+                    return Err(MobStateStandDownIncomplete {
+                        unsettled: vec![format!("{other:?}")],
+                    });
+                }
+            }
+        }
+        let state = self
+            .mob_state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let mob_tools = self
+            .builder_mob_tools_slot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(mob_tools);
+        drop(state);
+        Ok(())
+    }
+
+    /// Admit one wire MCP login start under the admission gate: `admit` runs
+    /// while the gate is held shared, and a `Started` attempt is recorded
+    /// before the gate is released, so shutdown's sweep sees it. A closed
+    /// gate refuses before any admission.
+    pub(crate) async fn admit_mcp_wire_login<F, Fut>(
+        &self,
+        target: &meerkat::McpServerIdentity,
+        admit: F,
+    ) -> Result<meerkat::McpOAuthLoginStart, meerkat::HostAuthError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<
+                Output = Result<meerkat::McpOAuthLoginStart, meerkat::HostAuthError>,
+            >,
+    {
+        let refuse = || {
+            Err(meerkat::HostAuthError::McpOAuth(
+                meerkat::McpOAuthError::AuthLifecycle {
+                    server_name: target.server_name().to_owned(),
+                    reason: "the runtime is shutting down".into(),
+                },
+            ))
+        };
+        if self.mcp_shutting_down.load(Ordering::Acquire) {
+            return refuse();
+        }
+        let gate = self.mcp_attempt_admission.read().await;
+        if *gate || self.mcp_shutting_down.load(Ordering::Acquire) {
+            return refuse();
+        }
+        let started = admit().await?;
+        if started.disposition == meerkat::McpOAuthLoginDisposition::Started {
+            self.mcp_wire_attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(started.state.clone(), target.clone());
+        }
+        drop(gate);
+        Ok(started)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_mcp_wire_attempt_for_testing(
+        &self,
+        state: &str,
+        target: &meerkat::McpServerIdentity,
+    ) {
+        self.mcp_wire_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(state.to_owned(), target.clone());
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn mcp_admission_closed_for_testing(&self) -> bool {
+        *self.mcp_attempt_admission.read().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mcp_wire_attempt_count_for_testing(&self) -> usize {
+        self.mcp_wire_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// A connection aborted `count` request handlers at its drain bound.
+    pub(crate) fn note_unsettled_requests(&self, count: usize) {
+        self.unsettled_requests.fetch_add(count, Ordering::AcqRel);
+    }
+
+    /// The wire attempt admitted under `state` reached a terminal disposition
+    /// (completed or cancelled). Only that exact attempt is forgotten.
+    pub(crate) fn forget_mcp_wire_attempt(&self, state: &str) {
+        self.mcp_wire_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(state);
+    }
+
+    /// The attempt with this non-secret reference for `target` was retired.
+    pub(crate) fn forget_mcp_wire_attempt_ref(
+        &self,
+        target: &meerkat::McpServerIdentity,
+        attempt_ref: &str,
+    ) {
+        self.mcp_wire_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|state, recorded| {
+                recorded != target
+                    || meerkat_providers::connector_oauth::OAuthBrowserActionRef::project(state)
+                        .as_str()
+                        != attempt_ref
+            });
+    }
+
+    /// Close MCP login admission and retire every wire-admitted attempt still
+    /// recorded, through the flow owner's canonical retirement. A retired or
+    /// absent attempt is forgotten; a failed retirement stays recorded and is
+    /// reported. The store calls run on the blocking pool, bounded by
+    /// `grace`; an unfinished sweep is reported incomplete, never as success.
+    pub async fn retire_mcp_wire_attempts(
+        &self,
+        grace: Duration,
+    ) -> Result<(), McpAttemptSweepIncomplete> {
+        // No admission starts from here on, even if the gate wait times out.
+        self.mcp_shutting_down.store(true, Ordering::Release);
+        // One deadline bounds the whole sweep: waiting for in-flight
+        // admissions to record, then the retirements.
+        let deadline = tokio::time::Instant::now() + grace;
+        let attempt_ref = |state: &str| {
+            meerkat_providers::connector_oauth::OAuthBrowserActionRef::project(state)
+                .as_str()
+                .to_owned()
+        };
+        match tokio::time::timeout_at(deadline, self.mcp_attempt_admission.write()).await {
+            Ok(mut closed) => *closed = true,
+            Err(_) => {
+                // An admission is still running: everything recorded so far
+                // is unresolved, and the running one may add to it.
+                return Err(McpAttemptSweepIncomplete {
+                    unresolved: self
+                        .mcp_wire_attempts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .keys()
+                        .map(|state| attempt_ref(state))
+                        .collect(),
+                });
+            }
+        }
+        let recorded: Vec<(String, meerkat::McpServerIdentity)> = self
+            .mcp_wire_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(state, target)| (state.clone(), target.clone()))
+            .collect();
+        if recorded.is_empty() {
+            return Ok(());
+        }
+        let service = match self.provider_auth_persistence() {
+            Ok(Some(persistence)) => {
+                let service = meerkat::HostAuthService::new(
+                    persistence,
+                    self.provider_auth_runtime_authority(),
+                )
+                .with_connector_client_auth_profiles(self.connector_client_auth_profiles());
+                match (self.realm_config_source(), self.realm_id()) {
+                    (Some(source), Some(realm)) => {
+                        service.with_realm_connector_clients(source, realm)
+                    }
+                    _ => service,
+                }
+            }
+            _ => {
+                return Err(McpAttemptSweepIncomplete {
+                    unresolved: recorded
+                        .iter()
+                        .map(|(state, _)| attempt_ref(state))
+                        .collect(),
+                });
+            }
+        };
+        let ledger = Arc::clone(&self.mcp_wire_attempts);
+        let handoffs_unsettled = self.unsettled_requests.load(Ordering::Acquire) > 0;
+        let sweep = tokio::task::spawn_blocking(move || {
+            let mut unresolved = Vec::new();
+            for (state, target) in recorded {
+                let reference = attempt_ref(&state);
+                match service.mcp_login_cancel_by_state(&target, &state) {
+                    Ok(()) => {
+                        tracing::info!(attempt = %reference, "retired MCP login attempt at shutdown");
+                    }
+                    Err(meerkat::HostAuthError::McpOAuth(meerkat::McpOAuthError::Flow(
+                        meerkat_providers::oauth_flow::OAuthFlowError::Missing,
+                    ))) if handoffs_unsettled => {
+                        // Possibly consumed by an aborted completion whose
+                        // credential save may still be running.
+                        tracing::warn!(attempt = %reference, "MCP login attempt absent while aborted request work may still run");
+                        unresolved.push(reference);
+                        continue;
+                    }
+                    Err(meerkat::HostAuthError::McpOAuth(meerkat::McpOAuthError::Flow(
+                        meerkat_providers::oauth_flow::OAuthFlowError::Missing,
+                    ))) => {
+                        tracing::info!(attempt = %reference, "MCP login attempt already absent at shutdown");
+                    }
+                    Err(error) => {
+                        tracing::warn!(attempt = %reference, %error, "MCP login attempt retirement failed at shutdown");
+                        unresolved.push(reference);
+                        continue;
+                    }
+                }
+                ledger
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&state);
+            }
+            unresolved
+        });
+        // A store call still running past the deadline keeps running on the
+        // blocking pool (an async timeout cannot bound it), and the process
+        // exits only once it ends; its attempt is reported unresolved.
+        let unresolved = match tokio::time::timeout_at(deadline, sweep).await {
+            Ok(Ok(unresolved)) => unresolved,
+            // Timed out or the blocking task failed: whatever is still
+            // recorded is unresolved.
+            Ok(Err(_)) | Err(_) => self
+                .mcp_wire_attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .keys()
+                .map(|state| attempt_ref(state))
+                .collect(),
+        };
+        if unresolved.is_empty() {
+            Ok(())
+        } else {
+            Err(McpAttemptSweepIncomplete { unresolved })
+        }
+    }
+
+    /// After a successful MCP login for `target`, wake the exact operation
+    /// awaiting it in this runtime's live sessions
+    /// ([`McpRouterAdapter::retry_authorized`]). Best effort per session:
+    /// the login's success stands, and each outcome is logged.
+    #[cfg(feature = "mcp")]
+    pub async fn mcp_credential_landed(
+        &self,
+        target: &meerkat::McpServerIdentity,
+    ) -> Vec<(
+        SessionId,
+        Result<meerkat::AuthorizedRetry, meerkat::McpError>,
+    )> {
+        let adapters: Vec<(SessionId, Arc<McpRouterAdapter>)> = self
+            .mcp_sessions
+            .read()
+            .await
+            .iter()
+            .map(|(session_id, state)| (session_id.clone(), Arc::clone(&state.adapter)))
+            .collect();
+        let mut outcomes = Vec::with_capacity(adapters.len());
+        for (session_id, adapter) in adapters {
+            let transition = self.enter_mcp_intent_transition(&session_id).await;
+            let retried = target.clone();
+            let Some(outcome) = Self::settle_mcp_intent_transition(async move {
+                let outcome = adapter.retry_authorized(&retried).await;
+                if matches!(outcome, Ok(meerkat::AuthorizedRetry::Staged)) {
+                    transition.reinstate_awaited(retried.server_name()).await;
+                }
+                outcome
+            })
+            .await
+            else {
+                continue;
+            };
+            // A logout-suppressed intent restored in this process has no
+            // awaiting router entry: the login reinstates its exact durable
+            // intent and re-stages it (taking the order itself).
+            if matches!(outcome, Ok(meerkat::AuthorizedRetry::NotAwaiting)) {
+                self.reinstate_suppressed_after_login(&session_id, target)
+                    .await;
+            }
+            match &outcome {
+                Ok(meerkat::AuthorizedRetry::Staged) => tracing::info!(
+                    %session_id,
+                    server = target.server_name(),
+                    "staged the MCP server awaiting this login"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    %session_id,
+                    server = target.server_name(),
+                    %error,
+                    "could not stage the MCP server awaiting this login"
+                ),
+            }
+            outcomes.push((session_id, outcome));
+        }
+        outcomes
+    }
+
+    /// After the credential for `target` was released (signed out), stop
+    /// offering every connected server that uses exactly it in this
+    /// runtime's sessions ([`McpRouterAdapter::credential_released`]). Calls
+    /// are already refused per request; the tools are unpublished at each
+    /// session's next boundary, and a later sign-in for the same target adds
+    /// the server back to the same session. Best effort per session: the
+    /// logout's success stands, and each outcome is logged.
+    #[cfg(feature = "mcp")]
+    pub async fn mcp_credential_released(
+        &self,
+        target: &meerkat::McpServerIdentity,
+    ) -> Vec<(
+        SessionId,
+        Result<meerkat::ReleasedCredential, meerkat::McpError>,
+    )> {
+        let adapters: Vec<(SessionId, Arc<McpRouterAdapter>)> = self
+            .mcp_sessions
+            .read()
+            .await
+            .iter()
+            .map(|(session_id, state)| (session_id.clone(), Arc::clone(&state.adapter)))
+            .collect();
+        let mut outcomes = Vec::with_capacity(adapters.len());
+        for (session_id, adapter) in adapters {
+            let transition = self.enter_mcp_intent_transition(&session_id).await;
+            let released = target.clone();
+            let Some(outcome) = Self::settle_mcp_intent_transition(async move {
+                let outcome = adapter.credential_released(&released).await;
+                if matches!(outcome, Ok(meerkat::ReleasedCredential::Unpublished)) {
+                    // An explicit sign-out suppresses the durable request
+                    // until a fresh explicit login, across a restart too.
+                    if let Err(error) = transition
+                        .record(
+                            meerkat_core::McpAttachmentIntentMutation::SuppressByLogout {
+                                server_name: released.server_name().to_owned(),
+                            },
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            session_id = %transition.session_id,
+                            server = released.server_name(),
+                            error = %error.message,
+                            "could not record the sign-out on the session's MCP attachment intent"
+                        );
+                    }
+                }
+                outcome
+            })
+            .await
+            else {
+                continue;
+            };
+            match &outcome {
+                Ok(meerkat::ReleasedCredential::Unpublished) => tracing::info!(
+                    %session_id,
+                    server = target.server_name(),
+                    "unpublished the MCP server whose credential was released"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    %session_id,
+                    server = target.server_name(),
+                    %error,
+                    "could not unpublish the MCP server whose credential was released"
+                ),
+            }
+            outcomes.push((session_id, outcome));
+        }
+        outcomes
     }
 
     /// Unregister every current runtime registration until terminal, keeping
@@ -11816,6 +12804,35 @@ impl SessionRuntime {
         config: McpServerConfig,
         persisted: bool,
     ) -> Result<bool, RpcError> {
+        self.mcp_stage_add_controlled(session_id, config, persisted, None)
+            .await
+            .map(|outcome| outcome.persisted)
+    }
+
+    /// Stage a governed live MCP add under a prepared, authenticated
+    /// attachment control. The trusted host composition prepares the control
+    /// through the runtime's native owners before calling; it is rechecked
+    /// before any persisted write and again at the apply boundary.
+    #[cfg(feature = "mcp")]
+    pub async fn mcp_stage_add_governed(
+        &self,
+        session_id: &SessionId,
+        config: McpServerConfig,
+        persisted: bool,
+        control: Arc<dyn meerkat_core::mcp_attachment::McpAttachmentAuthority>,
+    ) -> Result<meerkat_core::mcp_attachment::McpAttachmentOutcome, RpcError> {
+        self.mcp_stage_add_controlled(session_id, config, persisted, Some(control))
+            .await
+    }
+
+    #[cfg(feature = "mcp")]
+    async fn mcp_stage_add_controlled(
+        &self,
+        session_id: &SessionId,
+        config: McpServerConfig,
+        persisted: bool,
+        control: Option<Arc<dyn meerkat_core::mcp_attachment::McpAttachmentAuthority>>,
+    ) -> Result<meerkat_core::mcp_attachment::McpAttachmentOutcome, RpcError> {
         self.ensure_session_exists(session_id).await?;
         if config.name.trim().is_empty() {
             return Err(RpcError {
@@ -11824,40 +12841,29 @@ impl SessionRuntime {
                 data: None,
             });
         }
-
         let adapter = self.mcp_adapter_for_session(session_id).await?;
-        let rollback = if persisted {
-            let (context_root, user_root) = self.skill_identity_roots();
-            let authority =
-                meerkat::surface::mcp_config_mutation_authority(context_root, user_root);
-            match meerkat::surface::persist_mcp_add_if_requested(true, &authority, config.clone())
-                .await
-            {
-                Ok(rollback) => rollback,
-                Err(message) => {
-                    return Err(RpcError {
-                        code: error::INTERNAL_ERROR,
-                        message,
-                        data: None,
-                    });
-                }
-            }
-        } else {
-            None
-        };
-        if let Err(e) = adapter.stage_add(config).await {
-            let rollback_message =
-                match meerkat::surface::rollback_mcp_persisted_mutation(rollback).await {
-                    Ok(()) => String::new(),
-                    Err(rollback_err) => format!("; persisted rollback failed: {rollback_err}"),
-                };
-            return Err(RpcError {
-                code: error::INTERNAL_ERROR,
-                message: format!("{e}{rollback_message}"),
-                data: None,
-            });
-        }
-        Ok(rollback.is_some())
+        let descriptor = self.accepted_mcp_attachment_descriptor(&config).await?;
+        let (context_root, user_root) = self.skill_identity_roots();
+        let authority = meerkat::surface::mcp_config_mutation_authority(context_root, user_root);
+        let governed = self.runtime_adapter.has_native_work_authorization_host();
+        let transition = self.enter_mcp_intent_transition(session_id).await;
+        // The request is durable at acceptance, before any connection or
+        // sign-in wait: a restart in between still owes this session the
+        // attachment. Once entered, the record and the stage settle together.
+        Self::settle_mcp_intent_transition(async move {
+            transition
+                .record(meerkat_core::McpAttachmentIntentMutation::Request { descriptor })
+                .await?;
+            #[cfg(test)]
+            transition.settlement_hook().await;
+            meerkat::surface::stage_mcp_live_add(
+                &adapter, governed, control, &authority, config, persisted,
+            )
+            .await
+            .map_err(mcp_live_add_rpc_error)
+        })
+        .await
+        .unwrap_or_else(|| Err(Self::unsettled_mcp_intent_transition()))
     }
 
     #[cfg(feature = "mcp")]
@@ -11887,38 +12893,62 @@ impl SessionRuntime {
             });
         }
         let adapter = self.mcp_adapter_for_session(session_id).await?;
-        let rollback = if persisted {
-            let (context_root, user_root) = self.skill_identity_roots();
-            let authority =
-                meerkat::surface::mcp_config_mutation_authority(context_root, user_root);
-            match meerkat::surface::persist_mcp_remove_if_requested(true, &authority, &server_name)
-                .await
-            {
-                Ok(rollback) => rollback,
-                Err(message) => {
-                    return Err(RpcError {
+        let (context_root, user_root) = self.skill_identity_roots();
+        let authority = meerkat::surface::mcp_config_mutation_authority(context_root, user_root);
+        let transition = self.enter_mcp_intent_transition(session_id).await;
+        // Once entered, the persisted change, the durable withdrawal and the
+        // live removal (or the rollback) settle together.
+        Self::settle_mcp_intent_transition(async move {
+            let rollback = if persisted {
+                meerkat::surface::persist_mcp_remove_if_requested(true, &authority, &server_name)
+                    .await
+                    .map_err(|message| RpcError {
                         code: error::INTERNAL_ERROR,
                         message,
                         data: None,
-                    });
-                }
+                    })?
+            } else {
+                None
+            };
+            // The durable request is withdrawn before the live removal is
+            // staged, so a restore re-reading the intents after this point
+            // never re-stages it; the live drain and cleanup stay as they are.
+            if let Err(error) = transition
+                .record(meerkat_core::McpAttachmentIntentMutation::Withdraw {
+                    server_name: server_name.clone(),
+                })
+                .await
+            {
+                let rollback_message =
+                    match meerkat::surface::rollback_mcp_persisted_mutation(rollback).await {
+                        Ok(()) => String::new(),
+                        Err(rollback_err) => format!("; persisted rollback failed: {rollback_err}"),
+                    };
+                return Err(RpcError {
+                    message: format!("{}{rollback_message}", error.message),
+                    ..error
+                });
             }
-        } else {
-            None
-        };
-        if let Err(e) = adapter.stage_remove(server_name).await {
-            let rollback_message =
-                match meerkat::surface::rollback_mcp_persisted_mutation(rollback).await {
-                    Ok(()) => String::new(),
-                    Err(rollback_err) => format!("; persisted rollback failed: {rollback_err}"),
-                };
-            return Err(RpcError {
-                code: error::INTERNAL_ERROR,
-                message: format!("{e}{rollback_message}"),
-                data: None,
-            });
-        }
-        Ok(rollback.is_some())
+            #[cfg(test)]
+            transition.settlement_hook().await;
+            if let Err(e) = adapter.stage_remove(server_name.clone()).await {
+                let rollback_message =
+                    match meerkat::surface::rollback_mcp_persisted_mutation(rollback).await {
+                        Ok(()) => String::new(),
+                        Err(rollback_err) => format!("; persisted rollback failed: {rollback_err}"),
+                    };
+                return Err(RpcError {
+                    code: error::INTERNAL_ERROR,
+                    message: format!(
+                        "{e}{rollback_message}; the session's durable attachment request is withdrawn"
+                    ),
+                    data: None,
+                });
+            }
+            Ok(rollback.is_some())
+        })
+        .await
+        .unwrap_or_else(|| Err(Self::unsettled_mcp_intent_transition()))
     }
 
     #[cfg(feature = "mcp")]
@@ -11995,6 +13025,7 @@ impl SessionRuntime {
         &self,
         session_id: SessionId,
         mut build_config: AgentBuildConfig,
+        intents: Vec<meerkat_core::McpSessionAttachmentIntent>,
     ) -> Result<AgentBuildConfig, RpcError> {
         let router = match &build_config.runtime_build_mode {
             meerkat_core::RuntimeBuildMode::SessionOwned(bindings) => {
@@ -12026,15 +13057,769 @@ impl SessionRuntime {
         build_config.external_tools = Some(combined);
 
         let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
+        let intent_revisions = intents
+            .iter()
+            .map(|intent| (intent.descriptor.server_name.clone(), intent.revision))
+            .collect();
+        let governed = self.runtime_adapter.has_native_work_authorization_host();
+        let (restore_now, pending_restore) = if governed {
+            (Vec::new(), intents)
+        } else {
+            (intents, Vec::new())
+        };
         let state = SessionMcpState {
-            adapter,
+            adapter: Arc::clone(&adapter),
             turn_counter: 0,
-            lifecycle_tx,
+            lifecycle_tx: lifecycle_tx.clone(),
             lifecycle_rx,
             drain_task_running: Arc::new(AtomicBool::new(false)),
+            intent_revisions,
+            pending_restore,
+            intent_order: Arc::new(Mutex::new(())),
         };
-        self.mcp_sessions.write().await.insert(session_id, state);
+        self.mcp_sessions
+            .write()
+            .await
+            .insert(session_id.clone(), state);
+        if !restore_now.is_empty() {
+            self.restore_mcp_attachments(
+                &session_id,
+                &adapter,
+                &lifecycle_tx,
+                &restore_now,
+                HashMap::new(),
+                Vec::new(),
+                None,
+            )
+            .await;
+        }
         Ok(build_config)
+    }
+
+    /// Re-stage a resumed session's durable MCP attachment intents through the
+    /// native restore, against the current installation and authority. Each
+    /// intent is restored (staged; an absent credential awaits sign-in) or
+    /// refused locally; a logout-suppressed one stays down. No business input
+    /// is resubmitted. Every outcome but a restore is reported on the session's
+    /// lifecycle stream, so the client sees it as a typed
+    /// `tool_config_changed` at the session's first boundary.
+    #[cfg(feature = "mcp")]
+    #[allow(clippy::too_many_arguments)]
+    async fn restore_mcp_attachments(
+        &self,
+        session_id: &SessionId,
+        adapter: &Arc<McpRouterAdapter>,
+        lifecycle_tx: &mpsc::UnboundedSender<McpLifecycleAction>,
+        intents: &[meerkat_core::McpSessionAttachmentIntent],
+        controls: HashMap<String, Arc<dyn meerkat_core::mcp_attachment::McpAttachmentAuthority>>,
+        refused: Vec<meerkat::surface::McpAttachmentRestoreOutcome>,
+        installations: Option<Vec<meerkat_core::mcp_config::McpServerConfig>>,
+    ) {
+        let _order = self.lock_mcp_intent_order(session_id).await;
+        self.restore_mcp_attachments_in_order(
+            session_id,
+            adapter,
+            lifecycle_tx,
+            intents,
+            controls,
+            refused,
+            installations,
+        )
+        .await;
+    }
+
+    /// Restore an ungoverned session's queued reinstated intents (see
+    /// [`McpIntentTransition::reinstate_and_hand_off`]) under its intent
+    /// order. An entry leaves the queue only once its restore completed, so
+    /// a caller that leaves midway leaves it for the next boundary.
+    #[cfg(feature = "mcp")]
+    async fn restore_queued_mcp_attachments(&self, session_id: &SessionId) {
+        let order = self.lock_mcp_intent_order(session_id).await;
+        let (adapter, lifecycle_tx, queued) = {
+            let sessions = self.mcp_sessions.read().await;
+            let Some(state) = sessions.get(session_id) else {
+                return;
+            };
+            if state.pending_restore.is_empty() {
+                return;
+            }
+            (
+                Arc::clone(&state.adapter),
+                state.lifecycle_tx.clone(),
+                state.pending_restore.clone(),
+            )
+        };
+        self.restore_mcp_attachments_in_order(
+            session_id,
+            &adapter,
+            &lifecycle_tx,
+            &queued,
+            HashMap::new(),
+            Vec::new(),
+            None,
+        )
+        .await;
+        if let Some(state) = self.mcp_sessions.write().await.get_mut(session_id) {
+            state
+                .pending_restore
+                .retain(|intent| !queued.contains(intent));
+        }
+        drop(order);
+    }
+
+    /// [`Self::restore_mcp_attachments`] with the session's intent order
+    /// already held by the caller.
+    #[cfg(feature = "mcp")]
+    #[allow(clippy::too_many_arguments)]
+    async fn restore_mcp_attachments_in_order(
+        &self,
+        session_id: &SessionId,
+        adapter: &Arc<McpRouterAdapter>,
+        lifecycle_tx: &mpsc::UnboundedSender<McpLifecycleAction>,
+        intents: &[meerkat_core::McpSessionAttachmentIntent],
+        controls: HashMap<String, Arc<dyn meerkat_core::mcp_attachment::McpAttachmentAuthority>>,
+        refused: Vec<meerkat::surface::McpAttachmentRestoreOutcome>,
+        installations: Option<Vec<meerkat_core::mcp_config::McpServerConfig>>,
+    ) {
+        let mut refused = refused;
+        // Re-read the durable intents right before re-staging: an entry a
+        // removal, sign-out or newer request superseded since it was read is
+        // not restored.
+        let Some(current) = self.durable_mcp_attachment_intents(session_id).await else {
+            for intent in intents {
+                refused.push(Self::unavailable_restore(intent));
+            }
+            Self::report_restore_outcomes(session_id, lifecycle_tx, refused, Vec::new());
+            return;
+        };
+        let intents: Vec<_> = intents
+            .iter()
+            .filter(|intent| Self::intent_is_current(&current, intent))
+            .cloned()
+            .collect();
+        let intents = intents.as_slice();
+        // A governed composition supplies the realm's own installations (its
+        // installation authority); otherwise the runtime's configured ones.
+        let installed = match installations {
+            Some(installed) => installed,
+            None => match self.current_mcp_installations().await {
+                Ok(installed) => installed,
+                Err(()) => {
+                    for intent in intents {
+                        refused.push(Self::unavailable_restore(intent));
+                    }
+                    Self::report_restore_outcomes(session_id, lifecycle_tx, refused, Vec::new());
+                    return;
+                }
+            },
+        };
+        let current_installation =
+            |name: &str| installed.iter().find(|server| server.name == name).cloned();
+        let governed = self.runtime_adapter.has_native_work_authorization_host();
+        // A governed entry restores only under the fresh native control
+        // prepared for its current installation; one with none is refused by
+        // the native restore (fail closed).
+        let control_for = |server: &meerkat_core::mcp_config::McpServerConfig| {
+            controls.get(&server.name).cloned()
+        };
+        let (context_root, user_root) = self.skill_identity_roots();
+        let authority = meerkat::surface::mcp_config_mutation_authority(context_root, user_root);
+        // Load, never create, the realm's attachment identity key: a record
+        // that needs a key this realm cannot load is refused as needing
+        // renewal.
+        let identity_key = self.load_mcp_attachment_identity_key().await;
+        let outcomes = meerkat::surface::restore_session_mcp_attachments(
+            adapter,
+            governed,
+            intents,
+            &current_installation,
+            &control_for,
+            &authority,
+            identity_key.as_ref(),
+        )
+        .await;
+        // Every change of this session's intents in this process settles
+        // under the order (its caller leaving included), so what was staged
+        // is this restore's own. A change that still landed meanwhile wins,
+        // and the outcome says what is true: an entry whose exact intent is
+        // no longer current is unstaged again (a boundary that already
+        // applied it removes it at the next one) and is never reported
+        // restored; when that, or the re-read itself, cannot be confirmed,
+        // the entry is reported unavailable.
+        let after = self.durable_mcp_attachment_intents(session_id).await;
+        let mut settled = Vec::with_capacity(outcomes.len());
+        for outcome in outcomes {
+            let restaged = matches!(
+                outcome.disposition,
+                meerkat::surface::McpAttachmentRestoreDisposition::Restaged
+            );
+            let Some(intent) = intents
+                .iter()
+                .find(|intent| intent.descriptor.server_name == outcome.server_name)
+                .filter(|_| restaged)
+            else {
+                settled.push(outcome);
+                continue;
+            };
+            let successor = match after.as_deref() {
+                Some(after) if Self::intent_is_current(after, intent) => {
+                    settled.push(outcome);
+                    continue;
+                }
+                Some(after) => after
+                    .iter()
+                    .find(|current| current.descriptor.server_name == outcome.server_name)
+                    .map(|current| current.disposition),
+                None => None,
+            };
+            if let Err(error) = adapter.stage_remove(outcome.server_name.clone()).await {
+                tracing::warn!(
+                    %session_id,
+                    server = %outcome.server_name,
+                    %error,
+                    "could not unstage a restore superseded while it staged"
+                );
+                settled.push(Self::unavailable_restore(intent));
+                continue;
+            }
+            match (after.is_some(), successor) {
+                // A sign-out landed: the entry stays down, as suppressed.
+                (true, Some(meerkat_core::McpAttachmentIntentDisposition::SuppressedByLogout)) => {
+                    settled.push(meerkat::surface::McpAttachmentRestoreOutcome {
+                        server_name: outcome.server_name,
+                        disposition: meerkat::surface::McpAttachmentRestoreDisposition::Suppressed,
+                    });
+                }
+                // A removal landed: the request is withdrawn, so nothing is
+                // restored and there is nothing to report.
+                (true, None) => tracing::info!(
+                    %session_id,
+                    server = %outcome.server_name,
+                    "unstaged a restore whose attachment was removed while it staged"
+                ),
+                // A newer request is current (its own path stages it), or the
+                // re-read failed: this restore did not restore it.
+                _ => settled.push(Self::unavailable_restore(intent)),
+            }
+        }
+        let outcomes = settled;
+        Self::report_restore_outcomes(session_id, lifecycle_tx, refused, outcomes);
+    }
+
+    #[cfg(feature = "mcp")]
+    fn unavailable_restore(
+        intent: &meerkat_core::McpSessionAttachmentIntent,
+    ) -> meerkat::surface::McpAttachmentRestoreOutcome {
+        meerkat::surface::McpAttachmentRestoreOutcome {
+            server_name: intent.descriptor.server_name.clone(),
+            disposition: meerkat::surface::McpAttachmentRestoreDisposition::Refused(
+                meerkat::surface::McpAttachmentRestoreRefusal::Native(
+                    meerkat_core::mcp_attachment::McpAttachmentRefusal::Unavailable,
+                ),
+            ),
+        }
+    }
+
+    /// Report every restore outcome but a re-stage on the session's lifecycle
+    /// stream, as a typed `tool_config_changed` at its next boundary.
+    #[cfg(feature = "mcp")]
+    fn report_restore_outcomes(
+        session_id: &SessionId,
+        lifecycle_tx: &mpsc::UnboundedSender<McpLifecycleAction>,
+        refused: Vec<meerkat::surface::McpAttachmentRestoreOutcome>,
+        outcomes: Vec<meerkat::surface::McpAttachmentRestoreOutcome>,
+    ) {
+        for outcome in refused.into_iter().chain(outcomes) {
+            let Some(restore) = outcome.disposition.wire_outcome() else {
+                tracing::info!(
+                    %session_id,
+                    server = %outcome.server_name,
+                    "restored the session's MCP attachment"
+                );
+                continue;
+            };
+            tracing::info!(
+                %session_id,
+                server = %outcome.server_name,
+                ?restore,
+                "did not restore the session's MCP attachment"
+            );
+            let _ = lifecycle_tx.send(McpLifecycleAction {
+                target: outcome.server_name,
+                operation: ToolConfigChangeOperation::Add,
+                phase: meerkat_core::ExternalToolDeltaPhase::Failed,
+                persisted: false,
+                applied_at_turn: None,
+                tool_count: None,
+                detail: None,
+                confinement_refusal: None,
+                restore: Some(restore),
+            });
+        }
+    }
+
+    /// Restore a governed resume's parked durable intents now that the
+    /// resuming connection has bound the session's destination: each entry
+    /// gets a fresh native control for its current installation from
+    /// `prepare_control` (a refusal leaves it without one, so it is refused).
+    ///
+    /// The batch is taken under the session's MCP intent order, and the order
+    /// is held until the batch is staged and its outcomes are queued: a
+    /// concurrent request of the same session waits on the order, so it never
+    /// treats a queue emptied by a restore that has not staged yet as
+    /// restored. The restore settles in a task that owns the order and the
+    /// taken batch, so a caller that stops waiting leaves it to complete
+    /// (staged, its outcomes queued for the session's next boundary) instead
+    /// of losing it. Nothing here connects a server: the boundary does.
+    #[cfg(feature = "mcp")]
+    pub(crate) async fn restore_pending_mcp_attachments<F, Fut>(
+        self: &Arc<Self>,
+        session_id: &SessionId,
+        installations: Option<Vec<meerkat_core::mcp_config::McpServerConfig>>,
+        prepare_control: F,
+    ) where
+        F: Fn(meerkat_core::mcp_config::McpServerConfig) -> Fut + Send + 'static,
+        Fut: std::future::Future<
+                Output = Result<
+                    Arc<dyn meerkat_core::mcp_attachment::McpAttachmentAuthority>,
+                    meerkat_core::mcp_attachment::McpAttachmentRefusal,
+                >,
+            > + Send
+            + 'static,
+    {
+        let Some(order) = self.lock_mcp_intent_order(session_id).await else {
+            return;
+        };
+        let (adapter, lifecycle_tx, intents) = {
+            let mut sessions = self.mcp_sessions.write().await;
+            let Some(state) = sessions.get_mut(session_id) else {
+                return;
+            };
+            if state.pending_restore.is_empty() {
+                return;
+            }
+            (
+                Arc::clone(&state.adapter),
+                state.lifecycle_tx.clone(),
+                std::mem::take(&mut state.pending_restore),
+            )
+        };
+        let runtime = Arc::clone(self);
+        let session = session_id.clone();
+        let settlement = tokio::spawn(async move {
+            let _order = order;
+            #[cfg(test)]
+            Self::wait_pending_promotion_pre_turn_hook(&runtime.mcp_restore_batch_hook).await;
+            runtime
+                .restore_taken_mcp_batch(
+                    &session,
+                    &adapter,
+                    &lifecycle_tx,
+                    intents,
+                    installations,
+                    prepare_control,
+                )
+                .await;
+        });
+        let _ = settlement.await;
+    }
+
+    /// Prepare each entry of a taken restore batch and stage it, with the
+    /// session's intent order held by the caller.
+    #[cfg(feature = "mcp")]
+    async fn restore_taken_mcp_batch<F, Fut>(
+        &self,
+        session_id: &SessionId,
+        adapter: &Arc<McpRouterAdapter>,
+        lifecycle_tx: &mpsc::UnboundedSender<McpLifecycleAction>,
+        intents: Vec<meerkat_core::McpSessionAttachmentIntent>,
+        installations: Option<Vec<meerkat_core::mcp_config::McpServerConfig>>,
+        prepare_control: F,
+    ) where
+        F: Fn(meerkat_core::mcp_config::McpServerConfig) -> Fut,
+        Fut: std::future::Future<
+                Output = Result<
+                    Arc<dyn meerkat_core::mcp_attachment::McpAttachmentAuthority>,
+                    meerkat_core::mcp_attachment::McpAttachmentRefusal,
+                >,
+            >,
+    {
+        let mut controls = HashMap::new();
+        let mut refused = Vec::new();
+        let mut restorable = Vec::new();
+        let installed = match installations {
+            Some(installed) => installed,
+            None => {
+                let Ok(installed) = self.current_mcp_installations().await else {
+                    for intent in &intents {
+                        refused.push(Self::unavailable_restore(intent));
+                    }
+                    Self::report_restore_outcomes(session_id, lifecycle_tx, refused, Vec::new());
+                    return;
+                };
+                installed
+            }
+        };
+        for intent in intents {
+            let name = intent.descriptor.server_name.clone();
+            // Only a requested entry with a current installation needs a
+            // control; the native restore decides the others (suppressed,
+            // retired).
+            let installation = installed.iter().find(|server| server.name == name).cloned();
+            let requested = matches!(
+                intent.disposition,
+                meerkat_core::McpAttachmentIntentDisposition::Requested
+            );
+            if let (true, Some(server)) = (requested, installation) {
+                match prepare_control(server).await {
+                    Ok(control) => {
+                        controls.insert(name, control);
+                    }
+                    Err(refusal) => {
+                        // The native owners' typed refusal is this entry's
+                        // restore outcome; it is not restored.
+                        refused.push(meerkat::surface::McpAttachmentRestoreOutcome {
+                            server_name: name,
+                            disposition: meerkat::surface::McpAttachmentRestoreDisposition::Refused(
+                                meerkat::surface::McpAttachmentRestoreRefusal::Native(refusal),
+                            ),
+                        });
+                        continue;
+                    }
+                }
+            }
+            restorable.push(intent);
+        }
+        self.restore_mcp_attachments_in_order(
+            session_id,
+            adapter,
+            lifecycle_tx,
+            &restorable,
+            controls,
+            refused,
+            Some(installed),
+        )
+        .await;
+    }
+
+    /// The MCP servers currently installed for this runtime: the realm's own
+    /// (from its composed configuration) and the `mcp.toml` scopes.
+    #[cfg(feature = "mcp")]
+    async fn current_mcp_installations(
+        &self,
+    ) -> Result<Vec<meerkat_core::mcp_config::McpServerConfig>, ()> {
+        // A read failure is not an absence: the caller refuses the restore as
+        // unavailable rather than as retired or a lower-precedence fallback.
+        let mut servers = match self.effective_config().await {
+            Ok(config) => config.tools.mcp_servers,
+            Err(error) => {
+                tracing::warn!(error = %error.message, "could not read the realm's MCP installations");
+                return Err(());
+            }
+        };
+        let (context_root, user_root) = self.skill_identity_roots();
+        match meerkat_core::mcp_config::McpConfig::load_with_scopes_from_roots(
+            context_root.as_deref(),
+            user_root.as_deref(),
+        )
+        .await
+        {
+            Ok(scoped) => {
+                for entry in scoped {
+                    if !servers
+                        .iter()
+                        .any(|server| server.name == entry.server.name)
+                    {
+                        servers.push(entry.server);
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not read the MCP configuration scopes");
+                return Err(());
+            }
+        }
+        Ok(servers)
+    }
+
+    /// Take `session_id`'s attachment-intent order (see `SessionMcpState`);
+    /// `None` for a session with no MCP state.
+    #[cfg(feature = "mcp")]
+    async fn lock_mcp_intent_order(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let order = self
+            .mcp_sessions
+            .read()
+            .await
+            .get(session_id)
+            .map(|state| Arc::clone(&state.intent_order))?;
+        #[cfg(test)]
+        let order = match Arc::clone(&order).try_lock_owned() {
+            Ok(guard) => return Some(guard),
+            Err(_) => {
+                self.mcp_intent_order_contended.notify_one();
+                order
+            }
+        };
+        Some(order.lock_owned().await)
+    }
+
+    /// The session's current durable MCP attachment intents, read from its
+    /// authoritative document (`None` when that cannot be read).
+    #[cfg(feature = "mcp")]
+    async fn durable_mcp_attachment_intents(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<Vec<meerkat_core::McpSessionAttachmentIntent>> {
+        Self::read_durable_mcp_attachment_intents(&self.service, session_id).await
+    }
+
+    /// [`Self::durable_mcp_attachment_intents`] through `service`.
+    #[cfg(feature = "mcp")]
+    async fn read_durable_mcp_attachment_intents(
+        service: &PersistentSessionService<FactoryAgentBuilder>,
+        session_id: &SessionId,
+    ) -> Option<Vec<meerkat_core::McpSessionAttachmentIntent>> {
+        match service.load_authoritative_session(session_id).await {
+            Ok(Some(session)) => Some(
+                session
+                    .build_state()
+                    .map(|state| state.mcp_attachment_intents)
+                    .unwrap_or_default(),
+            ),
+            Ok(None) => Some(Vec::new()),
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "could not read the session's MCP attachment intents");
+                None
+            }
+        }
+    }
+
+    /// Whether `intent` is still exactly the session's current durable intent
+    /// for its server (same revision and disposition): a removal, sign-out or
+    /// newer request since it was read supersedes it.
+    #[cfg(feature = "mcp")]
+    fn intent_is_current(
+        current: &[meerkat_core::McpSessionAttachmentIntent],
+        intent: &meerkat_core::McpSessionAttachmentIntent,
+    ) -> bool {
+        current.iter().any(|candidate| {
+            candidate.descriptor.server_name == intent.descriptor.server_name
+                && candidate.revision == intent.revision
+                && candidate.disposition == intent.disposition
+        })
+    }
+
+    /// A fresh explicit login landed for `target` while this live session
+    /// holds its durable intent for that server suppressed by an earlier
+    /// sign-out (after a restart there is no awaiting router entry): if the
+    /// current installation is exactly the logged-in target, reinstate that
+    /// exact intent, fenced by its durable revision, and re-stage it under a
+    /// fresh restore (a governed session restores at its next bound turn).
+    #[cfg(feature = "mcp")]
+    async fn reinstate_suppressed_after_login(
+        &self,
+        session_id: &SessionId,
+        target: &meerkat::McpServerIdentity,
+    ) {
+        let server_name = target.server_name();
+        let transition = self.enter_mcp_intent_transition(session_id).await;
+        let Some(current) = self.durable_mcp_attachment_intents(session_id).await else {
+            return;
+        };
+        let Some(intent) = current.iter().find(|intent| {
+            intent.descriptor.server_name == server_name
+                && intent.disposition
+                    == meerkat_core::McpAttachmentIntentDisposition::SuppressedByLogout
+        }) else {
+            return;
+        };
+        let Ok(installed) = self.current_mcp_installations().await else {
+            return;
+        };
+        let Some(installation) = installed.iter().find(|server| server.name == server_name) else {
+            return;
+        };
+        let installed_target = match target.realm() {
+            Some(realm) => {
+                meerkat::McpServerIdentity::from_config_in_realm(realm.clone(), installation)
+            }
+            None => meerkat::McpServerIdentity::from_config(installation),
+        };
+        if installed_target.ok().as_ref() != Some(target) {
+            return;
+        }
+        // The login must be for the very attachment the sign-out suppressed:
+        // the record proves its exact target (an unbound or withheld one
+        // proves nothing), and under the realm's existing identity key
+        // (loaded, never created) the current installation reproduces that
+        // target and account exactly. Anything else leaves it suppressed.
+        let identity_key = self.load_mcp_attachment_identity_key().await;
+        if !Self::login_proves_suppressed_attachment(
+            &intent.descriptor,
+            installation,
+            identity_key.as_ref(),
+        ) {
+            return;
+        }
+        let reinstate = meerkat_core::McpAttachmentIntentMutation::Reinstate {
+            server_name: server_name.to_owned(),
+            expected_revision: intent.revision,
+        };
+        let handed_off = Self::settle_mcp_intent_transition(
+            transition.reinstate_and_hand_off(reinstate, server_name.to_owned()),
+        )
+        .await
+        .unwrap_or_else(|| Err(Self::unsettled_mcp_intent_transition()));
+        if let Err(error) = handed_off {
+            tracing::warn!(
+                %session_id,
+                server = server_name,
+                error = %error.message,
+                "could not reinstate the suppressed MCP attachment intent after the login"
+            );
+            return;
+        }
+        // An ungoverned session restores it now; were this caller to leave
+        // first, its next boundary does.
+        if !self.runtime_adapter.has_native_work_authorization_host() {
+            self.restore_queued_mcp_attachments(session_id).await;
+        }
+    }
+
+    /// Whether `installation`, under the realm's loaded identity `key`, is
+    /// exactly the attachment a sign-out suppressed as `recorded`: the record
+    /// proves its target (two unknown identities prove nothing) and the
+    /// current descriptor, target and account, equals it.
+    #[cfg(feature = "mcp")]
+    fn login_proves_suppressed_attachment(
+        recorded: &meerkat_core::McpAttachmentDescriptorIdentity,
+        installation: &meerkat_core::mcp_config::McpServerConfig,
+        key: Option<&meerkat_core::auth::McpAttachmentIdentityKey>,
+    ) -> bool {
+        recorded.target.is_exact()
+            && meerkat_core::McpAttachmentDescriptorIdentity::of(installation, key) == *recorded
+    }
+
+    /// The store holding the realm's MCP attachment identity key, the same
+    /// for admission and restore: the factory's provider-auth persistence
+    /// when it has one, else the governed host's identity-key custody. A
+    /// factory fault is returned as it is, never answered from the custody,
+    /// and what the chosen store holds, a missing or unreadable key included,
+    /// is that store's answer.
+    #[cfg(feature = "mcp")]
+    fn mcp_attachment_identity_persistence(
+        &self,
+    ) -> Result<Option<meerkat_providers::auth_store::ProviderAuthPersistence>, meerkat::FactoryError>
+    {
+        match self.provider_auth_persistence()? {
+            Some(persistence) => Ok(Some(persistence)),
+            None => Ok(self.mcp_attachment_identity_key_custody.clone()),
+        }
+    }
+
+    /// The accepted descriptor identity of an attachment request, keyed by the
+    /// realm's protected attachment identity key when its target carries
+    /// args or a credential-bearing URL (the key is created on first need).
+    #[cfg(feature = "mcp")]
+    async fn accepted_mcp_attachment_descriptor(
+        &self,
+        config: &meerkat_core::mcp_config::McpServerConfig,
+    ) -> Result<meerkat_core::McpAttachmentDescriptorIdentity, RpcError> {
+        let persistence = self
+            .mcp_attachment_identity_persistence()
+            .map_err(|error| RpcError {
+                code: error::INTERNAL_ERROR,
+                message: format!(
+                    "provider-auth persistence unavailable for the MCP attachment: {error}"
+                ),
+                data: None,
+            })?;
+        match (persistence, self.realm_id()) {
+            (Some(persistence), Some(realm)) => {
+                meerkat::surface::accepted_mcp_attachment_identity(&persistence, &realm, config)
+                    .await
+                    .map_err(|error| RpcError {
+                        code: error::INTERNAL_ERROR,
+                        message: format!(
+                            "failed to establish the MCP attachment identity: {error}"
+                        ),
+                        data: None,
+                    })
+            }
+            // No realm key store: the record keeps only nonsecret identity,
+            // and one that needs a key is refused as needing renewal later.
+            _ => Ok(meerkat_core::McpAttachmentDescriptorIdentity::of(
+                config, None,
+            )),
+        }
+    }
+
+    /// The realm's existing MCP attachment identity key, if it can be loaded.
+    #[cfg(feature = "mcp")]
+    async fn load_mcp_attachment_identity_key(
+        &self,
+    ) -> Option<meerkat_core::auth::McpAttachmentIdentityKey> {
+        let persistence = self.mcp_attachment_identity_persistence().ok().flatten()?;
+        let realm = self.realm_id()?;
+        match meerkat_core::auth::load_mcp_attachment_identity_key(
+            persistence.token_store().as_ref(),
+            &realm,
+        )
+        .await
+        {
+            Ok(key) => key,
+            Err(error) => {
+                tracing::warn!(%error, "could not load the realm's MCP attachment identity key");
+                None
+            }
+        }
+    }
+
+    /// Record one durable MCP attachment intent change for `session_id` in its
+    /// session document, and keep the recorded revision. A staged (not yet
+    /// durable) session has no document to record in.
+    /// Enter a change of `session_id`'s durable attachment intents: take its
+    /// intent order (see `SessionMcpState`) into the transition that owns it
+    /// until it settles.
+    #[cfg(feature = "mcp")]
+    async fn enter_mcp_intent_transition(&self, session_id: &SessionId) -> McpIntentTransition {
+        let order = self.lock_mcp_intent_order(session_id).await;
+        McpIntentTransition {
+            session_id: session_id.clone(),
+            _order: order,
+            service: Arc::clone(&self.service),
+            mcp_sessions: Arc::clone(&self.mcp_sessions),
+            staged: self.staged_sessions.contains(session_id).await,
+            #[cfg(test)]
+            settlement_hook: Arc::clone(&self.mcp_intent_settlement_hook),
+        }
+    }
+
+    /// Run an entered intent transition to settlement in a task that owns it:
+    /// the caller may leave, the change still settles under its order.
+    /// `None` only when the task ended without settling (runtime shutdown);
+    /// a panic propagates.
+    #[cfg(feature = "mcp")]
+    async fn settle_mcp_intent_transition<T: Send + 'static>(
+        work: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> Option<T> {
+        match tokio::spawn(work).await {
+            Ok(settled) => Some(settled),
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(_) => None,
+        }
+    }
+
+    #[cfg(feature = "mcp")]
+    fn unsettled_mcp_intent_transition() -> RpcError {
+        RpcError {
+            code: error::INTERNAL_ERROR,
+            message: "the MCP attachment change ended without settling".to_string(),
+            data: None,
+        }
     }
 
     #[cfg(feature = "mcp")]
@@ -12050,6 +13835,32 @@ impl SessionRuntime {
             });
         }
         Ok(())
+    }
+
+    /// Whether this runtime's factory carries a connector authority: every
+    /// router it builds then prepares connector calls.
+    #[cfg(all(test, feature = "mcp"))]
+    pub(crate) fn has_connector_authority_for_test(&self) -> bool {
+        self.factory.has_connector_oauth_authority()
+    }
+
+    /// Apply the session's staged MCP operations now, as its next boundary
+    /// would, and report how many operations are pending after it.
+    #[cfg(all(test, feature = "mcp"))]
+    pub(crate) async fn mcp_apply_staged_for_test(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<usize, RpcError> {
+        let adapter = self.mcp_adapter_for_session(session_id).await?;
+        adapter
+            .apply_staged()
+            .await
+            .map(|result| result.pending_count)
+            .map_err(|message| RpcError {
+                code: error::INTERNAL_ERROR,
+                message,
+                data: None,
+            })
     }
 
     #[cfg(feature = "mcp")]
@@ -12074,6 +13885,12 @@ impl SessionRuntime {
         event_tx: &mpsc::Sender<EventEnvelope<AgentEvent>>,
         prompt: &mut String,
     ) -> Result<(), RpcError> {
+        // An ungoverned session's reinstated requests a login handed off
+        // restore before this boundary applies (a governed one restores them
+        // under its prepared controls at its bound turn).
+        if !self.runtime_adapter.has_native_work_authorization_host() {
+            self.restore_queued_mcp_attachments(session_id).await;
+        }
         let (adapter, turn_number, drain_task_running, lifecycle_tx, mut queued_actions) = {
             let mut map = self.mcp_sessions.write().await;
             let state = match map.get_mut(session_id) {
@@ -14637,14 +16454,17 @@ mod tests {
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(meerkat_store::MemoryBlobStore::new());
         (
-            Arc::new(SessionRuntime::new(
-                factory,
-                Config::default(),
-                max_sessions,
-                meerkat::PersistenceBundle::new(session_store, runtime_store_dyn, blob_store)
-                    .expect("construct runtime authority"),
-                crate::router::NotificationSink::noop(),
-            )),
+            Arc::new(
+                SessionRuntime::new(
+                    factory,
+                    Config::default(),
+                    max_sessions,
+                    meerkat::PersistenceBundle::new(session_store, runtime_store_dyn, blob_store)
+                        .expect("construct runtime authority"),
+                    crate::router::NotificationSink::noop(),
+                )
+                .expect("compose the RPC session runtime"),
+            ),
             runtime_store,
         )
     }
@@ -14657,14 +16477,17 @@ mod tests {
         let runtime_store_dyn: Arc<dyn meerkat_runtime::RuntimeStore> = runtime_store.clone();
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(meerkat_store::MemoryBlobStore::new());
-        let runtime = Arc::new(SessionRuntime::new(
-            temp_factory(&temp),
-            Config::default(),
-            1,
-            meerkat::PersistenceBundle::new(session_store, runtime_store_dyn, blob_store)
-                .expect("construct runtime authority"),
-            crate::router::NotificationSink::noop(),
-        ));
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                temp_factory(&temp),
+                Config::default(),
+                1,
+                meerkat::PersistenceBundle::new(session_store, runtime_store_dyn, blob_store)
+                    .expect("construct runtime authority"),
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
         let session_id = SessionId::new();
         let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
         let snapshot = meerkat_runtime::ops_lifecycle::RuntimeOpsLifecycleRegistry::new()
@@ -14990,6 +16813,769 @@ mod tests {
         }
     }
 
+    // --- MCP login: autojoin, wire custody and shutdown ------------------
+
+    #[cfg(feature = "mcp")]
+    fn rpc_value(response: crate::protocol::RpcResponse) -> serde_json::Value {
+        assert!(response.error.is_none(), "{:?}", response.error);
+        serde_json::from_str(response.result.as_ref().unwrap().get()).unwrap()
+    }
+
+    #[cfg(feature = "mcp")]
+    fn rpc_params(value: serde_json::Value) -> Box<serde_json::value::RawValue> {
+        serde_json::value::to_raw_value(&value).unwrap()
+    }
+
+    /// A runtime with provider auth persistence and the fixture's server in
+    /// the project `mcp.toml`, so the wire auth handlers resolve it.
+    #[cfg(feature = "mcp")]
+    async fn oauth_runtime(
+        temp: &tempfile::TempDir,
+        fixture: &meerkat::test_fixtures::mcp_oauth::McpOAuthFixture,
+    ) -> (Arc<SessionRuntime>, McpServerConfig, serde_json::Value) {
+        let factory = temp_factory(temp).with_provider_auth_persistence(
+            meerkat_providers::auth_store::ProviderAuthPersistence::new(
+                Arc::new(meerkat_providers::auth_store::EphemeralTokenStore::new()),
+                Arc::new(meerkat_providers::auth_store::InMemoryCoordinator::new()),
+            ),
+        );
+        oauth_runtime_with(temp, fixture, make_runtime(factory, 4))
+    }
+
+    /// [`oauth_runtime`] whose session and runtime stores are one SQLite file
+    /// at `db` and whose credentials are file-backed under `temp`.
+    #[cfg(feature = "mcp")]
+    fn persistent_oauth_runtime(
+        temp: &tempfile::TempDir,
+        fixture: &meerkat::test_fixtures::mcp_oauth::McpOAuthFixture,
+        db: &std::path::Path,
+    ) -> (Arc<SessionRuntime>, McpServerConfig, serde_json::Value) {
+        let persistence = meerkat_providers::auth_store::TokenStoreBackend::File {
+            root: temp.path().join("credentials"),
+        }
+        .open_with_refresh_authority()
+        .unwrap();
+        let factory = temp_factory(temp).with_provider_auth_persistence(persistence);
+        let session_store: Arc<dyn meerkat::SessionStore> =
+            Arc::new(meerkat::SqliteSessionStore::open(db).unwrap());
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::store::SqliteRuntimeStore::new(db).unwrap());
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                factory,
+                Config::default(),
+                4,
+                meerkat::PersistenceBundle::new(
+                    session_store,
+                    runtime_store,
+                    Arc::new(meerkat_store::MemoryBlobStore::new()),
+                )
+                .expect("construct runtime authority"),
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
+        oauth_runtime_with(temp, fixture, runtime)
+    }
+
+    /// Point `runtime` at the fixture's OAuth-protected MCP server.
+    #[cfg(feature = "mcp")]
+    fn oauth_runtime_with(
+        temp: &tempfile::TempDir,
+        fixture: &meerkat::test_fixtures::mcp_oauth::McpOAuthFixture,
+        runtime: Arc<SessionRuntime>,
+    ) -> (Arc<SessionRuntime>, McpServerConfig, serde_json::Value) {
+        use meerkat::test_fixtures::mcp_oauth::SUBJECT;
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".rkat")).unwrap();
+        std::fs::write(
+            project.join(".rkat/mcp.toml"),
+            format!(
+                "[[servers]]\nname = \"attempts\"\nurl = \"{}\"\noauth_account = \"{SUBJECT}\"\n",
+                fixture.mcp_url()
+            ),
+        )
+        .unwrap();
+        runtime.set_skill_identity_roots(Some(project), None);
+        let mut config = McpServerConfig::streamable_http(
+            "attempts",
+            fixture.mcp_url(),
+            std::collections::HashMap::new(),
+        );
+        if let meerkat_core::mcp_config::McpTransportConfig::Http(http) = &mut config.transport {
+            http.oauth_account = Some(SUBJECT.to_owned());
+        }
+        let mcp = serde_json::json!({
+            "server_name": "attempts",
+            "server_url": fixture.mcp_url(),
+            "oauth_account": SUBJECT,
+        });
+        (runtime, config, mcp)
+    }
+
+    #[cfg(feature = "mcp")]
+    async fn session_awaiting(
+        runtime: &Arc<SessionRuntime>,
+        config: McpServerConfig,
+    ) -> (SessionId, Arc<McpRouterAdapter>, meerkat::McpServerIdentity) {
+        let session_id = runtime
+            .create_session(mock_build_config(), None, None, Vec::new())
+            .await
+            .expect("create session");
+        let target = meerkat::McpServerIdentity::from_config(&config).unwrap();
+        runtime.mcp_stage_add(&session_id, config).await.unwrap();
+        let adapter = runtime.mcp_adapter_for_session(&session_id).await.unwrap();
+        adapter.apply_staged().await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !adapter
+            .servers_awaiting_authorization()
+            .await
+            .contains(&target)
+        {
+            adapter.poll_lifecycle_actions().await.unwrap();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the server never reported awaiting authorization"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        (session_id, adapter, target)
+    }
+
+    /// Log in over the wire through a host loopback binding.
+    #[cfg(feature = "mcp")]
+    async fn wire_login(runtime: &SessionRuntime, mcp: &serde_json::Value) {
+        let binding =
+            meerkat_providers::auth_oauth::bind_loopback_callback(meerkat::MCP_OAUTH_CALLBACK_PATH)
+                .await
+                .unwrap();
+        let start = rpc_value(
+            crate::handlers::auth::handle_auth_login_start(
+                Some(crate::protocol::RpcId::Num(1)),
+                Some(
+                    rpc_params(serde_json::json!({
+                        "mcp": mcp,
+                        "redirect_uri": binding.redirect_url,
+                    }))
+                    .as_ref(),
+                ),
+                runtime,
+            )
+            .await,
+        );
+        let callback = binding.expect_state(start["state"].as_str().unwrap().to_owned());
+        meerkat::test_fixtures::mcp_oauth::follow_authorize_url(
+            start["authorize_url"].as_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        let outcome = callback
+            .wait(meerkat::MCP_INTERACTIVE_LOGIN_TIMEOUT)
+            .await
+            .unwrap();
+        rpc_value(
+            crate::handlers::auth::handle_auth_login_complete(
+                Some(crate::protocol::RpcId::Num(2)),
+                Some(
+                    rpc_params(serde_json::json!({
+                        "mcp": mcp,
+                        "code": outcome.code,
+                        "state": outcome.state,
+                        "redirect_uri": start["redirect_uri"],
+                    }))
+                    .as_ref(),
+                ),
+                runtime,
+            )
+            .await,
+        );
+    }
+
+    #[cfg(feature = "mcp")]
+    async fn wait_connected(adapter: &McpRouterAdapter, server: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !adapter
+            .active_server_names()
+            .await
+            .iter()
+            .any(|n| n == server)
+        {
+            adapter.poll_lifecycle_actions().await.unwrap();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "'{server}' never connected"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The wire completion wakes exactly the awaiting operation: the session
+    /// whose first add failed connects at its next boundary with no host
+    /// `mcp/reload`; a session without the server and one holding the same
+    /// name at another URL are untouched.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn wire_login_completion_reconnects_only_the_exact_awaiting_server() {
+        let fixture = meerkat::test_fixtures::mcp_oauth::McpOAuthFixture::spawn()
+            .await
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, mcp) = oauth_runtime(&temp, &fixture).await;
+
+        let (_a, adapter_a, _target) = session_awaiting(&runtime, config.clone()).await;
+        let session_b = runtime
+            .create_session(mock_build_config(), None, None, Vec::new())
+            .await
+            .unwrap();
+        let mut other_url = config.clone();
+        if let meerkat_core::mcp_config::McpTransportConfig::Http(http) = &mut other_url.transport {
+            http.url = spawn_oauth_required_mcp_endpoint().await;
+        }
+        let (_c, adapter_c, target_c) = session_awaiting(&runtime, other_url).await;
+
+        wire_login(&runtime, &mcp).await;
+
+        // Nothing connects before the boundary.
+        assert!(adapter_a.active_server_names().await.is_empty());
+        adapter_a.apply_staged().await.unwrap();
+        wait_connected(&adapter_a, "attempts").await;
+        assert!(adapter_a.servers_awaiting_authorization().await.is_empty());
+
+        let adapter_b = runtime.mcp_adapter_for_session(&session_b).await.unwrap();
+        assert!(adapter_b.active_server_names().await.is_empty());
+        adapter_c.apply_staged().await.unwrap();
+        assert!(adapter_c.active_server_names().await.is_empty());
+        assert_eq!(
+            adapter_c.servers_awaiting_authorization().await,
+            vec![target_c]
+        );
+        runtime.try_shutdown().await.unwrap();
+    }
+
+    /// Login attachment touches only the original awaiting session, and only
+    /// for a login that actually completed for its exact target: a
+    /// wrong-account completion and a denied login attach nothing; a real
+    /// login gives the ORIGINAL session (not a new one) the server's tools.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn login_attachment_reaches_only_the_original_session_for_its_exact_target() {
+        let fixture = meerkat::test_fixtures::mcp_oauth::McpOAuthFixture::spawn()
+            .await
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, mcp) = oauth_runtime(&temp, &fixture).await;
+        let (session, adapter, target) = session_awaiting(&runtime, config.clone()).await;
+        let sessions_before = runtime.mcp_sessions.read().await.len();
+
+        // A completion for another account of the same server attaches nothing.
+        let mut other_account = config.clone();
+        if let meerkat_core::mcp_config::McpTransportConfig::Http(http) =
+            &mut other_account.transport
+        {
+            http.oauth_account = Some("another-subject".to_owned());
+        }
+        let other_target = meerkat::McpServerIdentity::from_config(&other_account).unwrap();
+        for (_, outcome) in runtime.mcp_credential_landed(&other_target).await {
+            assert!(matches!(outcome, Ok(meerkat::AuthorizedRetry::NotAwaiting)));
+        }
+
+        // A denied login (the token endpoint refuses the code) attaches nothing.
+        let start = rpc_value(wire_start(&runtime, &mcp).await);
+        fixture.fail_token_exchange(true);
+        let denied = crate::handlers::auth::handle_auth_login_complete(
+            Some(crate::protocol::RpcId::Num(30)),
+            Some(
+                rpc_params(serde_json::json!({
+                    "mcp": mcp,
+                    "code": "denied-code",
+                    "state": start["state"],
+                    "redirect_uri": start["redirect_uri"],
+                }))
+                .as_ref(),
+            ),
+            &runtime,
+        )
+        .await;
+        fixture.fail_token_exchange(false);
+        assert!(denied.error.is_some(), "the denied login fails");
+        adapter.apply_staged().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        adapter.poll_lifecycle_actions().await.unwrap();
+        assert!(adapter.active_server_names().await.is_empty());
+        assert_eq!(
+            adapter.servers_awaiting_authorization().await,
+            vec![target.clone()]
+        );
+
+        // A real login: the ORIGINAL session connects and gets the tools.
+        wire_login(&runtime, &mcp).await;
+        adapter.apply_staged().await.unwrap();
+        wait_connected(&adapter, "attempts").await;
+        assert!(!meerkat_core::AgentToolDispatcher::tools(&*adapter).is_empty());
+        assert_eq!(runtime.mcp_sessions.read().await.len(), sessions_before);
+        assert!(Arc::ptr_eq(
+            &runtime.mcp_adapter_for_session(&session).await.unwrap(),
+            &adapter
+        ));
+        runtime.try_shutdown().await.unwrap();
+    }
+
+    /// A logout that lands before the retry's credential read: the retry
+    /// fails typed and the server awaits authorization again.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn logout_before_the_retry_reads_the_credential_awaits_again() {
+        let fixture = meerkat::test_fixtures::mcp_oauth::McpOAuthFixture::spawn()
+            .await
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, mcp) = oauth_runtime(&temp, &fixture).await;
+        let (_a, adapter, target) = session_awaiting(&runtime, config).await;
+
+        wire_login(&runtime, &mcp).await;
+        rpc_value(
+            crate::handlers::auth::handle_auth_logout(
+                Some(crate::protocol::RpcId::Num(3)),
+                Some(rpc_params(serde_json::json!({ "mcp": mcp })).as_ref()),
+                &runtime,
+            )
+            .await,
+        );
+        adapter.apply_staged().await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let actions = adapter.poll_lifecycle_actions().await.unwrap();
+            if actions.iter().any(|action| {
+                action.target == "attempts" && action.phase == McpLifecyclePhase::Failed
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the retry never failed"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(adapter.servers_awaiting_authorization().await, vec![target]);
+        assert!(adapter.active_server_names().await.is_empty());
+        runtime.try_shutdown().await.unwrap();
+    }
+
+    #[cfg(feature = "mcp")]
+    async fn wire_start(
+        runtime: &SessionRuntime,
+        mcp: &serde_json::Value,
+    ) -> crate::protocol::RpcResponse {
+        crate::handlers::auth::handle_auth_login_start(
+            Some(crate::protocol::RpcId::Num(10)),
+            Some(
+                rpc_params(serde_json::json!({
+                    "mcp": mcp,
+                    "redirect_uri": "http://127.0.0.1:1/mcp/oauth/callback",
+                }))
+                .as_ref(),
+            ),
+            runtime,
+        )
+        .await
+    }
+
+    #[cfg(feature = "mcp")]
+    async fn wire_pending_attempt(
+        runtime: &SessionRuntime,
+        mcp: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let status = rpc_value(
+            crate::handlers::auth::handle_auth_status_get(
+                Some(crate::protocol::RpcId::Num(11)),
+                Some(rpc_params(serde_json::json!({ "mcp": mcp })).as_ref()),
+                runtime,
+            )
+            .await,
+        );
+        status.get("attempt").cloned()
+    }
+
+    /// Shutdown retires every wire-admitted attempt still recorded and closes
+    /// admission; a stale completion for an older attempt leaves a newer
+    /// recorded attempt alone. In-process transport (the handlers directly).
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn shutdown_retires_wire_attempts_and_a_stale_result_keeps_the_newer_one() {
+        let fixture = meerkat::test_fixtures::mcp_oauth::McpOAuthFixture::spawn()
+            .await
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, _config, mcp) = oauth_runtime(&temp, &fixture).await;
+
+        // A is started, then cancelled by state: forgotten.
+        let a = rpc_value(wire_start(&runtime, &mcp).await);
+        let a_state = a["state"].as_str().unwrap().to_owned();
+        rpc_value(
+            crate::handlers::auth::handle_auth_login_cancel(
+                Some(crate::protocol::RpcId::Num(12)),
+                Some(rpc_params(serde_json::json!({ "mcp": mcp, "state": a_state })).as_ref()),
+                &runtime,
+            )
+            .await,
+        );
+        assert_eq!(runtime.mcp_wire_attempt_count_for_testing(), 0);
+        // B is started; a stale completion for A fails and erases nothing.
+        rpc_value(wire_start(&runtime, &mcp).await);
+        assert_eq!(runtime.mcp_wire_attempt_count_for_testing(), 1);
+        let stale = crate::handlers::auth::handle_auth_login_complete(
+            Some(crate::protocol::RpcId::Num(13)),
+            Some(
+                rpc_params(serde_json::json!({
+                    "mcp": mcp,
+                    "code": "stale-code",
+                    "state": a_state,
+                    "redirect_uri": "http://127.0.0.1:1/mcp/oauth/callback",
+                }))
+                .as_ref(),
+            ),
+            &runtime,
+        )
+        .await;
+        assert!(stale.error.is_some());
+        assert_eq!(runtime.mcp_wire_attempt_count_for_testing(), 1);
+        assert!(wire_pending_attempt(&runtime, &mcp).await.is_some());
+
+        runtime
+            .retire_mcp_wire_attempts(Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(runtime.mcp_wire_attempt_count_for_testing(), 0);
+        // Checked before any new start, so a start's own repair cannot hide
+        // a leaked attempt.
+        assert!(wire_pending_attempt(&runtime, &mcp).await.is_none());
+        // Admission is closed: no attempt is admitted after the sweep.
+        let refused = wire_start(&runtime, &mcp).await;
+        assert_eq!(refused.error.unwrap().code, error::INTERNAL_ERROR);
+        assert!(wire_pending_attempt(&runtime, &mcp).await.is_none());
+    }
+
+    /// An admission that holds the gate when shutdown starts is recorded
+    /// before the sweep reads the records, and the sweep retires it.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn an_admission_crossing_shutdown_is_recorded_then_retired() {
+        let fixture = meerkat::test_fixtures::mcp_oauth::McpOAuthFixture::spawn()
+            .await
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, mcp) = oauth_runtime(&temp, &fixture).await;
+        let target = meerkat::McpServerIdentity::from_config(&config).unwrap();
+        let service = meerkat::HostAuthService::new(
+            runtime.provider_auth_persistence().unwrap().unwrap(),
+            runtime.provider_auth_runtime_authority(),
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let admission = {
+            let runtime = Arc::clone(&runtime);
+            let target = target.clone();
+            let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
+            tokio::spawn(async move {
+                runtime
+                    .admit_mcp_wire_login(&target, || async {
+                        entered.notify_one();
+                        release.notified().await;
+                        service
+                            .mcp_login_start(&target, "http://127.0.0.1:1/mcp/oauth/callback", None)
+                            .await
+                    })
+                    .await
+            })
+        };
+        entered.notified().await;
+        let sweep = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                runtime
+                    .retire_mcp_wire_attempts(Duration::from_secs(20))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!sweep.is_finished(), "the sweep waits for the admission");
+        release.notify_one();
+        admission.await.unwrap().expect("the admission completes");
+        sweep.await.unwrap().expect("the sweep retires it");
+        assert_eq!(runtime.mcp_wire_attempt_count_for_testing(), 0);
+        assert!(wire_pending_attempt(&runtime, &mcp).await.is_none());
+        assert!(runtime.mcp_admission_closed_for_testing().await);
+    }
+
+    /// After a connection aborted request handlers, an attempt the sweep finds
+    /// absent may have been consumed by one whose credential save still runs:
+    /// it is reported unresolved, never as retired.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn an_absent_attempt_after_aborted_handlers_is_unresolved() {
+        let fixture = meerkat::test_fixtures::mcp_oauth::McpOAuthFixture::spawn()
+            .await
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, _mcp) = oauth_runtime(&temp, &fixture).await;
+        let target = meerkat::McpServerIdentity::from_config(&config).unwrap();
+        runtime.record_mcp_wire_attempt_for_testing("consumed-elsewhere", &target);
+        runtime.note_unsettled_requests(1);
+        let incomplete = runtime
+            .retire_mcp_wire_attempts(Duration::from_secs(10))
+            .await
+            .expect_err("an absent attempt is not settled while aborted work may run");
+        assert_eq!(incomplete.unresolved.len(), 1);
+        assert_eq!(runtime.mcp_wire_attempt_count_for_testing(), 1);
+    }
+
+    /// A gate wait that times out still stops new admissions.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn a_timed_out_gate_wait_still_stops_new_admissions() {
+        let fixture = meerkat::test_fixtures::mcp_oauth::McpOAuthFixture::spawn()
+            .await
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, config, mcp) = oauth_runtime(&temp, &fixture).await;
+        let target = meerkat::McpServerIdentity::from_config(&config).unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let held = {
+            let runtime = Arc::clone(&runtime);
+            let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
+            tokio::spawn(async move {
+                runtime
+                    .admit_mcp_wire_login(&target, || async {
+                        entered.notify_one();
+                        release.notified().await;
+                        Err(meerkat::HostAuthError::PersistenceUnavailable)
+                    })
+                    .await
+            })
+        };
+        entered.notified().await;
+        assert!(
+            runtime
+                .retire_mcp_wire_attempts(Duration::from_millis(100))
+                .await
+                .is_err(),
+            "the gate wait timed out"
+        );
+        let refused = wire_start(&runtime, &mcp).await;
+        assert_eq!(refused.error.unwrap().code, error::INTERNAL_ERROR);
+        release.notify_one();
+        assert!(held.await.unwrap().is_err());
+        assert!(wire_pending_attempt(&runtime, &mcp).await.is_none());
+    }
+
+    /// A persisted wire attempt that the sweep leaves unresolved survives a
+    /// reopen of its store with its obligation intact: the reopened file
+    /// still holds the exact pending record, and a flow owner built fresh over
+    /// it (not the process's shared one) still admits it as pending. A late
+    /// success that lands after the reopen (an admission in flight across the
+    /// sweep) joins that same pending attempt and neither clears nor replaces
+    /// it.
+    ///
+    /// Claim limits: the reopen is in-process, not a separate OS process, and
+    /// the original runtime is still alive during it. The process shares one
+    /// durable auth authority per store path, so the proof reads the reopened
+    /// file through a fresh store handle and a fresh flow owner rather than
+    /// through that shared authority. The late success joins the same pending
+    /// state; this does not show that a success for an older, distinct
+    /// attempt cannot clear a replacement attempt.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn an_unresolved_persisted_attempt_survives_a_store_reopen() {
+        use meerkat_providers::oauth_flow::{OAuthFlowAuthority as _, OAuthFlowRegistrySnapshot};
+        let fixture = meerkat::test_fixtures::mcp_oauth::McpOAuthFixture::spawn()
+            .await
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("runtime.sqlite3");
+        let (runtime, config, mcp) = persistent_oauth_runtime(&temp, &fixture, &db);
+        let target = meerkat::McpServerIdentity::from_config(&config).unwrap();
+        let pending = rpc_value(wire_start(&runtime, &mcp).await);
+        let state = pending["state"].as_str().unwrap().to_owned();
+        let reference = meerkat_providers::connector_oauth::OAuthBrowserActionRef::project(&state)
+            .as_str()
+            .to_owned();
+
+        // An admission in flight across the sweep holds the gate: the sweep
+        // times out and reports the recorded attempt unresolved.
+        let service = meerkat::HostAuthService::new(
+            runtime.provider_auth_persistence().unwrap().unwrap(),
+            runtime.provider_auth_runtime_authority(),
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let stale = {
+            let runtime = Arc::clone(&runtime);
+            let target = target.clone();
+            let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
+            tokio::spawn(async move {
+                runtime
+                    .admit_mcp_wire_login(&target, || async {
+                        entered.notify_one();
+                        release.notified().await;
+                        service
+                            .mcp_login_start(&target, "http://127.0.0.1:1/mcp/oauth/callback", None)
+                            .await
+                    })
+                    .await
+            })
+        };
+        entered.notified().await;
+        let incomplete = runtime
+            .retire_mcp_wire_attempts(Duration::from_millis(100))
+            .await
+            .expect_err("the sweep cannot settle while an admission holds the gate");
+        assert_eq!(incomplete.unresolved, vec![reference.clone()]);
+
+        // Reopen the store file with a fresh handle.
+        let reopened: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::store::SqliteRuntimeStore::new(&db).unwrap());
+        let persisted = |store: &Arc<dyn meerkat_runtime::RuntimeStore>| {
+            let bytes = store
+                .load_auth_oauth_flow_snapshot()
+                .unwrap()
+                .expect("the flow snapshot is persisted");
+            serde_json::from_slice::<OAuthFlowRegistrySnapshot>(&bytes)
+                .unwrap()
+                .browser
+        };
+        let before = persisted(&reopened);
+        assert_eq!(
+            before.len(),
+            1,
+            "exactly the unresolved attempt is persisted"
+        );
+        assert_eq!(before[0].state, state);
+        assert!(
+            before[0].expires_at_millis
+                > u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap(),
+            "the persisted attempt is still live"
+        );
+        let owner = meerkat_runtime::handles::RuntimeOAuthFlowHandle::new_with_persistent_store_and_auth_lease(
+            Duration::from_secs(600),
+            Arc::new(meerkat_runtime::handles::RuntimeAuthLeaseHandle::new()),
+            &reopened,
+        );
+        let record = owner
+            .admitted_connector_browser_attempt(&state, &before[0].target)
+            .unwrap()
+            .expect("a fresh flow owner over the reopened file still admits the attempt");
+        assert_eq!(record.redirect_uri, before[0].redirect_uri);
+
+        // The stale success lands after the reopen: it joins the pending
+        // attempt instead of admitting another.
+        release.notify_one();
+        let joined = stale
+            .await
+            .unwrap()
+            .expect("the in-flight admission succeeds");
+        assert_eq!(
+            joined.disposition,
+            meerkat::McpOAuthLoginDisposition::Joined
+        );
+        assert_eq!(joined.state, state);
+        let after = persisted(&reopened);
+        assert_eq!(after.len(), 1, "the stale success added no attempt");
+        assert_eq!(
+            after[0].state, state,
+            "the stale success replaced the attempt"
+        );
+        // Each snapshot write re-derives the persisted times from the
+        // attempt's monotonic age and the wall clock, so a rewrite of the same
+        // attempt may move them by 1 ms. Every identity field stays exact.
+        let rewritten = &after[0];
+        assert!(
+            rewritten
+                .created_at_millis
+                .abs_diff(before[0].created_at_millis)
+                <= 1
+                && rewritten
+                    .expires_at_millis
+                    .abs_diff(before[0].expires_at_millis)
+                    <= 1,
+            "the stale success kept the attempt's admission time"
+        );
+        let identity = meerkat_providers::oauth_flow::PersistedOAuthBrowserFlow {
+            created_at_millis: before[0].created_at_millis,
+            expires_at_millis: before[0].expires_at_millis,
+            ..rewritten.clone()
+        };
+        assert!(
+            identity == before[0],
+            "the stale success kept the attempt's identity"
+        );
+        assert_eq!(
+            wire_pending_attempt(&runtime, &mcp).await.unwrap()["ref"],
+            reference.as_str()
+        );
+    }
+
+    /// A record the sweep cannot retire stays recorded and is reported by
+    /// its exact reference.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn an_unretirable_wire_attempt_is_reported_and_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        // No provider auth persistence: nothing can be retired.
+        let runtime = make_runtime(temp_factory(&temp).without_provider_auth_persistence(), 2);
+        let target = meerkat::McpServerIdentity::from_config(&McpServerConfig::streamable_http(
+            "kept",
+            "https://mcp.example/mcp",
+            std::collections::HashMap::new(),
+        ))
+        .unwrap();
+        runtime.record_mcp_wire_attempt_for_testing("state-kept", &target);
+        let incomplete = runtime
+            .retire_mcp_wire_attempts(Duration::from_secs(5))
+            .await
+            .expect_err("an attempt that cannot be retired is reported");
+        assert_eq!(
+            incomplete.unresolved,
+            vec![
+                meerkat_providers::connector_oauth::OAuthBrowserActionRef::project("state-kept")
+                    .as_str()
+                    .to_owned()
+            ]
+        );
+        assert_eq!(runtime.mcp_wire_attempt_count_for_testing(), 1);
+        // try_shutdown surfaces it after the rest of the teardown.
+        assert!(runtime.try_shutdown().await.is_err());
+    }
+
+    /// Logout keeps wire records (a start admitted meanwhile must survive);
+    /// the sweep settles a retired one as absent.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn logout_keeps_wire_records_for_the_exact_sweep() {
+        let fixture = meerkat::test_fixtures::mcp_oauth::McpOAuthFixture::spawn()
+            .await
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, _config, mcp) = oauth_runtime(&temp, &fixture).await;
+        rpc_value(wire_start(&runtime, &mcp).await);
+        rpc_value(
+            crate::handlers::auth::handle_auth_logout(
+                Some(crate::protocol::RpcId::Num(20)),
+                Some(rpc_params(serde_json::json!({ "mcp": mcp })).as_ref()),
+                &runtime,
+            )
+            .await,
+        );
+        assert_eq!(runtime.mcp_wire_attempt_count_for_testing(), 1);
+        assert!(wire_pending_attempt(&runtime, &mcp).await.is_none());
+        runtime
+            .retire_mcp_wire_attempts(Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(runtime.mcp_wire_attempt_count_for_testing(), 0);
+    }
+
     fn make_runtime(factory: AgentFactory, max_sessions: usize) -> Arc<SessionRuntime> {
         make_runtime_with_config(factory, max_sessions, Config::default())
     }
@@ -15004,14 +17590,17 @@ mod tests {
             Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(meerkat_store::MemoryBlobStore::new());
-        Arc::new(SessionRuntime::new(
-            factory,
-            config,
-            max_sessions,
-            meerkat::PersistenceBundle::new(store, runtime_store, blob_store)
-                .expect("construct runtime authority"),
-            crate::router::NotificationSink::noop(),
-        ))
+        Arc::new(
+            SessionRuntime::new(
+                factory,
+                config,
+                max_sessions,
+                meerkat::PersistenceBundle::new(store, runtime_store, blob_store)
+                    .expect("construct runtime authority"),
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        )
     }
 
     fn make_runtime_with_session_store(
@@ -15021,18 +17610,21 @@ mod tests {
     ) -> Arc<SessionRuntime> {
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(meerkat_store::MemoryBlobStore::new());
-        Arc::new(SessionRuntime::new(
-            factory,
-            Config::default(),
-            max_sessions,
-            meerkat::PersistenceBundle::new(
-                store,
-                Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
-                blob_store,
+        Arc::new(
+            SessionRuntime::new(
+                factory,
+                Config::default(),
+                max_sessions,
+                meerkat::PersistenceBundle::new(
+                    store,
+                    Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+                    blob_store,
+                )
+                .expect("construct runtime authority"),
+                crate::router::NotificationSink::noop(),
             )
-            .expect("construct runtime authority"),
-            crate::router::NotificationSink::noop(),
-        ))
+            .expect("compose the RPC session runtime"),
+        )
     }
 
     fn make_runtime_with_session_store_and_runtime_store(
@@ -15044,14 +17636,17 @@ mod tests {
             Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(meerkat_store::MemoryBlobStore::new());
-        Arc::new(SessionRuntime::new(
-            factory,
-            Config::default(),
-            max_sessions,
-            meerkat::PersistenceBundle::new(store, runtime_store, blob_store)
-                .expect("construct runtime authority"),
-            crate::router::NotificationSink::noop(),
-        ))
+        Arc::new(
+            SessionRuntime::new(
+                factory,
+                Config::default(),
+                max_sessions,
+                meerkat::PersistenceBundle::new(store, runtime_store, blob_store)
+                    .expect("construct runtime authority"),
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        )
     }
 
     /// An `Event` subscription delivery requests runtime work: applied to an
@@ -15212,11 +17807,521 @@ mod tests {
         );
     }
 
+    /// The RPC mob state reaches back to its runtime's shared slots: its
+    /// session service holds the runtime's mob-state slot, and that
+    /// service's builder holds the mob-tools slot, both of which hold the
+    /// state. A shutdown releases both, so once the router and the runtime
+    /// are dropped no strong reference to the state or the runtime's machine
+    /// is left. Claim limits: in-memory stores, an idle state (no managed
+    /// child mob, no owned work); it proves reference release only, not a
+    /// durable reopen or the settlement of custody.
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn shutdown_releases_the_rpc_mob_state_and_its_machine() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = make_runtime_with_runtime_store(temp_factory(&temp), 10);
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        runtime.set_realm_context(
+            Some(meerkat_core::connection::RealmId::global()),
+            None,
+            None,
+        );
+        let config_store: Arc<dyn meerkat_core::ConfigStore> = Arc::new(
+            meerkat_core::MemoryConfigStore::new(Config::default(), meerkat_models::canonical()),
+        );
+        let router = crate::router::MethodRouter::new(
+            Arc::clone(&runtime),
+            config_store,
+            crate::router::NotificationSink::noop(),
+        )
+        .expect("the RPC router composes its mob state");
+        let mob_state = Arc::downgrade(router.mob_state());
+        let machine = Arc::downgrade(&runtime.runtime_adapter);
+        let held_before_session = mob_state.strong_count();
+        // A session built with generated mob authority while the mob tools
+        // are set takes a mob dispatcher, which holds the state.
+        let authority =
+            meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority()
+                .expect("generated create-only mob authority");
+        let session_id = runtime
+            .create_session(
+                AgentBuildConfig {
+                    mob_tool_authority_context: Some(authority),
+                    ..mock_build_config()
+                },
+                None,
+                None,
+                Vec::new(),
+            )
+            .await
+            .expect("create_session");
+        let (turn_event_tx, _turn_event_rx) = mpsc::channel(100);
+        runtime
+            .start_turn(
+                &session_id,
+                "a turn with mob tools".into(),
+                turn_event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("turn");
+        assert!(
+            mob_state.strong_count() > held_before_session,
+            "the live session's mob tools hold the state"
+        );
+
+        drop(router);
+        runtime.try_shutdown().await.expect("shutdown");
+        // A composition racing the shutdown cannot refill either slot.
+        let late = Arc::new(
+            meerkat_mob_mcp::MobMcpState::new_with_runtime_adapter(
+                runtime.session_service(),
+                Some(runtime.runtime_adapter()),
+                meerkat_mob::MobControlPrincipal::Owner,
+            )
+            .expect("a late mob state"),
+        );
+        runtime.set_mob_state(Arc::clone(&late));
+        runtime.set_mob_tools(Arc::new(meerkat_mob_mcp::AgentMobToolSurfaceFactory::new(
+            Arc::clone(&late),
+        )));
+        assert!(
+            runtime.mob_state().is_none(),
+            "the mob-state slot stays empty"
+        );
+        assert!(
+            runtime
+                .builder_mob_tools_slot
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "the mob-tools slot stays empty"
+        );
+        drop(late);
+        drop(runtime);
+        // Detached work the runtime started ends on its own; give it a
+        // bounded moment, then nothing may hold either owner.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while (mob_state.strong_count() > 0 || machine.strong_count() > 0)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            mob_state.strong_count(),
+            0,
+            "the shut-down runtime's mob state is freed"
+        );
+        assert_eq!(
+            machine.strong_count(),
+            0,
+            "the shut-down runtime's machine is freed"
+        );
+    }
+
+    /// A shutdown whose mob state still runs owned work past the stand-down
+    /// grace reports the incomplete shutdown and keeps the same state; a
+    /// retry after the work finished joins that state, settles clean and
+    /// releases it with the machine.
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn an_unsettled_mob_state_keeps_its_custody_until_a_retry_settles_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = make_runtime_with_runtime_store(temp_factory(&temp), 10);
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        runtime.set_realm_context(
+            Some(meerkat_core::connection::RealmId::global()),
+            None,
+            None,
+        );
+        let config_store: Arc<dyn meerkat_core::ConfigStore> = Arc::new(
+            meerkat_core::MemoryConfigStore::new(Config::default(), meerkat_models::canonical()),
+        );
+        let router = crate::router::MethodRouter::new(
+            Arc::clone(&runtime),
+            config_store,
+            crate::router::NotificationSink::noop(),
+        )
+        .expect("the RPC router composes its mob state");
+        let mob_state = Arc::downgrade(router.mob_state());
+        let machine = Arc::downgrade(&runtime.runtime_adapter);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let (task_release, task_finished) = (Arc::clone(&release), Arc::clone(&finished));
+        assert!(
+            router
+                .mob_state()
+                .spawn_owned_work_for_tests("held owned work", async move {
+                    task_release.notified().await;
+                    task_finished.store(true, Ordering::SeqCst);
+                }),
+            "an open state admits owned work"
+        );
+        drop(router);
+
+        let incomplete = runtime
+            .try_shutdown()
+            .await
+            .expect_err("owned work past the grace leaves the shutdown incomplete");
+        let meerkat_core::SessionError::Store(source) = &incomplete else {
+            panic!("a typed incomplete shutdown: {incomplete:?}");
+        };
+        let unsettled = source
+            .downcast_ref::<MobStateStandDownIncomplete>()
+            .expect("the mob state's incomplete stand-down");
+        assert!(
+            unsettled
+                .unsettled
+                .iter()
+                .any(|reason| reason.contains("held owned work")),
+            "{unsettled:?}"
+        );
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "owned work is never aborted"
+        );
+        let kept = runtime.mob_state().expect("the runtime keeps the state");
+        assert!(
+            mob_state
+                .upgrade()
+                .is_some_and(|state| Arc::ptr_eq(&state, &kept)),
+            "it is the same state"
+        );
+        drop(kept);
+
+        release.notify_one();
+        runtime
+            .try_shutdown()
+            .await
+            .expect("the retry joins the finished work and settles clean");
+        assert!(finished.load(Ordering::SeqCst));
+        assert!(
+            runtime.mob_state().is_none(),
+            "a clean stand-down releases it"
+        );
+        drop(runtime);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while (mob_state.strong_count() > 0 || machine.strong_count() > 0)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            mob_state.strong_count(),
+            0,
+            "the settled mob state is freed"
+        );
+        assert_eq!(machine.strong_count(), 0, "the machine is freed");
+    }
+
+    /// A runtime whose delivery owner is held inside an actual application:
+    /// a continuation for a session whose turn ran through the runtime (so
+    /// it is registered), held at the start of its admission by
+    /// `continuation_admit_hook`. Returns the runtime, the hook (reached once
+    /// the owner's pass holds there), the owner's pass channel and the
+    /// session.
+    async fn runtime_with_a_held_delivery_application(
+        temp: &tempfile::TempDir,
+    ) -> (
+        Arc<SessionRuntime>,
+        Arc<PendingPromotionPreTurnHook>,
+        tokio::sync::watch::Receiver<meerkat::RuntimeDeliveryPass>,
+        SessionId,
+    ) {
+        let runtime = make_runtime_with_runtime_store(temp_factory(temp), 10);
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        runtime.set_realm_context(
+            Some(meerkat_core::connection::RealmId::global()),
+            None,
+            None,
+        );
+        let session_id = runtime
+            .create_session(mock_build_config(), None, None, Vec::new())
+            .await
+            .expect("create_session");
+        let (turn_event_tx, _turn_event_rx) = mpsc::channel(100);
+        runtime
+            .start_turn_via_runtime(
+                &session_id,
+                "the session's turn".into(),
+                Vec::new(),
+                turn_event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("the session's turn through the runtime");
+        let hook = Arc::new(PendingPromotionPreTurnHook::default());
+        *runtime
+            .continuation_admit_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&hook));
+        runtime.arm_runtime_delivery_owner();
+        let passes = runtime
+            .subscribe_job_delivery_passes()
+            .expect("a runtime with a realm arms its owner");
+        let continuations = meerkat::ContinuationOwnerService::new(
+            runtime.runtime_delivery_inbox.clone(),
+            Arc::new(meerkat::SessionAddressResolver),
+            Arc::clone(&runtime.runtime_adapter),
+        );
+        continuations
+            .submit(
+                &meerkat::ContinuationOwner::Session {
+                    session_id: session_id.clone(),
+                },
+                meerkat::ContinuationDelivery {
+                    key: meerkat::ContinuationKey::new("held-task").expect("key"),
+                    result: meerkat::ContinuationResultRef {
+                        producer: meerkat::ContinuationProducer::Host {
+                            namespace: "tasks".into(),
+                        },
+                        producer_id: "op-held".into(),
+                        result_digest: "sha256:held".into(),
+                        summary: None,
+                    },
+                    body: "the held task finished".into(),
+                    handling: meerkat::ContinuationHandling::Queue,
+                },
+                1,
+            )
+            .await
+            .expect("submit");
+        (runtime, hook, passes, session_id)
+    }
+
+    /// Whether the delivery owner's pass reached the held application within
+    /// the witness bound.
+    async fn delivery_application_held(hook: &PendingPromotionPreTurnHook) -> bool {
+        tokio::time::timeout(TEST_ASYNC_WITNESS_TIMEOUT, async {
+            while !hook.reached_flag.load(AtomicOrdering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// Release the held application; no later admission waits.
+    fn release_delivery_application(runtime: &SessionRuntime, hook: &PendingPromotionPreTurnHook) {
+        *runtime
+            .continuation_admit_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        hook.release.notify_one();
+    }
+
+    /// Whether the runtime's slot still holds a delivery owner whose task
+    /// runs: neither aborted nor joined.
+    fn delivery_owner_kept_running(runtime: &SessionRuntime) -> bool {
+        runtime
+            .runtime_delivery_owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|owner| !owner.is_stopped())
+    }
+
+    fn delivery_owner_slot_empty(runtime: &SessionRuntime) -> bool {
+        runtime
+            .runtime_delivery_owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+    }
+
+    /// The typed incomplete retirement, or what came back instead.
+    fn retirement_incomplete(
+        result: &Result<(), meerkat_core::SessionError>,
+    ) -> Result<meerkat::RuntimeDeliveryOwnerRetirementIncomplete, String> {
+        match result {
+            Err(meerkat_core::SessionError::Store(source)) => source
+                .downcast_ref::<meerkat::RuntimeDeliveryOwnerRetirementIncomplete>()
+                .copied()
+                .ok_or_else(|| format!("another store error: {source}")),
+            other => Err(format!("not an incomplete retirement: {other:?}")),
+        }
+    }
+
+    /// A delivery-owner retirement cancelled while the owner applies a
+    /// delivery leaves the owner in its slot, running: neither aborted nor
+    /// joined. A retry while the application is held reports the typed
+    /// incomplete retirement, never success, and keeps the owner; once the
+    /// application is released, a retry joins the owner and empties the slot.
+    #[tokio::test]
+    async fn a_cancelled_delivery_owner_retirement_keeps_the_owner_for_a_retry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (runtime, hook, passes, _session_id) =
+            runtime_with_a_held_delivery_application(&temp).await;
+        // Observed while held; the release and the joins come before any
+        // assertion.
+        let held = delivery_application_held(&hook).await;
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(200),
+            runtime.retire_runtime_delivery_owner(TEST_ASYNC_WITNESS_TIMEOUT),
+        )
+        .await
+        .is_err();
+        let kept_after_cancel = delivery_owner_kept_running(&runtime);
+        let retry_while_held = runtime
+            .retire_runtime_delivery_owner(Duration::from_millis(200))
+            .await;
+        let kept_after_retry = delivery_owner_kept_running(&runtime);
+        release_delivery_application(&runtime, &hook);
+        let joined = runtime
+            .retire_runtime_delivery_owner(TEST_ASYNC_WITNESS_TIMEOUT)
+            .await;
+        let slot_empty = delivery_owner_slot_empty(&runtime);
+        let task_gone = passes.has_changed().is_err();
+        let shutdown = runtime.try_shutdown().await;
+
+        assert!(
+            held,
+            "the delivery owner never reached the held application"
+        );
+        assert!(cancelled, "the retirement waits on the held application");
+        assert!(
+            kept_after_cancel,
+            "a cancelled retirement leaves the owner in its slot, running"
+        );
+        let incomplete = retirement_incomplete(&retry_while_held)
+            .unwrap_or_else(|other| panic!("a retry while held: {other}"));
+        assert_eq!(incomplete.bound, Duration::from_millis(200));
+        assert!(
+            kept_after_retry,
+            "an incomplete retirement leaves the owner in its slot, running"
+        );
+        joined.expect("a retry after the release joins the owner");
+        assert!(slot_empty, "a joined owner leaves its slot");
+        assert!(task_gone, "the joined owner's task is gone");
+        shutdown.expect("the runtime shuts down");
+    }
+
+    /// Two retirements racing while the delivery owner applies a delivery
+    /// wait on the same task: the short one reports the typed incomplete
+    /// retirement within its bound, never success, while the long one still
+    /// waits; once the application is released, the long one joins the
+    /// owner and empties the slot.
+    #[tokio::test]
+    async fn concurrent_delivery_owner_retirements_join_the_same_held_owner() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (runtime, hook, passes, _session_id) =
+            runtime_with_a_held_delivery_application(&temp).await;
+        // Observed while held; the release and the joins come before any
+        // assertion.
+        let held = delivery_application_held(&hook).await;
+        let mut long = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move {
+                runtime
+                    .retire_runtime_delivery_owner(TEST_ASYNC_WITNESS_TIMEOUT)
+                    .await
+            }
+        });
+        let short = runtime
+            .retire_runtime_delivery_owner(Duration::from_millis(200))
+            .await;
+        let early = tokio::time::timeout(Duration::from_millis(50), &mut long).await;
+        let long_waiting_while_held = early.is_err();
+        let kept_while_held = delivery_owner_kept_running(&runtime);
+        release_delivery_application(&runtime, &hook);
+        // A retirement that already returned keeps its result and is not
+        // awaited again; one still waiting is bounded by its own bound.
+        let long = match early {
+            Ok(returned) => returned,
+            Err(_) => long.await,
+        };
+        let slot_empty = delivery_owner_slot_empty(&runtime);
+        let task_gone = passes.has_changed().is_err();
+        let shutdown = runtime.try_shutdown().await;
+
+        assert!(
+            held,
+            "the delivery owner never reached the held application"
+        );
+        let incomplete = retirement_incomplete(&short)
+            .unwrap_or_else(|other| panic!("a concurrent retirement while held: {other}"));
+        assert_eq!(incomplete.bound, Duration::from_millis(200));
+        assert!(
+            long_waiting_while_held,
+            "the long retirement still waits on the held owner"
+        );
+        assert!(
+            kept_while_held,
+            "racing retirements leave the owner in its slot, running"
+        );
+        long.expect("the long retirement's task")
+            .expect("the long retirement joins the released owner");
+        assert!(slot_empty, "a joined owner leaves its slot");
+        assert!(task_gone, "the joined owner's task is gone");
+        shutdown.expect("the runtime shuts down");
+    }
+
+    /// A shutdown whose delivery owner is still applying a delivery when its
+    /// grace runs out returns the typed incomplete retirement before any
+    /// teardown that depends on it: the owner stays in its slot, running, and
+    /// the session keeps its runtime registration, which owns its hosting
+    /// claim. Once the application is released, a retried shutdown joins the
+    /// owner and tears the registration down.
+    #[tokio::test]
+    async fn a_shutdown_past_a_held_delivery_application_keeps_the_registration_for_a_retry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (runtime, hook, passes, session_id) =
+            runtime_with_a_held_delivery_application(&temp).await;
+        // Observed while held; the release, the retried shutdown and its
+        // join come before any assertion.
+        let held = delivery_application_held(&hook).await;
+        let registered_before = runtime.runtime_adapter.contains_session(&session_id).await;
+        let first = runtime.try_shutdown().await;
+        let kept_after_first = delivery_owner_kept_running(&runtime);
+        let registered_after_first = runtime.runtime_adapter.contains_session(&session_id).await;
+        release_delivery_application(&runtime, &hook);
+        let retry = runtime.try_shutdown().await;
+        let slot_empty = delivery_owner_slot_empty(&runtime);
+        let task_gone = passes.has_changed().is_err();
+        let registered_after_retry = runtime.runtime_adapter.contains_session(&session_id).await;
+
+        assert!(
+            held,
+            "the delivery owner never reached the held application"
+        );
+        assert!(
+            registered_before,
+            "the session's turn registered it before the shutdown"
+        );
+        let incomplete = retirement_incomplete(&first)
+            .unwrap_or_else(|other| panic!("a shutdown while held: {other}"));
+        assert_eq!(incomplete.bound, DELIVERY_OWNER_RETIREMENT_GRACE);
+        assert!(
+            kept_after_first,
+            "an incomplete shutdown leaves the owner in its slot, running"
+        );
+        assert!(
+            registered_after_first,
+            "an incomplete shutdown keeps the session's registration"
+        );
+        retry.expect("a retried shutdown joins the released owner");
+        assert!(slot_empty, "a joined owner leaves its slot");
+        assert!(task_gone, "the joined owner's task is gone");
+        assert!(
+            !registered_after_retry,
+            "the retried shutdown tears the registration down"
+        );
+    }
+
     /// P3-B: a fork_off or council completion owed to a plain RPC session
     /// whose idle executor the runtime retired reaches it through the mob
     /// state's bound continuation services: the host resolver asks the RPC
     /// owner hook (`DetachedOwnerHost`) to make the session live, and the
-    /// completion is applied once and wakes it.
+    /// completion is applied once and wakes it. A retired runtime proves no
+    /// retirement of its owner: Mob's projection keeps the owner revivable,
+    /// and while the row is owed the RPC mob state's status read reports it
+    /// pending, never stranded.
     #[cfg(feature = "mob")]
     #[tokio::test]
     async fn a_completion_for_a_retired_plain_rpc_session_wakes_it_through_the_owner_hook() {
@@ -15245,8 +18350,9 @@ mod tests {
             .await
             .expect("create_session");
         // A detached job's owner ran the turn that dispatched it, so the
-        // session is materialized and reads; a session staged without a turn
-        // reads as gone and its rows are retired, not woken.
+        // session is materialized and reads. A session no turn materialized
+        // yet does not read; its rows wait for the turn that attaches it
+        // (`a_completion_for_an_rpc_session_that_does_not_read_yet_waits_for_its_first_turn`).
         let (turn_event_tx, _turn_event_rx) = mpsc::channel(100);
         runtime
             .start_turn(
@@ -15260,10 +18366,6 @@ mod tests {
             )
             .await
             .expect("the owner's dispatching turn");
-        runtime.arm_runtime_delivery_owner();
-        let mut passes = runtime
-            .subscribe_job_delivery_passes()
-            .expect("a runtime with a realm arms its owner");
         runtime
             .runtime_adapter
             .unregister_session(&session_id)
@@ -15275,6 +18377,22 @@ mod tests {
             .read(&session_id)
             .await
             .expect("the retired owner still reads");
+        let lifecycle = mob_state
+            .session_service()
+            .observe_session_resume_authority(&session_id)
+            .await
+            .expect("observe the owner's lifecycle")
+            .lifecycle();
+        assert!(
+            !matches!(
+                lifecycle,
+                meerkat_mob::SessionResumeLifecycle::Archived {
+                    revivable: false,
+                    ..
+                }
+            ),
+            "a retired executor leaves its owner revivable: {lifecycle:?}"
+        );
 
         let continuations = meerkat::ContinuationOwnerService::new(
             runtime.runtime_delivery_inbox(),
@@ -15312,7 +18430,24 @@ mod tests {
             )
             .await
             .expect("submit");
+        let owed = mob_state
+            .continuation_service()
+            .expect("the RPC mob state binds its continuation services")
+            .continuation_status(&owner, &key)
+            .await
+            .expect("status");
+        assert!(
+            matches!(
+                owed,
+                meerkat::ContinuationStatus::Pending { admitted: None, .. }
+            ),
+            "owed to a revivable owner: pending, never stranded: {owed:?}"
+        );
 
+        runtime.arm_runtime_delivery_owner();
+        let mut passes = runtime
+            .subscribe_job_delivery_passes()
+            .expect("a runtime with a realm arms its owner");
         let applied = tokio::time::timeout(TEST_ASYNC_WITNESS_TIMEOUT, async {
             loop {
                 if let meerkat::ContinuationStatus::Applied { session, input, .. } = continuations
@@ -15366,6 +18501,299 @@ mod tests {
         assert!(runtime.runtime_adapter.contains_session(&session_id).await);
     }
 
+    /// Commit council job `job_id`'s completion owed to `owner` through
+    /// `runtime`'s delivery inbox, under its `council:{job_id}` key.
+    #[cfg(feature = "mob")]
+    async fn owe_council_completion(
+        runtime: &Arc<SessionRuntime>,
+        owner: &meerkat::ContinuationOwner,
+        job_id: &str,
+    ) -> meerkat::ContinuationKey {
+        let key = meerkat::ContinuationKey::new(format!("council:{job_id}")).expect("key");
+        let continuations = meerkat::ContinuationOwnerService::new(
+            runtime.runtime_delivery_inbox(),
+            Arc::new(meerkat::SessionAddressResolver),
+            Arc::clone(&runtime.runtime_adapter),
+        );
+        let outcome = serde_json::json!({"result": "COUNCIL-DONE"});
+        continuations
+            .submit(
+                owner,
+                meerkat::ContinuationDelivery {
+                    key: key.clone(),
+                    result: meerkat::ContinuationResultRef {
+                        producer: meerkat::ContinuationProducer::Council,
+                        producer_id: job_id.into(),
+                        result_digest: meerkat_mob::detached_outcome_digest(&outcome),
+                        summary: None,
+                    },
+                    body: meerkat::ContinuationBody::notice(
+                        meerkat_mob_mcp::detached_completion_notice(
+                            "council",
+                            job_id,
+                            meerkat_core::event::BackgroundJobTerminalStatus::Completed,
+                            &outcome,
+                        )
+                        .expect("notice"),
+                    ),
+                    handling: meerkat::ContinuationHandling::Queue,
+                },
+                1,
+            )
+            .await
+            .expect("submit");
+        key
+    }
+
+    /// The delivery owner's first pass report that satisfies `predicate`
+    /// (the current one included), within the witness bound; it panics with
+    /// the last report when none does.
+    #[cfg(feature = "mob")]
+    async fn wait_for_delivery_pass(
+        passes: &mut tokio::sync::watch::Receiver<meerkat::RuntimeDeliveryPass>,
+        what: &str,
+        predicate: impl FnMut(&meerkat::RuntimeDeliveryPass) -> bool,
+    ) -> meerkat::RuntimeDeliveryPass {
+        let reached = tokio::time::timeout(TEST_ASYNC_WITNESS_TIMEOUT, passes.wait_for(predicate))
+            .await
+            .map(|pass| pass.map(|pass| pass.clone()));
+        match reached {
+            Ok(Ok(pass)) => pass,
+            Ok(Err(_)) => panic!("the owner's pass channel closed before: {what}"),
+            Err(_) => {
+                let last = passes.borrow().clone();
+                panic!("the delivery owner never reached: {what}; last pass {last:?}")
+            }
+        }
+    }
+
+    /// The RPC mob state over `runtime`, with a realm so its delivery owner
+    /// arms.
+    #[cfg(feature = "mob")]
+    fn rpc_mob_state_with_realm(
+        runtime: &Arc<SessionRuntime>,
+    ) -> Arc<meerkat_mob_mcp::MobMcpState> {
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        runtime.set_realm_context(
+            Some(meerkat_core::connection::RealmId::global()),
+            None,
+            None,
+        );
+        let config_store: Arc<dyn meerkat_core::ConfigStore> = Arc::new(
+            meerkat_core::MemoryConfigStore::new(Config::default(), meerkat_models::canonical()),
+        );
+        crate::router::compose_rpc_mob_state(runtime, &config_store, None)
+            .expect("compose the RPC mob state")
+    }
+
+    /// Run `session_id`'s turn through the shipping runtime path, which
+    /// attaches its executor (`ensure_runtime_executor`) first.
+    #[cfg(feature = "mob")]
+    async fn run_turn_via_runtime(runtime: &Arc<SessionRuntime>, session_id: &SessionId) {
+        let (turn_event_tx, _turn_event_rx) = mpsc::channel(100);
+        runtime
+            .start_turn_via_runtime(
+                session_id,
+                "the session's turn".into(),
+                Vec::new(),
+                turn_event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("the session's turn through the runtime");
+    }
+
+    /// A completion owed to a plain RPC session that does not read yet (it
+    /// was created and no turn has materialized it) stays owed with its
+    /// runtime blocked: the absence proves no retirement. The session's first
+    /// turn, through the shipping runtime path, attaches its executor
+    /// (`ensure_runtime_executor`); the delivery owner's retry on that wake
+    /// serves the session through the owner hook and admits the completion
+    /// exactly once to it.
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn a_completion_for_an_rpc_session_that_does_not_read_yet_waits_for_its_first_turn() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = make_runtime_with_runtime_store(temp_factory(&temp), 10);
+        let mob_state = rpc_mob_state_with_realm(&runtime);
+        let session_id = runtime
+            .create_session(mock_build_config(), None, None, Vec::new())
+            .await
+            .expect("create_session");
+        assert!(
+            matches!(
+                mob_state.session_service().read(&session_id).await,
+                Err(SessionError::NotFound { .. })
+            ),
+            "no turn materialized the session: it does not read yet"
+        );
+        runtime.arm_runtime_delivery_owner();
+        let mut passes = runtime
+            .subscribe_job_delivery_passes()
+            .expect("a runtime with a realm arms its owner");
+        let owner = meerkat::ContinuationOwner::Session {
+            session_id: session_id.clone(),
+        };
+        let address = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
+
+        let key = owe_council_completion(&runtime, &owner, "job-unmaterialized").await;
+        let blocked = wait_for_delivery_pass(
+            &mut passes,
+            "the owed row held blocked, not retired",
+            |pass| pass.blocked_runtimes.contains(&address),
+        )
+        .await;
+        assert_eq!(
+            (blocked.applied, blocked.refused),
+            (0, 0),
+            "never settled: {blocked:?}"
+        );
+
+        run_turn_via_runtime(&runtime, &session_id).await;
+        let applied = wait_for_delivery_pass(
+            &mut passes,
+            "the attached session admitted the row",
+            |pass| pass.applied > 0,
+        )
+        .await;
+        assert_eq!(applied.applied, 1, "admitted exactly once: {applied:?}");
+        assert!(
+            !applied.blocked_runtimes.contains(&address),
+            "nothing stays blocked: {applied:?}"
+        );
+        let status = mob_state
+            .continuation_service()
+            .expect("the RPC mob state binds its continuation services")
+            .continuation_status(&owner, &key)
+            .await
+            .expect("status");
+        assert!(
+            matches!(
+                &status,
+                meerkat::ContinuationStatus::Applied { session, .. } if session == &session_id
+            ),
+            "admitted to its exact owner session: {status:?}"
+        );
+    }
+
+    /// The positive Destroyed control, set up through the native control
+    /// plane: after a real RPC turn, while the session's registration still
+    /// exists, `RuntimeControlPlane::destroy` commits its runtime's durable
+    /// and generated terminal state and awaits the terminal publication. It
+    /// is not a shipping plain-RPC endpoint (the RPC archive retires a
+    /// runtime, which stays recoverable: see
+    /// `a_completion_for_a_retired_plain_rpc_session_wakes_it_through_the_owner_hook`)
+    /// and not a proof of joined unregister. Mob's projection observes the
+    /// destroyed runtime, from the authoritative snapshot, as Archived and
+    /// not revivable, so the owner is retired on its own lifecycle proof and
+    /// its completion is not held owed. A witness row for a live session is
+    /// committed after the owner's row, so the owner's row was taken in the
+    /// same-or-earlier completed batch as the witness's: a pass drains every
+    /// runtime it took, and its blocked set carries over between passes. The
+    /// pass that admits the witness therefore shows the owner's runtime
+    /// dropped as drained, not blocked and not failed. The RPC mob state's
+    /// status read reports the row stranded with its owner retired.
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn a_completion_for_an_rpc_session_over_a_destroyed_runtime_is_stranded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = make_runtime_with_runtime_store(temp_factory(&temp), 10);
+        let mob_state = rpc_mob_state_with_realm(&runtime);
+        let session_id = runtime
+            .create_session(mock_build_config(), None, None, Vec::new())
+            .await
+            .expect("create_session");
+        run_turn_via_runtime(&runtime, &session_id).await;
+        let address = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
+        meerkat_runtime::RuntimeControlPlane::destroy(runtime.runtime_adapter.as_ref(), &address)
+            .await
+            .expect("destroy the session's runtime through the native control plane");
+        let lifecycle = mob_state
+            .session_service()
+            .observe_session_resume_authority(&session_id)
+            .await
+            .expect("observe the owner's lifecycle")
+            .lifecycle();
+        assert!(
+            matches!(
+                lifecycle,
+                meerkat_mob::SessionResumeLifecycle::Archived {
+                    revivable: false,
+                    runtime_state: Some(meerkat_runtime::RuntimeState::Destroyed),
+                    ..
+                }
+            ),
+            "archived, not revivable, over a destroyed runtime: {lifecycle:?}"
+        );
+        let witness_id = runtime
+            .create_session(mock_build_config(), None, None, Vec::new())
+            .await
+            .expect("create the witness session");
+        run_turn_via_runtime(&runtime, &witness_id).await;
+        runtime.arm_runtime_delivery_owner();
+        let mut passes = runtime
+            .subscribe_job_delivery_passes()
+            .expect("a runtime with a realm arms its owner");
+        let owner = meerkat::ContinuationOwner::Session {
+            session_id: session_id.clone(),
+        };
+        let witness = meerkat::ContinuationOwner::Session {
+            session_id: witness_id.clone(),
+        };
+
+        let key = owe_council_completion(&runtime, &owner, "job-destroyed").await;
+        let witness_key = owe_council_completion(&runtime, &witness, "job-witness").await;
+        let witnessed =
+            wait_for_delivery_pass(&mut passes, "the later witness row admitted", |pass| {
+                pass.applied > 0
+            })
+            .await;
+        assert!(
+            !witnessed.blocked_runtimes.contains(&address),
+            "a proven-retired owner's runtime is dropped as drained: {witnessed:?}"
+        );
+        assert!(
+            witnessed.failures.is_empty(),
+            "the destroyed owner's address was resolved, not failed: {witnessed:?}"
+        );
+        assert_eq!(
+            (witnessed.applied, witnessed.refused),
+            (1, 0),
+            "only the witness was admitted: {witnessed:?}"
+        );
+        let continuations = mob_state
+            .continuation_service()
+            .expect("the RPC mob state binds its continuation services");
+        let status = continuations
+            .continuation_status(&owner, &key)
+            .await
+            .expect("status");
+        assert!(
+            matches!(
+                status,
+                meerkat::ContinuationStatus::Stranded {
+                    cause: meerkat::StrandedCause::OwnerRetired,
+                    ..
+                }
+            ),
+            "stranded with its owner retired: {status:?}"
+        );
+        let witness_status = continuations
+            .continuation_status(&witness, &witness_key)
+            .await
+            .expect("status");
+        assert!(
+            matches!(
+                &witness_status,
+                meerkat::ContinuationStatus::Applied { session, .. } if session == &witness_id
+            ),
+            "the witness was admitted to its session: {witness_status:?}"
+        );
+    }
+
     /// #1497 reserve-first rests on this: once a session is retired, a
     /// continuation can no longer be admitted into it under its admission
     /// key, so a reservation it never took is safe to repoint.
@@ -15417,14 +18845,17 @@ mod tests {
             Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(meerkat_store::MemoryBlobStore::new());
-        Arc::new(SessionRuntime::new(
-            factory,
-            Config::default(),
-            max_sessions,
-            meerkat::PersistenceBundle::new(store, runtime_store, blob_store)
-                .expect("construct runtime authority"),
-            crate::router::NotificationSink::noop(),
-        ))
+        Arc::new(
+            SessionRuntime::new(
+                factory,
+                Config::default(),
+                max_sessions,
+                meerkat::PersistenceBundle::new(store, runtime_store, blob_store)
+                    .expect("construct runtime authority"),
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        )
     }
 
     fn make_runtime_with_runtime_store_handle(
@@ -15437,14 +18868,17 @@ mod tests {
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(meerkat_store::MemoryBlobStore::new());
         (
-            Arc::new(SessionRuntime::new(
-                factory,
-                Config::default(),
-                max_sessions,
-                meerkat::PersistenceBundle::new(store, Arc::clone(&runtime_store), blob_store)
-                    .expect("construct runtime authority"),
-                crate::router::NotificationSink::noop(),
-            )),
+            Arc::new(
+                SessionRuntime::new(
+                    factory,
+                    Config::default(),
+                    max_sessions,
+                    meerkat::PersistenceBundle::new(store, Arc::clone(&runtime_store), blob_store)
+                        .expect("construct runtime authority"),
+                    crate::router::NotificationSink::noop(),
+                )
+                .expect("compose the RPC session runtime"),
+            ),
             runtime_store,
         )
     }
@@ -15698,13 +19132,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let runtime = Arc::new(SessionRuntime::new(
-            AgentFactory::new(root.join("sessions")),
-            Config::default(),
-            1,
-            bundle,
-            crate::router::NotificationSink::noop(),
-        ));
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                AgentFactory::new(root.join("sessions")),
+                Config::default(),
+                1,
+                bundle,
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
         runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
         runtime
     }
@@ -15901,14 +19338,17 @@ mod tests {
                 hook: Arc::clone(&hook),
                 armed: std::sync::atomic::AtomicBool::new(false),
             });
-            let runtime = Arc::new(SessionRuntime::new_with_config_store(
-                temp_factory(&temp),
-                Config::default(),
-                config_store.clone(),
-                1,
-                persistence,
-                crate::router::NotificationSink::noop(),
-            ));
+            let runtime = Arc::new(
+                SessionRuntime::new_with_config_store(
+                    temp_factory(&temp),
+                    Config::default(),
+                    config_store.clone(),
+                    1,
+                    persistence,
+                    crate::router::NotificationSink::noop(),
+                )
+                .expect("compose the RPC session runtime"),
+            );
             runtime.ensure_schedule_host_started().await.unwrap();
             config_store.armed.store(true, AtomicOrdering::SeqCst);
             let cancelled_runtime = Arc::clone(&runtime);
@@ -16342,6 +19782,167 @@ mod tests {
             )
             .await
             .unwrap();
+        runtime.try_shutdown().await.unwrap();
+    }
+
+    /// A request cancelled before or during a bound cold recovery answers
+    /// with a cancellation, leaves no actor, live or staged session, MCP
+    /// state entry or capacity admission, releases the registration fence,
+    /// and keeps the durable predecessor (compared as JSON). The cancel
+    /// points are: before the recovery starts, while the host binds, and at
+    /// the pre-promotion barrier, which sits after the session's (here empty)
+    /// MCP state is inserted and before the actor is constructed. This does
+    /// not cover cleanup of a non-empty MCP restore or the wire request
+    /// context (the signal is the watch the governed path derives from it).
+    #[tokio::test]
+    async fn no_turn_bound_recovery_cancellation_rolls_back_before_or_during_recovery() {
+        #[derive(Clone, Copy, Debug)]
+        enum CancelAt {
+            Before,
+            Binding,
+            Construction,
+        }
+
+        let temp = tempfile::tempdir_in(".").unwrap();
+        let seed_runtime = no_turn_disk_runtime(temp.path()).await;
+        let id = seed_runtime
+            .create_or_resume_session_without_turn(
+                mock_build_config(),
+                None,
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(100);
+        seed_runtime
+            .start_turn_via_runtime(
+                &id,
+                "preserve this committed predecessor".into(),
+                Vec::new(),
+                event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let predecessor = serde_json::to_value(
+            seed_runtime
+                .load_persisted_session(&id)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        seed_runtime.try_shutdown().await.unwrap();
+        drop(seed_runtime);
+
+        let runtime = no_turn_disk_runtime(temp.path()).await;
+        for at in [CancelAt::Before, CancelAt::Binding, CancelAt::Construction] {
+            let (cancel_tx, cancelled) = tokio::sync::watch::channel(false);
+            let cancel_tx = Arc::new(cancel_tx);
+            if matches!(at, CancelAt::Before) {
+                cancel_tx.send_replace(true);
+            }
+            let hook = matches!(at, CancelAt::Construction).then(|| install_no_turn_hook(&runtime));
+            let binds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let bind: BeforeConstruction = {
+                let binds = Arc::clone(&binds);
+                let cancel_tx = Arc::clone(&cancel_tx);
+                Box::new(move |_machine, _session_id| {
+                    Box::pin(async move {
+                        binds.fetch_add(1, AtomicOrdering::SeqCst);
+                        if matches!(at, CancelAt::Binding) {
+                            cancel_tx.send_replace(true);
+                            std::future::pending::<()>().await;
+                        }
+                        Ok(())
+                    })
+                })
+            };
+            let recovering = Arc::clone(&runtime);
+            let recover_id = id.clone();
+            let task = tokio::spawn(async move {
+                recovering
+                    .create_or_resume_session_without_turn_bound(
+                        mock_build_config(),
+                        Some(recover_id),
+                        None,
+                        Default::default(),
+                        Some(bind),
+                        Some(cancelled),
+                    )
+                    .await
+            });
+            if let Some(hook) = hook.as_ref() {
+                await_no_turn_hook(hook).await;
+                cancel_tx.send_replace(true);
+            }
+            let error = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+                .await
+                .expect("a cancelled recovery finishes its exact rollback")
+                .unwrap()
+                .expect_err("a cancelled recovery is refused");
+            assert_eq!(error.code, error::REQUEST_CANCELLED, "{at:?}: {error:?}");
+            assert_eq!(
+                binds.load(AtomicOrdering::SeqCst),
+                usize::from(!matches!(at, CancelAt::Before)),
+                "{at:?}: a recovery cancelled before it starts never binds"
+            );
+            let lock = runtime.runtime_registration_lock(&id);
+            let guard =
+                tokio::time::timeout(std::time::Duration::from_secs(10), lock.mutex().lock())
+                    .await
+                    .expect("the cancelled recovery released its registration fence");
+            assert!(
+                !runtime.runtime_adapter.contains_session(&id).await,
+                "{at:?}"
+            );
+            assert!(
+                !runtime.service.has_live_session(&id).await.unwrap(),
+                "{at:?}"
+            );
+            assert!(!runtime.staged_sessions.contains(&id).await, "{at:?}");
+            assert!(
+                runtime
+                    .staged_capacity_admissions
+                    .lock()
+                    .unwrap()
+                    .is_empty(),
+                "{at:?}"
+            );
+            #[cfg(feature = "mcp")]
+            assert!(
+                !runtime.mcp_sessions.read().await.contains_key(&id),
+                "{at:?}"
+            );
+            assert_eq!(
+                predecessor,
+                serde_json::to_value(runtime.load_persisted_session(&id).await.unwrap().unwrap())
+                    .unwrap(),
+                "{at:?}"
+            );
+            drop(guard);
+            *runtime.runtime_routed_pre_promotion_hook.lock().unwrap() = None;
+        }
+
+        // The claim and the capacity were released: an uncancelled recovery
+        // of the same session succeeds.
+        let recovered = runtime
+            .create_or_resume_session_without_turn_bound(
+                mock_build_config(),
+                Some(id.clone()),
+                None,
+                Default::default(),
+                None,
+                Some(tokio::sync::watch::channel(false).1),
+            )
+            .await
+            .expect("a cancelled recovery releases its claim for retry");
+        assert_eq!(recovered, id);
+        assert!(runtime.service.has_live_session(&id).await.unwrap());
         runtime.try_shutdown().await.unwrap();
     }
 
@@ -17495,14 +21096,17 @@ mod tests {
         let runtime_store_dyn: Arc<dyn meerkat_runtime::RuntimeStore> = runtime_store.clone();
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(meerkat_store::MemoryBlobStore::new());
-        let runtime = Arc::new(SessionRuntime::new(
-            temp_factory(&temp),
-            Config::default(),
-            1,
-            meerkat::PersistenceBundle::new(store, runtime_store_dyn, blob_store)
-                .expect("construct runtime authority"),
-            crate::router::NotificationSink::noop(),
-        ));
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                temp_factory(&temp),
+                Config::default(),
+                1,
+                meerkat::PersistenceBundle::new(store, runtime_store_dyn, blob_store)
+                    .expect("construct runtime authority"),
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
         *runtime
             .create_session_after_prepare_bindings_error
             .lock()
@@ -18047,6 +21651,264 @@ mod tests {
                 .live_session_actor_registered(&session_id)
                 .await,
             "the recovery tail must have materialized the live actor in place"
+        );
+    }
+
+    /// Attaching or reusing a session's executor announces the custody change
+    /// to the delivery owners once per validated success: they retry the rows
+    /// they hold blocked. A refused attach announces nothing.
+    #[tokio::test]
+    async fn a_validated_executor_attachment_announces_its_custody_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = make_runtime_with_runtime_store(temp_factory(&temp), 10);
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        let source_changes = runtime.continuation_bindings().subscribe_source_changes();
+        let announced = || *source_changes.borrow();
+        let before = announced();
+
+        let missing = SessionId::new();
+        let refused = runtime
+            .ensure_runtime_executor(&missing)
+            .await
+            .expect_err("a session that does not exist has no executor to attach");
+        assert_eq!(refused.code, error::SESSION_NOT_FOUND);
+        assert_eq!(announced(), before, "a refused attach announces nothing");
+
+        let session_id = runtime
+            .create_session(mock_build_config(), None, None, Vec::new())
+            .await
+            .expect("create_session");
+        assert_eq!(announced(), before, "creating a session attaches nothing");
+        runtime
+            .ensure_runtime_executor(&session_id)
+            .await
+            .expect("fresh executor attachment");
+        assert_eq!(
+            announced(),
+            before + 1,
+            "a fresh attachment announces its custody once"
+        );
+
+        runtime
+            .ensure_runtime_executor(&session_id)
+            .await
+            .expect("reused executor attachment");
+        assert_eq!(
+            announced(),
+            before + 2,
+            "a reused attachment announces its custody once"
+        );
+    }
+
+    /// Executor presence is not readiness: an attachment this runtime holds no
+    /// exact publication authority for is refused, and announces nothing.
+    #[tokio::test]
+    async fn an_executor_without_exact_publication_authority_is_refused_without_announcing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = make_runtime_with_runtime_store(temp_factory(&temp), 10);
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        let session_id = runtime
+            .create_session(mock_build_config(), None, None, Vec::new())
+            .await
+            .expect("create_session");
+        runtime
+            .ensure_runtime_executor(&session_id)
+            .await
+            .expect("fresh executor attachment");
+        let attachment = runtime
+            .runtime_adapter()
+            .current_executor_attachment_witness(&session_id)
+            .await
+            .expect("the fresh attachment is committed");
+        assert!(
+            runtime.clear_publication_sidecars_if_current(&session_id, Some(&attachment)),
+            "this runtime published the attachment it now forgets"
+        );
+        assert!(
+            runtime
+                .runtime_adapter()
+                .session_has_executor(&session_id)
+                .await
+                .expect("executor presence"),
+            "the executor is still attached"
+        );
+
+        let source_changes = runtime.continuation_bindings().subscribe_source_changes();
+        let before = *source_changes.borrow();
+        let refused = runtime
+            .ensure_runtime_executor(&session_id)
+            .await
+            .expect_err("reuse needs this runtime's exact publication authority");
+        assert_eq!(refused.code, error::INTERNAL_ERROR);
+        assert_eq!(
+            *source_changes.borrow(),
+            before,
+            "a refused reuse announces nothing"
+        );
+    }
+
+    /// A mob member's executor is attached by the member's own mob runtime,
+    /// so this runtime holds no publication authority of its own for it.
+    /// Reuse needs the machine's exact publisher for that attachment to serve
+    /// the live actor the mob published to this runtime: then it serves, and
+    /// announces once. An attachment whose publisher serves another actor, or
+    /// a same-ID attachment of another machine, is refused and announces
+    /// nothing.
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn a_mob_members_own_attachment_is_reused_only_through_its_exact_publisher() {
+        use meerkat_core::lifecycle::core_executor::CoreExecutor;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = make_runtime_with_runtime_store(temp_factory(&temp), 10);
+        let mob_state = rpc_mob_state_with_realm(&runtime);
+        runtime.set_mob_state(Arc::clone(&mob_state));
+        // Unique per test: the mob id names the process-global in-process
+        // supervisor participant.
+        let mut definition = meerkat_mob::MobDefinition::explicit(meerkat_mob::MobId::from(
+            format!("rpc-mob-own-attachment-{}", uuid::Uuid::new_v4().simple()),
+        ));
+        definition.profiles.insert(
+            meerkat_mob::ProfileName::from("worker"),
+            meerkat_mob::ProfileBinding::Inline(Box::new(meerkat_mob::Profile {
+                model_fallback: None,
+                model: "claude-sonnet-4-5".to_string(),
+                provider: None,
+                self_hosted_server_id: None,
+                image_generation_provider: None,
+                auto_compact_threshold: None,
+                resume_overrides: Vec::new(),
+                skills: Vec::new(),
+                tools: meerkat_mob::ToolConfig {
+                    comms: true,
+                    ..meerkat_mob::ToolConfig::default()
+                },
+                peer_description: "worker".to_string(),
+                external_addressable: false,
+                backend: None,
+                runtime_mode: meerkat_mob::MobRuntimeMode::TurnDriven,
+                max_inline_peer_notifications: None,
+                output_schema: None,
+                provider_params: None,
+            })),
+        );
+        let mob_id = mob_state
+            .mob_create_definition(definition)
+            .await
+            .expect("create the mob");
+        let mut members = Vec::new();
+        for name in ["worker-1", "worker-2"] {
+            mob_state
+                .mob_spawn_spec(&mob_id, meerkat_mob::SpawnMemberSpec::new("worker", name))
+                .await
+                .expect("spawn a turn-driven member");
+            let status = mob_state
+                .mob_member_status(&mob_id, &meerkat_mob::AgentIdentity::from(name))
+                .await
+                .expect("member status");
+            members.push(
+                status
+                    .current_session_id
+                    .expect("a turn-driven member has a session"),
+            );
+        }
+        let (member, other) = (&members[0], &members[1]);
+
+        let attachment = runtime
+            .runtime_adapter
+            .current_executor_attachment_witness(member)
+            .await
+            .expect("the member's own mob runtime attached its executor");
+        assert!(
+            runtime
+                .runtime_publication_handle_for_attachment(&attachment)
+                .is_err(),
+            "this runtime published nothing for the member's attachment"
+        );
+        let source_changes = runtime.continuation_bindings().subscribe_source_changes();
+        let announced = || *source_changes.borrow();
+
+        let before = announced();
+        runtime
+            .ensure_runtime_executor(member)
+            .await
+            .expect("the member's attachment serves the actor its mob published");
+        assert_eq!(
+            announced(),
+            before + 1,
+            "the reuse announces its custody once"
+        );
+
+        // The other member's actor in place of the one the mob published for
+        // this member: the attachment's publisher serves another actor.
+        let published = runtime
+            .mob_actor_witness(member)
+            .expect("the mob published the member's live actor");
+        let other_actor = runtime
+            .mob_actor_witness(other)
+            .expect("the mob published the other member's live actor");
+        runtime
+            .mob_actor_witnesses
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(member.clone(), other_actor);
+        let before = announced();
+        let refused = runtime
+            .ensure_runtime_executor(member)
+            .await
+            .expect_err("an attachment whose publisher serves another actor is refused");
+        assert_eq!(refused.code, error::INTERNAL_ERROR);
+        assert_eq!(announced(), before, "a refused reuse announces nothing");
+        runtime
+            .mob_actor_witnesses
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(member.clone(), published);
+        runtime
+            .ensure_runtime_executor(member)
+            .await
+            .expect("the member's own actor is served again");
+
+        // The same session attached on another machine: its witness names no
+        // attachment of this runtime's machine.
+        let foreign_machine = Arc::new(MeerkatMachine::ephemeral());
+        let foreign_runtime = Arc::clone(&runtime);
+        let foreign_session_id = member.clone();
+        let foreign = match foreign_machine
+            .ensure_session_with_executor_factory(member.clone(), move |_witness| {
+                Box::new(
+                    crate::session_executor::SessionRuntimeExecutor::new_for_actor_slot(
+                        foreign_runtime,
+                        foreign_session_id,
+                        meerkat::LiveSessionActorWitnessSlot::default(),
+                    ),
+                ) as Box<dyn CoreExecutor>
+            })
+            .await
+            .expect("prepare a same-ID attachment on another machine")
+        {
+            meerkat_runtime::EnsureRuntimeExecutorAttachment::Pending(pending) => pending
+                .commit()
+                .await
+                .expect("commit the same-ID attachment"),
+            meerkat_runtime::EnsureRuntimeExecutorAttachment::Existing(_) => {
+                panic!("another machine mints its own attachment")
+            }
+        };
+        runtime
+            .require_attachment_publication_authority(&runtime.runtime_adapter, &attachment)
+            .await
+            .expect("the member's own attachment is still served");
+        let before = announced();
+        let refused = runtime
+            .require_attachment_publication_authority(&runtime.runtime_adapter, &foreign)
+            .await
+            .expect_err("a same-ID attachment of another machine is refused");
+        assert_eq!(refused.code, error::INTERNAL_ERROR);
+        assert_eq!(
+            announced(),
+            before,
+            "a refused attachment announces nothing"
         );
     }
 
@@ -18762,14 +22624,17 @@ mod tests {
             Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(meerkat_store::MemoryBlobStore::new());
-        let runtime = Arc::new(SessionRuntime::new(
-            temp_factory(&temp),
-            Config::default(),
-            10,
-            meerkat::PersistenceBundle::new(store, Arc::clone(&runtime_store), blob_store)
-                .expect("construct runtime authority"),
-            crate::router::NotificationSink::noop(),
-        ));
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                temp_factory(&temp),
+                Config::default(),
+                10,
+                meerkat::PersistenceBundle::new(store, Arc::clone(&runtime_store), blob_store)
+                    .expect("construct runtime authority"),
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
         runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
 
         let mut build = mock_build_config();
@@ -18852,14 +22717,17 @@ mod tests {
             Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(meerkat_store::MemoryBlobStore::new());
-        let runtime = Arc::new(SessionRuntime::new(
-            temp_factory(&temp),
-            Config::default(),
-            10,
-            meerkat::PersistenceBundle::new(store, Arc::clone(&runtime_store), blob_store)
-                .expect("construct runtime authority"),
-            crate::router::NotificationSink::noop(),
-        ));
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                temp_factory(&temp),
+                Config::default(),
+                10,
+                meerkat::PersistenceBundle::new(store, Arc::clone(&runtime_store), blob_store)
+                    .expect("construct runtime authority"),
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
         runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
         let runtime = Arc::new(runtime);
 
@@ -19008,13 +22876,16 @@ mod tests {
             Arc::new(meerkat::MemoryScheduleStore::new()),
         )
         .expect("construct runtime authority");
-        let runtime = Arc::new(SessionRuntime::new(
-            temp_factory(&temp),
-            Config::default(),
-            4,
-            persistence,
-            crate::router::NotificationSink::noop(),
-        ));
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                temp_factory(&temp),
+                Config::default(),
+                4,
+                persistence,
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
 
         assert!(
             runtime.schedule_host.lock().await.is_none(),
@@ -19107,7 +22978,8 @@ mod tests {
             10,
             persistence,
             crate::router::NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
         let flow = runtime
             .oauth_flow_authority()
             .consume(
@@ -19146,6 +23018,53 @@ mod tests {
         }
     }
 
+    /// The runtime's approval service is the persistence's one selected
+    /// issuer: a record either one issues is the other's own record at once,
+    /// which no second service over the same approvals file would hold.
+    #[tokio::test]
+    async fn the_runtime_takes_the_persistences_one_approval_issuer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (_manifest, bundle) = meerkat::open_realm_persistence_in(
+            temp.path(),
+            "approval-issuer",
+            Some(meerkat_store::RealmBackend::Sqlite),
+            None,
+        )
+        .await
+        .expect("open persistence");
+        let issuer = bundle.approval_issuer();
+        let runtime = SessionRuntime::new(
+            AgentFactory::new(temp.path().join("agent-sessions")),
+            Config::default(),
+            10,
+            bundle,
+            crate::router::NotificationSink::noop(),
+        )
+        .expect("compose the RPC session runtime");
+        let from_runtime = runtime
+            .approval_service()
+            .request(approval_request())
+            .expect("request approval through the runtime");
+        assert_eq!(
+            issuer
+                .get(&from_runtime.approval_id)
+                .expect("the issuer holds the runtime's record")
+                .approval_id,
+            from_runtime.approval_id
+        );
+        let from_issuer = issuer
+            .request(approval_request())
+            .expect("request approval through the issuer");
+        assert_eq!(
+            runtime
+                .approval_service()
+                .get(&from_issuer.approval_id)
+                .expect("the runtime holds the issuer's record")
+                .approval_id,
+            from_issuer.approval_id
+        );
+    }
+
     #[tokio::test]
     async fn approval_service_reopens_from_realm_persistence_store_path() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -19163,7 +23082,8 @@ mod tests {
             10,
             bundle,
             crate::router::NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
         assert!(runtime.approval_service().is_persistent());
         let record = runtime
             .approval_service()
@@ -19184,7 +23104,8 @@ mod tests {
             10,
             reopened_bundle,
             crate::router::NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
         assert!(reopened.approval_service().is_persistent());
         let loaded = reopened
             .approval_service()
@@ -19215,7 +23136,8 @@ mod tests {
             10,
             bundle,
             crate::router::NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
         let session_id = SessionId::new();
         event_store
             .append(
@@ -19268,7 +23190,8 @@ mod tests {
             10,
             reopened_bundle,
             crate::router::NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
 
         let latest_error = reopened
             .event_latest_cursor(scope.clone())
@@ -19308,7 +23231,8 @@ mod tests {
             10,
             bundle,
             crate::router::NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
         assert!(runtime.approval_service().is_persistent());
         let record = runtime
             .approval_service()
@@ -19329,7 +23253,8 @@ mod tests {
             10,
             reopened_bundle,
             crate::router::NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
         assert!(reopened.approval_service().is_persistent());
         let loaded = reopened
             .approval_service()
@@ -20282,14 +24207,17 @@ mod tests {
         let runtime_store_dyn: Arc<dyn meerkat_runtime::RuntimeStore> = runtime_store.clone();
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(meerkat_store::MemoryBlobStore::new());
-        let runtime = Arc::new(SessionRuntime::new(
-            temp_factory(&temp),
-            Config::default(),
-            10,
-            meerkat::PersistenceBundle::new(store, runtime_store_dyn.clone(), blob_store)
-                .expect("construct runtime authority"),
-            crate::router::NotificationSink::noop(),
-        ));
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                temp_factory(&temp),
+                Config::default(),
+                10,
+                meerkat::PersistenceBundle::new(store, runtime_store_dyn.clone(), blob_store)
+                    .expect("construct runtime authority"),
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
 
         let session_id = runtime
             .create_session(mock_build_config(), None, None, Vec::new())
@@ -20408,13 +24336,16 @@ mod tests {
         )
         .await
         .expect("open persistence");
-        let runtime = Arc::new(SessionRuntime::new(
-            AgentFactory::new(temp.path().join("agent-sessions-a")),
-            Config::default(),
-            10,
-            bundle,
-            crate::router::NotificationSink::noop(),
-        ));
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                AgentFactory::new(temp.path().join("agent-sessions-a")),
+                Config::default(),
+                10,
+                bundle,
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
         runtime.set_realm_context(
             Some(meerkat_core::connection::RealmId::parse(realm_id).expect("realm id")),
             None,
@@ -20465,13 +24396,16 @@ mod tests {
         .await
         .expect("reopen persistence");
         let reopened_store = reopened_bundle.session_store();
-        let reopened = Arc::new(SessionRuntime::new(
-            AgentFactory::new(temp.path().join("agent-sessions-b")),
-            Config::default(),
-            10,
-            reopened_bundle,
-            crate::router::NotificationSink::noop(),
-        ));
+        let reopened = Arc::new(
+            SessionRuntime::new(
+                AgentFactory::new(temp.path().join("agent-sessions-b")),
+                Config::default(),
+                10,
+                reopened_bundle,
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
         reopened.set_realm_context(
             Some(meerkat_core::connection::RealmId::parse(realm_id).expect("realm id")),
             None,
@@ -21055,18 +24989,21 @@ mod tests {
             Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(meerkat_store::MemoryBlobStore::new());
-        let runtime = Arc::new(SessionRuntime::new(
-            temp_factory(&temp),
-            Config::default(),
-            10,
-            meerkat::PersistenceBundle::new(
-                Arc::clone(&store),
-                Arc::clone(&runtime_store),
-                Arc::clone(&blob_store),
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                temp_factory(&temp),
+                Config::default(),
+                10,
+                meerkat::PersistenceBundle::new(
+                    Arc::clone(&store),
+                    Arc::clone(&runtime_store),
+                    Arc::clone(&blob_store),
+                )
+                .expect("construct runtime authority"),
+                crate::router::NotificationSink::noop(),
             )
-            .expect("construct runtime authority"),
-            crate::router::NotificationSink::noop(),
-        ));
+            .expect("compose the RPC session runtime"),
+        );
         let build_config = mock_build_config();
 
         let created = runtime
@@ -21108,14 +25045,17 @@ mod tests {
         // retaining both durable stores. Unregister would finalize Stopped to
         // Idle and would not represent a crash/restart boundary.
         drop(runtime);
-        let runtime = Arc::new(SessionRuntime::new(
-            temp_factory(&temp),
-            Config::default(),
-            10,
-            meerkat::PersistenceBundle::new(store, runtime_store, blob_store)
-                .expect("construct runtime authority"),
-            crate::router::NotificationSink::noop(),
-        ));
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                temp_factory(&temp),
+                Config::default(),
+                10,
+                meerkat::PersistenceBundle::new(store, runtime_store, blob_store)
+                    .expect("construct runtime authority"),
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
         assert!(
             !runtime
                 .runtime_adapter
@@ -21490,14 +25430,17 @@ mod tests {
         let runtime_store_dyn: Arc<dyn meerkat_runtime::RuntimeStore> = runtime_store.clone();
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(meerkat_store::MemoryBlobStore::new());
-        let runtime = Arc::new(SessionRuntime::new(
-            temp_factory(&temp),
-            Config::default(),
-            1,
-            meerkat::PersistenceBundle::new(session_store, runtime_store_dyn, blob_store)
-                .expect("construct runtime authority"),
-            crate::router::NotificationSink::noop(),
-        ));
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                temp_factory(&temp),
+                Config::default(),
+                1,
+                meerkat::PersistenceBundle::new(session_store, runtime_store_dyn, blob_store)
+                    .expect("construct runtime authority"),
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
         let session_id = runtime
             .create_session(mock_build_config(), None, None, Vec::new())
             .await
@@ -22533,14 +26476,17 @@ mod tests {
         let runtime_store_dyn: Arc<dyn meerkat_runtime::RuntimeStore> = runtime_store.clone();
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
             Arc::new(meerkat_store::MemoryBlobStore::new());
-        let runtime = Arc::new(SessionRuntime::new(
-            temp_factory(&temp),
-            Config::default(),
-            1,
-            meerkat::PersistenceBundle::new(session_store, runtime_store_dyn, blob_store)
-                .expect("construct runtime authority"),
-            crate::router::NotificationSink::noop(),
-        ));
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                temp_factory(&temp),
+                Config::default(),
+                1,
+                meerkat::PersistenceBundle::new(session_store, runtime_store_dyn, blob_store)
+                    .expect("construct runtime authority"),
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
         let session_id = runtime
             .create_session(mock_build_config(), None, None, Vec::new())
             .await
@@ -25702,13 +29648,16 @@ mod tests {
         )
         .await
         .expect("open runtime and EventStore-backed persistence");
-        let runtime = Arc::new(SessionRuntime::new(
-            temp_factory(&temp),
-            Config::default(),
-            1,
-            persistence,
-            crate::router::NotificationSink::noop(),
-        ));
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                temp_factory(&temp),
+                Config::default(),
+                1,
+                persistence,
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
         runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
 
         let session_id = runtime
@@ -25859,13 +29808,16 @@ mod tests {
         )
         .await
         .expect("open runtime and EventStore-backed persistence");
-        let runtime = Arc::new(SessionRuntime::new(
-            temp_factory(&temp),
-            Config::default(),
-            1,
-            persistence,
-            crate::router::NotificationSink::noop(),
-        ));
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                temp_factory(&temp),
+                Config::default(),
+                1,
+                persistence,
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
         runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
         let service = runtime.session_service();
         runtime.set_mob_state(Arc::new(
@@ -26109,13 +30061,16 @@ mod tests {
         )
         .await
         .expect("open runtime and EventStore-backed persistence");
-        let runtime = Arc::new(SessionRuntime::new(
-            temp_factory(&temp),
-            Config::default(),
-            1,
-            persistence,
-            crate::router::NotificationSink::noop(),
-        ));
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                temp_factory(&temp),
+                Config::default(),
+                1,
+                persistence,
+                crate::router::NotificationSink::noop(),
+            )
+            .expect("compose the RPC session runtime"),
+        );
         runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
         let mob_service = runtime.session_service();
         runtime.set_mob_state(Arc::new(
@@ -26187,11 +30142,21 @@ mod tests {
             Some(RpcPublicationOwner::Mob { .. })
         ));
 
-        runtime
+        // Same-SessionId reuse below needs attachment A's teardown to be
+        // terminal; ordinary unregister_session only waits the caller grace.
+        let registration_a = runtime
             .runtime_adapter
-            .unregister_session(&session_id)
+            .current_session_registration_witness(&session_id)
             .await
-            .expect("retire exact Mob attachment A");
+            .expect("Mob attachment A must hold the current registration");
+        assert!(
+            runtime
+                .runtime_adapter
+                .unregister_session_registration_until_terminal_if_current(&registration_a)
+                .await
+                .expect("retire exact Mob attachment A"),
+            "attachment A's exact registration must reach terminal teardown"
+        );
         assert!(
             runtime.clear_publication_sidecars_if_current(&session_id, Some(&attachment_a)),
             "retirement cleanup must remove only attachment A's owner sidecars"
@@ -27539,6 +31504,523 @@ mod tests {
         assert!(
             sessions.is_empty(),
             "All sessions should be removed after shutdown"
+        );
+    }
+
+    /// A login lifts a sign-out's suppression only for the exact attachment
+    /// it suppressed: equal unbound identities (withheld parts, no key) prove
+    /// nothing, another account is not the same attachment, and an exact,
+    /// unchanged one is.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn login_reinstates_only_an_exactly_proven_suppressed_attachment() {
+        use meerkat_core::McpAttachmentDescriptorIdentity as Identity;
+        let stdio = |args: &[&str]| {
+            McpServerConfig::stdio(
+                "guarded",
+                "server",
+                args.iter().map(|arg| (*arg).to_owned()).collect(),
+                HashMap::new(),
+            )
+        };
+        // Recorded without a key: the arguments are withheld and unbound, so
+        // another installation that differs only there compares equal.
+        let unbound = Identity::of(&stdio(&["--token=a"]), None);
+        assert!(!unbound.target.is_exact());
+        assert!(
+            !SessionRuntime::login_proves_suppressed_attachment(
+                &unbound,
+                &stdio(&["--token=b"]),
+                None
+            ),
+            "an unbound record is not proven by an equal unbound identity"
+        );
+
+        let exact = Identity::of(&stdio(&[]), None);
+        assert!(
+            SessionRuntime::login_proves_suppressed_attachment(&exact, &stdio(&[]), None),
+            "the exact, unchanged attachment is reinstated"
+        );
+
+        let http = |account: &str| {
+            let mut config = McpServerConfig::streamable_http(
+                "guarded",
+                "https://mcp.example.test/mcp",
+                HashMap::new(),
+            );
+            if let meerkat_core::mcp_config::McpTransportConfig::Http(http) = &mut config.transport
+            {
+                http.oauth_account = Some(account.to_owned());
+            }
+            config
+        };
+        let account_a = Identity::of(&http("account-a"), None);
+        assert!(account_a.target.is_exact());
+        assert!(
+            !SessionRuntime::login_proves_suppressed_attachment(
+                &account_a,
+                &http("account-b"),
+                None
+            ),
+            "another account's installation does not lift the suppression"
+        );
+        assert!(SessionRuntime::login_proves_suppressed_attachment(
+            &account_a,
+            &http("account-a"),
+            None
+        ));
+    }
+
+    /// A removal whose caller leaves after its durable withdrawal was entered
+    /// still settles under the session's intent order: a restore attempted
+    /// meanwhile waits for it, then finds the request withdrawn and neither
+    /// stages nor reports anything, and the staged add is withdrawn (the next
+    /// boundary connects nothing).
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn cancelled_mcp_remove_settles_before_a_waiting_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = make_runtime(temp_factory(&temp), 10);
+        let session_id = runtime
+            .create_session(mock_build_config(), None, None, Vec::new())
+            .await
+            .unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(32);
+        runtime
+            .start_turn(
+                &session_id,
+                "hello".into(),
+                event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("the first turn materializes the session");
+        runtime
+            .mcp_stage_add(
+                &session_id,
+                McpServerConfig::stdio("restored", "echo", Vec::new(), HashMap::new()),
+            )
+            .await
+            .expect("stage add");
+        let requested = runtime
+            .durable_mcp_attachment_intents(&session_id)
+            .await
+            .expect("read the durable intents");
+        assert_eq!(requested.len(), 1, "the add is durable: {requested:?}");
+
+        let hook = Arc::new(PendingPromotionPreTurnHook::default());
+        *runtime
+            .mcp_intent_settlement_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&hook));
+        let remover = Arc::clone(&runtime);
+        let removed_session = session_id.clone();
+        let remove = tokio::spawn(async move {
+            remover
+                .mcp_stage_remove(&removed_session, "restored".to_string())
+                .await
+        });
+        // The withdrawal is recorded; its live removal waits on the hook.
+        wait_hook_reached(&hook).await;
+        remove.abort();
+        let _ = remove.await;
+
+        let adapter = runtime
+            .mcp_adapter_for_session(&session_id)
+            .await
+            .expect("the session's adapter");
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        let contended = runtime.mcp_intent_order_contended.notified();
+        let restorer = Arc::clone(&runtime);
+        let restored_session = session_id.clone();
+        let restore = tokio::spawn(async move {
+            restorer
+                .restore_mcp_attachments(
+                    &restored_session,
+                    &adapter,
+                    &lifecycle_tx,
+                    &requested,
+                    HashMap::new(),
+                    Vec::new(),
+                    None,
+                )
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), contended)
+            .await
+            .expect("the restore reaches the order the entered removal holds");
+        assert!(
+            !restore.is_finished(),
+            "the restore waits for the entered removal to settle"
+        );
+        hook.release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), restore)
+            .await
+            .expect("the restore runs once the removal settled")
+            .expect("the restore task completes");
+
+        let after = runtime
+            .durable_mcp_attachment_intents(&session_id)
+            .await
+            .expect("read the durable intents");
+        assert!(
+            after
+                .iter()
+                .all(|intent| intent.descriptor.server_name != "restored"),
+            "the cancelled removal still withdrew the request: {after:?}"
+        );
+        assert!(
+            lifecycle_rx.try_recv().is_err(),
+            "the withdrawn request is neither restored nor reported"
+        );
+        assert_eq!(
+            runtime
+                .mcp_apply_staged_for_test(&session_id)
+                .await
+                .expect("apply the staged operations"),
+            0,
+            "the settled removal withdrew the staged add: nothing connects"
+        );
+    }
+
+    /// A session with one parked governed restore entry (`restored`), whose
+    /// current installation the restore does not find: settling the batch
+    /// reports it once on the session's lifecycle stream.
+    #[cfg(feature = "mcp")]
+    async fn pending_restore_fixture(temp: &tempfile::TempDir) -> (Arc<SessionRuntime>, SessionId) {
+        let runtime = make_runtime(temp_factory(temp), 10);
+        let session_id = runtime
+            .create_session(mock_build_config(), None, None, Vec::new())
+            .await
+            .unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(32);
+        runtime
+            .start_turn(
+                &session_id,
+                "hello".into(),
+                event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("the first turn materializes the session");
+        runtime
+            .mcp_stage_add(
+                &session_id,
+                McpServerConfig::stdio("restored", "echo", Vec::new(), HashMap::new()),
+            )
+            .await
+            .expect("stage add");
+        let requested = runtime
+            .durable_mcp_attachment_intents(&session_id)
+            .await
+            .expect("read the durable intents");
+        assert_eq!(requested.len(), 1, "the add is durable: {requested:?}");
+        runtime
+            .mcp_sessions
+            .write()
+            .await
+            .get_mut(&session_id)
+            .expect("the session's MCP state")
+            .pending_restore = requested;
+        (runtime, session_id)
+    }
+
+    #[cfg(feature = "mcp")]
+    fn spawn_pending_restore(
+        runtime: &Arc<SessionRuntime>,
+        session_id: &SessionId,
+    ) -> tokio::task::JoinHandle<()> {
+        let runtime = Arc::clone(runtime);
+        let session_id = session_id.clone();
+        tokio::spawn(async move {
+            runtime
+                .restore_pending_mcp_attachments(&session_id, Some(Vec::new()), |_server| async {
+                    Err(meerkat_core::mcp_attachment::McpAttachmentRefusal::Unavailable)
+                })
+                .await;
+        })
+    }
+
+    /// The restore outcomes queued on `session_id`'s lifecycle stream.
+    #[cfg(feature = "mcp")]
+    async fn queued_mcp_lifecycle_actions(
+        runtime: &SessionRuntime,
+        session_id: &SessionId,
+    ) -> usize {
+        let mut sessions = runtime.mcp_sessions.write().await;
+        let state = sessions
+            .get_mut(session_id)
+            .expect("the session's MCP state");
+        let mut queued = 0;
+        while state.lifecycle_rx.try_recv().is_ok() {
+            queued += 1;
+        }
+        queued
+    }
+
+    /// A governed restore holds the session's intent order from taking its
+    /// batch until the batch is staged: a concurrent request's restore waits
+    /// on the order instead of finding the queue emptied and proceeding as
+    /// if restored, and the batch settles once.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn a_concurrent_governed_restore_waits_for_the_batch_taken_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, session_id) = pending_restore_fixture(&temp).await;
+        let hook = Arc::new(PendingPromotionPreTurnHook::default());
+        *runtime
+            .mcp_restore_batch_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&hook));
+        let first = spawn_pending_restore(&runtime, &session_id);
+        // The first restore took the real batch and holds there.
+        wait_hook_reached(&hook).await;
+        let contended = runtime.mcp_intent_order_contended.notified();
+        let second = spawn_pending_restore(&runtime, &session_id);
+        tokio::time::timeout(Duration::from_secs(5), contended)
+            .await
+            .expect("the second restore reaches the order the first holds");
+        assert!(
+            !second.is_finished(),
+            "the second restore waits until the first one's batch settles"
+        );
+        hook.release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("the first restore settles")
+            .expect("the first restore task completes");
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("the second restore runs once the first settled")
+            .expect("the second restore task completes");
+        assert_eq!(
+            queued_mcp_lifecycle_actions(&runtime, &session_id).await,
+            1,
+            "the batch settles once"
+        );
+    }
+
+    /// A governed restore whose caller stops waiting right after it took
+    /// the batch still settles it: the outcome is queued for the session's
+    /// next boundary, and the queue is not left with a lost batch.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn a_governed_restore_settles_its_batch_after_its_waiter_left() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, session_id) = pending_restore_fixture(&temp).await;
+        let hook = Arc::new(PendingPromotionPreTurnHook::default());
+        *runtime
+            .mcp_restore_batch_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&hook));
+        let waiter = spawn_pending_restore(&runtime, &session_id);
+        wait_hook_reached(&hook).await;
+        waiter.abort();
+        let _ = waiter.await;
+        hook.release.notify_waiters();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut queued = 0;
+        while queued == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the abandoned restore settles its batch"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            queued = queued_mcp_lifecycle_actions(&runtime, &session_id).await;
+        }
+        assert_eq!(queued, 1, "the batch settles once");
+        assert!(
+            runtime
+                .mcp_sessions
+                .read()
+                .await
+                .get(&session_id)
+                .is_some_and(|state| state.pending_restore.is_empty()),
+            "the settled batch is not parked again"
+        );
+    }
+
+    /// A suppressed-login reinstatement whose caller leaves after the durable
+    /// Reinstate was entered still hands the reinstated request to the
+    /// session's restore queue, and the next boundary restages it from there
+    /// against the matching current installation.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn cancelled_login_reinstatement_still_hands_off_to_the_restore_queue() {
+        let installation = McpServerConfig::stdio("restored", "echo", Vec::new(), HashMap::new());
+        let mut config = Config::default();
+        config.tools.mcp_servers.push(installation.clone());
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = make_runtime(temp_factory(&temp), 10);
+        runtime.set_config_runtime(Arc::new(meerkat_core::ConfigRuntime::new(
+            Arc::new(meerkat_core::MemoryConfigStore::new(
+                config,
+                meerkat_models::canonical(),
+            )),
+            temp.path().join("config_state.json"),
+        )));
+        let session_id = runtime
+            .create_session(mock_build_config(), None, None, Vec::new())
+            .await
+            .unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(32);
+        runtime
+            .start_turn(
+                &session_id,
+                "hello".into(),
+                event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("the first turn materializes the session");
+        runtime
+            .mcp_stage_add(&session_id, installation)
+            .await
+            .expect("stage add");
+        // Suppressed, as a sign-out leaves it: the live surface withdrawn
+        // (nothing pending at a boundary) and the durable request suppressed.
+        runtime
+            .mcp_adapter_for_session(&session_id)
+            .await
+            .expect("the session's adapter")
+            .stage_remove("restored")
+            .await
+            .expect("withdraw the staged add");
+        assert_eq!(
+            runtime
+                .mcp_apply_staged_for_test(&session_id)
+                .await
+                .expect("apply the withdrawal"),
+            0,
+            "nothing of the original add remains staged"
+        );
+        runtime
+            .enter_mcp_intent_transition(&session_id)
+            .await
+            .record(
+                meerkat_core::McpAttachmentIntentMutation::SuppressByLogout {
+                    server_name: "restored".to_string(),
+                },
+            )
+            .await
+            .expect("record the sign-out");
+        let suppressed = runtime
+            .durable_mcp_attachment_intents(&session_id)
+            .await
+            .expect("read the durable intents");
+        let [suppressed] = suppressed.as_slice() else {
+            panic!("one durable intent: {suppressed:?}");
+        };
+        assert_eq!(
+            suppressed.disposition,
+            meerkat_core::McpAttachmentIntentDisposition::SuppressedByLogout
+        );
+
+        let hook = Arc::new(PendingPromotionPreTurnHook::default());
+        *runtime
+            .mcp_intent_settlement_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&hook));
+        let transition = runtime.enter_mcp_intent_transition(&session_id).await;
+        let reinstate = meerkat_core::McpAttachmentIntentMutation::Reinstate {
+            server_name: "restored".to_string(),
+            expected_revision: suppressed.revision,
+        };
+        let caller = tokio::spawn(SessionRuntime::settle_mcp_intent_transition(
+            transition.reinstate_and_hand_off(reinstate, "restored".to_string()),
+        ));
+        // The Reinstate is recorded; the hand-off waits on the hook.
+        wait_hook_reached(&hook).await;
+        caller.abort();
+        let _ = caller.await;
+        *runtime
+            .mcp_intent_settlement_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        hook.release.notify_waiters();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let queued = loop {
+            let queued = runtime
+                .mcp_sessions
+                .read()
+                .await
+                .get(&session_id)
+                .map(|state| state.pending_restore.clone())
+                .unwrap_or_default();
+            if !queued.is_empty() || tokio::time::Instant::now() >= deadline {
+                break queued;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let requested = runtime
+            .durable_mcp_attachment_intents(&session_id)
+            .await
+            .expect("read the durable intents");
+        assert_eq!(
+            requested
+                .iter()
+                .map(|intent| intent.disposition)
+                .collect::<Vec<_>>(),
+            vec![meerkat_core::McpAttachmentIntentDisposition::Requested],
+            "the entered Reinstate settled"
+        );
+        assert_eq!(
+            queued, requested,
+            "the settlement handed that exact request to the restore queue"
+        );
+
+        // The next boundary's restore takes it from the queue and restages it
+        // from the current installation: that boundary starts its add.
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        runtime
+            .start_turn(
+                &session_id,
+                "again".into(),
+                event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("the next turn");
+        let events = collect_tool_config_events(&mut event_rx).await;
+        assert!(
+            events.iter().any(|payload| {
+                payload.operation == ToolConfigChangeOperation::Add
+                    && payload.target == "restored"
+                    && payload.status_text() == "pending"
+            }),
+            "the next boundary applies the restaged add: {events:?}"
+        );
+        assert!(
+            events.iter().all(|payload| !matches!(
+                payload.status_info(),
+                meerkat_core::ToolConfigChangeStatus::ExternalToolDelta {
+                    restore: Some(_),
+                    ..
+                }
+            )),
+            "no restore refusal is reported: {events:?}"
+        );
+        assert!(
+            runtime
+                .mcp_sessions
+                .read()
+                .await
+                .get(&session_id)
+                .is_some_and(|state| state.pending_restore.is_empty()),
+            "the boundary restored the queued request"
         );
     }
 
@@ -29175,18 +33657,21 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
         let runtime_store = Arc::new(FailingLifecycleRuntimeStore::new());
-        let runtime = Arc::new(SessionRuntime::new(
-            temp_factory(&temp),
-            Config::default(),
-            10,
-            meerkat::PersistenceBundle::new(
-                session_store,
-                runtime_store.clone(),
-                Arc::new(meerkat_store::MemoryBlobStore::new()),
+        let runtime = Arc::new(
+            SessionRuntime::new(
+                temp_factory(&temp),
+                Config::default(),
+                10,
+                meerkat::PersistenceBundle::new(
+                    session_store,
+                    runtime_store.clone(),
+                    Arc::new(meerkat_store::MemoryBlobStore::new()),
+                )
+                .expect("construct runtime authority"),
+                crate::router::NotificationSink::noop(),
             )
-            .expect("construct runtime authority"),
-            crate::router::NotificationSink::noop(),
-        ));
+            .expect("compose the RPC session runtime"),
+        );
         runtime_store.fail_next_catalog_read();
 
         // No session was created. The RuntimeStore-owned catalog read itself
@@ -31119,6 +35604,321 @@ mod tests {
         );
     }
 
+    /// How a test changes the session's text model under an open channel.
+    #[derive(Debug, Clone, Copy)]
+    enum TextModelChangeRoute {
+        /// The session-scoped reconfigure, which closes stale live channels
+        /// through `close_live_channels_for_identity_change`.
+        SessionReconfigure,
+        /// A machine-level reconfigure followed by config propagation, which
+        /// prechecks and compares every active channel.
+        ConfigPropagation,
+    }
+
+    /// What a text-model change did to one open channel.
+    struct TextModelChangeOutcome {
+        /// The bound identity and the session identity were equal at open.
+        initially_equal: bool,
+        session_model_after: String,
+        commands: Vec<meerkat_core::live_adapter::LiveAdapterCommand>,
+        status: meerkat_runtime::meerkat_machine::dsl::LiveChannelPublicStatus,
+        synthetic: Option<meerkat_core::live_adapter::LiveAdapterObservation>,
+        propagation: Option<LiveConfigPropagationReport>,
+        binding: Option<meerkat_runtime::live_execution::LiveChannelBinding>,
+    }
+
+    /// Open one channel bound to the session's current realtime identity,
+    /// with or without an independently selected execution profile, then
+    /// change the session's text model to a non-realtime model by `route`.
+    async fn text_model_change_over_open_channel(
+        execution_profile: Option<&str>,
+        route: TextModelChangeRoute,
+    ) -> TextModelChangeOutcome {
+        let _projection_guard = realtime_open_projection_test_guard().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = make_runtime(temp_factory(&temp), 10);
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+        let session_id = runtime
+            .create_session(
+                realtime_build_config("gpt-realtime-2"),
+                None,
+                None,
+                Vec::new(),
+            )
+            .await
+            .expect("create_session for live channel");
+        let (event_tx, _rx) = mpsc::channel(100);
+        runtime
+            .start_turn(
+                &session_id,
+                "materialize for the text-model change".into(),
+                event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("materialize session via first turn");
+        let host = Arc::new(meerkat_live::LiveAdapterHost::new(Arc::new(
+            meerkat_live::NoOpProjectionSink,
+        )));
+        runtime.set_live_adapter_host(Arc::clone(&host));
+
+        let current_identity = runtime
+            .live_open_config_for_session(
+                &session_id,
+                meerkat_contracts::RealtimeTurningMode::ProviderManaged,
+            )
+            .await
+            .expect("live_open_config_for_session")
+            .llm_identity;
+        let initially_equal = runtime
+            .service
+            .live_session_llm_identity(&session_id)
+            .await
+            .expect("session identity")
+            == current_identity;
+        let candidate_channel_id = meerkat_live::LiveChannelId::random_uuid();
+        let open_authority = runtime
+            .runtime_adapter()
+            .resolve_live_open_admission(&session_id, &candidate_channel_id, &current_identity)
+            .await
+            .expect("live open admission");
+        if let Some(profile_id) = execution_profile {
+            // The strict open admits the selection before the host
+            // publishes the channel.
+            let selection =
+                meerkat_runtime::live_execution::LiveExecutionProfileSelection::__test_new(
+                    profile_id,
+                    meerkat_core::LiveExecutionMode::ClientContext,
+                    meerkat_core::LiveExecutionCapabilities {
+                        function_bridge: false,
+                        client_context: true,
+                    },
+                )
+                .expect("test execution profile");
+            runtime
+                .runtime_adapter()
+                .resolve_live_execution_profile_admission(
+                    &session_id,
+                    &candidate_channel_id,
+                    &selection,
+                )
+                .await
+                .expect("admit the selected execution profile");
+        }
+        let channel_id = host
+            .open_channel_with_authority(
+                open_authority
+                    .channel_open_authority()
+                    .expect("generated live open handoff"),
+            )
+            .await
+            .expect("open_channel");
+        let log: Arc<tokio::sync::Mutex<Vec<meerkat_core::live_adapter::LiveAdapterCommand>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let adapter: Arc<dyn meerkat_core::live_adapter::LiveAdapter> =
+            Arc::new(R11RecordingAdapter {
+                log: Arc::clone(&log),
+            });
+        host.attach_adapter(&channel_id, adapter)
+            .await
+            .expect("attach_adapter");
+
+        let propagation = match route {
+            TextModelChangeRoute::SessionReconfigure => {
+                runtime
+                    .hot_swap_llm_client(
+                        &session_id,
+                        &crate::handlers::turn::TurnOverrides {
+                            model: Some("gpt-5.5".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("session text-model change");
+                None
+            }
+            TextModelChangeRoute::ConfigPropagation => {
+                runtime
+                    .runtime_adapter()
+                    .reconfigure_session_llm_identity(
+                        &session_id,
+                        SessionLlmReconfigureRequest {
+                            model: Some("gpt-5.5".to_string()),
+                            provider: None,
+                            self_hosted_server_id: None,
+                            provider_params: None,
+                            auth_binding: None,
+                        },
+                    )
+                    .await
+                    .expect("machine text-model change");
+                Some(runtime.propagate_config_to_live_channels().await)
+            }
+        };
+        let session_model_after = runtime
+            .service
+            .live_session_llm_identity(&session_id)
+            .await
+            .expect("session identity after the change")
+            .model;
+        let commands = log.lock().await.clone();
+        let status =
+            generated_live_public_status(&runtime, &session_id, host.as_ref(), &channel_id).await;
+        let synthetic = drain_pending_synthetic(&host, &channel_id).await;
+        let binding = runtime
+            .runtime_adapter()
+            .live_channel_binding(&session_id, &channel_id)
+            .await
+            .expect("binding read");
+        TextModelChangeOutcome {
+            initially_equal,
+            session_model_after,
+            commands,
+            status,
+            synthetic,
+            propagation,
+            binding,
+        }
+    }
+
+    /// A channel opened under an independently selected execution profile is
+    /// governed by that profile. With its bound identity initially equal to
+    /// the session's, a session text-model change to a non-realtime model
+    /// neither closes nor refreshes it; the generated binding still names its
+    /// realtime identity and the profile.
+    async fn assert_text_model_change_leaves_profile_selected_channel(route: TextModelChangeRoute) {
+        let outcome =
+            text_model_change_over_open_channel(Some("voice-client-context"), route).await;
+        assert!(
+            outcome.initially_equal,
+            "{route:?}: equal identities at open"
+        );
+        assert_eq!(outcome.session_model_after, "gpt-5.5", "{route:?}");
+        assert_ne!(
+            outcome.status,
+            meerkat_runtime::meerkat_machine::dsl::LiveChannelPublicStatus::Closed,
+            "{route:?}: a text-model change must not close a profile-selected channel"
+        );
+        assert!(
+            outcome.commands.is_empty(),
+            "{route:?}: the profile-selected channel is not refreshed: {:?}",
+            outcome.commands
+        );
+        assert!(
+            outcome.synthetic.is_none(),
+            "{route:?}: no terminal error is queued: {:?}",
+            outcome.synthetic
+        );
+        let binding = outcome.binding.expect("the channel stays bound");
+        assert_eq!(binding.identity().model, "gpt-realtime-2", "{route:?}");
+        assert_eq!(
+            binding.execution_profile_id(),
+            Some("voice-client-context"),
+            "{route:?}"
+        );
+        if let Some(report) = outcome.propagation {
+            assert!(report.closed.is_empty(), "{route:?}: {report:?}");
+            assert!(report.refreshed.is_empty(), "{route:?}: {report:?}");
+            assert_eq!(report.skipped.len(), 1, "{route:?}: {report:?}");
+            assert!(report.is_clean(), "{route:?}: {report:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn session_reconfigure_text_model_change_leaves_a_profile_selected_channel() {
+        assert_text_model_change_leaves_profile_selected_channel(
+            TextModelChangeRoute::SessionReconfigure,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn config_propagation_text_model_change_leaves_a_profile_selected_channel() {
+        assert_text_model_change_leaves_profile_selected_channel(
+            TextModelChangeRoute::ConfigPropagation,
+        )
+        .await;
+    }
+
+    /// The session-following control: the same text-model change closes a
+    /// channel that follows its session's identity, by identity swap through
+    /// the session reconfigure path and by the non-realtime precheck through
+    /// config propagation.
+    async fn assert_text_model_change_closes_session_following_channel(
+        route: TextModelChangeRoute,
+    ) {
+        let outcome = text_model_change_over_open_channel(None, route).await;
+        assert!(
+            outcome.initially_equal,
+            "{route:?}: equal identities at open"
+        );
+        assert_eq!(outcome.session_model_after, "gpt-5.5", "{route:?}");
+        assert_eq!(
+            outcome.status,
+            meerkat_runtime::meerkat_machine::dsl::LiveChannelPublicStatus::Closed,
+            "{route:?}: a session-following channel closes on a text-model change"
+        );
+        assert!(
+            outcome.commands.is_empty(),
+            "{route:?}: {:?}",
+            outcome.commands
+        );
+        assert!(
+            outcome.binding.is_none(),
+            "{route:?}: the binding is retired"
+        );
+        let reason = match outcome.synthetic {
+            Some(meerkat_core::live_adapter::LiveAdapterObservation::Error {
+                code: meerkat_core::live_adapter::LiveAdapterErrorCode::ConfigRejected { reason },
+                ..
+            }) => reason,
+            other => panic!("{route:?}: expected a ConfigRejected terminal error, got {other:?}"),
+        };
+        match route {
+            TextModelChangeRoute::SessionReconfigure => assert!(
+                matches!(
+                    &reason,
+                    meerkat_core::live_adapter::LiveConfigRejectionReason::ChannelIdentitySwap {
+                        from_model,
+                        to_model,
+                        ..
+                    } if from_model == "gpt-realtime-2" && to_model == "gpt-5.5"
+                ),
+                "{route:?}: {reason:?}"
+            ),
+            TextModelChangeRoute::ConfigPropagation => assert!(
+                matches!(
+                    &reason,
+                    meerkat_core::live_adapter::LiveConfigRejectionReason::NonRealtimeResolution { .. }
+                ),
+                "{route:?}: {reason:?}"
+            ),
+        }
+        if let Some(report) = outcome.propagation {
+            assert_eq!(report.closed.len(), 1, "{route:?}: {report:?}");
+            assert!(report.skipped.is_empty(), "{route:?}: {report:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn session_reconfigure_text_model_change_closes_a_session_following_channel() {
+        assert_text_model_change_closes_session_following_channel(
+            TextModelChangeRoute::SessionReconfigure,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn config_propagation_text_model_change_closes_a_session_following_channel() {
+        assert_text_model_change_closes_session_following_channel(
+            TextModelChangeRoute::ConfigPropagation,
+        )
+        .await;
+    }
+
     /// Experimental close authority that owns no binding: every channel it is
     /// asked about is an ordinary channel.
     #[cfg(feature = "openai-live")]
@@ -31159,7 +35959,7 @@ mod tests {
         }
     }
 
-    /// An embedder that installs the experimental open authority (MobKit
+    /// An embedder that installs the experimental open authority (Meta
     /// does) routes every `live/close` through the experimental close first.
     /// For an ordinary channel that close holds no generated close custody,
     /// so it must not release the channel's projections from the member's
@@ -31355,18 +36155,21 @@ mod tests {
             let store = Arc::new(FailingLifecycleRuntimeStore::new());
             let client = Arc::new(RecordingMessagesLlmClient::default());
             let config = Config::default();
-            let runtime = Arc::new(SessionRuntime::new(
-                temp_factory(&temp),
-                config.clone(),
-                1,
-                meerkat::PersistenceBundle::new(
-                    Arc::new(meerkat::MemoryStore::new()),
-                    store.clone(),
-                    Arc::new(meerkat_store::MemoryBlobStore::new()),
+            let runtime = Arc::new(
+                SessionRuntime::new(
+                    temp_factory(&temp),
+                    config.clone(),
+                    1,
+                    meerkat::PersistenceBundle::new(
+                        Arc::new(meerkat::MemoryStore::new()),
+                        store.clone(),
+                        Arc::new(meerkat_store::MemoryBlobStore::new()),
+                    )
+                    .expect("construct runtime authority"),
+                    crate::router::NotificationSink::noop(),
                 )
-                .expect("construct runtime authority"),
-                crate::router::NotificationSink::noop(),
-            ));
+                .expect("compose the RPC session runtime"),
+            );
             runtime.set_default_llm_client(Some(client.clone()));
             let config_store: Arc<dyn meerkat_core::ConfigStore> = Arc::new(
                 meerkat_core::MemoryConfigStore::new(config, meerkat_models::canonical()),
@@ -31604,5 +36407,28 @@ mod tests {
         let public_error = serde_json::to_string(&combined).expect("serialize public RPC error");
         assert!(!public_error.contains(PRIVATE_DETAIL));
         assert!(!public_error.contains(PRIVATE_CONTEXT));
+    }
+}
+
+#[cfg(feature = "mcp")]
+fn mcp_live_add_rpc_error(error: meerkat::surface::McpLiveAddError) -> RpcError {
+    use meerkat::surface::McpLiveAddError;
+    let code = match &error {
+        // The same typed refusal the router gives any non-initialize legacy
+        // request on a governed runtime: no authenticated control, no entry.
+        McpLiveAddError::GovernedRequiresControl => {
+            return runtime_driver_error_to_rpc(
+                meerkat_runtime::RuntimeDriverError::ControllerReadinessUnavailable {
+                    reason: meerkat_runtime::traits::ControllerReadinessFailure::UnsupportedScope,
+                },
+            );
+        }
+        McpLiveAddError::Refused(_) => error::INVALID_REQUEST,
+        McpLiveAddError::Persist(_) | McpLiveAddError::Stage(_) => error::INTERNAL_ERROR,
+    };
+    RpcError {
+        code,
+        message: error.to_string(),
+        data: None,
     }
 }

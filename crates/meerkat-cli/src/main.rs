@@ -1358,6 +1358,17 @@ struct Cli {
         help_heading = "Realm options"
     )]
     isolated: bool,
+    /// In a governed realm, act as this agent (its executor and the grants
+    /// the operator selected for it). Default: rkat-agent.
+    #[cfg(feature = "local-authorization")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "AGENT",
+        hide_short_help = true,
+        help_heading = "Realm options"
+    )]
+    as_agent: Option<String>,
     /// Optional instance ID inside a realm.
     #[arg(
         long,
@@ -2447,6 +2458,224 @@ enum AuthCommands {
         /// Auth profile id.
         profile_id: String,
     },
+
+    /// Manage the realm's connector OAuth clients (used for connector login
+    /// and refresh). Writes go to the realm's own config; client secrets go
+    /// to the credential store, never to the config.
+    ConnectorClient {
+        #[command(subcommand)]
+        command: ConnectorClientCommands,
+    },
+}
+
+/// `rkat auth connector-client ...`: the connector OAuth clients a realm's
+/// hosts use for connector login and refresh.
+#[derive(Subcommand)]
+enum ConnectorClientCommands {
+    /// Create or replace a connector client in the realm's own config. A
+    /// client secret is read from stdin (piped, or typed without echo), never
+    /// from the command line.
+    Set {
+        /// Profile id a connector login names.
+        id: String,
+        /// OAuth issuer the client belongs to.
+        #[arg(long)]
+        issuer: String,
+        /// OAuth client id.
+        #[arg(long)]
+        client: String,
+        /// Send a client secret (`client_secret_post`). Without
+        /// `--secret-stdin` the stored secret is kept and must exist.
+        #[arg(long)]
+        client_secret: bool,
+        /// Read a new client secret from stdin.
+        #[arg(long, requires = "client_secret")]
+        secret_stdin: bool,
+        /// Extra authorize parameter `name=value`, repeatable, in order.
+        #[arg(long = "authorize-param", value_name = "NAME=VALUE")]
+        authorize_params: Vec<String>,
+        /// Do not send the RFC 8707 `resource` parameter.
+        #[arg(long)]
+        no_resource_indicator: bool,
+        /// Provider protocol id.
+        #[arg(long)]
+        protocol: Option<String>,
+        /// Registered `https` redirect URI, repeatable.
+        #[arg(long = "redirect-uri")]
+        registered_redirect_uris: Vec<String>,
+    },
+    /// Replace a client's stored secret, read from stdin. The next code
+    /// exchange or refresh uses it; existing sign-ins stay valid.
+    RotateSecret {
+        /// Profile id.
+        id: String,
+    },
+    /// List the realm's effective connector clients (secrets are never shown).
+    List,
+    /// Remove a connector client from the realm's own config and its secret.
+    Remove {
+        /// Profile id.
+        id: String,
+    },
+}
+
+/// Read a connector client secret from stdin: one line, trailing newline
+/// removed. On a terminal, input is not echoed.
+fn read_connector_client_secret() -> anyhow::Result<String> {
+    use std::io::IsTerminal;
+    let stdin = std::io::stdin();
+    let terminal = stdin.is_terminal();
+    #[cfg(unix)]
+    let echo_off = terminal
+        && std::process::Command::new("stty")
+            .arg("-echo")
+            .stdin(std::process::Stdio::inherit())
+            .status()
+            .is_ok_and(|status| status.success());
+    #[cfg(not(unix))]
+    let echo_off = false;
+    if terminal && !echo_off {
+        anyhow::bail!("cannot hide terminal input here; pipe the client secret on stdin");
+    }
+    if terminal {
+        eprint!("Client secret: ");
+    }
+    let mut line = String::new();
+    let read = stdin.read_line(&mut line);
+    #[cfg(unix)]
+    if echo_off {
+        let _ = std::process::Command::new("stty")
+            .arg("echo")
+            .stdin(std::process::Stdio::inherit())
+            .status();
+        eprintln!();
+    }
+    read.map_err(|error| anyhow::anyhow!("failed to read the client secret: {error}"))?;
+    let secret = line.trim_end_matches(['\r', '\n']).to_owned();
+    if secret.is_empty() {
+        anyhow::bail!("the client secret is empty");
+    }
+    Ok(secret)
+}
+
+/// The realm's own (unfolded) config document store: connector client writes
+/// never flatten inherited entries into it.
+async fn cli_realm_doc_store(
+    scope: &RuntimeScope,
+    realm: &meerkat_core::connection::RealmId,
+) -> anyhow::Result<Arc<dyn ConfigStore>> {
+    let source = cli_filesystem_realm_config_source(scope);
+    let config_path = source.config_doc_path(realm);
+    if let Some(parent) = config_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create realm config directory: {e}"))?;
+    }
+    Ok(Arc::new(CliConfigDocStore::new(config_path, realm.clone())))
+}
+
+async fn handle_connector_client_command(
+    command: ConnectorClientCommands,
+    scope: &RuntimeScope,
+    realm: &str,
+) -> anyhow::Result<()> {
+    let realm = meerkat_core::connection::RealmId::parse(realm)
+        .map_err(|error| anyhow::anyhow!("invalid realm '{realm}': {error}"))?;
+    let persistence = meerkat_providers::auth_store::TokenStoreBackend::default_auto()
+        .map_err(|e| anyhow::anyhow!("Cannot open TokenStore: {e}"))?
+        .open_with_refresh_authority()
+        .map_err(|e| anyhow::anyhow!("Cannot open TokenStore: {e}"))?;
+    let token_store = persistence.token_store();
+    match command {
+        ConnectorClientCommands::Set {
+            id,
+            issuer,
+            client,
+            client_secret,
+            secret_stdin,
+            authorize_params,
+            no_resource_indicator,
+            protocol,
+            registered_redirect_uris,
+        } => {
+            let authorize_params = authorize_params
+                .iter()
+                .map(|pair| {
+                    pair.split_once('=')
+                        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--authorize-param must be NAME=VALUE: {pair}")
+                        })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let config = meerkat_core::ConnectorClientConfig {
+                issuer,
+                client,
+                client_auth: if client_secret {
+                    meerkat_core::ConnectorClientAuthMethod::ClientSecretPost
+                } else {
+                    meerkat_core::ConnectorClientAuthMethod::None
+                },
+                authorize_params,
+                resource_indicator: !no_resource_indicator,
+                protocol,
+                registered_redirect_uris,
+            };
+            let secret = if secret_stdin {
+                meerkat::ConnectorClientSecretUpdate::Set(read_connector_client_secret()?)
+            } else {
+                meerkat::ConnectorClientSecretUpdate::Keep
+            };
+            let store = cli_realm_doc_store(scope, &realm).await?;
+            meerkat::put_connector_client(store, &persistence, &realm, &id, config, secret).await?;
+            println!("Connector client '{id}' configured in realm '{realm}'.");
+        }
+        ConnectorClientCommands::RotateSecret { id } => {
+            let secret = read_connector_client_secret()?;
+            let store = cli_realm_doc_store(scope, &realm).await?;
+            meerkat::rotate_connector_client_secret(store, &persistence, &realm, &id, &secret)
+                .await?;
+            println!("Connector client '{id}' secret replaced in realm '{realm}'.");
+        }
+        ConnectorClientCommands::List => {
+            let config = meerkat_core::EffectiveConfigReader::new(cli_realm_config_source(scope))
+                .effective_config(&realm)
+                .await?;
+            let profiles = meerkat::connector_client_auth_profiles(&config, &realm)?;
+            if profiles.is_empty() {
+                println!("No connector clients configured for realm '{realm}'.");
+            }
+            for profile in profiles {
+                let secret = match &profile.client_secret {
+                    None => "none".to_owned(),
+                    Some(meerkat::ConnectorClientSecret::Inline(_)) => "inline".to_owned(),
+                    Some(meerkat::ConnectorClientSecret::RealmStore { realm: owner }) => {
+                        let stored = meerkat::load_connector_client_secret(
+                            token_store.as_ref(),
+                            owner,
+                            &profile.binding(),
+                        )
+                        .await?
+                        .is_some();
+                        format!(
+                            "{} (realm '{owner}')",
+                            if stored { "stored" } else { "MISSING" }
+                        )
+                    }
+                };
+                println!(
+                    "{}\tissuer={}\tclient={}\tsecret={secret}",
+                    profile.id, profile.issuer, profile.client
+                );
+            }
+        }
+        ConnectorClientCommands::Remove { id } => {
+            let store = cli_realm_doc_store(scope, &realm).await?;
+            meerkat::remove_connector_client(store, &persistence, &realm, &id).await?;
+            println!("Connector client '{id}' removed from realm '{realm}'.");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -2563,7 +2792,7 @@ enum SessionCommands {
         accept_shorter: bool,
         /// Open this WholeBlob runtime database directly instead of resolving
         /// `<state-root>/<realm>/runtime.sqlite3` from the CLI scope. Hosts
-        /// that open one runtime SQLite file themselves (MobKit's default
+        /// that open one runtime SQLite file themselves (Meta's default
         /// persistent layout, `<state_dir>/runtime.sqlite`) name it here; the
         /// session id must then be a full session UUID.
         #[arg(long, value_name = "FILE")]
@@ -2628,6 +2857,79 @@ enum RealmCommands {
         /// Backend to pin when creating a new realm.
         #[arg(long, value_enum)]
         backend: Option<RealmBackendArg>,
+    },
+    /// Govern an existing realm: select governed posture durably and
+    /// provision its grant owner with the local user as operator. Every later
+    /// rkat process opens the realm governed; it is never selected by a flag.
+    #[cfg(feature = "local-authorization")]
+    Govern {
+        /// Realm ID
+        realm_id: String,
+    },
+    /// Issue one grant of a governed realm to a named agent, as the local
+    /// operator, and select it for one target: an installed MCP server
+    /// (`--mcp`), the tool catalog (`--catalog`) or the agent's controller
+    /// (`--controller`). Each target has its own grant and lifetime; a new
+    /// grant supersedes only its target's previous one, which is recorded
+    /// for cleanup and retired once no unfinished work references it.
+    /// Realms opened afterwards use the new selection.
+    #[cfg(feature = "local-authorization")]
+    Grant {
+        /// Realm ID
+        realm_id: String,
+        /// The agent to grant.
+        #[arg(long, default_value = "rkat-agent")]
+        agent: String,
+        /// Issue the agent's controller grant, for the routes named by
+        /// `--route`.
+        #[arg(
+            long,
+            conflicts_with_all = ["catalog", "mcp", "expires_in_secs"],
+            requires = "route"
+        )]
+        controller: bool,
+        /// With `--controller`: the key of one controller route the grant
+        /// admits (`model-route/v1/<sha256 hex>`, the key of the route's
+        /// actual lowering). Repeatable.
+        #[arg(long = "route", value_name = "ROUTE_KEY", requires = "controller")]
+        route: Vec<String>,
+        /// Issue the agent's grant to read the session's tool catalog.
+        #[arg(long, conflicts_with = "mcp")]
+        catalog: bool,
+        /// Issue the agent's grant for one installed MCP server and its raw
+        /// operations, as `<server>=<op>[,<op>...]` or `<server>=*` for all
+        /// of them.
+        #[arg(long = "mcp", value_name = "SERVER=OPS")]
+        mcp: Option<String>,
+        /// The grant expires this many seconds from now. A controller grant
+        /// has no expiry.
+        #[arg(long)]
+        expires_in_secs: Option<u64>,
+    },
+    /// Revoke an agent's grant selected for one target now, as the local
+    /// operator, and unselect it once revoked: `--mcp <server>`,
+    /// `--catalog`, `--controller`, or `--worker` (an older selection's single
+    /// worker grant). Exits successfully only when it is revoked; otherwise
+    /// it reports what the attempt did.
+    #[cfg(feature = "local-authorization")]
+    RevokeGrant {
+        /// Realm ID
+        realm_id: String,
+        /// The agent whose grant is revoked.
+        #[arg(long, default_value = "rkat-agent")]
+        agent: String,
+        /// Revoke the controller grant.
+        #[arg(long, conflicts_with_all = ["catalog", "mcp", "worker"])]
+        controller: bool,
+        /// Revoke the tool catalog grant.
+        #[arg(long, conflicts_with_all = ["mcp", "worker"])]
+        catalog: bool,
+        /// Revoke the grant selected for this MCP server.
+        #[arg(long = "mcp", value_name = "SERVER", conflicts_with = "worker")]
+        mcp: Option<String>,
+        /// Revoke an older selection's single worker grant.
+        #[arg(long)]
+        worker: bool,
     },
     /// Delete a realm and all its state.
     Delete {
@@ -2996,6 +3298,11 @@ enum McpCommands {
         /// Write only if the realm config is at this generation (--scope realm)
         #[arg(long = "expected-generation")]
         expected_generation: Option<u64>,
+
+        /// Allow only this raw MCP operation on the server. Can be repeated;
+        /// every other operation is refused and not offered.
+        #[arg(long = "allow-operation", value_name = "OPERATION")]
+        allowed_operations: Vec<String>,
 
         /// Command and arguments after -- (for stdio transport)
         #[arg(last = true, num_args = 0..)]
@@ -4759,6 +5066,9 @@ struct RuntimeScope {
     origin_hint: RealmOrigin,
     context_root: Option<PathBuf>,
     user_config_root: Option<PathBuf>,
+    /// The governed-realm agent this process acts as (`--as-agent`).
+    #[cfg(feature = "local-authorization")]
+    stock_agent: Option<String>,
     auth_lease: meerkat_core::handles::GeneratedAuthLeaseHandle,
     #[cfg(any(
         all(feature = "anthropic", feature = "openai", feature = "gemini"),
@@ -4877,6 +5187,8 @@ fn resolve_runtime_scope_with_realm(
         origin_hint,
         context_root: Some(context_root),
         user_config_root,
+        #[cfg(feature = "local-authorization")]
+        stock_agent: cli.as_agent.clone(),
         auth_lease,
         #[cfg(any(
             all(feature = "anthropic", feature = "openai", feature = "gemini"),
@@ -5605,6 +5917,9 @@ async fn handle_auth_command(
             if let Some(expires_at) = projection.expires_at {
                 println!("expires_at:  {}", expires_at.to_rfc3339());
             }
+            if let Some(observation) = projection.credential_observation {
+                println!("credential:  not read by status ({observation:?})");
+            }
             if projection.phase.is_no_live_lease() {
                 println!("note:        no live AuthMachine lease for '{realm}:{binding_id}'.");
             }
@@ -5658,7 +5973,13 @@ async fn handle_auth_command(
                     .ok_or_else(|| anyhow::anyhow!("Binding '{realm}:{binding_id}' not found"))?
                     .credential_identity(&auth_binding);
                 let key = TokenKey::from_credential_identity(&credential_identity);
-                let should_clear = match store.load(&key).await {
+                let should_clear = match store
+                    .load_for(
+                        &key,
+                        meerkat_providers::auth_store::TokenStoreAccess::Interactive,
+                    )
+                    .await
+                {
                     Ok(present) => present.is_some(),
                     Err(e) if token_store_load_error_allows_clear(&e) => true,
                     Err(e) => return Err(anyhow::anyhow!("TokenStore load failed: {e}")),
@@ -5770,6 +6091,10 @@ async fn handle_auth_command(
                 );
             }
         }
+        AuthCommands::ConnectorClient { command } => {
+            let realm = auth_config_realm_or_default(config_realm_override);
+            handle_connector_client_command(command, scope, &realm).await?;
+        }
         AuthCommands::Refresh { profile_id } => {
             let realm = auth_config_realm_or_default(config_realm_override);
             #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
@@ -5861,7 +6186,10 @@ async fn refresh_auth_profile(
     let key = TokenKey::parse(realm, &binding_id)
         .map_err(|e| anyhow::anyhow!("invalid token-key realm/binding: {e}"))?;
     let before = store
-        .load(&key)
+        .load_for(
+            &key,
+            meerkat_providers::auth_store::TokenStoreAccess::Interactive,
+        )
         .await
         .map_err(|e| anyhow::anyhow!("TokenStore load failed: {e}"))?;
     if before.is_none() {
@@ -5949,9 +6277,13 @@ async fn refresh_auth_profile(
                     )
                     .map_err(|error| CredentialMutationError::AuthLifecycle(error.to_string()))?;
                     mutation_store
-                        .save(&mutation_key, &committed)
+                        .save_for(
+                            &mutation_key,
+                            &committed,
+                            meerkat_providers::auth_store::TokenStoreAccess::Interactive,
+                        )
                         .await
-                        .map_err(|error| CredentialMutationError::TokenStore(error.to_string()))?;
+                        .map_err(CredentialMutationError::from_token_store)?;
                     Ok(CredentialMutationOutcome::Persisted(committed))
                 })
             }),
@@ -6861,7 +7193,7 @@ async fn migrate_one_legacy_login_credential(
                     // Reload both while their locks are held so a concurrent
                     // source refresh cannot leave the target with stale A.
                     let Some(source_tokens) = source_store
-                        .load(&dev_key)
+                        .load_for(&dev_key, meerkat_providers::auth_store::TokenStoreAccess::Unattended)
                         .await
                         .map_err(|error| {
                             CredentialMutationError::TokenStore(error.to_string())
@@ -6880,7 +7212,7 @@ async fn migrate_one_legacy_login_credential(
                             Box::new(move || {
                                 Box::pin(async move {
                                     if let Some(existing) = target_store
-                                        .load(&target_key)
+                                        .load_for(&target_key, meerkat_providers::auth_store::TokenStoreAccess::Unattended)
                                         .await
                                         .map_err(|error| {
                                             CredentialMutationError::TokenStore(error.to_string())
@@ -6924,7 +7256,7 @@ async fn migrate_one_legacy_login_credential(
                                         }
                                     };
                                     if let Err(error) = target_store
-                                        .save(&target_key, &committed)
+                                        .save_for(&target_key, &committed, meerkat_providers::auth_store::TokenStoreAccess::Unattended)
                                         .await
                                     {
                                         let _ = target_auth_lease
@@ -6992,7 +7324,13 @@ async fn ensure_migrated_global_oauth_sections_provisioned(
         // Only anchor a section to a credential that actually exists under
         // `global` (migrated or freshly signed in). No token => nothing to
         // resolve, so don't synthesize a dangling section.
-        match token_store.load(&key).await {
+        match token_store
+            .load_for(
+                &key,
+                meerkat_providers::auth_store::TokenStoreAccess::Unattended,
+            )
+            .await
+        {
             Ok(Some(_)) => match ensure_cli_interactive_oauth_config(provider, &mut config) {
                 Ok(provider_changed) => changed |= provider_changed,
                 Err(error) => {
@@ -7212,7 +7550,14 @@ async fn save_marked_cli_token_commit_unlocked(
             ),
         },
     };
-    if let Err(e) = store.save(&commit.key, &committed_tokens).await {
+    if let Err(e) = store
+        .save_for(
+            &commit.key,
+            &committed_tokens,
+            meerkat_providers::auth_store::TokenStoreAccess::Interactive,
+        )
+        .await
+    {
         match rollback_cli_token_commit(store, auth_lease, commit).await {
             Ok(()) => anyhow::bail!(
                 "TokenStore save failed{failure_context}: {e}; acquired lease rolled back"
@@ -7326,7 +7671,11 @@ async fn rollback_cli_token_commit(
                     .release_credential_lifecycle(&commit.lease_key)
                     .map_err(|e| format!("AuthMachine lifecycle rollback release failed: {e}"))?;
                 store
-                    .save(&commit.key, previous)
+                    .save_for(
+                        &commit.key,
+                        previous,
+                        meerkat_providers::auth_store::TokenStoreAccess::Interactive,
+                    )
                     .await
                     .map_err(|e| format!("TokenStore rollback save failed: {e}"))?;
                 let restored_transition = meerkat_core::restore_token_lifecycle_snapshot(
@@ -7343,7 +7692,11 @@ async fn rollback_cli_token_commit(
                         )
                         .map_err(|e| format!("AuthMachine rollback marker handoff failed: {e}"))?;
                     store
-                        .save(&commit.key, &restored_previous)
+                        .save_for(
+                            &commit.key,
+                            &restored_previous,
+                            meerkat_providers::auth_store::TokenStoreAccess::Interactive,
+                        )
                         .await
                         .map_err(|e| format!("TokenStore rollback marker save failed: {e}"))?;
                 }
@@ -7353,7 +7706,11 @@ async fn rollback_cli_token_commit(
                     .release_credential_lifecycle(&commit.lease_key)
                     .map_err(|e| format!("AuthMachine lifecycle rollback release failed: {e}"))?;
                 store
-                    .save(&commit.key, previous)
+                    .save_for(
+                        &commit.key,
+                        previous,
+                        meerkat_providers::auth_store::TokenStoreAccess::Interactive,
+                    )
                     .await
                     .map_err(|e| format!("TokenStore rollback save failed: {e}"))?;
             }
@@ -7363,7 +7720,10 @@ async fn rollback_cli_token_commit(
                 .release_credential_lifecycle(&commit.lease_key)
                 .map_err(|e| format!("AuthMachine lifecycle rollback release failed: {e}"))?;
             store
-                .clear(&commit.key)
+                .clear_for(
+                    &commit.key,
+                    meerkat_providers::auth_store::TokenStoreAccess::Interactive,
+                )
                 .await
                 .map_err(|e| format!("TokenStore rollback clear failed: {e}"))?;
         }
@@ -7443,9 +7803,12 @@ async fn save_cli_oauth_tokens_and_consume_browser_flow(
                     .await
                     .map_err(|error| CredentialMutationError::Operation(error.to_string()))?;
                     let committed = store
-                        .load(&load_key)
+                        .load_for(
+                            &load_key,
+                            meerkat_providers::auth_store::TokenStoreAccess::Interactive,
+                        )
                         .await
-                        .map_err(|error| CredentialMutationError::TokenStore(error.to_string()))?
+                        .map_err(CredentialMutationError::from_token_store)?
                         .ok_or_else(|| {
                             CredentialMutationError::TokenStore(
                                 "successful browser login left no persisted credential".to_string(),
@@ -7640,7 +8003,11 @@ async fn interactive_login(
         tracing::warn!(error = %e, "legacy dev->global credential migration skipped");
     }
     let auth_service =
-        meerkat::HostAuthService::new(persistence, scope.provider_auth_authority.clone());
+        meerkat::HostAuthService::new(persistence, scope.provider_auth_authority.clone())
+            .with_realm_connector_clients(
+                cli_realm_config_source(scope),
+                scope.locator.realm.clone(),
+            );
     if provider == LoginProvider::Copilot {
         return interactive_copilot_device_login(target, &config, &host_target, auth_service).await;
     }
@@ -7931,7 +8298,13 @@ async fn interactive_logout(binding_key: &str, scope: &RuntimeScope) -> anyhow::
     };
     let mut cleared = 0;
     for key in keys {
-        let should_clear = match store.load(&key).await {
+        let should_clear = match store
+            .load_for(
+                &key,
+                meerkat_providers::auth_store::TokenStoreAccess::Interactive,
+            )
+            .await
+        {
             Ok(present) => present.is_some(),
             Err(e) if token_store_load_error_allows_clear(&e) => true,
             Err(e) => return Err(anyhow::anyhow!("TokenStore load failed: {e}")),
@@ -7940,7 +8313,9 @@ async fn interactive_logout(binding_key: &str, scope: &RuntimeScope) -> anyhow::
             meerkat_core::clear_tokens_and_publish_lifecycle_released_coordinated_for_identity(
                 persistence.clone(),
                 scope.auth_lease.clone(),
-                key.credential_identity().clone(),
+                key.credential_identity()
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("{key} is not a credential key"))?,
             )
             .await
             .map_err(|e| anyhow::anyhow!("Token lifecycle clear failed: {e}"))?;
@@ -7971,6 +8346,7 @@ fn source_kind_label(source: &meerkat_core::CredentialSourceSpec) -> &'static st
 struct CliAuthStatusProjection {
     phase: AuthStatusPhase,
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    credential_observation: Option<meerkat_core::CredentialObservation>,
 }
 
 async fn project_cli_auth_status(
@@ -7997,44 +8373,44 @@ async fn project_cli_auth_status(
         .map(meerkat_providers::auth_store::persisted_auth_mode_is_oauth_login)
         .unwrap_or(false);
     let mut stored = None;
+    let mut credential_observation = None;
     if source_uses_store && let Some(store) = token_store {
+        // Status never waits behind credential work and never starts an
+        // operating-system credential read. A store fault is a real error,
+        // not absent credentials, and an unanswered read is reported as such.
         let phase = AuthStatusPhase::from_lease_snapshot(now, &snapshot);
-        if phase.is_no_live_lease() {
-            if let Some(expected_mode) = expected_mode {
-                // A rehydration fault is a real error, not absent
-                // credentials. Propagate it rather than collapsing to None,
-                // which would report a store fault as "no credentials".
-                match meerkat_core::rehydrate_marked_tokens_for_status_for_identity(
-                    store,
-                    auth_lease,
-                    credential_identity,
-                    expected_mode,
-                    now,
-                )
-                .await
-                {
-                    Ok(Some(rehydrated)) => {
-                        stored = Some(rehydrated);
-                        snapshot = auth_lease.snapshot(&lease_key);
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        return Err(anyhow::anyhow!("TokenStore rehydration failed: {err}"));
-                    }
+        let read = if phase.is_no_live_lease() {
+            match expected_mode {
+                Some(expected_mode) => {
+                    let read = meerkat_core::observe_marked_tokens_for_status_for_identity(
+                        store,
+                        auth_lease,
+                        credential_identity,
+                        expected_mode,
+                        now,
+                    )
+                    .await
+                    .map_err(|err| anyhow::anyhow!("TokenStore rehydration failed: {err}"))?;
+                    snapshot = auth_lease.snapshot(&lease_key);
+                    Some(read)
                 }
+                None => None,
             }
         } else {
-            // A store-load fault is a real error, not absent credentials.
-            // Propagate the typed TokenStoreError rather than collapsing it
-            // to None, which would report a store fault as "no credentials".
-            stored = store
-                .load(
-                    &meerkat_providers::auth_store::TokenKey::from_credential_identity(
-                        credential_identity,
-                    ),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("TokenStore load failed: {e}"))?;
+            Some(meerkat_core::CredentialStatusRead::from_observation(
+                store
+                    .observe_status(
+                        &meerkat_providers::auth_store::TokenKey::from_credential_identity(
+                            credential_identity,
+                        ),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("TokenStore load failed: {e}"))?,
+            ))
+        };
+        if let Some(read) = read {
+            credential_observation = read.observation();
+            stored = read.into_tokens();
         }
     }
     if stored
@@ -8066,6 +8442,7 @@ async fn project_cli_auth_status(
     Ok(CliAuthStatusProjection {
         phase: projection.phase,
         expires_at: projection.expires_at,
+        credential_observation,
     })
 }
 
@@ -8759,6 +9136,14 @@ async fn handle_realm_command(command: RealmCommands, scope: &RuntimeScope) -> a
             println!("backend: {}", manifest.backend.as_str());
             println!("origin: {}", manifest.origin.as_str());
             println!("created_at: {}", manifest.created_at);
+            println!(
+                "governance: {}",
+                if manifest.governance.is_some() {
+                    "governed"
+                } else {
+                    "ungoverned"
+                }
+            );
             println!("state_root: {}", scope.locator.state_root.display());
             println!("active_leases: {}", leases.active.len());
             for lease in leases.active {
@@ -8768,6 +9153,55 @@ async fn handle_realm_command(command: RealmCommands, scope: &RuntimeScope) -> a
                 );
             }
             Ok(())
+        }
+        #[cfg(feature = "local-authorization")]
+        RealmCommands::Govern { realm_id } => {
+            validate_realm_id(&realm_id)?;
+            govern_realm(scope, &realm_id).await
+        }
+        #[cfg(feature = "local-authorization")]
+        RealmCommands::Grant {
+            realm_id,
+            agent,
+            controller,
+            route,
+            catalog,
+            mcp,
+            expires_in_secs,
+        } => {
+            validate_realm_id(&realm_id)?;
+            grant_realm_agent(
+                scope,
+                &realm_id,
+                agent,
+                controller.then_some(route.as_slice()),
+                catalog,
+                mcp.as_deref(),
+                expires_in_secs,
+            )
+            .await
+        }
+        #[cfg(feature = "local-authorization")]
+        RealmCommands::RevokeGrant {
+            realm_id,
+            agent,
+            controller,
+            catalog,
+            mcp,
+            worker,
+        } => {
+            validate_realm_id(&realm_id)?;
+            use meerkat::governed_realm::stock::issuance::StockGrantSlot;
+            let slot = match (controller, catalog, mcp, worker) {
+                (true, false, None, false) => StockGrantSlot::Controller,
+                (false, true, None, false) => StockGrantSlot::Catalog,
+                (false, false, Some(server), false) => StockGrantSlot::Mcp(server),
+                (false, false, None, true) => StockGrantSlot::LegacyWorker,
+                _ => anyhow::bail!(
+                    "name exactly one target: --mcp <server>, --catalog, --controller or --worker"
+                ),
+            };
+            revoke_realm_agent(scope, &realm_id, &agent, &slot).await
         }
         RealmCommands::Create { realm_id, backend } => {
             validate_realm_id(&realm_id)?;
@@ -9528,33 +9962,72 @@ async fn prune_realms_inner(
 }
 
 /// Create the realm-scoped session store backend.
+///
+/// The realm's governance posture is read first, from its manifest: a realm
+/// the operator governed (`rkat realm govern`) opens with the stock governed
+/// composition, never as an ordinary realm. An unreadable posture is an
+/// error, never ungoverned.
 #[cfg(feature = "session-store")]
 async fn create_persistence_bundle(
     scope: &RuntimeScope,
 ) -> anyhow::Result<(meerkat_store::RealmManifest, PersistenceBundle)> {
-    // The bootstrap layout is the path authority: its realm-root candidates
-    // arm the cross-candidate first-start reservation. A locator re-resolved
-    // after bootstrap (mob-host `[mob_host].realm` override) can leave the
-    // layout's chosen root; that path opens explicit-root (which builds its
-    // own single-candidate layout) instead of riding a stale one.
-    let opened = if scope.layout.state_root() == scope.locator.state_root.as_path() {
-        meerkat::storage_provider::open_realm_persistence_with_layout(
-            scope.layout.clone(),
-            scope.locator.realm.as_str(),
-            scope.backend_hint(),
-            Some(scope.origin_hint),
+    // With governed support the posture-aware opener decides; without it,
+    // the ordinary openers below refuse a governed realm.
+    #[cfg(feature = "local-authorization")]
+    {
+        let layout = (scope.layout.state_root() == scope.locator.state_root.as_path())
+            .then(|| scope.layout.clone());
+        let agent = scope
+            .stock_agent
+            .as_deref()
+            .unwrap_or(meerkat::governed_realm::stock::issuance::DEFAULT_STOCK_AGENT);
+        meerkat::governed_realm::stock::issuance::stock_agent_principal(
+            &scope.locator.realm,
+            agent,
         )
-        .await
-    } else {
-        meerkat::open_realm_persistence_in(
+        .map_err(|error| anyhow::anyhow!("invalid --as-agent '{agent}': {error}"))?;
+        let (pin, persistence) = meerkat::governed_realm::open_stock_realm_persistence_as(
+            &meerkat::DiskStorageProvider,
             &scope.locator.state_root,
             scope.locator.realm.as_str(),
             scope.backend_hint(),
             Some(scope.origin_hint),
+            layout,
+            agent,
         )
         .await
-    };
-    opened.map_err(|e| anyhow::anyhow!("Failed to open realm persistence backend: {e}"))
+        .map_err(|e| anyhow::anyhow!("Failed to open realm persistence backend: {e}"))?;
+        let manifest = pin.as_builtin().cloned().ok_or_else(|| {
+            anyhow::anyhow!("realm '{}' is not a builtin realm", scope.locator.realm)
+        })?;
+        Ok((manifest, persistence))
+    }
+    #[cfg(not(feature = "local-authorization"))]
+    {
+        // The bootstrap layout is the path authority: its realm-root candidates
+        // arm the cross-candidate first-start reservation. A locator re-resolved
+        // after bootstrap (mob-host `[mob_host].realm` override) can leave the
+        // layout's chosen root; that path opens explicit-root (which builds its
+        // own single-candidate layout) instead of riding a stale one.
+        let opened = if scope.layout.state_root() == scope.locator.state_root.as_path() {
+            meerkat::storage_provider::open_realm_persistence_with_layout(
+                scope.layout.clone(),
+                scope.locator.realm.as_str(),
+                scope.backend_hint(),
+                Some(scope.origin_hint),
+            )
+            .await
+        } else {
+            meerkat::open_realm_persistence_in(
+                &scope.locator.state_root,
+                scope.locator.realm.as_str(),
+                scope.backend_hint(),
+                Some(scope.origin_hint),
+            )
+            .await
+        };
+        opened.map_err(|e| anyhow::anyhow!("Failed to open realm persistence backend: {e}"))
+    }
 }
 
 #[cfg(not(feature = "session-store"))]
@@ -9562,6 +10035,347 @@ async fn create_persistence_bundle(
     _scope: &RuntimeScope,
 ) -> anyhow::Result<(meerkat_store::RealmManifest, PersistenceBundle)> {
     anyhow::bail!("rkat built without session-store support")
+}
+
+/// The scope realm's durable governance posture.
+#[cfg(feature = "local-authorization")]
+async fn realm_posture(scope: &RuntimeScope) -> anyhow::Result<meerkat_store::RealmPosture> {
+    meerkat_store::read_realm_posture_in(&scope.locator.state_root, scope.locator.realm.as_str())
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to read the governance posture of realm '{}': {error}",
+                scope.locator.realm
+            )
+        })
+}
+
+/// Govern the scope realm as its local operator: select the posture durably
+/// and provision its owners. Idempotent; it never re-issues grants.
+#[cfg(feature = "local-authorization")]
+async fn govern_realm(scope: &RuntimeScope, realm_id: &str) -> anyhow::Result<()> {
+    use meerkat::governed_realm::stock;
+    let realm = meerkat_core::connection::RealmId::parse(realm_id)
+        .map_err(|error| anyhow::anyhow!("invalid realm id '{realm_id}': {error}"))?;
+    let principals = stock::StockPrincipals::for_local_operator(&realm)?;
+    stock::govern_stock_realm(&scope.locator.state_root, realm_id, &principals).await?;
+    println!(
+        "Realm '{realm_id}' is governed; its operator is the local user. No grant was issued: \
+         governed prompts are refused until the operator issues and selects the realm's grants."
+    );
+    Ok(())
+}
+
+/// One `--mcp <server>=<ops>` value: the server and its operations.
+#[cfg(feature = "local-authorization")]
+fn parse_mcp_grant(
+    value: &str,
+) -> anyhow::Result<(
+    String,
+    meerkat::governed_realm::stock::issuance::McpOperations,
+)> {
+    use meerkat::governed_realm::stock::issuance::McpOperations;
+    let (server, ops) = value
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("--mcp expects <server>=<op>[,<op>...] or <server>=*"))?;
+    if server.is_empty() {
+        anyhow::bail!("--mcp needs a server name");
+    }
+    let operations = if ops == "*" {
+        McpOperations::All
+    } else {
+        McpOperations::Exact(
+            ops.split(',')
+                .map(str::trim)
+                .filter(|op| !op.is_empty())
+                .map(str::to_string)
+                .collect(),
+        )
+    };
+    Ok((server.to_string(), operations))
+}
+
+/// Issue one grant to a governed realm's agent as the local operator.
+#[cfg(feature = "local-authorization")]
+async fn grant_realm_agent(
+    scope: &RuntimeScope,
+    realm_id: &str,
+    agent: String,
+    controller_routes: Option<&[String]>,
+    catalog: bool,
+    mcp: Option<&str>,
+    expires_in_secs: Option<u64>,
+) -> anyhow::Result<()> {
+    use meerkat::governed_realm::stock;
+    use stock::issuance::{StockGrantError, StockGrantRequest, StockGrantTarget};
+    if controller_routes.is_some() && expires_in_secs.is_some() {
+        anyhow::bail!("a controller grant has no expiry");
+    }
+    let target = match (controller_routes, catalog, mcp) {
+        (Some(routes), false, None) => {
+            let mut keys = std::collections::BTreeSet::new();
+            for route in routes {
+                let key = meerkat_core::ControllerRouteKey::parse(route).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--route '{route}' is not a controller route key ({}<sha256 hex>)",
+                        meerkat_core::ControllerRouteKey::PREFIX
+                    )
+                })?;
+                if !keys.insert(key) {
+                    anyhow::bail!("--route names '{route}' twice");
+                }
+            }
+            StockGrantTarget::Controller { routes: keys }
+        }
+        (None, true, None) => StockGrantTarget::Catalog,
+        (None, false, Some(value)) => {
+            let (server, operations) = parse_mcp_grant(value)?;
+            StockGrantTarget::Mcp { server, operations }
+        }
+        _ => anyhow::bail!(
+            "name exactly one target: --mcp <server>=<ops>, --catalog or --controller"
+        ),
+    };
+    let realm = meerkat_core::connection::RealmId::parse(realm_id)
+        .map_err(|error| anyhow::anyhow!("invalid realm id '{realm_id}': {error}"))?;
+    let principals = stock::StockPrincipals::for_local_operator(&realm)?;
+    let request = StockGrantRequest {
+        agent,
+        target,
+        expires_in_ms: expires_in_secs.map(|secs| secs.saturating_mul(1000)),
+    };
+    let what = request.target.slot().describe();
+    let outcome = match stock::issuance::grant_stock_agent(
+        &scope.locator.state_root,
+        realm_id,
+        &principals,
+        &request,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(StockGrantError::Refused(error)) => {
+            anyhow::bail!("nothing was issued, selected or revoked: {error}")
+        }
+        Err(StockGrantError::SelectionUncertain {
+            issued, previous, ..
+        }) => {
+            let previous = previous.map_or_else(
+                || "none".to_string(),
+                |previous| previous.grant_id.as_str().to_string(),
+            );
+            anyhow::bail!(
+                "grant {} was issued and selected for the {what} of agent '{}', but the \
+                 selection may not be durable; the superseded grant ({previous}) was not retired",
+                issued.grant_id.as_str(),
+                request.agent
+            )
+        }
+        Err(error) => anyhow::bail!("{error}"),
+    };
+    println!(
+        "Issued and selected grant {} for the {what} of agent '{}' in realm '{realm_id}'; \
+         realms opened from now on use it.",
+        outcome.issued.grant_id.as_str(),
+        request.agent
+    );
+    if let Some(superseded) = &outcome.superseded {
+        println!(
+            "It supersedes grant {}, recorded for cleanup.",
+            superseded.grant_id.as_str()
+        );
+    }
+    print_cleanup(&outcome.cleanup);
+    Ok(())
+}
+
+#[cfg(feature = "local-authorization")]
+fn print_cleanup(cleanup: &[meerkat::governed_realm::stock::issuance::CleanupAttempt]) {
+    for attempt in cleanup {
+        println!(
+            "Superseded grant {} of agent '{}' {}.",
+            attempt.grant.grant_id.as_str(),
+            attempt.agent,
+            revocation_text(attempt.outcome)
+        );
+    }
+}
+
+#[cfg(feature = "local-authorization")]
+fn revocation_text(
+    outcome: meerkat::governed_realm::stock::issuance::RevocationOutcome,
+) -> &'static str {
+    use meerkat::governed_realm::stock::issuance::RevocationOutcome;
+    match outcome {
+        RevocationOutcome::Revoked => "is revoked",
+        RevocationOutcome::ControllerInUse => {
+            "was not revoked: unfinished work holds it as its controller"
+        }
+        RevocationOutcome::Deferred => {
+            "was not revoked: unfinished work references it, so its cleanup is deferred"
+        }
+        RevocationOutcome::ReferencesUnknown => {
+            "was not revoked: whether unfinished work references it could not be determined, \
+             so its cleanup is deferred"
+        }
+        RevocationOutcome::CustodyUnavailable => {
+            "was not revoked: controller custody was unavailable, so revocation was not attempted"
+        }
+        RevocationOutcome::Refused => "was not revoked: the grant owner refused this revocation",
+        RevocationOutcome::Uncertain => {
+            "may or may not be revoked: the grant owner failed during the revocation"
+        }
+    }
+}
+
+/// Revoke a governed realm agent's selected grant as the local operator.
+#[cfg(feature = "local-authorization")]
+async fn revoke_realm_agent(
+    scope: &RuntimeScope,
+    realm_id: &str,
+    agent: &str,
+    slot: &meerkat::governed_realm::stock::issuance::StockGrantSlot,
+) -> anyhow::Result<()> {
+    use meerkat::governed_realm::stock;
+    use stock::issuance::RevocationOutcome;
+    let realm = meerkat_core::connection::RealmId::parse(realm_id)
+        .map_err(|error| anyhow::anyhow!("invalid realm id '{realm_id}': {error}"))?;
+    let principals = stock::StockPrincipals::for_local_operator(&realm)?;
+    let outcome = stock::issuance::revoke_stock_agent(
+        &scope.locator.state_root,
+        realm_id,
+        &principals,
+        agent,
+        slot,
+    )
+    .await?;
+    let text = format!(
+        "Grant {} selected for the {} of agent '{agent}' in realm '{realm_id}' {}.",
+        outcome.revoked.grant_id.as_str(),
+        slot.describe(),
+        revocation_text(outcome.outcome)
+    );
+    print_cleanup(&outcome.cleanup);
+    if outcome.outcome != RevocationOutcome::Revoked {
+        anyhow::bail!("{text}");
+    }
+    println!("{text}");
+    if let Err(reason) = outcome.unselected {
+        println!(
+            "The selection still names it (it resolves as revoked): unselecting it failed: \
+             {reason}"
+        );
+    }
+    Ok(())
+}
+
+/// In a governed realm, bind this process's agent to the session's current
+/// registration before its agent is built, so its configured MCP servers are
+/// decided for that agent. Ordinary realms are unchanged.
+#[cfg(feature = "local-authorization")]
+async fn bind_stock_session_agent(
+    persistence: &PersistenceBundle,
+    runtime_adapter: &meerkat_runtime::MeerkatMachine,
+    session_id: &meerkat_core::SessionId,
+    servers: &[meerkat_core::McpServerConfig],
+) -> anyhow::Result<()> {
+    let Some(stock) = persistence.stock_governance() else {
+        return Ok(());
+    };
+    stock
+        .bind_session_agent(
+            runtime_adapter,
+            session_id,
+            servers.iter().map(|server| server.name.as_str()),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("governed session agent: {error}"))
+}
+
+/// A governed prompt's candidate original, admitted once the runtime
+/// accepted its input.
+#[cfg(feature = "local-authorization")]
+type StockPromptCustody = Option<meerkat::governed_realm::stock::originals::PendingOriginal>;
+#[cfg(not(feature = "local-authorization"))]
+type StockPromptCustody = Option<std::convert::Infallible>;
+
+/// For a governed prompt, the operator command that grants its pinned
+/// controller's actual route, shown if the runtime refuses the prompt.
+type StockRouteHint = Option<String>;
+
+/// A runtime accept failure. A refused governed prompt also names the
+/// command that grants its controller's actual route, since a controller
+/// grant admits only the routes it names.
+fn runtime_accept_failure(
+    error: meerkat_runtime::RuntimeDriverError,
+    route_hint: &StockRouteHint,
+) -> anyhow::Error {
+    match (route_hint, &error) {
+        (Some(hint), meerkat_runtime::RuntimeDriverError::InputRefused { .. }) => anyhow::anyhow!(
+            "runtime accept failed: {error}\nInformation only: if this refusal is due to the \
+             controller route, {hint}"
+        ),
+        _ => anyhow::anyhow!("runtime accept failed: {error}"),
+    }
+}
+
+/// Admit a governed prompt's original after the runtime accepted its input.
+fn admit_stock_prompt(custody: StockPromptCustody) {
+    #[cfg(feature = "local-authorization")]
+    if let Some(pending) = custody
+        && let Err(error) = pending.admit()
+    {
+        eprintln!("Warning: the governed prompt's original custody was not retained: {error}");
+    }
+    #[cfg(not(feature = "local-authorization"))]
+    let _ = custody;
+}
+
+/// Bind a CLI prompt to the stock governed composition when its realm is
+/// governed; ordinary realms submit it unchanged. A refusal is local and
+/// typed, before the input reaches the runtime and before any model call.
+#[cfg(feature = "local-authorization")]
+async fn bind_stock_prompt(
+    persistence: &PersistenceBundle,
+    service: &meerkat::PersistentSessionService<FactoryAgentBuilder>,
+    runtime_adapter: &meerkat_runtime::MeerkatMachine,
+    session_id: &meerkat_core::SessionId,
+    input: meerkat_runtime::Input,
+) -> anyhow::Result<(meerkat_runtime::Input, StockPromptCustody, StockRouteHint)> {
+    let Some(stock) = persistence.stock_governance() else {
+        return Ok((input, None, None));
+    };
+    let witness = service
+        .live_session_actor_witness(session_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("governed session {session_id} has no live actor"))?;
+    let lease = service
+        .acquire_live_session_actor_turn_boundary_lease_exact(&witness)
+        .await
+        .map_err(session_err_to_anyhow)?
+        .ok_or_else(|| anyhow::anyhow!("governed session {session_id} has no live actor"))?;
+    let controller = service
+        .pin_controller_client_for_actor(&lease)
+        .await
+        .map_err(session_err_to_anyhow)?;
+    drop(lease);
+    let route_hint = stock.controller_route_grant_hint(&controller);
+    let (input, pending) = stock
+        .bind_prompt(runtime_adapter, session_id, input, controller)
+        .await
+        .map_err(|error| anyhow::anyhow!("the governed realm refused this prompt: {error}"))?;
+    Ok((input, Some(pending), route_hint))
+}
+
+#[cfg(not(feature = "local-authorization"))]
+async fn bind_stock_prompt(
+    _persistence: &PersistenceBundle,
+    _service: &meerkat::PersistentSessionService<FactoryAgentBuilder>,
+    _runtime_adapter: &meerkat_runtime::MeerkatMachine,
+    _session_id: &meerkat_core::SessionId,
+    input: meerkat_runtime::Input,
+) -> anyhow::Result<(meerkat_runtime::Input, StockPromptCustody, StockRouteHint)> {
+    Ok((input, None, None))
 }
 
 struct PreparedFreshRunPersistence {
@@ -9601,6 +10415,16 @@ async fn prepare_fresh_run_persistence(
         Err(original_error) => {
             #[cfg(feature = "session-store")]
             {
+                // A governed realm, or one whose posture cannot be read, never
+                // falls back to a generated ordinary realm.
+                #[cfg(feature = "local-authorization")]
+                if !matches!(
+                    realm_posture(scope).await,
+                    Ok(meerkat_store::RealmPosture::Ungoverned
+                        | meerkat_store::RealmPosture::NotMaterialized)
+                ) {
+                    return Err(original_error);
+                }
                 let Some(fallback_scope) = workspace_fresh_run_storage_fallback_scope(scope)?
                 else {
                     return Err(original_error);
@@ -9782,7 +10606,7 @@ async fn cli_mcp_browser_login_with<F>(
 where
     F: FnOnce(String) -> std::io::Result<()> + Send + 'static,
 {
-    let pending = match service
+    let mut pending = match service
         .mcp_begin_loopback_login(target, www_authenticate)
         .await?
     {
@@ -9808,9 +10632,66 @@ where
             pending.start().authorize_url
         );
     }
-    Ok(pending
-        .complete(meerkat::MCP_INTERACTIVE_LOGIN_TIMEOUT)
-        .await?)
+    // The borrowed wait keeps the login (its attempt and listener) here, so
+    // an interrupt, SIGTERM, a cancel elsewhere or a failure ends in an
+    // explicit close: the attempt is retired first, then the listener is
+    // closed and its drain joined.
+    let deadline = tokio::time::Instant::now() + meerkat::MCP_INTERACTIVE_LOGIN_TIMEOUT;
+    let waited = tokio::select! {
+        completed = pending.complete_until(deadline) => Some(completed),
+        () = async {
+            if shutdown_signal::wait_for_shutdown_signal().await.is_err() {
+                // No signal handler: the login ends only by its own wait.
+                std::future::pending::<()>().await;
+            }
+        } => None,
+    };
+    match waited {
+        Some(Ok(completed)) => Ok(completed),
+        Some(Err(error)) => {
+            report_mcp_login_close(target, pending.close().await);
+            Err(error.into())
+        }
+        None => {
+            report_mcp_login_close(target, pending.close().await);
+            Err(meerkat::McpOAuthError::Callback {
+                server_name: target.server_name().to_owned(),
+                reason: "login interrupted by a shutdown signal".into(),
+            }
+            .into())
+        }
+    }
+}
+
+/// Report an MCP login close truthfully. A retired, consumed or absent
+/// attempt with a joined listener says nothing, except an attempt whose
+/// completion was handed the code but not observed: its outcome is unknown.
+#[cfg(feature = "mcp")]
+fn report_mcp_login_close(
+    target: &meerkat::McpServerIdentity,
+    closed: meerkat::McpOAuthPendingClose,
+) {
+    if let meerkat::McpOAuthAttemptCleanup::Absent {
+        completion_unobserved: true,
+    } = &closed.attempt
+    {
+        eprintln!(
+            "The authorization for MCP server '{}' was already handed over when the login stopped; its outcome is unknown.",
+            target.server_name()
+        );
+    }
+    if let meerkat::McpOAuthAttemptCleanup::RetirementFailed(error) = &closed.attempt {
+        eprintln!(
+            "Could not retire the pending authorization for MCP server '{}': {error}",
+            target.server_name()
+        );
+    }
+    if let meerkat::McpOAuthListenerCleanup::Failed(error) = &closed.listener {
+        eprintln!(
+            "The callback listener for MCP server '{}' did not close cleanly: {error}",
+            target.server_name()
+        );
+    }
 }
 
 #[cfg(feature = "mcp")]
@@ -9821,10 +10702,12 @@ fn open_cli_mcp_host_auth_service(
         .map_err(|error| anyhow::anyhow!("Cannot open MCP OAuth TokenStore: {error}"))?
         .open_with_refresh_authority()
         .map_err(|error| anyhow::anyhow!("Cannot open MCP OAuth TokenStore: {error}"))?;
-    Ok(meerkat::HostAuthService::new(
-        persistence,
-        scope.provider_auth_authority.clone(),
-    ))
+    // MCP logins and the session resolver address the scope realm's own
+    // credential slots.
+    Ok(
+        meerkat::HostAuthService::new(persistence, scope.provider_auth_authority.clone())
+            .with_mcp_realm(scope.locator.realm.clone()),
+    )
 }
 
 #[cfg(feature = "mcp")]
@@ -10072,6 +10955,90 @@ async fn load_mcp_external_tools(
 #[cfg(not(feature = "mcp"))]
 type McpRouterAdapter = ();
 
+/// Whether `persistence` opened a governed realm: its machine has the
+/// governed host installed, with or without available stock owners. Without
+/// owners the host's configured-attachment authority refuses every server,
+/// so the governed route never falls back to the ordinary preload.
+fn persistence_is_governed(persistence: &PersistenceBundle) -> bool {
+    persistence
+        .runtime_adapter()
+        .has_native_work_authorization_host()
+}
+
+/// On a governed realm the CLI does not start configured MCP servers itself:
+/// the effective realm, project and user server set becomes the session
+/// build's declarative servers, connected once by the factory through the
+/// session-owned bindings, where the governed host authorizes each before
+/// discovery or spawn. `None` keeps the ordinary CLI loader.
+async fn governed_configured_mcp_servers(
+    persistence: &PersistenceBundle,
+    scope: &RuntimeScope,
+    realm_servers: &[meerkat_core::McpServerConfig],
+) -> anyhow::Result<Option<Vec<meerkat_core::McpServerConfig>>> {
+    if !persistence_is_governed(persistence) {
+        return Ok(None);
+    }
+    #[cfg(feature = "mcp")]
+    {
+        let servers = meerkat_core::mcp_config::McpConfig::effective_servers_from_roots(
+            realm_servers,
+            scope.context_root.as_deref(),
+            scope.user_config_root.as_deref(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("MCP config error: {e}"))?;
+        Ok(Some(
+            servers.into_iter().map(|entry| entry.server).collect(),
+        ))
+    }
+    #[cfg(not(feature = "mcp"))]
+    {
+        let _ = (scope, realm_servers);
+        Ok(Some(Vec::new()))
+    }
+}
+
+/// Whether the factory must wait for governed declarative servers before the
+/// first prompt: the explicit `--wait-for-mcp`, or any server that may need
+/// OAuth, as the CLI loader waited.
+fn governed_mcp_wait(
+    governed_servers: Option<&[meerkat_core::McpServerConfig]>,
+    wait_for_mcp: bool,
+) -> bool {
+    let Some(servers) = governed_servers else {
+        return false;
+    };
+    #[cfg(feature = "mcp")]
+    {
+        !servers.is_empty() && (wait_for_mcp || servers.iter().any(mcp_server_may_need_oauth))
+    }
+    #[cfg(not(feature = "mcp"))]
+    {
+        let _ = (servers, wait_for_mcp);
+        false
+    }
+}
+
+/// The factory's MCP credential source for governed declarative servers,
+/// as the CLI loader would have used it.
+fn with_governed_mcp_auth(
+    factory: AgentFactory,
+    scope: &RuntimeScope,
+    governed_servers: Option<&[meerkat_core::McpServerConfig]>,
+    mcp_auth: CliMcpAuthMode,
+) -> anyhow::Result<AgentFactory> {
+    #[cfg(feature = "mcp")]
+    if let Some(servers) = governed_servers
+        && servers.iter().any(mcp_server_may_need_oauth)
+        && let Some(resolver) = open_mcp_auth_resolver(scope, mcp_auth)?
+    {
+        return Ok(factory.mcp_auth_resolver(resolver));
+    }
+    #[cfg(not(feature = "mcp"))]
+    let _ = (scope, governed_servers, mcp_auth);
+    Ok(factory)
+}
+
 /// Gracefully shutdown MCP tools (no-op when MCP is not compiled in or no adapter).
 async fn shutdown_mcp(_adapter: &Option<Arc<McpRouterAdapter>>) {
     #[cfg(feature = "mcp")]
@@ -10250,6 +11217,12 @@ impl meerkat_core::lifecycle::CoreExecutorInterruptHandle for CliRuntimeInterrup
 
 #[async_trait::async_trait]
 impl meerkat_core::lifecycle::CoreExecutor for CliRuntimeExecutor {
+    /// Every turn forwards the primitive's native work context into the
+    /// session turn (see `apply`), as the shared runtime-backed executor does.
+    fn supports_work_authorization(&self) -> bool {
+        true
+    }
+
     fn boundary_handle(
         &self,
     ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorBoundaryHandle>> {
@@ -10399,6 +11372,11 @@ impl meerkat_core::lifecycle::CoreExecutor for CliRuntimeExecutor {
                     .turn_metadata()
                     .and_then(|meta| meta.turn_tool_overlay.clone()),
                 primitive.turn_metadata().cloned(),
+            )
+            .with_work_authorization(
+                primitive
+                    .turn_metadata()
+                    .and_then(|meta| meta.work_authorization.clone()),
             )
             .with_typed_turn_appends(primitive.typed_turn_appends()),
         };
@@ -11792,12 +12770,45 @@ fn build_cli_runtime_backed_service_with_defaults(
     config_state_path: std::path::PathBuf,
     default_schedule_tools: Option<Arc<dyn AgentToolDispatcher>>,
     default_workgraph_tools: Option<Arc<dyn AgentToolDispatcher>>,
-) -> (
-    Arc<meerkat::PersistentSessionService<FactoryAgentBuilder>>,
-    Arc<meerkat_runtime::MeerkatMachine>,
-) {
+) -> Result<
+    (
+        Arc<meerkat::PersistentSessionService<FactoryAgentBuilder>>,
+        Arc<meerkat_runtime::MeerkatMachine>,
+    ),
+    meerkat::surface::RuntimeBackedCompositionError,
+> {
+    build_cli_runtime_backed_service_waiting_for_mcp(
+        factory,
+        config,
+        persistence,
+        config_state_path,
+        default_schedule_tools,
+        default_workgraph_tools,
+        false,
+    )
+}
+
+/// [`build_cli_runtime_backed_service_with_defaults`] whose factory waits for
+/// the build's declarative MCP servers before the first prompt when
+/// `wait_for_mcp` is set.
+fn build_cli_runtime_backed_service_waiting_for_mcp(
+    factory: AgentFactory,
+    config: Config,
+    persistence: PersistenceBundle,
+    config_state_path: std::path::PathBuf,
+    default_schedule_tools: Option<Arc<dyn AgentToolDispatcher>>,
+    default_workgraph_tools: Option<Arc<dyn AgentToolDispatcher>>,
+    wait_for_mcp: bool,
+) -> Result<
+    (
+        Arc<meerkat::PersistentSessionService<FactoryAgentBuilder>>,
+        Arc<meerkat_runtime::MeerkatMachine>,
+    ),
+    meerkat::surface::RuntimeBackedCompositionError,
+> {
     let max_sessions = config.max_sessions();
-    let builder = FactoryAgentBuilder::new(factory, config);
+    let mut builder = FactoryAgentBuilder::new(factory, config);
+    builder.wait_for_mcp = wait_for_mcp;
     meerkat::surface::set_default_schedule_tools(&builder, default_schedule_tools);
     meerkat::surface::set_default_workgraph_tools(&builder, default_workgraph_tools);
     if let Some(manifest) = persistence.manifest() {
@@ -11818,8 +12829,8 @@ fn build_cli_runtime_backed_service_with_defaults(
             max_sessions,
             persistence,
             config_state_path,
-        );
-    (service, runtime_adapter)
+        )?;
+    Ok((service, runtime_adapter))
 }
 
 #[cfg(test)]
@@ -12216,6 +13227,9 @@ async fn run_agent(
 
         #[cfg(feature = "comms")]
         let factory = factory.comms(!comms_overrides.disabled);
+        let governed_mcp =
+            governed_configured_mcp_servers(&persistence, scope, &config.tools.mcp_servers).await?;
+        let factory = with_governed_mcp_auth(factory, scope, governed_mcp.as_deref(), mcp_auth)?;
 
         let context_root = scope
             .context_root
@@ -12254,14 +13268,15 @@ async fn run_agent(
         let default_workgraph_tools = Some(Arc::new(meerkat::WorkGraphToolSurface::new(
             scoped_workgraph_service(storage_scope, &persistence),
         )) as Arc<dyn AgentToolDispatcher>);
-        let (service, runtime_adapter) = build_cli_runtime_backed_service_with_defaults(
+        let (service, runtime_adapter) = build_cli_runtime_backed_service_waiting_for_mcp(
             factory,
             config.clone(),
             persistence.clone(),
             config_base_dir.join("config_state.json"),
             default_schedule_tools,
             default_workgraph_tools,
-        );
+            governed_mcp_wait(governed_mcp.as_deref(), wait_for_mcp),
+        )?;
 
         if keep_alive {
             eprintln!(
@@ -12308,17 +13323,29 @@ async fn run_agent(
             .prepare_bindings(session_id.clone())
             .await
             .map_err(|e| anyhow::anyhow!("runtime bindings: {e}"))?;
+        #[cfg(feature = "local-authorization")]
+        bind_stock_session_agent(
+            &persistence,
+            &runtime_adapter,
+            &session_id,
+            governed_mcp.as_deref().unwrap_or_default(),
+        )
+        .await?;
 
         // Load optional MCP tools immediately before external tool composition so
         // later early-return windows cannot skip adapter shutdown.
-        let (mcp_external_tools, mcp_adapter) = load_mcp_external_tools(
-            scope,
-            &config.tools.mcp_servers,
-            wait_for_mcp,
-            mcp_auth,
-            Some(Arc::clone(bindings.external_tool_surface())),
-        )
-        .await?;
+        let (mcp_external_tools, mcp_adapter) = if governed_mcp.is_some() {
+            (None, None)
+        } else {
+            load_mcp_external_tools(
+                scope,
+                &config.tools.mcp_servers,
+                wait_for_mcp,
+                mcp_auth,
+                Some(Arc::clone(bindings.external_tool_surface())),
+            )
+            .await?
+        };
         // Mob tools now flow through mob_tools (factory pattern), not external_tools.
         // Only MCP tools remain as external_tools.
         let external_tools = mcp_external_tools;
@@ -12373,10 +13400,11 @@ async fn run_agent(
             external_tools,
             // The session service decides hosting when it creates the actor.
             hosting: meerkat_core::session_hosting::SessionHostingIntent::default(),
-            mcp_servers: Vec::new(),
+            mcp_servers: governed_mcp.clone().unwrap_or_default(),
             recoverable_tool_defs: None,
             llm_client_override: None,
             session_comms_runtime_override: None,
+            prepared_controller: None,
             host_prompt_sections: Default::default(),
             agent_llm_client_decorator: None,
             override_builtins: meerkat_core::ToolCategoryOverride::from_effective(enable_builtins),
@@ -12553,10 +13581,14 @@ async fn run_agent(
                     },
                 ),
             ));
+            let (input, custody, route_hint) =
+                bind_stock_prompt(&persistence, &service, &runtime_adapter, &session_id, input)
+                    .await?;
             let (_outcome, handle) = runtime_adapter
                 .accept_input_with_completion(&session_id, input)
                 .await
-                .map_err(|err| anyhow::anyhow!("runtime accept failed: {err}"))?;
+                .map_err(|err| runtime_accept_failure(err, &route_hint))?;
+            admit_stock_prompt(custody);
 
             // Spawn the comms drain in keep-alive mode so inbound peer interactions are
             // routed through the runtime adapter and automatically trigger new turns.
@@ -12995,6 +14027,9 @@ async fn resume_session_with_llm_override(
                     || keep_alive
                     || comms_overrides.requires_runtime()),
         );
+        let governed_mcp =
+            governed_configured_mcp_servers(&persistence, scope, &config.tools.mcp_servers).await?;
+        let factory = with_governed_mcp_auth(factory, scope, governed_mcp.as_deref(), mcp_auth)?;
 
         log_stage("build_cli_persistent_service");
         // Build persistent session service for resume — durable runtime
@@ -13012,14 +14047,15 @@ async fn resume_session_with_llm_override(
         let default_workgraph_tools = Some(Arc::new(meerkat::WorkGraphToolSurface::new(
             scoped_workgraph_service(scope, &persistence),
         )) as Arc<dyn AgentToolDispatcher>);
-        let (service, resume_adapter) = build_cli_runtime_backed_service_with_defaults(
+        let (service, resume_adapter) = build_cli_runtime_backed_service_waiting_for_mcp(
             factory,
             config.clone(),
             persistence.clone(),
             config_base_dir.join("config_state.json"),
             default_schedule_tools,
             default_workgraph_tools,
-        );
+            governed_mcp_wait(governed_mcp.as_deref(), wait_for_mcp),
+        )?;
 
         log_stage("compose_external_tool_dispatchers");
         #[cfg(feature = "mob")]
@@ -13053,17 +14089,29 @@ async fn resume_session_with_llm_override(
             .prepare_bindings(session_id.clone())
             .await
             .map_err(|e| anyhow::anyhow!("runtime bindings: {e}"))?;
+        #[cfg(feature = "local-authorization")]
+        bind_stock_session_agent(
+            &persistence,
+            &resume_adapter,
+            &session_id,
+            governed_mcp.as_deref().unwrap_or_default(),
+        )
+        .await?;
 
         // Load optional MCP tools immediately before external tool composition so
         // later early-return windows cannot skip adapter shutdown.
-        let (mcp_external_tools, mcp_adapter) = load_mcp_external_tools(
-            scope,
-            &config.tools.mcp_servers,
-            wait_for_mcp,
-            mcp_auth,
-            Some(Arc::clone(resume_bindings.external_tool_surface())),
-        )
-        .await?;
+        let (mcp_external_tools, mcp_adapter) = if governed_mcp.is_some() {
+            (None, None)
+        } else {
+            load_mcp_external_tools(
+                scope,
+                &config.tools.mcp_servers,
+                wait_for_mcp,
+                mcp_auth,
+                Some(Arc::clone(resume_bindings.external_tool_surface())),
+            )
+            .await?
+        };
         // Mob tools now flow through mob_tools (factory pattern), not external_tools.
         // Only MCP tools remain as external_tools.
         let external_tools = mcp_external_tools;
@@ -13166,6 +14214,11 @@ async fn resume_session_with_llm_override(
         let keep_alive = resolve_keep_alive(recovered.keep_alive)?;
         let mut build = recovered.build;
         build.external_tools = external_tools;
+        // Recovery leaves the declarative servers empty; a governed resume
+        // re-supplies the effective set for the factory to authorize.
+        if let Some(servers) = governed_mcp {
+            build.mcp_servers = servers;
+        }
         build.llm_client_override =
             llm_override.map(meerkat::encode_llm_client_override_for_service);
         build.runtime_build_mode = meerkat_core::RuntimeBuildMode::SessionOwned(resume_bindings);
@@ -13292,10 +14345,14 @@ async fn resume_session_with_llm_override(
                     },
                 ),
             ));
+            let (input, custody, route_hint) =
+                bind_stock_prompt(&persistence, &service, &resume_adapter, &session_id, input)
+                    .await?;
             let (_outcome, handle) = resume_adapter
                 .accept_input_with_completion(&session_id, input)
                 .await
-                .map_err(|err| anyhow::anyhow!("runtime accept failed: {err}"))?;
+                .map_err(|err| runtime_accept_failure(err, &route_hint))?;
+            admit_stock_prompt(custody);
 
             // Spawn the comms drain in keep-alive mode so inbound peer interactions are
             // routed through the runtime adapter and automatically trigger new turns.
@@ -13502,7 +14559,7 @@ async fn get_or_create_cli_persistent_surface_from_bundle(
             .join("config_state.json"),
         default_schedule_tools,
         default_workgraph_tools,
-    );
+    )?;
     #[cfg(all(feature = "mob", feature = "session-store"))]
     let mob_state_cache = Arc::new(CliMobStateCache::default());
     let schedule_host = if schedule_host_supported(schedule_service.store().kind()) {
@@ -15444,7 +16501,7 @@ async fn repair_wholeblob_session(
         // the session in this process, so the store-level repair is the
         // complete procedure here; the operator stops the member first.
         //
-        // A host that opened one runtime database itself (MobKit's default
+        // A host that opened one runtime database itself (Meta's default
         // `<state_dir>/runtime.sqlite`) has no realm layout to resolve: it
         // names the file, and the session id is the full UUID.
         let (session_id, store) = match runtime_store {
@@ -16304,6 +17361,7 @@ async fn handle_mcp_command(command: McpCommands, cli_scope: &RuntimeScope) -> a
             oauth_account,
             env,
             expected_generation,
+            allowed_operations,
             command,
         } => {
             let transport = transport.map(|t| match t {
@@ -16320,6 +17378,7 @@ async fn handle_mcp_command(command: McpCommands, cli_scope: &RuntimeScope) -> a
                 oauth_account,
                 command,
                 env,
+                allowed_operations,
                 project_scope: matches!(scope, CliMcpScope::Project | CliMcpScope::Local),
             };
             match McpServerSource::from(scope) {
@@ -19738,7 +20797,7 @@ where
         max_sessions,
         persistence,
         meerkat_rpc::router::NotificationSink::noop(),
-    );
+    )?;
     let session_service = runtime.session_service();
     let runtime_adapter = runtime.runtime_adapter();
     let default_user_root = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -20001,6 +21060,29 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::RwLock;
 
+    /// Only a revocation is reported as one; every other attempt says what
+    /// it did, never that the grant is live.
+    #[cfg(feature = "local-authorization")]
+    #[test]
+    fn revocation_outcomes_are_worded_by_the_attempt() {
+        use meerkat::governed_realm::stock::issuance::RevocationOutcome;
+        assert_eq!(revocation_text(RevocationOutcome::Revoked), "is revoked");
+        for outcome in [
+            RevocationOutcome::ControllerInUse,
+            RevocationOutcome::Deferred,
+            RevocationOutcome::ReferencesUnknown,
+            RevocationOutcome::CustodyUnavailable,
+            RevocationOutcome::Refused,
+            RevocationOutcome::Uncertain,
+        ] {
+            let text = revocation_text(outcome);
+            assert!(!text.contains("live"), "{outcome:?}: {text}");
+            assert!(!text.starts_with("is revoked"), "{outcome:?}: {text}");
+        }
+        assert!(revocation_text(RevocationOutcome::CustodyUnavailable).contains("not attempted"));
+        assert!(revocation_text(RevocationOutcome::Refused).contains("refused this revocation"));
+        assert!(revocation_text(RevocationOutcome::Deferred).contains("deferred"));
+    }
     #[test]
     fn shutdown_error_accumulation_preserves_every_failure() {
         let mut error = None;
@@ -20370,6 +21452,8 @@ mod tests {
             // test's own state root so `load_config` composition never reads the
             // developer's real `~/.rkat/config.toml`.
             user_config_root: Some(state_root),
+            #[cfg(feature = "local-authorization")]
+            stock_agent: None,
             auth_lease,
             #[cfg(any(
                 all(feature = "anthropic", feature = "openai", feature = "gemini"),
@@ -20478,6 +21562,144 @@ mod tests {
             .expect("compact caller")
             .join()
             .expect("populated Logs must fit the two MiB caller and worker stacks");
+    }
+
+    /// A governed realm whose stock owners are unavailable still takes the
+    /// governed MCP route: the configured set goes to the factory, where the
+    /// governed host refuses each server, and nothing is preloaded.
+    #[cfg(all(feature = "local-authorization", feature = "mcp"))]
+    #[tokio::test]
+    async fn a_governed_realm_without_stock_owners_never_preloads_mcp() {
+        use meerkat::governed_realm::{
+            RealmGovernance, open_governed_realm_persistence_with_provider,
+        };
+        let state_root = tempfile::tempdir().expect("tempdir");
+        let scope = test_scope(state_root.path().to_path_buf(), "ws-unowned");
+        let (_, ordinary) = create_persistence_bundle(&scope)
+            .await
+            .expect("an ordinary first open materializes the realm");
+        assert!(!persistence_is_governed(&ordinary));
+        let servers = vec![meerkat_core::McpServerConfig::stdio(
+            "configured",
+            "true",
+            Vec::new(),
+            std::collections::HashMap::new(),
+        )];
+        assert!(
+            governed_configured_mcp_servers(&ordinary, &scope, &servers)
+                .await
+                .expect("ordinary route")
+                .is_none()
+        );
+        drop(ordinary);
+
+        let (_, governed) = open_governed_realm_persistence_with_provider(
+            &meerkat::DiskStorageProvider,
+            state_root.path(),
+            "ws-unowned",
+            None,
+            None,
+            None,
+            RealmGovernance::GovernedWithoutOwners,
+        )
+        .await
+        .expect("governed without owners");
+        assert!(governed.stock_governance().is_none());
+        assert!(persistence_is_governed(&governed));
+        let routed = governed_configured_mcp_servers(&governed, &scope, &servers)
+            .await
+            .expect("governed route")
+            .expect("the governed route, never the ordinary preload");
+        assert_eq!(routed.len(), 1);
+    }
+
+    /// The governed route forwards `--wait-for-mcp` to the factory, and waits
+    /// for servers that may need OAuth as the CLI loader did.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn governed_mcp_wait_follows_the_flag_and_oauth_candidates() {
+        let stdio = meerkat_core::McpServerConfig::stdio(
+            "local",
+            "true",
+            Vec::new(),
+            std::collections::HashMap::new(),
+        );
+        let remote = meerkat_core::McpServerConfig::streamable_http(
+            "remote",
+            "https://mcp.example.test/mcp",
+            std::collections::HashMap::new(),
+        );
+        assert!(
+            !governed_mcp_wait(None, true),
+            "ordinary route: the loader waits"
+        );
+        assert!(!governed_mcp_wait(Some(&[]), true), "nothing to wait for");
+        assert!(governed_mcp_wait(Some(std::slice::from_ref(&stdio)), true));
+        assert!(!governed_mcp_wait(
+            Some(std::slice::from_ref(&stdio)),
+            false
+        ));
+        assert!(governed_mcp_wait(
+            Some(std::slice::from_ref(&remote)),
+            false
+        ));
+    }
+
+    /// A governed workspace realm whose storage cannot open never falls
+    /// back to a generated ordinary realm, and its posture survives reopen.
+    #[cfg(feature = "local-authorization")]
+    #[tokio::test]
+    async fn a_governed_realm_never_falls_back_to_a_generated_realm() {
+        let state_root = tempfile::tempdir().expect("tempdir");
+        let mut scope = test_scope(state_root.path().to_path_buf(), "ws-governed");
+        scope.origin_hint = RealmOrigin::Workspace;
+        let (_, persistence) = create_persistence_bundle(&scope)
+            .await
+            .expect("an ordinary first open materializes the realm");
+        assert!(persistence.stock_governance().is_none());
+        drop(persistence);
+
+        govern_realm(&scope, "ws-governed")
+            .await
+            .expect("the operator governs the realm");
+        assert_eq!(
+            realm_posture(&scope).await.expect("posture"),
+            meerkat_store::RealmPosture::Governed
+        );
+        let (_, persistence) = create_persistence_bundle(&scope)
+            .await
+            .expect("a governed realm opens governed");
+        assert!(persistence.stock_governance().is_some());
+        assert!(
+            persistence
+                .runtime_adapter()
+                .has_native_work_authorization_host()
+        );
+        drop(persistence);
+
+        let paths = meerkat_store::realm_paths_in(state_root.path(), "ws-governed");
+        for store in [&paths.sessions_sqlite_path, &paths.runtime_sqlite_path] {
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = store.as_os_str().to_owned();
+                sidecar.push(suffix);
+                let _ = std::fs::remove_file(PathBuf::from(sidecar));
+            }
+            std::fs::write(store, b"not a database").expect("corrupt store");
+        }
+        let realms_before = std::fs::read_dir(state_root.path())
+            .expect("state root")
+            .count();
+        assert!(
+            prepare_fresh_run_persistence(&scope).await.is_err(),
+            "the governed realm's open failure is returned"
+        );
+        assert_eq!(
+            std::fs::read_dir(state_root.path())
+                .expect("state root")
+                .count(),
+            realms_before,
+            "no generated fallback realm is created"
+        );
     }
 
     #[test]
@@ -21645,6 +22867,158 @@ mod tests {
             cli_config_warning_reported(&global_doc, ConfigWarning::LegacyModelFallbackDefault),
             "the rewriting bootstrap reports the warning"
         );
+    }
+
+    /// A store whose plain reads (an interactive mutation reads through them)
+    /// park until released, counting every read and every status observation.
+    #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
+    struct ParkedReadCliTokenStore {
+        inner: meerkat_providers::auth_store::EphemeralTokenStore,
+        reads: std::sync::atomic::AtomicUsize,
+        observations: std::sync::atomic::AtomicUsize,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
+    impl ParkedReadCliTokenStore {
+        fn new() -> Self {
+            Self {
+                inner: meerkat_providers::auth_store::EphemeralTokenStore::new(),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+                observations: std::sync::atomic::AtomicUsize::new(0),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
+    #[async_trait::async_trait]
+    impl meerkat_providers::auth_store::TokenStore for ParkedReadCliTokenStore {
+        async fn load(
+            &self,
+            key: &meerkat_providers::auth_store::TokenKey,
+        ) -> Result<
+            Option<meerkat_providers::auth_store::PersistedTokens>,
+            meerkat_providers::auth_store::TokenStoreError,
+        > {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.entered.notify_one();
+            let _permit = self.release.acquire().await;
+            self.inner.load(key).await
+        }
+
+        async fn save(
+            &self,
+            key: &meerkat_providers::auth_store::TokenKey,
+            tokens: &meerkat_providers::auth_store::PersistedTokens,
+        ) -> Result<(), meerkat_providers::auth_store::TokenStoreError> {
+            self.inner.save(key, tokens).await
+        }
+
+        async fn clear(
+            &self,
+            key: &meerkat_providers::auth_store::TokenKey,
+        ) -> Result<(), meerkat_providers::auth_store::TokenStoreError> {
+            self.inner.clear(key).await
+        }
+
+        async fn list(
+            &self,
+        ) -> Result<
+            Vec<meerkat_providers::auth_store::TokenKey>,
+            meerkat_providers::auth_store::TokenStoreError,
+        > {
+            self.inner.list().await
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "parked_read"
+        }
+
+        async fn observe_status(
+            &self,
+            key: &meerkat_providers::auth_store::TokenKey,
+        ) -> Result<
+            meerkat_providers::auth_store::TokenStoreObservation,
+            meerkat_providers::auth_store::TokenStoreError,
+        > {
+            self.observations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.observe_status(key).await
+        }
+    }
+
+    /// T1 at the public CLI status entry: an interactive save holds the
+    /// actual lifecycle guard while its durable read is in flight. Status
+    /// answers at once that the owner is busy, and reads nothing.
+    #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cli_auth_status_with_the_owner_busy_answers_at_once_without_reading() {
+        use meerkat_providers::auth_store::TokenStore;
+
+        let store = Arc::new(ParkedReadCliTokenStore::new());
+        let auth_lease = new_cli_auth_handles().0;
+        // Its own realm: the lifecycle owner registry is process wide.
+        let auth_binding = AuthBindingRef {
+            realm: meerkat_core::RealmId::parse("t1-cli").expect("realm id parses"),
+            binding: meerkat_core::BindingId::parse("openai_oauth").expect("binding id parses"),
+            profile: None,
+            origin: meerkat_core::connection::BindingOrigin::Configured,
+        };
+        let config = openai_oauth_login_config(
+            "managed_chatgpt_oauth",
+            meerkat_core::CredentialSourceSpec::ManagedStore,
+        );
+        let section = config.realm.get("global").expect("global realm exists");
+        let realm = meerkat_core::RealmConnectionSet::from_config("global", section)
+            .expect("realm config parses");
+        let (_, _, auth_profile) = realm
+            .lookup_auth_binding(&openai_auth_binding())
+            .expect("binding resolves");
+        let save = save_cli_tokens_and_publish_lifecycle(
+            test_provider_auth_persistence(store.clone()),
+            auth_lease.clone(),
+            auth_binding.clone(),
+            openai_oauth_tokens(),
+        );
+        tokio::pin!(save);
+        tokio::select! {
+            _ = &mut save => panic!("the save cannot finish while its read is parked"),
+            () = store.entered.notified() => {}
+        }
+
+        let projection = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            project_cli_auth_status(
+                &auth_lease,
+                Some(store.as_ref() as &dyn TokenStore),
+                &meerkat_core::AuthCredentialIdentity::from_auth_binding(&auth_binding),
+                auth_profile,
+                chrono::Utc::now(),
+            ),
+        )
+        .await
+        .expect("status answers at once, without waiting for the interactive save")
+        .expect("AuthMachine freshness observation succeeds");
+
+        assert_eq!(
+            projection.credential_observation,
+            Some(meerkat_core::CredentialObservation::OwnerBusy)
+        );
+        assert_eq!(
+            store.observations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "status read nothing"
+        );
+        assert_eq!(
+            store.reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the interactive save read the store"
+        );
+        store.release.add_permits(1);
+        save.await.expect("the interactive save completes");
     }
 
     #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
@@ -23477,6 +24851,7 @@ default_model = "gemma"
         saw_event_tx: std::sync::atomic::AtomicBool,
         typed_turn_appends: Mutex<Vec<meerkat_core::lifecycle::run_primitive::ConversationAppend>>,
         captured_turn_tool_overlay: Mutex<Option<meerkat_core::service::TurnToolOverlay>>,
+        saw_work_authorization: std::sync::atomic::AtomicBool,
     }
 
     impl CapturingEventTurnService {
@@ -23486,6 +24861,7 @@ default_model = "gemma"
                 saw_event_tx: std::sync::atomic::AtomicBool::new(false),
                 typed_turn_appends: Mutex::new(Vec::new()),
                 captured_turn_tool_overlay: Mutex::new(None),
+                saw_work_authorization: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -23529,6 +24905,10 @@ default_model = "gemma"
                 .lock()
                 .expect("captured turn tool overlay lock poisoned") =
                 req.runtime.turn_tool_overlay.clone();
+            self.saw_work_authorization.store(
+                req.runtime.work_authorization.is_some(),
+                std::sync::atomic::Ordering::Release,
+            );
             if let Some(tx) = req.event_tx {
                 self.saw_event_tx
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -24041,6 +25421,51 @@ default_model = "gemma"
                 .saw_event_tx
                 .load(std::sync::atomic::Ordering::Acquire),
             "runtime-backed executor must forward the caller event sender"
+        );
+    }
+
+    /// The CLI executor supports governed work (it forwards each turn's
+    /// native work context), and an ungoverned turn stays ungoverned: no
+    /// work context is invented for it.
+    #[tokio::test]
+    async fn test_cli_runtime_executor_supports_work_authorization_and_leaves_ungoverned_turns_unbound()
+     {
+        let session_id = SessionId::new();
+        let service = Arc::new(CapturingEventTurnService::new(session_id.clone()));
+        let mut executor = CliRuntimeExecutor {
+            service: service.clone(),
+            #[cfg(feature = "session-store")]
+            persistent_service: None,
+            #[cfg(feature = "session-store")]
+            publication_actor_witness: None,
+            session_id,
+            runtime_adapter: Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
+            workgraph_service: None,
+            event_tx: None,
+        };
+        assert!(meerkat_core::lifecycle::CoreExecutor::supports_work_authorization(&executor));
+        let primitive = meerkat_core::lifecycle::run_primitive::RunPrimitive::ImmediateAppend(
+            meerkat_core::lifecycle::run_primitive::ConversationAppend {
+                runtime_source: None,
+                role: meerkat_core::lifecycle::run_primitive::ConversationAppendRole::User,
+                content: meerkat_core::lifecycle::run_primitive::CoreRenderable::Text {
+                    text: "hello".to_string(),
+                },
+                identity: None,
+            },
+        );
+        meerkat_core::lifecycle::CoreExecutor::apply(
+            &mut executor,
+            meerkat_core::lifecycle::RunId::new(),
+            primitive,
+        )
+        .await
+        .expect("ungoverned CLI turn should succeed");
+        assert!(
+            !service
+                .saw_work_authorization
+                .load(std::sync::atomic::Ordering::Acquire),
+            "an ungoverned turn carries no work context"
         );
     }
 
@@ -28069,7 +29494,7 @@ capabilities = ["rpc"]
 
         assert!(
             names.contains("callback_tool"),
-            "MobKit callback tools must remain visible for RPC mob members"
+            "Meta callback tools must remain visible for RPC mob members"
         );
         assert!(
             names.contains("linear_add_comment"),
@@ -28549,7 +29974,8 @@ default_model = "gpt-5.4"
             temp.path().join("config_state.json"),
             None,
             None,
-        );
+        )
+        .expect("compose the CLI runtime-backed service");
         let wrapper = MobCliSessionService::new(Arc::clone(&inner));
         for archived in [false, true] {
             let mut session = Session::new();
@@ -28687,7 +30113,8 @@ default_model = "gpt-5.4"
             temp.path().join("config_state.json"),
             None,
             None,
-        );
+        )
+        .expect("compose the CLI runtime-backed service");
         let wrapper = MobCliSessionService::new(Arc::clone(&inner));
         let session = Session::new();
         let bindings = runtime_adapter
@@ -28885,7 +30312,8 @@ default_model = "gpt-5.4"
             temp.path().join("config_state.json"),
             None,
             None,
-        );
+        )
+        .expect("compose the CLI runtime-backed service");
         let wrapper = Arc::new(MobCliSessionService::new(service));
         assert!(
             <MobCliSessionService as meerkat_mob::MobSessionService>::forked_participant_source_runtime(wrapper)
@@ -28916,7 +30344,8 @@ default_model = "gpt-5.4"
             temp.path().join("config_state.json"),
             None,
             None,
-        );
+        )
+        .expect("compose the CLI runtime-backed service");
         let wrapper = MobCliSessionService::new(Arc::clone(&service));
         let unknown_session = SessionId::new();
         let authorities = [
@@ -29282,7 +30711,8 @@ default_model = "gpt-5.4"
             temp.path().join("config_state.json"),
             None,
             None,
-        );
+        )
+        .expect("compose the CLI runtime-backed service");
         let flow = runtime_adapter
             .oauth_flow_authority()
             .consume(
@@ -29320,7 +30750,8 @@ default_model = "gpt-5.4"
             temp.path().join("config_state.json"),
             None,
             None,
-        );
+        )
+        .expect("compose the CLI runtime-backed service");
         let auth_lease = runtime_adapter.auth_lease_handle();
 
         let session = Session::new();
@@ -29424,7 +30855,8 @@ default_model = "gpt-5.4"
             temp.path().join("config_state.json"),
             None,
             None,
-        );
+        )
+        .expect("compose the CLI runtime-backed service");
         let llm_override: Arc<dyn LlmClient> = Arc::new(CapturingLlmClient::new(
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(Mutex::new(None)),
@@ -31223,6 +32655,8 @@ supports_reasoning = true
             origin_hint: RealmOrigin::Explicit,
             context_root: Some(root),
             user_config_root: None,
+            #[cfg(feature = "local-authorization")]
+            stock_agent: None,
             auth_lease,
             #[cfg(any(
                 all(feature = "anthropic", feature = "openai", feature = "gemini"),

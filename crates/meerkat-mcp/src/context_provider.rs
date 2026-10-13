@@ -13,6 +13,11 @@ use serde_json::{Map, Value};
 pub struct McpConnectionId(u64);
 
 impl McpConnectionId {
+    /// The generation number, for a nonsecret operation target fact.
+    pub(crate) const fn generation(self) -> u64 {
+        self.0
+    }
+
     pub(crate) fn allocate() -> Result<Self, McpCallContextError> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
@@ -91,11 +96,20 @@ pub trait McpCallContextProvider: Send + Sync {
     }
 }
 
+/// What a passed final check keeps held through the call's native entry and
+/// local handoff (it travels with the request to the send owner).
+pub type McpCallFinalCustody = Box<dyn Send + Sync>;
+
+/// A synchronous check run at the call's final native entry.
+pub type McpCallFinalCheck =
+    Box<dyn FnOnce() -> Result<McpCallFinalCustody, McpCallContextError> + Send + Sync>;
+
 /// Metadata plus a call-lifetime lease. Dropping the call future drops the
 /// lease, including on cancellation or refusal. Neither part is logged.
 pub struct McpCallContext {
     pub(crate) metadata: Map<String, Value>,
     pub(crate) guard: Box<dyn Send + Sync>,
+    pub(crate) final_check: Option<McpCallFinalCheck>,
 }
 
 impl McpCallContext {
@@ -103,7 +117,26 @@ impl McpCallContext {
         Self {
             metadata,
             guard: Box::new(guard),
+            final_check: None,
         }
+    }
+
+    /// Run `check` at the call's final native entry, before the single
+    /// consuming reviewed entry, with no await before the request is handed
+    /// to the transport. A refusal there sends nothing and spends no review.
+    /// What a passed check returns stays held through the reviewed entry and
+    /// the local handoff, travelling with the request to the send owner, so
+    /// what it guards (for example a credential's lifecycle) cannot change
+    /// before the request has left the caller.
+    #[must_use]
+    pub fn with_final_check<C: Send + Sync + 'static>(
+        mut self,
+        check: impl FnOnce() -> Result<C, McpCallContextError> + Send + Sync + 'static,
+    ) -> Self {
+        self.final_check = Some(Box::new(move || {
+            check().map(|custody| Box::new(custody) as McpCallFinalCustody)
+        }));
+        self
     }
 }
 

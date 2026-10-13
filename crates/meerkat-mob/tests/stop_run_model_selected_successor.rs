@@ -262,6 +262,7 @@ async fn build_service(
         persistence,
         root.join("config-state.json"),
     )
+    .expect("compose the runtime-backed service")
 }
 
 fn mob_definition() -> MobDefinition {

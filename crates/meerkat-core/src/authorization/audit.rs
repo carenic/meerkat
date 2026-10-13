@@ -99,3 +99,144 @@ impl std::fmt::Debug for OperationObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("operation observation unavailable")]
 pub struct OperationObservationError;
+
+/// Bound on the already-run provider-native tools a withholding record lists.
+pub const MANDATORY_HOOK_PROVIDER_NATIVE_TOOLS: usize = 16;
+/// A provider-owned dynamic tool name longer than this is omitted, never
+/// truncated into an exact-looking prefix.
+pub const MANDATORY_HOOK_PROVIDER_NATIVE_NAME_BYTES: usize = 128;
+/// A configured hook id longer than this is omitted.
+pub const MANDATORY_HOOK_ID_BYTES: usize = 1024;
+
+/// Typed historical facts that a mandatory hook withheld the dependent effects
+/// of one model operation. Bounded: it carries no hook free text or payload,
+/// no request and no response content. It is not a permission decision, and
+/// decoding it grants nothing and replays nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MandatoryHookWithholding {
+    /// The run-local model operation sequence minted by the agent loop.
+    pub sequence: u64,
+    /// Absent when the configured id exceeded the bound.
+    pub hook_id: Option<crate::hooks::HookId>,
+    pub hook_id_omitted: bool,
+    pub point: crate::hooks::HookPoint,
+    pub cause: MandatoryHookCause,
+    pub effect: MandatoryHookWithheldEffect,
+}
+
+/// Why the mandatory prerequisite did not pass. A hook verdict or a typed
+/// confinement refusal, never an authorization refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MandatoryHookCause {
+    Denied {
+        reason_code: crate::hooks::HookReasonCode,
+    },
+    LaunchRefused {
+        refusal: crate::confinement::ConfinementRefusal,
+    },
+}
+
+/// What was withheld, at the boundary where the hook actually ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MandatoryHookWithheldEffect {
+    /// PreLlm: this model request was never sent.
+    RequestNotSent,
+    /// PostLlm: the response already exists. Only its later local tool
+    /// dispatch and its conversation commit were withheld; transport,
+    /// produced text and provider-native effects are not undone.
+    LocalDispatchAndCommitWithheld {
+        local_tool_calls: u64,
+        /// A text body was produced; whether a delta reached a subscriber is
+        /// not claimed here.
+        text_output_produced: bool,
+        provider_native_tools: Vec<MandatoryHookProviderTool>,
+        provider_native_tools_total: u64,
+        provider_native_tools_omitted: u64,
+    },
+}
+
+/// One already-run provider-native tool, by typed kind. An oversized dynamic
+/// name is replaced by an explicit omission marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MandatoryHookProviderTool {
+    pub tool: Option<crate::types::ServerToolKind>,
+    pub name_omitted: bool,
+}
+
+impl MandatoryHookProviderTool {
+    /// Bounded projection of already-run provider-native tools, with the
+    /// number of entries not listed.
+    #[must_use]
+    pub fn bounded(tools: &[crate::types::ServerToolKind]) -> (Vec<Self>, u64) {
+        let listed = tools
+            .iter()
+            .take(MANDATORY_HOOK_PROVIDER_NATIVE_TOOLS)
+            .map(|kind| match kind {
+                crate::types::ServerToolKind::ProviderNative { name }
+                    if name.len() > MANDATORY_HOOK_PROVIDER_NATIVE_NAME_BYTES =>
+                {
+                    Self {
+                        tool: None,
+                        name_omitted: true,
+                    }
+                }
+                kind => Self {
+                    tool: Some(kind.clone()),
+                    name_omitted: false,
+                },
+            })
+            .collect();
+        let omitted = tools
+            .len()
+            .saturating_sub(MANDATORY_HOOK_PROVIDER_NATIVE_TOOLS);
+        (listed, u64::try_from(omitted).unwrap_or(u64::MAX))
+    }
+}
+
+/// A withholding observation bound to the actual model candidate and the
+/// retained work's execution scope. Only the work context constructs it, so a
+/// caller cannot choose another scope.
+#[derive(Debug, Clone)]
+pub struct MandatoryHookWithholdingRecord {
+    operation_id: crate::OperationId,
+    execution_scope: crate::exact_operation::OperationExecutionScope,
+    run_id: Option<crate::RunId>,
+    withholding: MandatoryHookWithholding,
+}
+
+impl MandatoryHookWithholdingRecord {
+    pub(crate) fn new(
+        operation_id: crate::OperationId,
+        execution_scope: crate::exact_operation::OperationExecutionScope,
+        run_id: Option<crate::RunId>,
+        withholding: MandatoryHookWithholding,
+    ) -> Self {
+        Self {
+            operation_id,
+            execution_scope,
+            run_id,
+            withholding,
+        }
+    }
+
+    /// The actual candidate operation, reserved before its pre-hook.
+    pub fn operation_id(&self) -> &crate::OperationId {
+        &self.operation_id
+    }
+
+    pub fn execution_scope(&self) -> &crate::exact_operation::OperationExecutionScope {
+        &self.execution_scope
+    }
+
+    pub fn run_id(&self) -> Option<&crate::RunId> {
+        self.run_id.as_ref()
+    }
+
+    pub fn withholding(&self) -> &MandatoryHookWithholding {
+        &self.withholding
+    }
+}

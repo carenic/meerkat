@@ -4,7 +4,8 @@
 //! and applies pending inbox rows through a host: job rows recipient by
 //! recipient, continuation rows into the session serving their address. It
 //! is woken only by typed signals: a job outbox commit, a runtime delivery commit, a runtime
-//! attachment becoming serving and a run settlement. Arming runs one
+//! attachment becoming serving, a run settlement and a source change of the
+//! host's continuation services. Arming runs one
 //! reconcile pass over the stores first. A row whose application fails stays
 //! pending and is retried on the next wake that names its runtime, or on the
 //! next arming.
@@ -25,11 +26,18 @@
 //! how long a missed notification or a dead peer's released claim can delay
 //! a delivery; it is not a correctness mechanism (custody stays with the
 //! hosting claims and the delivery CAS).
+//!
+//! A host whose producers owe continuations it commits for them (consent
+//! notices) has them projected in rounds
+//! ([`RuntimeDeliveryHost::project_owed_continuations`]): a reconcile or a
+//! source change starts one, and it runs one finite page per pass, before
+//! the pass collects the inbox, until its enumeration ends.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::{BoxFuture, FutureExt as _, Shared};
 use meerkat_core::SessionId;
 use meerkat_jobs::DetachedJobStore;
 use meerkat_runtime::{
@@ -99,6 +107,82 @@ pub trait RuntimeDeliveryHost: Send + Sync {
     fn retained_job_source(&self) -> Option<Arc<dyn crate::RetainedJobSource>> {
         None
     }
+
+    /// Whether this host's producers owe continuations it projects
+    /// ([`Self::project_owed_continuations`]). For such a host a source
+    /// change starts a projection round whether or not anything is blocked,
+    /// so an obligation committed after the owner armed is projected on its
+    /// hint. Run settlements and attachments never start one.
+    fn projects_owed_continuations(&self) -> bool {
+        false
+    }
+
+    /// Changes of the source behind [`Self::project_owed_continuations`],
+    /// subscribed once when the owner arms. Every advance wakes the owner
+    /// exactly as a continuation-source change does: it retries what is
+    /// blocked and starts a round of the owed continuations (or asks for one
+    /// more), so an obligation the source commits and announces after the
+    /// owner armed is projected without a reconcile. Only a wake, never a
+    /// fact. `None`, the default, for a source that announces nothing.
+    fn subscribe_owed_continuation_changes(&self) -> Option<watch::Receiver<u64>> {
+        None
+    }
+
+    /// Commit, idempotently by their continuation keys, the rows of the
+    /// obligations on ONE page of the host's enumeration of what its
+    /// producers owe: at most `limit` obligations, starting after `after`
+    /// (from the first when `None`). Only rows this call commits count; an
+    /// obligation whose row is already committed stays owed until its
+    /// admission and counts nothing.
+    ///
+    /// The owner calls it once per pass, before it collects the inbox, so
+    /// the rows committed here drain in the same pass. A round starts on the
+    /// arming reconcile, on every reconcile and on every source change, and
+    /// continues page by page, one per pass, until a page reports no
+    /// [`OwedContinuationProjection::next`]; it is never repeated because
+    /// a page committed rows. The enumeration must be in a stable order and
+    /// each page's `next` past its start, so that a round reaches its end
+    /// and visits every obligation owed throughout it.
+    async fn project_owed_continuations(
+        &self,
+        after: Option<&OwedContinuationCursor>,
+        limit: usize,
+    ) -> OwedContinuationProjection {
+        let _ = (after, limit);
+        OwedContinuationProjection::default()
+    }
+}
+
+/// Where a host's enumeration of owed continuations continues. Opaque to the
+/// owner, which hands the one a page returned to the next page of the same
+/// round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwedContinuationCursor(String);
+
+impl OwedContinuationCursor {
+    pub fn new(position: impl Into<String>) -> Self {
+        Self(position.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// What one page of [`RuntimeDeliveryHost::project_owed_continuations`]
+/// did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwedContinuationProjection {
+    /// Rows this page committed; an obligation whose row was already
+    /// committed is not counted.
+    pub committed: usize,
+    /// Obligations of this page that could not be committed now, or an
+    /// enumeration that could not be read: each stays owed, and the next
+    /// wake after the round starts another.
+    pub failures: Vec<String>,
+    /// Where the next page of this round starts, when the enumeration goes
+    /// on past this page; `None` ends the round.
+    pub next: Option<OwedContinuationCursor>,
 }
 
 /// Session addresses are served by their session; nothing else is.
@@ -120,6 +204,9 @@ pub struct RuntimeDeliveryPass {
     pub generation: u64,
     /// Outbox entries projected into the inbox this pass.
     pub projected: usize,
+    /// Rows of owed continuations the host committed this pass: one page
+    /// of a round ([`RuntimeDeliveryHost::project_owed_continuations`]).
+    pub owed_projected: usize,
     /// Inbox rows applied this pass.
     pub applied: usize,
     /// Continuation rows settled as refused this pass: terminal policy
@@ -153,6 +240,7 @@ pub struct RuntimeDeliveryOwner {
     runtime_inbox: RuntimeDeliveryInbox,
     attachment_commits: Option<watch::Receiver<u64>>,
     run_settlements: Option<watch::Receiver<u64>>,
+    source_changes: Option<watch::Receiver<u64>>,
     store_sweep: Duration,
 }
 
@@ -170,6 +258,7 @@ impl RuntimeDeliveryOwner {
             runtime_inbox,
             attachment_commits: None,
             run_settlements: None,
+            source_changes: None,
             store_sweep: DEFAULT_STORE_SWEEP,
         }
     }
@@ -196,6 +285,23 @@ impl RuntimeDeliveryOwner {
     #[must_use]
     pub fn with_run_settlements(mut self, run_settlements: watch::Receiver<u64>) -> Self {
         self.run_settlements = Some(run_settlements);
+        self
+    }
+
+    /// Also retry blocked deliveries when the host's continuation sources
+    /// change, from
+    /// [`crate::ContinuationHostBindings::subscribe_source_changes`]: the
+    /// services were bound or rebound, or the bound job owner announced that
+    /// its custody may have changed. A retained completion stays blocked
+    /// while its job owner cannot answer, and no attachment or run signal
+    /// says when it can. Subscribe before arming, so a change after the
+    /// arming reconcile is never missed. The signal is only a wake, never a
+    /// fact: the retry asks the source again, and its revision is scheduling
+    /// information only. When the bindings are gone the signal ends and the
+    /// owner keeps running on its other signals.
+    #[must_use]
+    pub fn with_source_changes(mut self, source_changes: watch::Receiver<u64>) -> Self {
+        self.source_changes = Some(source_changes);
         self
     }
 
@@ -229,6 +335,9 @@ impl RuntimeDeliveryOwner {
         // seen by the pass or ticks the watch (at worst at the next sweep).
         let store_watch = StoreWake::start(&capability, self.store_sweep);
         let cold = meerkat_runtime::try_cold_delivery_ownership(&capability);
+        let (stop, stop_rx) = watch::channel(false);
+        let projects_owed = host.projects_owed_continuations();
+        let owed_changes = host.subscribe_owed_continuation_changes();
         let task = tokio::spawn(run_owner(OwnerLoop {
             projector: JobOutboxProjector::new(self.job_store, self.runtime_inbox.clone()),
             ownership,
@@ -238,16 +347,22 @@ impl RuntimeDeliveryOwner {
             inbox_commits,
             attachment_commits: self.attachment_commits,
             run_settlements: self.run_settlements,
+            source_changes: self.source_changes,
+            owed_changes,
+            projects_owed,
             passes,
             capability,
             store_watch,
             last_delivery_generation: None,
             cold,
             awaiting: HashMap::new(),
+            stop: Some(stop_rx),
+            owed_round: None,
         }));
         Ok(RuntimeDeliveryOwnerHandle {
-            task: Some(task),
+            task: Some(OwnerTask::new(task)),
             passes: passes_rx,
+            stop,
         })
     }
 }
@@ -255,8 +370,71 @@ impl RuntimeDeliveryOwner {
 /// A running owner. Dropping it stops the owner and releases the inbox,
 /// unless it was [detached](Self::detach).
 pub struct RuntimeDeliveryOwnerHandle {
-    task: Option<tokio::task::JoinHandle<()>>,
+    task: Option<OwnerTask>,
     passes: watch::Receiver<RuntimeDeliveryPass>,
+    /// Retirement's stop request. Dropping it (a detached owner) is not one.
+    stop: watch::Sender<bool>,
+}
+
+/// The owner's task: aborted when its handle drops, and joined by every
+/// retirement through one shared join of the task.
+struct OwnerTask {
+    abort: tokio::task::AbortHandle,
+    joined: Shared<BoxFuture<'static, ()>>,
+}
+
+impl OwnerTask {
+    fn new(task: tokio::task::JoinHandle<()>) -> Self {
+        let abort = task.abort_handle();
+        let joined = async move {
+            if let Err(error) = task.await
+                && error.is_panic()
+            {
+                tracing::warn!(%error, "runtime delivery owner task panicked");
+            }
+        }
+        .boxed()
+        .shared();
+        Self { abort, joined }
+    }
+}
+
+/// A wait on a retiring owner's task, from
+/// [`RuntimeDeliveryOwnerHandle::retire`].
+#[must_use = "a retirement is confirmed only once joined"]
+pub struct RuntimeDeliveryOwnerRetirement {
+    joined: Option<Shared<BoxFuture<'static, ()>>>,
+}
+
+impl std::fmt::Debug for RuntimeDeliveryOwnerRetirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeDeliveryOwnerRetirement")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RuntimeDeliveryOwnerRetirement {
+    /// Join the owner's task within `bound`. A joined owner has released the
+    /// inbox, its store watch and any cold-delivery claim.
+    pub async fn join(
+        self,
+        bound: Duration,
+    ) -> Result<(), RuntimeDeliveryOwnerRetirementIncomplete> {
+        let Some(joined) = self.joined else {
+            return Ok(());
+        };
+        tokio::time::timeout(bound, joined)
+            .await
+            .map_err(|_| RuntimeDeliveryOwnerRetirementIncomplete { bound })
+    }
+}
+
+/// The delivery owner's task did not stop within its retirement bound. Its
+/// handle keeps the task, so a later retirement joins the same task.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("the runtime delivery owner did not stop within {bound:?}")]
+pub struct RuntimeDeliveryOwnerRetirementIncomplete {
+    pub bound: Duration,
 }
 
 impl std::fmt::Debug for RuntimeDeliveryOwnerHandle {
@@ -276,19 +454,33 @@ impl RuntimeDeliveryOwnerHandle {
     pub fn is_stopped(&self) -> bool {
         self.task
             .as_ref()
-            .is_none_or(tokio::task::JoinHandle::is_finished)
+            .is_none_or(|task| task.abort.is_finished())
     }
 
     /// Let the owner run on its own until its host or its runtime is gone.
     pub fn detach(mut self) {
         self.task = None;
     }
+
+    /// Ask the owner to stop, and wait on its task through the returned
+    /// retirement.
+    ///
+    /// No pass starts after the request; a pass already running completes.
+    /// Every retirement of one owner joins the same task, which this handle
+    /// keeps: a wait that ends early, past its bound or cancelled, leaves
+    /// the owner and its custody here for the next retirement.
+    pub fn retire(&self) -> RuntimeDeliveryOwnerRetirement {
+        self.stop.send_replace(true);
+        RuntimeDeliveryOwnerRetirement {
+            joined: self.task.as_ref().map(|task| task.joined.clone()),
+        }
+    }
 }
 
 impl Drop for RuntimeDeliveryOwnerHandle {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
-            task.abort();
+            task.abort.abort();
         }
     }
 }
@@ -380,6 +572,17 @@ struct OwnerLoop {
     inbox_commits: watch::Receiver<u64>,
     attachment_commits: Option<watch::Receiver<u64>>,
     run_settlements: Option<watch::Receiver<u64>>,
+    /// The host's continuation source hint; `None` once its bindings are
+    /// gone.
+    source_changes: Option<watch::Receiver<u64>>,
+    /// The owing source's own change signal
+    /// ([`RuntimeDeliveryHost::subscribe_owed_continuation_changes`]), read
+    /// as a source change; `None` once the source is gone or when it
+    /// announces nothing.
+    owed_changes: Option<watch::Receiver<u64>>,
+    /// The host projects owed continuations: a reconcile or a source change
+    /// starts a round of them, whether or not anything is blocked.
+    projects_owed: bool,
     passes: watch::Sender<RuntimeDeliveryPass>,
     capability: HostingCapability,
     store_watch: StoreWake,
@@ -387,12 +590,33 @@ struct OwnerLoop {
     /// tick reconciles only when it moved.
     last_delivery_generation: Option<u64>,
     cold: ColdDeliveryOwnership,
+    /// The handle's retirement request. `None` once the handle is gone
+    /// without one (detached): the owner then runs on its other signals.
+    stop: Option<watch::Receiver<bool>>,
     /// Delivery runtimes whose next row waits on recipients this process
     /// did not apply. A store tick re-routes the recipients (registry reads
     /// only) and retries a runtime once one became this process's to apply:
     /// served here, or cold while this process is the cold-delivery owner
     /// (its claim attempt then decides).
     awaiting: HashMap<LogicalRuntimeId, AwaitingWait>,
+    /// The round of the host's owed continuations in progress, if any.
+    owed_round: Option<OwedRound>,
+}
+
+/// One enumeration of a host's owed continuations, a page per pass, from
+/// its first page to a page that reports no next one. Started by a reconcile
+/// or a source change; each following pass continues it without waiting for
+/// a signal. Obligations stay owed until their admission, so a round is
+/// never repeated because a page committed rows: it ends at the end of the
+/// enumeration, and only a later reconcile or source change starts another.
+#[derive(Debug, Default)]
+struct OwedRound {
+    /// Where the next page starts; `None` for the first.
+    after: Option<OwedContinuationCursor>,
+    /// A reconcile or source change arrived after this round started. What
+    /// it announces may sit before the cursor, so one more round follows
+    /// this one, from the first page.
+    again: bool,
 }
 
 /// What a waiting delivery runtime waits on.
@@ -476,9 +700,16 @@ struct Wake {
     reconcile: bool,
     job_commit: bool,
     inbox_commit: bool,
-    /// An attachment committed or a run may have ended: retry blocked
-    /// sessions.
-    attachment_commit: bool,
+    /// Retry blocked deliveries: an attachment committed, a run may have
+    /// ended, or the host's continuation sources may have changed (bound,
+    /// rebound or an announced custody change). Scheduling only: each retry
+    /// re-reads the facts it applies by.
+    retry_blocked: bool,
+    /// The host's continuation sources may have changed. Besides retrying
+    /// blocked rows, it starts a round of a projecting host's owed
+    /// continuations (or asks for one more), whether or not anything is
+    /// blocked: a newly committed obligation announces itself this way.
+    source_change: bool,
     /// The shared store's watch ticked: answer with cheap reads.
     store_tick: bool,
 }
@@ -492,25 +723,47 @@ async fn run_owner(mut owner: OwnerLoop) {
     };
     let mut generation = 0_u64;
     let mut reported_failures: Vec<String> = Vec::new();
+    // A reconcile read that failed during a round of owed continuations:
+    // owed to the first wake after the round, like any failed reconcile.
+    let mut reconcile_owed = false;
     loop {
-        // Mark the job and attachment signals seen BEFORE reading the
-        // authority they announce, so a commit that lands during this pass
-        // wakes the next one. The inbox signal is marked inside the pass.
-        wake.job_commit |= owner.job_commits.has_changed().unwrap_or(false);
-        owner.job_commits.borrow_and_update();
+        // A retired owner starts no pass, whichever signal woke it.
+        if owner.stop.as_ref().is_some_and(|stop| *stop.borrow()) {
+            return;
+        }
+        // Capture and mark the job, attachment and settlement signals in one
+        // step each, BEFORE reading the authority they announce: a commit
+        // published before the mark is read by this pass, and one published
+        // after it moves the signal again and wakes the next, so none is
+        // swallowed. Each borrow ends with its statement. The inbox signal is
+        // marked inside the pass.
+        wake.job_commit |= owner.job_commits.borrow_and_update().has_changed();
         if let Some(attachments) = owner.attachment_commits.as_mut() {
-            wake.attachment_commit |= attachments.has_changed().unwrap_or(false);
-            attachments.borrow_and_update();
+            wake.retry_blocked |= attachments.borrow_and_update().has_changed();
         }
         if let Some(settlements) = owner.run_settlements.as_mut() {
-            wake.attachment_commit |= settlements.has_changed().unwrap_or(false);
-            settlements.borrow_and_update();
+            wake.retry_blocked |= settlements.borrow_and_update().has_changed();
+        }
+        // Capture and mark the source revision in one step, before this
+        // pass reads any fact: a change published before the mark is read
+        // by this pass, and one published after it moves the revision again
+        // and wakes the next, so none is swallowed. The borrow ends with
+        // this statement, before any lock or await.
+        if let Some(sources) = owner.source_changes.as_mut() {
+            let changed = sources.borrow_and_update().has_changed();
+            wake.retry_blocked |= changed;
+            wake.source_change |= changed;
+        }
+        if let Some(owed) = owner.owed_changes.as_mut() {
+            let changed = owed.borrow_and_update().has_changed();
+            wake.retry_blocked |= changed;
+            wake.source_change |= changed;
         }
         wake.inbox_commit |= owner.inbox_commits.has_changed().unwrap_or(false);
         #[cfg(not(target_arch = "wasm32"))]
         if let StoreWake::Watching { ticks, .. } = &mut owner.store_watch {
-            wake.store_tick |= ticks.has_changed().unwrap_or(false);
-            ticks.borrow_and_update();
+            // Captured and marked in one step, as above.
+            wake.store_tick |= ticks.borrow_and_update().has_changed();
         }
         let due = if wake.store_tick {
             match owner.answer_store_tick(&mut wake).await {
@@ -522,13 +775,24 @@ async fn run_owner(mut owner: OwnerLoop) {
             Vec::new()
         };
 
+        // A reconcile (the arming one first) or a source change starts a
+        // round of the host's owed continuations, or asks for one more after
+        // the round in progress. Run settlements and attachments never do.
+        if owner.projects_owed && (wake.reconcile || wake.source_change) {
+            match owner.owed_round.as_mut() {
+                Some(round) => round.again = true,
+                None => owner.owed_round = Some(OwedRound::default()),
+            }
+        }
+
         // A retry signal with nothing blocked has nothing to do: run
         // settlements fire on every runtime loop iteration.
         let has_work = wake.reconcile
             || wake.job_commit
             || wake.inbox_commit
-            || (wake.attachment_commit
+            || (wake.retry_blocked
                 && (!blocked.is_empty() || owner.awaiting.values().any(|wait| wait.via_address)))
+            || owner.owed_round.is_some()
             || !due.is_empty();
         let mut reconcile_failed = false;
         if has_work {
@@ -557,9 +821,18 @@ async fn run_owner(mut owner: OwnerLoop) {
             owner.passes.send_replace(pass);
         }
 
+        if owner.owed_round.is_some() {
+            // The round goes on with its next page in the next pass, which
+            // no signal announces. Every page moves the cursor on and the
+            // round ends with its enumeration, so this never spins; a failed
+            // reconcile read waits for the first wake after the round.
+            reconcile_owed |= reconcile_failed;
+            wake = Wake::default();
+            continue;
+        }
         // A failed reconcile read stays owed to the next wake.
         wake = Wake {
-            reconcile: reconcile_failed,
+            reconcile: reconcile_failed || std::mem::take(&mut reconcile_owed),
             ..Wake::default()
         };
         tokio::select! {
@@ -580,13 +853,34 @@ async fn run_owner(mut owner: OwnerLoop) {
                 if changed.is_err() {
                     return;
                 }
-                wake.attachment_commit = true;
+                wake.retry_blocked = true;
             }
             changed = optional_changed(&mut owner.run_settlements) => {
                 if changed.is_err() {
                     return;
                 }
-                wake.attachment_commit = true;
+                wake.retry_blocked = true;
+            }
+            changed = optional_changed(&mut owner.source_changes) => {
+                if changed.is_ok() {
+                    wake.retry_blocked = true;
+                    wake.source_change = true;
+                } else {
+                    // The bindings are gone: their hint ends here, once, and
+                    // is not polled again. It never stops the owner: the
+                    // host and the runtime signals keep their lifetime
+                    // checks, and the other wakes keep serving.
+                    owner.source_changes = None;
+                }
+            }
+            changed = optional_changed(&mut owner.owed_changes) => {
+                if changed.is_ok() {
+                    wake.retry_blocked = true;
+                    wake.source_change = true;
+                } else {
+                    // The owing source is gone: its hint ends here, once.
+                    owner.owed_changes = None;
+                }
             }
             changed = owner.store_watch.tick() => {
                 // The watch's sender lives as long as the watch this loop
@@ -601,12 +895,19 @@ async fn run_owner(mut owner: OwnerLoop) {
                     wake.reconcile = true;
                 }
             }
+            changed = optional_changed(&mut owner.stop) => {
+                // The loop's top returns on a retirement request. A handle
+                // gone without one was detached: its owner runs on.
+                if changed.is_err() {
+                    owner.stop = None;
+                }
+            }
         }
     }
 }
 
-async fn optional_changed(
-    signal: &mut Option<watch::Receiver<u64>>,
+async fn optional_changed<T>(
+    signal: &mut Option<watch::Receiver<T>>,
 ) -> Result<(), watch::error::RecvError> {
     match signal {
         Some(signal) => signal.changed().await,
@@ -648,6 +949,28 @@ async fn run_pass(
             }
         }
     }
+    // One page of the round of owed continuations in progress (see
+    // `OwedRound`), before the inbox is collected, so the rows it commits
+    // drain in this pass.
+    if let Some(round) = owner.owed_round.take() {
+        let projection = owner
+            .host
+            .project_owed_continuations(round.after.as_ref(), DELIVERY_PAGE)
+            .await;
+        pass.owed_projected += projection.committed;
+        if !projection.failures.is_empty() {
+            reconcile_failed = true;
+        }
+        pass.failures.extend(projection.failures);
+        owner.owed_round = match projection.next {
+            Some(next) => Some(OwedRound {
+                after: Some(next),
+                again: round.again,
+            }),
+            None if round.again => Some(OwedRound::default()),
+            None => None,
+        };
+    }
 
     let mut runtimes: Vec<LogicalRuntimeId> = Vec::new();
     if wake.reconcile {
@@ -683,11 +1006,12 @@ async fn run_pass(
     // in the set taken here wakes the next pass.
     owner.inbox_commits.borrow_and_update();
     runtimes.extend(owner.ownership.take_committed_runtimes());
-    if wake.attachment_commit {
+    if wake.retry_blocked {
         runtimes.extend(blocked.keys().cloned());
         // A continuation address waiting on another host may now be served
         // here by another session (an attachment is the host's mapping
-        // change): retry it with a fresh resolution.
+        // change, and a rebinding replaces its address resolver): retry it
+        // with a fresh resolution.
         runtimes.extend(
             owner
                 .awaiting
@@ -799,7 +1123,7 @@ enum ServingSession {
     /// address resolution.
     Address(SessionId),
     /// A live owner no session serves at the moment: retried on the next
-    /// attachment commit or run settlement.
+    /// attachment commit, run settlement or source change.
     NotServed,
     /// No pending row this owner drains: empty, foreign, or a retired owner
     /// whose rows are stranded.

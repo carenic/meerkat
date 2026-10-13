@@ -51,6 +51,11 @@ pub enum PersistenceError {
     Runtime(#[from] RuntimeStoreError),
     #[error(transparent)]
     RuntimeAuthority(#[from] meerkat_runtime::RuntimeDriverError),
+    /// The realm is governed: its posture was selected durably, and it opens
+    /// only with its governed composition, never as an ordinary realm.
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    #[error("realm '{realm_id}' is governed and cannot be opened as an ordinary realm")]
+    RealmGoverned { realm_id: String },
     #[error(transparent)]
     WorkGraph(#[from] meerkat_workgraph::WorkGraphError),
     #[error(transparent)]
@@ -224,6 +229,17 @@ pub struct PersistenceBundle {
     /// Continuation services bound once the host's mob runtime exists.
     #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
     continuation_bindings: Arc<crate::ContinuationHostBindings>,
+    /// The stock host composition of a stock-governed realm.
+    #[cfg(all(
+        feature = "session-store",
+        feature = "local-authorization",
+        not(target_arch = "wasm32")
+    ))]
+    stock_governance: Option<Arc<crate::governed_realm::stock::StockGovernance>>,
+    /// The persistence's one approval issuer, selected once
+    /// ([`crate::ApprovalIssuerSelection`]) before the bundle is shared.
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    approval_issuer: meerkat_core::ApprovalService,
 }
 
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
@@ -324,6 +340,12 @@ impl PersistenceBundle {
         let session_persistence_profile = runtime_store.session_persistence_profile();
         let runtime_delivery_inbox =
             meerkat_runtime::RuntimeDeliveryInbox::new(runtime_store.clone());
+        // The bundle's delivery owners hear this runtime's runless input
+        // terminals as continuation-source changes.
+        #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+        let continuation_bindings = Arc::<crate::ContinuationHostBindings>::default();
+        #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+        continuation_bindings.announce_runless_input_terminals_of(&runtime_adapter);
         Self {
             #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
             manifest: None,
@@ -344,7 +366,19 @@ impl PersistenceBundle {
             projector: None,
             runtime_adapter,
             #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
-            continuation_bindings: Arc::default(),
+            continuation_bindings,
+            #[cfg(all(
+                feature = "session-store",
+                feature = "local-authorization",
+                not(target_arch = "wasm32")
+            ))]
+            stock_governance: None,
+            // A bundle composed from stores alone has no store path, so its
+            // approvals are process-local. An opened realm and a host's
+            // prepared composition select theirs before the bundle is shared
+            // ([`assemble_persistence_bundle`]).
+            #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+            approval_issuer: crate::ApprovalIssuerSelection::Ephemeral.open(),
         }
     }
 
@@ -398,14 +432,16 @@ impl PersistenceBundle {
         store_path: PathBuf,
         projection_root: PathBuf,
         stores: RealmSubsystemStores,
+        runtime_adapter: Arc<MeerkatMachine>,
     ) -> Result<Self, meerkat_runtime::RuntimeDriverError> {
-        let mut bundle = Self::new_with_subsystem_stores(
+        let mut bundle = Self::from_runtime_adapter(
             stores.session_store,
             stores.runtime_store,
             stores.blob_store,
             stores.schedule_store,
             stores.workgraph_store,
-        )?;
+            runtime_adapter,
+        );
         bundle.job_store = stores.job_store;
         let event_store: Arc<dyn EventStore> = Arc::new(FileEventStore::new(
             projection_root.join(".rkat").join("events"),
@@ -470,8 +506,44 @@ impl PersistenceBundle {
     /// The continuation services this bundle's host binds once its mob
     /// runtime exists; shared by every clone of the bundle.
     #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    /// The stock host composition when this bundle opened a stock-governed
+    /// realm; its prompts must be bound through it.
+    #[cfg(all(
+        feature = "session-store",
+        feature = "local-authorization",
+        not(target_arch = "wasm32")
+    ))]
+    pub fn stock_governance(&self) -> Option<&Arc<crate::governed_realm::stock::StockGovernance>> {
+        self.stock_governance.as_ref()
+    }
+
+    #[cfg(all(
+        feature = "session-store",
+        feature = "local-authorization",
+        not(target_arch = "wasm32")
+    ))]
+    pub(crate) fn set_stock_governance(
+        &mut self,
+        stock: Option<Arc<crate::governed_realm::stock::StockGovernance>>,
+    ) {
+        self.stock_governance = stock;
+    }
+
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
     pub fn continuation_bindings(&self) -> Arc<crate::ContinuationHostBindings> {
         Arc::clone(&self.continuation_bindings)
+    }
+
+    /// The persistence's one approval issuer: every surface, the operation
+    /// review, decision ingress, recovery and delivery over this bundle take
+    /// a clone of this one owner, never a service of their own. An opened
+    /// realm's issuer keeps its durable `approvals.json` under the realm's
+    /// store path; a host's prepared composition carries the selection the
+    /// host made ([`crate::governed_realm::stock_host::PreparedStockHost::construct`]);
+    /// a bundle composed from stores alone has process-local approvals.
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    pub fn approval_issuer(&self) -> meerkat_core::ApprovalService {
+        self.approval_issuer.clone()
     }
 
     /// Require the realm's declared hosting mode (#1813). `Multiprocess`
@@ -520,6 +592,7 @@ impl PersistenceBundle {
         )
         .with_attachment_commits(self.runtime_adapter.subscribe_attachment_commits())
         .with_run_settlements(self.runtime_adapter.subscribe_run_settlements())
+        .with_source_changes(self.continuation_bindings.subscribe_source_changes())
     }
 
     #[cfg(feature = "session-store")]
@@ -1208,6 +1281,180 @@ pub async fn open_realm_persistence_with_provider(
     origin_hint: Option<RealmOrigin>,
     layout: Option<meerkat_core::StorageLayout>,
 ) -> Result<(meerkat_store::RealmManifestPin, PersistenceBundle), PersistenceError> {
+    let opened = open_realm_persistence_with_provider_and_machine(
+        provider,
+        realms_root,
+        realm_id,
+        backend_hint,
+        origin_hint,
+        layout,
+        |runtime_store, blob_store, _paths| async move {
+            MeerkatMachine::persistent(runtime_store, blob_store)
+        },
+    )
+    .await?;
+    refuse_governed_posture(realms_root, realm_id).await?;
+    Ok(opened)
+}
+
+/// An ordinary open is valid only for a realm that is not governed. The
+/// posture is read while the opened bundle holds the realm's execution
+/// custody: governing a realm takes exclusive custody before it publishes
+/// the posture, so a realm read as ungoverned here stays so while this
+/// owner runs, and one governed meanwhile is refused (the caller's bundle is
+/// dropped with the error). Every build refuses, including one without
+/// governed support.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+pub(crate) async fn refuse_governed_posture(
+    realms_root: &std::path::Path,
+    realm_id: &str,
+) -> Result<(), PersistenceError> {
+    match meerkat_store::read_realm_posture_in(realms_root, realm_id).await? {
+        meerkat_store::RealmPosture::Governed => Err(PersistenceError::RealmGoverned {
+            realm_id: realm_id.to_string(),
+        }),
+        meerkat_store::RealmPosture::Ungoverned | meerkat_store::RealmPosture::NotMaterialized => {
+            Ok(())
+        }
+    }
+}
+
+/// [`open_realm_persistence_with_provider`] with the realm's sole runtime
+/// machine built by `build_machine`, after the manifest admission, the store
+/// set, durability and the session persistence profile checks, from the
+/// opened runtime and blob stores and the realm's paths. Every subsystem
+/// store, the manifest, store path and projection are composed unchanged.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+pub(crate) async fn open_realm_persistence_with_provider_and_machine<F>(
+    provider: &dyn crate::storage_provider::RealmStorageProvider,
+    realms_root: &std::path::Path,
+    realm_id: &str,
+    backend_hint: Option<RealmBackend>,
+    origin_hint: Option<RealmOrigin>,
+    layout: Option<meerkat_core::StorageLayout>,
+    build_machine: impl FnOnce(
+        Arc<dyn RuntimeStore>,
+        Arc<dyn BlobStore>,
+        meerkat_store::RealmPaths,
+    ) -> F,
+) -> Result<(meerkat_store::RealmManifestPin, PersistenceBundle), PersistenceError>
+where
+    F: std::future::Future<Output = Result<MeerkatMachine, meerkat_runtime::RuntimeDriverError>>,
+{
+    let stores = stage_realm_persistence_stores(
+        provider,
+        realms_root,
+        realm_id,
+        backend_hint,
+        origin_hint,
+        layout,
+    )
+    .await?;
+    let runtime_adapter = Arc::new(
+        build_machine(
+            stores.runtime_store(),
+            stores.blob_store(),
+            stores.paths().clone(),
+        )
+        .await?,
+    );
+    assemble_realm_persistence_bundle(stores, runtime_adapter)
+}
+
+/// A realm's opened and admitted stores before its runtime machine exists:
+/// the manifest admission, the provider's store set, durability and the
+/// session persistence profile checks are done. The bundle is assembled
+/// around the realm's one machine by [`assemble_realm_persistence_bundle`].
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+pub(crate) struct StagedRealmStores {
+    manifest: meerkat_store::RealmManifestPin,
+    set: crate::storage_provider::RealmStoreSet,
+    paths: meerkat_store::RealmPaths,
+}
+
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+impl StagedRealmStores {
+    pub(crate) fn runtime_store(&self) -> Arc<dyn RuntimeStore> {
+        Arc::clone(&self.set.runtime_store)
+    }
+
+    pub(crate) fn blob_store(&self) -> Arc<dyn BlobStore> {
+        Arc::clone(&self.set.blob_store)
+    }
+
+    pub(crate) fn paths(&self) -> &meerkat_store::RealmPaths {
+        &self.paths
+    }
+
+    /// The realm its builtin manifest names: the default realm a
+    /// runtime-backed service gives the builds of the assembled bundle.
+    #[cfg(feature = "local-authorization")]
+    pub(crate) fn manifest_realm_id(&self) -> Option<meerkat_core::RealmId> {
+        self.manifest
+            .as_builtin()
+            .map(|manifest| manifest.realm.clone())
+    }
+
+    /// A trusted host's own store set for the realm whose `manifest` and
+    /// `paths` name the host's association, admitted by the realm's own
+    /// checks ([`admit_store_set`]) and not opened through any provider.
+    #[cfg(feature = "local-authorization")]
+    pub(crate) fn host_supplied(
+        manifest: meerkat_store::RealmManifestPin,
+        set: crate::storage_provider::RealmStoreSet,
+        paths: meerkat_store::RealmPaths,
+    ) -> Result<Self, PersistenceError> {
+        admit_store_set(&set, &manifest)?;
+        Ok(Self {
+            manifest,
+            set,
+            paths,
+        })
+    }
+
+    /// Whether the set's own session or runtime store is persistent: such
+    /// a host's approvals are durable too.
+    #[cfg(feature = "local-authorization")]
+    pub(crate) fn is_persistent(&self) -> bool {
+        self.set.durability.iter().any(|declaration| {
+            matches!(declaration.domain.as_str(), "sessions" | "runtime")
+                && declaration.resolution == meerkat_core::DurabilityResolution::Persistent
+        })
+    }
+}
+
+/// The realm's checks on an opened store set: every durable slot is
+/// persistent unless the realm's manifest declares that domain ephemeral, and
+/// a head-canonical runtime store is paired with an incremental session store.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+fn admit_store_set(
+    set: &crate::storage_provider::RealmStoreSet,
+    manifest: &meerkat_store::RealmManifestPin,
+) -> Result<RuntimeSessionPersistenceProfile, PersistenceError> {
+    crate::storage_provider::enforce_fail_closed_durability(set, manifest.ephemeral_domains())?;
+    let profile = set.runtime_store.session_persistence_profile();
+    if profile == RuntimeSessionPersistenceProfile::HeadCanonicalV1
+        && Arc::clone(&set.session_store).as_incremental().is_none()
+    {
+        return Err(PersistenceError::SessionPersistenceProfileMismatch {
+            profile,
+            detail: "HeadCanonical requires an IncrementalSessionStore pairing".to_string(),
+        });
+    }
+    Ok(profile)
+}
+
+/// The first half of [`open_realm_persistence_with_provider_and_machine`]:
+/// everything before the realm's machine is built.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+pub(crate) async fn stage_realm_persistence_stores(
+    provider: &dyn crate::storage_provider::RealmStorageProvider,
+    realms_root: &std::path::Path,
+    realm_id: &str,
+    backend_hint: Option<RealmBackend>,
+    origin_hint: Option<RealmOrigin>,
+    layout: Option<meerkat_core::StorageLayout>,
+) -> Result<StagedRealmStores, PersistenceError> {
     // Provider-aware ensure: the disk provider keeps the historical
     // builtin-only semantics; a named external provider accepts (and
     // creates) exactly its own pins, so external realms are openable
@@ -1230,6 +1477,7 @@ pub async fn open_realm_persistence_with_provider(
     )
     .await?;
     let paths = realm_paths_in(realms_root, realm_id);
+    let machine_paths = paths.clone();
     let realm = meerkat_core::RealmId::parse(realm_id)
         .map_err(|_| StoreError::InvalidRealmSlug(realm_id.to_string()))?;
     let ctx = crate::storage_provider::RealmOpenContext {
@@ -1242,21 +1490,44 @@ pub async fn open_realm_persistence_with_provider(
         layout,
     };
     let set = provider.open(&ctx).await?;
-    crate::storage_provider::enforce_fail_closed_durability(&set, manifest.ephemeral_domains())?;
-    let profile = set.runtime_store.session_persistence_profile();
-    if profile == RuntimeSessionPersistenceProfile::HeadCanonicalV1
-        && Arc::clone(&set.session_store).as_incremental().is_none()
-    {
-        return Err(PersistenceError::SessionPersistenceProfileMismatch {
-            profile,
-            detail: "HeadCanonical requires an IncrementalSessionStore pairing".to_string(),
-        });
-    }
+    let profile = admit_store_set(&set, &manifest)?;
     if manifest.provider_name().is_some() {
         activate_external_head_canonical_store(&set.session_store, &set.runtime_store, profile)
             .await?;
     }
+    Ok(StagedRealmStores {
+        manifest,
+        set,
+        paths: machine_paths,
+    })
+}
 
+/// The second half of [`open_realm_persistence_with_provider_and_machine`]:
+/// compose every subsystem store, the manifest, store path and projection
+/// around the realm's sole runtime machine, unchanged. The realm's one
+/// approval issuer keeps its durable records under the realm's store path.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+pub(crate) fn assemble_realm_persistence_bundle(
+    stores: StagedRealmStores,
+    runtime_adapter: Arc<MeerkatMachine>,
+) -> Result<(meerkat_store::RealmManifestPin, PersistenceBundle), PersistenceError> {
+    let approvals = crate::ApprovalIssuerSelection::Persistent {
+        store_path: stores.set.store_path.clone(),
+    };
+    assemble_persistence_bundle(stores, runtime_adapter, &approvals)
+}
+
+/// [`assemble_realm_persistence_bundle`] with the persistence's one approval
+/// issuer opened, once, from `approvals`: the set's own job and artifact
+/// stores, one delivery inbox and one set of continuation bindings, and that
+/// issuer, all composed before the bundle is shared.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+pub(crate) fn assemble_persistence_bundle(
+    stores: StagedRealmStores,
+    runtime_adapter: Arc<MeerkatMachine>,
+    approvals: &crate::ApprovalIssuerSelection,
+) -> Result<(meerkat_store::RealmManifestPin, PersistenceBundle), PersistenceError> {
+    let StagedRealmStores { manifest, set, .. } = stores;
     let builtin_manifest = manifest.as_builtin().cloned();
     let mut bundle = if let (Some(projection_root), Some(builtin)) =
         (set.projection_root.clone(), builtin_manifest.clone())
@@ -1273,23 +1544,52 @@ pub async fn open_realm_persistence_with_provider(
                 workgraph_store: set.workgraph_store.clone(),
                 job_store: set.job_store.clone(),
             },
+            runtime_adapter,
         )?
     } else {
-        let mut bundle = PersistenceBundle::new_with_subsystem_stores(
+        let mut bundle = PersistenceBundle::from_runtime_adapter(
             set.session_store.clone(),
             set.runtime_store.clone(),
             set.blob_store.clone(),
             set.schedule_store.clone(),
             set.workgraph_store.clone(),
-        )?;
+            runtime_adapter,
+        );
         bundle.manifest = builtin_manifest;
         bundle.store_path = Some(set.store_path.clone());
         bundle.job_store = set.job_store.clone();
         bundle
     };
     bundle.artifact_store = set.artifact_store.clone();
+    bundle.approval_issuer = approvals.open();
 
     Ok((manifest, bundle))
+}
+
+/// The actual runtime database of the realm `manifest` pins at `paths`: the
+/// file [`open_disk_store_set`] opens the realm's runtime store over, whose
+/// governed execution custody is the realm's administrative custody. A memory
+/// realm or an external provider's realm has no such realm-wide database.
+#[cfg(all(
+    feature = "session-store",
+    feature = "local-authorization",
+    not(target_arch = "wasm32")
+))]
+pub(crate) fn realm_runtime_database(
+    manifest: &meerkat_store::RealmManifestPin,
+    paths: &meerkat_store::RealmPaths,
+) -> Result<PathBuf, &'static str> {
+    let Some(manifest) = manifest.as_builtin() else {
+        return Err("an external provider owns the realm's runtime store");
+    };
+    match manifest.backend {
+        // The SQLite backend's runtime store shares the session database.
+        RealmBackend::Sqlite => Ok(paths.sessions_sqlite_path.clone()),
+        RealmBackend::Jsonl => Ok(paths.runtime_sqlite_path.clone()),
+        RealmBackend::Memory => {
+            Err("a memory realm's execution custody belongs to each opened store")
+        }
+    }
 }
 
 /// The realm's session hosting paths (#1813), from its path authority. The
@@ -1524,6 +1824,7 @@ mod tests {
             manifest_format: 1,
             provider: None,
             ephemeral_domains: Vec::new(),
+            governance: None,
         };
         std::fs::write(&paths.manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
         Ok(())

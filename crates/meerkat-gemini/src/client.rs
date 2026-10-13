@@ -412,7 +412,7 @@ impl GeminiClient {
     }
 
     fn system_notice_gemini_parts(notice: &SystemNoticeMessage) -> Vec<Value> {
-        let rendered = notice.model_projection_text();
+        let rendered = notice.model_projection_lead_text();
         let mut parts = Vec::new();
         if !rendered.trim().is_empty() {
             parts.push(serde_json::json!({ "text": rendered }));
@@ -421,10 +421,23 @@ impl GeminiClient {
         for block in &notice.blocks {
             match block {
                 SystemNoticeBlock::Comms { content, .. }
-                | SystemNoticeBlock::ExternalEvent { content, .. } => {
-                    for content_block in content {
-                        if !matches!(content_block, ContentBlock::Text { .. }) {
-                            parts.push(Self::content_block_to_gemini_part(content_block));
+                | SystemNoticeBlock::ExternalEvent { content, .. }
+                | SystemNoticeBlock::RuntimeNotice { content, .. } => {
+                    if block.content_follows_notice_text() {
+                        // Runtime notice content and comms response blocks
+                        // follow the notice text in their own order, each
+                        // block lowered once.
+                        parts.extend(content.iter().map(Self::content_block_to_gemini_part));
+                    } else {
+                        // The content's text is part of the notice text;
+                        // only its media follows it.
+                        for content_block in content {
+                            if matches!(
+                                content_block,
+                                ContentBlock::Image { .. } | ContentBlock::Video { .. }
+                            ) {
+                                parts.push(Self::content_block_to_gemini_part(content_block));
+                            }
                         }
                     }
                 }
@@ -1063,7 +1076,8 @@ impl GeminiClient {
                     for block in &mut notice.blocks {
                         match block {
                             SystemNoticeBlock::Comms { content, .. }
-                            | SystemNoticeBlock::ExternalEvent { content, .. } => {
+                            | SystemNoticeBlock::ExternalEvent { content, .. }
+                            | SystemNoticeBlock::RuntimeNotice { content, .. } => {
                                 self.prepare_referenced_video_blocks(content).await?;
                             }
                             _ => {}
@@ -1095,7 +1109,8 @@ impl GeminiClient {
             Message::User(user) => blocks_require_preparation(&user.content),
             Message::SystemNotice(notice) => notice.blocks.iter().any(|block| match block {
                 SystemNoticeBlock::Comms { content, .. }
-                | SystemNoticeBlock::ExternalEvent { content, .. } => {
+                | SystemNoticeBlock::ExternalEvent { content, .. }
+                | SystemNoticeBlock::RuntimeNotice { content, .. } => {
                     blocks_require_preparation(content)
                 }
                 _ => false,
@@ -6399,6 +6414,129 @@ mod tests {
         );
         assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
         assert_eq!(parts[1]["inlineData"]["data"], "iVBOR...");
+        Ok(())
+    }
+
+    #[test]
+    fn gemini_comms_response_blocks_lower_once() -> Result<(), Box<dyn std::error::Error>> {
+        let client = GeminiClient::new("test-key".to_string());
+        let mut request = LlmRequest::new(
+            "gemini-3.1-pro-preview",
+            vec![Message::SystemNotice(
+                meerkat_core::SystemNoticeMessage::with_block(
+                    meerkat_core::SystemNoticeKind::Comms,
+                    None,
+                    SystemNoticeBlock::Comms {
+                        kind: meerkat_core::types::CommsNoticeKind::ResponseTerminal,
+                        direction: meerkat_core::types::SystemNoticeDirection::Incoming,
+                        peer: Some(meerkat_core::SystemNoticePeer {
+                            id: meerkat_core::comms::PeerId::new(),
+                            display_name: Some("operator".to_string()),
+                        }),
+                        sender_taint: None,
+                        request_id: Some("request-7".to_string()),
+                        intent: None,
+                        status: Some("completed".to_string()),
+                        summary: None,
+                        payload: Some(serde_json::json!({"result_marker_q7": true})),
+                        content: vec![
+                            ContentBlock::structured(&serde_json::json!({"block_marker_z9": 2}))
+                                .expect("structured response block"),
+                        ],
+                    },
+                ),
+            )],
+        );
+        request.messages = client.project_replay_messages(&request.messages)?;
+
+        let body = client.build_request_body(&request)?;
+        let rendered = body["contents"][0]["parts"].to_string();
+        assert_eq!(
+            rendered.matches("result_marker_q7").count(),
+            1,
+            "the response result appears once: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches("block_marker_z9").count(),
+            1,
+            "the response block appears once: {rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gemini_runtime_notice_content_lowers_in_order_once() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let client = GeminiClient::new("test-key".to_string());
+        let mut request = LlmRequest::new(
+            "gemini-3.1-pro-preview",
+            vec![Message::SystemNotice(
+                meerkat_core::SystemNoticeMessage::with_block(
+                    meerkat_core::SystemNoticeKind::Generic,
+                    None,
+                    SystemNoticeBlock::RuntimeNotice {
+                        category: "consent_attempt".to_string(),
+                        detail: Some("correlated result".to_string()),
+                        payload: None,
+                        content: vec![
+                            ContentBlock::Text {
+                                text: "first".to_string(),
+                            },
+                            ContentBlock::Image {
+                                media_type: "image/png".to_string(),
+                                data: ImageData::Inline {
+                                    data: "aW1hZ2Ux".to_string(),
+                                },
+                            },
+                            ContentBlock::Text {
+                                text: "second".to_string(),
+                            },
+                            ContentBlock::Image {
+                                media_type: "image/png".to_string(),
+                                data: ImageData::Inline {
+                                    data: "aW1hZ2Uy".to_string(),
+                                },
+                            },
+                            ContentBlock::structured(&serde_json::json!({"rows": 2}))
+                                .expect("structured content"),
+                        ],
+                    },
+                ),
+            )],
+        );
+        request.messages = client.project_replay_messages(&request.messages)?;
+
+        let body = client.build_request_body(&request)?;
+        let parts: Vec<(String, String)> = body["contents"][0]["parts"]
+            .as_array()
+            .ok_or("missing parts")?
+            .iter()
+            .map(|part| match part["text"].as_str() {
+                Some(text) => ("text".to_owned(), text.to_owned()),
+                None => (
+                    "inlineData".to_owned(),
+                    part["inlineData"]["data"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                ),
+            })
+            .collect();
+        let expected: Vec<(String, String)> = [
+            ("text", "correlated result"),
+            ("text", "first"),
+            ("inlineData", "aW1hZ2Ux"),
+            ("text", "second"),
+            ("inlineData", "aW1hZ2Uy"),
+            ("text", "{\"rows\":2}"),
+        ]
+        .iter()
+        .map(|(kind, value)| ((*kind).to_owned(), (*value).to_owned()))
+        .collect();
+        assert_eq!(
+            parts, expected,
+            "detail first, then the content in order, once"
+        );
         Ok(())
     }
 

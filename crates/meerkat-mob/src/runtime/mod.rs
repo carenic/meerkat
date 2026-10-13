@@ -79,7 +79,7 @@ pub(crate) const RECONCILE_SAFETY_INTERVAL: meerkat_core::time_compat::Duration 
 /// `select!` wait future is load-bearing: `select!` drops and recreates the
 /// sleep future on every wake, so a deadline computed inside the wait would
 /// reset under sustained wake traffic and the safety scan would starve
-/// (the mobkit `ReconcileCadence::next_safety_deadline` lesson).
+/// (the meta `ReconcileCadence::next_safety_deadline` lesson).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReconcileScanDeadline {
     next_scan_at: meerkat_core::time_compat::Instant,
@@ -205,12 +205,14 @@ mod reconcile_cadence_tests {
 
 pub(crate) mod actor;
 mod actor_turn_executor;
+mod admission_close;
 pub mod bridge;
 pub mod bridge_protocol;
 mod builder;
 pub mod composition;
 pub mod conditions;
 mod delegation;
+mod delivery_scope;
 mod delivery_wait;
 mod disposal;
 mod edge_locks;
@@ -222,6 +224,7 @@ pub mod flow_frame_engine;
 mod fork_build;
 pub mod forked_participant_routing;
 mod handle;
+mod held_spawn;
 mod identity_local_services;
 #[cfg(any(test, feature = "test-support"))]
 mod identity_recovery_test_support;
@@ -231,10 +234,10 @@ mod member_creation;
 #[cfg(any(test, feature = "test-support"))]
 mod member_status_test_support;
 mod read_handle;
+pub(crate) use handle::MemberTurnLlmIdentityAppliedSender;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-pub use handle::ForkSupervisorExitForTest;
-pub(crate) use handle::MemberTurnLlmIdentityAppliedSender;
+pub use handle::{ForkSupervisorExitForTest, MemberTurnAdmissionTestStage};
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use identity_recovery_test_support::trigger_identity_recovery_fail_stop;
 #[cfg(any(test, feature = "test-support"))]
@@ -306,6 +309,12 @@ mod placed_carrier_cleanup;
 mod provision_guard;
 mod provisioner;
 pub mod reconcile;
+#[cfg(feature = "runtime-adapter")]
+mod registration_hook;
+#[cfg(feature = "runtime-adapter")]
+pub use registration_hook::{
+    MemberDestinationSelection, MemberRuntimeBuildIdentity, MemberRuntimeRegistrationHook,
+};
 // Flow-spine lane file (remote flow tickets); declared here so the events
 // lane's pump can hand pages to `RemoteFlowTicketRegistry` by name (ADJ-P6-10
 // cross-lane seams). If the flow wave also adds this line, the lead dedups.
@@ -389,16 +398,26 @@ use state::MobCommand;
 use tools::compose_external_tools_for_profile;
 
 pub use crate::roster::{MobMemberKickoffPhase, MobMemberKickoffSnapshot};
+pub use admission_close::{CloseIfIdleOutcome, MobAdmissionCloseReason, MobBusy};
+pub(crate) use builder::owner_bridge_binding_from_history;
+pub(crate) use builder::recovered_lifecycle_quiesce_intent;
 pub use builder::{
     ControllingAcceptorConfig, LocalMemberAcceptorMaterialSource, MemberAcceptorRegistration,
 };
 pub use builder::{MobBeforeActivation, MobBuilder};
+pub use builder::{
+    StartAdmittedDestroyCustody, StartAdmittedDestroyCustodyWatch, start_admitted_destroy_custody,
+};
 pub use delegation::{
     BOUNDED_DELEGATION_REPORT_INSTRUCTION_V1, DelegationCancellationHandle,
     DelegationExecutionError, DelegationExecutionHandle, DelegationExecutionOutcome,
     DelegationExecutionRequest, DelegationExecutionService, DelegationExecutionSource,
     DelegationMemberOptions, DelegationParentContext, DelegationTerminalizedExecution,
     DelegationTurnTerminal, LiveDelegationTerminalEvidence, render_bounded_delegation_task,
+};
+pub use delivery_scope::{
+    DeliveryScopeDecodeError, MEMBER_DELIVERY_SCOPE_VERSION, MemberDeliveryScope,
+    ScopedRecoveryUnresolved, ScopedWorkRecovery, ScopedWorkState,
 };
 #[cfg(all(feature = "runtime-adapter", any(test, feature = "test-support")))]
 #[doc(hidden)]
@@ -414,6 +433,7 @@ pub use fork_build::{ForkBuildInheritance, ForkOverlayOrigin};
 pub use forked_participant_routing::{
     AttachedForkedParticipantLease, AttachedForkedParticipantSpawn, ForkedParticipantCreateRequest,
 };
+pub use handle::OwnerBridgeSessionLifecycleAuthority;
 pub use handle::{
     AdaptiveDriverCapability, AdaptiveLayerAdmission, AdaptiveLayerAdmissionRequest,
     AdaptiveLayerAttempt, AdaptiveLayerDisposition, AdaptiveLayerPhaseView,
@@ -430,13 +450,14 @@ pub use handle::{
     ExternalMemberRebindStatus, ExternalPeerBindingSpec, FlowRunHandle, FlowRunWaitError,
     FlowTargetProvisioner, ForkChildRun, ForkChildRunOutcome, ForkJobBinding, ForkJobRecord,
     ForkJobTerminalError, ForkMemberAtTurnBoundary, ForkMemberBoundedRunOutcome, ForkMemberResult,
-    HELPER_RESULT_TRUNCATION_MARKER, HelperOptions, HelperResult, HostBindReport, HostBindRequest,
-    HostCapabilityReport, HostRevokeReport, InitializeAdaptiveRunRequest,
-    MEMBER_ADMISSION_LANE_CAPACITY, MEMBER_RELOAD_TOTAL_TIMEOUT, MemberAdmissionBacklogGauge,
-    MemberAdmissionBacklogSnapshot, MemberBoundedTurnResult, MemberDeliveryReceipt, MemberHandle,
-    MemberPreviewUnavailable, MemberReloadDisposition, MemberReloadOutcome, MemberRespawnReceipt,
-    MemberRunState, MemberTargetAbsence, MemberTurnEventSender, MemberTurnHandle,
-    MemberTurnOptions, MobDestroyError, MobDestroyReport, MobEventsSubscription,
+    GovernedInputCustody, HELPER_RESULT_TRUNCATION_MARKER, HelperOptions, HelperResult,
+    HostBindReport, HostBindRequest, HostCapabilityReport, HostRevokeReport,
+    InitializeAdaptiveRunRequest, MEMBER_ADMISSION_LANE_CAPACITY, MEMBER_RELOAD_TOTAL_TIMEOUT,
+    MemberAdmissionBacklogGauge, MemberAdmissionBacklogSnapshot, MemberBoundedTurnResult,
+    MemberDeliveryReceipt, MemberHandle, MemberInputAdmission, MemberPreviewUnavailable,
+    MemberReloadDisposition, MemberReloadOutcome, MemberRespawnReceipt, MemberRunState,
+    MemberTargetAbsence, MemberTurnEventSender, MemberTurnHandle, MemberTurnOptions,
+    MobActorTaskWait, MobActorTaskWatch, MobDestroyError, MobDestroyReport, MobEventsSubscription,
     MobEventsSubscriptionConfig, MobEventsView, MobHandle, MobMachineStateChanges,
     MobMemberEndpointOwner, MobMemberEndpointStatus, MobMemberListEntry, MobMemberPeerEndpoint,
     MobMemberSnapshot, MobMemberStatus, MobPeerConnectivitySnapshot, MobRespawnError,
@@ -445,12 +466,15 @@ pub use handle::{
     SpawnContinuityIntent, SpawnCustomizationContext, SpawnMemberAdmission,
     SpawnMemberAdmissionObservations, SpawnMemberCustomizer, SpawnMemberCustomizerChain,
     SpawnMemberSpec, SpawnResult, SpawnSource, SpawnSystemPromptOverride, SpawnToolAdmission,
-    SupervisorRotationReport, WorkBoundedTurnResult, WorkDeliveryReceipt, WorkTurnHandle,
-    mob_error_wire_code, profile_to_wire, stored_realm_profile_to_wire,
+    SupervisorRotationReport, WorkAdmissionStage, WorkBoundedTurnResult, WorkDeliveryReceipt,
+    WorkTurnHandle, mob_error_wire_code, profile_to_wire, stored_realm_profile_to_wire,
 };
 pub(crate) use handle::{
     CanonicalOpsOwnerContext, ExactTurnCompletionSender, FlowOperationCustody, MemberSpawnReceipt,
 };
+pub use held_spawn::HeldSpawnDeadline;
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+pub use held_spawn::{HeldSpawn, HeldSpawnSettlement, HeldSpawnStart, abort_all_held};
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 pub use host_schedule::HostObservationScheduleMobHost;
 pub use identity_local_services::{
@@ -478,12 +502,14 @@ pub use reconcile::{
     ReconcileStage,
 };
 pub use recovery::RestoreIncompatible;
-pub(crate) use retirement_settlement::MemberLifecycleObservations;
+pub(crate) use retirement_settlement::{ActorTaskEnd, MemberLifecycleObservations};
 pub use retirement_settlement::{
     MemberShutdownOutcome, MobShutdownReport, RetirementSettlement, RetirementSettlementWatch,
     RetirementStage, ShutdownOptions,
 };
 use roster_authority::{RosterAuthority, RosterMutator};
+#[cfg(not(target_arch = "wasm32"))]
+pub use session_service::ControllerRouteObservation;
 pub use session_service::LiveDurableSourceObservation;
 pub use session_service::{
     AgentEventSubscription, AuthorizedSessionResume, MemberSessionActivity,

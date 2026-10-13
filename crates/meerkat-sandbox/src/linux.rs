@@ -50,22 +50,79 @@ const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
 // supported 64-bit architectures. These are syscall command numbers only.
 const F_SETOWN_EX: libc::c_int = 15;
 const F_SETSIG: libc::c_int = 10;
+// A probe child whose setup step fails exits with this base plus the step's
+// number, so the refused step can be read from its exit status (for example
+// in `strace -f`). The refusal itself stays BackendUnavailable.
+const PROBE_STEP_STATUS_BASE: i32 = 64;
+
+/// The steps of `LinuxPolicy::apply`, numbered for the probe's exit status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetupStep {
+    NoNewPrivileges = 1,
+    Unshare = 2,
+    Setgroups = 3,
+    UidMap = 4,
+    GidMap = 5,
+    PrivatePropagation = 6,
+    EnterRoot = 7,
+    MountSource = 8,
+    MountIdentity = 9,
+    StageMount = 10,
+    StageOpen = 11,
+    MountTarget = 12,
+    MountBind = 13,
+    MountRemount = 14,
+    StageRemount = 15,
+    Chroot = 16,
+    EnterChroot = 17,
+    Securebits = 18,
+    Capabilities = 19,
+    CloseRange = 20,
+    Seccomp = 21,
+}
+
+impl SetupStep {
+    fn probe_status(self) -> i32 {
+        PROBE_STEP_STATUS_BASE + self as i32
+    }
+
+    fn failed(self) -> impl Fn(i32) -> SetupFailure {
+        move |errno| SetupFailure { step: self, errno }
+    }
+}
+
+/// A failed setup step and its OS error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SetupFailure {
+    step: SetupStep,
+    errno: i32,
+}
 
 struct Mount {
     path: PathBuf,
     canonical: PathBuf,
+    // The canonical name, opened again in the new mount namespace at setup.
+    source: CString,
     file: File,
     identity: (u64, u64),
+    // fstat (st_dev, st_ino, st_rdev) of the pinned object. st_rdev also
+    // tells the three baseline devices apart; it is zero for directories and
+    // files.
+    pinned: (libc::dev_t, libc::ino_t, libc::dev_t),
     ancestors: Vec<(PathBuf, u64, u64)>,
     components: Vec<CString>,
     destination: CString,
     directory: bool,
     writable: bool,
     device: bool,
+    // The host mount is noexec, which the bind remount must keep.
+    noexec: bool,
 }
 
 /// Mechanical compiled resources. Every file descriptor pins the exact host
 /// object selected at setup. Per-launch checks cannot retarget these handles.
+/// Setup binds a source opened again by name in the new mount namespace, and
+/// only while it is still that pinned object.
 pub(super) struct LinuxPolicy {
     mounts: Vec<Mount>,
     filter: Vec<libc::sock_filter>,
@@ -177,13 +234,19 @@ impl LinuxPolicy {
     // Capability setup runs once per compiled host profile. It never executes
     // the requested target. Only the exact probe PID is waited/killed here.
     fn probe(&self) -> Result<(), ConfinementRefusal> {
+        // One slot per mount for setup's reopened sources, allocated before
+        // fork: the child only writes its own copy.
+        let mut sources = vec![-1; self.mounts.len()];
         let pid = unsafe { libc::fork() };
         if pid == -1 {
             return Err(ConfinementRefusal::BackendUnavailable);
         }
         if pid == 0 {
-            let result = self.apply();
-            unsafe { libc::_exit(if result.is_ok() { 0 } else { 125 }) };
+            let status = match self.apply(&mut sources) {
+                Ok(()) => 0,
+                Err(failure) => failure.step.probe_status(),
+            };
+            unsafe { libc::_exit(status) };
         }
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut status = 0;
@@ -226,15 +289,18 @@ impl LinuxPolicy {
     // Called only between fork and exec, or in the disposable capability probe.
     // This path performs raw syscalls and reads preallocated data only. No
     // allocation, host lock, callback, Rust destructor or async operation.
-    fn apply(&self) -> Result<(), i32> {
-        raw(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) })?;
+    // `sources` is preallocated with one slot per mount.
+    fn apply(&self, sources: &mut [i32]) -> Result<(), SetupFailure> {
+        raw(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) })
+            .map_err(SetupStep::NoNewPrivileges.failed())?;
         {
             raw(unsafe {
                 libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWIPC)
-            })?;
-            write_file(c"/proc/self/setgroups", b"deny")?;
-            write_file(c"/proc/self/uid_map", &self.uid_map)?;
-            write_file(c"/proc/self/gid_map", &self.gid_map)?;
+            })
+            .map_err(SetupStep::Unshare.failed())?;
+            write_file(c"/proc/self/setgroups", b"deny").map_err(SetupStep::Setgroups.failed())?;
+            write_file(c"/proc/self/uid_map", &self.uid_map).map_err(SetupStep::UidMap.failed())?;
+            write_file(c"/proc/self/gid_map", &self.gid_map).map_err(SetupStep::GidMap.failed())?;
             // Private propagation precedes every bind or filesystem mutation.
             raw(unsafe {
                 libc::mount(
@@ -244,8 +310,23 @@ impl LinuxPolicy {
                     libc::MS_REC | libc::MS_PRIVATE,
                     std::ptr::null(),
                 )
-            })?;
-            raw(unsafe { libc::chdir(c"/".as_ptr()) })?;
+            })
+            .map_err(SetupStep::PrivatePropagation.failed())?;
+            raw(unsafe { libc::chdir(c"/".as_ptr()) }).map_err(SetupStep::EnterRoot.failed())?;
+            // The kernel binds only mounts of the caller's own namespace, so
+            // a descriptor pinned in the host namespace cannot be a bind
+            // source here. Each source is opened again by its canonical name,
+            // before the staging tmpfs covers /tmp, and is used only while it
+            // is still the pinned object.
+            if sources.len() != self.mounts.len() {
+                return Err(SetupFailure {
+                    step: SetupStep::MountSource,
+                    errno: libc::EINVAL,
+                });
+            }
+            for (source, mount) in sources.iter_mut().zip(&self.mounts) {
+                *source = mount.reopen()?;
+            }
             raw(unsafe {
                 libc::mount(
                     c"tmpfs".as_ptr(),
@@ -254,17 +335,19 @@ impl LinuxPolicy {
                     libc::MS_NOSUID | libc::MS_NODEV,
                     c"mode=0755,size=16m".as_ptr().cast(),
                 )
-            })?;
+            })
+            .map_err(SetupStep::StageMount.failed())?;
             let root = raw(unsafe {
                 libc::open(
                     c"/tmp".as_ptr(),
                     libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
                 )
-            })?;
-            for mount in &self.mounts {
-                mount.install(root)?;
+            })
+            .map_err(SetupStep::StageOpen.failed())?;
+            for (mount, &source) in self.mounts.iter().zip(sources.iter()) {
+                mount.install(root, source)?;
             }
-            raw(unsafe { libc::close(root) })?;
+            raw(unsafe { libc::close(root) }).map_err(SetupStep::StageOpen.failed())?;
             // The synthetic ancestors are not writable scratch. Child mounts
             // keep their separately assigned read/write flags.
             raw(unsafe {
@@ -275,16 +358,18 @@ impl LinuxPolicy {
                     libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
                     std::ptr::null(),
                 )
-            })?;
-            raw(unsafe { libc::chroot(c"/tmp".as_ptr()) })?;
-            raw(unsafe { libc::chdir(c"/".as_ptr()) })?;
+            })
+            .map_err(SetupStep::StageRemount.failed())?;
+            raw(unsafe { libc::chroot(c"/tmp".as_ptr()) }).map_err(SetupStep::Chroot.failed())?;
+            raw(unsafe { libc::chdir(c"/".as_ptr()) }).map_err(SetupStep::EnterChroot.failed())?;
         }
         // Namespaced root may not regain capabilities at exec.
         {
             const LOCKED_NO_ROOT_OR_AMBIENT: libc::c_ulong = 1 | 2 | 4 | 8 | 32 | 64 | 128;
             raw(unsafe {
                 libc::prctl(libc::PR_SET_SECUREBITS, LOCKED_NO_ROOT_OR_AMBIENT, 0, 0, 0)
-            })?;
+            })
+            .map_err(SetupStep::Securebits.failed())?;
         }
         #[repr(C)]
         struct CapHeader {
@@ -315,13 +400,15 @@ impl LinuxPolicy {
         ];
         raw_long(unsafe {
             libc::syscall(libc::SYS_capset, std::ptr::addr_of!(header), data.as_ptr())
-        })?;
+        })
+        .map_err(SetupStep::Capabilities.failed())?;
         // Mark, rather than close, std::process's private exec-error pipe.
         // It must survive failed setup and disappear with all ambient handles
         // at the first exec. A declared custody fd3 is installed afterward.
         raw_long(unsafe {
             libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, CLOSE_RANGE_CLOEXEC)
-        })?;
+        })
+        .map_err(SetupStep::CloseRange.failed())?;
         let program = libc::sock_fprog {
             len: self.filter.len() as u16,
             filter: self.filter.as_ptr().cast_mut(),
@@ -332,7 +419,8 @@ impl LinuxPolicy {
                 libc::SECCOMP_MODE_FILTER,
                 std::ptr::addr_of!(program),
             )
-        })?;
+        })
+        .map_err(SetupStep::Seccomp.failed())?;
         Ok(())
     }
 }
@@ -425,6 +513,17 @@ impl Mount {
         ) {
             return Err(ConfinementRefusal::UnsupportedRequirement);
         }
+        let pinned =
+            stat_identity(file.as_raw_fd()).map_err(|_| ConfinementRefusal::BackendUnavailable)?;
+        // A namespaced remount cannot clear a flag the host mount has, so
+        // the bind keeps the host mount's noexec.
+        let mut mount_flags = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if unsafe { libc::fstatvfs(file.as_raw_fd(), mount_flags.as_mut_ptr()) } == -1 {
+            return Err(ConfinementRefusal::BackendUnavailable);
+        }
+        let noexec = (unsafe { mount_flags.assume_init() }.f_flag & libc::ST_NOEXEC) != 0;
+        let source = CString::new(canonical.as_os_str().as_bytes())
+            .map_err(|_| ConfinementRefusal::UnsupportedRequirement)?;
         let mut ancestors = Vec::new();
         for ancestor in canonical.ancestors().skip(1) {
             let value = std::fs::symlink_metadata(ancestor)
@@ -456,14 +555,17 @@ impl Mount {
         Ok(Self {
             path: path.to_path_buf(),
             canonical,
+            source,
             file,
             identity: (metadata.dev(), metadata.ino()),
+            pinned,
             ancestors,
             components,
             destination,
             directory: metadata.is_dir(),
             writable,
             device,
+            noexec,
         })
     }
 
@@ -498,15 +600,45 @@ impl Mount {
         Ok(())
     }
 
-    fn install(&self, root: i32) -> Result<(), i32> {
-        let mut parent = raw(unsafe { libc::fcntl(root, libc::F_DUPFD_CLOEXEC, 3) })?;
+    // Between fork and exec, in the new mount namespace: opens this mount's
+    // object again by its canonical name and returns it only while it is
+    // still the pinned object.
+    fn reopen(&self) -> Result<i32, SetupFailure> {
+        let kind = if self.directory { libc::O_DIRECTORY } else { 0 };
+        let source = raw(unsafe {
+            libc::open(
+                self.source.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC | kind,
+            )
+        })
+        .map_err(SetupStep::MountSource.failed())?;
+        match stat_identity(source) {
+            Ok(identity) if identity == self.pinned => Ok(source),
+            outcome => {
+                unsafe { libc::close(source) };
+                Err(SetupFailure {
+                    step: SetupStep::MountIdentity,
+                    errno: outcome.err().unwrap_or(libc::ESTALE),
+                })
+            }
+        }
+    }
+
+    // Binds `source`, this mount's reopened object, at its destination and
+    // closes it.
+    fn install(&self, root: i32, source: i32) -> Result<(), SetupFailure> {
+        let mut parent = raw(unsafe { libc::fcntl(root, libc::F_DUPFD_CLOEXEC, 3) })
+            .map_err(SetupStep::MountTarget.failed())?;
         for (index, name) in self.components.iter().enumerate() {
             let final_component = index + 1 == self.components.len();
             let directory = !final_component || self.directory;
             if directory {
                 let result = unsafe { libc::mkdirat(parent, name.as_ptr(), 0o755) };
                 if result == -1 && errno() != libc::EEXIST {
-                    return Err(errno());
+                    return Err(SetupFailure {
+                        step: SetupStep::MountTarget,
+                        errno: errno(),
+                    });
                 }
             }
             let flags = if directory {
@@ -521,12 +653,13 @@ impl Mount {
                     flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                     0o600,
                 )
-            })?;
-            raw(unsafe { libc::close(parent) })?;
+            })
+            .map_err(SetupStep::MountTarget.failed())?;
+            raw(unsafe { libc::close(parent) }).map_err(SetupStep::MountTarget.failed())?;
             parent = next;
         }
-        let mut source = [0_u8; 32];
-        let source = fd_path(self.file.as_raw_fd(), &mut source);
+        let mut path = [0_u8; 32];
+        let path = fd_path(source, &mut path);
         // These target nodes were created in this private empty tmpfs. Roots
         // are disjoint, so no mounted source can replace an ancestor here.
         // Resolve the fresh path for remount rather than an FD to the covered
@@ -534,35 +667,58 @@ impl Mount {
         let destination = self.destination.as_ptr();
         raw(unsafe {
             libc::mount(
-                source,
+                path,
                 destination,
                 std::ptr::null(),
                 libc::MS_BIND,
                 std::ptr::null(),
             )
-        })?;
+        })
+        .map_err(SetupStep::MountBind.failed())?;
+        raw(unsafe { libc::close(source) }).map_err(SetupStep::MountBind.failed())?;
         // Nonrecursive binds do not import hidden host submounts. The mounted
         // root cannot be replaced or renamed by the target. Read-only remount
         // also blocks metadata writes, not only file data writes.
-        let mut flags = libc::MS_BIND | libc::MS_REMOUNT | libc::MS_NOSUID;
-        if !self.device {
-            flags |= libc::MS_NODEV;
-        }
-        if !self.writable {
-            flags |= libc::MS_RDONLY;
-        }
         raw(unsafe {
             libc::mount(
                 std::ptr::null(),
                 destination,
                 std::ptr::null(),
-                flags,
+                Self::remount_flags(self.device, self.writable, self.noexec),
                 std::ptr::null(),
             )
-        })?;
-        raw(unsafe { libc::close(parent) })?;
+        })
+        .map_err(SetupStep::MountRemount.failed())?;
+        raw(unsafe { libc::close(parent) }).map_err(SetupStep::MountTarget.failed())?;
         Ok(())
     }
+
+    // nosuid always, nodev except for the three devices, read-only unless
+    // granted write. In this unprivileged namespace the host mount's flags
+    // are locked and a remount that would clear one fails, so a noexec host
+    // mount (such as the noexec /dev of stock Ubuntu) keeps noexec.
+    fn remount_flags(device: bool, writable: bool, noexec: bool) -> libc::c_ulong {
+        let mut flags = libc::MS_BIND | libc::MS_REMOUNT | libc::MS_NOSUID;
+        if !device {
+            flags |= libc::MS_NODEV;
+        }
+        if !writable {
+            flags |= libc::MS_RDONLY;
+        }
+        if noexec {
+            flags |= libc::MS_NOEXEC;
+        }
+        flags
+    }
+}
+
+// Raw fstat identity of an open object, (st_dev, st_ino, st_rdev). Usable
+// between fork and exec.
+fn stat_identity(descriptor: i32) -> Result<(libc::dev_t, libc::ino_t, libc::dev_t), i32> {
+    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+    raw(unsafe { libc::fstat(descriptor, status.as_mut_ptr()) })?;
+    let status = unsafe { status.assume_init() };
+    Ok((status.st_dev, status.st_ino, status.st_rdev))
 }
 
 fn fd_path(descriptor: i32, bytes: &mut [u8; 32]) -> *const libc::c_char {
@@ -693,7 +849,6 @@ fn filter(architecture: u32, ip: bool) -> Vec<libc::sock_filter> {
         libc::SYS_capset,
         libc::SYS_setpgid,
         libc::SYS_setsid,
-        libc::SYS_ioctl,
         libc::SYS_kill,
         libc::SYS_tkill,
         libc::SYS_tgkill,
@@ -757,6 +912,18 @@ fn filter(architecture: u32, ip: bool) -> Vec<libc::sock_filter> {
         jump(equal, libc::F_SETFL as u32, 0, 3),
         statement(load, 32),
         jump(bits, libc::O_ASYNC as u32, 0, 1),
+        statement(ret, refuse),
+        statement(ret, allow),
+    ]);
+    // ioctl reaches terminal, device and filesystem controls (TIOCSTI input
+    // injection, FIOASYNC signal ownership and more), so every command is
+    // refused except FIONBIO: the ioctl form of O_NONBLOCK on the caller's own
+    // descriptor, which std uses for nonblocking sockets. The kernel reads
+    // the command as 32 bits, so the low word of the argument decides.
+    code.extend([
+        jump(equal, libc::SYS_ioctl as u32, 0, 4),
+        statement(load, 24),
+        jump(equal, libc::FIONBIO as u32, 1, 0),
         statement(ret, refuse),
         statement(ret, allow),
     ]);
@@ -923,12 +1090,18 @@ pub(super) fn spawn(
     let gate = gate
         .map(|(descriptor, _)| duplicate(descriptor.as_raw_fd()))
         .transpose()?;
+    // One slot per mount for setup's reopened sources, allocated here: the
+    // pre-exec child only writes its own copy.
+    let mut sources = vec![-1; policy.mounts.len()];
     // SAFETY: The closure invokes only syscall helpers using preallocated
-    // strings, policy and FDs. Returning an error uses Command's existing
-    // owned error pipe; spawn does not report success after a setup failure.
+    // strings, buffers, policy and FDs. Returning an error uses Command's
+    // existing owned error pipe; spawn does not report success after a setup
+    // failure.
     unsafe {
         command.pre_exec(move || {
-            policy.apply().map_err(io::Error::from_raw_os_error)?;
+            policy
+                .apply(&mut sources)
+                .map_err(|failure| io::Error::from_raw_os_error(failure.errno))?;
             raw(libc::chdir(directory.as_ptr())).map_err(io::Error::from_raw_os_error)?;
             if let Some(gate) = &gate {
                 raw(libc::dup2(gate.as_raw_fd(), 3)).map_err(io::Error::from_raw_os_error)?;
@@ -1004,6 +1177,150 @@ mod tests {
         for path in ["/dev/null", "/dev/random", "/dev/urandom"] {
             let metadata = std::fs::metadata(path).unwrap();
             assert_eq!(validate_baseline_kind(Path::new(path), &metadata), Ok(()));
+        }
+    }
+
+    /// Setup opens each mount's source again by name and uses it only while
+    /// it is the object pinned at compile time; a renamed-over source is
+    /// refused at its identity step, never bound. No namespace is entered.
+    #[test]
+    fn setup_reopens_a_source_only_while_it_is_the_pinned_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let work = root.join("work");
+        std::fs::create_dir(&work).unwrap();
+        let null = Mount::capture(Path::new("/dev/null"), true, false).unwrap();
+        let directory = Mount::capture(&work, false, true).unwrap();
+        for mount in [&null, &directory] {
+            let source = mount.reopen().unwrap();
+            assert_eq!(stat_identity(source), Ok(mount.pinned));
+            unsafe { libc::close(source) };
+        }
+        assert_eq!(null.pinned.2, libc::makedev(1, 3));
+
+        std::fs::rename(&work, root.join("retained-work")).unwrap();
+        std::fs::create_dir(&work).unwrap();
+        assert_eq!(
+            directory.reopen(),
+            Err(SetupFailure {
+                step: SetupStep::MountIdentity,
+                errno: libc::ESTALE,
+            })
+        );
+    }
+
+    /// A bind remount may not clear a flag of the host mount in the
+    /// unprivileged namespace, so a noexec host mount keeps noexec; capture
+    /// records the host mount's own flag.
+    #[test]
+    fn bind_remount_keeps_the_host_mounts_noexec() {
+        for device in [false, true] {
+            for writable in [false, true] {
+                for noexec in [false, true] {
+                    let flags = Mount::remount_flags(device, writable, noexec);
+                    assert_ne!(flags & libc::MS_BIND, 0);
+                    assert_ne!(flags & libc::MS_REMOUNT, 0);
+                    assert_ne!(flags & libc::MS_NOSUID, 0);
+                    assert_eq!((flags & libc::MS_NODEV) != 0, !device);
+                    assert_eq!((flags & libc::MS_RDONLY) != 0, !writable);
+                    assert_eq!((flags & libc::MS_NOEXEC) != 0, noexec);
+                }
+            }
+        }
+        let null = Mount::capture(Path::new("/dev/null"), true, false).unwrap();
+        let mut host = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        assert_eq!(
+            unsafe { libc::statvfs(c"/dev/null".as_ptr(), host.as_mut_ptr()) },
+            0
+        );
+        let host = unsafe { host.assume_init() };
+        assert_eq!(null.noexec, (host.f_flag & libc::ST_NOEXEC) != 0);
+    }
+
+    // Runs `program` on one native syscall the way the kernel does and
+    // returns its action. Covers exactly the instructions `filter` emits.
+    fn run_filter(
+        program: &[libc::sock_filter],
+        architecture: u32,
+        nr: u32,
+        args: [u64; 6],
+    ) -> u32 {
+        let load = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
+        let equal = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
+        let bits = (libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16;
+        let ret = (libc::BPF_RET | libc::BPF_K) as u16;
+        // struct seccomp_data: nr, arch, instruction pointer, six arguments.
+        let mut data = [0_u8; 64];
+        data[0..4].copy_from_slice(&nr.to_ne_bytes());
+        data[4..8].copy_from_slice(&architecture.to_ne_bytes());
+        for (index, argument) in args.iter().enumerate() {
+            data[16 + 8 * index..24 + 8 * index].copy_from_slice(&argument.to_ne_bytes());
+        }
+        let mut accumulator = 0_u32;
+        let mut counter = 0;
+        loop {
+            let instruction = program[counter];
+            let skip = match instruction.code {
+                code if code == load => {
+                    let offset = instruction.k as usize;
+                    accumulator = u32::from_ne_bytes(data[offset..offset + 4].try_into().unwrap());
+                    0
+                }
+                code if code == equal => {
+                    if accumulator == instruction.k {
+                        instruction.jt
+                    } else {
+                        instruction.jf
+                    }
+                }
+                code if code == bits => {
+                    if accumulator & instruction.k != 0 {
+                        instruction.jt
+                    } else {
+                        instruction.jf
+                    }
+                }
+                code if code == ret => return instruction.k,
+                code => unreachable!("filter emits no instruction {code:#x}"),
+            };
+            counter += 1 + usize::from(skip);
+        }
+    }
+
+    /// ioctl admits only FIONBIO, the ioctl form of O_NONBLOCK that std uses
+    /// for nonblocking sockets; every other command stays refused, whatever
+    /// the IP policy.
+    #[test]
+    fn seccomp_admits_only_fionbio_among_ioctl_commands() {
+        let Some(architecture) = native_audit_arch() else {
+            return;
+        };
+        let refuse = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
+        let fionbio = u64::from(libc::FIONBIO as u32);
+        for ip in [false, true] {
+            let program = filter(architecture, ip);
+            let ioctl = |command: u64| {
+                run_filter(
+                    &program,
+                    architecture,
+                    libc::SYS_ioctl as u32,
+                    [0, command, 0, 0, 0, 0],
+                )
+            };
+            assert_eq!(ioctl(fionbio), libc::SECCOMP_RET_ALLOW);
+            // The kernel takes the command as 32 bits.
+            assert_eq!(ioctl((1 << 32) | fionbio), libc::SECCOMP_RET_ALLOW);
+            for command in [libc::FIOASYNC, libc::TIOCSTI, libc::FIONREAD, libc::FIOCLEX] {
+                assert_eq!(ioctl(u64::from(command as u32)), refuse);
+            }
+            assert_eq!(
+                run_filter(&program, architecture, libc::SYS_getpid as u32, [0; 6]),
+                libc::SECCOMP_RET_ALLOW
+            );
+            assert_eq!(
+                run_filter(&program, architecture, libc::SYS_mount as u32, [0; 6]),
+                refuse
+            );
         }
     }
 }

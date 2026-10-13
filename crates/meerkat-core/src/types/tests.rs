@@ -542,6 +542,7 @@ fn system_notice_explicit_null_payloads_round_trip_without_becoming_absent() {
             category: "nullable".to_string(),
             detail: None,
             payload: Some(Value::Null),
+            content: Vec::new(),
         },
         SystemNoticeBlock::Unknown {
             summary: None,
@@ -567,6 +568,113 @@ fn system_notice_explicit_null_payloads_round_trip_without_becoming_absent() {
             "notice bytes must be stable across the typed persistence round trip"
         );
     }
+}
+
+#[test]
+fn runtime_notice_content_is_optional_typed_and_projected() {
+    // Without content the block keeps its former wire shape and projection.
+    let bare = SystemNoticeBlock::RuntimeNotice {
+        category: "consent_attempt".to_string(),
+        detail: Some("detail line".to_string()),
+        payload: Some(json!({"payload_marker": "never-projected"})),
+        content: Vec::new(),
+    };
+    let encoded = serde_json::to_value(&bare).expect("serialize bare notice");
+    assert!(
+        encoded.get("content").is_none(),
+        "empty content stays off the wire: {encoded}"
+    );
+    let decoded: SystemNoticeBlock = serde_json::from_value(json!({
+        "type": "runtime_notice",
+        "category": "consent_attempt",
+        "detail": "detail line",
+        "payload": {"payload_marker": "never-projected"},
+    }))
+    .expect("a notice without content decodes");
+    assert_eq!(decoded, bare);
+    assert_eq!(bare.model_projection_text(), "detail line");
+
+    // Typed content round-trips; its text follows the detail, the payload
+    // is never projected, and its media is visible to capability checks.
+    let rich = SystemNoticeBlock::RuntimeNotice {
+        category: "consent_attempt".to_string(),
+        detail: Some("detail line".to_string()),
+        payload: Some(json!({"payload_marker": "never-projected"})),
+        content: vec![
+            ContentBlock::Text {
+                text: "result text".to_string(),
+            },
+            ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: ImageData::Inline {
+                    data: "iVBOR...".to_string(),
+                },
+            },
+        ],
+    };
+    let encoded = serde_json::to_value(&rich).expect("serialize rich notice");
+    let decoded: SystemNoticeBlock =
+        serde_json::from_value(encoded.clone()).expect("deserialize rich notice");
+    assert_eq!(decoded, rich);
+    assert_eq!(
+        serde_json::to_value(&decoded).expect("re-serialize rich notice"),
+        encoded
+    );
+    assert_eq!(
+        rich.model_projection_text(),
+        "detail line\nresult text\n[image: image/png]"
+    );
+    let with_media = SystemNoticeMessage::with_block(SystemNoticeKind::Generic, None, rich);
+    assert!(with_media.has_images());
+    assert!(
+        !with_media
+            .model_projection_text()
+            .contains("never-projected")
+    );
+    assert!(!SystemNoticeMessage::with_block(SystemNoticeKind::Generic, None, bare).has_images());
+}
+
+#[test]
+fn runtime_notice_lead_text_leaves_its_content_to_ordered_lowering() {
+    let skill = ContentBlock::SkillContext {
+        skill_key: crate::skills::SkillKey::new(
+            crate::skills::SourceUuid::parse("dc256086-0d2f-4f61-a307-320d4148107f").unwrap(),
+            crate::skills::SkillName::parse("email").unwrap(),
+        ),
+        text: "skill body".to_string(),
+    };
+    let notice = SystemNoticeMessage::with_block(
+        SystemNoticeKind::Generic,
+        Some("Correlated outcome".to_string()),
+        SystemNoticeBlock::RuntimeNotice {
+            category: "consent_attempt".to_string(),
+            detail: Some("call-1".to_string()),
+            payload: None,
+            content: vec![
+                ContentBlock::Text {
+                    text: "first".to_string(),
+                },
+                ContentBlock::structured(&json!({"rows": 2})).unwrap(),
+                skill,
+            ],
+        },
+    );
+    // Providers send this, then lower each content block once, in order.
+    assert_eq!(
+        notice.model_projection_lead_text(),
+        "Correlated outcome\ncall-1"
+    );
+    // Text-only consumers get the content's text in place, once.
+    assert_eq!(
+        notice.model_projection_text(),
+        "Correlated outcome\ncall-1\nfirst\n{\"rows\":2}\nskill body"
+    );
+    // Other notices keep one projection for both.
+    let plain = SystemNoticeMessage::new(SystemNoticeKind::Generic, "plain notice");
+    assert_eq!(
+        plain.model_projection_lead_text(),
+        plain.model_projection_text()
+    );
 }
 
 #[test]
@@ -2737,6 +2845,7 @@ mod content_block_tests {
             let prov = ToolProvenance {
                 kind: kind.clone(),
                 source_id: "test-source".into(),
+                artifact: None,
             };
             let json = serde_json::to_string(&prov).unwrap();
             let parsed: ToolProvenance = serde_json::from_str(&json).unwrap();
@@ -2761,6 +2870,7 @@ mod content_block_tests {
             .with_provenance(ToolProvenance {
                 kind: ToolSourceKind::Mcp,
                 source_id: "code-server".into(),
+                artifact: None,
             });
 
         let json = serde_json::to_string(&def).unwrap();
@@ -2918,5 +3028,92 @@ mod usage_aggregation_semantics {
 
         let decoded: TurnUsage = serde_json::from_value(json).unwrap();
         assert_eq!(decoded, call);
+    }
+}
+
+mod tool_artifact_provenance {
+    use super::*;
+
+    #[test]
+    fn provenance_without_an_artifact_keeps_its_wire_shape() {
+        let provenance = ToolProvenance::new(ToolSourceKind::Callback, "meta-callback:build-1");
+        let value = serde_json::to_value(&provenance).unwrap();
+        assert_eq!(
+            value,
+            json!({"kind": "callback", "source_id": "meta-callback:build-1"})
+        );
+        let decoded: ToolProvenance = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, provenance);
+    }
+
+    #[test]
+    fn a_verified_artifact_round_trips_beside_the_per_build_source() {
+        let artifact = ToolArtifactRef::new("ext.weather", "sha256:abc123").unwrap();
+        let provenance = ToolProvenance::new(ToolSourceKind::Callback, "meta-callback:build-2")
+            .with_artifact(artifact.clone());
+        let value = serde_json::to_value(&provenance).unwrap();
+        assert_eq!(
+            value["artifact"],
+            json!({"artifact_id": "ext.weather", "digest": "sha256:abc123"})
+        );
+        assert_eq!(value["source_id"], json!("meta-callback:build-2"));
+        let decoded: ToolProvenance = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.artifact, Some(artifact));
+    }
+
+    #[test]
+    fn malformed_artifact_references_are_refused() {
+        assert_eq!(
+            ToolArtifactRef::new("", "sha256:x"),
+            Err(ToolArtifactRefError::Empty(ToolArtifactRefPart::ArtifactId))
+        );
+        assert_eq!(
+            ToolArtifactRef::new("ext", " "),
+            Err(ToolArtifactRefError::InvalidCharacter(
+                ToolArtifactRefPart::Digest
+            ))
+        );
+        assert_eq!(
+            ToolArtifactRef::new("x".repeat(TOOL_ARTIFACT_REF_PART_MAX_BYTES + 1), "d"),
+            Err(ToolArtifactRefError::TooLong(
+                ToolArtifactRefPart::ArtifactId
+            ))
+        );
+        let wire = json!({
+            "kind": "callback",
+            "source_id": "s",
+            "artifact": {"artifact_id": "ext", "digest": ""}
+        });
+        assert!(serde_json::from_value::<ToolProvenance>(wire).is_err());
+        let extra = json!({"artifact_id": "ext", "digest": "d", "trusted": true});
+        assert!(serde_json::from_value::<ToolArtifactRef>(extra).is_err());
+    }
+}
+
+mod tool_artifact_refusal {
+    use super::*;
+
+    #[test]
+    fn a_refusal_is_a_typed_build_error_with_a_stable_kind() {
+        let refusal = ToolArtifactRefusal::DigestMismatch {
+            tool: "forecast".into(),
+            artifact_id: "ext.weather".into(),
+            declared: "sha256:bb".into(),
+            installed: "sha256:aa".into(),
+        };
+        assert_eq!(refusal.tool(), "forecast");
+        assert!(refusal.to_string().starts_with(ToolArtifactRefusal::KIND));
+        assert_eq!(
+            serde_json::to_value(&refusal).unwrap(),
+            json!({
+                "reason": "digest_mismatch",
+                "tool": "forecast",
+                "artifact_id": "ext.weather",
+                "declared": "sha256:bb",
+                "installed": "sha256:aa"
+            })
+        );
+        let error = crate::error::AgentError::ToolArtifactRefused(Box::new(refusal.clone()));
+        assert_eq!(error.to_string(), refusal.to_string());
     }
 }

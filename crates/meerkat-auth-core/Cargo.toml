@@ -60,6 +60,11 @@ hex = { version = "0.4", optional = true }
 tokio_with_wasm = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 
+# Optional: the macOS keychain status codes behind keyring's platform errors
+# (a user denial and a refused interaction are told apart from backend absence).
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3", optional = true }
+
 [dev-dependencies]
 meerkat-runtime = { path = "../meerkat-runtime", default-features = false, features = ["sqlite-store"] } # path-only (no version): breaks packaging dev-dep cycle; SQLite exercises the actual durable flow owner
 tokio = { workspace = true, features = ["test-util", "macros"] }
@@ -69,7 +74,7 @@ axum = { workspace = true }
 
 [features]
 default = ["oauth", "keyring", "file-lock"]
-keyring = ["dep:keyring"]
+keyring = ["dep:keyring", "dep:security-framework"]
 file-lock = ["dep:fs4"]
 oauth = ["dep:oauth2", "dep:jsonwebtoken", "dep:urlencoding", "dep:axum"]
 aws-sigv4 = [

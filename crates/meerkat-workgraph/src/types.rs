@@ -251,6 +251,20 @@ impl WorkAdmissionOutcome {
     }
 }
 
+/// The exact identity of one keyed admission: its key and the canonical digest
+/// of the complete scope-resolved creation request.
+///
+/// [`crate::WorkGraphService::admission_identity`] computes it without touching
+/// the store, and a [`crate::WorkGraphAdmissionFence`] receives it so the host
+/// can bind its current authority to this exact admission. Holding it grants no
+/// creation, replay or namespace permission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct WorkAdmission {
+    pub key: WorkAdmissionKey,
+    pub request_digest: String,
+}
+
 fn validate_token(name: &str, value: String) -> Result<String, WorkGraphError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {

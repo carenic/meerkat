@@ -105,7 +105,38 @@ pub async fn materialize_ephemeral_runtime_session<B: SessionAgentBuilder + 'sta
         machine,
         request,
         keep_alive,
+        #[cfg(not(target_arch = "wasm32"))]
+        None,
         #[cfg(all(test, not(target_arch = "wasm32")))]
+        None,
+    )
+    .await
+}
+
+/// [`materialize_ephemeral_runtime_session`] for a host whose delivery owners
+/// subscribe to `continuations`.
+///
+/// Once the attachment is committed and its peer ingress installed, it
+/// announces [`crate::ContinuationHostBindings::source_custody_changed`], so
+/// the delivery owners retry the rows they hold blocked. The announcement
+/// grants nothing: they read the actual owners again.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn materialize_ephemeral_runtime_session_with_continuations<
+    B: SessionAgentBuilder + 'static,
+>(
+    service: &Arc<EphemeralSessionService<B>>,
+    machine: &Arc<MeerkatMachine>,
+    request: CreateSessionRequest,
+    keep_alive: bool,
+    continuations: &crate::ContinuationHostBindings,
+) -> Result<RunResult, EphemeralRuntimeError> {
+    materialize_ephemeral_runtime_session_inner(
+        service,
+        machine,
+        request,
+        keep_alive,
+        Some(continuations),
+        #[cfg(test)]
         None,
     )
     .await
@@ -116,6 +147,7 @@ async fn materialize_ephemeral_runtime_session_inner<B: SessionAgentBuilder + 's
     machine: &Arc<MeerkatMachine>,
     mut request: CreateSessionRequest,
     keep_alive: bool,
+    #[cfg(not(target_arch = "wasm32"))] continuations: Option<&crate::ContinuationHostBindings>,
     #[cfg(all(test, not(target_arch = "wasm32")))] after_attachment_commit: Option<
         MaterializationCommitTestBarrier,
     >,
@@ -217,6 +249,12 @@ async fn materialize_ephemeral_runtime_session_inner<B: SessionAgentBuilder + 's
     // No await may follow this custody transfer: returning the result is the
     // caller's synchronous acquisition of the completed materialization.
     unpublished.armed = false;
+    // The witness is retained, the attachment committed and its peer ingress
+    // current: the session is served by its exact attachment.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(continuations) = continuations {
+        continuations.source_custody_changed();
+    }
     Ok(created)
 }
 
@@ -955,6 +993,55 @@ mod tests {
         assert!(!service.live_session_actor_registered(&id).await);
     }
 
+    /// A completed materialization announces the custody change to the
+    /// delivery owners once; a refused one announces nothing.
+    #[tokio::test]
+    async fn a_completed_ephemeral_materialization_announces_its_custody_once() {
+        let (service, machine) = service();
+        let continuations = crate::ContinuationHostBindings::default();
+        let source_changes = continuations.subscribe_source_changes();
+        let before = *source_changes.borrow();
+
+        let mut immediate = request();
+        immediate.initial_turn = InitialTurnPolicy::RunImmediately;
+        materialize_ephemeral_runtime_session_with_continuations(
+            &service,
+            &machine,
+            immediate,
+            false,
+            &continuations,
+        )
+        .await
+        .expect_err("runtime materialization refuses an immediate initial turn");
+        assert_eq!(
+            *source_changes.borrow(),
+            before,
+            "a refused materialization announces nothing"
+        );
+
+        let created = materialize_ephemeral_runtime_session_with_continuations(
+            &service,
+            &machine,
+            request(),
+            false,
+            &continuations,
+        )
+        .await
+        .expect("real actor materialization");
+        assert!(
+            machine
+                .current_executor_attachment_witness(&created.session_id)
+                .await
+                .is_some(),
+            "the session is served by its committed attachment"
+        );
+        assert_eq!(
+            *source_changes.borrow(),
+            before + 1,
+            "a fresh attachment announces its custody once"
+        );
+    }
+
     #[tokio::test]
     async fn ephemeral_reload_cleanup_is_exact_nonterminal_and_keeps_held_outer_boundary() {
         let (service, machine) = service();
@@ -1241,6 +1328,7 @@ mod tests {
                     &machine,
                     request(),
                     false,
+                    None,
                     Some(MaterializationCommitTestBarrier {
                         entered: entered_tx,
                         release: release_rx,

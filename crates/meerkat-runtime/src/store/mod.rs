@@ -5,6 +5,8 @@
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 mod execution_custody;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use execution_custody::final_drop_holds::hold as execution_custody_final_drop_hold;
 pub use execution_custody::{
     RuntimeStoreExecutionClaim, RuntimeStoreExecutionCustody, RuntimeStoreExecutionCustodyError,
 };
@@ -12,8 +14,13 @@ pub use execution_custody::{
 pub mod memory;
 #[cfg(feature = "sqlite-store")]
 pub mod sqlite;
+#[cfg(any(test, feature = "test-support"))]
+mod test_faults;
 pub mod whole_blob_repair;
 mod whole_blob_rewrite;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use test_faults::InputPersistAckLossFault;
 
 pub use meerkat_core::{HeadCanonicalProvisionalTailAuthority, WholeBlobProvisionalTailAuthority};
 pub use whole_blob_rewrite::{
@@ -2651,6 +2658,11 @@ pub enum RuntimeStoreError {
     /// target operation was not invoked and the caller should re-observe.
     #[error("Runtime store write fence backoff: {reason}")]
     WriteFenceBackoff { reason: String },
+    /// The non-waiting controller administration reservation met momentary
+    /// contention before it began any transaction. Nothing was written; a
+    /// caller with a deadline may try again from the start.
+    #[error("Runtime store controller custody is busy: {detail}")]
+    ControllerCustodyBusy { detail: String },
     /// Direct-member semantic authority is malformed before durable admission.
     #[error("Invalid direct-member incarnation: {reason}")]
     InvalidDirectMemberIncarnation { reason: String },
@@ -8579,6 +8591,17 @@ pub trait RuntimeStore: Send + Sync {
     ) -> Result<Box<dyn RuntimeStoreControllerCustody + 'a>, RuntimeStoreError> {
         self.session_authority_ops()
             .try_controller_mutation_custody(claim)
+    }
+
+    /// Test support: this store instance's scripted loss of an
+    /// input-persistence acknowledgement (see [`InputPersistAckLossFault`]).
+    /// Only `SqliteRuntimeStore` returns one. Every other store, including a
+    /// store that wraps a `SqliteRuntimeStore`, returns `None`, so a control
+    /// that needs the seam fails closed instead of arming nothing.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    fn input_persist_ack_loss_fault_for_test(&self) -> Option<InputPersistAckLossFault> {
+        None
     }
 
     /// Durable session representation owned by this store.

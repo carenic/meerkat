@@ -1645,11 +1645,180 @@ impl LiveSessionActorWitness {
         self.incarnation.live.load(Ordering::Acquire)
     }
 
+    /// This exact actor incarnation as executor attachments identify it (see
+    /// [`meerkat_core::lifecycle::CoreExecutorActorIdentity`]): an
+    /// observation for comparison with the actor an attachment serves, not
+    /// authority.
+    pub fn executor_actor_identity(&self) -> meerkat_core::lifecycle::CoreExecutorActorIdentity {
+        meerkat_core::lifecycle::CoreExecutorActorIdentity::new(self.incarnation.clone())
+    }
+
     fn revoke(&self) {
         self.incarnation
             .transient_turn_context_state
             .revoke_boundary_actor();
         self.incarnation.live.store(false, Ordering::Release);
+    }
+}
+
+/// A live MCP attachment attempt observed only while the actor incarnation
+/// that attached it is still the live one: every observation checks that
+/// witness before and after its read, so a replaced or retired actor answers
+/// `NotCurrent` and its successor's router is never consulted.
+struct ActorBoundAttempt {
+    actor: LiveSessionActorWitness,
+    inner: Arc<dyn meerkat_core::mcp_attachment::McpAttachmentAttemptObserver>,
+}
+
+impl ActorBoundAttempt {
+    fn bind(
+        mut receipt: meerkat_core::mcp_attachment::LiveMcpAttachmentReceipt,
+        actor: LiveSessionActorWitness,
+    ) -> meerkat_core::mcp_attachment::LiveMcpAttachmentReceipt {
+        receipt.attempt = receipt
+            .attempt
+            .observed_through(|inner| Arc::new(Self { actor, inner }));
+        receipt
+    }
+
+    fn current(
+        &self,
+        readiness: meerkat_core::mcp_attachment::McpAttachmentReadiness,
+    ) -> meerkat_core::mcp_attachment::McpAttachmentReadiness {
+        if self.actor.is_live() {
+            readiness
+        } else {
+            meerkat_core::mcp_attachment::McpAttachmentReadiness::NotCurrent
+        }
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl meerkat_core::mcp_attachment::McpAttachmentAttemptObserver for ActorBoundAttempt {
+    async fn observe(&self, tool: &str) -> meerkat_core::mcp_attachment::McpAttachmentReadiness {
+        if !self.actor.is_live() {
+            return meerkat_core::mcp_attachment::McpAttachmentReadiness::NotCurrent;
+        }
+        let readiness = self.inner.observe(tool).await;
+        self.current(readiness)
+    }
+
+    async fn wait(
+        &self,
+        tool: &str,
+        timeout: std::time::Duration,
+    ) -> meerkat_core::mcp_attachment::McpAttachmentReadiness {
+        if !self.actor.is_live() {
+            return meerkat_core::mcp_attachment::McpAttachmentReadiness::NotCurrent;
+        }
+        let readiness = self.inner.wait(tool, timeout).await;
+        self.current(readiness)
+    }
+}
+
+#[cfg(test)]
+mod actor_bound_attempt_tests {
+    use super::*;
+    use meerkat_core::mcp_attachment::{
+        LiveMcpAttachmentReceipt, McpAttachmentAttempt, McpAttachmentAttemptObserver,
+        McpAttachmentOutcome, McpAttachmentReadiness,
+    };
+
+    /// Always usable; revokes `revoke_during` while it reads, when set.
+    struct UsableInner {
+        revoke_during: Option<LiveSessionActorWitness>,
+    }
+
+    impl UsableInner {
+        fn answer(&self) -> McpAttachmentReadiness {
+            if let Some(actor) = &self.revoke_during {
+                actor.revoke();
+            }
+            McpAttachmentReadiness::Usable {
+                connection_generation: 7,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl McpAttachmentAttemptObserver for UsableInner {
+        async fn observe(&self, _tool: &str) -> McpAttachmentReadiness {
+            self.answer()
+        }
+
+        async fn wait(&self, _tool: &str, _timeout: std::time::Duration) -> McpAttachmentReadiness {
+            self.answer()
+        }
+    }
+
+    fn bound(
+        actor: &LiveSessionActorWitness,
+        revoke_during: Option<LiveSessionActorWitness>,
+    ) -> LiveMcpAttachmentReceipt {
+        ActorBoundAttempt::bind(
+            LiveMcpAttachmentReceipt {
+                outcome: McpAttachmentOutcome {
+                    persisted: false,
+                    staged: true,
+                },
+                attempt: McpAttachmentAttempt::new(
+                    "tools",
+                    Arc::new(UsableInner { revoke_during }),
+                ),
+            },
+            actor.clone(),
+        )
+    }
+
+    fn actor() -> LiveSessionActorWitness {
+        LiveSessionActorWitness::new(
+            SessionId::new(),
+            meerkat_core::TransientTurnContextStateHandle::new(),
+        )
+    }
+
+    /// The attempt answers only while the actor incarnation that attached
+    /// it is live, checked before and after each read.
+    #[tokio::test]
+    async fn an_attempt_answers_only_while_its_attaching_actor_is_live() {
+        let live = actor();
+        let receipt = bound(&live, None);
+        assert_eq!(
+            receipt.attempt.observe("echo").await,
+            McpAttachmentReadiness::Usable {
+                connection_generation: 7
+            }
+        );
+        live.revoke();
+        assert_eq!(
+            receipt.attempt.observe("echo").await,
+            McpAttachmentReadiness::NotCurrent
+        );
+        assert_eq!(
+            receipt
+                .attempt
+                .wait("echo", std::time::Duration::from_millis(10))
+                .await,
+            McpAttachmentReadiness::NotCurrent
+        );
+
+        // Replaced while the read was in flight: caught after it.
+        let replaced = actor();
+        let receipt = bound(&replaced, Some(replaced.clone()));
+        assert_eq!(
+            receipt.attempt.observe("echo").await,
+            McpAttachmentReadiness::NotCurrent
+        );
+        let replaced = actor();
+        let receipt = bound(&replaced, Some(replaced.clone()));
+        assert_eq!(
+            receipt
+                .attempt
+                .wait("echo", std::time::Duration::from_millis(10))
+                .await,
+            McpAttachmentReadiness::NotCurrent
+        );
     }
 }
 
@@ -1667,6 +1836,12 @@ impl std::fmt::Debug for LiveSessionActorWitness {
             .debug_struct("LiveSessionActorWitness")
             .field("session_id", &self.session_id)
             .finish_non_exhaustive()
+    }
+}
+
+impl meerkat_core::lifecycle::CoreExecutorActorIncarnation for LiveSessionActorIncarnation {
+    fn is_live(&self) -> bool {
+        self.live.load(Ordering::Acquire)
     }
 }
 
@@ -1901,6 +2076,18 @@ impl SessionTurnExecutionOutcome {
 
 /// Commands sent from the service to a session task.
 enum SessionCommand {
+    /// Attach one reviewed MCP server to the exact actor's own router,
+    /// between turns.
+    AttachMcpServer {
+        expected_actor: LiveSessionActorWitness,
+        attachment: Box<meerkat_core::mcp_attachment::LiveMcpAttachment>,
+        reply_tx: oneshot::Sender<
+            Result<
+                meerkat_core::mcp_attachment::LiveMcpAttachmentReceipt,
+                meerkat_core::mcp_attachment::LiveMcpAttachError,
+            >,
+        >,
+    },
     /// Setup-only query against the exact actor already owning the client.
     PinControllerClient {
         expected_actor: LiveSessionActorWitness,
@@ -2185,6 +2372,12 @@ enum SessionCommand {
     UpdateMobToolAuthority {
         authority_context: Option<MobToolAuthorityContext>,
         reply_tx: oneshot::Sender<Result<(), meerkat_core::error::AgentError>>,
+    },
+    ApplyMcpAttachmentIntent {
+        mutation: meerkat_core::McpAttachmentIntentMutation,
+        reply_tx: oneshot::Sender<
+            Result<meerkat_core::McpAttachmentIntentRecorded, meerkat_core::error::AgentError>,
+        >,
     },
     GovernedSystemContextControl {
         control: meerkat_core::service::SystemContextAppendControl,
@@ -3178,6 +3371,15 @@ pub trait SessionAgent: Send {
         ))
     }
 
+    /// Release what the agent's construction handed it (its MCP router's
+    /// own surface lineages). The session task awaits this before it reports
+    /// its exit, so an ordinary observed actor exit means they are released.
+    /// Limits: a task that panics or is aborted never runs this; its agent is
+    /// dropped instead, which closes the router's connections without
+    /// releasing its lineages, and the surface's lineage fence keeps a later
+    /// holder's staging and connection safe from them.
+    async fn release_owned_resources(&mut self) {}
+
     /// Run the agent with the given prompt, streaming events.
     async fn run_with_events(
         &mut self,
@@ -3371,6 +3573,19 @@ pub trait SessionAgent: Send {
     /// that do not support pinning remain unavailable for governed setup.
     fn pin_controller_client(&self) -> Option<meerkat_core::ControllerModelClient> {
         None
+    }
+
+    /// Attach one reviewed MCP server to this member's own router, between
+    /// turns. Builders without a live MCP attachment surface refuse.
+    async fn attach_mcp_server(
+        &mut self,
+        attachment: meerkat_core::mcp_attachment::LiveMcpAttachment,
+    ) -> Result<
+        meerkat_core::mcp_attachment::LiveMcpAttachmentReceipt,
+        meerkat_core::mcp_attachment::LiveMcpAttachError,
+    > {
+        let _ = attachment;
+        Err(meerkat_core::mcp_attachment::LiveMcpAttachError::Unsupported)
     }
 
     /// Replace the LLM client for subsequent turns after proving that its
@@ -3573,6 +3788,16 @@ pub trait SessionAgent: Send {
     /// live session. This ensures subsequent inheriting calls observe the
     /// updated value.
     fn update_keep_alive(&mut self, _keep_alive: bool) {}
+
+    /// Apply one change to the session's durable MCP attachment intents.
+    fn apply_mcp_attachment_intent(
+        &mut self,
+        _mutation: meerkat_core::McpAttachmentIntentMutation,
+    ) -> Result<meerkat_core::McpAttachmentIntentRecorded, meerkat_core::error::AgentError> {
+        Err(meerkat_core::error::AgentError::ConfigError(
+            "MCP attachment intents are not supported by this session agent".to_string(),
+        ))
+    }
 
     /// Update the canonical mob operator authority persisted on the session.
     fn update_mob_tool_authority_context(
@@ -7367,6 +7592,42 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         Ok(controller)
     }
 
+    /// Attach one reviewed MCP server to the exact live actor's own router.
+    /// The actor runs it between turns; another or a retired actor refuses
+    /// as not current.
+    pub async fn attach_live_mcp_server_for_actor(
+        &self,
+        expected_actor: &LiveSessionActorWitness,
+        attachment: meerkat_core::mcp_attachment::LiveMcpAttachment,
+    ) -> Result<
+        meerkat_core::mcp_attachment::LiveMcpAttachmentReceipt,
+        meerkat_core::mcp_attachment::LiveMcpAttachError,
+    > {
+        use meerkat_core::mcp_attachment::{LiveMcpAttachError, McpAttachmentRefusal};
+        let not_current = || LiveMcpAttachError::Refused(McpAttachmentRefusal::NotCurrent);
+        let id = expected_actor.session_id();
+        let command_tx = self
+            .sessions
+            .read(|sessions| {
+                sessions
+                    .get(id)
+                    .filter(|handle| expected_actor.is_handle(handle) && expected_actor.is_live())
+                    .map(|handle| handle.command_tx.clone())
+            })
+            .await
+            .ok_or_else(not_current)?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        command_tx
+            .send(SessionCommand::AttachMcpServer {
+                expected_actor: expected_actor.clone(),
+                attachment: Box::new(attachment),
+                reply_tx,
+            })
+            .await
+            .map_err(|_| not_current())?;
+        reply_rx.await.map_err(|_| not_current())?
+    }
+
     /// Get the current live durable LLM identity for a session.
     pub async fn live_session_llm_identity(
         &self,
@@ -8634,6 +8895,31 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
         Ok(())
     }
 
+    async fn update_session_mcp_attachment_intent(
+        &self,
+        id: &SessionId,
+        mutation: meerkat_core::McpAttachmentIntentMutation,
+    ) -> Result<meerkat_core::McpAttachmentIntentRecorded, SessionError> {
+        let command_tx = self.session_command_tx(id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        command_tx
+            .send(SessionCommand::ApplyMcpAttachmentIntent { mutation, reply_tx })
+            .await
+            .map_err(|_| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                    "Session task has exited".to_string(),
+                ))
+            })?;
+        reply_rx
+            .await
+            .map_err(|_| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                    "Session task dropped reply channel".to_string(),
+                ))
+            })?
+            .map_err(SessionError::Agent)
+    }
+
     async fn update_session_mob_authority_context(
         &self,
         id: &SessionId,
@@ -9448,6 +9734,13 @@ async fn drain_session_task_commands<A: SessionAgent>(
             *transcript_authority_generation = (*transcript_authority_generation).saturating_add(1);
         }
         match cmd {
+            SessionCommand::AttachMcpServer { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(
+                    meerkat_core::mcp_attachment::LiveMcpAttachError::Refused(
+                        meerkat_core::mcp_attachment::McpAttachmentRefusal::NotCurrent,
+                    ),
+                ));
+            }
             SessionCommand::PinControllerClient { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(AgentError::OperationRefused {
                     refusal: meerkat_core::authorization::OperationRefused::new(
@@ -9623,6 +9916,9 @@ async fn drain_session_task_commands<A: SessionAgent>(
             SessionCommand::UpdateMobToolAuthority { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(meerkat_core::error::AgentError::Cancelled));
             }
+            SessionCommand::ApplyMcpAttachmentIntent { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(meerkat_core::error::AgentError::Cancelled));
+            }
             SessionCommand::GovernedSystemContextControl { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(SessionError::Agent(AgentError::Cancelled).into()));
             }
@@ -9758,6 +10054,28 @@ async fn session_task<A: SessionAgent>(
         }
 
         match cmd {
+            SessionCommand::AttachMcpServer {
+                expected_actor,
+                attachment,
+                reply_tx,
+            } => {
+                let outcome = if expected_actor.is_live()
+                    && expected_actor.same_incarnation(&control.actor_witness)
+                {
+                    // The attempt is observed only through this exact actor
+                    // incarnation.
+                    agent
+                        .attach_mcp_server(*attachment)
+                        .await
+                        .map(|receipt| ActorBoundAttempt::bind(receipt, expected_actor.clone()))
+                } else {
+                    Err(meerkat_core::mcp_attachment::LiveMcpAttachError::Refused(
+                        meerkat_core::mcp_attachment::McpAttachmentRefusal::NotCurrent,
+                    ))
+                };
+                let _ = reply_tx.send(outcome);
+                continue;
+            }
             SessionCommand::PinControllerClient {
                 expected_actor,
                 reply_tx,
@@ -11143,6 +11461,13 @@ async fn session_task<A: SessionAgent>(
             } => {
                 let _ = reply_tx.send(agent.update_mob_tool_authority_context(authority_context));
             }
+            SessionCommand::ApplyMcpAttachmentIntent { mutation, reply_tx } => {
+                // A caller that is already gone owns no settlement for the
+                // change, so it is not applied.
+                if !reply_tx.is_closed() {
+                    let _ = reply_tx.send(agent.apply_mcp_attachment_intent(mutation));
+                }
+            }
             SessionCommand::AppendSystemNoticeControl { record, reply_tx } => {
                 let result = match control.archive_snapshot_gate.enter_apply() {
                     Ok(_gate) => agent.append_system_notice_control(record),
@@ -11231,6 +11556,11 @@ async fn session_task<A: SessionAgent>(
             }
         }
     };
+    // An ordinary exit releases what the agent owned before it is reported.
+    // This is not a cleanup receipt: a panic or abort skips it, a removed-
+    // exit join discards the task's JoinError, and `complete_task_exit` is a
+    // unit marker, so an observed exit does not prove the release completed.
+    agent.release_owned_resources().await;
     teardown_authorization.complete_task_exit();
 }
 

@@ -65,6 +65,8 @@ fn configuration() -> meerkat_runtime::meerkat_machine::NativeGrantWorkConfigura
         .unwrap(),
     );
     meerkat_runtime::meerkat_machine::NativeGrantWorkConfiguration {
+        retained_resume: None,
+        require_scoped_destination: false,
         grants,
         ingress: Arc::new(|_, _, _, _| {
             Err(
@@ -75,6 +77,7 @@ fn configuration() -> meerkat_runtime::meerkat_machine::NativeGrantWorkConfigura
         }),
         invocation_owner: Arc::new(RefusingPolicies),
         operation_owner: Arc::new(RefusingPolicies),
+        configured_mcp_attachment: None,
     }
 }
 fn bundle() -> PersistenceBundle {

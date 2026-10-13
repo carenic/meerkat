@@ -18,6 +18,7 @@ use super::status::AuthStatusPhase;
 #[cfg(not(target_arch = "wasm32"))]
 use super::token_store::{
     CredentialMutationError, CredentialMutationOutcome, ProviderAuthPersistence, TokenStore,
+    TokenStoreAccess, TokenStoreObservation,
 };
 use super::token_store::{PersistedAuthMode, PersistedTokens, TokenKey, TokenStoreError};
 use crate::connection::{AuthBindingRef, AuthCredentialIdentity};
@@ -28,7 +29,28 @@ use crate::handles::{
 };
 
 #[cfg(not(target_arch = "wasm32"))]
-type LoginLifecycleLockMap = parking_lot::Mutex<HashMap<LeaseKey, Weak<tokio::sync::Mutex<()>>>>;
+type LoginLifecycleLockMap = parking_lot::Mutex<HashMap<LeaseKey, Weak<LeaseLifecycleOwner>>>;
+
+/// One lease's lifecycle exclusion and the guard that currently holds it, so
+/// admitted credential work can keep that same exclusion until it settles.
+#[cfg(not(target_arch = "wasm32"))]
+struct LeaseLifecycleOwner {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    held: parking_lot::Mutex<Weak<HeldLeaseLifecycle>>,
+    /// Operating-system credential operations still physically running that
+    /// retain the held exclusion.
+    physical: std::sync::atomic::AtomicUsize,
+    /// Wakes unattended waiters when such an operation starts.
+    physical_started: tokio::sync::Notify,
+}
+
+/// A held lifecycle exclusion. The lease is released only when its guard and
+/// every retention of it are gone.
+#[cfg(not(target_arch = "wasm32"))]
+struct HeldLeaseLifecycle {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    owner: Arc<LeaseLifecycleOwner>,
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 static LOGIN_LIFECYCLE_LOCKS: OnceLock<LoginLifecycleLockMap> = OnceLock::new();
@@ -43,7 +65,7 @@ fn login_lifecycle_locks() -> &'static LoginLifecycleLockMap {
 #[cfg(not(target_arch = "wasm32"))]
 pub struct AuthLoginLifecycleGuard {
     lease_key: LeaseKey,
-    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _held: Arc<HeldLeaseLifecycle>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -55,24 +77,119 @@ impl AuthLoginLifecycleGuard {
     }
 }
 
+/// A retention of a held lifecycle exclusion by an operating-system
+/// credential operation that is physically running. The operation keeps it
+/// until it settles, so the exclusion outlives a cancelled caller or a
+/// dropped runtime in a running host. It grants no other authority.
 #[cfg(not(target_arch = "wasm32"))]
-fn auth_login_lifecycle_lock(lease_key: &LeaseKey) -> Arc<tokio::sync::Mutex<()>> {
-    let mut locks = login_lifecycle_locks().lock();
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = locks.get(lease_key).and_then(Weak::upgrade) {
-        lock
-    } else {
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
-        locks.insert(lease_key.clone(), Arc::downgrade(&lock));
-        lock
+pub struct AuthLoginLifecycleRetention {
+    held: Arc<HeldLeaseLifecycle>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for AuthLoginLifecycleRetention {
+    fn drop(&mut self) {
+        self.held
+            .owner
+            .physical
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for AuthLoginLifecycleRetention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuthLoginLifecycleRetention")
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn auth_login_lifecycle_owner(lease_key: &LeaseKey) -> Arc<LeaseLifecycleOwner> {
+    let mut owners = login_lifecycle_locks().lock();
+    owners.retain(|_, owner| owner.strong_count() > 0);
+    if let Some(owner) = owners.get(lease_key).and_then(Weak::upgrade) {
+        owner
+    } else {
+        let owner = Arc::new(LeaseLifecycleOwner {
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            held: parking_lot::Mutex::new(Weak::new()),
+            physical: std::sync::atomic::AtomicUsize::new(0),
+            physical_started: tokio::sync::Notify::new(),
+        });
+        owners.insert(lease_key.clone(), Arc::downgrade(&owner));
+        owner
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn hold_lease_lifecycle(
+    owner: Arc<LeaseLifecycleOwner>,
+    guard: tokio::sync::OwnedMutexGuard<()>,
+) -> Arc<HeldLeaseLifecycle> {
+    let held = Arc::new(HeldLeaseLifecycle {
+        _guard: guard,
+        owner: Arc::clone(&owner),
+    });
+    *owner.held.lock() = Arc::downgrade(&held);
+    held
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn acquire_auth_login_lifecycle_guard(lease_key: &LeaseKey) -> AuthLoginLifecycleGuard {
+    let owner = auth_login_lifecycle_owner(lease_key);
+    let guard = Arc::clone(&owner.lock).lock_owned().await;
     AuthLoginLifecycleGuard {
         lease_key: lease_key.clone(),
-        _guard: auth_login_lifecycle_lock(lease_key).lock_owned().await,
+        _held: hold_lease_lifecycle(owner, guard),
+    }
+}
+
+/// Retain the lifecycle exclusion that is held for `lease_key` right now, for
+/// an operating-system credential operation that is about to run, or `None`
+/// when nobody holds it. The operation keeps the exclusion until it settles;
+/// unattended waiters learn at once that it is physically held.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn retain_auth_login_lifecycle_exclusion(
+    lease_key: &LeaseKey,
+) -> Option<AuthLoginLifecycleRetention> {
+    let owner = login_lifecycle_locks()
+        .lock()
+        .get(lease_key)
+        .and_then(Weak::upgrade)?;
+    let held = owner.held.lock().upgrade()?;
+    owner
+        .physical
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    owner.physical_started.notify_waiters();
+    Some(AuthLoginLifecycleRetention { held })
+}
+
+/// Acquire the lease guard for unattended credential work (provider setup,
+/// request preparation). If the lease's exclusion is retained by an
+/// operating-system credential operation that is still physically running,
+/// return `None` at once instead of waiting behind it; ordinary contention is
+/// waited out as before.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn acquire_auth_login_lifecycle_guard_for_unattended(
+    lease_key: &LeaseKey,
+) -> Option<AuthLoginLifecycleGuard> {
+    let owner = auth_login_lifecycle_owner(lease_key);
+    loop {
+        let started = owner.physical_started.notified();
+        tokio::pin!(started);
+        started.as_mut().enable();
+        if owner.physical.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            return None;
+        }
+        tokio::select! {
+            guard = Arc::clone(&owner.lock).lock_owned() => {
+                return Some(AuthLoginLifecycleGuard {
+                    lease_key: lease_key.clone(),
+                    _held: hold_lease_lifecycle(Arc::clone(&owner), guard),
+                });
+            }
+            () = &mut started => {}
+        }
     }
 }
 
@@ -86,10 +203,11 @@ pub async fn acquire_auth_login_lifecycle_guard(lease_key: &LeaseKey) -> AuthLog
 pub fn try_acquire_auth_login_lifecycle_guard(
     lease_key: &LeaseKey,
 ) -> Option<AuthLoginLifecycleGuard> {
-    let guard = auth_login_lifecycle_lock(lease_key).try_lock_owned().ok()?;
+    let owner = auth_login_lifecycle_owner(lease_key);
+    let guard = Arc::clone(&owner.lock).try_lock_owned().ok()?;
     Some(AuthLoginLifecycleGuard {
         lease_key: lease_key.clone(),
-        _guard: guard,
+        _held: hold_lease_lifecycle(owner, guard),
     })
 }
 
@@ -118,6 +236,9 @@ pub fn persisted_auth_mode_uses_oauth_login_lifecycle(mode: PersistedAuthMode) -
         | PersistedAuthMode::Vertex
         | PersistedAuthMode::Foundry
         | PersistedAuthMode::ExternalAuthorizer
+        | PersistedAuthMode::ConnectorClientSecret
+        | PersistedAuthMode::McpAttachmentIdentityKey
+        | PersistedAuthMode::McpServiceSecret
         | PersistedAuthMode::Command => false,
     }
 }
@@ -130,7 +251,13 @@ pub fn persisted_auth_mode_uses_oauth_login_lifecycle(mode: PersistedAuthMode) -
 /// Single owner of the "direct-secret only at create surfaces" predicate over
 /// the typed [`PersistedAuthMode`].
 pub fn persisted_auth_mode_is_directly_creatable(mode: PersistedAuthMode) -> bool {
-    !persisted_auth_mode_uses_oauth_login_lifecycle(mode)
+    // A connector client secret and an MCP service secret are server or
+    // client configuration owned by their own writers, not credentials
+    // either surface may create.
+    mode != PersistedAuthMode::ConnectorClientSecret
+        && mode != PersistedAuthMode::McpAttachmentIdentityKey
+        && mode != PersistedAuthMode::McpServiceSecret
+        && !persisted_auth_mode_uses_oauth_login_lifecycle(mode)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +270,10 @@ pub struct TokenLifecyclePublication {
 
 #[derive(Debug, Error)]
 pub enum TokenLifecycleMarkerError {
+    /// The key holds client configuration (a connector client secret), which
+    /// has no credential lifecycle.
+    #[error("token key `{token_key}` is not a credential key")]
+    NotACredentialKey { token_key: String },
     #[error(
         "AuthMachine lifecycle transition belongs to `{transition_key}`, not token key `{token_key}`"
     )]
@@ -192,7 +323,12 @@ pub fn mark_tokens_lifecycle_published_for_transition(
     tokens: &PersistedTokens,
     transition: &AuthLeaseTransition,
 ) -> Result<PersistedTokens, TokenLifecycleMarkerError> {
-    let token_lease_key = LeaseKey::from_credential_identity(key.credential_identity());
+    let Some(identity) = key.credential_identity() else {
+        return Err(TokenLifecycleMarkerError::NotACredentialKey {
+            token_key: key.to_string(),
+        });
+    };
+    let token_lease_key = LeaseKey::from_credential_identity(identity);
     if transition.lease_key() != &token_lease_key {
         return Err(TokenLifecycleMarkerError::LeaseKeyMismatch {
             token_key: token_lease_key.to_string(),
@@ -292,6 +428,78 @@ pub fn publish_token_lifecycle_acquired_for_identity(
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+const CONTROLLER_CUSTODY_BUSY_FIRST_BACKOFF: std::time::Duration =
+    std::time::Duration::from_millis(10);
+#[cfg(not(target_arch = "wasm32"))]
+const CONTROLLER_CUSTODY_BUSY_MAX_BACKOFF: std::time::Duration =
+    std::time::Duration::from_millis(200);
+
+/// Outcome of a credential publication bounded by a caller deadline.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum BoundedLifecyclePublicationError {
+    /// The publication was refused for a reason that is never retried.
+    #[error("{0}")]
+    Refused(DslTransitionError),
+    /// The caller's deadline passed while native controller custody was busy.
+    /// `last_busy` is the last typed Busy refusal; `None` means the deadline
+    /// had already passed and no publication was attempted.
+    #[error("credential publication deadline passed while controller custody was busy{}", last_busy.as_ref().map(|busy| format!(": {busy}")).unwrap_or_default())]
+    DeadlineExceeded {
+        last_busy: Option<DslTransitionError>,
+    },
+}
+
+/// [`publish_token_lifecycle_acquired_for_identity`] retried while native
+/// controller custody is busy, until the caller's monotonic `deadline`.
+///
+/// Each attempt is one complete publication: native custody is acquired and
+/// its current references are checked again, and a refusal has released all
+/// of it before this caller waits. Only the typed
+/// [`ControllerReadinessFailure::Busy`](crate::authorization::ControllerReadinessFailure::Busy)
+/// refusal is retried. The deadline is checked before every attempt, so an
+/// expired deadline starts no publication; each wait is clipped to it.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn publish_token_lifecycle_acquired_for_identity_within(
+    handle: &GeneratedAuthLeaseHandle,
+    credential_identity: &AuthCredentialIdentity,
+    tokens: &PersistedTokens,
+    deadline: tokio::time::Instant,
+) -> Result<AuthLeaseTransition, BoundedLifecyclePublicationError> {
+    retry_busy_controller_custody(deadline, || {
+        publish_token_lifecycle_acquired_for_identity(handle, credential_identity, tokens)
+    })
+    .await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn retry_busy_controller_custody<T>(
+    deadline: tokio::time::Instant,
+    mut attempt: impl FnMut() -> Result<T, DslTransitionError>,
+) -> Result<T, BoundedLifecyclePublicationError> {
+    let mut backoff = CONTROLLER_CUSTODY_BUSY_FIRST_BACKOFF;
+    let mut last_busy = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(BoundedLifecyclePublicationError::DeadlineExceeded { last_busy });
+        }
+        match attempt() {
+            Err(error)
+                if error.controller_readiness_refusal()
+                    == Some(crate::authorization::ControllerReadinessFailure::Busy) =>
+            {
+                last_busy = Some(error);
+            }
+            result => return result.map_err(BoundedLifecyclePublicationError::Refused),
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(backoff.min(remaining)).await;
+        backoff = (backoff * 2).min(CONTROLLER_CUSTODY_BUSY_MAX_BACKOFF);
+    }
+}
+
 pub fn publish_token_lifecycle_released(
     handle: &GeneratedAuthLeaseHandle,
     auth_binding: &AuthBindingRef,
@@ -353,7 +561,7 @@ async fn clear_tokens_and_publish_lifecycle_released_under_guard(
 
     // Commit: one durable mutation destroys the credential and its lifecycle
     // marker together.
-    if let Err(clear_err) = store.clear(&key).await {
+    if let Err(clear_err) = store.clear_for(&key, TokenStoreAccess::Interactive).await {
         // Pre-commit rollback: durable truth still holds the credential, so
         // restoring the staged release keeps the lease projection aligned.
         if let Err(restore_err) = restore_token_lifecycle_snapshot(handle, &staged) {
@@ -455,9 +663,9 @@ async fn clear_tokens_and_publish_lifecycle_released_coordinated_with_mode(
                     if let Some(expected_mode) = expected_mode {
                         let key = TokenKey::from_credential_identity(&credential_identity);
                         if let Some(tokens) = store
-                            .load(&key)
+                            .load_for(&key, TokenStoreAccess::Interactive)
                             .await
-                            .map_err(|error| CredentialMutationError::TokenStore(error.to_string()))?
+                            .map_err(CredentialMutationError::from_token_store)?
                             && tokens.auth_mode != expected_mode
                         {
                             return Err(CredentialMutationError::SlotRefused(
@@ -664,7 +872,154 @@ pub async fn rehydrate_marked_tokens_for_status_for_identity_with_guard(
         return Err(AuthStatusRehydrateError::LeaseGuardMismatch);
     }
     let key = TokenKey::from_credential_identity(credential_identity);
-    let Some(tokens) = token_store.load(&key).await? else {
+    let tokens = token_store
+        .load_for(&key, TokenStoreAccess::Unattended)
+        .await?;
+    apply_marked_tokens_status_rehydration(
+        tokens,
+        auth_lease,
+        credential_identity,
+        expected_mode,
+        now,
+        guard,
+    )
+}
+
+/// What a non-blocking public status read learned about one credential.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CredentialStatusRead {
+    /// The store answered. `None` is proven absence.
+    Answered(Option<PersistedTokens>),
+    /// The credential's lifecycle owner is busy with credential work. Nothing
+    /// was read or restored, and nothing waited.
+    OwnerBusy,
+    /// The store did not answer without operating-system interaction. This is
+    /// never absence.
+    Unanswered(TokenStoreObservation),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl CredentialStatusRead {
+    /// A status read from a store observation, with no lease restoration
+    /// (the caller already has a live lease).
+    pub fn from_observation(observation: TokenStoreObservation) -> Self {
+        match observation {
+            TokenStoreObservation::Present(tokens) => Self::Answered(Some(*tokens)),
+            TokenStoreObservation::Missing => Self::Answered(None),
+            observation => Self::Unanswered(observation),
+        }
+    }
+
+    /// The tokens the store answered with, if it answered with any.
+    pub fn tokens(&self) -> Option<&PersistedTokens> {
+        match self {
+            Self::Answered(tokens) => tokens.as_ref(),
+            Self::OwnerBusy | Self::Unanswered(_) => None,
+        }
+    }
+
+    /// The answered tokens, consuming the read.
+    pub fn into_tokens(self) -> Option<PersistedTokens> {
+        match self {
+            Self::Answered(tokens) => tokens,
+            Self::OwnerBusy | Self::Unanswered(_) => None,
+        }
+    }
+
+    /// What this read could not observe, or `None` when the store answered.
+    pub fn observation(&self) -> Option<super::status::CredentialObservation> {
+        use super::status::CredentialObservation;
+        match self {
+            Self::Answered(_) => None,
+            Self::OwnerBusy => Some(CredentialObservation::OwnerBusy),
+            Self::Unanswered(observation) => Some(match observation {
+                TokenStoreObservation::Pending => CredentialObservation::Pending,
+                TokenStoreObservation::Denied => CredentialObservation::Denied,
+                TokenStoreObservation::InteractionRequired => {
+                    CredentialObservation::InteractionRequired
+                }
+                TokenStoreObservation::Unavailable => CredentialObservation::Unavailable,
+                TokenStoreObservation::NotObserved
+                | TokenStoreObservation::Present(_)
+                | TokenStoreObservation::Missing => CredentialObservation::NotObserved,
+            }),
+        }
+    }
+}
+
+/// Public status read for a credential with no live lease.
+///
+/// It never waits for the credential's lifecycle owner and never starts an
+/// operating-system credential read. A busy owner is [`CredentialStatusRead::OwnerBusy`]
+/// with no load and no restore. Only a store answer restores or releases the
+/// lease, exactly as [`rehydrate_marked_tokens_for_status_for_identity`] does.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn observe_marked_tokens_for_status_for_identity(
+    token_store: &dyn TokenStore,
+    auth_lease: &GeneratedAuthLeaseHandle,
+    credential_identity: &AuthCredentialIdentity,
+    expected_mode: PersistedAuthMode,
+    now: DateTime<Utc>,
+) -> Result<CredentialStatusRead, AuthStatusRehydrateError> {
+    let lease_key = LeaseKey::from_credential_identity(credential_identity);
+    let Some(guard) = try_acquire_auth_login_lifecycle_guard(&lease_key) else {
+        return Ok(CredentialStatusRead::OwnerBusy);
+    };
+    let key = TokenKey::from_credential_identity(credential_identity);
+    let tokens = match token_store.observe_status(&key).await? {
+        TokenStoreObservation::Present(tokens) => Some(*tokens),
+        TokenStoreObservation::Missing => None,
+        observation => return Ok(CredentialStatusRead::Unanswered(observation)),
+    };
+    apply_marked_tokens_status_rehydration(
+        tokens,
+        auth_lease,
+        credential_identity,
+        expected_mode,
+        now,
+        &guard,
+    )
+    .map(CredentialStatusRead::Answered)
+}
+
+/// Rehydrate from tokens the caller already read under this exact lease
+/// guard, without reading the store again.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn rehydrate_loaded_marked_tokens_with_guard(
+    tokens: Option<PersistedTokens>,
+    auth_lease: &GeneratedAuthLeaseHandle,
+    credential_identity: &AuthCredentialIdentity,
+    expected_mode: PersistedAuthMode,
+    now: DateTime<Utc>,
+    guard: &AuthLoginLifecycleGuard,
+) -> Result<Option<PersistedTokens>, AuthStatusRehydrateError> {
+    if guard.lease_key() != &LeaseKey::from_credential_identity(credential_identity) {
+        return Err(AuthStatusRehydrateError::LeaseGuardMismatch);
+    }
+    apply_marked_tokens_status_rehydration(
+        tokens,
+        auth_lease,
+        credential_identity,
+        expected_mode,
+        now,
+        guard,
+    )
+}
+
+/// Apply one answered status read under the exact lease guard.
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_marked_tokens_status_rehydration(
+    tokens: Option<PersistedTokens>,
+    auth_lease: &GeneratedAuthLeaseHandle,
+    credential_identity: &AuthCredentialIdentity,
+    expected_mode: PersistedAuthMode,
+    now: DateTime<Utc>,
+    guard: &AuthLoginLifecycleGuard,
+) -> Result<Option<PersistedTokens>, AuthStatusRehydrateError> {
+    let key = TokenKey::from_credential_identity(credential_identity);
+    let Some(tokens) = tokens else {
         // Durable truth holds no credential for this binding. The in-process
         // lease is a projection of durable truth: a credential-bearing lease
         // that outlived its durable record (e.g. a clear whose release
@@ -744,6 +1099,8 @@ pub async fn rehydrate_durable_predecessor_for_mutation(
     .await
 }
 
+/// The predecessor read of an explicit credential mutation (login, profile
+/// replacement, logout): an interactive access.
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn rehydrate_durable_predecessor_for_mutation_for_identity(
     token_store: &dyn TokenStore,
@@ -752,11 +1109,33 @@ pub async fn rehydrate_durable_predecessor_for_mutation_for_identity(
     now: DateTime<Utc>,
     guard: &AuthLoginLifecycleGuard,
 ) -> Result<Option<PersistedTokens>, AuthStatusRehydrateError> {
+    rehydrate_durable_predecessor_for_mutation_with_access(
+        token_store,
+        auth_lease,
+        credential_identity,
+        now,
+        guard,
+        TokenStoreAccess::Interactive,
+    )
+    .await
+}
+
+/// The predecessor read of a credential mutation, for a stated access: an
+/// unattended refresh normalization reads with `Unattended`.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn rehydrate_durable_predecessor_for_mutation_with_access(
+    token_store: &dyn TokenStore,
+    auth_lease: &GeneratedAuthLeaseHandle,
+    credential_identity: &AuthCredentialIdentity,
+    now: DateTime<Utc>,
+    guard: &AuthLoginLifecycleGuard,
+    access: TokenStoreAccess,
+) -> Result<Option<PersistedTokens>, AuthStatusRehydrateError> {
     if guard.lease_key() != &LeaseKey::from_credential_identity(credential_identity) {
         return Err(AuthStatusRehydrateError::LeaseGuardMismatch);
     }
     let key = TokenKey::from_credential_identity(credential_identity);
-    let tokens = match token_store.load(&key).await {
+    let tokens = match token_store.load_for(&key, access).await {
         Ok(tokens) => tokens,
         Err(TokenStoreError::Serde(_)) => None,
         Err(error) => return Err(AuthStatusRehydrateError::TokenStore(error)),
@@ -828,6 +1207,125 @@ mod tests {
     use crate::auth::PersistedAuthMode;
     use crate::handles::AuthLeasePhase;
 
+    #[test]
+    fn a_connector_client_secret_is_neither_a_lifecycle_nor_a_creatable_credential() {
+        assert!(!persisted_auth_mode_uses_oauth_login_lifecycle(
+            PersistedAuthMode::ConnectorClientSecret
+        ));
+        assert!(!persisted_auth_mode_is_directly_creatable(
+            PersistedAuthMode::ConnectorClientSecret
+        ));
+        assert!(!persisted_auth_mode_uses_oauth_login_lifecycle(
+            PersistedAuthMode::McpServiceSecret
+        ));
+        assert!(!persisted_auth_mode_is_directly_creatable(
+            PersistedAuthMode::McpServiceSecret
+        ));
+        assert!(persisted_auth_mode_is_directly_creatable(
+            PersistedAuthMode::ApiKey
+        ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn busy() -> DslTransitionError {
+        DslTransitionError::controller_readiness_refused(
+            "NativeControllerCredentialRelease::Busy",
+            crate::authorization::ControllerReadinessFailure::Busy,
+            "custody busy",
+        )
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(start_paused = true)]
+    async fn busy_controller_custody_is_retried_until_it_publishes() {
+        let mut attempts = 0;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        retry_busy_controller_custody(deadline, || {
+            attempts += 1;
+            if attempts == 1 { Err(busy()) } else { Ok(()) }
+        })
+        .await
+        .expect("second attempt publishes");
+        assert_eq!(attempts, 2);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(start_paused = true)]
+    async fn only_typed_busy_controller_custody_is_retried() {
+        use crate::authorization::ControllerReadinessFailure;
+        for refusal in [
+            DslTransitionError::controller_readiness_refused(
+                "NativeControllerCredentialRelease::AuthorityUnavailable",
+                ControllerReadinessFailure::AuthorityUnavailable,
+                "unavailable",
+            ),
+            DslTransitionError::controller_readiness_refused(
+                "NativeControllerCredentialRelease::UnsupportedScope",
+                ControllerReadinessFailure::UnsupportedScope,
+                "unsupported",
+            ),
+            DslTransitionError::no_matching("NativeControllerCredentialRelease::InUse", "in use"),
+            // Busy text without the typed cause is not retry authority.
+            DslTransitionError::no_matching("NativeControllerCredentialRelease::Busy", "busy"),
+            DslTransitionError::guard_rejected("AuthLeaseHandle::acquire_lease", "guard"),
+        ] {
+            let mut attempts = 0;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            let error = retry_busy_controller_custody(deadline, || -> Result<(), _> {
+                attempts += 1;
+                Err(refusal.clone())
+            })
+            .await
+            .expect_err("refusal is returned");
+            assert_eq!(error, BoundedLifecyclePublicationError::Refused(refusal));
+            assert_eq!(attempts, 1);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(start_paused = true)]
+    async fn busy_past_the_deadline_keeps_the_last_busy_and_makes_no_late_attempt() {
+        let started = tokio::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(500);
+        let mut attempted_at = Vec::new();
+        let error = retry_busy_controller_custody(deadline, || -> Result<(), _> {
+            attempted_at.push(tokio::time::Instant::now());
+            Err(busy())
+        })
+        .await
+        .expect_err("busy past the deadline");
+        assert_eq!(
+            error,
+            BoundedLifecyclePublicationError::DeadlineExceeded {
+                last_busy: Some(busy())
+            }
+        );
+        assert_eq!(tokio::time::Instant::now(), deadline, "waits are clipped");
+        assert!(
+            attempted_at.iter().all(|at| *at < deadline),
+            "no late attempt"
+        );
+        assert!((2..=10).contains(&attempted_at.len()), "{attempted_at:?}");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_deadline_starts_no_publication() {
+        let deadline = tokio::time::Instant::now();
+        let mut attempts = 0;
+        let error = retry_busy_controller_custody(deadline, || -> Result<(), _> {
+            attempts += 1;
+            Ok(())
+        })
+        .await
+        .expect_err("expired deadline");
+        assert_eq!(
+            error,
+            BoundedLifecyclePublicationError::DeadlineExceeded { last_busy: None }
+        );
+        assert_eq!(attempts, 0);
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn try_lifecycle_guard_shares_async_owner_and_releases_to_waiter() {
@@ -864,6 +1362,59 @@ mod tests {
             try_acquire_auth_login_lifecycle_guard(&key).is_some(),
             "a failed attempt must leave no retained lease ownership"
         );
+    }
+
+    /// Unattended acquisition waits out ordinary contention, but answers at
+    /// once, without the lease, while an operating-system credential call
+    /// retains the held exclusion (including one that starts while it
+    /// waits). The retention keeps the lease held after its guard is gone.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn unattended_acquisition_never_waits_behind_a_retained_exclusion() {
+        let key = LeaseKey::new(
+            crate::RealmId::parse("unattended-guard-test").unwrap(),
+            crate::BindingId::parse("retained").unwrap(),
+            None,
+        );
+        assert!(
+            retain_auth_login_lifecycle_exclusion(&key).is_none(),
+            "nothing to retain while nobody holds the lease"
+        );
+        let held = acquire_auth_login_lifecycle_guard(&key).await;
+        let mut waiting = Box::pin(acquire_auth_login_lifecycle_guard_for_unattended(&key));
+        let pending = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(waiting.as_mut(), cx).is_pending())
+        })
+        .await;
+        assert!(pending, "ordinary contention is waited out");
+        let retention = retain_auth_login_lifecycle_exclusion(&key).expect("the lease is held");
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+            .await
+            .expect("the waiter answers at once when a call starts retaining the lease");
+        assert!(
+            answered.is_none(),
+            "no guard while a call retains the lease"
+        );
+        drop(held);
+        assert!(
+            try_acquire_auth_login_lifecycle_guard(&key).is_none(),
+            "the retention keeps the lease held after its guard is gone"
+        );
+        assert!(
+            acquire_auth_login_lifecycle_guard_for_unattended(&key)
+                .await
+                .is_none(),
+            "a later unattended caller answers at once too"
+        );
+        drop(retention);
+        let acquired = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            acquire_auth_login_lifecycle_guard_for_unattended(&key),
+        )
+        .await
+        .expect("the lease is free once the call settles")
+        .expect("an unattended caller acquires a free lease");
+        assert_eq!(acquired.lease_key(), &key);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

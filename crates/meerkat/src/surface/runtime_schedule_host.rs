@@ -76,17 +76,71 @@ pub fn spawn_runtime_backed_schedule_host_with_mobs<B: SessionAgentBuilder + 'st
     workgraph_service: Option<WorkGraphService>,
     owner_id: impl Into<String>,
 ) -> Option<super::ScheduleHostHandle> {
-    if !schedule_host_supported(schedule_service.store().kind()) {
-        return None;
-    }
-
-    let session_host: Arc<dyn SurfaceScheduleSessionHost> =
-        Arc::new(RuntimeBackedScheduleSessionHost::new(
+    spawn_schedule_session_host(
+        RuntimeBackedScheduleSessionHost::new(
             service,
             runtime_adapter,
             build_template,
             workgraph_service,
-        ));
+        ),
+        schedule_service,
+        mob_host,
+        runnable_host,
+        owner_id,
+    )
+}
+
+/// [`spawn_runtime_backed_schedule_host_with_mobs`] for a host whose delivery
+/// owners subscribe to `continuations`.
+///
+/// Each time this host attaches or reuses a scheduled session's exact
+/// executor attachment and completes its admission, it announces
+/// [`crate::ContinuationHostBindings::source_custody_changed`], so the
+/// delivery owners retry the rows they hold blocked. The announcement grants
+/// nothing: they read the actual owners again.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_runtime_backed_schedule_host_with_mobs_and_continuations<
+    B: SessionAgentBuilder + 'static,
+>(
+    service: Arc<PersistentSessionService<B>>,
+    runtime_adapter: Arc<MeerkatMachine>,
+    _config: Config,
+    schedule_service: ScheduleService,
+    build_template: SessionBuildOptions,
+    mob_host: Arc<dyn SurfaceScheduleMobHost>,
+    runnable_host: Option<Arc<dyn ScheduleRunnableHost>>,
+    workgraph_service: Option<WorkGraphService>,
+    continuations: Arc<crate::ContinuationHostBindings>,
+    owner_id: impl Into<String>,
+) -> Option<super::ScheduleHostHandle> {
+    spawn_schedule_session_host(
+        RuntimeBackedScheduleSessionHost::new(
+            service,
+            runtime_adapter,
+            build_template,
+            workgraph_service,
+        )
+        .with_continuations(continuations),
+        schedule_service,
+        mob_host,
+        runnable_host,
+        owner_id,
+    )
+}
+
+fn spawn_schedule_session_host<B: SessionAgentBuilder + 'static>(
+    session_host: RuntimeBackedScheduleSessionHost<B>,
+    schedule_service: ScheduleService,
+    mob_host: Arc<dyn SurfaceScheduleMobHost>,
+    runnable_host: Option<Arc<dyn ScheduleRunnableHost>>,
+    owner_id: impl Into<String>,
+) -> Option<super::ScheduleHostHandle> {
+    if !schedule_host_supported(schedule_service.store().kind()) {
+        return None;
+    }
+
+    let session_host: Arc<dyn SurfaceScheduleSessionHost> = Arc::new(session_host);
     let adapter =
         SharedScheduleTargetAdapter::new(schedule_service.clone(), session_host, mob_host);
     let adapter = match runnable_host {
@@ -105,6 +159,10 @@ struct RuntimeBackedScheduleSessionHost<B: SessionAgentBuilder> {
     runtime_adapter: Arc<MeerkatMachine>,
     build_template: SessionBuildOptions,
     workgraph_service: Option<WorkGraphService>,
+    /// Told after each completed ordinary admission; see
+    /// [`spawn_runtime_backed_schedule_host_with_mobs_and_continuations`].
+    #[cfg(not(target_arch = "wasm32"))]
+    continuations: Option<Arc<crate::ContinuationHostBindings>>,
 }
 
 #[derive(Debug)]
@@ -168,7 +226,15 @@ impl<B: SessionAgentBuilder + 'static> RuntimeBackedScheduleSessionHost<B> {
             runtime_adapter,
             build_template,
             workgraph_service,
+            #[cfg(not(target_arch = "wasm32"))]
+            continuations: None,
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn with_continuations(mut self, continuations: Arc<crate::ContinuationHostBindings>) -> Self {
+        self.continuations = Some(continuations);
+        self
     }
 
     fn recovered_schedule_request(
@@ -354,6 +420,15 @@ impl<B: SessionAgentBuilder + 'static> RuntimeBackedScheduleSessionHost<B> {
         };
         self.ensure_schedule_peer_ingress_for_admission(session_id, &admission)
             .await?;
+        // An ordinary admission attached or reused this host's exact
+        // attachment and checked its publication authority. A mob-owned one
+        // only consumes the mob's attachment, so it announces nothing.
+        #[cfg(not(target_arch = "wasm32"))]
+        if matches!(admission, ScheduledSessionAdmission::Ordinary)
+            && let Some(continuations) = &self.continuations
+        {
+            continuations.source_custody_changed();
+        }
         Ok(admission)
     }
 
@@ -930,6 +1005,103 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    fn build_announcing_schedule_host(
+        temp: &tempfile::TempDir,
+    ) -> (
+        RuntimeBackedScheduleSessionHost<crate::FactoryAgentBuilder>,
+        Arc<PersistentSessionService<crate::FactoryAgentBuilder>>,
+        Arc<crate::ContinuationHostBindings>,
+    ) {
+        let persistence = crate::PersistenceBundle::new(
+            Arc::new(meerkat_store::MemoryStore::new()) as Arc<dyn crate::SessionStore>,
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new())
+                as Arc<dyn meerkat_runtime::RuntimeStore>,
+            Arc::new(crate::MemoryBlobStore::new()),
+        )
+        .expect("construct runtime authority");
+        let continuations = persistence.continuation_bindings();
+        let mut builder = crate::FactoryAgentBuilder::new(
+            crate::AgentFactory::new(temp.path().join("sessions")),
+            crate::Config::default(),
+        );
+        builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::for_provider(
+            meerkat_core::Provider::OpenAI,
+        )));
+        let (service, runtime_adapter) =
+            crate::surface::build_runtime_backed_service(builder, 4, persistence)
+                .expect("compose the runtime-backed service");
+        let service = Arc::new(service);
+        let host = RuntimeBackedScheduleSessionHost::new(
+            Arc::clone(&service),
+            runtime_adapter,
+            SessionBuildOptions::default(),
+            None,
+        )
+        .with_continuations(Arc::clone(&continuations));
+        (host, service, continuations)
+    }
+
+    /// A completed ordinary admission announces the custody change to the
+    /// delivery owners once, whether it reused the exact attachment or
+    /// rebuilt the actor over it; a refused admission announces nothing.
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn a_completed_scheduled_admission_announces_its_custody_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (host, service, continuations) = build_announcing_schedule_host(&temp);
+        let mut create = sample_materialization_spec();
+        create.comms_name = None;
+        let session_id = host
+            .materialize_session(&sample_occurrence(), &create)
+            .await
+            .expect("scheduled materialization");
+        let source_changes = continuations.subscribe_source_changes();
+        let before = *source_changes.borrow();
+
+        let refused = host
+            .ensure_runtime_session_registered(&SessionId::new())
+            .await
+            .expect_err("a missing session target is refused");
+        assert!(
+            matches!(refused, ScheduleDomainError::InvalidSchedule(_)),
+            "{refused:?}"
+        );
+        assert_eq!(
+            *source_changes.borrow(),
+            before,
+            "a refused admission announces nothing"
+        );
+
+        let admission = host
+            .ensure_runtime_session_registered(&session_id)
+            .await
+            .expect("the live actor reuses its exact attachment");
+        assert!(matches!(admission, ScheduledSessionAdmission::Ordinary));
+        assert_eq!(
+            *source_changes.borrow(),
+            before + 1,
+            "a reused attachment announces its custody once"
+        );
+
+        let turn_boundary = service
+            .acquire_runtime_turn_finalization_guard(&session_id)
+            .await;
+        service
+            .discard_live_session_under_runtime_turn_boundary(&session_id)
+            .await
+            .expect("discard the live actor while keeping the attachment");
+        drop(turn_boundary);
+        host.ensure_runtime_session_registered(&session_id)
+            .await
+            .expect("the cold target is rebuilt over its exact attachment");
+        assert_eq!(
+            *source_changes.borrow(),
+            before + 2,
+            "a rebuilt admission announces its custody once"
+        );
+    }
+
     #[cfg(all(
         feature = "session-store",
         feature = "comms",
@@ -964,6 +1136,38 @@ mod tests {
             .publication_handle_for_executor_attachment(&attachment)
             .await
             .expect("scheduled attachment must retain actor A publication authority");
+        let actor_a = service
+            .live_session_actor_witness(&session_id)
+            .await
+            .expect("scheduled actor A");
+        assert!(
+            actor_a_publication
+                .actor_identity()
+                .is_some_and(|named| named.is_same_actor(&actor_a.executor_actor_identity())),
+            "the attachment's retained owner names actor A"
+        );
+        let owner_boundary = actor_a_publication
+            .turn_finalization_boundary()
+            .expect("the owner lends its session's boundary")
+            .acquire()
+            .await
+            .expect("the owner's boundary");
+        {
+            let waiting = service.acquire_runtime_turn_finalization_guard(&session_id);
+            tokio::pin!(waiting);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), &mut waiting)
+                    .await
+                    .is_err(),
+                "the owner's boundary is the service's own per-session boundary"
+            );
+            drop(owner_boundary);
+            drop(
+                tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+                    .await
+                    .expect("released with the owner's boundary"),
+            );
+        }
 
         let turn_boundary = service
             .acquire_runtime_turn_finalization_guard(&session_id)
@@ -991,6 +1195,22 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&actor_a_publication, &actor_b_publication),
             "machine-retained scheduled publication authority must advance from A to B"
+        );
+        let actor_b = service
+            .live_session_actor_witness(&session_id)
+            .await
+            .expect("scheduled actor B");
+        assert!(
+            actor_b_publication
+                .actor_identity()
+                .is_some_and(|named| named.is_same_actor(&actor_b.executor_actor_identity())),
+            "the attachment's retained owner advanced to actor B"
+        );
+        assert!(
+            actor_a_publication.actor_identity().is_some_and(|named| {
+                !named.is_same_actor(&actor_b.executor_actor_identity()) && !named.is_live()
+            }),
+            "actor A's owner names only revoked actor A, never B"
         );
 
         let terminal = meerkat_core::event::AgentEvent::InteractionComplete {
@@ -1040,7 +1260,8 @@ mod tests {
             meerkat_core::Provider::OpenAI,
         )));
         let (service, runtime_adapter) =
-            crate::surface::build_runtime_backed_service(builder, 4, persistence);
+            crate::surface::build_runtime_backed_service(builder, 4, persistence)
+                .expect("compose the runtime-backed service");
         let service = service.with_event_projection(
             Arc::new(meerkat_session::event_store::FileEventStore::new(
                 temp.path().join("events"),

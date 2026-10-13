@@ -167,7 +167,7 @@ work through their WorkGraph tools; SDK callers inspect the current graph.
 ### Jobs, approvals, artifacts, and projected event replay
 
 - jobs: `jobs_get/list/cancel/progress/result/artifacts/retry/health/subscribe/unsubscribe`
-- monitors and MobKit workers: `monitors_start`, `mobkit_job_*`
+- monitors and Meta workers: `monitors_start`, `meta_job_*`
 - approvals: `request_approval`, `list_approvals`, `get_approval`, `decide_approval`
 - artifacts: `list_artifacts`, `get_artifact`, `download_artifact`
 - projected event recovery: `latest_event_cursor`, `list_events_since`,

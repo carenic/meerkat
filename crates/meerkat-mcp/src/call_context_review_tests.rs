@@ -46,6 +46,17 @@ struct Decision {
 }
 
 impl WorkAuthorization for Work {
+    /// This test owner has no review material: explicitly not applicable.
+    fn review_operation_context(
+        &self,
+        _binding: &meerkat_core::authorization::PreparedAuthorizationBinding,
+    ) -> Result<
+        meerkat_core::authorization::ReviewOperationContextResolution,
+        meerkat_core::OperationAuthorizationError,
+    > {
+        Ok(meerkat_core::authorization::ReviewOperationContextResolution::NotApplicable)
+    }
+
     fn prepare(
         &self,
         binding: &PreparedAuthorizationBinding,

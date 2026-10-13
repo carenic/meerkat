@@ -349,6 +349,7 @@ mod tests {
         let provenance = ToolProvenance {
             kind: ToolSourceKind::Callback,
             source_id: "owner-a".into(),
+            artifact: None,
         };
         let tool = Arc::new(ToolDef::new(
             "deferred",
@@ -376,6 +377,7 @@ mod tests {
         let provenance = ToolProvenance {
             kind: ToolSourceKind::Mcp,
             source_id: "app-server".into(),
+            artifact: None,
         };
         let entries = (0..3)
             .map(|index| {
@@ -418,6 +420,7 @@ mod tests {
                 ToolProvenance {
                     kind: ToolSourceKind::Callback,
                     source_id: "owner".into(),
+                    artifact: None,
                 },
             ),
         ] {

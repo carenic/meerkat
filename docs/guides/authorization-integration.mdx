@@ -20,6 +20,14 @@ flag or universal REST/RPC authorization setup is documented here. Existing
 governed profile.
 </Note>
 
+Each protected operation needs current native permission. Its owner's policy
+selects no additional review (R1), bounded model review (R2), or fresh human
+approval (R3). Review and consent cannot supply missing permission. Refused or
+action-required operations return local feedback while permitted work continues.
+The support table below separates recorded evidence from remaining work; the
+[review requirements](#model-review-requirements) explain how to integrate each
+choice.
+
 ## Check support before rollout
 
 | Area | Current evidence and remaining work |
@@ -27,10 +35,11 @@ governed profile.
 | Native input, grants, and tool feedback | Completed-turn SQLite has direct acceptance in actual separate processes, marked File-credential restoration, fresh current host grants and new authenticated model-tool-model work. The published fixed-host JSONL profile has focused public-entry acceptance and recorded CI qualification for local refusal, permitted siblings and same-run notification feedback, using in-memory storage and loopback callbacks. The [implementation checkpoint](/internal/design/adr-001-implementation/implementation-progress) owns exact source scope and test inventories. Ordinary constructors, JWT ingress, interrupted recovery and all-surface activation remain unqualified. |
 | Model/provider and infrastructure errors | Focused tests exercise primary infrastructure-error classification through three provider adapters, native deferred siblings, and live/fallback fixtures. They do not certify every production route, retry, hosted capability, or live mode. |
 | Controller continuity | Actual controller selection and retained work references exist; the qualified cold case pins the reconstructed actor and issues current host grants. Storeless grant mutation uses actual native custody and vetoes unfinished controller lineages. Persistent controller administration remains unavailable; complete account-policy, credential-removal and concurrent-admission coverage remains open. |
+| Application tool policy on mob resume | Core 0.8.51 release-tag source drops the host policy registry during cold member restore and can replace an explicitly tightened application policy with the older persisted binding on resume. The Core 0.8.52 local rebuild candidate has independent source review and passing real-factory cold/explicit-resume controls linked to its source. Candidate hooks, CI and publication remain separate. Already-live reseating does not apply a changed binding or registry, and placed-member resume retains an unresolved portable policy-intent gap. These findings concern application consequence policy, separately from native tool-access restrictions. See the [implementation checkpoint](/internal/design/adr-001-implementation/implementation-progress). |
 | Durable operation audit | Completed-turn SQLite acceptance preserves committed input-row audit and the original transcript prefix through cold reconstruction and fresh work. The fixed-host JSONL cases also assert native audit. These results do not prove crash-safe pre-effect evidence, interrupted recovery, every observation-failure path or complete commit-race coverage. |
-| Human consent | The existing approval owner maintains request, decision, and expiry audit records. Authenticated action-bound consent, conditional use consumption, presentation, and later decision delivery remain proposed integration work. |
+| Human consent | The existing approval owner maintains request, decision, and expiry audit records. A source candidate adds authenticated action-bound decisions, conditional consumption and restored history without live consent. Targeted store corrections have passing tests; current host/account context, authenticated presentation, later decision delivery and interrupted recovery remain unqualified. See [Human consent](#human-consent) for the store outcomes and restored history. |
 | OS confinement | Local macOS tests cover shell launch, bootstrap, foreground/background execution and recovered monitors. A native foreground scenario also verifies a blocked syscall, permitted sibling, continued model turn and input-row audit. Command hooks, restart, Linux, Windows, containers and browser/WASM retain their separate integration and acceptance requirements. |
-| Console access administration | Access refresh and typed local feedback have component, browser and published Console CI qualification. The Access panel edits MobKit console ABAC, not native tool, source or account grants. Console projection does not activate native governance or establish an integrated native-plus-Console route. |
+| Console access administration | Access refresh and typed local feedback have component, browser and published Console CI qualification. The Access panel edits Meta console ABAC, not native tool, source or account grants. Console projection does not activate native governance or establish an integrated native-plus-Console route. |
 | Publication and overhead | The explicit native and fixed-host JSONL profiles have normal publication and recorded CI qualification. Completed measurements have not met the cheap-default target: the representative study's six conditional mean comparisons missed their threshold. Full-platform and per-operation p99 acceptance remain open; the implementation checkpoint retains the exact measurements and their limits. |
 | Full application coverage | Tool/source access, peers, schedules, memory/history/export, Elephant, live/audio, and all supported surfaces remain the intended scope. A narrow successful fixture is not acceptance of this whole set. |
 
@@ -104,6 +113,10 @@ Map typed errors before rendering text:
 - `OperationAuthorizationError::Refused` represents an ordinary operation
   refusal. Give the agent audience-safe feedback, preserve permitted siblings,
   and let it choose a different action within existing budgets.
+- `OperationAuthorizationError::Unavailable` means the authorization owner
+  could not supply authority. Preserve `operation_authorization_unavailable`;
+  this is not a policy denial or reviewer verdict. Repair the owner for that
+  affected operation; do not retry unchecked or switch to an ungoverned route.
 - `OperationAuthorizationError::ObservationUnavailable` means required audit
   observation failed. Preserve that infrastructure classification through tool,
   provider, callback, live, and SDK adapters. Do not give the model a misleading
@@ -111,13 +124,41 @@ Map typed errors before rendering text:
 - `SessionError::RuntimeUnavailable { reason }` means a session operation could
   not acquire its runtime owner. Preserve the typed readiness reason and retained
   work; do not fall back to direct store mutation or report a policy denial.
+- `ToolError::OutcomeUncertain` (`outcome_uncertain`) means the call was sent
+  but its effect is unknown. It proves neither success nor refusal before entry.
+  Resolve it through the operation's existing reconciliation or idempotency
+  contract before considering a new, freshly authorized attempt.
 - When an effect already returned, preserve its actual result and any separate
-  observation or settlement failure. An uncertain effect requires its existing
-  reconciliation or idempotency contract before another attempt.
+  observation or settlement failure. A `settlement_failures` companion describes
+  an additional failure; it does not replace the primary result or prove that
+  the physical effect was absent.
 
 Render **Permission denied** or **Unable to record audit event** from the typed
 result, not string matching. Keep private grant, account, and source details out
 of public status text.
+
+Before resubmitting an operation, use its typed outcome to choose the next step.
+These are integration responsibilities; human routing retains the preview
+limits in [Human consent](#human-consent).
+
+| Outcome | Next step |
+| --- | --- |
+| Permission or review denied | Check the current operation policy or review decision. Preserve permitted sibling results and let the agent choose an allowed action. Do not restart the whole turn solely because this operation was refused. |
+| Review context changed | A later explicit attempt needs current authorization and a fresh review. The previous allow cannot authorize changed work. |
+| Human consent required or escalated | Use a configured, supported route to an eligible human for the exact retained candidate. With no such route, return local feedback. Displaying an approval reference or receiving a decision does not execute the action. |
+| Reviewer unavailable | Inspect the typed reason: missing reviewer, unsupported entry, expired deadline and unavailable owner need different repairs. None supplies an allow verdict or authorizes automatic retry. |
+| Required audit observation failed | Repair the observation owner. Retain entered effects, permitted sibling results and separate settlement diagnostics. Keep the infrastructure failure distinct from denial; approval cannot repair it. |
+| Consent consumed or effect uncertain | Resolve the actual operation outcome through its existing owner or idempotency contract before another attempt. Consumption does not prove success, and fresh consent does not prove the earlier effect was absent. |
+
+A current reviewer allow may continue the same in-flight retained operation
+through its remaining native entry checks. It must not automatically
+re-dispatch an operation that already settled. After action-required feedback,
+a later authenticated decision can wake the owner through configured delivery;
+the agent or host explicitly makes a fresh attempt. A still-current exact
+decision needs no repeat review, but the attempt still needs current
+authorization and entry checks. An approval notification alone proves neither
+a decision nor execution. Resolve any earlier uncertain outcome before another
+attempt, while preserving permitted sibling work and model continuation.
 
 Attach the required audit sink to the actual admitted input row. The production
 composition exposes `audited_work_context` for this purpose. A tracing callback
@@ -125,6 +166,73 @@ or lossy event subscription is not a substitute. Stage observations for the next
 existing native commit, preserving concurrent suffixes and rollback behavior.
 Report process-lifetime storage as such; do not add an undisclosed fsync to each
 operation or promise crash-proof pre-effect evidence.
+
+### SDK error compatibility
+
+The corrected SDK error contract in this release exposes `outcome_uncertain` in
+`ToolDispatchTerminalErrorKind` across generated schemas and TypeScript, Web,
+and Python types. It is a dispatch/settlement classification, separate from the
+unchanged coarse `WireToolErrorClass`. Do not infer its meaning from an HTTP
+status or the generic `internal` class.
+
+Update exhaustive Rust/TypeScript handling and closed response validators,
+including validators for `settlement_failures`, when adopting that contract.
+Keep runtime, schema, and SDK pins aligned. Updated readers retain the existing
+named encodings, but older closed readers can reject the new value; the literal
+`other` is not an unknown-value fallback. Do not convert an unrecognized value
+into success, denial, or permission to retry. A compatible version handshake
+alone does not establish that a client can decode every new enum value.
+
+The correction preserves released Rust enum ordinals and updates the closed
+TypeScript and Python validators. Recorded Rust, Python and TypeScript checks
+pass on that change; see the exact scope in the
+[implementation checkpoint](/internal/design/adr-001-implementation/implementation-progress).
+These checks do not establish full end-to-end SDK support.
+
+### Preserve restrictions during respawn (candidate)
+
+For a locally bound predecessor, the respawn candidate carries its inherited
+launch policy and tool visibility ceiling into its successor. It reads those
+restrictions from the actual retained session owner before retiring it.
+
+If that authority is lost, `RespawnPredecessorRestrictionsUnavailable` refuses
+the respawn and retains the member, including a Broken member after partial
+cold restart. Preserve usable siblings and give the calling agent local feedback.
+A surviving profile name or session reference cannot reconstruct the lost
+restrictions. A generation proven never to have had a local session is a
+different case; its successor still keeps its own inherited policy and ceiling.
+
+Explicit retirement and a fresh spawn are separate governed operations under
+current authorization and inherited restrictions. They do not recover the lost
+predecessor authority, and an acknowledgement cannot make that authority
+unrestricted. A pending respawn correction candidate passes the corrected
+cold-loss scenario:
+respawn returns the typed refusal, preserves the exact Broken member, and
+installs no replacement trust. A separate surviving-session scenario passes
+replacement and reciprocal peer wiring after service reconstruction. These
+tests retain an in-memory RuntimeStore within one process and use default
+profiles; separate-process recovery and continuity of nontrivial inherited
+restrictions remain unproven. See the
+[implementation checkpoint](/internal/design/adr-001-implementation/implementation-progress)
+for the exact source and executed scope.
+
+### Preserve child ownership during shutdown (candidate)
+
+Durable-child shutdown must settle the state owner's admitted creation and
+recovery work as well as its child actors before releasing root ownership.
+A closed actor channel is not a clean settlement report. Preserve pending
+cleanup or effect debt across repeat shutdown calls and cancelled callers.
+Until that contract is implemented, the interim design requires retaining the
+existing root claim until process exit; same-process reopen then returns
+AlreadyClaimed. This is a later implementation slice, not released durable-child
+recovery support.
+
+Choose child durability explicitly. ProcessBound remains valid long term.
+The definition-based `.persistent_state()` convenience path persists session
+and runtime data while keeping mob storage in memory; durable-child support
+through that path remains open. A supplied `.mob_spec(spec)` can carry a
+durable composition. Preserve the actual selected custody and its matching
+provenance instead of inferring child durability from a constructor name.
 
 ## 5. Retain a usable controller for admitted work
 
@@ -143,24 +251,73 @@ Retry only a grant revocation known to have stopped on contention without
 mutation, after the contention clears. `Unavailable` alone does not identify
 that condition. Audit failures do not authorize retrying an effect.
 
-## 6. Add consent or confinement where required
+## 6. Add review, consent, or confinement where required
+
+### Model review requirements
+
+The [model-review and consent amendment](/internal/design/adr-001-model-review-and-consent)
+defines the accepted integration direction. The responsibilities below do not
+establish end-to-end implementation or qualification.
+
+Have the existing native policy owner select the requirement for each operation.
+Check policy coverage at activation and when adding dynamic operations; unknown
+coverage never implies R1. Enforce the requirement at the shared native boundary,
+including direct SDK entry. Reject an invalid configuration update without
+terminating already admitted work.
+
+| Requirement | Host integration responsibility |
+| --- | --- |
+| R1: local authorization | Use current native permission and entry checks, with no reviewer model call. |
+| R2: model review | Obtain a bounded verdict for the exact retained candidate or explicitly submitted closed batch. An allow satisfies only that review requirement. |
+| R3: human review | Obtain fresh approval from an authenticated, eligible human for the exact displayed candidate or closed batch. A model allow cannot substitute for it. |
+
+Retain the candidate and its authenticated original-work association through the
+existing owners. Carry requester, executor, represented subject, ingress, selected
+account, and applicable mandates or policy edits from those owners, not model
+text. A copied reference or matching JSON cannot recreate a lost binding.
+Independent calls do not implicitly become an approved batch.
+
+Have each owner distinguish required material, genuine inapplicability, and
+unavailable context. Missing or unsupported facts are not inapplicability;
+required facts that cannot be supplied or disclosed produce typed unavailable
+review before reviewer transport. The action account comes from the action's
+actual owner, not the reviewer's credential route. Concrete host/account
+derivations still need integration. Keep this optional review-context work off
+the R1 path.
+
+The reviewer itself needs authorization for its actual model, processor,
+credential route, investigation tools, and information sources under that work
+context. Give the review a finite owner-selected deadline and retire expired
+attempts before fallback; a late result cannot authorize entry. Neither model
+allow nor human approval grants missing permissions or weakens confinement.
+
+Keep deny, escalate, and reviewer unavailable distinct. Missing necessary reviewer
+access or a failed review supplies no verdict. Route escalation or unavailable
+review to eligible human review only when that alternative is configured;
+autonomous profiles can return audience-safe local feedback instead. Pending human
+action also settles the affected operation locally while permitted siblings and
+queued work continue. Required audit-observation failure remains an infrastructure
+error, not a denial or ordinary reviewer-unavailable result. Human approval cannot
+repair that failure.
 
 ### Human consent
 
-The current `ApprovalService` exposes `request`, `get`, `list`, and `decide` for
+The existing `ApprovalService` exposes `request`, `get`, `list`, and `decide` for
 approval audit records. These methods do not authenticate supplied actor
-identities or gate or execute effects. The
-[model-review and consent amendment](/internal/design/adr-001-model-review-and-consent)
-describes the proposed action-bound workflow; it is not implemented end to end.
+identities or execute effects. The native consent candidate adds a separate
+authenticated decision and retained-action path; the workflow is not qualified
+end to end. Its store outcomes and restored history, described below,
+remain subject to the current integration status.
 
-For that proposed integration, the host authenticates the decision event, checks
+For that integration, the host authenticates the decision event, checks
 current approver eligibility, and binds the presented facts to the exact retained
 candidate. An audit actor string is not an approval credential.
 
 Present the action, target, recipient, account, arguments, requester, agent, and
 expiry to an eligible audience. Return **Approval required** while other permitted
-work continues. Deliver later authenticated decisions through ordinary native
-admission without replaying the action or changing its requester.
+work continues. Use the existing delivery and session owners to admit later
+authenticated decisions and wake the owning session. Delivery does not execute
+the retained action, replay it, or change its requester.
 
 On a later explicit attempt, resolve the retained candidate and complete host
 validation, preparation, and cancellation checks before consumption. Recheck
@@ -174,6 +331,126 @@ effect; fresh consent alone does not establish non-delivery. An audit record
 cannot recreate executable consent. Test presentation, delivery, and sink
 integration before advertising this workflow.
 
+The candidate restores consent records as history only. An old Pending or
+Approved row does not restore the original retained action, even when it has no
+`consumed_at`. A real human denial remains Denied; closing the original run or
+withdrawing its authority is a separate withdrawal. A new service refusing an
+old reference and completing fresh work is a safety control, not proof of
+interrupted-run resumption or automatic decision delivery.
+
+Several services may open the same approval store. A service that opens it
+reads consent rows as history: an empty set of retained candidates proves only
+that this service holds none, not that the issuing owner lost custody. Such a
+reader withdraws nothing. A decision through it is refused before any commit,
+and an attempt through it reports the owner as unavailable rather than consent
+as missing. Decide and attempt through the live issuing owner.
+
+An attempt through a service that did not issue the consent, including one
+that names consent approved before a process restart, reports the owner as
+unavailable (`OwnerUnavailable`) only when the approval is Pending or Approved,
+its consent is neither spent nor withdrawn, and the service holds no candidate
+for it. A spent, withdrawn or denied row keeps its usual outcome. That says only that this service holds no
+custody for the approval. It does not report that another owner is live or
+that the issuing process stopped, and it does not mean a remote decision path
+exists. It is not transient in that service, so a host should request fresh
+consent rather than retry.
+
+A consent approval issued in a run that the runtime staged on a store with
+cross-process hosting claims records a passive owner scope: the store's
+hosting domain and the run's session. It is identity data for later
+recovery, never authority or custody: the owner's own transitions keep it,
+but the stored row is not tamper-proof, and later recovery checks the
+actual hosting claim rather than trusting it. Approvals
+issued without it, such as those of a sessionless host, behave as described
+above.
+
+Decisions reach the owner through `ApprovalService::decide_consent` on the same
+service the host passed to its operation review composition. The stock REST
+server, and `rkat-rpc` serving an ordinary realm, install no operation review
+and no human route, so they create no native consent approvals and offer no
+consent decision method. `rkat-rpc` serves a governed realm only as governed
+JSONL over stdio. When the realm configures review rules, `rkat-rpc` composes
+the realm owner's operation review for that pipe, with the pipe's operator as
+its R3 human route. The pipe then delivers consent notices and decides through
+`approval/consent_decide`; see
+[R3 human consent on a stock governed pipe](/api/rpc#r3-human-consent-on-a-stock-governed-pipe).
+An embedding host that installs a human route calls `decide_consent` directly.
+
+An embedding host whose own transport authenticates the actual human decision
+event can route it through the RPC router instead. Its trusted adapter builds
+an `AuthenticatedConsentEvent`: the `AuthenticatedApprover`, carrying the
+event's `HostAuthenticationScope` (the exact login or session), together with
+the approval and the decision. The adapter passes it with an
+`approval/consent_decide` request to `MethodRouter::dispatch_with_consent_event`.
+
+- Plain dispatch has no route to that method.
+- The request may only name the approval and the decision, and both must equal
+  the event's. An approver, actor, assurance, login or reason in the body is an
+  invalid parameter.
+- The host route's `eligibility` receives the approver with its authentication
+  scope. The host must refuse an event from a revoked login even while another
+  login of the same person is live. Revoking a login must advance the
+  publication that the returned evidence checks, so a decision already in
+  flight from that login is refused at commit.
+- The constructors of the approver and the event authenticate nobody. They
+  record what the host adapter established, and the adapter supplies the
+  current login scope and eligibility, including logout and revocation.
+- The router's runtime must use the approval service the host gave its review
+  composition, because only the issuing owner holds the candidate.
+
+Revoking allowances that were published earlier, for example on logout, stays
+with the host's existing publication and withdrawal path. The stock servers
+build no such event.
+
+Waking the owning session on a decision, durable delivery with a visible
+failure, and handing approved consent across a new turn are later work.
+
+Reusable consent applies only to a requirement that owner policy explicitly
+makes reusable, with a defined scope, use limits where bounded, expiry or an
+explicit until-revoked lifetime, and revocation.
+It cannot waive R3 or an unresolved R2 escalation. Temporarily changing a review
+tier is a separate, scoped policy edit through the existing policy owner, with
+its own administrator authorization and expiry. Present the action approval and
+policy change separately; eligibility to approve does not confer policy-edit
+authority.
+
+### Mandatory hook migration (candidate)
+
+This candidate introduces the hook-locality correction and the
+`model_operations` configuration field. Qualification and full lifecycle
+coverage remain open. This section describes the candidate migration, not
+released availability.
+
+Before activation, reject any mandatory model-request hook configuration that
+would also gate the feedback request needed to report its own refusal. Apply
+this check to the effective configuration, including per-run overrides and
+replacement engines. Report unsupported configuration; a rejected update must
+preserve the previous valid configuration and already admitted work.
+
+The default remains `model_operations = "all"`. An affected configuration stays
+invalid until the policy owner explicitly selects
+`model_operations = "ordinary_only"` or changes that configuration. This choice
+limits that prerequisite
+to ordinary model requests and permits a separately authorized controller
+request to explain the refusal. Never silently skip a mandatory hook or convert
+`Guardrail` to `Observe`. Feedback does not waive the original prerequisite.
+
+Give each request its own purpose. A feedback request can explain what was
+withheld while permitted work continues; later ordinary requests through the
+same controller must still pass their mandatory hooks. A feedback failure must
+not start another feedback loop.
+
+Unsupported mandatory `RunStarted` and `TurnBoundary` configurations must also
+be rejected before activation or admission in this slice. Per-item boundary
+withholding and full hook-lifecycle coverage remain open; silently skipping
+these gates is not a migration.
+
+Describe outcomes at the actual boundary. `PreLlmRequest` can withhold the model
+request. `PostLlmResponse` runs after the provider call and possible streamed
+output or provider-native effects. A refusal there can withhold subsequent
+local tool dispatch and authoritative assistant commit; it cannot undo those
+earlier effects. Do not expose rejected raw output in ordinary feedback.
+
 ### Process confinement
 
 Choose explicitly between host-trusted execution and a required mechanical
@@ -186,8 +463,12 @@ Native hosts can select the shell requirement with
 when enabling shell tools. Each automatic agent build inherits that host
 requirement into its own dispatcher. The compatibility default is
 `ShellConfinement::TrustedHost`. A session request or recovered job does not
-select a weaker requirement. This configuration applies to shell tools;
-command hooks and other subprocess owners still need their own integration.
+select a weaker requirement. This configuration applies to shell tools.
+Source-reviewed factory integration also binds required confinement through the
+native command-hook owner. That integration remains queued source, with full
+hook-locality, protected-audit, and platform qualification open; it does not
+establish coverage for every subprocess owner. See the
+[native embedding guide](/rust/native-authorization) for the current checkpoint.
 
 At host setup, validate the backend's real capabilities and compile supported
 policy for the configuration generation. Bind exact command inputs at launch

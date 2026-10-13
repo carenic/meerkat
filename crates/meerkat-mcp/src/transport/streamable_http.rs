@@ -22,7 +22,11 @@ use rmcp::transport::streamable_http_client::{
     StreamableHttpPostResponse,
 };
 
+use meerkat_auth_core::http_egress::HttpEgressError;
 use meerkat_auth_core::{McpOAuthError, McpServerIdentity};
+use meerkat_core::mcp_attachment::{McpAttachmentAuthority, McpAttachmentRefusal};
+
+use super::EgressGuard;
 
 /// Shared HTTP client for Streamable HTTP connections.
 ///
@@ -38,6 +42,76 @@ pub(crate) struct ReqwestStreamableHttpClient {
     protected_metadata: ProtectedMetadataState,
     session_expiry: SessionExpiryRecorder,
     bearer: Option<OAuthBearer>,
+    first_request: FirstRequestEntry,
+    /// The host egress profile every request is admitted by; a required
+    /// profile also supplies the ordinary and protected clients.
+    egress: EgressGuard,
+    /// The caller-held attempt this client serves, if any: its cancellation
+    /// aborts this client's credential reads, requests, bodies and streams.
+    attempt: Option<crate::McpConnectAttempt>,
+    /// Keeps the attempt counting this client live until its last clone (in
+    /// the transport worker and its stream tasks) is released.
+    _live: Option<Arc<crate::connect_attempt::AttemptLease>>,
+}
+
+/// The governed attachment control of one HTTP connection attempt, asked by
+/// its first request after that request's own preparation (its per-request
+/// credential read included) and immediately before it is handed to the HTTP
+/// client, with no wait in between. Once that request has entered, the
+/// attempt keeps its entry: later requests of the same attempt (a challenge
+/// continuation included) are not asked again, and a later policy change does
+/// not cancel or rewrite what already began. A refusal is sticky for the
+/// attempt and nothing is sent.
+#[derive(Clone, Default)]
+pub(crate) struct FirstRequestEntry(Arc<Mutex<FirstRequestState>>);
+
+#[derive(Default)]
+enum FirstRequestState {
+    /// No control, or the first request already entered.
+    #[default]
+    Entered,
+    Pending(Arc<dyn McpAttachmentAuthority>),
+    Refused(McpAttachmentRefusal),
+}
+
+impl FirstRequestEntry {
+    pub(crate) fn pending(control: Option<Arc<dyn McpAttachmentAuthority>>) -> Self {
+        Self(Arc::new(Mutex::new(match control {
+            Some(control) => FirstRequestState::Pending(control),
+            None => FirstRequestState::Entered,
+        })))
+    }
+
+    fn enter(&self) -> Result<(), StreamableHttpError<reqwest::Error>> {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let refused = match std::mem::take(&mut *state) {
+            FirstRequestState::Entered => return Ok(()),
+            FirstRequestState::Pending(control) => match control.authorize_apply() {
+                Ok(()) => return Ok(()),
+                Err(refusal) => refusal,
+            },
+            FirstRequestState::Refused(refusal) => refusal,
+        };
+        *state = FirstRequestState::Refused(refused.clone());
+        Err(StreamableHttpError::UnexpectedServerResponse(
+            format!("MCP attachment refused before its first request: {refused}").into(),
+        ))
+    }
+
+    /// The refusal this attempt's first request met, if it was refused.
+    pub(crate) fn refusal(&self) -> Option<McpAttachmentRefusal> {
+        match &*self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            FirstRequestState::Refused(refusal) => Some(refusal.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// Typed, sticky record that the server dropped this connection's session
@@ -106,6 +180,10 @@ pub(crate) enum RequestDisposition {
     SentRedirected,
     /// Sent, then answered `404` for its session: it may have taken effect.
     SentSessionExpired,
+    /// Refused by the host egress profile before anything was connected
+    /// (its URI, or the clients' own resolution of its host). Nothing was
+    /// sent.
+    RefusedEgress(HttpEgressError),
 }
 
 /// Request-local disposition witness. `RefusedExpired` is the affirmative
@@ -125,13 +203,13 @@ impl RequestDispatch {
     }
 
     /// Recorded once per request.
-    fn record(&self, disposition: RequestDisposition) {
+    pub(crate) fn record(&self, disposition: RequestDisposition) {
         let _ = self.disposition.set(disposition);
     }
 }
 
 /// The witness a `tools/call` carries, if any.
-fn request_dispatch(message: &ClientJsonRpcMessage) -> Option<RequestDispatch> {
+pub(crate) fn request_dispatch(message: &ClientJsonRpcMessage) -> Option<RequestDispatch> {
     use rmcp::model::ClientRequest;
     match message {
         ClientJsonRpcMessage::Request(request) => match &request.request {
@@ -187,12 +265,38 @@ impl OAuthBearer {
         &self.target
     }
 
+    /// The account the resolver's credential owner selected for this
+    /// target, from its local selection only
+    /// ([`crate::McpAuthResolver::selected_account`]).
+    pub(crate) fn selected_account(&self) -> meerkat_core::OperationAccount {
+        self.resolver.selected_account(&self.target)
+    }
+
     /// The bearer for one request. Without a usable credential the request
     /// is refused as `AuthRequired` before anything is sent; an unselected
-    /// target with no stored credential sends none, as it always has.
-    async fn resolve(&self) -> Result<Option<String>, StreamableHttpError<reqwest::Error>> {
+    /// target with no stored credential sends none, as it always has. An
+    /// egress refusal or unavailability of the credential owner's own
+    /// traffic is recorded on the attempt's egress guard and on this
+    /// request's own disposition: the request is affirmatively unsent.
+    async fn resolve(
+        &self,
+        egress: &EgressGuard,
+        dispatch: Option<&RequestDispatch>,
+    ) -> Result<Option<String>, StreamableHttpError<reqwest::Error>> {
         match self.resolver.stored_bearer_token(&self.target).await {
             Ok(Some(token)) => Ok(Some(token)),
+            Err(McpOAuthError::EgressRefused { refusal, .. }) => {
+                egress.refuse(dispatch, HttpEgressError::Refused(refusal));
+                Err(StreamableHttpError::UnexpectedServerResponse(
+                    "MCP credential refused by the host egress profile".into(),
+                ))
+            }
+            Err(McpOAuthError::EgressUnavailable { reason, .. }) => {
+                egress.refuse(dispatch, HttpEgressError::Unavailable(reason));
+                Err(StreamableHttpError::UnexpectedServerResponse(
+                    "MCP credential owner cannot enforce the host egress profile".into(),
+                ))
+            }
             Ok(None) if !self.target.is_selected() => Ok(None),
             Ok(None)
             | Err(
@@ -304,6 +408,10 @@ impl ReqwestStreamableHttpClient {
             protected_metadata: Default::default(),
             session_expiry: Default::default(),
             bearer: None,
+            first_request: FirstRequestEntry::default(),
+            egress: EgressGuard::default(),
+            attempt: None,
+            _live: None,
         }
     }
 
@@ -317,6 +425,10 @@ impl ReqwestStreamableHttpClient {
             protected_metadata: Default::default(),
             session_expiry: Default::default(),
             bearer: None,
+            first_request: FirstRequestEntry::default(),
+            egress: EgressGuard::default(),
+            attempt: None,
+            _live: None,
         }
     }
 
@@ -325,14 +437,111 @@ impl ReqwestStreamableHttpClient {
         self
     }
 
-    fn client(&self) -> Result<&reqwest::Client, StreamableHttpError<reqwest::Error>> {
-        self.client.as_ref().map_err(|_| {
-            StreamableHttpError::UnexpectedServerResponse("MCP HTTP client unavailable".into())
-        })
+    /// Apply the host egress profile of this attempt to every request.
+    pub(crate) fn with_egress(mut self, egress: EgressGuard) -> Self {
+        self.egress = egress;
+        self
+    }
+
+    /// Serve the caller-held `attempt`: its cancellation aborts this
+    /// client's work, and it counts this client live until released.
+    pub(crate) fn with_attempt(mut self, attempt: &crate::McpConnectAttempt) -> Self {
+        self._live = Some(Arc::new(attempt.lease()));
+        self.attempt = Some(attempt.clone());
+        self
+    }
+
+    /// `work` unless this client's attempt is or becomes cancelled first,
+    /// which drops it at its current await and fails the request.
+    async fn unless_cancelled<T, E>(
+        &self,
+        work: impl std::future::Future<Output = Result<T, E>>,
+    ) -> Result<Result<T, E>, StreamableHttpError<reqwest::Error>> {
+        match &self.attempt {
+            None => Ok(work.await),
+            Some(attempt) => attempt.abortable(work).await.ok_or_else(attempt_cancelled),
+        }
+    }
+
+    /// `stream`, ended when this client's attempt is cancelled and leased by
+    /// the attempt until the stream itself is dropped: the task holding a
+    /// response stream can outlive the transport worker and this client.
+    fn until_cancelled(
+        &self,
+        stream: BoxStream<'static, Result<Sse, sse_stream::Error>>,
+    ) -> BoxStream<'static, Result<Sse, sse_stream::Error>> {
+        use futures::StreamExt as _;
+        match &self.attempt {
+            None => stream,
+            Some(attempt) => {
+                let cancelled = attempt.clone();
+                crate::connect_attempt::LeasedStream::new(
+                    stream
+                        .take_until(async move { cancelled.cancelled().await })
+                        .boxed(),
+                    attempt.lease(),
+                )
+                .boxed()
+            }
+        }
+    }
+
+    /// The ordinary client: the required profile's own, or the existing
+    /// trusted-host client. A required profile never falls back to it; an
+    /// unbuildable one leaves a tool call affirmatively unsent.
+    fn client(
+        &self,
+        dispatch: Option<&RequestDispatch>,
+    ) -> Result<&reqwest::Client, StreamableHttpError<reqwest::Error>> {
+        match self.egress.ordinary_client() {
+            Some(Ok(client)) => Ok(client),
+            Some(Err(reason)) => Err(self.refuse(dispatch, HttpEgressError::Unavailable(reason))),
+            None => self.client.as_ref().map_err(|_| {
+                StreamableHttpError::UnexpectedServerResponse("MCP HTTP client unavailable".into())
+            }),
+        }
+    }
+
+    /// The protected-call client (no redirect, no proxy, no retry): the
+    /// required profile's own, or the existing static one.
+    fn protected_client(
+        &self,
+        dispatch: Option<&RequestDispatch>,
+    ) -> Result<&reqwest::Client, StreamableHttpError<reqwest::Error>> {
+        match self.egress.protected_client() {
+            Some(Ok(client)) => Ok(client),
+            Some(Err(reason)) => Err(self.refuse(dispatch, HttpEgressError::Unavailable(reason))),
+            None => protected_http_client().map_err(|_| {
+                StreamableHttpError::UnexpectedServerResponse(
+                    "protected MCP HTTP client unavailable".into(),
+                )
+            }),
+        }
+    }
+
+    /// Admit one request URI under the host egress profile.
+    fn admit(&self, uri: &str) -> Result<(), StreamableHttpError<reqwest::Error>> {
+        self.egress.admit(uri).map_err(egress_error)
+    }
+
+    /// The transport error of a request the host egress profile did not
+    /// admit, its typed outcome recorded.
+    fn refuse(
+        &self,
+        dispatch: Option<&RequestDispatch>,
+        error: HttpEgressError,
+    ) -> StreamableHttpError<reqwest::Error> {
+        egress_error(self.egress.refuse(dispatch, error))
     }
 
     pub(crate) fn with_session_expiry(mut self, recorder: SessionExpiryRecorder) -> Self {
         self.session_expiry = recorder;
+        self
+    }
+
+    /// Ask `entry` at this attempt's first request entry.
+    pub(crate) fn with_first_request_entry(mut self, entry: FirstRequestEntry) -> Self {
+        self.first_request = entry;
         self
     }
 
@@ -348,11 +557,45 @@ impl ReqwestStreamableHttpClient {
     async fn request_bearer(
         &self,
         transport_token: Option<String>,
+        dispatch: Option<&RequestDispatch>,
     ) -> Result<Option<String>, StreamableHttpError<reqwest::Error>> {
         match &self.bearer {
-            Some(bearer) => bearer.resolve().await,
+            Some(bearer) => {
+                self.unless_cancelled(bearer.resolve(&self.egress, dispatch))
+                    .await?
+            }
             None => Ok(transport_token),
         }
+    }
+
+    /// Delete the session; `Ok(false)` when the server does not support
+    /// deleting sessions.
+    async fn send_delete_session(
+        &self,
+        uri: Arc<str>,
+        session: Arc<str>,
+        auth_token: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<bool, StreamableHttpError<reqwest::Error>> {
+        self.admit(uri.as_ref())?;
+        let mut request_builder = self.client(None)?.delete(uri.as_ref());
+        request_builder = self.apply_headers(request_builder);
+        request_builder = Self::apply_custom_headers(request_builder, custom_headers)?;
+        if let Some(auth_header) = self.request_bearer(auth_token, None).await? {
+            request_builder = request_builder.bearer_auth(auth_header);
+        }
+        let response = self
+            .unless_cancelled(
+                request_builder
+                    .header(HEADER_SESSION_ID, session.as_ref())
+                    .send(),
+            )
+            .await?
+            .map_err(|error| {
+                self.egress.observe_send_error(&error);
+                StreamableHttpError::Client(error)
+            })?;
+        deletion_outcome(response.status())
     }
 
     fn apply_headers(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -372,6 +615,43 @@ impl ReqwestStreamableHttpClient {
         }
         Ok(builder)
     }
+}
+
+/// What a session deletion's response status says: deleted only on a
+/// success status, unsupported on 405, and otherwise not confirmed (a
+/// redirect, informational or error status alike).
+fn deletion_outcome(
+    status: reqwest::StatusCode,
+) -> Result<bool, StreamableHttpError<reqwest::Error>> {
+    if status.is_success() {
+        Ok(true)
+    } else if status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+        Ok(false)
+    } else {
+        Err(StreamableHttpError::UnexpectedServerResponse(
+            format!(
+                "MCP server answered the session deletion with status {}",
+                status.as_u16()
+            )
+            .into(),
+        ))
+    }
+}
+
+/// The transport error of a request its caller-held attempt cancelled: it
+/// was dropped at its current await, and whether the server received it is
+/// not known.
+fn attempt_cancelled() -> StreamableHttpError<reqwest::Error> {
+    StreamableHttpError::UnexpectedServerResponse("the MCP connect attempt was cancelled".into())
+}
+
+/// The transport error of a request the host egress profile did not admit.
+/// Its typed outcome is on the attempt's egress guard and, for a tool call,
+/// on the request's own disposition.
+fn egress_error(error: HttpEgressError) -> StreamableHttpError<reqwest::Error> {
+    StreamableHttpError::UnexpectedServerResponse(
+        format!("MCP request not admitted by the host egress profile: {error}").into(),
+    )
 }
 
 fn validate_custom_header(name: &HeaderName) -> Result<(), String> {
@@ -441,8 +721,9 @@ impl StreamableHttpClient for ReqwestStreamableHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<BoxStream<'static, Result<Sse, sse_stream::Error>>, StreamableHttpError<Self::Error>>
     {
+        self.admit(uri.as_ref())?;
         let mut request_builder = self
-            .client()?
+            .client(None)?
             .get(uri.as_ref())
             .header(ACCEPT, [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "))
             .header(HEADER_SESSION_ID, session_id.as_ref());
@@ -451,13 +732,17 @@ impl StreamableHttpClient for ReqwestStreamableHttpClient {
         if let Some(last_event_id) = last_event_id {
             request_builder = request_builder.header(HEADER_LAST_EVENT_ID, last_event_id);
         }
-        if let Some(auth_header) = self.request_bearer(auth_token).await? {
+        if let Some(auth_header) = self.request_bearer(auth_token, None).await? {
             request_builder = request_builder.bearer_auth(auth_header);
         }
-        let response = request_builder
-            .send()
-            .await
-            .map_err(StreamableHttpError::Client)?;
+        self.first_request.enter()?;
+        let response = self
+            .unless_cancelled(request_builder.send())
+            .await?
+            .map_err(|error| {
+                self.egress.observe_send_error(&error);
+                StreamableHttpError::Client(error)
+            })?;
         refuse_redirect(response.status())?;
         self.auth_challenge.record(&response);
         if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
@@ -493,7 +778,7 @@ impl StreamableHttpClient for ReqwestStreamableHttpClient {
             }
         }
         let event_stream = protected_sse_stream(response, self.protected_metadata.clone(), false);
-        Ok(event_stream)
+        Ok(self.until_cancelled(event_stream))
     }
 
     async fn delete_session(
@@ -503,26 +788,21 @@ impl StreamableHttpClient for ReqwestStreamableHttpClient {
         auth_token: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
-        let mut request_builder = self.client()?.delete(uri.as_ref());
-        request_builder = self.apply_headers(request_builder);
-        request_builder = Self::apply_custom_headers(request_builder, custom_headers)?;
-        if let Some(auth_header) = self.request_bearer(auth_token).await? {
-            request_builder = request_builder.bearer_auth(auth_header);
+        if let Some(attempt) = &self.attempt {
+            attempt.record_session_delete_started();
         }
-        let response = request_builder
-            .header(HEADER_SESSION_ID, session.as_ref())
-            .send()
-            .await
-            .map_err(StreamableHttpError::Client)?;
-        refuse_redirect(response.status())?;
-
-        if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
-            return Ok(());
+        let deleted = self
+            .send_delete_session(uri, session, auth_token, custom_headers)
+            .await;
+        if let Some(attempt) = &self.attempt {
+            match &deleted {
+                Ok(supported) => attempt.record_session_deleted(*supported),
+                // A cancelled deletion stays started: unconfirmed.
+                Err(_) if attempt.is_cancelled() => {}
+                Err(_) => attempt.record_session_delete_failed(),
+            }
         }
-        let _response = response
-            .error_for_status()
-            .map_err(StreamableHttpError::Client)?;
-        Ok(())
+        deleted.map(|_| ())
     }
 
     async fn post_message(
@@ -542,22 +822,26 @@ impl StreamableHttpClient for ReqwestStreamableHttpClient {
             }
             return Err(StreamableHttpError::SessionExpired);
         }
+        // The host egress profile admits the actual URI before anything is
+        // prepared; a refused tools/call is affirmatively unsent.
+        if let Err(error) = self.egress.admit(uri.as_ref()) {
+            if let Some(dispatch) = &dispatch {
+                dispatch.record(RequestDisposition::RefusedEgress(error));
+            }
+            return Err(egress_error(error));
+        }
         let protected_call = has_protected_metadata(&message);
         let client = if protected_call {
-            protected_http_client().map_err(|_| {
-                StreamableHttpError::UnexpectedServerResponse(
-                    "protected MCP HTTP client unavailable".into(),
-                )
-            })?
+            self.protected_client(dispatch.as_ref())?
         } else {
-            self.client()?
+            self.client(dispatch.as_ref())?
         };
         let mut request = client
             .post(uri.as_ref())
             .header(ACCEPT, [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "));
         request = self.apply_headers(request);
         request = Self::apply_custom_headers(request, custom_headers)?;
-        if let Some(auth_header) = self.request_bearer(auth_token).await? {
+        if let Some(auth_header) = self.request_bearer(auth_token, dispatch.as_ref()).await? {
             request = request.bearer_auth(auth_header);
         }
         let session_was_attached = session_id.is_some();
@@ -576,16 +860,38 @@ impl StreamableHttpClient for ReqwestStreamableHttpClient {
             .or_insert(HeaderValue::from_static(JSON_MIME_TYPE));
         *request.body_mut() = Some(bytes.into());
         let requested_url = request.url().clone();
-        let result = client.execute(request).await;
+        // Physical entry: after this request's preparation and credential
+        // read, immediately before it is handed to the HTTP client.
+        self.first_request.enter()?;
+        let result = self
+            .unless_cancelled(async {
+                // From the moment the request is handed over, the server may
+                // open a session even if its answer is never observed.
+                if let Some(attempt) = &self.attempt {
+                    attempt.record_request_sent();
+                }
+                client.execute(request).await
+            })
+            .await?;
+        // The clients' own resolver refused the destination. A required
+        // profile's clients follow no redirect, so this is the request's own
+        // first and only hop: nothing was connected for it.
+        let refused_first_hop = match &result {
+            Err(error) => self.egress.observe_send_error(error),
+            Ok(_) => None,
+        };
         // From here the server may have received the request, possibly more
         // than once if a same-origin redirect was followed. Its own final
         // disposition is recorded here; a session 404 records its own below.
         if let Some(dispatch) = &dispatch {
-            match &result {
-                Ok(response)
+            match (&result, refused_first_hop) {
+                (Err(_), Some(refusal)) => dispatch.record(RequestDisposition::RefusedEgress(
+                    HttpEgressError::Refused(refusal),
+                )),
+                (Ok(response), _)
                     if session_was_attached
                         && response.status() == reqwest::StatusCode::NOT_FOUND => {}
-                Ok(response)
+                (Ok(response), _)
                     if response.url() != &requested_url || response.status().is_redirection() =>
                 {
                     dispatch.record(RequestDisposition::SentRedirected);
@@ -594,6 +900,9 @@ impl StreamableHttpClient for ReqwestStreamableHttpClient {
             }
         }
         let response = result.map_err(StreamableHttpError::Client)?;
+        if let Some(attempt) = &self.attempt {
+            attempt.record_response_head(response.headers().contains_key(HEADER_SESSION_ID));
+        }
         refuse_redirect(response.status())?;
         self.auth_challenge.record(&response);
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -663,11 +972,14 @@ impl StreamableHttpClient for ReqwestStreamableHttpClient {
             return Ok(StreamableHttpPostResponse::Accepted);
         }
         if !status.is_success() {
-            let body = read_bounded_body(response).await.map_err(|_| {
-                StreamableHttpError::UnexpectedServerResponse(
-                    "invalid or oversized MCP response".into(),
-                )
-            })?;
+            let body = self
+                .unless_cancelled(read_bounded_body(response))
+                .await?
+                .map_err(|_| {
+                    StreamableHttpError::UnexpectedServerResponse(
+                        "invalid or oversized MCP response".into(),
+                    )
+                })?;
             if content_type
                 .as_deref()
                 .is_some_and(|ct| ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()))
@@ -683,14 +995,20 @@ impl StreamableHttpClient for ReqwestStreamableHttpClient {
             Some(ct) if ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes()) => {
                 let event_stream =
                     protected_sse_stream(response, self.protected_metadata.clone(), false);
-                Ok(StreamableHttpPostResponse::Sse(event_stream, session_id))
+                Ok(StreamableHttpPostResponse::Sse(
+                    self.until_cancelled(event_stream),
+                    session_id,
+                ))
             }
             Some(ct) if ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()) => {
-                let body = read_bounded_body(response).await.map_err(|_| {
-                    StreamableHttpError::UnexpectedServerResponse(
-                        "invalid or oversized MCP response".into(),
-                    )
-                })?;
+                let body = self
+                    .unless_cancelled(read_bounded_body(response))
+                    .await?
+                    .map_err(|_| {
+                        StreamableHttpError::UnexpectedServerResponse(
+                            "invalid or oversized MCP response".into(),
+                        )
+                    })?;
                 let message = self.protected_metadata.parse(&body).map_err(|_| {
                     StreamableHttpError::UnexpectedServerResponse(
                         "invalid MCP JSON-RPC response".into(),

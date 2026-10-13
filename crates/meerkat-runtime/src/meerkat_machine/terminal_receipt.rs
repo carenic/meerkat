@@ -116,7 +116,7 @@ impl MeerkatMachine {
                 }
             };
             let live = match &input_id {
-                Some(input_id) => Self::live_input_terminal_receipt_read(&guard, input_id)?,
+                Some(input_id) => self.live_input_terminal_receipt_read(&guard, input_id)?,
                 None => None,
             };
             (input_id, live)
@@ -202,7 +202,7 @@ impl MeerkatMachine {
             };
             let (completion, observer) = {
                 let guard = driver.lock().await;
-                match Self::live_input_terminal_receipt_read(&guard, input_id)? {
+                match self.live_input_terminal_receipt_read(&guard, input_id)? {
                     Some(report) if report.is_resolved() => {
                         return Ok(Some(InputTerminalReceiptWait::Resolved(Sourced {
                             source: TerminalWitnessSource::LiveRuntime,
@@ -237,7 +237,7 @@ impl MeerkatMachine {
             // the registry and close both registrations.
             drop(completions);
             drop(driver);
-            let completion = std::pin::pin!(completion.try_wait());
+            let completion = std::pin::pin!(completion.wait_terminal_wake());
             let observer = std::pin::pin!(observer.woken());
             // A wake carries no semantics; the loop re-reads the receipt.
             let _wake = futures::future::select(completion, observer).await;
@@ -264,14 +264,51 @@ impl MeerkatMachine {
             }))
     }
 
+    /// A finalized receipt carries the batch's outcome, so its result
+    /// payload is released only to a reader the input's scoped destination
+    /// permits (see [`super::scoped_context::result_disclosure_permitted`]).
     fn live_input_terminal_receipt_read(
+        &self,
         driver: &DriverEntry,
         input_id: &InputId,
     ) -> Result<Option<InputTerminalReceiptRead>, RuntimeDriverError> {
-        driver
+        let Some(read) = driver
             .exact_input_terminal_completion_rows(input_id)?
             .map(|rows| Self::classify_input_terminal_receipt(&rows, input_id))
-            .transpose()
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        let posture =
+            super::scoped_context::scoped_host_posture(&self.native_work_authorization_host);
+        let permitted = match driver.as_driver().stored_input_state(input_id) {
+            Some(row) => super::scoped_context::disclosure_permitted_with(
+                Some(&driver.shared_dsl_authority()),
+                &row.state,
+                posture,
+            ),
+            None => posture == super::scoped_context::ScopedHostPosture::Ungoverned,
+        };
+        Self::withhold_undisclosed_receipt(read, permitted).map(Some)
+    }
+
+    /// Refuse a finalized receipt whose result payload this reader may not
+    /// receive. The receipt, the input's terminal and its preserved result
+    /// are unaffected; pending and receipt-less reads carry no payload.
+    fn withhold_undisclosed_receipt(
+        read: InputTerminalReceiptRead,
+        permitted: bool,
+    ) -> Result<InputTerminalReceiptRead, RuntimeDriverError> {
+        match &read {
+            InputTerminalReceiptRead::Finalized(receipt)
+                if !permitted && receipt.outcome().carries_result_payload() =>
+            {
+                Err(RuntimeDriverError::ScopedResultWithheld {
+                    input_id: receipt.input_id().clone(),
+                })
+            }
+            _ => Ok(read),
+        }
     }
 
     async fn durable_input_terminal_receipt_read(
@@ -289,11 +326,17 @@ impl MeerkatMachine {
         };
         let runtime_id = Self::logical_runtime_id(session_id);
         let input_id = target.state.input_id.clone();
+        let row = target.state.clone();
         let rows = Self::load_durable_terminal_completion_rows(store.as_ref(), &runtime_id, target)
             .await?;
+        let report = Self::classify_input_terminal_receipt(&rows, &input_id)?;
+        // Decided after the last awaited load, immediately before release.
+        let permitted = self
+            .stored_result_disclosure_permitted(session_id, &row)
+            .await;
         Ok(Some(Sourced {
             source: TerminalWitnessSource::DurableStore,
-            report: Self::classify_input_terminal_receipt(&rows, &input_id)?,
+            report: Self::withhold_undisclosed_receipt(report, permitted)?,
         }))
     }
 

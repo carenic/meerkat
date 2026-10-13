@@ -1,4 +1,6 @@
 import type {
+  McpAttachmentRestoreWireOutcome,
+  ToolConfigChangeStatus,
   BlobRef,
   ForkSessionReplaceParams,
   ProviderImageMetadata,
@@ -178,3 +180,19 @@ void invalidAssistantPhase;
 void invalidReasoningNull;
 void invalidInlineImage;
 void invalidBlobImage;
+
+const restoredStatus: ToolConfigChangeStatus = {
+  kind: "external_tool_delta",
+  phase: "failed",
+  restore: "renewal_required",
+};
+const restoreOutcome: McpAttachmentRestoreWireOutcome = "account_changed";
+const invalidRestoreStatus: ToolConfigChangeStatus = {
+  kind: "external_tool_delta",
+  phase: "failed",
+  // @ts-expect-error the restore outcome is the generated closed vocabulary
+  restore: "bogus",
+};
+void restoredStatus;
+void restoreOutcome;
+void invalidRestoreStatus;

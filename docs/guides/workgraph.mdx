@@ -19,7 +19,7 @@ controls for trusted local operators.
 
 An agent receives one host-issued `WorkGraphNamespaceGrant` containing its
 exact realm and namespace. Standard hosts issue it for you: the `rkat`
-persistent surfaces (CLI, REST, JSON-RPC, MCP server) and the MobKit gateways
+persistent surfaces (CLI, REST, JSON-RPC, MCP server) and the Meta gateways
 grant the runtime's realm plus the `default` namespace to every agent with
 WorkGraph enabled, so nothing in a mob definition, the SDKs, or the RPC params
 asks you to issue one. Every tool call is scoped to that grant: omitting

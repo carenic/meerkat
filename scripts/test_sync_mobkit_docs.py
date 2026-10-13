@@ -191,7 +191,7 @@ class SyncMobKitDocsTests(unittest.TestCase):
         stamp = sync.version_stamp("1.2.3", "main", commit, "2026-09-22")
         self.assertIn("Mirrored from MobKit main at", stamp)
         self.assertIn(
-            f"[{commit[:12]}](https://github.com/lukacf/meerkat-mobkit/commit/{commit})", stamp
+            f"[{commit[:12]}](https://github.com/lukacf/meerkat-meta/commit/{commit})", stamp
         )
         self.assertIn("on 2026-09-22", stamp)
         self.assertIn("MobKit workspace version 1.2.3 at that commit", stamp)

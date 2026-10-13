@@ -7,6 +7,7 @@ use meerkat_core::{ContentInput, Session, SessionId, skills::SkillRef, types::Re
 use meerkat_runtime::{
     CompletionHandle, MeerkatMachine, SessionServiceRuntimeExt,
     completion::{CompletionOutcome, CompletionWaitError},
+    meerkat_machine::dsl::RuntimeCompletionObservedOutcome,
 };
 use meerkat_schedule::{
     DeliveryCompletion, DeliveryCompletionFailureReason, DeliveryDispatch, DeliveryFailureReason,
@@ -1737,6 +1738,27 @@ fn schedule_completion_from_runtime_completion(
         let outcome = match completion {
             AcceptedScheduledInputCompletion::Handle(handle) => match handle.try_wait().await {
                 Ok(outcome) => outcome,
+                // The input's known status, from the body-free generated
+                // observation; its result or callback arguments are withheld
+                // from this reader.
+                Err(CompletionWaitError::DisclosureRefused { observed }) => {
+                    let outcome = match observed {
+                        RuntimeCompletionObservedOutcome::Completed => {
+                            meerkat_schedule::RuntimeCompletionOutcome::Completed
+                        }
+                        RuntimeCompletionObservedOutcome::CallbackPending => {
+                            meerkat_schedule::RuntimeCompletionOutcome::CallbackPending
+                        }
+                        _ => {
+                            let error = CompletionWaitError::DisclosureRefused { observed };
+                            return Err(ScheduleDomainError::DeliveryCompletionFailed {
+                                reason: completion_wait_failure_reason(&error),
+                                detail: error.to_string(),
+                            });
+                        }
+                    };
+                    return Ok(DeliveryTerminal::runtime_completion(outcome, None, None));
+                }
                 Err(error) => {
                     return Err(ScheduleDomainError::DeliveryCompletionFailed {
                         reason: completion_wait_failure_reason(&error),
@@ -1771,6 +1793,11 @@ fn completion_wait_failure_reason(error: &CompletionWaitError) -> DeliveryComple
         }
         CompletionWaitError::AttachmentReplaced | CompletionWaitError::AuthorityUnavailable(_) => {
             DeliveryCompletionFailureReason::RuntimeCompletionAuthorityUnavailable
+        }
+        // Only reached for an observation that carries no payload, which a
+        // refusal never has.
+        CompletionWaitError::DisclosureRefused { .. } => {
+            DeliveryCompletionFailureReason::CompletionFutureFailed
         }
     }
 }

@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 
+use base64::Engine;
 use serde::Serialize;
 use serde_json::value::RawValue;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -523,48 +524,14 @@ impl CallbackToolDispatcher {
                 meerkat_core::ToolUnavailableReason::ExecutionModeOwnerUnavailable,
             )
         })?;
-        let origin_session_id = context.origin_session_id().cloned().ok_or_else(|| {
-            ToolError::execution_failed(
-                "detached callback dispatch requires runtime-owned session identity".to_string(),
-            )
-        })?;
-        let interaction_lineage = context.interaction_lineage_id().ok_or_else(|| {
-            ToolError::execution_failed(
-                "detached callback dispatch requires runtime-owned interaction lineage".to_string(),
-            )
-        })?;
-        let arguments_sha256 = plan.canonical_arguments_sha256().ok_or_else(|| {
-            ToolError::execution_failed(
-                "detached callback dispatch requires a root-fenced canonical argument digest"
-                    .to_string(),
-            )
-        })?;
-        let policy = match plan.kind() {
-            meerkat_core::ResolvedExecutionKind::Detached(policy) => policy,
-            _ => {
-                return Err(ToolError::execution_failed(
-                    "detached callback owner received a non-detached execution plan".to_string(),
-                ));
-            }
-        };
-        let arguments: serde_json::Value = serde_json::from_str(call.args.get())
-            .map_err(|error| ToolError::invalid_arguments(call.name, error.to_string()))?;
-        let arguments_hash = format_sha256(arguments_sha256);
-        let lineage = interaction_lineage.to_string();
-        let submission_key = callback_submission_key(
-            &runtime.realm_id,
-            &origin_session_id,
-            &lineage,
-            call,
-            policy,
-            &arguments_hash,
-            &arguments,
-        )?;
+        let (spec, arguments) = detached_callback_job_spec(&runtime.realm_id, call, context, plan)?;
+        // The blob contract carries base64-encoded bytes: store the base64 of
+        // the exact argument bytes the call carried.
         let specification = runtime
             .blob_store
             .put_artifact(
-                "application/vnd.meerkat.callback-arguments+json",
-                call.args.get(),
+                CALLBACK_ARGUMENTS_MEDIA_TYPE,
+                &base64::engine::general_purpose::STANDARD.encode(call.args.get().as_bytes()),
             )
             .await
             .map_err(|error| {
@@ -572,40 +539,17 @@ impl CallbackToolDispatcher {
                     "failed to persist detached callback specification: {error}"
                 ))
             })?;
-        let execution_intent_id = meerkat::ExecutionIntentId::from_string(format!(
-            "intent:{lineage}:{}:{arguments_hash}",
-            call.name
-        ))
-        .map_err(|error| ToolError::execution_failed(error.to_string()))?;
-        let spec = meerkat::JobSpec::new(
-            runtime.realm_id.clone(),
-            origin_session_id,
-            execution_intent_id,
-            meerkat::InteractionLineageId::from_string(lineage)
-                .map_err(|error| ToolError::execution_failed(error.to_string()))?,
-            meerkat::ToolIdentity::new(call.name, policy.runner().version())
-                .map_err(|error| ToolError::execution_failed(error.to_string()))?,
-            meerkat::RunnerIdentity::new(policy.runner().name(), policy.runner().version())
-                .map_err(|error| ToolError::execution_failed(error.to_string()))?,
-            job_restart_class(policy.restart_class()),
-            meerkat::CanonicalArgumentsHash::new(arguments_hash)
-                .map_err(|error| ToolError::execution_failed(error.to_string()))?,
-            meerkat::JobSubmissionKey::new(submission_key)
-                .map_err(|error| ToolError::execution_failed(error.to_string()))?,
-        )
-        .with_runner_specification_ref(
+        let spec = spec.with_runner_specification_ref(
             meerkat::RunnerSpecificationRef::new(specification.blob_id.to_string())
                 .map_err(|error| ToolError::execution_failed(error.to_string()))?,
-        )
-        .with_credential_context_refs(match plan.credential_context_refs() {
-            meerkat_core::ToolExecutionApplicability::Applicable(references) => references.clone(),
-            meerkat_core::ToolExecutionApplicability::NotApplicable => Vec::new(),
-        });
-        let receipt = runtime
-            .service
-            .submit(spec)
-            .await
-            .map_err(|error| ToolError::execution_failed(error.to_string()))?;
+        );
+        let receipt = match runtime.service.submit(spec.clone()).await {
+            Ok(receipt) => receipt,
+            Err(meerkat::DetachedJobError::SubmissionConflict) => {
+                resubmit_under_recorded_arguments(&runtime, spec, &arguments).await?
+            }
+            Err(error) => return Err(ToolError::execution_failed(error.to_string())),
+        };
         let wire_receipt = meerkat::project_job_receipt(receipt.clone());
 
         let callback_tx = self.callback_tx.clone();
@@ -1219,6 +1163,181 @@ fn format_sha256(digest: [u8; 32]) -> String {
     encoded
 }
 
+const CALLBACK_ARGUMENTS_MEDIA_TYPE: &str = "application/vnd.meerkat.callback-arguments+json";
+
+/// The job a detached callback call submits, without its runner
+/// specification reference, and the call's parsed arguments.
+fn detached_callback_job_spec(
+    realm_id: &str,
+    call: ToolCallView<'_>,
+    context: &meerkat_core::ToolDispatchContext,
+    plan: &meerkat_core::ResolvedToolExecutionPlan,
+) -> Result<(meerkat::JobSpec, serde_json::Value), ToolError> {
+    let origin_session_id = context.origin_session_id().cloned().ok_or_else(|| {
+        ToolError::execution_failed(
+            "detached callback dispatch requires runtime-owned session identity".to_string(),
+        )
+    })?;
+    let interaction_lineage = context.interaction_lineage_id().ok_or_else(|| {
+        ToolError::execution_failed(
+            "detached callback dispatch requires runtime-owned interaction lineage".to_string(),
+        )
+    })?;
+    let arguments_sha256 = plan.canonical_arguments_sha256().ok_or_else(|| {
+        ToolError::execution_failed(
+            "detached callback dispatch requires a root-fenced canonical argument digest"
+                .to_string(),
+        )
+    })?;
+    let policy = match plan.kind() {
+        meerkat_core::ResolvedExecutionKind::Detached(policy) => policy,
+        _ => {
+            return Err(ToolError::execution_failed(
+                "detached callback owner received a non-detached execution plan".to_string(),
+            ));
+        }
+    };
+    let arguments: serde_json::Value = serde_json::from_str(call.args.get())
+        .map_err(|error| ToolError::invalid_arguments(call.name, error.to_string()))?;
+    let arguments_hash = format_sha256(arguments_sha256);
+    let lineage = interaction_lineage.to_string();
+    let submission_key = callback_submission_key(
+        realm_id,
+        &origin_session_id,
+        &lineage,
+        call,
+        policy,
+        &arguments_hash,
+        &arguments,
+    )?;
+    let execution_intent_id = meerkat::ExecutionIntentId::from_string(format!(
+        "intent:{lineage}:{}:{arguments_hash}",
+        call.name
+    ))
+    .map_err(|error| ToolError::execution_failed(error.to_string()))?;
+    let spec = meerkat::JobSpec::new(
+        realm_id,
+        origin_session_id,
+        execution_intent_id,
+        meerkat::InteractionLineageId::from_string(lineage)
+            .map_err(|error| ToolError::execution_failed(error.to_string()))?,
+        meerkat::ToolIdentity::new(call.name, policy.runner().version())
+            .map_err(|error| ToolError::execution_failed(error.to_string()))?,
+        meerkat::RunnerIdentity::new(policy.runner().name(), policy.runner().version())
+            .map_err(|error| ToolError::execution_failed(error.to_string()))?,
+        job_restart_class(policy.restart_class()),
+        meerkat::CanonicalArgumentsHash::new(arguments_hash)
+            .map_err(|error| ToolError::execution_failed(error.to_string()))?,
+        meerkat::JobSubmissionKey::new(submission_key)
+            .map_err(|error| ToolError::execution_failed(error.to_string()))?,
+    )
+    .with_credential_context_refs(match plan.credential_context_refs() {
+        meerkat_core::ToolExecutionApplicability::Applicable(references) => references.clone(),
+        meerkat_core::ToolExecutionApplicability::NotApplicable => Vec::new(),
+    });
+    Ok((spec, arguments))
+}
+
+/// Resolve a detached callback's submission conflict against the job
+/// admitted under the same submission key.
+///
+/// A job admitted before callback arguments were base64 encoded references
+/// the address of the literal arguments, so a replay of the same call now
+/// addresses its arguments differently and the store refuses it as another
+/// submission. When the admitted job's retained arguments decode to this
+/// call's arguments, submit once more under the recorded reference; the
+/// arguments hash is the fenced plan's own, and the store's unchanged
+/// equivalence check decides every other field. An established mismatch
+/// stays a submission conflict; a missing admitted job or a failed read is
+/// reported as such, not as a mismatch.
+async fn resubmit_under_recorded_arguments(
+    runtime: &DetachedCallbackJobRuntime,
+    spec: meerkat::JobSpec,
+    arguments: &serde_json::Value,
+) -> Result<meerkat::JobReceipt, ToolError> {
+    let Some(admitted) = runtime
+        .store
+        .get_by_submission_key(&spec.realm_id, &spec.submission_key)
+        .await
+        .map_err(|error| ToolError::execution_failed(error.to_string()))?
+    else {
+        return Err(ToolError::execution_failed(format!(
+            "detached callback submission {} conflicted with an admitted job that is unavailable",
+            spec.submission_key
+        )));
+    };
+    let Some(recorded_ref) = admitted.spec.runner_specification_ref else {
+        return Err(ToolError::execution_failed(
+            meerkat::DetachedJobError::SubmissionConflict.to_string(),
+        ));
+    };
+    if read_callback_arguments(runtime, &recorded_ref)
+        .await
+        .map_err(ToolError::execution_failed)?
+        != *arguments
+    {
+        return Err(ToolError::execution_failed(
+            meerkat::DetachedJobError::SubmissionConflict.to_string(),
+        ));
+    }
+    let mut replay = spec;
+    replay.runner_specification_ref = Some(recorded_ref);
+    runtime
+        .service
+        .submit(replay)
+        .await
+        .map_err(|error| ToolError::execution_failed(error.to_string()))
+}
+
+/// Read the retained arguments of a detached callback job.
+async fn read_callback_arguments(
+    runtime: &DetachedCallbackJobRuntime,
+    reference: &meerkat::RunnerSpecificationRef,
+) -> Result<serde_json::Value, String> {
+    let payload = runtime
+        .blob_store
+        .get(&meerkat_core::BlobId::new(reference.as_str()))
+        .await
+        .map_err(|error| error.to_string())?;
+    decode_callback_arguments(&payload)
+        .map_err(|error| format!("detached callback arguments are corrupt: {error}"))
+}
+
+/// Decode retained callback arguments stored under exactly the callback
+/// media type.
+///
+/// Arguments written before they were base64 encoded hold the literal JSON
+/// text, which stores that keep payloads verbatim return unchanged. Callback
+/// arguments may be any JSON value, and no base64 of valid JSON starts with
+/// a JSON start token, so the first byte after JSON whitespace selects the
+/// representation: a start token selects the literal form, anything else the
+/// strict base64 of the original text. A malformed selected representation
+/// is an error; it is never retried as the other one.
+fn decode_callback_arguments(
+    payload: &meerkat_core::BlobPayload,
+) -> Result<serde_json::Value, String> {
+    if payload.media_type != CALLBACK_ARGUMENTS_MEDIA_TYPE {
+        return Err(format!(
+            "media type {} is not {CALLBACK_ARGUMENTS_MEDIA_TYPE}",
+            payload.media_type
+        ));
+    }
+    let first = payload
+        .data
+        .bytes()
+        .find(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'));
+    if matches!(
+        first,
+        Some(b'{' | b'[' | b'"' | b'-' | b'0'..=b'9' | b't' | b'f' | b'n')
+    ) {
+        return serde_json::from_str(&payload.data).map_err(|error| error.to_string());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.data.as_bytes())
+        .map_err(|error| format!("invalid base64: {error}"))?;
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+}
+
 fn callback_submission_key(
     realm_id: &str,
     origin_session_id: &meerkat_core::SessionId,
@@ -1331,13 +1450,7 @@ async fn start_detached_callback_attempt(
         .runner_specification_ref
         .as_ref()
         .ok_or_else(|| format!("detached callback job {job_id} has no runner specification"))?;
-    let specification = runtime
-        .blob_store
-        .get(&meerkat_core::BlobId::new(specification_ref.as_str()))
-        .await
-        .map_err(|error| error.to_string())?;
-    let arguments: serde_json::Value =
-        serde_json::from_str(&specification.data).map_err(|error| error.to_string())?;
+    let arguments = read_callback_arguments(&runtime, specification_ref).await?;
     let credential_scopes = stored
         .spec
         .credential_context_refs
@@ -1486,6 +1599,7 @@ mod tests {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Callback,
                 source_id: "callback".into(),
+                artifact: None,
             }),
             ..make_tool_def(name)
         }
@@ -1493,7 +1607,7 @@ mod tests {
 
     fn detached_execution_contract() -> meerkat_core::ToolExecutionContract {
         let policy = meerkat_core::DetachedToolExecutionPolicy::new(
-            meerkat_core::RunnerIdentity::new("mobkit.callback", "v1").unwrap(),
+            meerkat_core::RunnerIdentity::new("meta.callback", "v1").unwrap(),
             meerkat_core::RestartClass::CheckpointResumable,
             meerkat_core::IdempotencyScope::InteractionAndArguments,
             std::time::Duration::from_secs(5),
@@ -1642,7 +1756,7 @@ mod tests {
             .execution
             .detached_policy()
             .expect("detached callback policy");
-        assert_eq!(policy.runner().name(), "mobkit.callback");
+        assert_eq!(policy.runner().name(), "meta.callback");
         assert_eq!(policy.runner().version(), "v1");
         assert_eq!(
             policy.restart_class(),
@@ -1664,7 +1778,7 @@ mod tests {
         let contract = execution_contract_from_wire(Some(
             meerkat_contracts::CallbackToolExecution::Detached {
                 runner: meerkat_contracts::JobRunner {
-                    name: "mobkit.callback".to_string(),
+                    name: "meta.callback".to_string(),
                     version: "v1".to_string(),
                 },
                 restart_class: meerkat_contracts::JobRestartClass::Adoptable,
@@ -1680,7 +1794,7 @@ mod tests {
             meerkat_core::ToolExecutionMode::Detached
         );
         let policy = contract.detached_policy().unwrap();
-        assert_eq!(policy.runner().name(), "mobkit.callback");
+        assert_eq!(policy.runner().name(), "meta.callback");
         assert_eq!(
             policy.restart_class(),
             meerkat_core::RestartClass::Adoptable
@@ -1701,7 +1815,7 @@ mod tests {
         let error = execution_contract_from_wire(Some(
             meerkat_contracts::CallbackToolExecution::Detached {
                 runner: meerkat_contracts::JobRunner {
-                    name: "mobkit.callback".to_string(),
+                    name: "meta.callback".to_string(),
                     version: "v1".to_string(),
                 },
                 restart_class: meerkat_contracts::JobRestartClass::Replayable,
@@ -1788,7 +1902,7 @@ mod tests {
         let start: meerkat_contracts::CallbackJobStartParams =
             serde_json::from_str(request.params.as_deref().unwrap().get()).unwrap();
         assert_eq!(start.authority.job_id, receipt.job_id);
-        assert_eq!(start.runner.name, "mobkit.callback");
+        assert_eq!(start.runner.name, "meta.callback");
         assert_eq!(
             start.restart_class,
             meerkat_contracts::JobRestartClass::CheckpointResumable
@@ -1821,6 +1935,442 @@ mod tests {
         );
         assert!(snapshot.spec.runner_specification_ref.is_some());
         assert_eq!(snapshot.machine_state.attempt_count, 1);
+    }
+
+    fn standard_base64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn callback_arguments_payload(data: String) -> meerkat_core::BlobPayload {
+        meerkat_core::BlobPayload {
+            blob_id: meerkat_core::BlobId::new("callback-arguments"),
+            media_type: CALLBACK_ARGUMENTS_MEDIA_TYPE.to_string(),
+            data,
+        }
+    }
+
+    #[test]
+    fn callback_arguments_decode_from_base64_and_from_legacy_literals_of_every_json_shape() {
+        for text in [
+            r#"{"target": "lan"}"#,
+            r#"[1, "two", {"three": 3}]"#,
+            r#""text""#,
+            "-1.5",
+            "0",
+            "1234",
+            "true",
+            "false",
+            "null",
+            " \t\r\n{\"padded\": true}",
+        ] {
+            let expected: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                decode_callback_arguments(&callback_arguments_payload(text.to_string())),
+                Ok(expected.clone()),
+                "legacy literal {text:?}"
+            );
+            assert_eq!(
+                decode_callback_arguments(&callback_arguments_payload(standard_base64(
+                    text.as_bytes()
+                ))),
+                Ok(expected),
+                "base64 of {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn callback_arguments_require_exactly_the_callback_media_type() {
+        for media_type in [
+            "application/json",
+            "application/vnd.meerkat.callback-arguments+json; charset=utf-8",
+            "Application/vnd.meerkat.callback-arguments+json",
+        ] {
+            let mut payload = callback_arguments_payload("null".to_string());
+            payload.media_type = media_type.to_string();
+            assert!(
+                decode_callback_arguments(&payload).is_err(),
+                "{media_type} must not decode"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_callback_argument_record_fails_in_the_form_its_first_token_selects() {
+        // A JSON start token selects the literal form. "nope" is also valid
+        // base64, and is still read only as a literal.
+        for literal in ["nope", "{\"open\": ", " [1,"] {
+            let expected = serde_json::from_str::<serde_json::Value>(literal)
+                .expect_err("malformed literal")
+                .to_string();
+            assert_eq!(
+                decode_callback_arguments(&callback_arguments_payload(literal.to_string())),
+                Err(expected),
+                "{literal:?}"
+            );
+        }
+        // Anything else is the strict base64 of the original text: no
+        // whitespace trimming, no missing padding, no byte order mark.
+        for encoded in [
+            format!(" {}", standard_base64(b"{}")),
+            format!("{}\n", standard_base64(b"{}")),
+            standard_base64(b"{}").trim_end_matches('=').to_string(),
+            format!("\u{feff}{}", standard_base64(b"{}")),
+        ] {
+            let error = decode_callback_arguments(&callback_arguments_payload(encoded.clone()))
+                .expect_err("malformed base64");
+            assert!(
+                error.starts_with("invalid base64: "),
+                "{encoded:?}: {error}"
+            );
+        }
+        // Valid base64 of text that is not JSON is not read as a literal.
+        let expected = serde_json::from_slice::<serde_json::Value>(b"not json")
+            .expect_err("not JSON")
+            .to_string();
+        assert_eq!(
+            decode_callback_arguments(&callback_arguments_payload(standard_base64(b"not json"))),
+            Err(expected)
+        );
+    }
+
+    /// A verbatim blob store held to the base64 blob contract.
+    ///
+    /// A payload that is not canonical standard base64 is refused at write,
+    /// as a gateway's base64 adapter refuses it, so a write of literal JSON
+    /// fails here. Reads return what the inner store holds, so records
+    /// planted there keep their stored form.
+    struct StrictBase64BlobStore {
+        inner: Arc<dyn meerkat_core::BlobStore>,
+    }
+
+    #[async_trait]
+    impl meerkat_core::BlobStore for StrictBase64BlobStore {
+        async fn put_image(
+            &self,
+            media_type: &str,
+            data: &str,
+        ) -> Result<meerkat_core::BlobRef, meerkat_core::BlobStoreError> {
+            base64::engine::general_purpose::STANDARD
+                .decode(data.as_bytes())
+                .map_err(|error| {
+                    meerkat_core::BlobStoreError::WriteFailed(format!(
+                        "invalid blob base64: {error}"
+                    ))
+                })?;
+            self.inner.put_image(media_type, data).await
+        }
+
+        async fn get(
+            &self,
+            blob_id: &meerkat_core::BlobId,
+        ) -> Result<meerkat_core::BlobPayload, meerkat_core::BlobStoreError> {
+            self.inner.get(blob_id).await
+        }
+
+        async fn delete(
+            &self,
+            blob_id: &meerkat_core::BlobId,
+        ) -> Result<(), meerkat_core::BlobStoreError> {
+            self.inner.delete(blob_id).await
+        }
+
+        fn is_persistent(&self) -> bool {
+            self.inner.is_persistent()
+        }
+    }
+
+    /// Detached-job and blob stores persisted under `root`: the job store,
+    /// the verbatim file blob store, and that store held to the base64
+    /// contract. Opening them again reopens the same records.
+    fn open_detached_callback_stores(
+        root: &std::path::Path,
+    ) -> (
+        Arc<dyn meerkat::DetachedJobStore>,
+        Arc<dyn meerkat_core::BlobStore>,
+        Arc<dyn meerkat_core::BlobStore>,
+    ) {
+        let job_store: Arc<dyn meerkat::DetachedJobStore> =
+            Arc::new(meerkat::SqliteDetachedJobStore::open(root.join("jobs.db")).unwrap());
+        let verbatim: Arc<dyn meerkat_core::BlobStore> =
+            Arc::new(meerkat_store::FsBlobStore::new(root.join("blobs")));
+        let strict: Arc<dyn meerkat_core::BlobStore> = Arc::new(StrictBase64BlobStore {
+            inner: Arc::clone(&verbatim),
+        });
+        (job_store, verbatim, strict)
+    }
+
+    /// A dispatcher owning one detached tool, `durable`, whose submissions
+    /// are keyed by tool call: the same call id with other arguments is the
+    /// same submission.
+    fn detached_callback_dispatcher(
+        job_store: Arc<dyn meerkat::DetachedJobStore>,
+        blob_store: Arc<dyn meerkat_core::BlobStore>,
+    ) -> (
+        Arc<dyn AgentToolDispatcher>,
+        mpsc::Receiver<CallbackRequestEnvelope>,
+    ) {
+        let policy = meerkat_core::DetachedToolExecutionPolicy::new(
+            meerkat_core::RunnerIdentity::new("meta.callback", "v1").unwrap(),
+            meerkat_core::RestartClass::CheckpointResumable,
+            meerkat_core::IdempotencyScope::ToolCall,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let contract = meerkat_core::ToolExecutionContract::new(
+            std::collections::BTreeSet::from([meerkat_core::ToolExecutionMode::Detached]),
+            meerkat_core::ToolExecutionMode::Detached,
+            None,
+            Some(policy),
+        )
+        .unwrap();
+        let registry = Arc::new(CallbackToolRegistry::default());
+        registry
+            .replace_or_add_with_contracts(vec![(make_provenanced_tool_def("durable"), contract)])
+            .unwrap();
+        let (callback_tx, callback_rx) = mpsc::channel(2);
+        let dispatcher: Arc<dyn AgentToolDispatcher> =
+            Arc::new(CallbackToolDispatcher::from_registry_with_job_runtime(
+                registry,
+                callback_tx,
+                Arc::new(AtomicU64::new(0)),
+                vec![],
+                "realm-a",
+                job_store,
+                blob_store,
+            ));
+        (dispatcher, callback_rx)
+    }
+
+    fn detached_callback_context() -> meerkat_core::ToolDispatchContext {
+        meerkat_core::ToolDispatchContext::default().with_runtime_identity(
+            meerkat_core::SessionId::parse("019f74fb-1907-7b21-932d-ab22c4d1f532").unwrap(),
+            Some(meerkat_core::interaction::InteractionId(
+                uuid::Uuid::from_u128(0x5ca1_ab1e),
+            )),
+        )
+    }
+
+    fn resolve_detached_callback_plan(
+        dispatcher: &Arc<dyn AgentToolDispatcher>,
+        call: ToolCallView<'_>,
+        context: &meerkat_core::ToolDispatchContext,
+    ) -> meerkat_core::ResolvedToolExecutionPlan {
+        meerkat_core::resolve_tool_execution_plan_fenced(
+            dispatcher,
+            call,
+            context,
+            &meerkat_core::ToolExecutionResolutionContext::new(
+                meerkat_core::ToolDeadlineChain::new(vec![
+                    meerkat_core::ToolDeadlineContributor::finite(
+                        meerkat_core::ToolDeadlineOwner::CoreToolDispatch,
+                        std::time::Duration::from_secs(30),
+                    ),
+                ])
+                .unwrap(),
+            ),
+        )
+        .unwrap()
+    }
+
+    async fn submit_detached_callback(
+        dispatcher: &Arc<dyn AgentToolDispatcher>,
+        call: ToolCallView<'_>,
+    ) -> Result<meerkat_contracts::JobReceipt, ToolError> {
+        let context = detached_callback_context();
+        let plan = resolve_detached_callback_plan(dispatcher, call, &context);
+        let outcome =
+            meerkat_core::dispatch_tool_execution_plan_fenced(dispatcher, call, &context, &plan)
+                .await?;
+        Ok(serde_json::from_str(&outcome.result.text_content()).unwrap())
+    }
+
+    /// Accept the next `callback/job/start` the dispatcher offers and return
+    /// its parameters.
+    async fn accept_detached_callback_start(
+        callback_rx: &mut mpsc::Receiver<CallbackRequestEnvelope>,
+    ) -> meerkat_contracts::CallbackJobStartParams {
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), callback_rx.recv())
+            .await
+            .expect("attempt start should be offered")
+            .expect("callback channel");
+        let (request, response_tx, _outbound_permit) = envelope.into_parts();
+        assert_eq!(request.method, "callback/job/start");
+        let start: meerkat_contracts::CallbackJobStartParams =
+            serde_json::from_str(request.params.as_deref().unwrap().get()).unwrap();
+        assert!(
+            response_tx
+                .send(CallbackResponseHandoff::unmetered_for_test(
+                    RpcResponse::success(
+                        request.id,
+                        meerkat_contracts::CallbackJobStartResult {
+                            accepted: true,
+                            runner_handle: start.runner_handle.clone(),
+                        },
+                    ),
+                ))
+                .is_ok()
+        );
+        start
+    }
+
+    #[tokio::test]
+    async fn detached_callback_array_arguments_are_stored_as_base64_and_replay_after_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let args = RawValue::from_string(r#"[1, "two", {"three": 3}]"#.to_string()).unwrap();
+        let call = ToolCallView {
+            id: "tc-array",
+            name: "durable",
+            args: &args,
+        };
+
+        let (receipt, reference) = {
+            let (job_store, verbatim, strict) = open_detached_callback_stores(root.path());
+            let (dispatcher, mut callback_rx) =
+                detached_callback_dispatcher(job_store.clone(), strict);
+            let receipt = submit_detached_callback(&dispatcher, call).await.unwrap();
+            assert!(!receipt.deduplicated);
+            let start = accept_detached_callback_start(&mut callback_rx).await;
+            assert_eq!(start.arguments, serde_json::json!([1, "two", {"three": 3}]));
+            let admitted = job_store
+                .get(&meerkat::JobId::new(&receipt.job_id).unwrap())
+                .await
+                .unwrap()
+                .expect("admitted job");
+            let reference = admitted
+                .spec
+                .runner_specification_ref
+                .clone()
+                .expect("runner specification");
+            assert_eq!(
+                start.runner_specification_ref.as_deref(),
+                Some(reference.as_str())
+            );
+            assert_eq!(admitted.machine_state.attempt_count, 1);
+            // The record holds the base64 of exactly the argument bytes the
+            // call carried.
+            let stored = verbatim
+                .get(&meerkat_core::BlobId::new(reference.as_str()))
+                .await
+                .unwrap();
+            assert_eq!(stored.media_type, CALLBACK_ARGUMENTS_MEDIA_TYPE);
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD.decode(stored.data.as_bytes()),
+                Ok(args.get().as_bytes().to_vec())
+            );
+            (receipt, reference)
+        };
+
+        let (job_store, _verbatim, strict) = open_detached_callback_stores(root.path());
+        let (dispatcher, _callback_rx) = detached_callback_dispatcher(job_store.clone(), strict);
+        let replay = submit_detached_callback(&dispatcher, call).await.unwrap();
+        assert_eq!(replay.job_id, receipt.job_id);
+        assert!(replay.deduplicated);
+        let jobs = job_store.list_all(usize::MAX).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].spec.runner_specification_ref.as_ref(),
+            Some(&reference)
+        );
+        assert_eq!(jobs[0].machine_state.attempt_count, 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_literal_callback_arguments_replay_to_their_admitted_job_after_reopen() {
+        for literal in [r#"{"target": "lan"}"#, "null"] {
+            let root = tempfile::tempdir().unwrap();
+            let args = RawValue::from_string(literal.to_string()).unwrap();
+            let call = ToolCallView {
+                id: "tc-legacy",
+                name: "durable",
+                args: &args,
+            };
+
+            // Before this fix the dispatcher stored the literal arguments,
+            // which a verbatim store kept, and admitted the job under the
+            // literal's address.
+            let (legacy_job, legacy_reference) = {
+                let (job_store, verbatim, strict) = open_detached_callback_stores(root.path());
+                let legacy = verbatim
+                    .put_artifact(CALLBACK_ARGUMENTS_MEDIA_TYPE, literal)
+                    .await
+                    .unwrap();
+                let legacy_reference =
+                    meerkat::RunnerSpecificationRef::new(legacy.blob_id.to_string()).unwrap();
+                let (dispatcher, _callback_rx) =
+                    detached_callback_dispatcher(job_store.clone(), strict);
+                let context = detached_callback_context();
+                let plan = resolve_detached_callback_plan(&dispatcher, call, &context);
+                let (spec, _) =
+                    detached_callback_job_spec("realm-a", call, &context, &plan).unwrap();
+                let legacy_job = meerkat::DetachedJobService::new(job_store)
+                    .submit(spec.with_runner_specification_ref(legacy_reference.clone()))
+                    .await
+                    .unwrap();
+                (legacy_job, legacy_reference)
+            };
+
+            let (job_store, _verbatim, strict) = open_detached_callback_stores(root.path());
+            let (dispatcher, mut callback_rx) =
+                detached_callback_dispatcher(job_store.clone(), strict);
+            let replay = submit_detached_callback(&dispatcher, call).await.unwrap();
+            assert_eq!(replay.job_id, legacy_job.job_id.to_string(), "{literal}");
+            assert!(replay.deduplicated, "{literal}");
+            // The admitted job was still queued: its first attempt reads the
+            // literal record.
+            let start = accept_detached_callback_start(&mut callback_rx).await;
+            assert_eq!(
+                start.arguments,
+                serde_json::from_str::<serde_json::Value>(literal).unwrap(),
+                "{literal}"
+            );
+            assert_eq!(
+                start.runner_specification_ref.as_deref(),
+                Some(legacy_reference.as_str()),
+                "{literal}"
+            );
+            let admitted = job_store
+                .get(&legacy_job.job_id)
+                .await
+                .unwrap()
+                .expect("admitted job");
+            assert_eq!(admitted.machine_state.attempt_count, 1, "{literal}");
+
+            let again = submit_detached_callback(&dispatcher, call).await.unwrap();
+            assert_eq!(again.job_id, replay.job_id, "{literal}");
+            assert!(again.deduplicated, "{literal}");
+
+            // The same call id with other arguments is still another
+            // submission.
+            let changed = RawValue::from_string(r#"{"target": "wan"}"#.to_string()).unwrap();
+            let error = submit_detached_callback(
+                &dispatcher,
+                ToolCallView {
+                    id: "tc-legacy",
+                    name: "durable",
+                    args: &changed,
+                },
+            )
+            .await
+            .expect_err("changed arguments conflict");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&meerkat::DetachedJobError::SubmissionConflict.to_string()),
+                "{literal}: {error}"
+            );
+
+            let jobs = job_store.list_all(usize::MAX).await.unwrap();
+            assert_eq!(jobs.len(), 1, "{literal}");
+            assert_eq!(jobs[0].job_id, legacy_job.job_id, "{literal}");
+            assert_eq!(
+                jobs[0].spec.runner_specification_ref.as_ref(),
+                Some(&legacy_reference),
+                "{literal}"
+            );
+            assert_eq!(jobs[0].revision, admitted.revision, "{literal}");
+            assert_eq!(jobs[0].machine_state.attempt_count, 1, "{literal}");
+        }
     }
 
     #[tokio::test]
@@ -1909,7 +2459,7 @@ mod tests {
                     meerkat::ExecutionIntentId::from_string("intent-reconcile").unwrap(),
                     meerkat::InteractionLineageId::from_string("lineage-reconcile").unwrap(),
                     meerkat::ToolIdentity::new("durable", "v1").unwrap(),
-                    meerkat::RunnerIdentity::new("mobkit.callback", "v1").unwrap(),
+                    meerkat::RunnerIdentity::new("meta.callback", "v1").unwrap(),
                     meerkat::RestartClass::Adoptable,
                     meerkat::CanonicalArgumentsHash::new("sha256:args").unwrap(),
                     meerkat::JobSubmissionKey::new("reconcile-same-authority").unwrap(),
@@ -2013,7 +2563,7 @@ mod tests {
                 meerkat::ExecutionIntentId::from_string("intent-cancel").unwrap(),
                 meerkat::InteractionLineageId::from_string("lineage-cancel").unwrap(),
                 meerkat::ToolIdentity::new("durable", "v1").unwrap(),
-                meerkat::RunnerIdentity::new("mobkit.callback", "v1").unwrap(),
+                meerkat::RunnerIdentity::new("meta.callback", "v1").unwrap(),
                 meerkat::RestartClass::Adoptable,
                 meerkat::CanonicalArgumentsHash::new("sha256:args").unwrap(),
                 meerkat::JobSubmissionKey::new("cancel-same-authority").unwrap(),
@@ -2095,7 +2645,7 @@ mod tests {
                 meerkat::ExecutionIntentId::from_string("intent-lost").unwrap(),
                 meerkat::InteractionLineageId::from_string("lineage-lost").unwrap(),
                 meerkat::ToolIdentity::new("durable", "v1").unwrap(),
-                meerkat::RunnerIdentity::new("mobkit.callback", "v1").unwrap(),
+                meerkat::RunnerIdentity::new("meta.callback", "v1").unwrap(),
                 meerkat::RestartClass::NonResumable,
                 meerkat::CanonicalArgumentsHash::new("sha256:args").unwrap(),
                 meerkat::JobSubmissionKey::new("lost-no-replay").unwrap(),

@@ -1,6 +1,8 @@
-from typing import NotRequired, Required, get_args, get_origin, get_type_hints
+from typing import NotRequired, Optional, Required, get_args, get_origin, get_type_hints
 
 from meerkat.generated.types import (
+    McpAttachmentRestoreWireOutcome,
+    ToolConfigChangeStatusExternalToolDelta,
     BlobRef,
     ForkSessionReplaceParams,
     ProviderImageMetadata,
@@ -168,3 +170,21 @@ def test_promoted_optional_nullable_fields_keep_null_as_a_value() -> None:
     )
     assert get_origin(reasoning_hints["text"]) is NotRequired
     assert get_args(reasoning_hints["text"])[0] is str
+
+
+def test_tool_config_change_status_types_the_restore_outcome() -> None:
+    hints = get_type_hints(ToolConfigChangeStatusExternalToolDelta)
+    assert hints["restore"] == Optional[McpAttachmentRestoreWireOutcome]
+    assert set(get_args(McpAttachmentRestoreWireOutcome)) == {
+        "suppressed",
+        "retired",
+        "rebound",
+        "account_changed",
+        "denied",
+        "unavailable",
+        "not_current",
+        "review_required",
+        "mismatch",
+        "stage_failed",
+        "renewal_required",
+    }

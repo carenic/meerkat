@@ -30,7 +30,7 @@ def compare_payload(
     files: list[str],
     renamed_from: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    """Shaped like `gh api repos/lukacf/meerkat-mobkit/compare/<mirrored>...main`."""
+    """Shaped like `gh api repos/lukacf/meerkat-meta/compare/<mirrored>...main`."""
     renamed_from = renamed_from or {}
     return {
         "status": status,

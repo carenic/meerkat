@@ -1605,6 +1605,9 @@ async fn a_member_address_of_a_mob_gone_for_good_is_retired() {
         meerkat::AddressResolution::Session(_)
     ));
 
+    // A handle kept here would own the mob database's observer, and the
+    // destroy would leave its storage cleanup outstanding.
+    drop(handle);
     fixture
         .state
         .mob_destroy(&mob_id)
@@ -2594,5 +2597,937 @@ async fn a_hooked_host_revives_a_member_convener_through_its_mob() {
         0,
         "the owner hook is not asked for a mob member"
     );
+    fixture.teardown().await;
+}
+
+// ===========================================================================
+// A status read observes the owner; only delivery serves it
+// ===========================================================================
+
+/// The committed owner of one host setup result, in its own namespace.
+struct OneSetupJob(meerkat::RetainedJobFacts);
+
+#[async_trait::async_trait]
+impl meerkat::RetainedJobSource for OneSetupJob {
+    async fn retained_job(
+        &self,
+        producer: &meerkat::ContinuationProducer,
+        job_id: &str,
+    ) -> meerkat::RetainedJobLookup {
+        if *producer == setup_producer() && job_id == "setup-1" {
+            meerkat::RetainedJobLookup::Found(self.0.clone())
+        } else {
+            meerkat::RetainedJobLookup::Absent
+        }
+    }
+}
+
+fn setup_producer() -> meerkat::ContinuationProducer {
+    meerkat::ContinuationProducer::Host {
+        namespace: "status-read".to_string(),
+    }
+}
+
+/// The host setup result owed to its owner as a continuation.
+fn setup_completion() -> meerkat::ContinuationDelivery {
+    meerkat::ContinuationDelivery {
+        key: meerkat::ContinuationKey::new("setup:setup-1").expect("key"),
+        result: meerkat::ContinuationResultRef {
+            producer: setup_producer(),
+            producer_id: "setup-1".to_string(),
+            result_digest: "sha256:status-read".to_string(),
+            summary: None,
+        },
+        body: "the setup finished".into(),
+        handling: meerkat::ContinuationHandling::Queue,
+    }
+}
+
+/// An owner hook whose first ask, the delivery owner's own resolution,
+/// parks until the test releases it (`true`: the owner is made live). Every
+/// later ask is counted and refused at once.
+struct ParkedOwnerHost {
+    asks: std::sync::atomic::AtomicUsize,
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<bool>>>,
+}
+
+impl ParkedOwnerHost {
+    fn new() -> (
+        Arc<Self>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<bool>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        (
+            Arc::new(Self {
+                asks: std::sync::atomic::AtomicUsize::new(0),
+                entered: Mutex::new(Some(entered_tx)),
+                release: tokio::sync::Mutex::new(Some(release_rx)),
+            }),
+            entered_rx,
+            release_tx,
+        )
+    }
+
+    fn asks(&self) -> usize {
+        self.asks.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl meerkat_mob_mcp::DetachedOwnerHost for ParkedOwnerHost {
+    async fn ensure_owner_live(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<(), meerkat_mob_mcp::DetachedOwnerError> {
+        if self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            if let Some(entered) = self.entered.lock().expect("entered").take() {
+                let _ = entered.send(());
+            }
+            let release = self.release.lock().await.take();
+            if let Some(release) = release
+                && release.await == Ok(true)
+            {
+                return Ok(());
+            }
+        }
+        Err(meerkat_mob_mcp::DetachedOwnerError::Failed {
+            detail: "the owner is not live".to_string(),
+        })
+    }
+}
+
+/// Reading a continuation's status never makes its owner live. The delivery
+/// owner's own resolution of the row is parked inside the owner hook, an
+/// acknowledged cutpoint after which no delivery work can ask the hook
+/// again. Through the bound service (which outlives its binding), the status
+/// read and the read-only retained observation report the row pending and
+/// never ask the hook. Delivery still serves the owner: released as live,
+/// the parked resolution applies the completion to its exact session, and
+/// the hook was asked that one time only.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_read_never_revives_the_owner_and_delivery_still_does() {
+    let fixture =
+        CouncilFixture::new_runtime_backed(routed_script(RequestLog::default(), Vec::new()));
+    fixture.seed_source_mob(&["forker"]).await;
+    let session_id = member_session(&fixture, "forker").await;
+    let (host, entered, release) = ParkedOwnerHost::new();
+    fixture.state.set_detached_owner_host(Some(host.clone()));
+    let continuations = fixture
+        .state
+        .continuation_service()
+        .expect("the bound continuation service");
+    let owner = meerkat::ContinuationOwner::Session {
+        session_id: session_id.clone(),
+    };
+    let jobs = OneSetupJob(meerkat::RetainedJobFacts {
+        owner_session_id: session_id.clone(),
+        retained_work: None,
+        result_digest: "sha256:status-read".to_string(),
+    });
+    let record = meerkat::RetainedJobRecord::from_owner(&jobs, setup_producer(), "setup-1")
+        .await
+        .expect("read the setup owner")
+        .expect("the setup result is committed");
+    let delivery = setup_completion();
+    continuations
+        .submit_retained_completion(&owner, delivery.clone(), &record, 1)
+        .await
+        .expect("commit the completion");
+    tokio::time::timeout(Duration::from_secs(60), entered)
+        .await
+        .expect("the delivery owner resolves the row")
+        .expect("the hook remains owned");
+
+    let status = continuations
+        .continuation_status(&owner, &delivery.key)
+        .await
+        .expect("status");
+    assert!(
+        matches!(
+            status,
+            meerkat::ContinuationStatus::Pending { admitted: None, .. }
+        ),
+        "{status:?}"
+    );
+    let observed = continuations
+        .observe_retained_completion(&owner, &delivery, &record)
+        .await
+        .expect("observe");
+    assert!(
+        matches!(
+            observed,
+            meerkat::ContinuationObservation::Matched {
+                status: meerkat::ContinuationStatus::Pending { admitted: None, .. },
+                ..
+            }
+        ),
+        "{observed:?}"
+    );
+    assert_eq!(
+        host.asks(),
+        1,
+        "only the delivery owner's resolution asked the owner hook"
+    );
+
+    release
+        .send(true)
+        .expect("release the parked resolution as live");
+    let applied = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if let meerkat::ContinuationStatus::Applied { session, .. } = continuations
+                .continuation_status(&owner, &delivery.key)
+                .await
+                .expect("status")
+            {
+                break session;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("delivery applies the completion");
+    assert_eq!(applied, session_id, "applied to its exact owner session");
+    assert_eq!(
+        host.asks(),
+        1,
+        "delivery served the owner once; no status read asked"
+    );
+    fixture.teardown().await;
+}
+
+/// A row for a member of a mob this host does not manage, committed through
+/// a service that resolves only that member's address.
+struct ForeignMember(meerkat_runtime::LogicalRuntimeId);
+
+#[async_trait::async_trait]
+impl meerkat::ContinuationAddressResolver for ForeignMember {
+    async fn current_address(
+        &self,
+        _owner: &meerkat::ContinuationOwner,
+    ) -> Result<Option<meerkat_runtime::LogicalRuntimeId>, String> {
+        Ok(Some(self.0.clone()))
+    }
+
+    async fn resolve_address(
+        &self,
+        _address: &meerkat_runtime::LogicalRuntimeId,
+    ) -> Result<meerkat::AddressResolution, String> {
+        Ok(meerkat::AddressResolution::NotServed)
+    }
+}
+
+/// A status read strands a row only when the owner's records prove it gone.
+/// A plain session that does not read proves nothing (it may not be
+/// persisted yet), so its row stays pending. A member of a mob this host
+/// does not manage stays pending while the host may still register that
+/// mob, and is stranded once the host declared every mob it will have.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_read_strands_only_an_owner_whose_records_prove_it_gone() {
+    let fixture =
+        CouncilFixture::new_runtime_backed(routed_script(RequestLog::default(), Vec::new()));
+    let continuations = fixture
+        .state
+        .continuation_service()
+        .expect("the bound continuation service");
+
+    let absent = meerkat::ContinuationOwner::Session {
+        session_id: SessionId::new(),
+    };
+    let delivery = setup_completion();
+    let receipt = continuations
+        .submit(&absent, delivery.clone(), 1)
+        .await
+        .expect("commit the continuation");
+    let status = continuations
+        .continuation_status(&absent, &delivery.key)
+        .await
+        .expect("status");
+    assert!(
+        matches!(
+            &status,
+            meerkat::ContinuationStatus::Pending { receipt: pending, admitted: None, .. }
+                if pending == &receipt
+        ),
+        "mere absence is not retirement: {status:?}"
+    );
+
+    let address = meerkat::member_delivery_address("foreign-mob", "absent", 1)
+        .expect("foreign member address");
+    let member = meerkat::ContinuationOwner::Member {
+        mob_id: "foreign-mob".to_string(),
+        identity: "absent".to_string(),
+    };
+    let foreign = meerkat::ContinuationOwnerService::new(
+        fixture
+            .continuations
+            .as_ref()
+            .expect("the fixture's continuations")
+            .inbox
+            .clone(),
+        Arc::new(ForeignMember(address)),
+        fixture
+            .runtime_adapter
+            .clone()
+            .expect("runtime-backed fixture"),
+    );
+    let foreign_receipt = foreign
+        .submit(&member, delivery.clone(), 1)
+        .await
+        .expect("commit the foreign member's continuation");
+    let status = continuations
+        .continuation_status(&member, &delivery.key)
+        .await
+        .expect("status");
+    assert!(
+        matches!(
+            &status,
+            meerkat::ContinuationStatus::Pending { receipt: pending, admitted: None, .. }
+                if pending == &foreign_receipt
+        ),
+        "the host may still register that mob: {status:?}"
+    );
+    fixture.state.declare_mob_set_restored();
+    assert_eq!(
+        continuations
+            .continuation_status(&member, &delivery.key)
+            .await
+            .expect("status"),
+        meerkat::ContinuationStatus::Stranded {
+            receipt: foreign_receipt,
+            cause: meerkat::StrandedCause::OwnerRetired,
+        },
+        "the host's complete mob set proves that mob gone"
+    );
+    fixture.teardown().await;
+}
+
+/// An ephemeral session whose live actor is discarded without archiving
+/// reads as absent, and the host restores it under the same id from the
+/// snapshot it kept. A retained continuation owed to it stays pending through
+/// that absence (its status and its read-only retained observation), never
+/// stranded, and the same-id restore succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_read_keeps_a_discarded_ephemeral_owner_pending_through_its_same_id_restore() {
+    use meerkat_core::service::SessionService as _;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut builder = meerkat::FactoryAgentBuilder::new(
+        meerkat::AgentFactory::new(temp.path().join("sessions")).builtins(false),
+        meerkat::Config::default(),
+    );
+    builder.default_llm_client = Some(Arc::new(support::ScriptedCouncilClient::new(
+        routed_script(RequestLog::default(), Vec::new()),
+    )));
+    let service = Arc::new(meerkat_session::EphemeralSessionService::new(builder, 4));
+    let state = MobMcpState::new_with_runtime_adapter(
+        service.clone(),
+        None,
+        meerkat_mob::MobControlPrincipal::Owner,
+    )
+    .expect("the ephemeral service supplies its runtime")
+    .into_shared();
+    let bindings = meerkat::ContinuationHostBindings::default();
+    state
+        .bind_continuations(
+            meerkat_runtime::RuntimeDeliveryInbox::new(Arc::new(
+                meerkat_runtime::InMemoryRuntimeStore::new(),
+            )),
+            &bindings,
+        )
+        .expect("bind the continuation services");
+    let continuations = state
+        .continuation_service()
+        .expect("the bound continuation service");
+    let request = |build| meerkat_core::service::CreateSessionRequest {
+        injected_context: Vec::new(),
+        model: "claude-haiku-4-5-20251001".to_string(),
+        prompt: ContentInput::Text(String::new()),
+        system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+        max_tokens: None,
+        event_tx: None,
+        initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+        deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+        build: Some(build),
+        labels: None,
+    };
+    let session_id = service
+        .create_session(request(
+            meerkat_core::service::SessionBuildOptions::default(),
+        ))
+        .await
+        .expect("create the ephemeral session")
+        .session_id;
+    let owner = meerkat::ContinuationOwner::Session {
+        session_id: session_id.clone(),
+    };
+    let jobs = OneSetupJob(meerkat::RetainedJobFacts {
+        owner_session_id: session_id.clone(),
+        retained_work: None,
+        result_digest: "sha256:status-read".to_string(),
+    });
+    let record = meerkat::RetainedJobRecord::from_owner(&jobs, setup_producer(), "setup-1")
+        .await
+        .expect("read the setup owner")
+        .expect("the setup result is committed");
+    let delivery = setup_completion();
+    let receipt = continuations
+        .submit_retained_completion(&owner, delivery.clone(), &record, 1)
+        .await
+        .expect("commit the retained continuation");
+
+    let snapshot = service
+        .export_session(&session_id)
+        .await
+        .expect("the host keeps the session's snapshot");
+    service
+        .discard_live_session(&session_id)
+        .await
+        .expect("discard the live actor without archiving");
+    assert!(
+        matches!(
+            service.read(&session_id).await,
+            Err(meerkat_core::service::SessionError::NotFound { .. })
+        ),
+        "the discarded session reads as absent"
+    );
+    let pending = |status: &meerkat::ContinuationStatus| {
+        matches!(
+            status,
+            meerkat::ContinuationStatus::Pending { receipt: pending, admitted: None, .. }
+                if pending == &receipt
+        )
+    };
+    let status = continuations
+        .continuation_status(&owner, &delivery.key)
+        .await
+        .expect("status");
+    assert!(
+        pending(&status),
+        "a recoverable absence is not retirement: {status:?}"
+    );
+    let observed = continuations
+        .observe_retained_completion(&owner, &delivery, &record)
+        .await
+        .expect("observe");
+    assert!(
+        matches!(
+            &observed,
+            meerkat::ContinuationObservation::Matched { status, .. } if pending(status)
+        ),
+        "{observed:?}"
+    );
+
+    let mut restore = meerkat_core::service::SessionBuildOptions::default();
+    restore.resume_existing_session(snapshot);
+    let restored = tokio::time::timeout(
+        Duration::from_secs(60),
+        service.create_session(request(restore)),
+    )
+    .await
+    .expect("the restore is bounded")
+    .expect("the session is restored under the same id");
+    assert_eq!(restored.session_id, session_id);
+    service
+        .read(&session_id)
+        .await
+        .expect("the restored session reads");
+    let status = continuations
+        .continuation_status(&owner, &delivery.key)
+        .await
+        .expect("status");
+    assert!(
+        pending(&status),
+        "still owed to the restored session: {status:?}"
+    );
+}
+
+// ===========================================================================
+// Delivery strands a session owner only on its own lifecycle proof
+// ===========================================================================
+
+/// An owner hook the test toggles: while the host does not hold the owner it
+/// answers "gone", which a host answers for a session it holds no record of
+/// right now (an RPC host answers `SESSION_NOT_FOUND` for a temporary absence
+/// as for a deleted session); while it holds it, the owner is live. Counts
+/// every ask.
+struct TogglingOwnerHost {
+    holds: std::sync::atomic::AtomicBool,
+    asks: std::sync::atomic::AtomicUsize,
+}
+
+impl TogglingOwnerHost {
+    fn holding(holds: bool) -> Arc<Self> {
+        Arc::new(Self {
+            holds: std::sync::atomic::AtomicBool::new(holds),
+            asks: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn hold(&self) {
+        self.holds.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn asks(&self) -> usize {
+        self.asks.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl meerkat_mob_mcp::DetachedOwnerHost for TogglingOwnerHost {
+    async fn ensure_owner_live(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<(), meerkat_mob_mcp::DetachedOwnerError> {
+        self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.holds.load(std::sync::atomic::Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(meerkat_mob_mcp::DetachedOwnerError::OwnerGone {
+                detail: "the host holds no record of the session right now".to_string(),
+            })
+        }
+    }
+}
+
+/// Commit the host setup result owed to `session_id`, and return the row's
+/// receipt with the delivery owner's first pass that holds the owner's
+/// address blocked: the row is owed, not retired.
+async fn owe_setup_result(
+    continuations: &meerkat::ContinuationOwnerService,
+    passes: &mut tokio::sync::watch::Receiver<meerkat::RuntimeDeliveryPass>,
+    session_id: &SessionId,
+) -> (meerkat::ContinuationReceipt, meerkat::RuntimeDeliveryPass) {
+    let jobs = OneSetupJob(meerkat::RetainedJobFacts {
+        owner_session_id: session_id.clone(),
+        retained_work: None,
+        result_digest: "sha256:status-read".to_string(),
+    });
+    let record = meerkat::RetainedJobRecord::from_owner(&jobs, setup_producer(), "setup-1")
+        .await
+        .expect("read the setup owner")
+        .expect("the setup result is committed");
+    let receipt = continuations
+        .submit_retained_completion(
+            &meerkat::ContinuationOwner::Session {
+                session_id: session_id.clone(),
+            },
+            setup_completion(),
+            &record,
+            1,
+        )
+        .await
+        .expect("commit the retained setup result");
+    let address = meerkat_runtime::LogicalRuntimeId::for_session(session_id);
+    let blocked =
+        support::wait_for_pass(passes, "the owed row held blocked, not retired", |pass| {
+            pass.blocked_runtimes.contains(&address)
+        })
+        .await;
+    (receipt, blocked)
+}
+
+/// Whether `status` is the owed row `receipt`, pending and never admitted.
+fn owed(status: &meerkat::ContinuationStatus, receipt: &meerkat::ContinuationReceipt) -> bool {
+    matches!(
+        status,
+        meerkat::ContinuationStatus::Pending { receipt: pending, admitted: None, .. }
+            if pending == receipt
+    )
+}
+
+/// Delivery keeps a retained completion owed to an ephemeral session whose
+/// live actor was discarded without archiving: the session reads as absent,
+/// which proves no retirement, so the delivery owner holds its runtime
+/// blocked instead of dropping it as drained. Restored under the same id from
+/// the host's snapshot, the session reads again, and the bound source's hint
+/// retries the blocked row, which admits the completion as that session's
+/// input exactly once. The owner is a session of the service's own runtime
+/// machine, prepared the way a surface prepares one (native bindings, no
+/// executor), because only such a session can be admitted a continuation:
+/// this proves the admission, not a processed turn. The raw restore commits
+/// no attachment, so it proves the restore together with the hint, not a
+/// wake from the restore.
+#[tokio::test(flavor = "multi_thread")]
+async fn delivery_keeps_a_discarded_ephemeral_owner_owed_until_a_hint_after_its_restore() {
+    use meerkat_core::service::SessionService as _;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut builder = meerkat::FactoryAgentBuilder::new(
+        meerkat::AgentFactory::new(temp.path().join("sessions")).builtins(false),
+        meerkat::Config::default(),
+    );
+    builder.default_llm_client = Some(Arc::new(support::ScriptedCouncilClient::new(
+        routed_script(RequestLog::default(), Vec::new()),
+    )));
+    let service = Arc::new(meerkat_session::EphemeralSessionService::new(builder, 4));
+    let state = MobMcpState::new_with_runtime_adapter(
+        service.clone(),
+        None,
+        meerkat_mob::MobControlPrincipal::Owner,
+    )
+    .expect("the ephemeral service supplies its runtime")
+    .into_shared();
+    let machine = meerkat_mob::MobSessionService::acquire_runtime_adapter(service.as_ref(), None)
+        .expect("acquire the service's machine")
+        .expect("an ephemeral service owns its machine");
+    let delivery_host = support::FixtureContinuations::arm_over(
+        &service,
+        &machine,
+        meerkat_runtime::RuntimeDeliveryInbox::new(Arc::new(
+            meerkat_runtime::InMemoryRuntimeStore::new(),
+        )),
+        true,
+    );
+    delivery_host.bind(&state);
+    let mut passes = delivery_host.passes.clone();
+    let continuations = state
+        .continuation_service()
+        .expect("the bound continuation service");
+    let request = |build| meerkat_core::service::CreateSessionRequest {
+        injected_context: Vec::new(),
+        model: "claude-haiku-4-5-20251001".to_string(),
+        prompt: ContentInput::Text(String::new()),
+        system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+        max_tokens: None,
+        event_tx: None,
+        initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+        deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+        build: Some(build),
+        labels: None,
+    };
+    let prepared = meerkat::surface::prepare_surface_session(&machine)
+        .await
+        .expect("prepare the owner's runtime bindings");
+    let mut build = meerkat_core::service::SessionBuildOptions::default();
+    build.mint_session_with_id(prepared.session_id.clone());
+    build.runtime_build_mode = meerkat_core::RuntimeBuildMode::SessionOwned(prepared.bindings);
+    let session_id = service
+        .create_session(request(build))
+        .await
+        .expect("create the owner session in the service's machine")
+        .session_id;
+    assert_eq!(session_id, prepared.session_id);
+    let owner = meerkat::ContinuationOwner::Session {
+        session_id: session_id.clone(),
+    };
+    let address = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
+    let key = setup_completion().key;
+
+    let snapshot = service
+        .export_session(&session_id)
+        .await
+        .expect("the host keeps the session's snapshot");
+    service
+        .discard_live_session(&session_id)
+        .await
+        .expect("discard the live actor without archiving");
+    assert!(
+        matches!(
+            service.read(&session_id).await,
+            Err(meerkat_core::service::SessionError::NotFound { .. })
+        ),
+        "the discarded session reads as absent"
+    );
+
+    let (receipt, blocked) = owe_setup_result(&continuations, &mut passes, &session_id).await;
+    assert_eq!(
+        (blocked.applied, blocked.refused),
+        (0, 0),
+        "never settled: {blocked:?}"
+    );
+    let status = continuations
+        .continuation_status(&owner, &key)
+        .await
+        .expect("status");
+    assert!(owed(&status, &receipt), "{status:?}");
+
+    let mut restore = meerkat_core::service::SessionBuildOptions::default();
+    restore.resume_existing_session(snapshot);
+    let restored = tokio::time::timeout(
+        Duration::from_secs(60),
+        service.create_session(request(restore)),
+    )
+    .await
+    .expect("the restore is bounded")
+    .expect("the session is restored under the same id");
+    assert_eq!(restored.session_id, session_id);
+    service
+        .read(&session_id)
+        .await
+        .expect("the restored session reads");
+
+    let hinted = passes.borrow().generation;
+    delivery_host.bindings.source_custody_changed();
+    let applied =
+        support::wait_for_pass(&mut passes, "the hinted retry admitted the row", |pass| {
+            pass.applied > 0
+        })
+        .await;
+    assert!(
+        applied.generation > hinted,
+        "admitted by the owner's retry after the hint: {applied:?}"
+    );
+    assert_eq!(applied.applied, 1, "admitted exactly once: {applied:?}");
+    assert!(
+        !applied.blocked_runtimes.contains(&address),
+        "nothing stays blocked: {applied:?}"
+    );
+    let status = continuations
+        .continuation_status(&owner, &key)
+        .await
+        .expect("status");
+    assert!(
+        matches!(
+            &status,
+            meerkat::ContinuationStatus::Applied { receipt: applied_receipt, session, .. }
+                if applied_receipt == &receipt && session == &session_id
+        ),
+        "admitted as its exact owner session's input: {status:?}"
+    );
+}
+
+/// The owner hook's "gone" is not a retirement proof. The owner session
+/// reads, but the hook answers it gone (a host answers so for a session
+/// absent only for the moment); its lifecycle proves no retirement, so the
+/// delivery owner keeps the row owed and its runtime blocked instead of
+/// dropping it as drained. Once the host holds the session again, the bound
+/// source's hint retries the blocked row, and the hook serves the owner,
+/// which is applied the completion exactly once.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_hook_gone_answer_without_lifecycle_proof_keeps_the_row_owed_until_a_hint() {
+    let fixture = CouncilFixture::new_runtime_backed_with_source_hints(
+        routed_script(RequestLog::default(), Vec::new()),
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+    );
+    fixture.seed_source_mob(&["forker"]).await;
+    let session_id = member_session(&fixture, "forker").await;
+    let host = TogglingOwnerHost::holding(false);
+    fixture.state.set_detached_owner_host(Some(host.clone()));
+    let bound = fixture
+        .continuations
+        .as_ref()
+        .expect("the runtime-backed fixture's continuations");
+    let mut passes = bound.passes.clone();
+    let continuations = fixture
+        .state
+        .continuation_service()
+        .expect("the bound continuation service");
+    let owner = meerkat::ContinuationOwner::Session {
+        session_id: session_id.clone(),
+    };
+    let address = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
+    let key = setup_completion().key;
+
+    let (receipt, blocked) = owe_setup_result(&continuations, &mut passes, &session_id).await;
+    assert_eq!(
+        (blocked.applied, blocked.refused),
+        (0, 0),
+        "never settled: {blocked:?}"
+    );
+    assert!(host.asks() >= 1, "delivery asked the owner hook");
+    let status = continuations
+        .continuation_status(&owner, &key)
+        .await
+        .expect("status");
+    assert!(owed(&status, &receipt), "{status:?}");
+
+    host.hold();
+    let hinted = passes.borrow().generation;
+    bound.bindings.source_custody_changed();
+    let applied = support::wait_for_pass(&mut passes, "the hinted retry applied the row", |pass| {
+        pass.applied > 0
+    })
+    .await;
+    assert!(
+        applied.generation > hinted,
+        "applied by the owner's retry after the hint: {applied:?}"
+    );
+    assert_eq!(applied.applied, 1, "applied exactly once: {applied:?}");
+    assert!(
+        !applied.blocked_runtimes.contains(&address),
+        "nothing stays blocked: {applied:?}"
+    );
+    let status = continuations
+        .continuation_status(&owner, &key)
+        .await
+        .expect("status");
+    assert!(
+        matches!(
+            &status,
+            meerkat::ContinuationStatus::Applied { receipt: applied_receipt, session, .. }
+                if applied_receipt == &receipt && session == &session_id
+        ),
+        "applied to its exact owner session: {status:?}"
+    );
+    fixture.teardown().await;
+}
+
+/// A failed read of the owner session answers nothing about the owner:
+/// delivery keeps the row owed and its runtime blocked, never asks the owner
+/// hook and admits nothing, though the hook would serve the owner. Once the
+/// session reads again, the bound source's hint retries the blocked row, the
+/// hook serves the owner, and the completion is applied exactly once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_owner_read_keeps_the_row_owed_without_asking_the_owner_hook() {
+    let store = Arc::new(support::commit_gate::CommitGateRuntimeStore::new());
+    let fixture = CouncilFixture::new_runtime_backed_with_source_hints(
+        routed_script(RequestLog::default(), Vec::new()),
+        store.clone(),
+    );
+    fixture.seed_source_mob(&["forker"]).await;
+    let session_id = member_session(&fixture, "forker").await;
+    let host = TogglingOwnerHost::holding(true);
+    fixture.state.set_detached_owner_host(Some(host.clone()));
+    let bound = fixture
+        .continuations
+        .as_ref()
+        .expect("the runtime-backed fixture's continuations");
+    let mut passes = bound.passes.clone();
+    let continuations = fixture
+        .state
+        .continuation_service()
+        .expect("the bound continuation service");
+    let owner = meerkat::ContinuationOwner::Session {
+        session_id: session_id.clone(),
+    };
+    let address = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
+    let key = setup_completion().key;
+
+    store.fail_session_reads(address.clone());
+    let unreadable = fixture.state.session_service().read(&session_id).await;
+    assert!(
+        matches!(
+            &unreadable,
+            Err(error) if !matches!(error, meerkat_core::service::SessionError::NotFound { .. })
+        ),
+        "the owner session cannot be read: {:?}",
+        unreadable.map(|_| ())
+    );
+    let (receipt, blocked) = owe_setup_result(&continuations, &mut passes, &session_id).await;
+    assert_eq!(
+        (blocked.applied, blocked.refused),
+        (0, 0),
+        "nothing was admitted: {blocked:?}"
+    );
+    assert_eq!(
+        host.asks(),
+        0,
+        "the owner hook is not asked for an unreadable owner"
+    );
+    let status = continuations
+        .continuation_status(&owner, &key)
+        .await
+        .expect("status");
+    assert!(owed(&status, &receipt), "{status:?}");
+
+    store.restore_session_reads();
+    let hinted = passes.borrow().generation;
+    bound.bindings.source_custody_changed();
+    let applied = support::wait_for_pass(&mut passes, "the hinted retry applied the row", |pass| {
+        pass.applied > 0
+    })
+    .await;
+    assert!(
+        applied.generation > hinted,
+        "applied by the owner's retry after the hint: {applied:?}"
+    );
+    assert_eq!(applied.applied, 1, "applied exactly once: {applied:?}");
+    assert!(
+        host.asks() >= 1,
+        "the retry served the owner through the hook"
+    );
+    let status = continuations
+        .continuation_status(&owner, &key)
+        .await
+        .expect("status");
+    assert!(
+        matches!(
+            &status,
+            meerkat::ContinuationStatus::Applied { receipt: applied_receipt, session, .. }
+                if applied_receipt == &receipt && session == &session_id
+        ),
+        "applied to its exact owner session: {status:?}"
+    );
+    fixture.teardown().await;
+}
+
+/// The observer-failure control: a lifecycle that cannot be observed proves
+/// nothing. The owner hook answers the owner gone while the owner's resume
+/// authority cannot be read, so delivery keeps the row owed and its runtime
+/// blocked instead of settling it on a failed observation, and a status read
+/// reports the owner unavailable, typed. Once the lifecycle reads again it
+/// proves no retirement (the owner is active): the hint's retry still keeps
+/// the row owed, and the status reads it pending.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unobservable_owner_lifecycle_never_retires_its_row() {
+    let store = Arc::new(support::commit_gate::CommitGateRuntimeStore::new());
+    let fixture = CouncilFixture::new_runtime_backed_with_source_hints(
+        routed_script(RequestLog::default(), Vec::new()),
+        store.clone(),
+    );
+    fixture.seed_source_mob(&["forker"]).await;
+    let session_id = member_session(&fixture, "forker").await;
+    let host = TogglingOwnerHost::holding(false);
+    fixture.state.set_detached_owner_host(Some(host.clone()));
+    let bound = fixture
+        .continuations
+        .as_ref()
+        .expect("the runtime-backed fixture's continuations");
+    let mut passes = bound.passes.clone();
+    let continuations = fixture
+        .state
+        .continuation_service()
+        .expect("the bound continuation service");
+    let owner = meerkat::ContinuationOwner::Session {
+        session_id: session_id.clone(),
+    };
+    let address = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
+    let key = setup_completion().key;
+
+    store.fail_resume_observations(address.clone());
+    let (receipt, blocked) = owe_setup_result(&continuations, &mut passes, &session_id).await;
+    assert_eq!(
+        (blocked.applied, blocked.refused),
+        (0, 0),
+        "never settled: {blocked:?}"
+    );
+    assert!(host.asks() >= 1, "delivery asked the owner hook");
+    let unavailable = continuations.continuation_status(&owner, &key).await;
+    assert!(
+        matches!(
+            unavailable,
+            Err(meerkat::ContinuationStatusError::Unavailable(_))
+        ),
+        "{unavailable:?}"
+    );
+
+    store.restore_resume_observations();
+    let hinted = passes.borrow().generation;
+    let asked = host.asks();
+    let retry_host = Arc::clone(&host);
+    bound.bindings.source_custody_changed();
+    // The retry resolved the row again: the hook was asked once more.
+    let retried =
+        support::wait_for_pass(&mut passes, "the hinted retry resolved the row", |pass| {
+            pass.generation > hinted && retry_host.asks() > asked
+        })
+        .await;
+    assert!(
+        retried.blocked_runtimes.contains(&address),
+        "an active owner is not retired: the row stays owed: {retried:?}"
+    );
+    assert_eq!(
+        (retried.applied, retried.refused),
+        (0, 0),
+        "never settled: {retried:?}"
+    );
+    let status = continuations
+        .continuation_status(&owner, &key)
+        .await
+        .expect("status");
+    assert!(owed(&status, &receipt), "{status:?}");
     fixture.teardown().await;
 }

@@ -32,7 +32,7 @@ use meerkat_runtime::{
 use meerkat_session::{EphemeralSessionService, PersistentSessionService};
 
 use crate::StagedSessionRegistry;
-use crate::factory::AgentFactory;
+use crate::factory::{AgentFactory, LlmCredentialSelection};
 use crate::service_factory::FactoryAgentBuilder;
 use crate::session_runtime::recovery::parse_provider_override;
 
@@ -724,7 +724,7 @@ impl SessionRuntimeLlmReconfigureService for EphemeralSessionService<FactoryAgen
 /// Embedded hosts create this blueprint immediately before moving the builder
 /// into a persistent or ephemeral service, then call [`Self::install`] with
 /// that concrete service. This keeps adapter/config/auth wiring in Meerkat
-/// instead of duplicating it across MobKit and desktop surfaces.
+/// instead of duplicating it across Meta and desktop surfaces.
 pub struct SessionRuntimeLlmReconfigureHostBlueprint {
     factory: AgentFactory,
     config_store: Arc<dyn meerkat_core::ConfigStore>,
@@ -891,13 +891,14 @@ impl SessionRuntimeLlmReconfigureHost {
         let preferred_realm = self.inheritance_head_realm();
         self.build_adapter_for_llm_identity_in_realm(identity, preferred_realm.as_ref())
             .await
+            .map(|(adapter, _selection)| adapter)
     }
 
     async fn build_adapter_for_session_llm_identity(
         &self,
         session_id: &SessionId,
         identity: &SessionLlmIdentity,
-    ) -> Result<Arc<dyn AgentLlmClient>, RuntimeDriverError> {
+    ) -> Result<(Arc<dyn AgentLlmClient>, Option<LlmCredentialSelection>), RuntimeDriverError> {
         let preferred_realm = preferred_hot_swap_realm(
             self.service()?.as_ref(),
             session_id,
@@ -920,18 +921,19 @@ impl SessionRuntimeLlmReconfigureHost {
         &self,
         identity: &SessionLlmIdentity,
         preferred_realm: Option<&meerkat_core::RealmId>,
-    ) -> Result<Arc<dyn AgentLlmClient>, RuntimeDriverError> {
+    ) -> Result<(Arc<dyn AgentLlmClient>, Option<LlmCredentialSelection>), RuntimeDriverError> {
         let default_llm_client = self
             .default_llm_client
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let raw_client = if let Some(default) = default_llm_client {
-            default
+        let (raw_client, selection) = if let Some(default) = default_llm_client {
+            (default, None)
         } else {
             let config = self.load_config_for_hot_swap().await?;
-            self.factory
-                .build_llm_client_for_identity_with_auth_lease_in_realm(
+            let built = self
+                .factory
+                .build_llm_client_with_selection_for_identity_in_realm(
                     &config,
                     identity,
                     Some(self.auth_lease.clone()),
@@ -942,7 +944,8 @@ impl SessionRuntimeLlmReconfigureHost {
                     RuntimeDriverError::Internal(format!(
                         "Failed to build LLM client for session identity hot-swap: {e}"
                     ))
-                })?
+                })?;
+            (built.client, built.selection)
         };
 
         let adapter = self
@@ -960,11 +963,13 @@ impl SessionRuntimeLlmReconfigureHost {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        AgentFactory::decorate_agent_llm_client(adapter, decorator.as_ref()).map_err(|error| {
-            RuntimeDriverError::Internal(format!(
-                "Failed to preserve request-attempt authority during LLM hot-swap: {error}"
-            ))
-        })
+        let adapter = AgentFactory::decorate_agent_llm_client(adapter, decorator.as_ref())
+            .map_err(|error| {
+                RuntimeDriverError::Internal(format!(
+                    "Failed to preserve request-attempt authority during LLM hot-swap: {error}"
+                ))
+            })?;
+        Ok((adapter, selection))
     }
 
     async fn load_config_for_hot_swap(&self) -> Result<Config, RuntimeDriverError> {
@@ -1171,6 +1176,17 @@ impl SessionLlmReconfigureHost for SessionRuntimeLlmReconfigureHost {
         identity: &SessionLlmIdentity,
         capability_surface: Option<&SessionLlmCapabilitySurface>,
     ) -> Result<(), RuntimeDriverError> {
+        self.apply_live_session_llm_identity_effective(session_id, identity, capability_surface)
+            .await
+            .map(|_applied| ())
+    }
+
+    async fn apply_live_session_llm_identity_effective(
+        &self,
+        session_id: &SessionId,
+        identity: &SessionLlmIdentity,
+        capability_surface: Option<&SessionLlmCapabilitySurface>,
+    ) -> Result<SessionLlmIdentity, RuntimeDriverError> {
         if self
             .service()?
             .live_session_has_instruction_activations(session_id)
@@ -1188,12 +1204,23 @@ impl SessionLlmReconfigureHost for SessionRuntimeLlmReconfigureHost {
                 });
             }
         }
-        let adapter = self
+        let (adapter, selection) = self
             .build_adapter_for_session_llm_identity(session_id, identity)
             .await?;
-        let request_policy = self
-            .build_request_policy_for_llm_identity(session_id, identity)
+        // An identity without a binding (`Clear`, or none ever chosen) is
+        // served by whichever candidate resolved. When that candidate carries
+        // lifecycle authority, the applied and persisted identity names it and
+        // the request policy names its credential, exactly as initial
+        // construction does; otherwise the lease rotation would see "previous
+        // credential -> none" and release a credential the new client uses.
+        let mut identity = identity.clone();
+        let selected_credential = LlmCredentialSelection::bind_unselected(selection, &mut identity);
+        let mut request_policy = self
+            .build_request_policy_for_llm_identity(session_id, &identity)
             .await?;
+        if let Some(credential_identity) = selected_credential {
+            request_policy.credential_identity = Some(credential_identity);
+        }
         self.service()?
             .apply_live_llm_identity_under_runtime_turn_boundary(
                 session_id,
@@ -1202,7 +1229,8 @@ impl SessionLlmReconfigureHost for SessionRuntimeLlmReconfigureHost {
                 request_policy,
             )
             .await
-            .map_err(session_error_to_runtime_driver)
+            .map_err(session_error_to_runtime_driver)?;
+        Ok(identity)
     }
 
     async fn apply_live_session_tool_visibility_state(
@@ -1284,7 +1312,8 @@ mod tests {
                 2,
                 bundle,
                 directory.path().join("reconfigure.json"),
-            );
+            )
+            .expect("compose the runtime-backed service");
         (service, machine, directory)
     }
 

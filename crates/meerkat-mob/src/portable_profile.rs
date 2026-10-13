@@ -39,6 +39,27 @@ pub(crate) fn project_portable_profile(
 
     let mut mcp_servers = BTreeMap::new();
     for server in &profile.tools.mcp_servers {
+        // The access ceiling travels exactly. An invalid one is refused,
+        // never stripped: dropping it would widen the server on the host.
+        server
+            .validate_access()
+            .map_err(|error| error.to_string())?;
+        // A connector binding is host configuration with no exact portable
+        // form; dropping it would change what the server's calls carry.
+        if server.connector.is_some() {
+            return Err(format!(
+                "MCP server '{}' has a connector binding that a portable profile cannot carry",
+                server.name
+            ));
+        }
+        // An account declaration is host configuration too; dropping it
+        // would change how review states the server's operations.
+        if server.account.is_some() {
+            return Err(format!(
+                "MCP server '{}' has an account declaration that a portable profile cannot carry",
+                server.name
+            ));
+        }
         let decl = match &server.transport {
             meerkat_core::mcp_config::McpTransportConfig::Stdio(stdio) => {
                 if !stdio.env.is_empty() {
@@ -53,6 +74,7 @@ pub(crate) fn project_portable_profile(
                     required_env_keys: Vec::new(),
                     connect_timeout_secs: server.connect_timeout_secs.map(u64::from),
                     tool_names: server.tool_names.clone(),
+                    access: server.access.clone(),
                 }
             }
             meerkat_core::mcp_config::McpTransportConfig::Http(http) => {
@@ -78,6 +100,7 @@ pub(crate) fn project_portable_profile(
                     required_header_names: Vec::new(),
                     connect_timeout_secs: server.connect_timeout_secs.map(u64::from),
                     tool_names: server.tool_names.clone(),
+                    access: server.access.clone(),
                 }
             }
         };
@@ -146,6 +169,7 @@ pub(crate) fn rehydrate_portable_profile(portable: &PortableProfile) -> Result<P
                 required_env_keys,
                 connect_timeout_secs,
                 tool_names,
+                access,
             } => {
                 if !required_env_keys.is_empty() {
                     return Err(format!(
@@ -159,6 +183,7 @@ pub(crate) fn rehydrate_portable_profile(portable: &PortableProfile) -> Result<P
                     HashMap::new(),
                 );
                 server.tool_names = tool_names.clone();
+                server.access = access.clone();
                 server.connect_timeout_secs = connect_timeout_secs
                     .map(|seconds| {
                         u32::try_from(seconds).map_err(|_| {
@@ -175,6 +200,7 @@ pub(crate) fn rehydrate_portable_profile(portable: &PortableProfile) -> Result<P
                 required_header_names,
                 connect_timeout_secs,
                 tool_names,
+                access,
             } => {
                 if !required_header_names.is_empty() {
                     return Err(format!(
@@ -193,6 +219,10 @@ pub(crate) fn rehydrate_portable_profile(portable: &PortableProfile) -> Result<P
                         },
                     ),
                     tool_names: tool_names.clone(),
+                    access: access.clone(),
+                    // Portable HTTP servers never carry a connector binding.
+                    connector: None,
+                    account: None,
                     connect_timeout_secs: connect_timeout_secs
                         .map(|seconds| {
                             u32::try_from(seconds).map_err(|_| {
@@ -203,6 +233,10 @@ pub(crate) fn rehydrate_portable_profile(portable: &PortableProfile) -> Result<P
                 }
             }
         };
+        // A carried ceiling must be valid; it is refused, never stripped.
+        server
+            .validate_access()
+            .map_err(|error| error.to_string())?;
         mcp_servers.push(server);
     }
 
@@ -385,6 +419,7 @@ mod tests {
                 required_header_names: Vec::new(),
                 connect_timeout_secs: Some(23),
                 tool_names: BTreeMap::new(),
+                access: None,
             })
         );
         let rehydrated = rehydrate_portable_profile(&portable).expect("reverse projection");
@@ -421,6 +456,7 @@ mod tests {
                 required_header_names: Vec::new(),
                 connect_timeout_secs: None,
                 tool_names: selected.tool_names.clone(),
+                access: None,
             })
         );
         assert_eq!(
@@ -480,6 +516,7 @@ mod tests {
                 required_header_names: vec!["authorization".to_string()],
                 connect_timeout_secs: None,
                 tool_names: BTreeMap::new(),
+                access: None,
             },
         );
         assert!(rehydrate_portable_profile(&portable).is_err());
@@ -530,5 +567,208 @@ mod tests {
             .expect_err("a portable profile never strips an account selection");
             assert!(error.contains("OAuth account selection"), "{error}");
         }
+    }
+
+    fn access_profile(servers: Vec<meerkat_core::mcp_config::McpServerConfig>) -> Profile {
+        let tools = ToolConfig {
+            mcp_servers: servers,
+            ..ToolConfig::default()
+        };
+        Profile {
+            model_fallback: None,
+            model: "override-model".to_string(),
+            provider: Some(meerkat_core::Provider::Anthropic),
+            self_hosted_server_id: None,
+            image_generation_provider: None,
+            auto_compact_threshold: None,
+            resume_overrides: Vec::new(),
+            skills: Vec::new(),
+            tools,
+            peer_description: String::new(),
+            external_addressable: false,
+            backend: None,
+            runtime_mode: crate::MobRuntimeMode::AutonomousHost,
+            max_inline_peer_notifications: None,
+            output_schema: None,
+            provider_params: None,
+        }
+    }
+
+    fn project(profile: &Profile) -> Result<PortableProfile, String> {
+        project_portable_profile(
+            profile,
+            crate::MobRuntimeMode::AutonomousHost,
+            &BTreeMap::new(),
+            "worker",
+            "review",
+            Vec::new(),
+        )
+    }
+
+    /// An exact access ceiling travels through the portable profile on both
+    /// transports with its raw tool-name mappings, and still refuses an
+    /// operation outside it after rehydration. No ceiling stays no ceiling,
+    /// and its absence is not serialized.
+    #[test]
+    fn mcp_access_ceiling_round_trips_exactly() {
+        let mut stdio = meerkat_core::mcp_config::McpServerConfig::stdio(
+            "ceiled-stdio",
+            "/bin/true",
+            Vec::new(),
+            HashMap::new(),
+        );
+        stdio.tool_names = BTreeMap::from([("read".to_string(), "docs_read".to_string())]);
+        stdio.access = Some(meerkat_core::McpServerAccess::allowing(["read", "list"]));
+        let mut http = meerkat_core::mcp_config::McpServerConfig::streamable_http(
+            "ceiled-http",
+            "https://mcp.example.invalid/mcp",
+            HashMap::new(),
+        );
+        http.access = Some(meerkat_core::McpServerAccess::allowing(["search"]));
+        let open = meerkat_core::mcp_config::McpServerConfig::streamable_http(
+            "open-http",
+            "https://mcp.example.invalid/open",
+            HashMap::new(),
+        );
+        let profile = access_profile(vec![stdio.clone(), http.clone(), open.clone()]);
+
+        let portable = project(&profile).expect("a valid ceiling projects");
+        assert!(matches!(
+            portable.tools.mcp_servers.get("ceiled-stdio"),
+            Some(PortableMcpDecl::Stdio { access, tool_names, .. })
+                if access == &stdio.access && tool_names == &stdio.tool_names
+        ));
+        assert!(matches!(
+            portable.tools.mcp_servers.get("ceiled-http"),
+            Some(PortableMcpDecl::Http { access, .. }) if access == &http.access
+        ));
+        let open_json =
+            serde_json::to_value(portable.tools.mcp_servers.get("open-http")).expect("serialize");
+        assert!(
+            open_json.get("access").is_none(),
+            "no ceiling is omitted, keeping the digest-covered bytes: {open_json}"
+        );
+
+        let rehydrated = rehydrate_portable_profile(&portable).expect("rehydrate");
+        for expected in [&stdio, &http, &open] {
+            let server = rehydrated
+                .tools
+                .mcp_servers
+                .iter()
+                .find(|server| server.name == expected.name)
+                .expect("server rehydrated");
+            assert_eq!(server, expected);
+        }
+        let ceiled = rehydrated
+            .tools
+            .mcp_servers
+            .iter()
+            .find(|server| server.name == "ceiled-stdio")
+            .expect("ceiled server");
+        assert!(ceiled.permits_operation("read"));
+        assert!(ceiled.permits_operation("list"));
+        assert!(
+            !ceiled.permits_operation("write"),
+            "an operation outside the ceiling stays refused"
+        );
+        assert_eq!(project(&rehydrated).expect("re-project"), portable);
+    }
+
+    /// An invalid ceiling is refused on both sides, never stripped to none.
+    #[test]
+    fn invalid_mcp_access_ceiling_is_refused_not_stripped() {
+        let empty = meerkat_core::McpServerAccess::allowing(Vec::<String>::new());
+        let mut server = meerkat_core::mcp_config::McpServerConfig::streamable_http(
+            "ceiled-http",
+            "https://mcp.example.invalid/mcp",
+            HashMap::new(),
+        );
+        server.access = Some(empty.clone());
+        let error = project(&access_profile(vec![server])).expect_err("invalid ceiling");
+        assert!(error.contains("invalid access policy"), "{error}");
+
+        let mut portable = project(&access_profile(Vec::new())).expect("projection");
+        portable.tools.mcp_servers.insert(
+            "carried".to_string(),
+            PortableMcpDecl::Stdio {
+                command: "/bin/true".to_string(),
+                args: Vec::new(),
+                required_env_keys: Vec::new(),
+                connect_timeout_secs: None,
+                tool_names: BTreeMap::new(),
+                access: Some(empty),
+            },
+        );
+        let error = rehydrate_portable_profile(&portable).expect_err("invalid carried ceiling");
+        assert!(error.contains("invalid access policy"), "{error}");
+    }
+
+    /// A connector-bound server is refused with or without a valid ceiling:
+    /// the binding has no portable form and is never dropped. The portable
+    /// declaration has no connector field, so the host decompile input cannot
+    /// name one either.
+    #[test]
+    fn connector_bound_mcp_server_is_refused_in_portable_projection() {
+        for access in [
+            None,
+            Some(meerkat_core::McpServerAccess::allowing(["read"])),
+        ] {
+            let mut server = meerkat_core::mcp_config::McpServerConfig::stdio(
+                "connector-stdio",
+                "/bin/true",
+                Vec::new(),
+                HashMap::new(),
+            );
+            server.access = access;
+            server.connector = Some(meerkat_core::mcp_config::McpConnectorBinding {
+                realm_id: "realm".to_string(),
+                slot_id: "slot".to_string(),
+                issuer: "https://issuer.example.invalid".to_string(),
+                client: "client".to_string(),
+                resource: "https://api.example.invalid".to_string(),
+                strategy_id: "strategy".to_string(),
+                account: "account-subject".to_string(),
+                operations: BTreeMap::from([(
+                    "read".to_string(),
+                    meerkat_core::mcp_config::McpConnectorOperation {
+                        required_scopes: Default::default(),
+                        destination_origin: "https://api.example.invalid".to_string(),
+                        read_only: true,
+                    },
+                )]),
+            });
+            let error = project(&access_profile(vec![server])).expect_err("connector-bound");
+            assert!(error.contains("connector binding"), "{error}");
+        }
+    }
+
+    /// A server whose host declares the account its operations act with is
+    /// refused: the declaration is host configuration and is never dropped,
+    /// which would change how review states its operations.
+    #[test]
+    fn an_account_declaration_is_refused_in_portable_projection() {
+        let mut server = meerkat_core::mcp_config::McpServerConfig::stdio(
+            "declared",
+            "/bin/true",
+            Vec::new(),
+            HashMap::new(),
+        );
+        server.account = Some(meerkat_core::McpAccountDeclaration::NoAccount);
+        let error = project(&access_profile(vec![server])).expect_err("declared");
+        assert!(error.contains("account declaration"), "{error}");
+    }
+
+    /// The declaration rejects fields it does not know, so a reader that
+    /// predates a field refuses it instead of silently widening.
+    #[test]
+    fn portable_mcp_declaration_rejects_unknown_fields() {
+        let error = serde_json::from_value::<PortableMcpDecl>(serde_json::json!({
+            "transport": "stdio",
+            "command": "/bin/true",
+            "access": {"allowed_operations": ["read"]},
+            "future_field": true,
+        }))
+        .expect_err("unknown field");
+        assert!(error.to_string().contains("future_field"), "{error}");
     }
 }

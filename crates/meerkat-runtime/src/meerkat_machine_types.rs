@@ -325,6 +325,24 @@ pub trait SessionLlmReconfigureHost: Send + Sync {
         capability_surface: Option<&SessionLlmCapabilitySurface>,
     ) -> Result<(), RuntimeDriverError>;
 
+    /// [`Self::apply_live_session_llm_identity`], returning the identity the
+    /// host actually applied. A host may complete the requested identity from
+    /// the same resolution that built its client (a target naming no binding
+    /// is applied with the binding that resolved); the default applies the
+    /// request unchanged and returns it.
+    ///
+    /// Caller must hold the turn-finalization boundary.
+    async fn apply_live_session_llm_identity_effective(
+        &self,
+        session_id: &SessionId,
+        identity: &meerkat_core::SessionLlmIdentity,
+        capability_surface: Option<&SessionLlmCapabilitySurface>,
+    ) -> Result<meerkat_core::SessionLlmIdentity, RuntimeDriverError> {
+        self.apply_live_session_llm_identity(session_id, identity, capability_surface)
+            .await?;
+        Ok(identity.clone())
+    }
+
     /// Caller must hold the turn-finalization boundary.
     async fn apply_live_session_tool_visibility_state(
         &self,
@@ -855,6 +873,10 @@ meerkat_machine_runtime_internal_inputs!(
         AdvanceSessionContext,
         ArchiveTerminalInput,
         BindInputAuthority,
+        BindInputContextTarget,
+        RequireScopedContext,
+        BindScopedContext,
+        RetireScopedContext,
         BudgetExhausted,
         ChangeLane,
         CoalesceInput,
@@ -1216,6 +1238,7 @@ meerkat_machine_runtime_internal_inputs!(
         SurfaceMarkPendingFailed,
         SurfaceMarkPendingSucceeded,
         SurfaceRegister,
+        SurfaceRelease,
         SurfaceShutdown,
         SurfaceSnapshotAligned,
         SurfaceStageAdd,

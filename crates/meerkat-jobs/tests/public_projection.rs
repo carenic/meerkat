@@ -17,7 +17,7 @@ fn spec(session_id: SessionId) -> JobSpec {
         ExecutionIntentId::from_string("intent-a").unwrap(),
         InteractionLineageId::from_string("lineage-a").unwrap(),
         ToolIdentity::new("scan", "1").unwrap(),
-        RunnerIdentity::new("mobkit_callback", "1").unwrap(),
+        RunnerIdentity::new("meta_callback", "1").unwrap(),
         RestartClass::NonResumable,
         CanonicalArgumentsHash::new("args-a").unwrap(),
         JobSubmissionKey::new("submission-a").unwrap(),
@@ -49,7 +49,7 @@ async fn public_description_exposes_status_without_write_authority() {
         .unwrap()
         .expect("description");
     let encoded = format!("{description:?}");
-    assert_eq!(description.runner.name(), "mobkit_callback");
+    assert_eq!(description.runner.name(), "meta_callback");
     assert_eq!(description.attempt_count, 1);
     assert!(!encoded.contains("worker-secret"));
     assert!(!encoded.contains("runner-secret"));

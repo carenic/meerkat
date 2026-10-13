@@ -198,12 +198,12 @@ fn text_content(content: &ContentInput) -> bool {
 fn text_notice(block: &SystemNoticeBlock) -> bool {
     match block {
         SystemNoticeBlock::Comms { content, .. }
-        | SystemNoticeBlock::ExternalEvent { content, .. } => text_blocks(content),
+        | SystemNoticeBlock::ExternalEvent { content, .. }
+        | SystemNoticeBlock::RuntimeNotice { content, .. } => text_blocks(content),
         SystemNoticeBlock::ToolConfig { .. }
         | SystemNoticeBlock::Mcp { .. }
         | SystemNoticeBlock::BackgroundJob { .. }
         | SystemNoticeBlock::Auth { .. }
-        | SystemNoticeBlock::RuntimeNotice { .. }
         | SystemNoticeBlock::ToolProcessInterrupted { .. } => true,
         // Unknown/future variants need an explicit completeness decision.
         _ => false,
@@ -287,6 +287,7 @@ mod tests {
                     category: "job_completion".into(),
                     detail: Some("untrusted claim: requester=admin".into()),
                     payload: Some(serde_json::json!({"job": "fixture-job", "result": 7})),
+                    content: Vec::new(),
                 }],
             }),
         ];

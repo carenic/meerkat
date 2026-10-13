@@ -32,7 +32,8 @@ fn build_runtime() -> meerkat::session_runtime::MeerkatSessionRuntime {
     let builder = FactoryAgentBuilder::new(factory, Config::default());
     let staged_sessions = Arc::new(StagedSessionRegistry::new());
     let (service, runtime_adapter) =
-        build_runtime_backed_service_with_capacities(builder, 4, 16, persistence);
+        build_runtime_backed_service_with_capacities(builder, 4, 16, persistence)
+            .expect("compose the runtime-backed service");
     let service = Arc::new(service);
     SessionRuntimeBuilder::new(service, staged_sessions, runtime_adapter).build()
 }
@@ -90,7 +91,8 @@ fn builder_with_skill_identity_roots_pre_populates_inner() {
     let builder = FactoryAgentBuilder::new(factory, Config::default());
     let staged_sessions = Arc::new(StagedSessionRegistry::new());
     let (service, runtime_adapter) =
-        build_runtime_backed_service_with_capacities(builder, 4, 16, persistence);
+        build_runtime_backed_service_with_capacities(builder, 4, 16, persistence)
+            .expect("compose the runtime-backed service");
     let context_root = PathBuf::from("/tmp/meerkat-skills-context");
     let user_root = PathBuf::from("/tmp/meerkat-skills-user");
     let runtime = SessionRuntimeBuilder::new(Arc::new(service), staged_sessions, runtime_adapter)
@@ -117,7 +119,8 @@ fn builder_with_realm_id_pre_populates_inner() {
     let builder = FactoryAgentBuilder::new(factory, Config::default());
     let staged_sessions = Arc::new(StagedSessionRegistry::new());
     let (service, runtime_adapter) =
-        build_runtime_backed_service_with_capacities(builder, 4, 16, persistence);
+        build_runtime_backed_service_with_capacities(builder, 4, 16, persistence)
+            .expect("compose the runtime-backed service");
     let runtime = SessionRuntimeBuilder::new(Arc::new(service), staged_sessions, runtime_adapter)
         .with_realm_id(RealmId::parse("alpha".to_string()).expect("valid realm id"))
         .with_instance_id("inst-1".to_string())

@@ -24,6 +24,9 @@ mod structured_output_request_tests;
 #[cfg(test)]
 mod tool_choice_request_tests;
 #[cfg(test)]
+mod tool_input_schema_request_tests;
+pub(crate) mod tool_schema_root;
+#[cfg(test)]
 mod turn_cache_anchor_tests;
 pub mod web_search;
 

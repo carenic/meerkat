@@ -94,13 +94,22 @@ fn definition(mob_id: &str, tools: serde_json::Value) -> serde_json::Value {
 }
 
 fn agent_surface(fixture: &CouncilFixture) -> Arc<dyn AgentToolDispatcher> {
+    agent_surface_owned_by(fixture, SessionId::new())
+}
+
+/// The agent surface of `owner`'s session: the mobs it creates are that
+/// session's child mobs.
+fn agent_surface_owned_by(
+    fixture: &CouncilFixture,
+    owner: SessionId,
+) -> Arc<dyn AgentToolDispatcher> {
     Arc::new(AgentMobToolSurface::new(
         Arc::clone(&fixture.state),
         None,
         meerkat_runtime::mob_operator_authority::create_only_mob_operator_authority()
             .expect("generated authority"),
         "claude-sonnet-4-5".to_string(),
-        SessionId::new(),
+        owner,
         None,
         None,
         None,
@@ -111,10 +120,17 @@ async fn agent_mob_create(
     fixture: &CouncilFixture,
     definition: serde_json::Value,
 ) -> Result<ToolDispatchOutcome, ToolError> {
+    agent_mob_create_on(agent_surface(fixture), definition).await
+}
+
+async fn agent_mob_create_on(
+    surface: Arc<dyn AgentToolDispatcher>,
+    definition: serde_json::Value,
+) -> Result<ToolDispatchOutcome, ToolError> {
     let raw =
         serde_json::value::RawValue::from_string(json!({ "definition": definition }).to_string())
             .unwrap();
-    agent_surface(fixture)
+    surface
         .dispatch(ToolCallView {
             id: "surface-call",
             name: "mob_create",
@@ -248,9 +264,22 @@ async fn callers_cannot_name_tool_bundles() {
 async fn resuming_a_child_after_the_host_withdraws_its_bundle_refuses_typed() {
     let (fixture, recorded) = fixture();
     let mob_id = format!("child-{}", fixture.scope);
-    agent_mob_create(&fixture, definition(&mob_id, json!({ "comms": true })))
+    // A child mob is restored only while its owner session resolves; an
+    // owner with no durable record holds the child before activation. So
+    // the creating session here is a real, durable member session.
+    fixture.seed_source_mob(&["owner"]).await;
+    let owner = fixture
+        .state
+        .mob_resolve_bridge_session_id(&fixture.source_mob_id(), &AgentIdentity::from("owner"))
         .await
-        .expect("the agent creates a child mob");
+        .expect("resolve the owner session")
+        .expect("the owner member has a session");
+    agent_mob_create_on(
+        agent_surface_owned_by(&fixture, owner),
+        definition(&mob_id, json!({ "comms": true })),
+    )
+    .await
+    .expect("the agent creates a child mob");
     let tools = member_tools(&fixture, &recorded, &mob_id).await;
     assert!(tools.iter().any(|name| name == CHILD_TOOL), "{tools:?}");
     let handle = fixture
@@ -259,6 +288,16 @@ async fn resuming_a_child_after_the_host_withdraws_its_bundle_refuses_typed() {
         .await
         .expect("child mob handle");
     handle.shutdown().await.expect("shut the child mob down");
+    // The owner's mob is restored by the restarted host too; this lifetime's
+    // copy stops first, keeping the owner session durable.
+    fixture
+        .state
+        .handle_for(&fixture.source_mob_id())
+        .await
+        .expect("owner mob handle")
+        .shutdown()
+        .await
+        .expect("shut the owner mob down");
 
     // The restarted host registers no child bundles at all.
     let restarted = fixture.restart_state();

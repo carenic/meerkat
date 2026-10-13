@@ -819,7 +819,8 @@ async fn attach_harness(
             4,
             persistence,
             environment.temp.path().join("config_state.json"),
-        );
+        )
+        .expect("compose the runtime-backed service");
 
     let fresh = resume_session_id.is_none();
     let session = match resume_session_id {

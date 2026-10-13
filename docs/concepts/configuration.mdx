@@ -133,6 +133,7 @@ Meerkat uses three update models:
   - `shell`, `store`, `comms`, `compaction`, and `rest`: retain nondefault whole-section replacement, not per-field inheritance
   - filesystem-backed docs additionally use raw TOML presence for `tools`, `retry`, and `skills` overrides, so explicitly setting a supported field to its default can override a parent; this is not a universal rule for all scalar fields or non-filesystem sources
   - `model_fallback`: a nondefault table replaces the inherited table as a whole; an empty/default-valued table inherits, while `enabled = false` explicitly replaces and disables
+  - `governance`: a present section, even an empty one, replaces the inherited one as a whole; a document without it inherits it
   - the binding/backend/auth maps are **not** merged across realms: each realm's binding resolves its `backend_profile` / `auth_profile` only within its own section (the owning realm)
 3. Runtime patch APIs (`config/patch`, `PATCH /config`) use **RFC 7396 JSON merge-patch** semantics.
 
@@ -160,6 +161,25 @@ the realm inherits it again.
 **presence-based** (an explicit value wins, regardless of whether it equals the
 default), so a child realm can override a non-default parent value back **down to
 the default** - something a `!= default` heuristic could not express.
+
+## Agent turn limits
+
+Set `agent.max_turns` to bound the model-loop iterations in one agent run:
+
+```toml
+[agent]
+max_turns = 700
+```
+
+An omitted value inherits from the parent realm. If the entire chain omits
+it, agent construction uses the default of `100`. An explicit value always
+overrides the parent, including `100` and `0`.
+
+`max_turns = 0` terminates immediately with the `TurnLimitReached` cause,
+before the first model request; zero does not mean unlimited. The counter
+resets for each run, so this is not a limit on the number of user messages
+in a session. Direct Rust callers can set the same limit with
+`AgentBuilder::max_turns(u32)`.
 
 ## CLI behavior
 
@@ -466,6 +486,64 @@ reconfiguration; explicit identity overrides obsolete that provenance. There is
 no automatic restoration or migration of pre-0.8.37 sticky routes: historical
 notice text and brain-swap history are not fallback authority. Scoped overlays,
 expiry, timed reversion, and doctor/migration redesign remain unsupported.
+
+## Governance settings
+
+A stock governed realm can require review above R1 for exact operation
+targets. Each rule names one target, by the name its owner registers it under
+(never a model-facing display name), and the tier it requires:
+
+```toml
+[[governance.review.rules]]
+target = { kind = "mcp_operation", server = "mail", operation = "send" }
+tier = "r3"
+consent_assurance = "person_authenticated"
+
+[[governance.review.rules]]
+target = { kind = "mcp_server", server = "calendar" }
+tier = "r2"
+
+[governance.review.reviewer]
+identity = { model = "claude-sonnet-5-5", provider = "anthropic" }
+max_output_tokens = 1024
+```
+
+- `target`: `mcp_server` (every operation of one configured MCP server),
+  `mcp_operation` (one raw operation of one server) or
+  `tool_bundle_operation` (one operation of a registered tool bundle). Each
+  target appears once.
+- `tier`: `r2` (the configured reviewer model reviews the exact operation
+  before it runs) or `r3` (a human consents to it). A rule only raises a
+  tier: it never allows an operation the stock rules refuse, and where
+  several rules match, the strictest applies.
+- `consent_assurance`: required for `r3` and refused for `r2`. The weakest
+  approver authentication the consent accepts: `device_trusted` (a declared
+  local-operator posture, such as the operator of a stdio connection) or
+  `person_authenticated`. A person satisfies either; a delegated service
+  credential satisfies neither.
+- `[governance.review.reviewer]`: the explicit model that reviews R2
+  operations. There is no default model; without it an R2 operation is
+  refused, never run at R1.
+
+A reviewed MCP or tool-bundle operation shows its reviewer and consenting
+human the account it acts with, as its own owner states it: the MCP
+server's connector binding, its `oauth_account`, or its host's
+`account = "none"` declaration (see
+[the account an operation acts with](/api/mcp#the-account-an-operation-acts-with)),
+or the account a host declared when it registered the bundle. An operation
+whose owner states none is refused, never reviewed without it.
+
+The stock host reads the rules from the realm's effective configuration when
+the realm opens; a section that cannot be read or is malformed refuses the
+realm's governed work. Unknown or misspelled fields are refused, including
+inside the reviewer's identity.
+
+Governance is administered by the realm's trusted host in the realm's own
+config document. An ordinary config write (`config/set`, `config/patch`,
+`PUT`/`PATCH /config`, the MCP config tool or the CLI) cannot change,
+remove or restate the section, including a full replace that omits it, and
+is refused with `governance_administration_required`. The section stays
+readable through the ordinary config reads.
 
 ## See also
 

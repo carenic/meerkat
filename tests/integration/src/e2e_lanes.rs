@@ -5422,6 +5422,177 @@ fn suite_spec(name: &str) -> Option<&'static Spec> {
                 all_features: false,
             },
         }),
+        "cli-realm-mcp-access-ceiling" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "CLI realm MCP access ceilings hold in fresh processes",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "rkat",
+                test_target: "system_cli_realm_mcp",
+                test_name: "integration_real_cli_realm_mcp_access_ceiling",
+                features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
+        "cli-realm-mcp-ceiling-invocation" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "CLI realm MCP ceiling refuses an unoffered call at invocation",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "rkat",
+                test_target: "system_cli_realm_mcp",
+                test_name: "integration_real_cli_realm_mcp_ceiling_refuses_invocation",
+                features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
+        "cli-realm-mcp-installation-per-agent" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "CLI governed realm MCP installation is offered only to the granted agent",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "rkat",
+                test_target: "system_cli_realm_mcp",
+                test_name: "integration_real_cli_realm_mcp_installation_does_not_grant_every_agent",
+                features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
+        "cli-realm-mcp-original-session-restart" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "CLI original session gains, keeps and loses a realm MCP connection across restarts",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "rkat",
+                test_target: "system_cli_realm_mcp",
+                test_name: "integration_real_cli_realm_mcp_original_session_across_restart",
+                features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
+        "cli-realm-mcp-per-agent-grant" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "CLI governed realm MCP installation reaches only the granted agent",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "rkat",
+                test_target: "system_cli_realm_mcp",
+                test_name: "integration_real_cli_realm_mcp_installation_does_not_grant_every_agent",
+                features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
+        "rpc-mcp-original-session-attachment" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "RPC sign-in attaches an MCP connection to the original session only",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "meerkat-rpc",
+                test_target: "realm_mcp_original_session",
+                test_name: "integration_real_rpc_mcp_original_session_attachment",
+                features: &[],
+                all_features: false,
+            },
+        }),
+        "cli-realm-mcp-missing-tool-call-local" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "CLI model call to a missing tool is call-local feedback and the turn continues",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "rkat",
+                test_target: "system_cli_realm_mcp",
+                test_name: "integration_real_cli_realm_mcp_refused_write_is_call_local_feedback",
+                features: &["integration-real-tests"],
+                all_features: false,
+            },
+        }),
+        "rpc-mcp-other-realm-no-credential" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "RPC another realm gets no MCP credential of the first realm",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "meerkat-rpc",
+                test_target: "realm_mcp_original_session",
+                test_name: "integration_real_rpc_mcp_other_realm_gets_no_credential",
+                features: &[],
+                all_features: false,
+            },
+        }),
+        "rpc-mcp-sign-out-unpublishes" => Some(&Spec {
+            id: None,
+            lane: Lane::System,
+            title: "RPC sign-out unpublishes an MCP connection and sign-in restores it",
+            timeout_secs: 600,
+            required_env: &[],
+            required_bins: &["cargo"],
+            cwd: ".",
+            env: &[],
+            cargo_bin_env: &[],
+            pre_commands: &[],
+            command: CommandSpec::CargoTest {
+                package: "meerkat-rpc",
+                test_target: "realm_mcp_original_session",
+                test_name: "integration_real_rpc_mcp_sign_out_revokes_original_session",
+                features: &[],
+                all_features: false,
+            },
+        }),
         "rest-resume-metadata" => Some(&Spec {
             id: None,
             lane: Lane::System,
@@ -6430,13 +6601,13 @@ fn suite_spec(name: &str) -> Option<&'static Spec> {
 mod tests {
     use super::{
         ArtifactManifest, ArtifactRequirement, CommandLockMode, CommandSpec, E2ePlan, E2eSelection,
-        ExecutionMode, Lane, NodeSetup, OutputPolicy, SMOKE_ENTRIES, SmokeRuntimeClass,
-        SmokeScheduler, bazel_build_event_provenance, build_commands_for_mode,
+        ExecutionMode, Lane, NodeSetup, OutputPolicy, RustTestRequirement, SMOKE_ENTRIES,
+        SmokeRuntimeClass, SmokeScheduler, bazel_build_event_provenance, build_commands_for_mode,
         inherited_cargo_build_context, normalize_command_with_env, order_smoke_specs_for_runtime,
-        parse_cargo_build_requirement, plan_for_selection, pre_command_lock_mode, repo_cargo,
-        require_built_by_recorded_invocation, run_command, sanitize_artifact_key, scenario_env,
-        scenario_spec, smoke_runtime_class, smoke_test_filter_for_selection, source_revision_key,
-        suite_spec, workspace_root,
+        parse_cargo_build_requirement, parse_cargo_test_requirement, plan_for_selection,
+        pre_command_lock_mode, repo_cargo, require_built_by_recorded_invocation, run_command,
+        sanitize_artifact_key, scenario_env, scenario_spec, smoke_runtime_class,
+        smoke_test_filter_for_selection, source_revision_key, suite_spec, workspace_root,
     };
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -6644,6 +6815,94 @@ mod tests {
         );
     }
 
+    /// The e2e-system lane prebuilds (scripts/run-build-backend-lane,
+    /// `prebuild_e2e_system_rkat_tests` and `prebuild_e2e_system_other_tests`)
+    /// the test target of every cargo-test suite in tests/e2e_system_lane.rs,
+    /// with the suite's own package and features: a target missing from the
+    /// prebuild compiles inside its first suite's behaviour timeout.
+    #[test]
+    fn system_lane_prebuild_builds_every_system_suites_test_target() {
+        let root = workspace_root();
+        let script_path = root.join("scripts/run-build-backend-lane");
+        let lane_path = root.join("tests/integration/tests/e2e_system_lane.rs");
+        let (Ok(script), Ok(lane)) = (
+            std::fs::read_to_string(&script_path),
+            std::fs::read_to_string(&lane_path),
+        ) else {
+            // The Bazel unit target's runfiles do not carry scripts/; the
+            // Cargo unit lane runs this drift gate on every CI push.
+            eprintln!(
+                "skipping system test-target prebuild coverage: {} or {} not present in this sandbox",
+                script_path.display(),
+                lane_path.display()
+            );
+            return;
+        };
+
+        let mut needed = BTreeSet::new();
+        for invocation in lane.split("system_suite!(").skip(1) {
+            let suite = invocation
+                .split('"')
+                .nth(1)
+                .expect("every system_suite! names its suite");
+            let spec =
+                suite_spec(suite).unwrap_or_else(|| panic!("system suite '{suite}' has no spec"));
+            if let CommandSpec::CargoTest {
+                package,
+                test_target,
+                features,
+                all_features,
+                ..
+            } = spec.command
+            {
+                needed.insert(RustTestRequirement::new(
+                    package,
+                    test_target,
+                    features,
+                    all_features,
+                ));
+            }
+        }
+        assert!(
+            !needed.is_empty(),
+            "no cargo-test system suites found in {}",
+            lane_path.display()
+        );
+
+        let mut prebuilt = BTreeSet::new();
+        for function in [
+            "prebuild_e2e_system_rkat_tests",
+            "prebuild_e2e_system_other_tests",
+        ] {
+            // Each entry is one command continued over several lines.
+            let body = script
+                .split(&format!("{function}() {{"))
+                .nth(1)
+                .and_then(|rest| rest.split("\n}").next())
+                .unwrap_or_else(|| panic!("{function} is defined"))
+                .replace("\\\n", " ");
+            prebuilt.extend(
+                body.lines()
+                    .filter_map(|line| line.trim().strip_prefix("\"${cargo_bin}\" "))
+                    .map(|arguments| {
+                        let command: Vec<&str> = std::iter::once("cargo")
+                            .chain(arguments.split_whitespace())
+                            .collect();
+                        assert!(command.contains(&"--no-run"), "not a prebuild: {arguments}");
+                        parse_cargo_test_requirement(&command).unwrap_or_else(|| {
+                            panic!("not a cargo test build of one target: {arguments}")
+                        })
+                    }),
+            );
+        }
+
+        let missing: Vec<_> = needed.difference(&prebuilt).collect();
+        assert!(
+            missing.is_empty(),
+            "the e2e-system prebuild misses system suites' test targets: {missing:?}"
+        );
+    }
+
     /// Whether `pid` names a process that is running (not gone, and not a
     /// zombie awaiting its parent's reap).
     #[cfg(unix)]
@@ -6682,12 +6941,12 @@ mod tests {
         fifo
     }
 
-    /// The reading end of a [`backgrounding_command`]'s FIFO: typed signals,
-    /// with no polling, for "the descendant is running" (its pid arrives) and
-    /// "the descendant is gone" (end of file: the kernel closes a process's
-    /// descriptors when it exits, and the descendant holds the last writer).
-    /// A descendant that is never killed never ends, so a regression shows
-    /// as a hung test, never as a pass.
+    /// The reading end of a [`backgrounding_command`]'s FIFO. Its pid signals
+    /// readiness; EOF signals closure of the last writer, not process exit.
+    /// After EOF, the process predicate must observe exit within a five-second
+    /// retry budget starting at the first live observation. This does not bound
+    /// blocking FIFO reads or OS latency in `ps`. Closing the FIFO cannot pass
+    /// a live process.
     #[cfg(unix)]
     struct DescendantWatch {
         pid: u32,
@@ -6715,20 +6974,108 @@ mod tests {
             Self { pid, fifo }
         }
 
-        /// Block until the descendant has exited.
-        fn wait_until_gone(mut self, what: &str) {
+        /// After FIFO closure, retry the process predicate within a fixed budget.
+        fn wait_until_gone(self, what: &str) {
+            let mut deadline = None;
+            self.wait_until_gone_with(what, process_running, || {
+                let deadline = deadline
+                    .get_or_insert_with(|| std::time::Instant::now() + Duration::from_secs(5));
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                true
+            });
+        }
+
+        fn wait_until_gone_with(
+            mut self,
+            what: &str,
+            mut running: impl FnMut(u32) -> bool,
+            mut wait_again: impl FnMut() -> bool,
+        ) {
             use std::io::Read;
             let mut rest = Vec::new();
             self.fifo
                 .read_to_end(&mut rest)
                 .expect("read the pid FIFO to its end");
             assert!(rest.is_empty(), "{what}: unexpected FIFO output {rest:?}");
-            assert!(
-                !process_running(self.pid),
-                "{what}: descendant {} closed the FIFO but still runs",
-                self.pid
-            );
+            while running(self.pid) {
+                assert!(
+                    wait_again(),
+                    "{what}: descendant {} closed the FIFO but did not exit before the deadline",
+                    self.pid
+                );
+            }
         }
+    }
+
+    #[cfg(unix)]
+    fn closed_fifo_watch() -> (tempfile::TempDir, DescendantWatch) {
+        use std::io::Write;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pid_fifo = make_pid_fifo(temp.path());
+        let writer_fifo = pid_fifo.clone();
+        let writer = std::thread::spawn(move || {
+            let mut fifo = std::fs::File::create(writer_fifo).expect("open the FIFO writer");
+            writeln!(fifo, "{}", std::process::id()).expect("report the live test process");
+        });
+        let watch = DescendantWatch::open(&pid_fifo);
+        writer.join().expect("close the last FIFO writer");
+        (temp, watch)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descendant_watch_waits_for_delayed_exit_after_fifo_close() {
+        let (_temp, watch) = closed_fifo_watch();
+        let mut observations = 0;
+        let mut waits = 0;
+        watch.wait_until_gone_with(
+            "controlled delayed exit",
+            |pid| {
+                assert_eq!(pid, std::process::id());
+                observations += 1;
+                observations == 1
+            },
+            || {
+                waits += 1;
+                assert_eq!(waits, 1);
+                true
+            },
+        );
+        assert_eq!(observations, 2, "observe live, then exited");
+        assert_eq!(waits, 1, "wait only after a live observation");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descendant_watch_refuses_live_process_after_fifo_close_at_deadline() {
+        let (_temp, watch) = closed_fifo_watch();
+        let mut observations = 0;
+        let mut deadline_checks = 0;
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            watch.wait_until_gone_with(
+                "closed FIFO with a live process",
+                |pid| {
+                    observations += 1;
+                    assert_eq!(pid, std::process::id());
+                    process_running(pid)
+                },
+                || {
+                    deadline_checks += 1;
+                    deadline_checks < 2
+                },
+            );
+        }));
+        assert!(
+            failure.is_err(),
+            "FIFO closure must not accept a live process"
+        );
+        assert_eq!(observations, 2, "keep checking the actual live process");
+        assert_eq!(deadline_checks, 2, "fail only when the deadline is reached");
+        assert!(process_running(std::process::id()));
     }
 
     /// A command that outlives its timeout is killed with everything it
@@ -6779,7 +7126,8 @@ mod tests {
     /// kills it before the harness exits: nothing the command started keeps
     /// running.
     ///
-    /// Every step waits on a typed signal, never on a clock. The helper is
+    /// Readiness and harness exit use explicit signals; descendant exit uses
+    /// a bounded process-predicate retry after FIFO closure. The helper is
     /// signalled only once it is interruptible: its handler is installed
     /// before its command spawns, the command's group is registered under
     /// the same lock the handler takes, and the command reports its

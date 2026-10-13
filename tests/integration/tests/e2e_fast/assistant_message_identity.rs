@@ -203,7 +203,8 @@ fn spawn_server(client: Arc<dyn LlmClient>) -> (RpcClient, tempfile::TempDir) {
         )
         .expect("construct runtime authority"),
         meerkat_rpc::router::NotificationSink::noop(),
-    );
+    )
+    .expect("compose the RPC session runtime");
     let config_store: Arc<dyn meerkat_core::ConfigStore> = Arc::new(MemoryConfigStore::new(
         Config::default(),
         meerkat_models::canonical(),

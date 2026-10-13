@@ -78,39 +78,39 @@
     },
     {
       "description": "Renew a detached callback attempt lease under its current fence",
-      "name": "mobkit/jobs/heartbeat",
-      "params_type": "MobkitJobHeartbeatParams",
-      "result_type": "MobkitJobMutationResult"
+      "name": "meta/jobs/heartbeat",
+      "params_type": "MetaJobHeartbeatParams",
+      "result_type": "MetaJobMutationResult"
     },
     {
       "description": "Commit detached callback progress under its current fence",
-      "name": "mobkit/jobs/progress",
-      "params_type": "MobkitJobProgressParams",
-      "result_type": "MobkitJobMutationResult"
+      "name": "meta/jobs/progress",
+      "params_type": "MetaJobProgressParams",
+      "result_type": "MetaJobMutationResult"
     },
     {
       "description": "Commit a detached callback checkpoint under its current fence",
-      "name": "mobkit/jobs/checkpoint",
-      "params_type": "MobkitJobCheckpointParams",
-      "result_type": "MobkitJobMutationResult"
+      "name": "meta/jobs/checkpoint",
+      "params_type": "MetaJobCheckpointParams",
+      "result_type": "MetaJobMutationResult"
     },
     {
       "description": "Complete a detached callback attempt under its current fence",
-      "name": "mobkit/jobs/complete",
-      "params_type": "MobkitJobCompleteParams",
-      "result_type": "MobkitJobMutationResult"
+      "name": "meta/jobs/complete",
+      "params_type": "MetaJobCompleteParams",
+      "result_type": "MetaJobMutationResult"
     },
     {
       "description": "Fail a detached callback attempt under its current fence",
-      "name": "mobkit/jobs/fail",
-      "params_type": "MobkitJobFailParams",
-      "result_type": "MobkitJobMutationResult"
+      "name": "meta/jobs/fail",
+      "params_type": "MetaJobFailParams",
+      "result_type": "MetaJobMutationResult"
     },
     {
       "description": "Acknowledge detached callback cancellation under its current fence",
-      "name": "mobkit/jobs/cancel_ack",
-      "params_type": "MobkitJobCancelAckParams",
-      "result_type": "MobkitJobMutationResult"
+      "name": "meta/jobs/cancel_ack",
+      "params_type": "MetaJobCancelAckParams",
+      "result_type": "MetaJobMutationResult"
     },
     {
       "description": "Create session + run first turn",
@@ -1066,6 +1066,10 @@
     {
       "description": "Mob stream terminal notification",
       "name": "mob/stream_end"
+    },
+    {
+      "description": "One recorded R3 human consent transition (requested, approved, denied, used, withdrawn) of an approval this connection's approver decides",
+      "name": "approval/consent_notice"
     },
     {
       "description": "Opaque playback handle for one admitted assistant output (measured playback)",

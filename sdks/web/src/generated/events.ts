@@ -419,6 +419,8 @@ export interface LoweredRequestProvenance {
   provider: Provider;
 }
 
+export type McpAttachmentRestoreWireOutcome = "suppressed" | "retired" | "rebound" | "account_changed" | "denied" | "unavailable" | "not_current" | "review_required" | "mismatch" | "stage_failed" | "renewal_required";
+
 export type MeerkatSchema = unknown;
 
 export type ModelFallbackSkipReason = "provider_boundary" | "auth_unavailable" | "context_fit" | "context_unknown" | "output_budget" | "tool_parity" | "modality_parity" | "request_unsupported" | "admission_unavailable" | "tool_choice_unsupported";
@@ -812,6 +814,7 @@ export type SystemNoticeBlock = {
   type: "auth";
 } | {
   category: string;
+  content?: ContentBlock[];
   detail?: string | null;
   payload?: unknown;
   type: "runtime_notice";
@@ -876,6 +879,7 @@ export type ToolConfigChangeStatus = {
   detail?: string | null;
   kind: "external_tool_delta";
   phase: ExternalToolDeltaPhase;
+  restore?: McpAttachmentRestoreWireOutcome | null;
 };
 
 export type ToolConfigChangedPayload = {

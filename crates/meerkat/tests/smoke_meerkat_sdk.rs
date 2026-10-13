@@ -541,7 +541,9 @@ mod scenario_06_hooks {
 
         // Build a HooksConfig with three hook entries:
         // 1. Observer on RunStarted
-        // 2. Guardrail on PreLlmRequest (always Allow)
+        // 2. Guardrail on RunCompleted (always Allow). A model-request
+        //    Guardrail would need an ordinary_only scope and a retained
+        //    authorized controller, which this plain live run does not carry.
         // 3. Observer on PostLlmResponse
         let hooks_config = HooksConfig {
             entries: vec![
@@ -553,6 +555,7 @@ mod scenario_06_hooks {
                     capability: HookCapability::Observe,
                     priority: 100,
                     timeout_ms: None,
+                    model_operations: HookModelOperationScope::All,
                     runtime: HookAdapterConfig::from_kind_and_value(
                         HookRuntimeKind::InProcess,
                         Some(serde_json::json!({"name": "observer"})),
@@ -562,11 +565,12 @@ mod scenario_06_hooks {
                 HookEntryConfig {
                     id: HookId::new("guardrail"),
                     enabled: true,
-                    point: HookPoint::PreLlmRequest,
+                    point: HookPoint::RunCompleted,
                     mode: HookExecutionMode::Foreground,
                     capability: HookCapability::Guardrail,
                     priority: 90,
                     timeout_ms: None,
+                    model_operations: HookModelOperationScope::All,
                     runtime: HookAdapterConfig::from_kind_and_value(
                         HookRuntimeKind::InProcess,
                         Some(serde_json::json!({"name": "guardrail"})),
@@ -581,6 +585,7 @@ mod scenario_06_hooks {
                     capability: HookCapability::Observe,
                     priority: 80,
                     timeout_ms: None,
+                    model_operations: HookModelOperationScope::All,
                     runtime: HookAdapterConfig::from_kind_and_value(
                         HookRuntimeKind::InProcess,
                         Some(serde_json::json!({"name": "post_llm_observer"})),

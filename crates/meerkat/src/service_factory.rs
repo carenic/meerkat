@@ -152,6 +152,10 @@ impl FactoryAgent {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl SessionAgent for FactoryAgent {
+    async fn release_owned_resources(&mut self) {
+        self.agent.release_owned_resources().await;
+    }
+
     fn tool_application_executor(&self) -> Option<meerkat_core::ToolApplicationExecutor> {
         Some(self.agent.tool_application_executor())
     }
@@ -366,6 +370,19 @@ impl SessionAgent for FactoryAgent {
         Ok(())
     }
 
+    async fn attach_mcp_server(
+        &mut self,
+        attachment: meerkat_core::mcp_attachment::LiveMcpAttachment,
+    ) -> Result<
+        meerkat_core::mcp_attachment::LiveMcpAttachmentReceipt,
+        meerkat_core::mcp_attachment::LiveMcpAttachError,
+    > {
+        match self.agent.live_mcp_attachment() {
+            Some(surface) => Arc::clone(surface).attach(attachment).await,
+            None => Err(meerkat_core::mcp_attachment::LiveMcpAttachError::Unsupported),
+        }
+    }
+
     fn pin_controller_client(&self) -> Option<meerkat_core::ControllerModelClient> {
         let controller = self.agent.pin_controller_client()?;
         let identity = self.agent.session().session_metadata()?.llm_identity();
@@ -401,6 +418,20 @@ impl SessionAgent for FactoryAgent {
                 tracing::warn!(error = %e, "failed to update keep_alive in session metadata");
             }
         }
+    }
+
+    fn apply_mcp_attachment_intent(
+        &mut self,
+        mutation: meerkat_core::McpAttachmentIntentMutation,
+    ) -> Result<meerkat_core::McpAttachmentIntentRecorded, meerkat_core::error::AgentError> {
+        self.agent
+            .session_mut()
+            .apply_mcp_attachment_intent_mutation(mutation)
+            .map_err(|err| {
+                meerkat_core::error::AgentError::InternalError(format!(
+                    "failed to record MCP attachment intent in session build state: {err}"
+                ))
+            })
     }
 
     fn update_mob_tool_authority_context(
@@ -1093,6 +1124,106 @@ pub struct RealmInheritance {
     head: meerkat_core::connection::RealmId,
 }
 
+/// Why a builder's effective config could not be read.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum EffectiveConfigReadError {
+    #[error("failed to read latest config from store: {0}")]
+    Store(meerkat_core::ConfigError),
+    #[error("failed to compose effective config for realm '{realm}': {error}")]
+    Compose {
+        realm: meerkat_core::connection::RealmId,
+        error: meerkat_core::ConfigError,
+    },
+}
+
+/// See [`FactoryAgentBuilder::effective_config_view`].
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub(crate) struct EffectiveConfigView {
+    store: Option<Arc<dyn ConfigStore>>,
+    snapshot: Config,
+    inheritance: Arc<std::sync::RwLock<Option<RealmInheritance>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl EffectiveConfigView {
+    /// The effective config, and the head realm when realm inheritance is
+    /// configured.
+    ///
+    /// The head config is the surface's authoritative document: the live
+    /// store when one is configured (a read failure is propagated, never
+    /// masked behind a stale snapshot), otherwise the in-memory snapshot.
+    /// When realm inheritance is configured, the head realm's config is
+    /// folded with its ancestor chain so top-level fields (models, mcp, hooks,
+    /// skills, limits) inherit on every build. Inheritance only ADDS ancestor
+    /// docs, so an inherited entry is never durably flattened into the child
+    /// realm's document.
+    pub(crate) async fn read(
+        &self,
+    ) -> Result<(Config, Option<meerkat_core::connection::RealmId>), EffectiveConfigReadError> {
+        let head_config = match &self.store {
+            Some(store) => store.get().await.map_err(EffectiveConfigReadError::Store)?,
+            None => self.snapshot.clone(),
+        };
+        let inheritance = self
+            .inheritance
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(inheritance) = inheritance else {
+            return Ok((head_config, None));
+        };
+        let reader = meerkat_core::EffectiveConfigReader::new(inheritance.source.clone());
+        let config = reader
+            .effective_config_over_head(&inheritance.head, head_config)
+            .await
+            .map_err(|error| EffectiveConfigReadError::Compose {
+                realm: inheritance.head.clone(),
+                error,
+            })?;
+        Ok((config, Some(inheritance.head)))
+    }
+
+    /// The realm whose OWN document defines the MCP server `name` in this
+    /// effective configuration, with that definition: the nearest document
+    /// on the chain [`Self::read`] composes, from the same head document and
+    /// realm-inheritance slot. `None` when no realm document defines it,
+    /// including without a configured head store (an in-memory snapshot is
+    /// not a realm's document) or without realm inheritance.
+    #[cfg(feature = "mcp")]
+    pub(crate) async fn mcp_server_owner(
+        &self,
+        name: &str,
+    ) -> Result<
+        Option<(
+            meerkat_core::connection::RealmId,
+            meerkat_core::McpServerConfig,
+        )>,
+        EffectiveConfigReadError,
+    > {
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        let inheritance = self
+            .inheritance
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(inheritance) = inheritance else {
+            return Ok(None);
+        };
+        let head_config = store.get().await.map_err(EffectiveConfigReadError::Store)?;
+        meerkat_core::EffectiveConfigReader::new(inheritance.source.clone())
+            .mcp_server_owner_over_head(&inheritance.head, head_config, name)
+            .await
+            .map_err(|error| EffectiveConfigReadError::Compose {
+                realm: inheritance.head.clone(),
+                error,
+            })
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 impl RealmInheritance {
     /// Build the inheritance inputs from a realm config `source` (supplies the
@@ -1296,6 +1427,17 @@ impl FactoryAgentBuilder {
         self
     }
 
+    /// Install the connector credential owner on the factory
+    /// ([`AgentFactory::connector_oauth_authority`]).
+    #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+    pub fn with_connector_oauth_authority(
+        mut self,
+        authority: meerkat_providers::connector_login::ConnectorOAuthAuthority,
+    ) -> Self {
+        self.factory = self.factory.connector_oauth_authority(authority);
+        self
+    }
+
     pub fn with_image_generation_machine(
         mut self,
         machine: Arc<dyn meerkat_tools::builtin::image_generation::ImageGenerationMachine>,
@@ -1311,50 +1453,32 @@ impl FactoryAgentBuilder {
     /// never serves a stale `config_snapshot` behind a store failure. The
     /// in-memory `config_snapshot` is returned only when no store is configured.
     async fn resolve_config(&self) -> Result<Config, SessionError> {
-        // The head config is the surface's authoritative document: the live
-        // `config_store` when one is configured (a read failure is propagated,
-        // never masked behind a stale snapshot), otherwise the in-memory
-        // `config_snapshot`.
-        #[cfg(not(target_arch = "wasm32"))]
-        let head_config = if let Some(store) = &self.config_store {
-            store.get().await.map_err(|err| {
-                SessionError::Agent(meerkat_core::error::AgentError::ConfigError(format!(
-                    "failed to read latest config from store: {err}"
-                )))
-            })?
-        } else {
-            self.config_snapshot.clone()
-        };
-        #[cfg(target_arch = "wasm32")]
-        let head_config = self.config_snapshot.clone();
-
-        // When realm inheritance is configured, fold the head realm's config with
-        // its ancestor chain so top-level fields (models, mcp, hooks, skills,
-        // limits) inherit on every build — not just the auth-binding path. The
-        // head config keeps coming from the surface's store/snapshot; inheritance
-        // only ADDS ancestor docs, so an inherited entry is never durably
-        // flattened into the child realm's document.
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let inheritance = self
-                .realm_inheritance
+            self.effective_config_view()
                 .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            if let Some(inheritance) = inheritance {
-                let reader = meerkat_core::EffectiveConfigReader::new(inheritance.source.clone());
-                return reader
-                    .effective_config_over_head(&inheritance.head, head_config)
-                    .await
-                    .map_err(|err| {
-                        SessionError::Agent(meerkat_core::error::AgentError::ConfigError(format!(
-                            "failed to compose effective config for realm '{}': {err}",
-                            inheritance.head
-                        )))
-                    });
-            }
+                .await
+                .map(|(config, _head)| config)
+                .map_err(|err| {
+                    SessionError::Agent(meerkat_core::error::AgentError::ConfigError(
+                        err.to_string(),
+                    ))
+                })
         }
-        Ok(head_config)
+        #[cfg(target_arch = "wasm32")]
+        Ok(self.config_snapshot.clone())
+    }
+
+    /// A detached reader of this builder's effective config: the same head
+    /// document and realm-inheritance slot [`Self::resolve_config`] reads, for
+    /// consumers that outlive the builder.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn effective_config_view(&self) -> EffectiveConfigView {
+        EffectiveConfigView {
+            store: self.config_store.clone(),
+            snapshot: self.config_snapshot.clone(),
+            inheritance: Arc::clone(&self.realm_inheritance),
+        }
     }
 
     /// Get a reference to the factory.
@@ -1382,6 +1506,73 @@ impl FactoryAgentBuilder {
     /// Get a reference to the config.
     pub fn config(&self) -> &Config {
         &self.config_snapshot
+    }
+
+    /// Prepare the controller of the session `req` will create, for its
+    /// pre-assigned `session_id`, under the realm machine's actual auth
+    /// lifecycle owner `auth_lease` (see `crate::prepared_controller`).
+    ///
+    /// The request is completed with this builder's controller defaults as
+    /// [`SessionAgentBuilder::build_agent`] completes it (final-client
+    /// decorator, realm, image-generation executor), and the effective config
+    /// is read once, as a build reads it. A default LLM client is an injected
+    /// client and is refused. Like a build, it runs on its own task, aborted
+    /// when the caller stops waiting.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(
+        not(all(
+            feature = "session-store",
+            feature = "local-authorization",
+            not(target_arch = "wasm32")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) async fn prepare_controller_graph(
+        &self,
+        req: &CreateSessionRequest,
+        auth_lease: meerkat_core::handles::GeneratedAuthLeaseHandle,
+        session_id: &meerkat_core::SessionId,
+    ) -> Result<crate::prepared_controller::PreparedControllerGraph, crate::BuildAgentError> {
+        if self.default_llm_client.is_some() {
+            return Err(
+                crate::prepared_controller::PreparedControllerRefusal::InjectedClient.into(),
+            );
+        }
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let mut build_config = AgentBuildConfig::from_create_session_request(req, event_tx);
+        // The consuming build binds its own run channel.
+        build_config.event_tx = None;
+        if build_config.agent_llm_client_decorator.is_none()
+            && let Some(decorator) = self
+                .default_agent_llm_client_decorator
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        {
+            build_config.agent_llm_client_decorator = Some(decorator);
+        }
+        if build_config.realm_id.is_none()
+            && let Some(realm_id) = self.default_realm_id.clone()
+        {
+            build_config.realm_id = Some(realm_id);
+        }
+        if build_config.image_generation_executor_override.is_none()
+            && let Some(executor) = self.default_image_generation_executor.clone()
+        {
+            build_config.image_generation_executor_override = Some(executor);
+        }
+        let config = self
+            .resolve_config()
+            .await
+            .map_err(|error| crate::BuildAgentError::Config(error.to_string()))?;
+        let factory = self.factory.clone();
+        let session_id = session_id.clone();
+        meerkat_runtime::stack_relief::relieve_caller_stack(move || async move {
+            factory
+                .prepare_controller_graph(build_config, &config, auth_lease, &session_id)
+                .await
+        })
+        .await
     }
 }
 
@@ -1637,6 +1828,14 @@ impl FactoryAgentBuilder {
             }
             _ => None,
         };
+        // The registration's trusted host decides the agent's prepared
+        // surface before it is finished, when it installed a gate.
+        let surface_gate = match req.build.as_ref().map(|opts| &opts.runtime_build_mode) {
+            Some(meerkat_core::RuntimeBuildMode::SessionOwned(bindings)) => {
+                bindings.tool_surface_gate()
+            }
+            _ => None,
+        };
 
         let provider_error_context = build_config.provider.or_else(|| {
             config
@@ -1671,7 +1870,14 @@ impl FactoryAgentBuilder {
         // chain (2 MiB production worker-stack budget).
         let factory = self.factory.clone();
         let agent = meerkat_runtime::stack_relief::relieve_caller_stack(move || async move {
-            factory.build_agent(build_config, &config).await
+            match surface_gate {
+                Some(gate) => {
+                    factory
+                        .build_agent_through_surface_gate(build_config, &config, gate.as_ref())
+                        .await
+                }
+                None => factory.build_agent(build_config, &config).await,
+            }
         })
         .await
         .map_err(|error| {
@@ -1730,10 +1936,13 @@ pub fn build_persistent_service_with_runtime_adapter(
     config: Config,
     max_sessions: usize,
     persistence: PersistenceBundle,
-) -> (
-    meerkat_session::PersistentSessionService<FactoryAgentBuilder>,
-    Arc<meerkat_runtime::MeerkatMachine>,
-) {
+) -> Result<
+    (
+        meerkat_session::PersistentSessionService<FactoryAgentBuilder>,
+        Arc<meerkat_runtime::MeerkatMachine>,
+    ),
+    crate::surface::RuntimeBackedCompositionError,
+> {
     let builder = FactoryAgentBuilder::new(factory, config);
     set_default_workgraph_tools_from_persistence(&builder, &persistence);
     crate::surface::build_runtime_backed_service(builder, max_sessions, persistence)
@@ -1746,8 +1955,12 @@ pub fn build_persistent_service(
     config: Config,
     max_sessions: usize,
     persistence: PersistenceBundle,
-) -> meerkat_session::PersistentSessionService<FactoryAgentBuilder> {
-    build_persistent_service_with_runtime_adapter(factory, config, max_sessions, persistence).0
+) -> Result<
+    meerkat_session::PersistentSessionService<FactoryAgentBuilder>,
+    crate::surface::RuntimeBackedCompositionError,
+> {
+    build_persistent_service_with_runtime_adapter(factory, config, max_sessions, persistence)
+        .map(|(service, _runtime_adapter)| service)
 }
 
 #[cfg(test)]
@@ -2066,6 +2279,13 @@ mod tests {
     #[cfg(feature = "openai-live")]
     #[async_trait]
     impl meerkat_core::HookEngine for CountingHookEngine {
+        fn mandatory_topology(
+            &self,
+            _overrides: Option<&meerkat_core::HookRunOverrides>,
+        ) -> Result<meerkat_core::HookMandatoryTopology, meerkat_core::HookEngineError> {
+            Ok(meerkat_core::HookMandatoryTopology::none())
+        }
+
         async fn execute(
             &self,
             _invocation: meerkat_core::HookInvocation,
@@ -3450,6 +3670,7 @@ mod tests {
             .with_provenance(meerkat_core::ToolProvenance {
                 kind: meerkat_core::ToolSourceKind::Callback,
                 source_id: "callback-owner".into(),
+                artifact: None,
             }),
         );
         let dispatcher = Arc::new(PolicyProbeDispatcher {

@@ -3832,6 +3832,30 @@ macro_rules! meerkat_catalog_machine_dsl {
             input_authority_bindings: Map<String, String>,
             #[redacted]
             input_authority_batch_keys: Map<String, String>,
+            // Scoped session document/context ownership. The registration
+            // owner binds the exact destination (owner, runtime, context,
+            // generation, audience) this session document serves, as an
+            // opaque digest of the canonical target. Governed inputs record
+            // the destination their retained association names. Accepted
+            // work whose destination is no longer current still stages under
+            // its own controller; its destination-scoped operations are
+            // refused as local feedback.
+            #[redacted]
+            scoped_context_binding: Option<String>,
+            // Stable authenticated scope of the document (owner, runtime,
+            // context, audience), fixed at the first binding. A rebind may
+            // only advance the generation of the same scope.
+            #[redacted]
+            scoped_context_scope: Option<String>,
+            scoped_context_generation: u64,
+            // Set by an owner that requires every governed input to name a
+            // bound destination (no unscoped governed work, including after
+            // a restart before the destination is bound again).
+            scoped_context_required: bool,
+            #[redacted]
+            input_context_targets: Map<String, String>,
+            #[redacted]
+            run_context_binding: Option<String>,
             authority_staged_run: Option<RunId>,
             #[redacted]
             authority_staged_batch: Option<String>,
@@ -4260,6 +4284,11 @@ macro_rules! meerkat_catalog_machine_dsl {
             surface_pending_task_sequence: Map<String, u64>,
             next_pending_task_sequence: u64,
             surface_pending_lineage_sequence: Map<String, u64>,
+            // The staged intent lineage whose connection made the surface
+            // Active. It survives the pending reset so the router that staged
+            // it can release exactly its own surface (`SurfaceRelease`); it
+            // ends when the surface is removed.
+            surface_active_lineage: Map<String, u64>,
             surface_inflight_calls: Map<String, u64>,
             surface_last_delta_operation: Map<String, Enum<ExternalToolSurfaceDeltaOperation>>,
             surface_last_delta_phase: Map<String, Enum<ExternalToolSurfaceDeltaPhase>>,
@@ -4580,6 +4609,12 @@ macro_rules! meerkat_catalog_machine_dsl {
             // Input lifecycle substate
             input_authority_bindings = EmptyMap,
             input_authority_batch_keys = EmptyMap,
+            scoped_context_binding = None,
+            scoped_context_scope = None,
+            scoped_context_generation = 0,
+            scoped_context_required = false,
+            input_context_targets = EmptyMap,
+            run_context_binding = None,
             authority_staged_run = None,
             authority_staged_batch = None,
             input_phases = EmptyMap,
@@ -4848,6 +4883,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             surface_pending_task_sequence = EmptyMap,
             next_pending_task_sequence = 0,
             surface_pending_lineage_sequence = EmptyMap,
+            surface_active_lineage = EmptyMap,
             surface_inflight_calls = EmptyMap,
             surface_last_delta_operation = EmptyMap,
             surface_last_delta_phase = EmptyMap,
@@ -5401,6 +5437,32 @@ macro_rules! meerkat_catalog_machine_dsl {
                 authority_binding: String,
                 #[redacted]
                 authority_batch_key: String,
+            },
+            // Bind this session document to one exact scoped destination
+            // (the registration owner's canonical target digest). The
+            // generation strictly increases; no run may be in flight.
+            BindScopedContext {
+                #[redacted]
+                binding: String,
+                #[redacted]
+                scope: String,
+                generation: u64,
+            },
+            // Retire the current scoped destination (revocation, retire,
+            // rebind preparation). Work already staged under it keeps its
+            // controller; its destination-scoped operations are refused.
+            RetireScopedContext {
+                generation: u64,
+            },
+            // The installed owner requires a bound destination for governed
+            // work on this session document. Monotonic.
+            RequireScopedContext,
+            // Record the destination a governed input's retained association
+            // names (its canonical target digest). Attribution only.
+            BindInputContextTarget {
+                input_id: String,
+                #[redacted]
+                target: String,
             },
             ResolveAdmissionPlan {
                 input_id: String,
@@ -6609,6 +6671,14 @@ macro_rules! meerkat_catalog_machine_dsl {
             SurfaceFinalizeRemovalForced { surface_id: String },
             SurfaceSnapshotAligned { epoch: u64 },
             SurfaceShutdown,
+            // A router releases one surface lineage it staged: whichever of
+            // the surface's staged, pending or active slots still carries
+            // exactly that lineage is cleared, and a lineage the surface no
+            // longer carries is refused. Releasing the active slot also
+            // cancels a staged Reload that depends on that active base, even
+            // one staged under a different lineage (a reload of a removed
+            // surface is meaningless).
+            SurfaceRelease { surface_id: String, lineage: u64 },
             // MCP server lifecycle inputs. Shell fires these when transport
             // state changes; each rewrites the server's slot in
             // `mcp_server_states` and emits `McpServerStateChanged`.
@@ -8073,6 +8143,9 @@ macro_rules! meerkat_catalog_machine_dsl {
                 cause: Option<Enum<ExternalToolSurfaceFailureCause>>,
             },
             CloseSurfaceConnection { surface_id: String },
+            // The staged intent sequence a stage input just recorded, so its
+            // stager knows the exact lineage it holds.
+            SurfaceStageRecorded { surface_id: String, staged_intent_sequence: u64 },
             RejectSurfaceCall { surface_id: String, cause: Enum<ExternalToolSurfaceFailureCause> },
             PublishSupervisorTrustEdge {
                 local_endpoint: Option<PeerEndpoint>,
@@ -8471,6 +8544,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         disposition RefreshVisibleSurfaceSet => external handoff surface_snapshot_alignment seam OwnerRealizationOnly,
         disposition EmitExternalToolDelta => external seam OwnerRealizationOnly,
         disposition CloseSurfaceConnection => local seam NoOwnerRealization,
+        disposition SurfaceStageRecorded => local seam NoOwnerRealization,
         disposition RejectSurfaceCall => external seam OwnerRealizationOnly,
         disposition PublishSupervisorTrustEdge => external handoff supervisor_trust_publish seam OwnerRealizationOnly,
         disposition RevokeSupervisorTrustEdge => external handoff supervisor_trust_revoke seam OwnerRealizationOnly,
@@ -9805,6 +9879,11 @@ macro_rules! meerkat_catalog_machine_dsl {
         // Admission may bind an input before its lifecycle phase is created.
         // Both equality projections belong to that generated admission or the
         // tracked input, and terminal archival removes them together.
+        invariant input_context_targets_are_governed {
+            for_all(input_id in self.input_context_targets.keys(),
+                self.input_authority_bindings.contains_key(input_id))
+        }
+
         invariant input_authority_bindings_have_native_owner {
             self.input_authority_bindings.keys() == self.input_authority_batch_keys.keys()
             && for_all(input_id in self.input_authority_bindings.keys(),
@@ -14280,12 +14359,32 @@ macro_rules! meerkat_catalog_machine_dsl {
         // persisted Retired+current-run states; normal Retire never creates
         // that shape. Ambient cancellation never gains a Retired arm, and the
         // run-id guard prevents redirecting a delayed request to a successor.
+        //
+        // An exact-run request records the run's turn `cancel_after_boundary`
+        // in the same transition that admits (or joins) its dispatch, so the
+        // agent that claims a run staged before its turn was taken sees the
+        // cancel at its first boundary even when no session-side receiver
+        // existed yet (#1471). An already-pending dispatch may be ambient or
+        // undelivered, so the joining arms record the flag too. Only a
+        // cancellable turn is accepted: a current run whose turn already ended
+        // is refused here, which the shell reports as a run that ended before
+        // the cancel. The dispatch-abort compensation clears only its dispatch
+        // fields and never this flag. The native boundary transitions consume
+        // it into the cancelled terminal, and run start and terminal
+        // acknowledgement reset it.
         transition CancelAfterBoundaryForRunRunning {
             on input CancelAfterBoundaryForRun { run_id, reason }
             guard { self.lifecycle_phase == Phase::Running }
             guard "run_matches_current" { self.current_run_id == Some(run_id) }
+            guard "turn_cancellable" {
+                self.turn_phase != TurnPhase::Ready
+                && self.turn_phase != TurnPhase::Completed
+                && self.turn_phase != TurnPhase::Failed
+                && self.turn_phase != TurnPhase::Cancelled
+            }
             guard "no_dispatch_outstanding" { self.boundary_cancel_dispatch_pending == false }
             update {
+                self.cancel_after_boundary = true;
                 self.boundary_cancel_dispatch_pending = true;
                 self.boundary_cancel_dispatch_generation = self.boundary_cancel_dispatch_generation + 1;
             }
@@ -14297,8 +14396,15 @@ macro_rules! meerkat_catalog_machine_dsl {
             on input CancelAfterBoundaryForRun { run_id, reason }
             guard { self.lifecycle_phase == Phase::Retired }
             guard "run_matches_current" { self.current_run_id == Some(run_id) }
+            guard "turn_cancellable" {
+                self.turn_phase != TurnPhase::Ready
+                && self.turn_phase != TurnPhase::Completed
+                && self.turn_phase != TurnPhase::Failed
+                && self.turn_phase != TurnPhase::Cancelled
+            }
             guard "no_dispatch_outstanding" { self.boundary_cancel_dispatch_pending == false }
             update {
+                self.cancel_after_boundary = true;
                 self.boundary_cancel_dispatch_pending = true;
                 self.boundary_cancel_dispatch_generation = self.boundary_cancel_dispatch_generation + 1;
             }
@@ -14310,8 +14416,16 @@ macro_rules! meerkat_catalog_machine_dsl {
             on input CancelAfterBoundaryForRun { run_id, reason }
             guard { self.lifecycle_phase == Phase::Running }
             guard "run_matches_current" { self.current_run_id == Some(run_id) }
+            guard "turn_cancellable" {
+                self.turn_phase != TurnPhase::Ready
+                && self.turn_phase != TurnPhase::Completed
+                && self.turn_phase != TurnPhase::Failed
+                && self.turn_phase != TurnPhase::Cancelled
+            }
             guard "dispatch_outstanding" { self.boundary_cancel_dispatch_pending == true }
-            update {}
+            update {
+                self.cancel_after_boundary = true;
+            }
             to Running
             emit BoundaryCancelAlreadyPending
         }
@@ -14319,8 +14433,16 @@ macro_rules! meerkat_catalog_machine_dsl {
             on input CancelAfterBoundaryForRun { run_id, reason }
             guard { self.lifecycle_phase == Phase::Retired }
             guard "run_matches_current" { self.current_run_id == Some(run_id) }
+            guard "turn_cancellable" {
+                self.turn_phase != TurnPhase::Ready
+                && self.turn_phase != TurnPhase::Completed
+                && self.turn_phase != TurnPhase::Failed
+                && self.turn_phase != TurnPhase::Cancelled
+            }
             guard "dispatch_outstanding" { self.boundary_cancel_dispatch_pending == true }
-            update {}
+            update {
+                self.cancel_after_boundary = true;
+            }
             to Retired
             emit BoundaryCancelAlreadyPending
         }
@@ -17669,6 +17791,61 @@ macro_rules! meerkat_catalog_machine_dsl {
             update {
                 self.input_authority_bindings.insert(input_id, authority_binding);
                 self.input_authority_batch_keys.insert(input_id, authority_batch_key);
+            }
+            to Idle
+        }
+
+        // Scoped destination binding of this session document. Only while no
+        // run is in flight; the generation strictly increases.
+        transition BindScopedContext {
+            per_phase [Idle, Attached]
+            on input BindScopedContext { binding, scope, generation }
+            guard "nonempty_binding" { binding != "" && scope != "" }
+            guard "generation_advances" { generation > self.scoped_context_generation }
+            guard "stable_scope" {
+                self.scoped_context_scope == None || self.scoped_context_scope == Some(scope)
+            }
+            update {
+                self.scoped_context_binding = Some(binding);
+                self.scoped_context_scope = Some(scope);
+                self.scoped_context_generation = generation;
+            }
+            to Idle
+        }
+
+        transition RequireScopedContext {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RequireScopedContext
+            update {
+                self.scoped_context_required = true;
+            }
+            to Idle
+        }
+
+        transition RetireScopedContext {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input RetireScopedContext { generation }
+            guard "current_generation" {
+                self.scoped_context_binding != None
+                && generation == self.scoped_context_generation
+            }
+            update {
+                self.scoped_context_binding = None;
+            }
+            to Idle
+        }
+
+        transition BindInputContextTarget {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input BindInputContextTarget { input_id, target }
+            guard "governed_input" { self.input_authority_bindings.contains_key(input_id) }
+            guard "nonempty_target" { target != "" }
+            guard "immutable_target" {
+                !self.input_context_targets.contains_key(input_id)
+                || self.input_context_targets.get_cloned(input_id) == Some(target)
+            }
+            update {
+                self.input_context_targets.insert(input_id, target);
             }
             to Idle
         }
@@ -21631,6 +21808,10 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_staged_intent_sequence.insert(surface_id, self.next_staged_intent_sequence);
             }
             to Idle
+            emit SurfaceStageRecorded {
+                surface_id: surface_id,
+                staged_intent_sequence: self.next_staged_intent_sequence,
+            }
         }
         transition SurfaceStageAddAttached {
             on input SurfaceStageAdd { surface_id, now_ms }
@@ -21644,6 +21825,10 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_staged_intent_sequence.insert(surface_id, self.next_staged_intent_sequence);
             }
             to Attached
+            emit SurfaceStageRecorded {
+                surface_id: surface_id,
+                staged_intent_sequence: self.next_staged_intent_sequence,
+            }
         }
         transition SurfaceStageAddRunning {
             on input SurfaceStageAdd { surface_id, now_ms }
@@ -21657,6 +21842,10 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_staged_intent_sequence.insert(surface_id, self.next_staged_intent_sequence);
             }
             to Running
+            emit SurfaceStageRecorded {
+                surface_id: surface_id,
+                staged_intent_sequence: self.next_staged_intent_sequence,
+            }
         }
 
         transition SurfaceStageRemoveIdle {
@@ -21671,6 +21860,10 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_staged_intent_sequence.insert(surface_id, self.next_staged_intent_sequence);
             }
             to Idle
+            emit SurfaceStageRecorded {
+                surface_id: surface_id,
+                staged_intent_sequence: self.next_staged_intent_sequence,
+            }
         }
         transition SurfaceStageRemoveAttached {
             on input SurfaceStageRemove { surface_id, now_ms }
@@ -21684,6 +21877,10 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_staged_intent_sequence.insert(surface_id, self.next_staged_intent_sequence);
             }
             to Attached
+            emit SurfaceStageRecorded {
+                surface_id: surface_id,
+                staged_intent_sequence: self.next_staged_intent_sequence,
+            }
         }
         transition SurfaceStageRemoveRunning {
             on input SurfaceStageRemove { surface_id, now_ms }
@@ -21697,6 +21894,10 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_staged_intent_sequence.insert(surface_id, self.next_staged_intent_sequence);
             }
             to Running
+            emit SurfaceStageRecorded {
+                surface_id: surface_id,
+                staged_intent_sequence: self.next_staged_intent_sequence,
+            }
         }
 
         transition SurfaceSetRemovalTimeoutIdle {
@@ -21740,6 +21941,10 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_staged_intent_sequence.insert(surface_id, self.next_staged_intent_sequence);
             }
             to Idle
+            emit SurfaceStageRecorded {
+                surface_id: surface_id,
+                staged_intent_sequence: self.next_staged_intent_sequence,
+            }
         }
         transition SurfaceStageReloadAttached {
             on input SurfaceStageReload { surface_id, now_ms }
@@ -21754,6 +21959,10 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_staged_intent_sequence.insert(surface_id, self.next_staged_intent_sequence);
             }
             to Attached
+            emit SurfaceStageRecorded {
+                surface_id: surface_id,
+                staged_intent_sequence: self.next_staged_intent_sequence,
+            }
         }
         transition SurfaceStageReloadRunning {
             on input SurfaceStageReload { surface_id, now_ms }
@@ -21768,6 +21977,10 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_staged_intent_sequence.insert(surface_id, self.next_staged_intent_sequence);
             }
             to Running
+            emit SurfaceStageRecorded {
+                surface_id: surface_id,
+                staged_intent_sequence: self.next_staged_intent_sequence,
+            }
         }
 
         transition SurfaceApplyBoundaryAddIdle {
@@ -22244,6 +22457,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
                 self.surface_pending_task_sequence.insert(surface_id, 0);
                 self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_active_lineage.insert(surface_id, staged_intent_sequence);
                 self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Active);
                 self.active_surfaces.insert(surface_id);
                 self.visible_surfaces.insert(surface_id);
@@ -22271,6 +22485,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
                 self.surface_pending_task_sequence.insert(surface_id, 0);
                 self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_active_lineage.insert(surface_id, staged_intent_sequence);
                 self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Active);
                 self.active_surfaces.insert(surface_id);
                 self.visible_surfaces.insert(surface_id);
@@ -22298,6 +22513,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
                 self.surface_pending_task_sequence.insert(surface_id, 0);
                 self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_active_lineage.insert(surface_id, staged_intent_sequence);
                 self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Active);
                 self.active_surfaces.insert(surface_id);
                 self.visible_surfaces.insert(surface_id);
@@ -22325,6 +22541,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
                 self.surface_pending_task_sequence.insert(surface_id, 0);
                 self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_active_lineage.insert(surface_id, staged_intent_sequence);
                 self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Active);
                 self.active_surfaces.insert(surface_id);
                 self.visible_surfaces.insert(surface_id);
@@ -22352,6 +22569,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
                 self.surface_pending_task_sequence.insert(surface_id, 0);
                 self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_active_lineage.insert(surface_id, staged_intent_sequence);
                 self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Active);
                 self.active_surfaces.insert(surface_id);
                 self.visible_surfaces.insert(surface_id);
@@ -22379,6 +22597,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
                 self.surface_pending_task_sequence.insert(surface_id, 0);
                 self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_active_lineage.insert(surface_id, staged_intent_sequence);
                 self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Active);
                 self.active_surfaces.insert(surface_id);
                 self.visible_surfaces.insert(surface_id);
@@ -22565,6 +22784,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
                 self.surface_pending_task_sequence.insert(surface_id, 0);
                 self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_active_lineage.remove(surface_id);
                 self.surface_draining_since_ms.remove(surface_id);
                 self.surface_removal_timeout_at_ms.remove(surface_id);
                 self.surface_removal_applied_at_turn.remove(surface_id);
@@ -22597,6 +22817,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
                 self.surface_pending_task_sequence.insert(surface_id, 0);
                 self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_active_lineage.remove(surface_id);
                 self.surface_draining_since_ms.remove(surface_id);
                 self.surface_removal_timeout_at_ms.remove(surface_id);
                 self.surface_removal_applied_at_turn.remove(surface_id);
@@ -22629,6 +22850,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
                 self.surface_pending_task_sequence.insert(surface_id, 0);
                 self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_active_lineage.remove(surface_id);
                 self.surface_draining_since_ms.remove(surface_id);
                 self.surface_removal_timeout_at_ms.remove(surface_id);
                 self.surface_removal_applied_at_turn.remove(surface_id);
@@ -22658,6 +22880,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
                 self.surface_pending_task_sequence.insert(surface_id, 0);
                 self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_active_lineage.remove(surface_id);
                 self.surface_inflight_calls.insert(surface_id, 0);
                 self.surface_draining_since_ms.remove(surface_id);
                 self.surface_removal_timeout_at_ms.remove(surface_id);
@@ -22687,6 +22910,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
                 self.surface_pending_task_sequence.insert(surface_id, 0);
                 self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_active_lineage.remove(surface_id);
                 self.surface_inflight_calls.insert(surface_id, 0);
                 self.surface_draining_since_ms.remove(surface_id);
                 self.surface_removal_timeout_at_ms.remove(surface_id);
@@ -22716,6 +22940,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
                 self.surface_pending_task_sequence.insert(surface_id, 0);
                 self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                self.surface_active_lineage.remove(surface_id);
                 self.surface_inflight_calls.insert(surface_id, 0);
                 self.surface_draining_since_ms.remove(surface_id);
                 self.surface_removal_timeout_at_ms.remove(surface_id);
@@ -22783,6 +23008,231 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.surface_phase = SurfacePhase::Shutdown;
             }
             to Running
+        }
+
+        // A router's release of one lineage it staged. Legal after staging
+        // closes (no `surface_operating` guard) so a router can always clean
+        // up after itself; a lineage the surface no longer carries is refused.
+        transition SurfaceReleaseIdle {
+            on input SurfaceRelease { surface_id, lineage }
+            guard { self.lifecycle_phase == Phase::Idle }
+            guard "release_holds_lineage" {
+                lineage != 0
+                && (self.surface_staged_intent_sequence.get_copied(surface_id) == Some(lineage)
+                    || self.surface_pending_lineage_sequence.get_copied(surface_id) == Some(lineage)
+                    || self.surface_active_lineage.get_copied(surface_id) == Some(lineage))
+            }
+            update {
+                if self.surface_active_lineage.get_copied(surface_id) == Some(lineage)
+                    && self.surface_staged_op.get_copied(surface_id) == Some(SurfaceStagedOp::Reload) {
+                    self.surface_staged_op.remove(surface_id);
+                    self.surface_staged_intent_sequence.remove(surface_id);
+                }
+                if self.surface_staged_intent_sequence.get_copied(surface_id) == Some(lineage) {
+                    self.surface_staged_op.remove(surface_id);
+                    self.surface_staged_intent_sequence.remove(surface_id);
+                    self.reload_staged_surfaces.remove(surface_id);
+                }
+                if self.surface_pending_lineage_sequence.get_copied(surface_id) == Some(lineage) {
+                    self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                    self.surface_pending_task_sequence.insert(surface_id, 0);
+                    self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                }
+                if self.surface_active_lineage.get_copied(surface_id) == Some(lineage) {
+                    self.surface_active_lineage.remove(surface_id);
+                    self.reload_staged_surfaces.remove(surface_id);
+                    self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Removed);
+                    self.active_surfaces.remove(surface_id);
+                    self.visible_surfaces.remove(surface_id);
+                    self.surface_inflight_calls.insert(surface_id, 0);
+                    self.surface_draining_since_ms.remove(surface_id);
+                    self.surface_removal_timeout_at_ms.remove(surface_id);
+                    self.surface_removal_applied_at_turn.remove(surface_id);
+                    self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Remove);
+                    self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Forced);
+                }
+            }
+            to Idle
+        }
+
+        // A router's release of one lineage it staged. Legal after staging
+        // closes (no `surface_operating` guard) so a router can always clean
+        // up after itself; a lineage the surface no longer carries is refused.
+        transition SurfaceReleaseAttached {
+            on input SurfaceRelease { surface_id, lineage }
+            guard { self.lifecycle_phase == Phase::Attached }
+            guard "release_holds_lineage" {
+                lineage != 0
+                && (self.surface_staged_intent_sequence.get_copied(surface_id) == Some(lineage)
+                    || self.surface_pending_lineage_sequence.get_copied(surface_id) == Some(lineage)
+                    || self.surface_active_lineage.get_copied(surface_id) == Some(lineage))
+            }
+            update {
+                if self.surface_active_lineage.get_copied(surface_id) == Some(lineage)
+                    && self.surface_staged_op.get_copied(surface_id) == Some(SurfaceStagedOp::Reload) {
+                    self.surface_staged_op.remove(surface_id);
+                    self.surface_staged_intent_sequence.remove(surface_id);
+                }
+                if self.surface_staged_intent_sequence.get_copied(surface_id) == Some(lineage) {
+                    self.surface_staged_op.remove(surface_id);
+                    self.surface_staged_intent_sequence.remove(surface_id);
+                    self.reload_staged_surfaces.remove(surface_id);
+                }
+                if self.surface_pending_lineage_sequence.get_copied(surface_id) == Some(lineage) {
+                    self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                    self.surface_pending_task_sequence.insert(surface_id, 0);
+                    self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                }
+                if self.surface_active_lineage.get_copied(surface_id) == Some(lineage) {
+                    self.surface_active_lineage.remove(surface_id);
+                    self.reload_staged_surfaces.remove(surface_id);
+                    self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Removed);
+                    self.active_surfaces.remove(surface_id);
+                    self.visible_surfaces.remove(surface_id);
+                    self.surface_inflight_calls.insert(surface_id, 0);
+                    self.surface_draining_since_ms.remove(surface_id);
+                    self.surface_removal_timeout_at_ms.remove(surface_id);
+                    self.surface_removal_applied_at_turn.remove(surface_id);
+                    self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Remove);
+                    self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Forced);
+                }
+            }
+            to Attached
+        }
+
+        // A router's release of one lineage it staged. Legal after staging
+        // closes (no `surface_operating` guard) so a router can always clean
+        // up after itself; a lineage the surface no longer carries is refused.
+        transition SurfaceReleaseRunning {
+            on input SurfaceRelease { surface_id, lineage }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "release_holds_lineage" {
+                lineage != 0
+                && (self.surface_staged_intent_sequence.get_copied(surface_id) == Some(lineage)
+                    || self.surface_pending_lineage_sequence.get_copied(surface_id) == Some(lineage)
+                    || self.surface_active_lineage.get_copied(surface_id) == Some(lineage))
+            }
+            update {
+                if self.surface_active_lineage.get_copied(surface_id) == Some(lineage)
+                    && self.surface_staged_op.get_copied(surface_id) == Some(SurfaceStagedOp::Reload) {
+                    self.surface_staged_op.remove(surface_id);
+                    self.surface_staged_intent_sequence.remove(surface_id);
+                }
+                if self.surface_staged_intent_sequence.get_copied(surface_id) == Some(lineage) {
+                    self.surface_staged_op.remove(surface_id);
+                    self.surface_staged_intent_sequence.remove(surface_id);
+                    self.reload_staged_surfaces.remove(surface_id);
+                }
+                if self.surface_pending_lineage_sequence.get_copied(surface_id) == Some(lineage) {
+                    self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                    self.surface_pending_task_sequence.insert(surface_id, 0);
+                    self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                }
+                if self.surface_active_lineage.get_copied(surface_id) == Some(lineage) {
+                    self.surface_active_lineage.remove(surface_id);
+                    self.reload_staged_surfaces.remove(surface_id);
+                    self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Removed);
+                    self.active_surfaces.remove(surface_id);
+                    self.visible_surfaces.remove(surface_id);
+                    self.surface_inflight_calls.insert(surface_id, 0);
+                    self.surface_draining_since_ms.remove(surface_id);
+                    self.surface_removal_timeout_at_ms.remove(surface_id);
+                    self.surface_removal_applied_at_turn.remove(surface_id);
+                    self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Remove);
+                    self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Forced);
+                }
+            }
+            to Running
+        }
+
+        // A router's release of one lineage it staged. Legal after staging
+        // closes (no `surface_operating` guard) so a router can always clean
+        // up after itself; a lineage the surface no longer carries is refused.
+        transition SurfaceReleaseStopped {
+            on input SurfaceRelease { surface_id, lineage }
+            guard { self.lifecycle_phase == Phase::Stopped }
+            guard "release_holds_lineage" {
+                lineage != 0
+                && (self.surface_staged_intent_sequence.get_copied(surface_id) == Some(lineage)
+                    || self.surface_pending_lineage_sequence.get_copied(surface_id) == Some(lineage)
+                    || self.surface_active_lineage.get_copied(surface_id) == Some(lineage))
+            }
+            update {
+                if self.surface_active_lineage.get_copied(surface_id) == Some(lineage)
+                    && self.surface_staged_op.get_copied(surface_id) == Some(SurfaceStagedOp::Reload) {
+                    self.surface_staged_op.remove(surface_id);
+                    self.surface_staged_intent_sequence.remove(surface_id);
+                }
+                if self.surface_staged_intent_sequence.get_copied(surface_id) == Some(lineage) {
+                    self.surface_staged_op.remove(surface_id);
+                    self.surface_staged_intent_sequence.remove(surface_id);
+                    self.reload_staged_surfaces.remove(surface_id);
+                }
+                if self.surface_pending_lineage_sequence.get_copied(surface_id) == Some(lineage) {
+                    self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                    self.surface_pending_task_sequence.insert(surface_id, 0);
+                    self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                }
+                if self.surface_active_lineage.get_copied(surface_id) == Some(lineage) {
+                    self.surface_active_lineage.remove(surface_id);
+                    self.reload_staged_surfaces.remove(surface_id);
+                    self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Removed);
+                    self.active_surfaces.remove(surface_id);
+                    self.visible_surfaces.remove(surface_id);
+                    self.surface_inflight_calls.insert(surface_id, 0);
+                    self.surface_draining_since_ms.remove(surface_id);
+                    self.surface_removal_timeout_at_ms.remove(surface_id);
+                    self.surface_removal_applied_at_turn.remove(surface_id);
+                    self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Remove);
+                    self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Forced);
+                }
+            }
+            to Stopped
+        }
+
+        // A router's release of one lineage it staged. Legal after staging
+        // closes (no `surface_operating` guard) so a router can always clean
+        // up after itself; a lineage the surface no longer carries is refused.
+        transition SurfaceReleaseRetired {
+            on input SurfaceRelease { surface_id, lineage }
+            guard { self.lifecycle_phase == Phase::Retired }
+            guard "release_holds_lineage" {
+                lineage != 0
+                && (self.surface_staged_intent_sequence.get_copied(surface_id) == Some(lineage)
+                    || self.surface_pending_lineage_sequence.get_copied(surface_id) == Some(lineage)
+                    || self.surface_active_lineage.get_copied(surface_id) == Some(lineage))
+            }
+            update {
+                if self.surface_active_lineage.get_copied(surface_id) == Some(lineage)
+                    && self.surface_staged_op.get_copied(surface_id) == Some(SurfaceStagedOp::Reload) {
+                    self.surface_staged_op.remove(surface_id);
+                    self.surface_staged_intent_sequence.remove(surface_id);
+                }
+                if self.surface_staged_intent_sequence.get_copied(surface_id) == Some(lineage) {
+                    self.surface_staged_op.remove(surface_id);
+                    self.surface_staged_intent_sequence.remove(surface_id);
+                    self.reload_staged_surfaces.remove(surface_id);
+                }
+                if self.surface_pending_lineage_sequence.get_copied(surface_id) == Some(lineage) {
+                    self.surface_pending_op.insert(surface_id, SurfacePendingOp::None);
+                    self.surface_pending_task_sequence.insert(surface_id, 0);
+                    self.surface_pending_lineage_sequence.insert(surface_id, 0);
+                }
+                if self.surface_active_lineage.get_copied(surface_id) == Some(lineage) {
+                    self.surface_active_lineage.remove(surface_id);
+                    self.reload_staged_surfaces.remove(surface_id);
+                    self.surface_base_state.insert(surface_id, ExternalToolSurfaceBaseState::Removed);
+                    self.active_surfaces.remove(surface_id);
+                    self.visible_surfaces.remove(surface_id);
+                    self.surface_inflight_calls.insert(surface_id, 0);
+                    self.surface_draining_since_ms.remove(surface_id);
+                    self.surface_removal_timeout_at_ms.remove(surface_id);
+                    self.surface_removal_applied_at_turn.remove(surface_id);
+                    self.surface_last_delta_operation.insert(surface_id, ExternalToolSurfaceDeltaOperation::Remove);
+                    self.surface_last_delta_phase.insert(surface_id, ExternalToolSurfaceDeltaPhase::Forced);
+                }
+            }
+            to Retired
         }
 
         // 31. Commit: Running → Idle/Attached/Retired (guard pre_run_phase + run_id match)
@@ -23643,7 +24093,22 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.authority_staged_run != Some(run_id)
                 || self.authority_staged_batch == self.input_authority_batch_keys.get_cloned(input_id)
             }
+            // Accepted governed work always stages, whatever its destination's
+            // state: a stale or retired destination is refused per operation
+            // (the controller keeps its run and receives that refusal as
+            // feedback). Only governed work recovered after a restart on a
+            // document that requires a destination waits until the
+            // registration owner reattaches one.
+            guard "scoped_context_attached" {
+                self.scoped_context_required == false
+                || self.scoped_context_binding != None
+                || self.scoped_context_generation != 0
+                || !self.input_authority_bindings.contains_key(input_id)
+            }
+            // Destination homogeneity follows from `homogeneous_run_authority`:
+            // the batch key includes the exact target.
             update {
+                self.run_context_binding = self.input_context_targets.get_cloned(input_id);
                 self.authority_staged_run = Some(run_id);
                 self.authority_staged_batch = self.input_authority_batch_keys.get_cloned(input_id);
                 self.input_phases.insert(input_id, InputPhase::Staged);
@@ -24572,6 +25037,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             update {
                 self.input_authority_bindings.remove(input_id);
                 self.input_authority_batch_keys.remove(input_id);
+                self.input_context_targets.remove(input_id);
                 self.input_phases.remove(input_id);
                 self.input_terminal_kind.remove(input_id);
                 self.input_superseded_by.remove(input_id);
@@ -37626,7 +38092,10 @@ macro_rules! meerkat_catalog_machine_dsl {
                 lane: InputLane,
                 source: RuntimeLoopBatchSource,
             ) -> Option<RuntimeLoopBatchPlan> {
-                let ordered = ordered_queued_lane_inputs(state, lane)?;
+                let ordered: Vec<String> = ordered_queued_lane_inputs(state, lane)?
+                    .into_iter()
+                    .filter(|input_id| scoped_context_stageable(state, input_id))
+                    .collect();
                 let first = ordered.first()?;
                 // AppendContentAndRun owns exactly one SystemNotice per run.
                 let selected = if state.input_runtime_peer_response_terminal_apply_intent.get(first)
@@ -37678,6 +38147,9 @@ macro_rules! meerkat_catalog_machine_dsl {
                     RuntimeLoopBatchSource::Steer => InputLane::Steer,
                 };
                 for input_id in input_ids {
+                    if !scoped_context_stageable(state, input_id) {
+                        return None;
+                    }
                     if state.input_phases.get(input_id) != Some(&InputPhase::Queued) {
                         return None;
                     }
@@ -37699,6 +38171,16 @@ macro_rules! meerkat_catalog_machine_dsl {
                     input_ids: input_ids.to_vec(),
                     source,
                 })
+            }
+
+            // Mirrors the StageForRun `scoped_context_attached` guard: only
+            // recovered governed work waiting for its required destination to
+            // be reattached is held (queued), never terminated.
+            fn scoped_context_stageable(state: &MeerkatMachineState, input_id: &String) -> bool {
+                !state.scoped_context_required
+                    || state.scoped_context_binding.is_some()
+                    || state.scoped_context_generation != 0
+                    || !state.input_authority_bindings.contains_key(input_id)
             }
 
             fn ordered_queued_lane_inputs(

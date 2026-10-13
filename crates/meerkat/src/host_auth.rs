@@ -52,9 +52,9 @@ use meerkat_providers::auth_store::{
     credential_source_uses_persisted_store, persisted_auth_mode_is_oauth_login,
 };
 use meerkat_providers::connector_login::{
-    ConnectorAccountStrategy, ConnectorAuthPhase, ConnectorAuthStatus, ConnectorLoginComplete,
-    ConnectorLoginError, ConnectorLoginStart, ConnectorOAuthAuthority, ConnectorOAuthCallback,
-    ConnectorOAuthTarget, ConnectorStrategies, ConnectorVerifiedAccount,
+    ConnectorAccountStrategy, ConnectorAuthPhase, ConnectorAuthStatus, ConnectorClientAuthProfile,
+    ConnectorLoginComplete, ConnectorLoginError, ConnectorLoginStart, ConnectorOAuthAuthority,
+    ConnectorOAuthCallback, ConnectorOAuthTarget, ConnectorStrategies, ConnectorVerifiedAccount,
 };
 use meerkat_providers::connector_oauth::{AccountSelection, ScopeEvidence};
 use meerkat_providers::mcp_oauth::{
@@ -89,6 +89,10 @@ pub struct HostAuthStatus {
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+    /// Set when the credential store did not answer this non-blocking read;
+    /// `phase` then reflects the live lease alone and never claims absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_observation: Option<meerkat_core::CredentialObservation>,
 }
 
 /// Browser navigation data returned by [`HostAuthService::login_start`].
@@ -233,12 +237,32 @@ pub fn mcp_login_disposition_to_wire(
 /// credential is the typed `AuthorizationRequired` host status. `None` when
 /// the host has no provider-auth persistence or the owner is not
 /// AuthMachine-backed.
+///
+/// Its credentials are the realm-less shared slot; a host serving a realm
+/// uses [`default_mcp_auth_resolver_in_realm`].
 #[cfg(feature = "mcp")]
 pub fn default_mcp_auth_resolver(
     persistence: Option<ProviderAuthPersistence>,
     authority: meerkat_runtime::ProviderAuthRuntimeAuthority,
 ) -> Option<Arc<dyn meerkat_mcp::McpAuthResolver>> {
-    let service = HostAuthService::new(persistence?, authority);
+    mcp_auth_resolver_for(HostAuthService::new(persistence?, authority))
+}
+
+/// [`default_mcp_auth_resolver`] scoped to the host runtime's `realm`: every
+/// MCP credential it resolves, refreshes or requests is that realm's own.
+#[cfg(feature = "mcp")]
+pub fn default_mcp_auth_resolver_in_realm(
+    persistence: Option<ProviderAuthPersistence>,
+    authority: meerkat_runtime::ProviderAuthRuntimeAuthority,
+    realm: RealmId,
+) -> Option<Arc<dyn meerkat_mcp::McpAuthResolver>> {
+    mcp_auth_resolver_for(HostAuthService::new(persistence?, authority).with_mcp_realm(realm))
+}
+
+#[cfg(feature = "mcp")]
+fn mcp_auth_resolver_for(
+    service: HostAuthService,
+) -> Option<Arc<dyn meerkat_mcp::McpAuthResolver>> {
     match service.mcp_oauth_authority() {
         Ok(authority) => Some(Arc::new(authority)),
         Err(error) => {
@@ -276,6 +300,10 @@ pub enum HostMcpTargetRefusal {
     /// are literal, so the realm's MCP set does not resolve.
     #[error(transparent)]
     RealmServerEnvReference(meerkat_core::mcp_config::McpRealmServerEnvReference),
+    /// A configured server's access policy is invalid, so the realm's MCP
+    /// set does not resolve.
+    #[error(transparent)]
+    InvalidAccessPolicy(meerkat_core::McpServerAccessError),
 }
 
 impl HostMcpTargetRefusal {
@@ -287,6 +315,7 @@ impl HostMcpTargetRefusal {
             Self::ConfigUnavailable(_)
                 | Self::DefinitionConflict(_)
                 | Self::RealmServerEnvReference(_)
+                | Self::InvalidAccessPolicy(_)
         )
     }
 }
@@ -333,6 +362,9 @@ pub async fn resolve_configured_mcp_target_in_realm(
                 }
                 EffectiveMcpServersError::RealmEnvReference(reference) => {
                     HostMcpTargetRefusal::RealmServerEnvReference(reference)
+                }
+                EffectiveMcpServersError::Access(error) => {
+                    HostMcpTargetRefusal::InvalidAccessPolicy(error)
                 }
             })?;
     let server = servers
@@ -453,6 +485,7 @@ pub fn connector_target_from_wire(
             }
             WireConnectorAccountSelection::Discover => AccountSelection::Discover,
         },
+        client_auth_profile: target.client_auth_profile.clone(),
     })
 }
 
@@ -566,6 +599,15 @@ pub enum HostAuthError {
 /// (store paths, persistence errors) stays in protected diagnostics.
 const INFRASTRUCTURE_PUBLIC_MESSAGE: &str = "auth infrastructure failure";
 
+/// Fixed public text for a refused credential access, one per public reason.
+/// The store's backend and platform detail stays in protected diagnostics.
+const CREDENTIAL_ACCESS_DENIED_PUBLIC_MESSAGE: &str = "access to the stored credential was denied";
+const CREDENTIAL_INTERACTION_REQUIRED_PUBLIC_MESSAGE: &str =
+    "access to the stored credential needs user interaction";
+const CREDENTIAL_ACCESS_PENDING_PUBLIC_MESSAGE: &str =
+    "access to the stored credential is still pending";
+const CREDENTIAL_STORE_UNAVAILABLE_PUBLIC_MESSAGE: &str = "the credential store is unavailable";
+
 impl HostAuthError {
     /// The typed public reason of this error: the one mapping every auth
     /// surface projects. Exhaustive on purpose, so a new native error must
@@ -583,8 +625,12 @@ impl HostAuthError {
             Self::OAuthFlow(error) => oauth_flow_reason(error),
             Self::OAuthExchange(_) => R::UpstreamFailure,
             Self::CredentialMutation(error) => credential_mutation_reason(error),
-            Self::TokenStore(_)
-            | Self::Factory(_)
+            Self::TokenStore(error) => error
+                .credential_access()
+                .map_or(R::Infrastructure, |(refusal, _)| {
+                    credential_access_reason(refusal)
+                }),
+            Self::Factory(_)
             | Self::PersistenceUnavailable
             | Self::Lifecycle(_)
             | Self::StatusRehydrate(_) => R::Infrastructure,
@@ -597,21 +643,41 @@ impl HostAuthError {
                 HostMcpTargetRefusal::AccountMismatch { .. } => R::AccountMismatch,
                 HostMcpTargetRefusal::ConfigUnavailable(_)
                 | HostMcpTargetRefusal::DefinitionConflict(_)
-                | HostMcpTargetRefusal::RealmServerEnvReference(_) => R::ConfigurationInvalid,
+                | HostMcpTargetRefusal::RealmServerEnvReference(_)
+                | HostMcpTargetRefusal::InvalidAccessPolicy(_) => R::ConfigurationInvalid,
             },
             Self::Connector(error) => connector_reason(error),
         }
     }
 
-    /// The error text a public surface may show. Infrastructure failures use
-    /// fixed text; their detail goes only to protected diagnostics.
+    /// The error text a public surface may show. Infrastructure failures and
+    /// refused credential accesses use fixed text per reason; their detail
+    /// goes only to protected diagnostics.
     pub fn public_message(&self) -> String {
-        match self.reason() {
-            meerkat_contracts::WireAuthErrorReason::Infrastructure => {
-                INFRASTRUCTURE_PUBLIC_MESSAGE.to_owned()
-            }
-            _ => self.to_string(),
+        match fixed_public_message(self.reason()) {
+            Some(text) => text.to_owned(),
+            None => self.to_string(),
         }
+    }
+
+    /// Whether the public text withholds this error's detail. A surface logs
+    /// the full error to protected diagnostics when it does.
+    pub fn withholds_detail(&self) -> bool {
+        fixed_public_message(self.reason()).is_some()
+    }
+}
+
+/// The fixed public text of a reason whose detail is withheld, or `None`
+/// when the error's own text may be shown.
+fn fixed_public_message(reason: meerkat_contracts::WireAuthErrorReason) -> Option<&'static str> {
+    use meerkat_contracts::WireAuthErrorReason as R;
+    match reason {
+        R::Infrastructure => Some(INFRASTRUCTURE_PUBLIC_MESSAGE),
+        R::CredentialAccessDenied => Some(CREDENTIAL_ACCESS_DENIED_PUBLIC_MESSAGE),
+        R::CredentialInteractionRequired => Some(CREDENTIAL_INTERACTION_REQUIRED_PUBLIC_MESSAGE),
+        R::CredentialAccessPending => Some(CREDENTIAL_ACCESS_PENDING_PUBLIC_MESSAGE),
+        R::CredentialStoreUnavailable => Some(CREDENTIAL_STORE_UNAVAILABLE_PUBLIC_MESSAGE),
+        _ => None,
     }
 }
 
@@ -665,6 +731,8 @@ fn connector_refusal_reason(
         C::MissingScopes => R::MissingScopes,
         C::CredentialMismatch => R::CredentialMismatch,
         C::VerificationUnavailable => R::VerificationUnavailable,
+        // The host's own egress profile does not admit the endpoint.
+        C::EgressRefused(_) => R::InvalidTarget,
     }
 }
 
@@ -682,11 +750,31 @@ fn slot_refusal_reason(
     }
 }
 
+/// The public reason of a refused credential access. An unobserved or
+/// unsupported access is reported as the store being unavailable.
+fn credential_access_reason(
+    refusal: meerkat_providers::auth_store::TokenStoreRefusal,
+) -> meerkat_contracts::WireAuthErrorReason {
+    use meerkat_contracts::WireAuthErrorReason as R;
+    use meerkat_providers::auth_store::TokenStoreRefusal as Refusal;
+    match refusal {
+        Refusal::Denied => R::CredentialAccessDenied,
+        Refusal::InteractionRequired => R::CredentialInteractionRequired,
+        Refusal::Pending => R::CredentialAccessPending,
+        Refusal::Unavailable | Refusal::NotObserved | Refusal::Unsupported => {
+            R::CredentialStoreUnavailable
+        }
+    }
+}
+
 fn credential_mutation_reason(
     error: &CredentialMutationError,
 ) -> meerkat_contracts::WireAuthErrorReason {
     match error {
         CredentialMutationError::SlotRefused(refusal) => slot_refusal_reason(*refusal),
+        CredentialMutationError::CredentialAccess { refusal, .. } => {
+            credential_access_reason(*refusal)
+        }
         CredentialMutationError::StalePreparation
         | CredentialMutationError::Operation(_)
         | CredentialMutationError::TokenStore(_)
@@ -703,10 +791,14 @@ fn mcp_oauth_reason(error: &McpOAuthError) -> meerkat_contracts::WireAuthErrorRe
     match error {
         McpOAuthError::InvalidAccountSelection
         | McpOAuthError::UnsupportedAccountSelection
+        | McpOAuthError::RealmMismatch { .. }
         | McpOAuthError::TokenKey { .. } => R::InvalidTarget,
         McpOAuthError::AccountSelectionRequired => R::AccountSelectionRequired,
         McpOAuthError::Verification(refusal) => connector_refusal_reason(*refusal),
         McpOAuthError::Flow(error) => oauth_flow_reason(error),
+        // A confirmed retirement of the attempt the wait served.
+        McpOAuthError::AttemptRetired { .. } => R::AttemptMissing,
+        McpOAuthError::AdmissionReadFailed { read, .. } => mcp_oauth_reason(read),
         McpOAuthError::MissingStoredToken { .. }
         | McpOAuthError::HumanAuthorizationRequired { .. } => R::AuthorizationRequired,
         McpOAuthError::Callback { .. } => R::CallbackUnavailable,
@@ -714,14 +806,18 @@ fn mcp_oauth_reason(error: &McpOAuthError) -> meerkat_contracts::WireAuthErrorRe
         | McpOAuthError::RegistrationFailed { .. }
         | McpOAuthError::TokenExchangeFailed { .. }
         | McpOAuthError::RefreshFailed { .. } => R::UpstreamFailure,
+        // The host's own egress profile does not admit the destination.
+        McpOAuthError::EgressRefused { .. } => R::InvalidTarget,
         McpOAuthError::ReauthRequired { .. } => R::ReauthRequired,
         // The slot holds a credential this login may not replace.
         McpOAuthError::DisconnectRequired { .. } => R::SlotOccupied,
         McpOAuthError::CredentialSlot { refusal, .. } => slot_refusal_reason(*refusal),
+        McpOAuthError::CredentialAccess { refusal, .. } => credential_access_reason(*refusal),
         McpOAuthError::StalePreparation
         | McpOAuthError::TokenStore(_)
         | McpOAuthError::MissingStoredMetadata { .. }
         | McpOAuthError::AuthLifecycle { .. }
+        | McpOAuthError::EgressUnavailable { .. }
         | McpOAuthError::HttpClientUnavailable(_) => R::Infrastructure,
     }
 }
@@ -730,7 +826,9 @@ fn connector_reason(error: &ConnectorLoginError) -> meerkat_contracts::WireAuthE
     use meerkat_contracts::WireAuthErrorReason as R;
     match error {
         ConnectorLoginError::UnknownStrategy => R::UnknownStrategy,
-        ConnectorLoginError::InvalidRedirect => R::InvalidTarget,
+        ConnectorLoginError::InvalidRedirect | ConnectorLoginError::RemoteCustodyRequired => {
+            R::InvalidTarget
+        }
         ConnectorLoginError::Verification(refusal) => connector_refusal_reason(*refusal),
         ConnectorLoginError::Flow(error) => oauth_flow_reason(error),
         ConnectorLoginError::Slot(refusal) => slot_refusal_reason(*refusal),
@@ -738,10 +836,13 @@ fn connector_reason(error: &ConnectorLoginError) -> meerkat_contracts::WireAuthE
         | ConnectorLoginError::TokenExchangeFailed
         | ConnectorLoginError::RefreshFailed(_) => R::UpstreamFailure,
         ConnectorLoginError::ReauthRequired => R::ReauthRequired,
+        ConnectorLoginError::CredentialAccess { refusal, .. } => credential_access_reason(*refusal),
         ConnectorLoginError::StalePreparation
         | ConnectorLoginError::TokenStore(_)
         | ConnectorLoginError::AuthLifecycle(_)
         | ConnectorLoginError::HttpClientUnavailable(_) => R::Infrastructure,
+        ConnectorLoginError::ClientConfig(_)
+        | ConnectorLoginError::ClientSecretUnavailable { .. } => R::ConfigurationInvalid,
     }
 }
 
@@ -755,6 +856,20 @@ pub struct HostAuthService {
     http: Result<reqwest::Client, meerkat_providers::auth_oauth::CredentialHttpClientUnavailable>,
     mcp_account_strategy: Arc<dyn McpOAuthAccountStrategy>,
     connector_strategies: ConnectorStrategies,
+    /// The runtime realm whose MCP credentials this service owns.
+    mcp_realm: Option<RealmId>,
+    /// Host-installed connector client-auth profiles (secrets from host
+    /// configuration).
+    connector_client_auth: Vec<ConnectorClientAuthProfile>,
+    /// Provider protocols a client-auth profile may name.
+    connector_protocols: meerkat_providers::connector_protocol::ConnectorProtocols,
+    /// Where the connector owner reads the host's current client-auth
+    /// profiles at each use (normally the realm's configuration).
+    connector_client_source:
+        Option<Arc<dyn meerkat_providers::connector_login::ConnectorClientAuthSource>>,
+    /// The one connector OAuth owner, built on first use and shared by every
+    /// clone of this service. A connector builder starts a new one.
+    connector_authority: Arc<std::sync::OnceLock<ConnectorOAuthAuthority>>,
 }
 
 impl HostAuthService {
@@ -768,25 +883,110 @@ impl HostAuthService {
             http: meerkat_providers::auth_oauth::credential_http_client(),
             mcp_account_strategy: Arc::new(OidcUserInfoAccountStrategy::new()),
             connector_strategies: ConnectorStrategies::with_defaults(),
+            mcp_realm: None,
+            connector_client_auth: Vec::new(),
+            connector_protocols:
+                meerkat_providers::connector_protocol::ConnectorProtocols::with_defaults(),
+            connector_client_source: None,
+            connector_authority: Arc::default(),
         }
+    }
+
+    /// Scope MCP credentials to the host runtime's `realm`: its MCP
+    /// authority binds every target to that realm, so each realm has its own
+    /// MCP logins, refresh lineage and logout. Native hosts serving a realm
+    /// set this; the credential stored before realm scoping is left unused.
+    pub fn with_mcp_realm(mut self, realm: RealmId) -> Self {
+        self.mcp_realm = Some(realm);
+        self
+    }
+
+    /// Replace the provider protocols client-auth profiles may name. The
+    /// default set is the built-in Slack and Salesforce protocols.
+    pub fn with_connector_protocols(
+        mut self,
+        protocols: meerkat_providers::connector_protocol::ConnectorProtocols,
+    ) -> Self {
+        self.connector_protocols = protocols;
+        self.connector_authority = Arc::default();
+        self
+    }
+
+    /// Install the host's connector client-auth profiles (see
+    /// [`ConnectorClientAuthProfile`]). A connector login names one by id.
+    pub fn with_connector_client_auth_profiles(
+        mut self,
+        profiles: impl IntoIterator<Item = ConnectorClientAuthProfile>,
+    ) -> Self {
+        self.connector_client_auth = profiles.into_iter().collect();
+        self.connector_authority = Arc::default();
+        self
+    }
+
+    /// Read the connector client-auth profiles from `source` at each connector
+    /// login and refresh, next to any installed directly.
+    pub fn with_connector_client_source(
+        mut self,
+        source: Arc<dyn meerkat_providers::connector_login::ConnectorClientAuthSource>,
+    ) -> Self {
+        self.connector_client_source = Some(source);
+        self.connector_authority = Arc::default();
+        self
+    }
+
+    /// Use the connector clients `realm` declares in its configuration (its
+    /// own document folded over its parent chain), read at each use.
+    pub fn with_realm_connector_clients(
+        self,
+        source: Arc<dyn meerkat_core::RealmConfigSource>,
+        realm: RealmId,
+    ) -> Self {
+        self.with_connector_client_source(Arc::new(
+            crate::connector_clients::RealmConnectorClients::from_realm_source(source, realm),
+        ))
     }
 
     /// Install a connector account strategy (keyed by its strategy id) next
     /// to the default OIDC UserInfo strategy.
     pub fn with_connector_strategy(mut self, strategy: Arc<dyn ConnectorAccountStrategy>) -> Self {
         self.connector_strategies = self.connector_strategies.with(strategy);
+        self.connector_authority = Arc::default();
         self
+    }
+
+    /// Whether this service installs a connector client-auth profile whose
+    /// canonical meaning is exactly `binding` (`<id>@<sha256>`,
+    /// [`ConnectorClientAuthProfile::binding`]).
+    pub fn has_connector_client_auth_binding(&self, binding: &str) -> bool {
+        self.connector_client_auth
+            .iter()
+            .any(|profile| profile.binding() == binding)
     }
 
     /// The native connector OAuth owner bound to this service's persistence,
     /// AuthMachine lease and flow owner. Native hosts use it for bearer
     /// tokens (with refresh); its HTTP client follows no redirects.
+    ///
+    /// It is built once and retained: every connector method of this
+    /// service, and of every clone of it, runs on this same owner, and the
+    /// returned value is a handle to it, so attempts admitted through one
+    /// clone complete or cancel through another.
     pub fn connector_oauth_authority(&self) -> Result<ConnectorOAuthAuthority, HostAuthError> {
-        Ok(ConnectorOAuthAuthority::new(
+        if let Some(retained) = self.connector_authority.get() {
+            return Ok(retained.clone());
+        }
+        let built = ConnectorOAuthAuthority::new(
             self.persistence.clone(),
             self.authority.oauth_flow_authority(),
             self.connector_strategies.clone(),
-        )?)
+        )?
+        .with_client_auth_profiles(self.connector_client_auth.iter().cloned())?
+        .with_connector_protocols(self.connector_protocols.clone());
+        let built = match &self.connector_client_source {
+            Some(source) => built.with_client_auth_source(Arc::clone(source)),
+            None => built,
+        };
+        Ok(self.connector_authority.get_or_init(|| built).clone())
     }
 
     /// Admit one host-driven connector OAuth attempt into `target.slot`. The
@@ -802,8 +1002,11 @@ impl HostAuthService {
             .await?)
     }
 
-    /// Complete an admitted connector attempt from the host's loopback
-    /// callback. The admitted descriptor must equal `target`'s facts.
+    /// Complete an admitted connector attempt from the host's callback (a
+    /// loopback one, or a registered `https` one with the retained
+    /// `host_attempt_handle`). The admitted descriptor must equal `target`'s
+    /// facts, and the callback's `redirect_uri` must equal the admitted
+    /// attempt's; neither is taken on trust.
     pub async fn connector_login_complete(
         &self,
         target: &ConnectorOAuthTarget,
@@ -815,7 +1018,12 @@ impl HostAuthService {
             .await?)
     }
 
-    /// Retire the connector attempt admitted under `state` for `slot`.
+    /// Retire the connector attempt admitted under `state` for `slot`. `Ok`
+    /// means no credential will ever be published from that attempt; a
+    /// completion still running for it fails before its commit. A refusal
+    /// with the missing-attempt flow error means the attempt is already
+    /// terminal (committed, retired or never admitted); the completion's own
+    /// result, or [`connector_status`](Self::connector_status), reports which.
     pub fn connector_login_cancel(
         &self,
         slot: &CredentialAccountRef,
@@ -838,6 +1046,20 @@ impl HostAuthService {
         slot: &CredentialAccountRef,
     ) -> Result<ConnectorAuthStatus, HostAuthError> {
         Ok(self.connector_oauth_authority()?.status(slot).await?)
+    }
+
+    /// Passively check a connector slot's stored credential against
+    /// `expect`. It loads the persisted tokens (and may rehydrate the slot's
+    /// auth state from them) but extracts and uses no token, performs no
+    /// refresh and enters no call.
+    pub async fn connector_check_expectation(
+        &self,
+        expect: &meerkat_providers::connector_login::ConnectorCallExpectation,
+    ) -> Result<(), HostAuthError> {
+        Ok(self
+            .connector_oauth_authority()?
+            .check_expectation(expect)
+            .await?)
     }
 
     /// The redirect-free token-exchange client, or its typed build failure.
@@ -869,14 +1091,18 @@ impl HostAuthService {
     /// It uses its own HTTP client, which follows no redirects, rather than
     /// [`Self::with_http_client`]'s.
     pub fn mcp_oauth_authority(&self) -> Result<McpOAuthAuthority, HostAuthError> {
-        Ok(McpOAuthAuthority::new(
+        let authority = McpOAuthAuthority::new(
             self.persistence.clone(),
             self.authority.generated_auth_lease_handle(),
         )
         .with_interactive_strategy(
             self.authority.oauth_flow_authority(),
             Arc::clone(&self.mcp_account_strategy),
-        )?)
+        )?;
+        Ok(match &self.mcp_realm {
+            Some(realm) => authority.in_realm(realm.clone()),
+            None => authority,
+        })
     }
 
     /// Admit one host-driven MCP OAuth attempt. The returned projection is
@@ -958,11 +1184,21 @@ impl HostAuthService {
             .cancel_attempt_by_ref(target, attempt_ref)?)
     }
 
-    /// Disconnect one MCP target: remove its stored credential and release
-    /// the credential lifecycle. A pending attempt is unaffected, and nothing
-    /// is revoked at the provider.
+    /// Disconnect one MCP target: retire every attempt pending for it, then
+    /// remove its stored credential and release the credential lifecycle.
+    /// Nothing is revoked at the provider.
     pub async fn mcp_logout(&self, target: &McpServerIdentity) -> Result<(), HostAuthError> {
         Ok(self.mcp_oauth_authority()?.logout(target).await?)
+    }
+
+    /// `target` scoped to the realm whose MCP credentials this service
+    /// serves: the exact identity its login, logout and live connections use
+    /// for that credential slot (the configured target is realm-less).
+    pub fn mcp_target_in_service_realm(
+        &self,
+        target: &McpServerIdentity,
+    ) -> Result<McpServerIdentity, HostAuthError> {
+        Ok(target.scoped_to(self.mcp_realm.as_ref())?)
     }
 
     /// Secret-free authorization status of one MCP target, projected from
@@ -972,10 +1208,14 @@ impl HostAuthService {
         &self,
         target: &McpServerIdentity,
     ) -> Result<HostMcpAuthStatus, HostAuthError> {
+        let target = &target.scoped_to(self.mcp_realm.as_ref())?;
         let stored = self
             .persistence
             .token_store()
-            .load(&target.token_key()?)
+            .load_for(
+                &target.token_key()?,
+                meerkat_providers::auth_store::TokenStoreAccess::Status,
+            )
             .await?
             .filter(|tokens| {
                 tokens.auth_mode == meerkat_providers::auth_store::PersistedAuthMode::McpOauth
@@ -1061,29 +1301,42 @@ impl HostAuthService {
             .unwrap_or(false);
         let store = self.persistence.token_store();
         let mut stored = None;
+        let mut credential_observation = None;
         if source_uses_store {
+            // Status never waits behind credential work and never starts an
+            // operating-system credential read.
             let phase = AuthStatusPhase::from_lease_snapshot(now, &snapshot);
-            if phase.is_no_live_lease() {
-                if let Some(expected_mode) = expected_mode {
-                    stored = meerkat_core::rehydrate_marked_tokens_for_status_for_identity(
-                        store.as_ref(),
-                        &auth_lease,
-                        &resolved.credential_identity,
-                        expected_mode,
-                        now,
-                    )
-                    .await
-                    .map_err(HostAuthError::StatusRehydrate)?;
-                    snapshot = auth_lease.snapshot(&lease_key);
+            let read = if phase.is_no_live_lease() {
+                match expected_mode {
+                    Some(expected_mode) => {
+                        let read = meerkat_core::observe_marked_tokens_for_status_for_identity(
+                            store.as_ref(),
+                            &auth_lease,
+                            &resolved.credential_identity,
+                            expected_mode,
+                            now,
+                        )
+                        .await
+                        .map_err(HostAuthError::StatusRehydrate)?;
+                        snapshot = auth_lease.snapshot(&lease_key);
+                        Some(read)
+                    }
+                    None => None,
                 }
             } else {
-                stored = store
-                    .load(
-                        &meerkat_providers::auth_store::TokenKey::from_credential_identity(
-                            &resolved.credential_identity,
-                        ),
-                    )
-                    .await?;
+                Some(meerkat_core::CredentialStatusRead::from_observation(
+                    store
+                        .observe_status(
+                            &meerkat_providers::auth_store::TokenKey::from_credential_identity(
+                                &resolved.credential_identity,
+                            ),
+                        )
+                        .await?,
+                ))
+            };
+            if let Some(read) = read {
+                credential_observation = read.observation();
+                stored = read.into_tokens();
             }
         }
         if stored
@@ -1112,6 +1365,7 @@ impl HostAuthService {
             account_id: projection
                 .tokens
                 .and_then(|tokens| tokens.account_id.clone()),
+            credential_observation,
         })
     }
 
@@ -1405,6 +1659,65 @@ mod tests {
     };
     use std::sync::Arc;
 
+    #[test]
+    fn credential_access_public_messages_preserve_reasons_without_internal_details() {
+        use meerkat_contracts::WireAuthErrorReason as Reason;
+        use meerkat_providers::auth_store::{TokenStoreAccess, TokenStoreRefusal};
+
+        const DETAIL: &str = "private-credential-detail-canary-150a";
+        const BACKEND: &str = "private-credential-backend-canary-150a";
+        let cases = [
+            (
+                HostAuthError::Connector(ConnectorLoginError::CredentialAccess {
+                    refusal: TokenStoreRefusal::Denied,
+                    detail: DETAIL.into(),
+                }),
+                Reason::CredentialAccessDenied,
+            ),
+            (
+                HostAuthError::McpOAuth(McpOAuthError::CredentialAccess {
+                    refusal: TokenStoreRefusal::InteractionRequired,
+                    detail: DETAIL.into(),
+                }),
+                Reason::CredentialInteractionRequired,
+            ),
+            (
+                HostAuthError::CredentialMutation(CredentialMutationError::CredentialAccess {
+                    refusal: TokenStoreRefusal::Pending,
+                    detail: DETAIL.into(),
+                }),
+                Reason::CredentialAccessPending,
+            ),
+            (
+                HostAuthError::TokenStore(TokenStoreError::refused(
+                    BACKEND,
+                    TokenStoreAccess::Interactive,
+                    TokenStoreRefusal::Unavailable,
+                    DETAIL,
+                )),
+                Reason::CredentialStoreUnavailable,
+            ),
+            (
+                HostAuthError::TokenStore(TokenStoreError::BackendFailed {
+                    backend: BACKEND,
+                    detail: DETAIL.into(),
+                }),
+                Reason::CredentialStoreUnavailable,
+            ),
+        ];
+        for (error, expected_reason) in cases {
+            assert_eq!(error.reason(), expected_reason);
+            assert!(error.to_string().contains(DETAIL));
+            if matches!(&error, HostAuthError::TokenStore(_)) {
+                assert!(error.to_string().contains(BACKEND));
+            }
+            let public = error.public_message();
+            assert!(!public.is_empty());
+            assert!(!public.contains(DETAIL), "{expected_reason:?}: {public}");
+            assert!(!public.contains(BACKEND), "{expected_reason:?}: {public}");
+        }
+    }
+
     fn config_with_inherited_openai() -> Config {
         let mut config = Config::default();
         let mut global = RealmConfigSection::default();
@@ -1499,6 +1812,54 @@ mod tests {
             resolve_writable_oauth_target(&config, &target),
             Err(HostAuthError::OAuthTarget(_))
         ));
+    }
+
+    /// The native MCP OAuth owner states a connection's account from its
+    /// local selection alone: a Known selection is its subject at the
+    /// server's origin (never the URL's path, query or userinfo); a
+    /// discovered, unverified or legacy selection states none.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn the_mcp_oauth_owner_states_only_a_known_selection_as_the_account() {
+        use meerkat_core::OperationAccount;
+        use meerkat_core::mcp_config::{McpOAuthAccountSelection, McpTransportConfig};
+        use meerkat_mcp::McpAuthResolver as _;
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let persistence = ProviderAuthPersistence::new(
+            Arc::new(meerkat_providers::auth_store::EphemeralTokenStore::new()),
+            Arc::new(meerkat_providers::auth_store::InMemoryCoordinator::new()),
+        );
+        let authority =
+            HostAuthService::new(persistence, runtime.provider_auth_runtime_authority())
+                .mcp_oauth_authority()
+                .expect("the MCP OAuth owner");
+        let target = |account: Option<&str>, selection: Option<McpOAuthAccountSelection>| {
+            let mut server = meerkat_core::McpServerConfig::streamable_http(
+                "mail",
+                "https://user:pw@mcp.example:8443/api?token=x",
+                std::collections::HashMap::new(),
+            );
+            if let McpTransportConfig::Http(http) = &mut server.transport {
+                http.oauth_account = account.map(str::to_owned);
+                http.oauth_account_selection = selection;
+            }
+            meerkat_providers::mcp_oauth::McpServerIdentity::from_config(&server)
+                .expect("the server's OAuth target")
+        };
+        assert_eq!(
+            authority.selected_account(&target(Some("subject-7"), None)),
+            OperationAccount::selected("https://mcp.example:8443", "subject-7")
+        );
+        for unstated in [
+            target(None, None),
+            target(None, Some(McpOAuthAccountSelection::Discover)),
+            target(None, Some(McpOAuthAccountSelection::Unverified)),
+        ] {
+            assert_eq!(
+                authority.selected_account(&unstated),
+                OperationAccount::Unavailable
+            );
+        }
     }
 
     #[tokio::test]

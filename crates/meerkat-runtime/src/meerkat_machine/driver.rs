@@ -987,6 +987,33 @@ impl DriverEntry {
         }
     }
 
+    pub(crate) fn bind_scoped_context_within(
+        &mut self,
+        binding: String,
+        scope: String,
+        generation: u64,
+        within: impl FnOnce(&mut dyn FnMut()) -> Result<(), RuntimeDriverError>,
+    ) -> Result<(), RuntimeDriverError> {
+        self.shell_driver_mut()
+            .bind_scoped_context_within(binding, scope, generation, within)
+    }
+
+    /// Whether the session document is currently bound to exactly `binding`
+    /// at `generation`.
+    pub(crate) fn scoped_context_is(&mut self, binding: &str, generation: u64) -> bool {
+        self.shell_driver_mut().with_dsl_state(|state| {
+            state.scoped_context_binding.as_deref() == Some(binding)
+                && state.scoped_context_generation == generation
+        })
+    }
+
+    pub(crate) fn retire_scoped_context(
+        &mut self,
+        generation: u64,
+    ) -> Result<(), RuntimeDriverError> {
+        self.shell_driver_mut().retire_scoped_context(generation)
+    }
+
     fn stage_interaction_terminal_outboxes(
         &mut self,
         outboxes: Vec<crate::input_state::InteractionTerminalOutbox>,
@@ -4763,6 +4790,18 @@ impl DriverEntry {
         }
     }
 
+    /// Give the driver a lineage clone of the registration's hosting claim,
+    /// for the work contexts it stages with a consent scope.
+    pub(crate) fn set_consent_hosting(
+        &mut self,
+        claim: meerkat_core::session_hosting::HostingClaim,
+    ) {
+        match self {
+            DriverEntry::Ephemeral(d) => d.set_consent_hosting(Some(claim)),
+            DriverEntry::Persistent(d) => d.inner_mut().set_consent_hosting(Some(claim)),
+        }
+    }
+
     pub(crate) fn batch_work_authorization(
         &self,
         run_id: &RunId,
@@ -5702,6 +5741,7 @@ impl DriverEntry {
     pub(crate) async fn commit_prepared_destroy_lifecycle(
         &mut self,
         lifecycle: PreparedDestroyLifecycle,
+        runless_terminal: &mut super::RunlessTerminalAnnouncement,
     ) -> Result<(), RuntimeDriverError> {
         match (self, lifecycle) {
             (DriverEntry::Ephemeral(_), PreparedDestroyLifecycle::Ephemeral(_)) => Ok(()),
@@ -5710,7 +5750,7 @@ impl DriverEntry {
                 PreparedDestroyLifecycle::PersistentFailStop { changed_input_ids },
             ) => {
                 driver
-                    .commit_prepared_destroy_lifecycle(changed_input_ids)
+                    .commit_prepared_destroy_lifecycle(changed_input_ids, runless_terminal)
                     .await
             }
             _ => Err(RuntimeDriverError::Internal(
@@ -9086,11 +9126,14 @@ pub(crate) fn machine_prepare_destroy(
     driver.prepare_destroy_lifecycle()
 }
 
+/// Commit a prepared destroy. A durable commit of the inputs the destroy
+/// abandoned owes `runless_terminal` before the fallible steps after it.
 pub(crate) async fn machine_commit_prepared_destroy(
     driver: &mut DriverEntry,
     lifecycle: PreparedDestroyLifecycle,
+    runless_terminal: &mut super::RunlessTerminalAnnouncement,
 ) -> Result<(), RuntimeDriverError> {
-    Box::pin(driver.commit_prepared_destroy_lifecycle(lifecycle)).await?;
+    Box::pin(driver.commit_prepared_destroy_lifecycle(lifecycle, runless_terminal)).await?;
     driver.sync_control_projection_from_dsl_authority();
     Ok(())
 }
@@ -9107,16 +9150,22 @@ pub(crate) async fn machine_retire(
     }
 }
 
+/// Realize Reset. The inputs it abandons are owed to `runless_terminal` at
+/// their acknowledged commit, before the fallible steps after it.
 pub(crate) async fn machine_reset(
     driver: &mut DriverEntry,
+    runless_terminal: &mut super::RunlessTerminalAnnouncement,
 ) -> Result<ResetReport, RuntimeDriverError> {
     match driver {
         DriverEntry::Ephemeral(d) => {
             let report = d.reset_cleanup()?;
+            if report.inputs_abandoned > 0 {
+                runless_terminal.owe();
+            }
             d.sync_control_projection_from_dsl_authority();
             Ok(report)
         }
-        DriverEntry::Persistent(d) => d.realize_reset_lifecycle().await,
+        DriverEntry::Persistent(d) => d.realize_reset_lifecycle(runless_terminal).await,
     }
 }
 
@@ -9169,6 +9218,7 @@ pub(crate) async fn prepare_runtime_loop_batch_start(
     driver: &SharedDriver,
     run_id: RunId,
     batch: AuthorizedRuntimeLoopBatch,
+    runless_terminal: super::RunlessTerminalAnnouncement,
 ) -> Result<RuntimeLoopBatchStart, RuntimeDriverError> {
     let mut driver = Arc::clone(driver).lock_owned().await;
     let staged_ids = batch.input_ids().to_vec();
@@ -9206,15 +9256,26 @@ pub(crate) async fn prepare_runtime_loop_batch_start(
             // refusal probe cannot attribute a batch-level refusal to any
             // single member, so it would need a whole-batch fallback anyway -
             // a second, untested path through the never-starve floor.
+            //
+            // The handoff owns the announcement of the inputs it terminalizes
+            // at the retry cap and tells it once the driver guard is
+            // released, whether or not this caller still awaits the handoff.
             let handoff = crate::tokio::spawn(async move {
-                let abandoned_input_ids = driver
-                    .resolve_unstageable_queued_inputs(&run_id, &staged_ids, &reason)
-                    .await
-                    .map_err(|resolve_err| {
-                        RuntimeDriverError::Internal(format!(
-                            "failed to resolve unstageable queued inputs: {resolve_err}; staging refusal: {reason}"
-                        ))
-                    })?;
+                let mut runless_terminal = runless_terminal;
+                let resolved = {
+                    let mut held_driver = driver;
+                    held_driver
+                        .resolve_unstageable_queued_inputs(&run_id, &staged_ids, &reason)
+                        .await
+                };
+                let abandoned_input_ids = resolved.map_err(|resolve_err| {
+                    RuntimeDriverError::Internal(format!(
+                        "failed to resolve unstageable queued inputs: {resolve_err}; staging refusal: {reason}"
+                    ))
+                })?;
+                if !abandoned_input_ids.is_empty() {
+                    runless_terminal.owe();
+                }
                 Ok(RuntimeLoopBatchStart::StageRefused {
                     reason,
                     abandoned_input_ids,

@@ -97,7 +97,8 @@ fn spawn_test_server() -> (
         )
         .expect("construct runtime authority"),
         meerkat_rpc::router::NotificationSink::noop(),
-    );
+    )
+    .expect("compose the RPC session runtime");
     let config_store: Arc<dyn meerkat_core::ConfigStore> = Arc::new(MemoryConfigStore::new(
         Config::default(),
         meerkat_models::canonical(),
@@ -312,7 +313,7 @@ async fn runtime_skill_refs_reach_canonical_history_and_provider_bytes() {
                 Arc::new(MemoryBlobStore::new()),
             ).expect("construct runtime authority"),
             meerkat_rpc::router::NotificationSink::noop(),
-        ));
+        ).expect("compose the RPC session runtime"));
         runtime.set_default_llm_client(Some(Arc::new(client)));
         runtime.set_config_runtime(Arc::new(ConfigRuntime::new(
             config_store.clone(), directory.path().join("config-state.json"),

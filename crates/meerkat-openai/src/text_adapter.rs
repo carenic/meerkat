@@ -346,6 +346,9 @@ fn convert_messages(messages: &[Message]) -> Result<Vec<Item>, LlmError> {
                     }],
                 });
             }
+            // Text-only: notice media (comms, external-event or runtime
+            // notice content) reaches the realtime session only as the
+            // placeholders in the notice's text projection.
             Message::SystemNotice(notice) => {
                 items.push(Item::Message {
                     id: None,
@@ -802,6 +805,40 @@ mod tests {
             } if matches!(
                 content.as_slice(),
                 [ContentPart::InputText { text }] if text.contains("notice")
+            )
+        ));
+    }
+
+    #[test]
+    fn convert_messages_keeps_runtime_notice_media_text_only() {
+        // The realtime text adapter carries notice media only as the
+        // placeholder in the notice's text projection, never as media.
+        let notice = SystemNoticeMessage::with_block(
+            SystemNoticeKind::Generic,
+            None,
+            meerkat_core::SystemNoticeBlock::RuntimeNotice {
+                category: "consent_attempt".to_string(),
+                detail: Some("correlated result".to_string()),
+                payload: None,
+                content: vec![ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: ImageData::Inline {
+                        data: "iVBOR...".to_string(),
+                    },
+                }],
+            },
+        );
+        let items = convert_messages(&[Message::SystemNotice(notice)]).expect("convert notice");
+        assert!(matches!(
+            items.as_slice(),
+            [Item::Message {
+                role: Role::User,
+                content,
+                ..
+            }] if matches!(
+                content.as_slice(),
+                [ContentPart::InputText { text }]
+                    if text.contains("correlated result") && text.contains("[image: image/png]")
             )
         ));
     }

@@ -70,6 +70,7 @@ async fn documented_cost_tracker_runs_through_hook_engine() {
                         ..Usage::default()
                     }),
                     server_tool_content: vec![],
+                    operation: Default::default(),
                 }),
                 tool_call: None,
                 tool_result: None,

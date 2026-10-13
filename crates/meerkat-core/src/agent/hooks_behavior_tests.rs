@@ -219,6 +219,13 @@ struct TestHookEngine {
 
 #[async_trait]
 impl HookEngine for TestHookEngine {
+    fn mandatory_topology(
+        &self,
+        _overrides: Option<&crate::config::HookRunOverrides>,
+    ) -> Result<crate::hooks::HookMandatoryTopology, crate::hooks::HookEngineError> {
+        Ok(crate::hooks::HookMandatoryTopology::none())
+    }
+
     async fn execute(
         &self,
         invocation: HookInvocation,

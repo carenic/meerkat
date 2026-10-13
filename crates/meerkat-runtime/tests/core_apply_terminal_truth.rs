@@ -496,7 +496,12 @@ fn core_apply_terminal_truth_has_one_authority() -> Result<(), String> {
         .find("externalize_input_images(self.blob_store.as_ref(), &mut input_for_recovery)")
         .ok_or_else(|| "persistent accept must externalize images before admission".to_string())?;
     let final_authentication = persistent_accept
-        .rfind(".authenticate_work_with_credential(&input, custody)?")
+        .rfind(".authenticate_work_with_credential_replay(")
+        .filter(|&replay| {
+            persistent_accept[replay..]
+                .split_once(")?;")
+                .is_some_and(|(call, _)| call.contains("NativeReplayLookup::FirstAuthentication"))
+        })
         .ok_or_else(|| {
             "persistent accept must revalidate after image externalization".to_string()
         })?;

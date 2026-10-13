@@ -27,9 +27,18 @@ pub enum CredentialReadiness {
     /// The binding's credential lifecycle requires an interactive login.
     NeedsReauth,
     /// The source can only be observed by materializing it (an external
-    /// resolver, a credential command, a host file descriptor), so the open
-    /// resolves it and reports any failure there.
+    /// resolver, a credential command, a host file descriptor, an
+    /// operating-system keychain), so the open resolves it and reports any
+    /// failure there.
     MaterializedAtOpen,
+    /// The credential store reported that the user denied access. Not absence.
+    AccessDenied,
+    /// The credential store reported that reading needs user interaction.
+    InteractionRequired,
+    /// The credential store or the credential's owner could not answer now
+    /// (a lookup is pending, the owner is busy, or the store failed). Not
+    /// absence.
+    Unavailable,
 }
 
 impl CredentialReadiness {

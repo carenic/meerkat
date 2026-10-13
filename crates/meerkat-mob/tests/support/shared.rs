@@ -426,6 +426,10 @@ pub struct HostFixtureOptions {
     /// ensure returns, before the materializer publishes attach success.
     /// Deterministically exercises executor-sidecar startup cleanup.
     pub stop_first_executor_after_ensure: bool,
+    /// Host selection of each placed member's destination, installed on the
+    /// member's registration by the host's member substrate.
+    pub member_runtime_registration_hook:
+        Option<Arc<dyn meerkat_mob::MemberRuntimeRegistrationHook>>,
     /// Phase 3: LLM client for MEMBER sessions built on this host (`None` ⇒
     /// `TestClient::default()`). Inject [`OneShotToolCallClient`] to drive a
     /// member turn through one deterministic tool call (upcall/budget rows).
@@ -470,6 +474,7 @@ impl HostFixtureOptions {
             failing_archive_with_mob_lifecycle_authority_calls: 0,
             failing_first_projection_drain: false,
             stop_first_executor_after_ensure: false,
+            member_runtime_registration_hook: None,
             member_llm_client: None,
             failing_member_region_persistence: false,
             listen_tcp: None,
@@ -2092,6 +2097,7 @@ pub async fn spawn_host_daemon_fixture(
             Some(HostMemberSubstrate {
                 session_service: service,
                 runtime_adapter: adapter,
+                member_runtime_registration_hook: opts.member_runtime_registration_hook.clone(),
                 tool_consequence_policy_registry: None,
                 durable_event_log: None,
                 realm_backend_persistent: false,
@@ -2163,6 +2169,7 @@ pub async fn spawn_host_daemon_fixture(
             Some(HostMemberSubstrate {
                 session_service: mob_service,
                 runtime_adapter: adapter,
+                member_runtime_registration_hook: opts.member_runtime_registration_hook.clone(),
                 tool_consequence_policy_registry: None,
                 durable_event_log: member_durable_log.clone().map(|log| {
                     log as Arc<dyn meerkat_runtime::member_observation::DurableEventLogRead>

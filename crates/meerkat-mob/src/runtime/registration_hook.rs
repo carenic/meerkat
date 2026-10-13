@@ -1,0 +1,400 @@
+//! Host selection of a member's scoped destination at the exact native
+//! registration boundary.
+//!
+//! A configured host only selects. The provisioner installs the selected
+//! destination itself, on the machine that minted the member's exact
+//! registration, so a host can neither skip the install nor bind another
+//! runtime owner's session. The host never receives the machine.
+
+use crate::MobError;
+use meerkat_authorization_contracts::constraints::AudienceRef;
+use meerkat_authorization_contracts::evidence::EvidenceId;
+use meerkat_authorization_contracts::work_association::NativeWorkTarget;
+use meerkat_core::auth::PrincipalRef;
+use meerkat_core::{MobMemberBinding, RealmId};
+use meerkat_runtime::meerkat_machine::SessionAgentMandate;
+use meerkat_runtime::{LogicalRuntimeId, MeerkatMachine, RuntimeSessionRegistrationWitness};
+use std::sync::Arc;
+
+/// The destination a host selects for one member: everything of the
+/// member's scoped target except its runtime, which only the member's exact
+/// registration names. A host can therefore never select another runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberDestinationSelection {
+    pub logical_owner: PrincipalRef,
+    pub context: EvidenceId,
+    pub context_generation: u64,
+    pub audience: AudienceRef,
+}
+
+impl MemberDestinationSelection {
+    /// The full scoped target for the session `registration` registered. The
+    /// context must be that session's own document: a host cannot relabel a
+    /// member's history under another context.
+    fn target_for(
+        &self,
+        registration: &RuntimeSessionRegistrationWitness,
+        identity: &MemberRuntimeBuildIdentity,
+    ) -> Result<NativeWorkTarget, MobError> {
+        if self.context != identity.session_document {
+            return Err(MobError::WiringError(
+                "the selected context is not the member's own session document".into(),
+            ));
+        }
+        let runtime = LogicalRuntimeId::for_session(registration.session_id());
+        let logical_runtime = EvidenceId::new(runtime.to_string()).map_err(|error| {
+            MobError::Internal(format!("member runtime is not a valid target id: {error}"))
+        })?;
+        Ok(NativeWorkTarget {
+            logical_owner: self.logical_owner.clone(),
+            logical_runtime,
+            context: self.context.clone(),
+            context_generation: self.context_generation,
+            audience: self.audience.clone(),
+        })
+    }
+}
+
+/// The canonical context of a registered member: its own session document.
+fn session_document(
+    registration: &RuntimeSessionRegistrationWitness,
+) -> Result<EvidenceId, MobError> {
+    EvidenceId::new(registration.session_id().to_string()).map_err(|error| {
+        MobError::Internal(format!("member session is not a valid context id: {error}"))
+    })
+}
+
+/// Immutable native build identity of the receiving member. Application
+/// labels, prompts and session contents are deliberately absent: hosts
+/// choose their destination from these typed facts only.
+#[derive(Clone, Debug)]
+pub struct MemberRuntimeBuildIdentity {
+    realm_id: RealmId,
+    member: MobMemberBinding,
+    session_document: EvidenceId,
+}
+
+impl MemberRuntimeBuildIdentity {
+    pub fn realm_id(&self) -> &RealmId {
+        &self.realm_id
+    }
+
+    pub fn member(&self) -> &MobMemberBinding {
+        &self.member
+    }
+
+    /// The member's own session document, the only context a selection may
+    /// name.
+    pub fn session_document(&self) -> &EvidenceId {
+        &self.session_document
+    }
+
+    pub(super) fn from_request(
+        req: &meerkat_core::service::CreateSessionRequest,
+        registration: &RuntimeSessionRegistrationWitness,
+    ) -> Result<Self, MobError> {
+        let build = req.build.as_ref().ok_or_else(|| {
+            MobError::Internal("registration hook requires native member build identity".into())
+        })?;
+        let member = build.mob_member_binding.clone().ok_or_else(|| {
+            MobError::Internal("registration hook requires native MobMemberBinding".into())
+        })?;
+        let realm_id = build.realm_id.clone().ok_or_else(|| {
+            MobError::Internal("registration hook requires native member realm".into())
+        })?;
+        let expected_realm = meerkat_core::mob_realm_id(&member.mob_id)
+            .map_err(|error| MobError::Internal(error.to_string()))?;
+        let comms_name = member
+            .comms_name()
+            .map_err(|error| MobError::Internal(error.to_string()))?;
+        if realm_id != expected_realm
+            || build.comms_name.as_deref() != Some(comms_name.to_string().as_str())
+        {
+            return Err(MobError::Internal(
+                "registration hook member identity disagrees with native realm or comms binding"
+                    .into(),
+            ));
+        }
+        Ok(Self {
+            realm_id,
+            member,
+            session_document: session_document(registration)?,
+        })
+    }
+}
+
+/// Optional host composition, never queue admission or permission. Both
+/// methods are required: a configured host must fail closed when it cannot
+/// select. Absence preserves the existing unscoped runtime behavior.
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+pub trait MemberRuntimeRegistrationHook: Send + Sync {
+    /// Select the destination a newly registered member's session document is
+    /// bound to. Called while the member's prepared registration transaction
+    /// owns cleanup, before actor creation; a refusal rolls that transaction
+    /// back exactly. The provisioner installs the returned target.
+    async fn select_destination(
+        &self,
+        identity: &MemberRuntimeBuildIdentity,
+    ) -> Result<MemberDestinationSelection, MobError>;
+
+    /// The destination the host still expects for an already attached member.
+    /// Read-only: never a cold setter and never physical work. The machine
+    /// checks it against the member's current binding inside the same
+    /// preparation that recovers the member's actor.
+    async fn expected_destination(
+        &self,
+        identity: &MemberRuntimeBuildIdentity,
+    ) -> Result<MemberDestinationSelection, MobError>;
+
+    /// Select the agent a NEW member's registration acts as: its qualified
+    /// executor, the represented subject and the exact grant lineage selected
+    /// for each configured server, from the host's own trusted installation
+    /// facts (the identity's labels authorize nothing). Called after the
+    /// member's destination is installed and before its agent or any of its
+    /// tools is built; the provisioner binds the returned mandate on the
+    /// member's exact registration. A refusal rolls the registration back
+    /// exactly. The default selects none: the registration stays unbound, so
+    /// its configured servers are refused as unavailable.
+    async fn select_agent_mandate(
+        &self,
+        _identity: &MemberRuntimeBuildIdentity,
+    ) -> Result<Option<SessionAgentMandate>, MobError> {
+        Ok(None)
+    }
+
+    /// The agent mandate the host still expects an already attached member's
+    /// registration to be bound to (`None`: unbound). Read-only: recovery
+    /// never binds or rebinds the agent. The machine checks it against the
+    /// registration's binding inside the same preparation that recovers the
+    /// member's actor; a mismatch refuses the recovery and leaves the binding
+    /// as it is (a surface gate the recovery installed before the check
+    /// stays). The default expects none.
+    async fn expected_agent_mandate(
+        &self,
+        _identity: &MemberRuntimeBuildIdentity,
+    ) -> Result<Option<SessionAgentMandate>, MobError> {
+        Ok(None)
+    }
+
+    /// Check the member's ACTUAL visible tool surface, as its built session
+    /// owns it, before the member is published (a new member before its
+    /// first turn; a recovered actor before it is committed). Tool
+    /// provenance is attribution only: the host compares this surface with
+    /// its own committed activation, which owns the association between an
+    /// installed artifact and its tools. A refusal discards the member
+    /// exactly; effects its construction already started are not undone.
+    async fn verify_member_surface(
+        &self,
+        identity: &MemberRuntimeBuildIdentity,
+        surface: &[meerkat_core::ToolDef],
+    ) -> Result<(), MobError>;
+
+    /// Select the policy a NEW member's construction is finished under, from
+    /// its prepared tool surface: the actual winning tool identities of its
+    /// one construction, after it is composed and before it is finished. The
+    /// host compiles and commits what it needs (its application tool policy,
+    /// its installed-artifact associations) to its own owners here and
+    /// returns the resolved `Provider` binding with the exact surface it
+    /// compiled against; the construction binds it, with its own member and
+    /// registry, when it is finished. A refusal abandons the construction and
+    /// discards the member exactly. A host that selects nothing cannot
+    /// complete a member it registers: the default refuses.
+    async fn prepare_member_surface(
+        &self,
+        _identity: &MemberRuntimeBuildIdentity,
+        _surface: &meerkat_core::PreparedToolSurface,
+    ) -> Result<meerkat_core::ToolSurfaceSelection, MobError> {
+        Err(MobError::WiringError(
+            "the member's host selected no application tool policy for its prepared surface".into(),
+        ))
+    }
+}
+
+/// Where a member's provision records the selection its host made for the
+/// member's prepared surface. The construction is finished only under that
+/// selection, so a recorded selection of a finished member is the one its
+/// agent was finished under.
+#[derive(Clone, Default)]
+pub(super) struct MemberSurfaceSelectionSlot(
+    Arc<std::sync::Mutex<Option<meerkat_core::ToolSurfaceSelection>>>,
+);
+
+impl MemberSurfaceSelectionSlot {
+    fn record(&self, selection: &meerkat_core::ToolSurfaceSelection) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(selection.clone());
+    }
+
+    pub(super) fn selection(&self) -> Option<meerkat_core::ToolSurfaceSelection> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// A new member registration's tool-surface gate: its host's
+/// [`MemberRuntimeRegistrationHook::prepare_member_surface`] for that member.
+struct MemberSurfaceGate {
+    hook: Arc<dyn MemberRuntimeRegistrationHook>,
+    identity: MemberRuntimeBuildIdentity,
+    selected: Option<MemberSurfaceSelectionSlot>,
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl meerkat_core::ToolSurfaceGate for MemberSurfaceGate {
+    async fn decide(
+        &self,
+        surface: &meerkat_core::PreparedToolSurface,
+    ) -> Result<meerkat_core::ToolSurfaceSelection, meerkat_core::ToolSurfaceRefusal> {
+        let selection = self
+            .hook
+            .prepare_member_surface(&self.identity, surface)
+            .await
+            .map_err(|error| meerkat_core::ToolSurfaceRefusal::new(error.to_string()))?;
+        if let Some(selected) = &self.selected {
+            selected.record(&selection);
+        }
+        Ok(selection)
+    }
+}
+
+/// Install the host's surface selection on the member's exact registration,
+/// before its agent is built: a new member's, or a recovered member's whose
+/// registration carries none yet (a registration keeps the gate it was
+/// given; a replaced registration starts without one).
+pub(super) async fn install_member_surface_gate(
+    machine: &MeerkatMachine,
+    hook: Arc<dyn MemberRuntimeRegistrationHook>,
+    registration: &RuntimeSessionRegistrationWitness,
+    identity: &MemberRuntimeBuildIdentity,
+    selected: Option<MemberSurfaceSelectionSlot>,
+) -> Result<(), MobError> {
+    if machine
+        .session_tool_surface_gate(registration.session_id())
+        .await
+        .is_some()
+    {
+        return Ok(());
+    }
+    machine
+        .bind_session_tool_surface_gate(
+            registration,
+            Arc::new(MemberSurfaceGate {
+                hook,
+                identity: identity.clone(),
+                selected,
+            }),
+        )
+        .await
+        .map_err(|error| {
+            MobError::WiringError(format!(
+                "member tool-surface decision could not be installed on its registration: {error}"
+            ))
+        })
+}
+
+/// Bind the host's selected agent mandate on the member's exact registration,
+/// before its agent is built. Nothing is bound when the host selects none.
+pub(super) async fn install_selected_agent_mandate(
+    machine: &MeerkatMachine,
+    hook: &dyn MemberRuntimeRegistrationHook,
+    registration: &RuntimeSessionRegistrationWitness,
+    identity: &MemberRuntimeBuildIdentity,
+) -> Result<(), MobError> {
+    let Some(mandate) = hook.select_agent_mandate(identity).await? else {
+        return Ok(());
+    };
+    machine
+        .bind_session_agent_mandate(registration, mandate)
+        .await
+        .map_err(|error| {
+            MobError::WiringError(format!(
+                "member agent mandate could not be bound on its registration: {error}"
+            ))
+        })
+}
+
+/// The runtime owner and host selected for one backend; present only when
+/// both are configured.
+pub(super) type MemberRegistrationComposition =
+    Option<(Arc<MeerkatMachine>, Arc<dyn MemberRuntimeRegistrationHook>)>;
+
+/// Select and install a newly registered member's destination on the exact
+/// registration's own machine.
+pub(super) async fn install_selected_destination(
+    machine: &MeerkatMachine,
+    hook: &dyn MemberRuntimeRegistrationHook,
+    registration: &RuntimeSessionRegistrationWitness,
+    req: &meerkat_core::service::CreateSessionRequest,
+) -> Result<MemberRuntimeBuildIdentity, MobError> {
+    require_deferred_first_turn(req)?;
+    let identity = MemberRuntimeBuildIdentity::from_request(req, registration)?;
+    let target = hook
+        .select_destination(&identity)
+        .await?
+        .target_for(registration, &identity)?;
+    machine
+        .bind_scoped_context(registration, &target)
+        .await
+        .map_err(|error| {
+            MobError::WiringError(format!(
+                "member destination could not be installed on its registration: {error}"
+            ))
+        })?;
+    Ok(identity)
+}
+
+/// The member's surface is verified before its first turn, so a hooked
+/// member, created or recovered, is built on the deferred route only; an
+/// eager request is refused before the host is asked.
+fn require_deferred_first_turn(
+    req: &meerkat_core::service::CreateSessionRequest,
+) -> Result<(), MobError> {
+    if req.initial_turn == meerkat_core::service::InitialTurnPolicy::RunImmediately {
+        return Err(MobError::WiringError(
+            "a member registered through a host hook is created with a deferred first turn".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Hand the built member's actual visible tool surface to the host before
+/// the member is published.
+pub(super) async fn verify_member_surface(
+    hook: &dyn MemberRuntimeRegistrationHook,
+    session_service: &dyn super::MobSessionService,
+    session_id: &meerkat_core::types::SessionId,
+    identity: &MemberRuntimeBuildIdentity,
+) -> Result<(), MobError> {
+    let surface = session_service
+        .live_visible_tool_defs(session_id)
+        .await
+        .map_err(MobError::SessionError)?
+        .ok_or_else(|| {
+            MobError::WiringError(
+                "the member's session service cannot report its actual tool surface".into(),
+            )
+        })?;
+    hook.verify_member_surface(identity, &surface).await
+}
+
+/// The destination the host still expects for an attached member, as the
+/// full target its current registration must be bound to.
+pub(super) async fn expected_target(
+    hook: &dyn MemberRuntimeRegistrationHook,
+    registration: &RuntimeSessionRegistrationWitness,
+    req: &meerkat_core::service::CreateSessionRequest,
+) -> Result<(NativeWorkTarget, MemberRuntimeBuildIdentity), MobError> {
+    require_deferred_first_turn(req)?;
+    let identity = MemberRuntimeBuildIdentity::from_request(req, registration)?;
+    let target = hook
+        .expected_destination(&identity)
+        .await?
+        .target_for(registration, &identity)?;
+    Ok((target, identity))
+}

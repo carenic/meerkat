@@ -419,12 +419,15 @@ impl MeerkatMachine {
         authorized_next_visibility_state.active_revision =
             authority_plan.next_active_visibility_revision;
 
-        host.apply_live_session_llm_identity(
-            session_id,
-            &target_identity,
-            Some(&target_capability_surface),
-        )
-        .await?;
+        // The applied identity can name the binding the host's resolution
+        // selected for a target that named none; the report returns it.
+        let applied_identity = host
+            .apply_live_session_llm_identity_effective(
+                session_id,
+                &target_identity,
+                Some(&target_capability_surface),
+            )
+            .await?;
         if let Err(error) = host
             .apply_live_session_tool_visibility_state(
                 session_id,
@@ -462,7 +465,7 @@ impl MeerkatMachine {
 
         Ok(SessionLlmReconfigureReport {
             previous_identity,
-            new_identity: target_identity,
+            new_identity: applied_identity,
             capability_delta: authority_plan.capability_delta,
             tool_visibility_delta: authority_plan.tool_visibility_delta,
             rollback_occurred: false,

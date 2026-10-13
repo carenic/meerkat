@@ -12,6 +12,188 @@ use crate::hooks::{
 use crate::tokio;
 use tokio::sync::mpsc;
 
+/// A mandatory model-request prerequisite that did not pass: an entered
+/// Guardrail denial or a mandatory launch refused by confinement. Every other
+/// hook failure is infrastructure and keeps its existing path.
+pub(super) struct MandatoryPrerequisiteFailure {
+    pub(super) hook_id: crate::hooks::HookId,
+    pub(super) cause: crate::authorization::MandatoryHookCause,
+    /// The existing fail-closed error, used when no same-run feedback exists.
+    pub(super) fatal: AgentError,
+}
+
+/// Split a model-request hook result into success, a mandatory prerequisite
+/// failure, or an infrastructure error.
+pub(super) fn classify_model_request_hooks(
+    result: Result<HookExecutionReport, AgentError>,
+    point: crate::hooks::HookPoint,
+) -> Result<Option<MandatoryPrerequisiteFailure>, AgentError> {
+    match result {
+        Ok(report) => Ok(report.denial(point).map(|denial| {
+            let fatal = AgentError::HookDenied {
+                hook_id: denial.hook_id.clone(),
+                point: denial.point,
+                reason_code: denial.reason_code,
+                message: denial.message,
+                payload: denial.payload,
+            };
+            MandatoryPrerequisiteFailure {
+                hook_id: denial.hook_id,
+                cause: crate::authorization::MandatoryHookCause::Denied {
+                    reason_code: denial.reason_code,
+                },
+                fatal,
+            }
+        })),
+        Err(AgentError::HookLaunchRefused {
+            hook_id,
+            reason: HookFailureReason::ConfinementRefused { refusal },
+        }) => Ok(Some(MandatoryPrerequisiteFailure {
+            hook_id: hook_id.clone(),
+            cause: crate::authorization::MandatoryHookCause::LaunchRefused { refusal },
+            fatal: AgentError::HookLaunchRefused {
+                hook_id,
+                reason: HookFailureReason::ConfinementRefused { refusal },
+            },
+        })),
+        Err(error) => Err(error),
+    }
+}
+
+/// PostLlm effect facts: the response exists, so only its later local tool
+/// dispatch and its conversation commit are withheld.
+pub(super) fn withheld_after_response(
+    local_tool_calls: usize,
+    text_output_produced: bool,
+    provider_native_tools: &[crate::types::ServerToolKind],
+) -> crate::authorization::MandatoryHookWithheldEffect {
+    let (listed, omitted) =
+        crate::authorization::MandatoryHookProviderTool::bounded(provider_native_tools);
+    crate::authorization::MandatoryHookWithheldEffect::LocalDispatchAndCommitWithheld {
+        local_tool_calls: u64::try_from(local_tool_calls).unwrap_or(u64::MAX),
+        text_output_produced,
+        provider_native_tools: listed,
+        provider_native_tools_total: u64::try_from(provider_native_tools.len()).unwrap_or(u64::MAX),
+        provider_native_tools_omitted: omitted,
+    }
+}
+
+/// The typed, bounded withholding facts shared by the protected audit record
+/// and the audience notice.
+pub(super) fn mandatory_hook_withholding(
+    sequence: u64,
+    point: crate::hooks::HookPoint,
+    failure: &MandatoryPrerequisiteFailure,
+    effect: crate::authorization::MandatoryHookWithheldEffect,
+) -> crate::authorization::MandatoryHookWithholding {
+    let fits = failure.hook_id.0.len() <= crate::authorization::MANDATORY_HOOK_ID_BYTES;
+    crate::authorization::MandatoryHookWithholding {
+        sequence,
+        hook_id: fits.then(|| failure.hook_id.clone()),
+        hook_id_omitted: !fits,
+        point,
+        cause: failure.cause,
+        effect,
+    }
+}
+
+/// Whether the withholding was staged in protected custody. `Unavailable`
+/// is local to the withheld operation and never claims an audit record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProtectedRecord {
+    Staged,
+    Unavailable,
+}
+
+/// Bounded typed feedback for the retained controller, projected from the
+/// same facts the protected record holds. It names the failed mandatory
+/// prerequisite and exactly which effects were withheld; it never carries the
+/// hook's free text, its payload or the rejected response body.
+pub(super) fn mandatory_prerequisite_notice(
+    invocation: &HookInvocation,
+    withholding: &crate::authorization::MandatoryHookWithholding,
+    record: ProtectedRecord,
+) -> crate::types::Message {
+    use crate::authorization::{MandatoryHookCause, MandatoryHookWithheldEffect};
+    let (disposition, reason) = match withholding.cause {
+        MandatoryHookCause::Denied { reason_code } => {
+            ("denied", serde_json::json!({ "reason_code": reason_code }))
+        }
+        MandatoryHookCause::LaunchRefused { refusal } => (
+            "launch_refused",
+            serde_json::json!(HookFailureReason::ConfinementRefused { refusal }),
+        ),
+    };
+    let (withheld, already_occurred, body) = match &withholding.effect {
+        MandatoryHookWithheldEffect::RequestNotSent => (
+            serde_json::json!({ "model_request": true }),
+            serde_json::Value::Null,
+            "A mandatory hook prerequisite for the next model request did not pass, so that request was not sent. Continue with permitted work; this notice grants no permission. Any oversized attribution fields were omitted.",
+        ),
+        MandatoryHookWithheldEffect::LocalDispatchAndCommitWithheld {
+            local_tool_calls,
+            text_output_produced,
+            provider_native_tools,
+            provider_native_tools_total,
+            provider_native_tools_omitted,
+        } => (
+            serde_json::json!({ "local_tool_calls": local_tool_calls, "commit": true }),
+            serde_json::json!({
+                "model_response": true,
+                "text_output": text_output_produced,
+                "provider_native_tools": provider_native_tools
+                    .iter()
+                    .map(|entry| match &entry.tool {
+                        Some(kind) => serde_json::to_value(kind).unwrap_or(serde_json::Value::Null),
+                        None => serde_json::json!({
+                            "kind": "provider_native",
+                            "name": null,
+                            "name_omitted": true,
+                        }),
+                    })
+                    .collect::<Vec<_>>(),
+                "provider_native_tools_total": provider_native_tools_total,
+                "provider_native_tools_omitted": provider_native_tools_omitted,
+            }),
+            "A mandatory hook rejected the previous model response after it was produced. Its local tool calls were not dispatched and it was not committed to the conversation; output that already streamed and provider-native tools that already ran are not undone. Continue with permitted work; this notice grants no permission. Any oversized attribution fields were omitted.",
+        ),
+    };
+    let payload = serde_json::json!({
+        "attribution": {
+            "session_id": invocation.session_id, "run_id": invocation.run_id,
+            "turn_number": invocation.turn_number, "hook_id": withholding.hook_id,
+            "point": withholding.point,
+        },
+        "requirement": "mandatory",
+        "disposition": disposition,
+        "reason": reason,
+        "operation_sequence": withholding.sequence,
+        "withheld": withheld,
+        "already_occurred": already_occurred,
+        "attribution_truncated": withholding.hook_id_omitted,
+        "protected_record": match record {
+            ProtectedRecord::Staged => "staged",
+            ProtectedRecord::Unavailable => "unavailable",
+        },
+    });
+    let body = match record {
+        ProtectedRecord::Staged => body.to_owned(),
+        ProtectedRecord::Unavailable => {
+            format!("{body} The protected audit record for this withholding could not be staged.")
+        }
+    };
+    crate::types::Message::SystemNotice(crate::types::SystemNoticeMessage::with_block(
+        crate::types::SystemNoticeKind::Generic,
+        Some(body),
+        crate::types::SystemNoticeBlock::RuntimeNotice {
+            category: "mandatory_hook_prerequisite_failed".to_owned(),
+            detail: Some(payload.to_string()),
+            payload: Some(payload),
+            content: Vec::new(),
+        },
+    ))
+}
+
 /// Call-local projections only. Concurrent pre-tool hooks return these to the
 /// mutable caller; no event await can strand an already-returned notice.
 pub(super) struct CollectedHookExecution {
@@ -220,6 +402,7 @@ fn project_hook_report(
         });
     }
     for refusal in &report.launch_refusals {
+        notices.push(foreground_observe_refusal_notice(invocation, refusal));
         events.push(AgentEvent::HookLaunchRefused {
             hook_id: refusal.hook_id.clone(),
             point: refusal.point,
@@ -253,6 +436,48 @@ fn project_hook_report(
             payload: payload.clone(),
         });
     }
+}
+
+/// Project only the optional observer's typed no-entry fact. The command, its
+/// arguments/environment, and hook decision payloads are not audience material.
+/// Oversized variable identities are omitted rather than presented as prefixes.
+fn foreground_observe_refusal_notice(
+    invocation: &HookInvocation,
+    refusal: &crate::hooks::HookLaunchRefusal,
+) -> crate::types::Message {
+    const ID_BYTES: usize = 1024;
+    let hook_id = (refusal.hook_id.0.len() <= ID_BYTES).then_some(refusal.hook_id.0.as_str());
+    let original_call = invocation
+        .tool_call
+        .as_ref()
+        .map(|call| call.tool_use_id.as_str())
+        .or_else(|| {
+            invocation
+                .tool_result
+                .as_ref()
+                .map(|result| result.tool_use_id.as_str())
+        });
+    let tool_use_id = original_call.filter(|id| id.len() <= ID_BYTES);
+    let payload = serde_json::json!({
+        "attribution": {
+            "session_id": invocation.session_id, "run_id": invocation.run_id,
+            "turn_number": invocation.turn_number, "hook_id": hook_id,
+            "point": refusal.point, "tool_use_id": tool_use_id,
+        },
+        "disposition": "launch_refused",
+        "reason": HookFailureReason::ConfinementRefused { refusal: refusal.refusal },
+        "attribution_truncated": hook_id.is_none() || original_call != tool_use_id,
+    });
+    crate::types::Message::SystemNotice(crate::types::SystemNoticeMessage::with_block(
+        crate::types::SystemNoticeKind::Generic,
+        Some("An optional observation hook was refused before entry. Continue with permitted work; this notice grants no permission. Any oversized attribution fields were omitted.".to_owned()),
+        crate::types::SystemNoticeBlock::RuntimeNotice {
+            category: "foreground_hook_launch_refused".to_owned(),
+            detail: Some(payload.to_string()),
+            payload: Some(payload),
+            content: Vec::new(),
+        },
+    ))
 }
 
 fn project_hook_engine_error(
@@ -291,6 +516,7 @@ fn project_hook_engine_error(
         });
     }
 }
+
 /// Each variable identity is bounded independently for audience projection. An
 /// oversized identity is omitted explicitly, never replaced with an exact-looking
 /// prefix. This does not change the engine's original typed scheduling report.
@@ -339,6 +565,7 @@ fn background_scheduling_notice(
         crate::types::SystemNoticeBlock::RuntimeNotice {
             category: "background_hook_not_scheduled".to_owned(),
             detail: Some(payload.to_string()), payload: Some(payload),
+            content: Vec::new(),
         },
     ))
 }
@@ -346,6 +573,65 @@ fn background_scheduling_notice(
 #[cfg(test)]
 mod background_notice_tests {
     use super::*;
+
+    #[test]
+    fn foreground_refusal_notice_omits_oversized_ids_and_preserves_typed_reason()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut invocation =
+            HookInvocation::new(crate::HookPoint::PreToolExecution, crate::SessionId::new());
+        invocation.run_id = Some(crate::RunId::new());
+        invocation.turn_number = Some(7);
+        invocation.tool_call = Some(crate::HookToolCall {
+            tool_use_id: "private-long-call".repeat(1024),
+            name: "private-tool-name".to_owned(),
+            args: crate::event::ToolCallArguments::empty(),
+            provenance: None,
+        });
+        let refusal = crate::hooks::HookLaunchRefusal {
+            hook_id: crate::HookId::new("private-long-hook".repeat(1024)),
+            point: invocation.point,
+            refusal: crate::confinement::ConfinementRefusal::BackendUnavailable,
+        };
+        let crate::types::Message::SystemNotice(notice) =
+            foreground_observe_refusal_notice(&invocation, &refusal)
+        else {
+            return Err("expected runtime notice".into());
+        };
+        let crate::types::SystemNoticeBlock::RuntimeNotice {
+            category,
+            payload: Some(payload),
+            ..
+        } = &notice.blocks[0]
+        else {
+            return Err("expected bounded structured metadata".into());
+        };
+        assert_eq!(category, "foreground_hook_launch_refused");
+        assert_eq!(
+            payload,
+            &serde_json::json!({
+                "attribution": {
+                    "session_id": invocation.session_id, "run_id": invocation.run_id,
+                    "turn_number": 7, "hook_id": null,
+                    "point": invocation.point, "tool_use_id": null,
+                },
+                "disposition": "launch_refused",
+                "reason": HookFailureReason::ConfinementRefused { refusal: refusal.refusal },
+                "attribution_truncated": true,
+            })
+        );
+        let detail = notice.blocks[0].model_projection_text();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&detail)?,
+            *payload
+        );
+        let text = notice.model_projection_text();
+        assert!(text.contains(&detail));
+        assert!(text.len() < 4096);
+        assert!(!text.contains("private-long-call"));
+        assert!(!text.contains("private-long-hook"));
+        assert!(!text.contains("private-tool-name"));
+        Ok(())
+    }
 
     #[test]
     fn scheduling_notice_bounds_oversized_identity_without_losing_original_run()

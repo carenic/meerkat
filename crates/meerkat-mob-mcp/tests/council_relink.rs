@@ -354,16 +354,16 @@ async fn restart_inside_the_lease_retries_and_delivers_the_interrupted_council()
     fixture.teardown().await;
 }
 
-/// A host built like MobKit: no persistent root, a durable council store it
+/// A host built like Meta: no persistent root, a durable council store it
 /// supplies itself, `into_shared`, and mobs restored by inserting their
 /// handles. That alone runs the council sweep after restore, including the
 /// retry after a held lease and the detached-council re-link.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_mobkit_style_host_recovers_and_relinks_councils_after_restore() {
+async fn a_meta_style_host_recovers_and_relinks_councils_after_restore() {
     let fixture = CouncilFixture::new(|_| ScriptedTurn::Text("unused".to_string()));
     fixture.seed_source_mob(&["convener"]).await;
     let owner = member_session(&fixture, "convener").await;
-    let job_id = "council-job-mobkit";
+    let job_id = "council-job-meta";
     let handle = fixture
         .state
         .handle_for(&fixture.source_mob_id())
@@ -379,7 +379,7 @@ async fn a_mobkit_style_host_recovers_and_relinks_councils_after_restore() {
             )
             .expect("open the durable council store"),
         );
-    let council_id = fixture.council_id("relink-mobkit");
+    let council_id = fixture.council_id("relink-meta");
     write_interrupted_council(&council_store, &council_id, job_id, &owner).await;
 
     // The restarted host: no persistent root, only the durable council store.
@@ -460,7 +460,7 @@ async fn relink_settles_a_council_whose_convener_is_gone() {
     fixture.teardown().await;
 }
 
-/// A MobKit-style host restores the convener's mob stopped, inserts its
+/// A Meta-style host restores the convener's mob stopped, inserts its
 /// handle, and activates it later. The convener is not live and cannot be
 /// revived while its mob is stopped: the re-link commits and submits the
 /// sealed outcome durably, settling the job, and the host's delivery owner
@@ -546,7 +546,7 @@ async fn a_council_relink_on_a_stopped_mob_delivers_once_the_mob_runs() {
 }
 
 /// The restored host's sweep can run its first pass before the host has
-/// registered the convener's mob (MobKit inserts restored handles after
+/// registered the convener's mob (Meta inserts restored handles after
 /// constructing the state). That pass cannot resolve the convener, so the
 /// sweep waits for the managed-mob set to change instead of ending: once the
 /// handle is inserted and the mob runs, the outcome is delivered once.

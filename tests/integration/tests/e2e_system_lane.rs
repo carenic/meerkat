@@ -28,6 +28,42 @@ system_suite!(e2e_system_cli_resume_tools, "cli-resume-tools");
 system_suite!(e2e_system_cli_export_atif, "cli-export-atif");
 system_suite!(e2e_system_cli_mcp_pending_resume, "cli-mcp-pending-resume");
 system_suite!(e2e_system_cli_realm_mcp_servers, "cli-realm-mcp-servers");
+system_suite!(
+    e2e_system_cli_realm_mcp_access_ceiling,
+    "cli-realm-mcp-access-ceiling"
+);
+system_suite!(
+    e2e_system_cli_realm_mcp_ceiling_invocation,
+    "cli-realm-mcp-ceiling-invocation"
+);
+system_suite!(
+    e2e_system_cli_realm_mcp_original_session_restart,
+    "cli-realm-mcp-original-session-restart"
+);
+system_suite!(
+    e2e_system_cli_realm_mcp_installation_per_agent,
+    "cli-realm-mcp-installation-per-agent"
+);
+system_suite!(
+    e2e_system_cli_realm_mcp_per_agent_grant,
+    "cli-realm-mcp-per-agent-grant"
+);
+system_suite!(
+    e2e_system_rpc_mcp_original_session_attachment,
+    "rpc-mcp-original-session-attachment"
+);
+system_suite!(
+    e2e_system_cli_realm_mcp_missing_tool_call_local,
+    "cli-realm-mcp-missing-tool-call-local"
+);
+system_suite!(
+    e2e_system_rpc_mcp_sign_out_unpublishes,
+    "rpc-mcp-sign-out-unpublishes"
+);
+system_suite!(
+    e2e_system_rpc_mcp_other_realm_no_credential,
+    "rpc-mcp-other-realm-no-credential"
+);
 system_suite!(e2e_system_rest_resume_metadata, "rest-resume-metadata");
 system_suite!(
     e2e_system_cli_capabilities_and_config,

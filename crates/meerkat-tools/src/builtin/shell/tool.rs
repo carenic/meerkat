@@ -616,6 +616,7 @@ impl BuiltinTool for ShellTool {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Shell,
                 source_id: "shell".into(),
+                artifact: None,
             }),
         }
     }

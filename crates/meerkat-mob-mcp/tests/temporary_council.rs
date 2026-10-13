@@ -319,6 +319,9 @@ async fn full_mesh_wiring_is_observable_on_the_live_temporary_mob() {
             );
         }
     }
+    // A handle kept here would own the temporary mob database's observer, and
+    // the council's destroy would leave its storage cleanup outstanding.
+    drop(handle);
 
     gate.open();
     let outcome = running
@@ -811,7 +814,7 @@ async fn a_process_style_restart_seals_an_interrupted_terminal_and_cleans_up() {
     // real seated members exist, which is exactly the crash shape.
     let failing = Arc::new(std::sync::OnceLock::<Arc<OneShotFailingCouncilStore>>::new());
     let failing_slot = failing.clone();
-    let fixture = CouncilFixture::new_with(role_script, move |state, root| {
+    let mut fixture = CouncilFixture::new_with(role_script, move |state, root| {
         let path = MobMcpState::persistent_forked_participant_store_path(root);
         let inner: Arc<dyn meerkat_mob::store::TemporaryCouncilStore> = Arc::new(
             meerkat_mob::store::SqliteTemporaryCouncilStore::open(&path)
@@ -856,8 +859,15 @@ async fn a_process_style_restart_seals_an_interrupted_terminal_and_cleans_up() {
     }
 
     // A restart is a DIFFERENT coordinator identity, so it may only take over
-    // once the dead coordinator's lease has been observed expired.
+    // once the dead coordinator's lease has been observed expired. Like a
+    // real restart, it leaves no handle of the previous lifetime behind: the
+    // previous state's handles would still own the temporary mob database's
+    // observer, and the recovered destroy would leave its cleanup owed.
     let restarted = fixture.restart_state();
+    drop(std::mem::replace(
+        &mut fixture.state,
+        Arc::clone(&restarted),
+    ));
     let held = restarted.temporary_council_store_for_tests();
     let reports = restarted
         .temporary_council()
@@ -1076,6 +1086,121 @@ async fn retained_cleanup_debt_converges_on_retry() {
         record.result.as_ref(),
         Some(&sealed),
         "the immutable result is unchanged by the cleanup retry"
+    );
+
+    fixture.teardown().await;
+}
+
+/// A temporary mob whose database a public reader still holds is destroyed,
+/// but its storage cleanup stays owed: the council keeps typed debt, and a
+/// cleanup retry while the reader holds keeps it, rather than reading the
+/// retained destroy as the mob being gone. Once the reader is gone, a retry
+/// continues that same destroy and settles.
+#[tokio::test(flavor = "multi_thread")]
+async fn owed_temporary_mob_storage_cleanup_keeps_council_debt_until_it_settles() {
+    let gate = TurnGate::new();
+    let gate_for_script = gate.clone();
+    let fixture = CouncilFixture::new(move |request| {
+        if user_text(request).contains("Council topic:") {
+            ScriptedTurn::Gated(gate_for_script.clone(), "gated position".to_string())
+        } else {
+            role_script(request)
+        }
+    });
+    fixture.seed_source_mob(&["researcher"]).await;
+
+    let request = TemporaryCouncilRequest::new(
+        fixture.council_id("owed"),
+        council_definition("template-is-replaced"),
+        vec![participant(&fixture, 0, "analyst", "researcher", "analyst")],
+        "Owed storage cleanup",
+        bounds(1, 240),
+        MergeBackPolicy::NoMerge,
+    );
+    let id = request.council_id.clone();
+    let temporary_mob_id = request.council_id.temporary_mob_id();
+    let coordinator = fixture.state.temporary_council();
+    let running = tokio::spawn(async move { coordinator.run(request).await });
+    gate.wait_entered(1).await;
+
+    // A public reader of the temporary mob's database, held across cleanup.
+    let mob_root =
+        MobMcpState::persistent_forked_participant_store_path(&fixture.root.join("state"))
+            .parent()
+            .expect("the per-mob database directory")
+            .to_path_buf();
+    let database = mob_root.join(format!("mob--{temporary_mob_id}.db"));
+    assert!(
+        database.is_file(),
+        "the temporary mob's database: {}",
+        database.display()
+    );
+    let reader = meerkat_mob::MobStorage::persistent(&database).expect("a public reader");
+
+    gate.open();
+    let outcome = running
+        .await
+        .expect("owned task joins")
+        .expect("council runs");
+    let owes_cleanup =
+        |cleanup: &meerkat_mob::temporary_council::TemporaryCouncilCleanupReceipt| {
+            !cleanup.settled()
+                && !cleanup.temporary_mob_destroyed
+                && cleanup
+                    .debts
+                    .iter()
+                    .any(|debt| debt.detail.contains("storage cleanup outstanding"))
+        };
+    assert!(owes_cleanup(&outcome.cleanup), "{:?}", outcome.cleanup);
+
+    let retried = fixture
+        .state
+        .temporary_council()
+        .recover_unfinished()
+        .await
+        .expect("cleanup retry while the reader holds");
+    let report = retried
+        .iter()
+        .find(|report| report.council_id == id)
+        .expect("the council with debt is retried");
+    assert!(
+        owes_cleanup(&report.cleanup),
+        "a retained destroy is not the mob being gone: {:?}",
+        report.cleanup
+    );
+    assert!(database.is_file(), "the held database is kept");
+
+    drop(reader);
+    let retried = fixture
+        .state
+        .temporary_council()
+        .recover_unfinished()
+        .await
+        .expect("cleanup retry after the reader is gone");
+    let report = retried
+        .iter()
+        .find(|report| report.council_id == id)
+        .expect("the council with debt is retried");
+    assert!(
+        report.settled && report.cleanup.settled(),
+        "{:?}",
+        report.cleanup
+    );
+    assert!(report.cleanup.temporary_mob_destroyed);
+    assert!(
+        !database.exists(),
+        "the continued destroy removed the temporary mob's database"
+    );
+    let record = fixture
+        .state
+        .temporary_council()
+        .load(&id)
+        .await
+        .expect("load")
+        .expect("record present");
+    assert_eq!(
+        record.machine_state.lifecycle_phase,
+        TemporaryCouncilLifecycleState::Settled
     );
 
     fixture.teardown().await;
@@ -1990,6 +2115,9 @@ async fn a_remote_capability_acquired_but_never_seated_is_recovered_from_persist
         .insert_new(&record)
         .await
         .expect("write the crashed council record");
+    // The destroy drains the source mob database's observer, which this
+    // handle would still own.
+    drop(source);
     fixture
         .state
         .mob_destroy(&fixture.source_mob_id())

@@ -482,7 +482,10 @@ async fn probe_binding_presence_with_lookup(
             CredentialSourceSpec::ManagedStore => {
                 if let Some(store) = token_store {
                     let key = meerkat_core::auth::TokenKey::from_auth_binding(&target.auth_binding);
-                    match store.load(&key).await {
+                    match store
+                        .load_for(&key, meerkat_core::auth::TokenStoreAccess::Status)
+                        .await
+                    {
                         Ok(Some(_)) => return Ok(true),
                         Ok(None) => {}
                         Err(err) => {
@@ -556,7 +559,10 @@ async fn probe_resolvable_providers_with_lookup(
                     if let Some(store) = token_store {
                         let key =
                             meerkat_core::auth::TokenKey::from_auth_binding(&target.auth_binding);
-                        match store.load(&key).await {
+                        match store
+                            .load_for(&key, meerkat_core::auth::TokenStoreAccess::Status)
+                            .await
+                        {
                             Ok(Some(_)) => present = true,
                             Ok(None) => {}
                             Err(err) => {
@@ -861,7 +867,7 @@ pub(crate) async fn run_mob_host(args: MobHostArgs, scope: &RuntimeScope) -> any
             .join("config_state.json"),
         default_schedule_tools,
         None,
-    );
+    )?;
     let capability_source_runtime: Arc<dyn ForkedParticipantSourceRuntime> = service.clone();
 
     // 6. Live plane (DEC-P2-8, served since 6b): four facade roles over the
@@ -1054,6 +1060,7 @@ pub(crate) async fn run_mob_host(args: MobHostArgs, scope: &RuntimeScope) -> any
         member_host: Some(HostMemberSubstrate {
             session_service: Arc::clone(&service) as Arc<dyn MobSessionService>,
             runtime_adapter: Arc::clone(&runtime_adapter),
+            member_runtime_registration_hook: None,
             tool_consequence_policy_registry: None,
             durable_event_log: durable_log.clone(),
             realm_backend_persistent: durable_sessions,

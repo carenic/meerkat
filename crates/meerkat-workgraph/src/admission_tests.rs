@@ -6,8 +6,9 @@ use std::sync::Arc;
 use crate::machines::work_item_admission::{WorkAdmissionReplayKind, WorkItemAdmissionPhase};
 use crate::types::{ClaimWorkItemRequest, WorkItemFilter, WorkOwner, WorkOwnerKey, WorkOwnerKind};
 use crate::{
-    CloseWorkItemRequest, CreateWorkItemRequest, ExternalWorkRef, MemoryWorkGraphStore,
-    WorkAdmissionKey, WorkAdmissionOutcome, WorkGraphError, WorkGraphEventFilter, WorkGraphMachine,
+    CloseWorkItemRequest, CreateWorkItemRequest, DisabledWorkGraphStore, ExternalWorkRef,
+    MemoryWorkGraphStore, WorkAdmission, WorkAdmissionKey, WorkAdmissionOutcome,
+    WorkGraphAdmissionFence, WorkGraphError, WorkGraphEventFilter, WorkGraphMachine,
     WorkGraphService, WorkGraphStore, WorkItem, WorkNamespace, WorkStatus,
 };
 
@@ -368,6 +369,265 @@ async fn concurrent_same_key_memory_admission_creates_exactly_once() {
     assert_eq!(item_count(&service).await, 1);
 }
 
+/// How a test fence answers one admission.
+#[derive(Clone, Copy)]
+enum FenceMode {
+    /// Current: run the operation and report its result.
+    Current,
+    /// Revoked: refuse without running the operation.
+    Revoked,
+    /// Faulty: report success without running the operation.
+    SkipsOperation,
+    /// Faulty: run the operation, then fail anyway.
+    FailsAfterOperation,
+}
+
+struct RecordingFence {
+    mode: FenceMode,
+    seen: std::sync::Mutex<Vec<(String, WorkNamespace, WorkAdmission)>>,
+}
+
+impl RecordingFence {
+    fn new(mode: FenceMode) -> Arc<Self> {
+        Arc::new(Self {
+            mode,
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn seen(&self) -> Vec<(String, WorkNamespace, WorkAdmission)> {
+        self.seen.lock().expect("fence record").clone()
+    }
+}
+
+impl WorkGraphAdmissionFence for RecordingFence {
+    fn execute_if_current(
+        &self,
+        realm_id: &str,
+        namespace: &WorkNamespace,
+        admission: &WorkAdmission,
+        operation: Box<dyn FnOnce() -> Result<(), WorkGraphError> + '_>,
+    ) -> Result<(), WorkGraphError> {
+        self.seen.lock().expect("fence record").push((
+            realm_id.to_string(),
+            namespace.clone(),
+            admission.clone(),
+        ));
+        match self.mode {
+            FenceMode::Current => operation(),
+            FenceMode::Revoked => Err(WorkGraphError::Conflict(
+                "host authority is no longer current".to_string(),
+            )),
+            FenceMode::SkipsOperation => Ok(()),
+            FenceMode::FailsAfterOperation => {
+                let _ = operation();
+                Err(WorkGraphError::Conflict("late fence failure".to_string()))
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn fenced_admission_runs_inside_the_fence_with_the_exact_identity() {
+    let store = Arc::new(MemoryWorkGraphStore::new());
+    let service = WorkGraphService::new(store.clone());
+    let exact = service
+        .admission_identity(key("setup-1"), request("setup"))
+        .expect("identity");
+    let fence = RecordingFence::new(FenceMode::Current);
+
+    let first = created(
+        service
+            .create_idempotent_with_fence(key("setup-1"), request("setup"), fence.clone())
+            .await
+            .expect("fenced admit"),
+    );
+    let again = replayed(
+        service
+            .create_idempotent_with_fence(key("setup-1"), request("setup"), fence.clone())
+            .await
+            .expect("fenced replay"),
+    );
+    assert_eq!(again, first);
+    match service
+        .create_idempotent_with_fence(key("setup-1"), request("changed"), fence.clone())
+        .await
+        .expect("fenced classify")
+    {
+        WorkAdmissionOutcome::Conflict {
+            existing_item_id, ..
+        } => assert_eq!(existing_item_id, first.id),
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+
+    let seen = fence.seen();
+    assert_eq!(seen.len(), 3, "every admission, replay included, is fenced");
+    assert_eq!(seen[0].0, first.realm_id);
+    assert_eq!(seen[0].1, first.namespace);
+    assert_eq!(seen[0].2, exact);
+    assert_eq!(seen[1].2, exact);
+    assert_ne!(
+        seen[2].2.request_digest, exact.request_digest,
+        "the fence sees the identity of the request it authorizes"
+    );
+    assert_eq!(item_count(&service).await, 1);
+    assert_eq!(event_count(store.as_ref()).await, 1);
+}
+
+#[tokio::test]
+async fn revoked_fence_writes_nothing_and_discloses_no_replay() {
+    let store = Arc::new(MemoryWorkGraphStore::new());
+    let service = WorkGraphService::new(store.clone());
+    let revoked = RecordingFence::new(FenceMode::Revoked);
+
+    let refused = service
+        .create_idempotent_with_fence(key("setup-1"), request("setup"), revoked.clone())
+        .await;
+    assert!(
+        matches!(refused, Err(WorkGraphError::Conflict(_))),
+        "the fence refusal is returned: {refused:?}"
+    );
+    assert_eq!(item_count(&service).await, 0);
+    assert_eq!(event_count(store.as_ref()).await, 0);
+    assert_eq!(
+        service
+            .observe_admission(key("setup-1"), request("setup"))
+            .await
+            .expect("observe"),
+        None,
+        "a refused admission leaves no identity behind"
+    );
+
+    created(
+        service
+            .create_idempotent(key("setup-1"), request("setup"))
+            .await
+            .expect("admit"),
+    );
+    let refused_replay = service
+        .create_idempotent_with_fence(key("setup-1"), request("setup"), revoked.clone())
+        .await;
+    assert!(
+        matches!(refused_replay, Err(WorkGraphError::Conflict(_))),
+        "a revoked fence must not disclose the existing item: {refused_replay:?}"
+    );
+    assert_eq!(revoked.seen().len(), 2);
+    assert_eq!(item_count(&service).await, 1);
+    assert_eq!(event_count(store.as_ref()).await, 1);
+}
+
+#[tokio::test]
+async fn fence_reporting_success_without_running_the_commit_is_an_error() {
+    let store = Arc::new(MemoryWorkGraphStore::new());
+    let service = WorkGraphService::new(store.clone());
+    let result = service
+        .create_idempotent_with_fence(
+            key("setup-1"),
+            request("setup"),
+            RecordingFence::new(FenceMode::SkipsOperation),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(WorkGraphError::Store(_))),
+        "unexpected {result:?}"
+    );
+    assert_eq!(item_count(&service).await, 0);
+    assert_eq!(event_count(store.as_ref()).await, 0);
+}
+
+#[tokio::test]
+async fn late_fence_failure_cannot_rewrite_a_committed_admission() {
+    let store = Arc::new(MemoryWorkGraphStore::new());
+    let service = WorkGraphService::new(store.clone());
+    let item = created(
+        service
+            .create_idempotent_with_fence(
+                key("setup-1"),
+                request("setup"),
+                RecordingFence::new(FenceMode::FailsAfterOperation),
+            )
+            .await
+            .expect("the committed target result is preserved"),
+    );
+    assert_eq!(
+        service
+            .observe_admission(key("setup-1"), request("setup"))
+            .await
+            .expect("observe"),
+        Some(WorkAdmissionOutcome::Replayed(item))
+    );
+    assert_eq!(event_count(store.as_ref()).await, 1);
+}
+
+#[tokio::test]
+async fn store_without_fence_support_refuses_before_entering_the_fence() {
+    let (item, event, admission) = WorkGraphMachine::create_item_with_admission(
+        request("setup"),
+        "default".into(),
+        WorkNamespace::default(),
+        chrono::Utc::now(),
+        Some((
+            &key("setup-1"),
+            format!("sha256:{}", "a".repeat(64)).as_str(),
+        )),
+    )
+    .expect("keyed create");
+    let fence = RecordingFence::new(FenceMode::Current);
+    let result = DisabledWorkGraphStore
+        .insert_item_admitted_with_fence(item, event, admission, fence.clone())
+        .await;
+    assert!(
+        matches!(result, Err(WorkGraphError::UnsupportedBackend(_))),
+        "unexpected {result:?}"
+    );
+    assert!(fence.seen().is_empty());
+    let observed = DisabledWorkGraphStore
+        .observe_item_admission("default", &WorkNamespace::default(), &key("setup-1"))
+        .await;
+    assert!(matches!(
+        observed,
+        Err(WorkGraphError::UnsupportedBackend(_))
+    ));
+}
+
+#[tokio::test]
+async fn observation_classifies_without_writing() {
+    let store = Arc::new(MemoryWorkGraphStore::new());
+    let service = WorkGraphService::new(store.clone());
+    assert_eq!(
+        service
+            .observe_admission(key("setup-1"), request("setup"))
+            .await
+            .expect("observe absent"),
+        None
+    );
+    let item = created(
+        service
+            .create_idempotent(key("setup-1"), request("setup"))
+            .await
+            .expect("admit"),
+    );
+    assert_eq!(
+        service
+            .observe_admission(key("setup-1"), request("setup"))
+            .await
+            .expect("observe replay"),
+        Some(WorkAdmissionOutcome::Replayed(item.clone()))
+    );
+    assert_eq!(
+        service
+            .observe_admission(key("setup-1"), request("changed"))
+            .await
+            .expect("observe conflict"),
+        Some(WorkAdmissionOutcome::Conflict {
+            admission_key: key("setup-1"),
+            existing_item_id: item.id,
+        })
+    );
+    assert_eq!(item_count(&service).await, 1);
+    assert_eq!(event_count(store.as_ref()).await, 1);
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 mod sqlite {
     use super::*;
@@ -378,6 +638,56 @@ mod sqlite {
         let service =
             WorkGraphService::with_scope(store.clone(), "realm", WorkNamespace::default());
         (store, service)
+    }
+
+    #[tokio::test]
+    async fn revoked_fence_rolls_back_and_fenced_admission_survives_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("workgraph.sqlite3");
+        {
+            let (_store, service) = open_service(&path);
+            let refused = service
+                .create_idempotent_with_fence(
+                    key("setup-1"),
+                    request("setup"),
+                    RecordingFence::new(FenceMode::Revoked),
+                )
+                .await;
+            assert!(matches!(refused, Err(WorkGraphError::Conflict(_))));
+        }
+        assert_eq!(row_count(&path, "workgraph_items"), 0);
+        assert_eq!(row_count(&path, "workgraph_item_admissions"), 0);
+
+        let fence = RecordingFence::new(FenceMode::Current);
+        let first = {
+            let (_store, service) = open_service(&path);
+            created(
+                service
+                    .create_idempotent_with_fence(key("setup-1"), request("setup"), fence.clone())
+                    .await
+                    .expect("fenced admit"),
+            )
+        };
+        assert_eq!(fence.seen().len(), 1);
+
+        // A fresh process view observes and replays the fenced admission.
+        let (_store, service) = open_service(&path);
+        assert_eq!(
+            service
+                .observe_admission(key("setup-1"), request("setup"))
+                .await
+                .expect("observe"),
+            Some(WorkAdmissionOutcome::Replayed(first.clone()))
+        );
+        let again = replayed(
+            service
+                .create_idempotent_with_fence(key("setup-1"), request("setup"), fence.clone())
+                .await
+                .expect("fenced replay"),
+        );
+        assert_eq!(again, first);
+        assert_eq!(row_count(&path, "workgraph_items"), 1);
+        assert_eq!(row_count(&path, "workgraph_item_admissions"), 1);
     }
 
     #[tokio::test]

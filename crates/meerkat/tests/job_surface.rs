@@ -10,7 +10,7 @@ use meerkat_jobs::{
 fn domain_job_description_maps_to_safe_wire_projection() {
     let wire = project_job_description(JobDescription {
         job_id: JobId::new("job_01").unwrap(),
-        runner: RunnerIdentity::new("mobkit_callback", "1").unwrap(),
+        runner: RunnerIdentity::new("meta_callback", "1").unwrap(),
         phase: JobPhase::NeedsAttention,
         restart_class: RestartClass::NonResumable,
         attempt_count: 1,

@@ -39,15 +39,24 @@
 // sizes and recursive closures do not calibrate today's build-closure input;
 // current estimates require comparison with hosted results. On d1dda1482 the
 // runtime unit lane models 15.1 minutes, not a measured completion guarantee.
-// The pull-request unit plan must stay under PR_UNIT_BUDGET_MINUTES.
-// Every unit lane that ever exceeded the 1200 s push-to-terminal budget
-// compiled meerkat-mob's 442k lines: mob's own lane, and the lanes of crates
+// The pull-request unit plan must stay under PR_UNIT_BUDGET_MINUTES, a
+// surrogate packing cap and not a measured timing. It is 17 since the runtime
+// lane, whose closure counts its self dev-dependency, modelled 16.2 minutes.
+// The enforced limits are the CI gate's: 1500 s of lane execution and 2700 s
+// push-to-terminal, runner queue excluded (CI_MAX_EXEC_SECONDS and
+// CI_MAX_TERMINAL_SECONDS in ci.yml); ordinary hosted runs supply the
+// measured timing.
+// Every unit lane that ever exceeded the push-to-terminal budget of its time
+// (1200 s, since replaced by the gates above) compiled meerkat-mob's 442k
+// lines: mob's own lane, and the lanes of crates
 // that depend on mob and rebuild it under their own feature unification
 // (rkat, rpc, rest, mcp-server, mob-mcp, mob-pack, ...). Those
 // crates' unit tests therefore run on the push-to-main run (no budget) and
-// on nightly, never in the pull-request unit lane; the chain is computed
-// from cargo metadata, not listed here. Clippy of a changed crate always
-// runs in the pull request (worst measured lane 12:24 for mob).
+// on nightly; the chain is computed from cargo metadata, not listed here.
+// The pull-request unit lane runs none of them except the package that
+// PR_UNIT_CHAIN_EXCEPTIONS selects when one of its trigger packages changed.
+// Clippy of a changed crate always runs in the pull request (worst measured
+// lane 12:24 for mob).
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
@@ -67,7 +76,7 @@ const NULL_SHA = "0000000000000000000000000000000000000000";
 const LINK_COST_PER_DEP = 8000;
 const COST_UNITS_PER_MINUTE = 35000;
 const LANE_SETUP_MINUTES = 1;
-export const PR_UNIT_BUDGET_MINUTES = 16;
+export const PR_UNIT_BUDGET_MINUTES = 17;
 const HEAVY_ANCHOR = "meerkat-mob";
 
 // Feature-gated unit suites. Every unit lane builds its packages with their
@@ -143,7 +152,9 @@ export const INTEGRATION_SUITES = [
     package: "meerkat-machine-codegen",
     triggers: [...MACHINE_AUTHORITY_PACKAGES, "meerkat-runtime", "meerkat-mob", "meerkat-machine-codegen"],
   },
-  { package: "xtask", features: ["machine-authority"], triggers: ["xtask"], paths: [".github/workflows/"] },
+  // buildbuddy_static_lanes also reads the SDK manifests and generated types
+  // and walks sdks/ (version parity, generated-type and banned-name checks).
+  { package: "xtask", features: ["machine-authority"], triggers: ["xtask"], paths: [".github/workflows/", "sdks/"] },
   // kernel_typed_round_trip drives the generated kernels with hand-built
   // inputs, so any machine DSL change can break it; it needs `test-oracle`.
   { package: "meerkat-machine-kernels", features: ["test-oracle"], triggers: MACHINE_AUTHORITY_PACKAGES },
@@ -168,6 +179,30 @@ export const INTEGRATION_SUITES = [
       "brain_swap_surface_parity",
     ],
     triggers: ["meerkat", "meerkat-core", "meerkat-store", "meerkat-session", "meerkat-runtime", "meerkat-sqlite"],
+  },
+  // A governed realm's composition: posture, restored grant owner, stock
+  // composition and the realm's persisted MCP installations (the connection
+  // control spawns the mcp-test-server fixture).
+  {
+    package: "meerkat",
+    name: "meerkat-governed-realm",
+    features: ["session-store", "local-authorization", "mcp"],
+    tests: ["governed_realm"],
+    triggers: ["meerkat", "meerkat-core", "meerkat-store", "meerkat-runtime", "meerkat-mcp"],
+  },
+  // These no-provider regressions exercise configured limits through the
+  // factory and the RPC realm path. Select only their named test binaries.
+  {
+    package: "meerkat",
+    name: "standalone-turn-lifecycle",
+    tests: ["standalone_turn_lifecycle"],
+    triggers: ["meerkat", "meerkat-core"],
+  },
+  {
+    package: "meerkat-rpc",
+    name: "rpc-configured-turn-limit",
+    tests: ["configured_turn_limit"],
+    triggers: ["meerkat-rpc", "meerkat", "meerkat-core"],
   },
   // Deterministic replays of recorded Turbo S gpt-live-1 provider streams
   // (tests/integration/fixtures/gpt_live_replay): the S104/S106 voice
@@ -214,6 +249,194 @@ export const INTEGRATION_SUITES = [
 // default-feature lane and per feature suite) and fan the run out over
 // `partitions` jobs that execute the archive with `--partition hash:k/n`.
 export const ARCHIVED_UNIT_LANES = [{ package: "meerkat-mob", partitions: 2 }];
+
+// The one exception to the chain deferral. meerkat-rpc compiles meerkat-mob,
+// but its default features include local-authorization and mcp, and its lib
+// tests carry the MCP restart controls (governed_jsonl::tests::stock_governed_*:
+// a stock governed realm's MCP attachment is restored, or refused after a
+// revoke, across a host restart). Those controls must run before merge, so
+// meerkat-rpc's existing default-feature unit row joins the pull request when
+// a trigger package changed directly: meerkat-rpc itself or a native package
+// the controls exercise (the facade's governed realm, the core contracts, the
+// store and its SQLite backend, the runtime and session owners, the MCP
+// client, local authorization). It is packed and held to
+// PR_UNIT_BUDGET_MINUTES like every other unit lane. The rest of the chain
+// stays deferred (a meerkat-mob change alone selects nothing here), and
+// meerkat-rpc's feature suites stay on main. Names are checked against cargo
+// metadata, so a rename fails the plan instead of dropping the exception.
+export const PR_UNIT_CHAIN_EXCEPTIONS = [
+  {
+    package: "meerkat-rpc",
+    triggers: [
+      "meerkat-rpc",
+      "meerkat",
+      "meerkat-core",
+      "meerkat-store",
+      "meerkat-sqlite",
+      "meerkat-runtime",
+      "meerkat-session",
+      "meerkat-mcp",
+      "meerkat-authorization",
+      "meerkat-authorization-contracts",
+    ],
+  },
+];
+// Feature-combination checks (#1687). Every Cargo lane builds a package with
+// its default features (plus FEATURE_UNIT_SUITES and --all-features), but the
+// Bazel graph builds each crate with the feature set the generated BUILD.bazel
+// gives it, and the nightly feature matrix checks further combinations. That
+// graph runs only nightly on main and at the release tag, so a break under one
+// of those sets reached release/0.8.51 three times: meerkat-mob-mcp's lib tests
+// under `openai-live` alone (#1595) and `meerkat-mob --no-default-features`
+// (#1558) among them. For each changed package the plan adds compile-only
+// checks under:
+//   - its Bazel test feature set (every rust_test of a package carries the
+//     same set), in one `check --lib --bins --tests` per clippy shard over the
+//     shard's packages, as Bazel's own unified graph builds them;
+//   - every other Bazel library or binary feature set it has (production
+//     variants that strip `test-support`, the surface feature variants);
+//   - the `$(CARGO) check` rows of the Make feature-matrix targets below.
+// The rows follow the clippy shards, whose packing is already sized for a
+// pull-request lane; each shard gives a Bazel-set job and a matrix job.
+// Feature names come from the generated BUILD.bazel (kept fresh by the
+// bazel-locks-freshness gate) and the Makefile, and are validated against
+// cargo metadata, so a renamed feature fails the plan.
+export const MAKE_FEATURE_MATRIX_TARGETS = ["test-minimal", "test-feature-matrix-lib"];
+
+function parseBazelFeatureSets(pkg) {
+  const buildPath = resolve(root, packageDir(pkg), "BUILD.bazel");
+  if (!existsSync(buildPath)) {
+    throw new Error(`no generated BUILD.bazel for ${pkg.name} (${relative(root, buildPath)})`);
+  }
+  const text = readFileSync(buildPath, "utf8");
+  const known = new Set(Object.keys(pkg.features ?? {}));
+  const testSets = new Set();
+  const variants = new Map();
+  for (const [, rule, body] of text.matchAll(/^(rust_test|rust_library|rust_binary)\(\n([\s\S]*?)^\)/gm)) {
+    const list = body.match(/^ {4}crate_features = \[([\s\S]*?)\]/m);
+    // Weak dependency features (`dep?/feature`) are rustc cfgs the generator
+    // passes through; Cargo enables them from the package's own features.
+    const features = list
+      ? [...list[1].matchAll(/"([^"]+)"/g)].map((match) => match[1]).filter((name) => !name.includes("/"))
+      : [];
+    for (const feature of features) {
+      if (!known.has(feature)) {
+        throw new Error(`${relative(root, buildPath)} enables ${feature}, which ${pkg.name} does not declare`);
+      }
+    }
+    const key = [...new Set(features)].sort().join(",");
+    if (rule === "rust_test") {
+      testSets.add(key);
+    } else {
+      const variant = variants.get(key) ?? { lib: false, bins: false };
+      if (rule === "rust_library") variant.lib = true;
+      if (rule === "rust_binary") variant.bins = true;
+      variants.set(key, variant);
+    }
+  }
+  if (testSets.size > 1) {
+    throw new Error(
+      `${relative(root, buildPath)} gives ${pkg.name}'s tests ${testSets.size} feature sets; the feature-combination check expects one`,
+    );
+  }
+  const testSet = testSets.size === 1 ? [...testSets][0] : null;
+  if (testSet !== null) variants.delete(testSet);
+  const split = (key) => (key === "" ? [] : key.split(","));
+  return {
+    test: testSet === null ? null : split(testSet),
+    variants: [...variants]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, variant]) => ({ features: split(key), ...variant })),
+  };
+}
+
+function parseMakeFeatureMatrix(byName) {
+  const text = readFileSync(resolve(root, "Makefile"), "utf8");
+  const rows = [];
+  for (const target of MAKE_FEATURE_MATRIX_TARGETS) {
+    const start = text.match(new RegExp(`^${target}:.*\\n((?:\\t.*\\n|#.*\\n)*)`, "m"));
+    if (!start) throw new Error(`Makefile has no ${target} target`);
+    let count = 0;
+    for (const line of start[1].split("\n")) {
+      const check = line.match(/^\t\$\(CARGO\) check (.+)$/);
+      if (!check) continue;
+      const args = check[1].trim();
+      const pkgName = args.match(/(?:^|\s)-p (\S+)/)?.[1];
+      if (!pkgName || !byName.has(pkgName)) {
+        throw new Error(`Makefile ${target} row names no known package: ${args}`);
+      }
+      const features = args.match(/--features (\S+)/)?.[1]?.split(",") ?? [];
+      for (const feature of features) {
+        const [owner, name] = feature.includes("/") ? feature.split("/", 2) : [pkgName, feature];
+        const ownerPkg = byName.get(owner);
+        if (!ownerPkg || !Object.hasOwn(ownerPkg.features, name)) {
+          throw new Error(`Makefile ${target} row enables unknown feature ${feature}: ${args}`);
+        }
+      }
+      rows.push({ target, package: pkgName, args });
+      count += 1;
+    }
+    if (count === 0) throw new Error(`Makefile ${target} has no $(CARGO) check rows`);
+  }
+  return rows;
+}
+
+function targetFlags(pkgs, { tests }) {
+  const kinds = new Set(pkgs.flatMap((pkg) => pkg.targets.flatMap((target) => target.kind)));
+  const flags = [];
+  if (["lib", "rlib", "cdylib", "dylib", "staticlib", "proc-macro"].some((kind) => kinds.has(kind))) flags.push("--lib");
+  if (kinds.has("bin")) flags.push("--bins");
+  if (tests) flags.push("--tests");
+  return flags;
+}
+
+function bazelTestRow(pkgs, sets) {
+  const withTests = pkgs.filter((pkg) => sets.get(pkg.name).test !== null);
+  if (withTests.length === 0) return null;
+  const features = withTests.flatMap((pkg) => sets.get(pkg.name).test.map((feature) => `${pkg.name}/${feature}`));
+  return [
+    ...withTests.map((pkg) => `-p ${pkg.name}`),
+    "--no-default-features",
+    ...(features.length > 0 ? [`--features ${features.join(",")}`] : []),
+    ...targetFlags(withTests, { tests: true }),
+  ].join(" ");
+}
+
+function featureChecks(shards, byName) {
+  const changedNames = shards.flatMap((shard) => shard.packages);
+  const sets = new Map(changedNames.map((name) => [name, parseBazelFeatureSets(byName.get(name))]));
+  const makeRows = parseMakeFeatureMatrix(byName);
+  // Each shard gives two jobs that run in parallel: its Bazel test-set check
+  // (one invocation over the shard, 534-796 s cold on #1763's workspace run)
+  // and its other rows (variants and Make matrix rows, up to ~1000 s cold).
+  // In one job they reached 1568 s, over the pull-request lane budget.
+  return shards.flatMap((shard) => {
+    const pkgs = shard.packages.map((name) => byName.get(name));
+    const bazel = bazelTestRow(pkgs, sets);
+    const commands = [];
+    const add = (args) => {
+      if (args && !commands.includes(args)) commands.push(args);
+    };
+    for (const pkg of pkgs) {
+      for (const variant of sets.get(pkg.name).variants) {
+        add([
+          `-p ${pkg.name}`,
+          "--no-default-features",
+          ...(variant.features.length > 0 ? [`--features ${variant.features.join(",")}`] : []),
+          ...(variant.lib ? ["--lib"] : []),
+          ...(variant.bins ? ["--bins"] : []),
+        ].join(" "));
+      }
+      for (const row of makeRows) {
+        if (row.package === pkg.name) add(row.args);
+      }
+    }
+    return [
+      { name: `${shard.name} bazel set`, packages: shard.packages, commands: bazel ? [bazel] : [] },
+      { name: `${shard.name} matrix`, packages: shard.packages, commands },
+    ].filter((job) => job.commands.length > 0);
+  });
+}
 
 function estimatedMinutes(cost) {
   return Math.round((LANE_SETUP_MINUTES + cost / COST_UNITS_PER_MINUTE) * 10) / 10;
@@ -699,6 +922,14 @@ function plan(args) {
     };
   });
 
+  for (const exception of PR_UNIT_CHAIN_EXCEPTIONS) {
+    for (const name of [exception.package, ...exception.triggers]) {
+      if (!byName.has(name)) {
+        throw new Error(`pull-request unit exception ${exception.package} names unknown package ${name}`);
+      }
+    }
+  }
+
   const archivedPackages = new Map(
     ARCHIVED_UNIT_LANES.map((lane) => {
       if (!byName.has(lane.package)) {
@@ -762,10 +993,17 @@ function plan(args) {
       if (!covered.has(name)) throw new Error(`internal error: package ${name} not covered by any shard`);
     }
     // Pull-request unit lanes: the changed packages outside the heavy chain,
-    // packed so that no lane models over the budget; the rest is deferred to
-    // the push-to-main run and reported.
-    result.unit_deferred = result.packages.filter((name) => heavyChain.has(name));
-    result.unit_packages = result.packages.filter((name) => !heavyChain.has(name));
+    // plus each exception package one of whose triggers changed, packed so
+    // that no lane models over the budget; the rest of the chain is deferred
+    // to the push-to-main run and reported.
+    result.unit_chain_exceptions = PR_UNIT_CHAIN_EXCEPTIONS.filter((exception) =>
+      exception.triggers.some((name) => result.packages.includes(name)),
+    ).map((exception) => exception.package);
+    const runsInPullRequest = (name) => !heavyChain.has(name) || result.unit_chain_exceptions.includes(name);
+    result.unit_deferred = result.packages.filter((name) => !runsInPullRequest(name));
+    result.unit_packages = [...new Set([...result.packages, ...result.unit_chain_exceptions])]
+      .filter(runsInPullRequest)
+      .sort();
     result.unit_shards = packWithinBudget(result.unit_packages, weights, shardCap, model);
     for (const shard of result.unit_shards) {
       if (shard.estimated_minutes > PR_UNIT_BUDGET_MINUTES) {
@@ -787,12 +1025,15 @@ function plan(args) {
     result.main_archive_runs = archived.runs;
     // Feature-gated suites: all of them on main (an archived package's
     // suites run as archived lanes); in the pull request those of a changed
-    // package that runs its unit tests there (the heavy chain's suites are
-    // deferred with the package).
+    // package that runs its unit tests there. The heavy chain's suites stay
+    // deferred with the package, an exception package's too: the exception
+    // covers its default-feature row only.
     result.main_feature_unit_shards = featureSuites.filter(
       (suite) => !archivedPackages.has(suite.packages[0]),
     );
-    result.unit_feature_shards = featureSuites.filter((suite) => result.unit_packages.includes(suite.packages[0]));
+    result.unit_feature_shards = featureSuites.filter(
+      (suite) => result.unit_packages.includes(suite.packages[0]) && !heavyChain.has(suite.packages[0]),
+    );
     for (const suite of result.unit_feature_shards) {
       if (suite.estimated_minutes > PR_UNIT_BUDGET_MINUTES) {
         throw new Error(
@@ -800,7 +1041,9 @@ function plan(args) {
         );
       }
     }
+    result.feature_check_jobs = featureChecks(result.shards, byName);
   } else {
+    result.unit_chain_exceptions = [];
     result.unit_deferred = [];
     result.unit_packages = [];
     result.unit_shards = [];
@@ -809,6 +1052,7 @@ function plan(args) {
     result.unit_feature_shards = [];
     result.main_archive_builds = [];
     result.main_archive_runs = [];
+    result.feature_check_jobs = [];
   }
 
   // Integration suites of the directly changed packages' triggers. Package
@@ -967,6 +1211,15 @@ function githubOutput(result) {
   scalar("main_archive_run_matrix", archiveMatrixOf(result.main_archive_runs));
   scalar("integration_count", String(result.integration_suites.length));
   scalar("integration_matrix", matrixOf(result.integration_suites));
+  scalar("feature_check_count", String(result.feature_check_jobs.length));
+  scalar(
+    "feature_check_matrix",
+    JSON.stringify({
+      include: result.feature_check_jobs.length > 0
+        ? result.feature_check_jobs.map((job) => ({ name: job.name, commands: job.commands.join("\n") }))
+        : [{ name: "none", commands: "" }],
+    }),
+  );
   return `${lines.join("\n")}\n`;
 }
 
@@ -979,7 +1232,7 @@ function main() {
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   }
   process.stderr.write(
-    `ci-cargo-lanes: mode=${result.mode} packages=${result.packages.length} closure=${result.closure.length} clippy_shards=${result.shards.length} unit_shards=${result.unit_shards.length} feature_suites=${result.unit_feature_shards.length}/${result.main_feature_unit_shards.length} unit_deferred=${result.unit_deferred.length} integration=${result.integration_suites.length} (${result.reason})\n`,
+    `ci-cargo-lanes: mode=${result.mode} packages=${result.packages.length} closure=${result.closure.length} clippy_shards=${result.shards.length} unit_shards=${result.unit_shards.length} feature_suites=${result.unit_feature_shards.length}/${result.main_feature_unit_shards.length} unit_deferred=${result.unit_deferred.length} unit_chain_exceptions=${result.unit_chain_exceptions.length} integration=${result.integration_suites.length} feature_check_jobs=${result.feature_check_jobs.length} (${result.reason})\n`,
   );
 }
 

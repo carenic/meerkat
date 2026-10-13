@@ -308,6 +308,7 @@ impl BuiltinTool for BlobSaveFileTool {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Builtin,
                 source_id: "builtin".into(),
+                artifact: None,
             }),
         }
     }
@@ -434,6 +435,7 @@ impl BuiltinTool for BlobLoadFileTool {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Builtin,
                 source_id: "builtin".into(),
+                artifact: None,
             }),
         }
     }
@@ -535,6 +537,7 @@ impl BuiltinTool for BlobInspectTool {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Builtin,
                 source_id: "builtin".into(),
+                artifact: None,
             }),
         }
     }

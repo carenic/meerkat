@@ -546,9 +546,37 @@ pub async fn create_session_with_params_on_route(
     params: CreateSessionParams,
     runtime: Arc<SessionRuntime>,
     notification_sink: &NotificationSink,
+    runtime_adapter: &Arc<meerkat_runtime::MeerkatMachine>,
+    request_context: Option<RequestContext>,
+    callback_route: Option<crate::callback_dispatcher::CallbackRoute>,
+) -> RpcResponse {
+    create_session_with_params_on_route_and_configured_mcp(
+        id,
+        params,
+        runtime,
+        notification_sink,
+        runtime_adapter,
+        request_context,
+        callback_route,
+        Vec::new(),
+    )
+    .await
+}
+
+/// [`create_session_with_params_on_route`] for a trusted host composition
+/// that carries `configured_mcp_servers` (full descriptors) into the
+/// session's build, where each connects through the governed configured
+/// entry. Never taken from wire parameters.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_session_with_params_on_route_and_configured_mcp(
+    id: Option<RpcId>,
+    params: CreateSessionParams,
+    runtime: Arc<SessionRuntime>,
+    notification_sink: &NotificationSink,
     _runtime_adapter: &Arc<meerkat_runtime::MeerkatMachine>,
     request_context: Option<RequestContext>,
     callback_route: Option<crate::callback_dispatcher::CallbackRoute>,
+    configured_mcp_servers: Vec<meerkat_core::McpServerConfig>,
 ) -> RpcResponse {
     if let Err(err) = meerkat::surface::validate_public_peer_meta(params.peer_meta.as_ref()) {
         return RpcResponse::error(id, error::INVALID_PARAMS, err);
@@ -658,6 +686,7 @@ pub async fn create_session_with_params_on_route(
     build_config.app_context = params.app_context;
     build_config.shell_env = params.shell_env;
     build_config.preload_skills = params.preload_skills;
+    build_config.mcp_servers = configured_mcp_servers;
 
     // Wire callback tools backed by the live registered_tools list.
     // Tools added later via tools/register are picked up dynamically at each
@@ -673,6 +702,7 @@ pub async fn create_session_with_params_on_route(
                 provenance: Some(meerkat_core::types::ToolProvenance {
                     kind: meerkat_core::types::ToolSourceKind::Callback,
                     source_id: "callback".into(),
+                    artifact: None,
                 }),
                 ..t
             })

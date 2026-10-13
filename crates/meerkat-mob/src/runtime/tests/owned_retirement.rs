@@ -306,7 +306,7 @@ async fn a_retirement_settles_on_its_cancel_signal_not_the_hang_guard() {
 /// lives (`#[tokio::test]` runs the mob actor on the test's own thread).
 fn capture_info_events() -> (
     Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>,
-    tracing::subscriber::DefaultGuard,
+    CaptureGuard,
 ) {
     use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -336,15 +336,66 @@ fn capture_info_events() -> (
             }
             let mut fields = BTreeMap::new();
             event.record(&mut FieldVisitor(&mut fields));
+            // Event metadata under keys no field name can take, so a failure
+            // shows where each captured event came from.
+            fields.insert("@level".into(), event.metadata().level().to_string());
+            fields.insert("@target".into(), event.metadata().target().to_string());
             self.0.lock().expect("captured events lock").push(fields);
         }
     }
 
+    // A second, separately registered Dispatch that lives as long as the
+    // capture. With only one Dispatch registered, tracing-core 0.1.36 computes
+    // a callsite's interest from the current default of the thread that
+    // reaches it first (or rebuilds interest), so a concurrent test thread
+    // without a subscriber caches `never` for every thread and this capture
+    // sees nothing from that callsite. With two, interest comes from every
+    // registered Dispatch.
+    let anchor = tracing::Dispatch::new(tracing_subscriber::Registry::default());
     let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
     let guard = tracing::subscriber::set_default(
         tracing_subscriber::registry().with(InfoCapture(Arc::clone(&captured))),
     );
-    (captured, guard)
+    (
+        captured,
+        CaptureGuard {
+            _default: guard,
+            _anchor: anchor,
+        },
+    )
+}
+
+/// Keeps the capture installed, and its anchor Dispatch registered.
+struct CaptureGuard {
+    _default: tracing::subscriber::DefaultGuard,
+    _anchor: tracing::Dispatch,
+}
+
+/// The capture sees this thread's events from a callsite that a thread
+/// without a subscriber reached first, and after that thread rebuilt every
+/// callsite's interest.
+#[test]
+fn the_capture_sees_a_callsite_first_reached_by_a_thread_without_a_subscriber() {
+    fn probe(origin: &'static str) {
+        tracing::info!(origin, "capture probe");
+    }
+
+    let (captured, _guard) = capture_info_events();
+    std::thread::spawn(|| {
+        tracing::dispatcher::with_default(&tracing::Dispatch::none(), || {
+            probe("a thread without a subscriber");
+            tracing::callsite::rebuild_interest_cache();
+        });
+    })
+    .join()
+    .expect("the uncaptured probe thread finishes");
+    probe("this thread");
+    let raw = captured.lock().expect("captured events lock").clone();
+    assert!(
+        raw.iter()
+            .any(|fields| fields.get("origin").map(String::as_str) == Some("this thread")),
+        "captured events: {raw:?}"
+    );
 }
 
 /// A caller deadline shorter than a held runtime unregister returns the
@@ -407,16 +458,31 @@ async fn shutdown_logs_each_member_outcome_as_it_settles() {
     let (stuck, _) = spawn_member(&handle, "stuck-peer").await;
     stuck_retirement(&handle, &service, &stuck).await;
 
-    tokio::time::timeout(
+    let report = tokio::time::timeout(
         STEP,
         handle.shutdown_with_report(ShutdownOptions::default()),
     )
     .await
     .expect("shutdown completes")
     .expect("shutdown succeeds");
-    let outcomes = captured
-        .lock()
-        .expect("captured events lock")
+    // Every failure below names the whole capture, not only the outcomes
+    // filtered from it.
+    let raw = captured.lock().expect("captured events lock").clone();
+    assert!(
+        matches!(
+            report.members.get(&first),
+            Some(MemberShutdownOutcome::Unregistered)
+        ),
+        "report: {report:?}; captured events: {raw:?}"
+    );
+    assert!(
+        matches!(
+            report.members.get(&stuck),
+            Some(MemberShutdownOutcome::RetirementStuck { .. })
+        ),
+        "report: {report:?}; captured events: {raw:?}"
+    );
+    let outcomes = raw
         .iter()
         .filter(|fields| {
             fields.get("message").map(String::as_str) == Some("shutdown member outcome")
@@ -432,13 +498,13 @@ async fn shutdown_logs_each_member_outcome_as_it_settles() {
         outcomes
             .iter()
             .any(|(member, outcome)| member == first.as_str() && outcome.contains("Unregistered")),
-        "{outcomes:?}"
+        "outcomes: {outcomes:?}; captured events: {raw:?}"
     );
     assert!(
         outcomes.iter().any(
             |(member, outcome)| member == stuck.as_str() && outcome.contains("RetirementStuck")
         ),
-        "{outcomes:?}"
+        "outcomes: {outcomes:?}; captured events: {raw:?}"
     );
 }
 

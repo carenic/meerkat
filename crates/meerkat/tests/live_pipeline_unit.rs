@@ -57,6 +57,10 @@ mod live_pipeline {
     use meerkat_store::MemoryBlobStore;
 
     const ADVERTISED_BASE: &str = "wss://advertised.example:7443";
+    /// The catalog's realtime model.
+    const REALTIME_MODEL: &str = "gpt-realtime-2";
+    /// A text model the catalog does not flag as realtime-capable.
+    const TEXT_MODEL: &str = "gpt-5.5";
 
     struct NonFactorySessionAgentBuilder;
 
@@ -137,7 +141,8 @@ mod live_pipeline {
         );
         let mut builder = FactoryAgentBuilder::new(factory, config);
         builder.default_llm_client = Some(Arc::new(TestClient::default()));
-        let (service, adapter) = build_runtime_backed_service(builder, 4, persistence);
+        let (service, adapter) = build_runtime_backed_service(builder, 4, persistence)
+            .expect("compose the runtime-backed service");
         let service = Arc::new(service);
 
         let projection = Arc::new(ServiceLiveProjection::new(
@@ -170,10 +175,10 @@ mod live_pipeline {
         }
     }
 
-    fn create_request() -> CreateSessionRequest {
+    fn create_request_for_model(model: &str) -> CreateSessionRequest {
         CreateSessionRequest {
             injected_context: Vec::new(),
-            model: "gpt-realtime-2".to_string(),
+            model: model.to_string(),
             prompt: meerkat_core::ContentInput::Text(String::new()),
             system_prompt: meerkat::SystemPromptOverride::Set(
                 "live pipeline unit battery".to_string(),
@@ -188,6 +193,10 @@ mod live_pipeline {
     }
 
     async fn create_realtime_session(fx: &Fixture) -> SessionId {
+        create_session_with_model(fx, REALTIME_MODEL).await
+    }
+
+    async fn create_session_with_model(fx: &Fixture, model: &str) -> SessionId {
         let session = Session::new();
         let session_id = session.id().clone();
         let service_for_executor = Arc::clone(&fx.service);
@@ -196,7 +205,7 @@ mod live_pipeline {
             &fx.service,
             &fx.adapter,
             session,
-            create_request(),
+            create_request_for_model(model),
             move |session_id| {
                 default_persistent_executor(service_for_executor, adapter_for_executor, session_id)
             },
@@ -271,6 +280,51 @@ mod live_pipeline {
             WireLiveTransportBootstrap::Websocket { url, token } => (url.clone(), token.clone()),
             other => panic!("expected websocket bootstrap, got {other:?}"),
         }
+    }
+
+    /// Open through the composed-surface projection seam with the realtime
+    /// model selected for this channel over the member's text model, as a
+    /// composed surface's per-open model selection does.
+    async fn open_with_realtime_model(
+        fx: &Fixture,
+        ingress: &RecordingIngress,
+        factory: &ScriptedRealtimeSessionFactory,
+        session_id: &SessionId,
+    ) -> meerkat_contracts::LiveOpenResult {
+        let mut projection = orchestrator(fx, Some(ingress))
+            .live_open_projection_for_session(
+                session_id,
+                RealtimeTurningMode::ProviderManaged,
+                None,
+            )
+            .await
+            .expect("prepare projection");
+        projection.open_config.llm_identity.model = REALTIME_MODEL.to_string();
+        orchestrator(fx, Some(ingress))
+            .open_live_channel_from_projection(
+                &fx.host,
+                transport_ctx(fx),
+                factory,
+                session_id,
+                projection,
+                None,
+            )
+            .await
+            .expect("open under the channel's realtime model")
+    }
+
+    /// Every `Refresh` snapshot the adapter received, in order.
+    fn refresh_snapshots(
+        adapter: &meerkat::test_fixtures::realtime::ScriptedLiveAdapter,
+    ) -> Vec<meerkat_core::live_adapter::LiveProjectionSnapshot> {
+        adapter
+            .commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                LiveAdapterCommand::Refresh { snapshot } => Some(snapshot),
+                _ => None,
+            })
+            .collect()
     }
 
     /// T-L3: the happy-path open returns a bootstrap whose base is the
@@ -816,6 +870,217 @@ mod live_pipeline {
             )),
             "bridge Truncate must map to TruncateAssistantOutput: {commands:?}"
         );
+    }
+
+    /// One channel whose realtime model differs from its member's text
+    /// model, on a session with durable history and an image whose bytes
+    /// were never hydrated. The public `live/refresh` verb and the member
+    /// `refresh` control are both queued while the process-wide open
+    /// reservation is occupied, and both payloads are history-free
+    /// configuration updates under the channel's bound identity, with the
+    /// durable currentness sidecars, no audio config and increasing snapshot
+    /// versions. The channel's adapter is the scripted one, which accepts
+    /// every command, so this is native host and payload acceptance, not
+    /// provider acceptance. Once the channel is retired its refresh is
+    /// refused locally, with no fallback to the text identity, and a sibling
+    /// channel opened later still refreshes.
+    ///
+    /// The open reservation is process wide; nextest isolates tests by
+    /// process.
+    #[tokio::test]
+    async fn refresh_projects_the_bound_identity_from_the_history_free_export() {
+        let fx = build_fixture().await;
+        let session_id = create_session_with_model(&fx, TEXT_MODEL).await;
+        let factory = ScriptedRealtimeSessionFactory::new();
+        let ingress = RecordingIngress::default();
+        let opened = open_with_realtime_model(&fx, &ingress, &factory, &session_id).await;
+        let channel = LiveChannelId::new(&opened.channel_id);
+        let adapter = factory.adapters().pop().expect("scripted adapter minted");
+
+        fx.service
+            .append_external_user_content(
+                &session_id,
+                meerkat_core::types::ContentInput::Text(
+                    "durable history committed before the refresh".to_string(),
+                ),
+            )
+            .await
+            .expect("append durable history");
+        fx.service
+            .append_external_user_content(
+                &session_id,
+                meerkat_core::types::ContentInput::Blocks(vec![
+                    meerkat_core::types::ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        data: meerkat_core::types::ImageData::Blob {
+                            blob_id: meerkat_core::blob::content_blob_id(
+                                "image/png",
+                                "never-hydrated",
+                            ),
+                        },
+                    },
+                ]),
+            )
+            .await
+            .expect("append an image whose bytes were never stored");
+        let durable = fx
+            .service
+            .export_realtime_refresh_session_snapshot(&session_id)
+            .await
+            .expect("durable session");
+        let text_identity = fx
+            .service
+            .live_session_llm_identity(&session_id)
+            .await
+            .expect("the member's text identity");
+        assert_eq!(text_identity.model, TEXT_MODEL);
+        let binding = fx
+            .adapter
+            .live_channel_binding(&session_id, &channel)
+            .await
+            .expect("binding read")
+            .expect("the channel is bound");
+        assert_eq!(binding.identity().model, REALTIME_MODEL);
+        assert!(
+            binding.follows_session_identity(),
+            "no execution profile was admitted for this channel"
+        );
+
+        let held = meerkat_core::RealtimeOpenProjectionAdmission::global()
+            .try_acquire()
+            .expect("the open reservation is free before the refreshes");
+        let public = orchestrator(&fx, None)
+            .refresh_live_channel(&fx.host, &channel, None)
+            .await
+            .expect("public refresh while the open reservation is occupied");
+        let member = orchestrator(&fx, None)
+            .control_live_channel(
+                &fx.host,
+                transport_ctx(&fx),
+                &channel,
+                Some(&session_id),
+                BridgeLiveControlVerb::Refresh,
+            )
+            .await
+            .expect("member refresh while the open reservation is occupied");
+        drop(held);
+        assert_eq!(public.status, meerkat_contracts::LiveRefreshStatus::Queued);
+        assert_eq!(
+            member,
+            BridgeLiveControlOutcome::Refresh {
+                status: meerkat_contracts::LiveRefreshStatus::Queued,
+            }
+        );
+
+        let refreshes = refresh_snapshots(&adapter);
+        assert_eq!(
+            refreshes.len(),
+            2,
+            "both refreshes reach the scripted adapter"
+        );
+        let expected =
+            meerkat_client::realtime_session::RealtimeSessionOpenConfig::for_refresh_from_messages(
+                RealtimeTurningMode::ProviderManaged,
+                text_identity.clone(),
+                Vec::new(),
+                durable.messages(),
+            )
+            .expect("expected refresh projection");
+        let rewrite_generation = durable
+            .transcript_rewrite_generation()
+            .expect("rewrite generation");
+        for snapshot in &refreshes {
+            assert_eq!(snapshot.session_id, session_id);
+            assert!(
+                snapshot.seed_messages.is_empty(),
+                "a refresh replays no history: {:?}",
+                snapshot.seed_messages
+            );
+            assert_eq!(
+                snapshot.model_id, REALTIME_MODEL,
+                "the channel keeps its bound realtime model, not the text model"
+            );
+            assert_eq!(snapshot.provider_id, binding.identity().provider);
+            assert_eq!(
+                snapshot.canonical_system_messages,
+                expected.canonical_system_messages_ref(),
+                "the canonical System drift data is the durable session's"
+            );
+            assert_eq!(
+                format!("{:?}", snapshot.user_content_identities),
+                format!("{:?}", durable.realtime_user_content_identities()),
+            );
+            assert_eq!(
+                format!("{:?}", snapshot.user_content_tombstones),
+                format!("{:?}", durable.realtime_user_content_tombstones()),
+            );
+            assert_eq!(snapshot.transcript_rewrite_generation, rewrite_generation);
+            assert!(snapshot.audio_config.is_none());
+        }
+        assert!(
+            refreshes[1].snapshot_version > refreshes[0].snapshot_version,
+            "each refresh stamps a newer snapshot version"
+        );
+
+        // Retirement: the refusal is local and never falls back to the text
+        // identity.
+        orchestrator(&fx, None)
+            .close_live_channel(&fx.host, &channel, Some(&session_id))
+            .await
+            .expect("retire the channel");
+        let public_retired = orchestrator(&fx, None)
+            .refresh_live_channel(&fx.host, &channel, None)
+            .await
+            .expect_err("a retired channel is not refreshed");
+        assert!(
+            matches!(public_retired, LiveChannelVerbError::UnboundRequest { .. }),
+            "{public_retired:?}"
+        );
+        let member_retired = orchestrator(&fx, None)
+            .control_live_channel(
+                &fx.host,
+                transport_ctx(&fx),
+                &channel,
+                Some(&session_id),
+                BridgeLiveControlVerb::Refresh,
+            )
+            .await
+            .expect_err("a retired channel is not refreshed");
+        assert!(
+            matches!(member_retired, LiveChannelVerbError::UnboundRequest { .. }),
+            "{member_retired:?}"
+        );
+        assert_eq!(
+            refresh_snapshots(&adapter).len(),
+            2,
+            "no refresh reaches the retired adapter"
+        );
+
+        // A sibling opened later refreshes under its own bound identity.
+        let sibling_session = create_session_with_model(&fx, TEXT_MODEL).await;
+        fx.service
+            .append_external_user_content(
+                &sibling_session,
+                meerkat_core::types::ContentInput::Text("sibling history".to_string()),
+            )
+            .await
+            .expect("append sibling history");
+        let sibling_factory = ScriptedRealtimeSessionFactory::new();
+        let sibling =
+            open_with_realtime_model(&fx, &ingress, &sibling_factory, &sibling_session).await;
+        orchestrator(&fx, None)
+            .refresh_live_channel(&fx.host, &LiveChannelId::new(&sibling.channel_id), None)
+            .await
+            .expect("a later sibling refreshes");
+        let sibling_refreshes = refresh_snapshots(
+            &sibling_factory
+                .adapters()
+                .pop()
+                .expect("sibling scripted adapter"),
+        );
+        assert_eq!(sibling_refreshes.len(), 1);
+        assert_eq!(sibling_refreshes[0].model_id, REALTIME_MODEL);
+        assert!(sibling_refreshes[0].seed_messages.is_empty());
     }
 
     /// T-L13: error-mapping spot checks (the exhaustive matches ARE the

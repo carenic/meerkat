@@ -4035,7 +4035,7 @@ pub(crate) mod tests {
             1,
             lifecycle.clone(),
         );
-        let target = target();
+        let target = target_with_binding("stale_registry_openai");
         let provider = OAuthProviderIdentity::OpenAiChatGpt;
 
         authority
@@ -4052,7 +4052,7 @@ pub(crate) mod tests {
 
         authority
             .start(
-                alternate_target(),
+                target_with_binding("stale_registry_alternate_openai"),
                 provider,
                 "http://127.0.0.1/other-callback".to_string(),
                 "verifier-2".to_string(),
@@ -4495,6 +4495,8 @@ mod connector_owner_tests {
             redirect_uri: REDIRECT.into(),
             expected_account: account.into(),
             strategy_id: "authenticated-test-profile".into(),
+            client_auth_profile: None,
+            protocol: None,
         }
         .try_into()
         .unwrap()

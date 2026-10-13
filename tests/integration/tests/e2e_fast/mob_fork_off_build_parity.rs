@@ -9,7 +9,7 @@
 //!
 //! These lanes compose the production persistent session service behind a
 //! host build callback (`SessionAgentBuilder` wrapping the factory, the shape
-//! MobKit's `callback/build_agent` gateway has) that resolves tools from
+//! Meta's `callback/build_agent` gateway has) that resolves tools from
 //! `app_context`, the way a downstream app does, and runs the members on the real
 //! OpenAI Responses client against a loopback server that records every
 //! request body. A child and its source must send byte-identical `tools`
@@ -65,7 +65,7 @@ const WAIT: Duration = Duration::from_secs(60);
 const CALENDAR_HOST_TOOLS: [&str; 2] = ["calendar_create_event", "display_publish"];
 /// The host tool the build callback grants a member it cannot place.
 const GENERIC_HOST_TOOL: &str = "generic_note";
-/// The source's per-spawn overlay (MobKit's `memory` recorder).
+/// The source's per-spawn overlay (Meta's `memory` recorder).
 const OVERLAY_TOOL: &str = "memory";
 
 // ===========================================================================
@@ -238,7 +238,7 @@ impl meerkat_core::AgentToolDispatcher for NamedTools {
 
 /// The host side of `callback/build_agent`: grants tools by the member's
 /// `app_context["domain"]` and composes them over whatever the mob already
-/// installed (the per-spawn overlay and mob-owned tools), as MobKit does.
+/// installed (the per-spawn overlay and mob-owned tools), as Meta does.
 struct HostBuildCallback {
     inner: FactoryAgentBuilder,
     builds: Arc<Mutex<Vec<RecordedBuild>>>,

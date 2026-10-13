@@ -14,7 +14,7 @@ use meerkat_core::AuthCredentialIdentity;
 use meerkat_core::OAuthProviderIdentity;
 use meerkat_core::auth::token_store::{
     CredentialMutationError, CredentialMutationOutcome, PersistedTokens, ProviderAuthPersistence,
-    TokenKey, TokenStore,
+    TokenKey, TokenStore, TokenStoreAccess,
 };
 use meerkat_core::handles::{
     AuthLeasePhase, AuthLeaseRestoreSnapshot, AuthLeaseSnapshot, AuthLeaseTransition,
@@ -24,6 +24,12 @@ use meerkat_core::handles::{
 use crate::oauth_flow::{
     OAuthBrowserFlowCompletion, OAuthDevicePollLease, OAuthFlowAuthority, OAuthFlowError,
 };
+
+/// How long one login publication retries busy native controller custody.
+/// It bounds only the lifecycle publication attempt inside the commit, not
+/// flow consumption, token exchange or the durable save. These callers have
+/// no shorter deadline of their own.
+const LIFECYCLE_PUBLICATION_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// One verified browser-flow terminal consume request.
 #[derive(Clone)]
@@ -81,11 +87,13 @@ pub async fn save_tokens_and_publish_lifecycle(
                         auth_lease.capture_auth_lifecycle_restore_snapshot(&lease_key);
                     let previous_lifecycle = previous_lifecycle_restore.snapshot().clone();
                     let lifecycle_transition =
-                        meerkat_core::publish_token_lifecycle_acquired_for_identity(
+                        meerkat_core::publish_token_lifecycle_acquired_for_identity_within(
                             &auth_lease,
                             &credential_identity,
                             &tokens,
+                            tokio::time::Instant::now() + LIFECYCLE_PUBLICATION_RETRY_BUDGET,
                         )
+                        .await
                         .map_err(|error| {
                             CredentialMutationError::AuthLifecycle(format!(
                                 "AuthMachine lifecycle acquire failed: {error}"
@@ -115,7 +123,10 @@ pub async fn save_tokens_and_publish_lifecycle(
                             .await);
                         }
                     };
-                    if let Err(error) = store.save(&commit.key, &marked).await {
+                    if let Err(error) = store
+                        .save_for(&commit.key, &marked, TokenStoreAccess::Interactive)
+                        .await
+                    {
                         return Err(compensated_error(
                             store.as_ref(),
                             &auth_lease,
@@ -219,11 +230,14 @@ pub async fn save_oauth_tokens_and_consume_browser_flow(
                         auth_lease.capture_auth_lifecycle_restore_snapshot(&lease_key);
                     let previous_lifecycle = previous_lifecycle_restore.snapshot().clone();
                     let lifecycle_transition =
-                        match meerkat_core::publish_token_lifecycle_acquired_for_identity(
+                        match meerkat_core::publish_token_lifecycle_acquired_for_identity_within(
                             &auth_lease,
                             &credential_identity,
                             &tokens,
-                        ) {
+                            tokio::time::Instant::now() + LIFECYCLE_PUBLICATION_RETRY_BUDGET,
+                        )
+                        .await
+                        {
                             Ok(transition) => transition,
                             Err(error) => {
                                 let cleanup = if previous.is_none() {
@@ -271,7 +285,10 @@ pub async fn save_oauth_tokens_and_consume_browser_flow(
                                 .await);
                             }
                         };
-                    if let Err(error) = store.save(&commit.key, &marked).await {
+                    if let Err(error) = store
+                        .save_for(&commit.key, &marked, TokenStoreAccess::Interactive)
+                        .await
+                    {
                         return Err(compensated_error(
                             store.as_ref(),
                             &auth_lease,
@@ -350,11 +367,14 @@ pub async fn save_oauth_tokens_and_consume_device_flow(
                         auth_lease.capture_auth_lifecycle_restore_snapshot(&lease_key);
                     let previous_lifecycle = previous_lifecycle_restore.snapshot().clone();
                     let lifecycle_transition =
-                        match meerkat_core::publish_token_lifecycle_acquired_for_identity(
+                        match meerkat_core::publish_token_lifecycle_acquired_for_identity_within(
                             &auth_lease,
                             &credential_identity,
                             &tokens,
-                        ) {
+                            tokio::time::Instant::now() + LIFECYCLE_PUBLICATION_RETRY_BUDGET,
+                        )
+                        .await
+                        {
                             Ok(transition) => transition,
                             Err(error) => {
                                 let cleanup = if previous.is_none() {
@@ -402,7 +422,10 @@ pub async fn save_oauth_tokens_and_consume_device_flow(
                                 .await);
                             }
                         };
-                    if let Err(error) = store.save(&commit.key, &marked).await {
+                    if let Err(error) = store
+                        .save_for(&commit.key, &marked, TokenStoreAccess::Interactive)
+                        .await
+                    {
                         return Err(compensated_error(
                             store.as_ref(),
                             &auth_lease,
@@ -478,7 +501,7 @@ async fn rollback_commit(
     match &commit.previous {
         Some(previous) => {
             store
-                .save(&commit.key, previous)
+                .save_for(&commit.key, previous, TokenStoreAccess::Interactive)
                 .await
                 .map_err(|error| format!("TokenStore rollback save failed: {error}"))?;
             if matches!(
@@ -497,14 +520,14 @@ async fn rollback_commit(
                 )
                 .map_err(|error| format!("AuthMachine rollback marker handoff failed: {error}"))?;
                 store
-                    .save(&commit.key, &restored)
+                    .save_for(&commit.key, &restored, TokenStoreAccess::Interactive)
                     .await
                     .map_err(|error| format!("TokenStore rollback marker save failed: {error}"))?;
             }
         }
         None => {
             store
-                .clear(&commit.key)
+                .clear_for(&commit.key, TokenStoreAccess::Interactive)
                 .await
                 .map_err(|error| format!("TokenStore rollback clear failed: {error}"))?;
         }

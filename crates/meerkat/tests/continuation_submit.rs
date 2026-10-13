@@ -2,12 +2,14 @@
 //! Continuation submit and status: exact-key replay, conflict, first-binding
 //! incarnation rules, and the store-only status overlay.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use meerkat::{
-    AddressResolution, ContinuationAddressResolver, ContinuationDelivery, ContinuationHandling,
-    ContinuationKey, ContinuationOwner, ContinuationOwnerService, ContinuationProducer,
-    ContinuationResultRef, ContinuationStatus, ContinuationSubmitError, SessionAddressResolver,
+    AddressObservation, AddressResolution, ContinuationAddressResolver, ContinuationDelivery,
+    ContinuationHandling, ContinuationKey, ContinuationObservation, ContinuationObserveError,
+    ContinuationOwner, ContinuationOwnerService, ContinuationProducer, ContinuationResultRef,
+    ContinuationStatus, ContinuationStatusError, ContinuationSubmitError, SessionAddressResolver,
     SessionId, StrandedCause, member_delivery_address,
 };
 use meerkat_runtime::{
@@ -199,6 +201,29 @@ impl ContinuationAddressResolver for MemberResolver {
         } else {
             Ok(AddressResolution::NotServed)
         }
+    }
+
+    /// The double's records: a respawned or retired generation is retired.
+    async fn observe_address(
+        &self,
+        address: &LogicalRuntimeId,
+    ) -> Result<AddressObservation, String> {
+        let member = address
+            .member_address()
+            .map_err(|error| error.to_string())?
+            .ok_or("not a member address")?;
+        Ok(
+            if self
+                .retired_generations
+                .lock()
+                .expect("lock")
+                .contains(&member.generation)
+            {
+                AddressObservation::Retired
+            } else {
+                AddressObservation::MayServe
+            },
+        )
     }
 }
 
@@ -578,5 +603,135 @@ async fn a_governed_runtime_commits_only_retained_completions() {
             .await
             .expect_err("the public submit carries no binding"),
         ContinuationSubmitError::NoAdmissibleWorkBinding
+    );
+}
+
+/// A session resolver whose observation the test sets, counting the
+/// resolutions (the serving) asked of it.
+struct ObservingResolver {
+    observation: Mutex<Result<AddressObservation, String>>,
+    resolutions: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ContinuationAddressResolver for ObservingResolver {
+    async fn current_address(
+        &self,
+        owner: &ContinuationOwner,
+    ) -> Result<Option<LogicalRuntimeId>, String> {
+        SessionAddressResolver.current_address(owner).await
+    }
+
+    async fn resolve_address(
+        &self,
+        address: &LogicalRuntimeId,
+    ) -> Result<AddressResolution, String> {
+        self.resolutions.fetch_add(1, Ordering::SeqCst);
+        SessionAddressResolver.resolve_address(address).await
+    }
+
+    async fn observe_address(
+        &self,
+        _address: &LogicalRuntimeId,
+    ) -> Result<AddressObservation, String> {
+        self.observation.lock().expect("lock").clone()
+    }
+}
+
+/// A status read observes the owner and never serves it. A row not yet
+/// admitted reads pending while its owner is not proven retired, stranded
+/// once its owner's records prove it retired, and unavailable, typed, when
+/// those records cannot be read; the read-only retained observation answers
+/// the same. No read asks the resolver to resolve (serve) the address.
+#[tokio::test]
+async fn a_status_read_observes_the_owner_and_never_serves_it() {
+    let store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+    let resolver = Arc::new(ObservingResolver {
+        observation: Mutex::new(Ok(AddressObservation::MayServe)),
+        resolutions: AtomicUsize::new(0),
+    });
+    let (continuations, _) = service(store, resolver.clone());
+    let session_id = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session_id.clone(),
+    };
+    let jobs = OneJob(meerkat::RetainedJobFacts {
+        owner_session_id: session_id,
+        retained_work: Some(retained_identity()),
+        result_digest: "sha256:result".into(),
+    });
+    let record =
+        meerkat::RetainedJobRecord::from_owner(&jobs, ContinuationProducer::ForkOff, "job-1")
+            .await
+            .expect("read")
+            .expect("committed job");
+    let delivery = fork_completion("sha256:result");
+    let receipt = continuations
+        .submit_retained_completion(&owner, delivery.clone(), &record, 1)
+        .await
+        .expect("commit");
+    let observe = || continuations.observe_retained_completion(&owner, &delivery, &record);
+
+    let pending = ContinuationStatus::Pending {
+        receipt: receipt.clone(),
+        sequence: 1,
+        admitted: None,
+    };
+    assert_eq!(
+        continuations
+            .continuation_status(&owner, &delivery.key)
+            .await
+            .expect("status"),
+        pending,
+        "an owner not proven retired may still be served"
+    );
+    assert_eq!(
+        observe().await.expect("observe"),
+        ContinuationObservation::Matched {
+            receipt: receipt.clone(),
+            status: pending,
+        }
+    );
+
+    *resolver.observation.lock().expect("lock") = Ok(AddressObservation::Retired);
+    let stranded = ContinuationStatus::Stranded {
+        receipt: receipt.clone(),
+        cause: StrandedCause::OwnerRetired,
+    };
+    assert_eq!(
+        continuations
+            .continuation_status(&owner, &delivery.key)
+            .await
+            .expect("status"),
+        stranded,
+        "a proven retirement strands the row"
+    );
+    assert_eq!(
+        observe().await.expect("observe"),
+        ContinuationObservation::Matched {
+            receipt,
+            status: stranded,
+        }
+    );
+
+    *resolver.observation.lock().expect("lock") = Err("the owner records are unreadable".into());
+    assert_eq!(
+        continuations
+            .continuation_status(&owner, &delivery.key)
+            .await,
+        Err(ContinuationStatusError::Unavailable(
+            "the owner records are unreadable".into()
+        ))
+    );
+    assert_eq!(
+        observe().await,
+        Err(ContinuationObserveError::Unavailable(
+            "the owner records are unreadable".into()
+        ))
+    );
+    assert_eq!(
+        resolver.resolutions.load(Ordering::SeqCst),
+        0,
+        "no read asked the resolver to serve the owner"
     );
 }

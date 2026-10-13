@@ -6,7 +6,7 @@ icon: "python"
 
 The Python SDK (`meerkat-sdk`) is a runtime-backed client over `rkat-rpc`.
 
-- **Contract version:** `0.8.52`
+- **Contract version:** `0.9.0`
 - **Python:** `>=3.10`
 - **Runtime dependencies:** `websockets>=12,<16`
 
@@ -141,9 +141,9 @@ inspect the graph and its goal/attention projections:
   `jobs_result`, `jobs_artifacts`, `jobs_retry`, `jobs_health`,
   `jobs_subscribe`, `jobs_unsubscribe`
 - monitors: `monitors_start`
-- MobKit workers: `mobkit_job_heartbeat`, `mobkit_job_progress`,
-  `mobkit_job_checkpoint`, `mobkit_job_complete`, `mobkit_job_fail`,
-  `mobkit_job_cancel_ack`
+- Meta workers: `meta_job_heartbeat`, `meta_job_progress`,
+  `meta_job_checkpoint`, `meta_job_complete`, `meta_job_fail`,
+  `meta_job_cancel_ack`
 - approvals: `request_approval`, `list_approvals`, `get_approval`,
   `decide_approval`
 - artifacts: `list_artifacts`, `get_artifact`, `download_artifact`

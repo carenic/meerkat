@@ -10,7 +10,9 @@ use serde_json::json;
 use crate::machine::{WorkAttentionMachine, WorkGraphMachine, completion_policy_name};
 use crate::machines::work_item_admission as admission_dsl;
 use crate::machines::workgraph_lifecycle as wg_dsl;
-use crate::store::{WorkGraphEventFilter, WorkGraphStore, WorkItemAdmissionInsert};
+use crate::store::{
+    WorkGraphAdmissionFence, WorkGraphEventFilter, WorkGraphStore, WorkItemAdmissionInsert,
+};
 use crate::types::{
     AddEvidenceRequest, AttentionBindingRequest, AttentionBindingResult,
     AttentionContextProjection, AttentionListRequest, AttentionListResult, AttentionPauseRequest,
@@ -22,13 +24,13 @@ use crate::types::{
     GoalCreateResult, GoalRequestCloseRequest, GoalRequestCloseResult, GoalStatusRequest,
     GoalStatusResult, LinkWorkItemsRequest, ObserveLeaseExpiryRequest, ObserveReadinessRequest,
     PolicyEscalateRequest, ProjectedAttentionAuthority, ReadyWorkFilter, ReleaseWorkItemRequest,
-    UpdateWorkItemRequest, WorkAdmissionKey, WorkAdmissionOutcome, WorkAttentionBinding,
-    WorkAttentionBindingId, WorkAttentionMode, WorkAttentionStatus, WorkCompletionPolicy, WorkEdge,
-    WorkEdgeKind, WorkEvidenceKind, WorkEvidenceRef, WorkExecutionBinding,
-    WorkExecutionBindingFilter, WorkExecutionBindingId, WorkExecutionEvidenceKind,
-    WorkExecutionEvidenceProjection, WorkGraphEvent, WorkGraphEventKind, WorkGraphSnapshot,
-    WorkGraphSnapshotFilter, WorkItem, WorkItemFilter, WorkItemId, WorkItemRef, WorkNamespace,
-    WorkOwnerKey, WorkStatus,
+    UpdateWorkItemRequest, WorkAdmission, WorkAdmissionKey, WorkAdmissionOutcome,
+    WorkAttentionBinding, WorkAttentionBindingId, WorkAttentionMode, WorkAttentionStatus,
+    WorkCompletionPolicy, WorkEdge, WorkEdgeKind, WorkEvidenceKind, WorkEvidenceRef,
+    WorkExecutionBinding, WorkExecutionBindingFilter, WorkExecutionBindingId,
+    WorkExecutionEvidenceKind, WorkExecutionEvidenceProjection, WorkGraphEvent, WorkGraphEventKind,
+    WorkGraphSnapshot, WorkGraphSnapshotFilter, WorkItem, WorkItemFilter, WorkItemId, WorkItemRef,
+    WorkNamespace, WorkOwnerKey, WorkStatus,
 };
 use crate::{
     ChildJoinDisposition, WorkExecutionLifecycleEffect, WorkExecutionMachine,
@@ -266,7 +268,121 @@ impl WorkGraphService {
         admission_key: WorkAdmissionKey,
         request: CreateWorkItemRequest,
     ) -> Result<WorkAdmissionOutcome, WorkGraphError> {
+        self.admit_idempotent(admission_key, request, None).await
+    }
+
+    /// [`Self::create_idempotent`] under a participating current-authority
+    /// fence held through the actual store commit.
+    ///
+    /// The store takes its write boundary, then runs the admission lookup and
+    /// either the commit or the read of an existing admitted item inside
+    /// `fence`, so the fence also gates disclosure of a replay. A refusing
+    /// fence writes and reveals nothing. Replay versus conflict is still
+    /// classified by `WorkItemAdmissionMachine`. Stores without fence support
+    /// return a typed `UnsupportedBackend` refusal.
+    pub async fn create_idempotent_with_fence(
+        &self,
+        admission_key: WorkAdmissionKey,
+        request: CreateWorkItemRequest,
+        fence: Arc<dyn WorkGraphAdmissionFence>,
+    ) -> Result<WorkAdmissionOutcome, WorkGraphError> {
+        self.admit_idempotent(admission_key, request, Some(fence))
+            .await
+    }
+
+    /// Observe an existing keyed admission without creating an item or event.
+    ///
+    /// `Some(Replayed)` when the key was admitted with this exact request,
+    /// `Some(Conflict)` when it was admitted with a different one, `None` when
+    /// the key is not admitted. `None` is only an absence observation: an
+    /// outstanding admission can still commit later, so it neither permits a
+    /// retry nor proves cancellation. The caller must enforce current host
+    /// permission on every observation; no fence participates here.
+    pub async fn observe_admission(
+        &self,
+        admission_key: WorkAdmissionKey,
+        request: CreateWorkItemRequest,
+    ) -> Result<Option<WorkAdmissionOutcome>, WorkGraphError> {
+        let (realm_id, namespace, _, request_digest) = self.scoped_admission_request(request)?;
+        let Some((existing, existing_admission)) = self
+            .store
+            .observe_item_admission(&realm_id, &namespace, &admission_key)
+            .await?
+        else {
+            return Ok(None);
+        };
+        classify_existing_admission(
+            existing,
+            &existing_admission,
+            admission_key,
+            &request_digest,
+        )
+        .map(Some)
+    }
+
+    /// The exact admission identity of a keyed create, computed without
+    /// touching the store. It grants no creation, replay or namespace
+    /// permission.
+    pub fn admission_identity(
+        &self,
+        admission_key: WorkAdmissionKey,
+        request: CreateWorkItemRequest,
+    ) -> Result<WorkAdmission, WorkGraphError> {
+        let (_, _, _, request_digest) = self.scoped_admission_request(request)?;
+        Ok(WorkAdmission {
+            key: admission_key,
+            request_digest,
+        })
+    }
+
+    async fn admit_idempotent(
+        &self,
+        admission_key: WorkAdmissionKey,
+        request: CreateWorkItemRequest,
+        fence: Option<Arc<dyn WorkGraphAdmissionFence>>,
+    ) -> Result<WorkAdmissionOutcome, WorkGraphError> {
+        let (realm_id, namespace, scoped, request_digest) =
+            self.scoped_admission_request(request)?;
         let now = self.store.get_store_time_utc().await?;
+        let (item, event, admission) = WorkGraphMachine::create_item_with_admission(
+            scoped,
+            realm_id,
+            namespace,
+            now,
+            Some((&admission_key, request_digest.as_str())),
+        )?;
+        let inserted = match fence {
+            Some(fence) => {
+                self.store
+                    .insert_item_admitted_with_fence(item, event, admission, fence)
+                    .await?
+            }
+            None => {
+                self.store
+                    .insert_item_admitted(item, event, admission)
+                    .await?
+            }
+        };
+        match inserted {
+            WorkItemAdmissionInsert::Inserted(item) => Ok(WorkAdmissionOutcome::Created(item)),
+            WorkItemAdmissionInsert::Existing {
+                item: existing,
+                admission: existing_admission,
+            } => classify_existing_admission(
+                existing,
+                &existing_admission,
+                admission_key,
+                &request_digest,
+            ),
+        }
+    }
+
+    /// Validate a keyed create request, resolve its scope and compute the
+    /// canonical digest of the scope-resolved request.
+    fn scoped_admission_request(
+        &self,
+        request: CreateWorkItemRequest,
+    ) -> Result<(String, WorkNamespace, CreateWorkItemRequest, String), WorkGraphError> {
         validate_completion_policy(&request.completion_policy)?;
         match WorkGraphMachine::classify_create_completion_policy_admission(
             &request.completion_policy,
@@ -285,45 +401,7 @@ impl WorkGraphService {
         scoped.realm_id = Some(realm_id.clone());
         scoped.namespace = Some(namespace.clone());
         let request_digest = item_admission_request_digest(&scoped)?;
-        let (item, event, admission) = WorkGraphMachine::create_item_with_admission(
-            scoped,
-            realm_id,
-            namespace,
-            now,
-            Some((&admission_key, request_digest.as_str())),
-        )?;
-        match self
-            .store
-            .insert_item_admitted(item, event, admission)
-            .await?
-        {
-            WorkItemAdmissionInsert::Inserted(item) => Ok(WorkAdmissionOutcome::Created(item)),
-            WorkItemAdmissionInsert::Existing {
-                item: existing,
-                admission: existing_admission,
-            } => match WorkGraphMachine::classify_admission_replay(
-                &existing.id,
-                &existing_admission,
-                &admission_key,
-                &request_digest,
-            )? {
-                admission_dsl::WorkAdmissionReplayKind::Replayed => {
-                    Ok(WorkAdmissionOutcome::Replayed(existing))
-                }
-                admission_dsl::WorkAdmissionReplayKind::Conflict => {
-                    Ok(WorkAdmissionOutcome::Conflict {
-                        admission_key,
-                        existing_item_id: existing.id,
-                    })
-                }
-                admission_dsl::WorkAdmissionReplayKind::KeyMismatch => {
-                    Err(WorkGraphError::Store(format!(
-                        "work item admission index returned item {} whose recorded admission key differs from `{admission_key}`",
-                        existing.id
-                    )))
-                }
-            },
-        }
+        Ok((realm_id, namespace, scoped, request_digest))
     }
 
     pub async fn create_goal(
@@ -2309,6 +2387,35 @@ impl WorkExecutionBridge {
         self.service
             .project_execution_evidence(realm_id, namespace, binding_id, projection)
             .await
+    }
+}
+
+/// Classify an already admitted key through `WorkItemAdmissionMachine`:
+/// the same request replays, a different request conflicts. A recorded
+/// identity under another key is index corruption.
+fn classify_existing_admission(
+    existing: WorkItem,
+    existing_admission: &crate::types::WorkItemAdmissionState,
+    admission_key: WorkAdmissionKey,
+    request_digest: &str,
+) -> Result<WorkAdmissionOutcome, WorkGraphError> {
+    match WorkGraphMachine::classify_admission_replay(
+        &existing.id,
+        existing_admission,
+        &admission_key,
+        request_digest,
+    )? {
+        admission_dsl::WorkAdmissionReplayKind::Replayed => {
+            Ok(WorkAdmissionOutcome::Replayed(existing))
+        }
+        admission_dsl::WorkAdmissionReplayKind::Conflict => Ok(WorkAdmissionOutcome::Conflict {
+            admission_key,
+            existing_item_id: existing.id,
+        }),
+        admission_dsl::WorkAdmissionReplayKind::KeyMismatch => Err(WorkGraphError::Store(format!(
+            "work item admission index returned item {} whose recorded admission key differs from `{admission_key}`",
+            existing.id
+        ))),
     }
 }
 

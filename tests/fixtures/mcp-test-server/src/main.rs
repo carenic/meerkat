@@ -5,6 +5,9 @@
 //! - add: Adds two numbers
 //! - slow: Sleeps for N seconds (for timeout testing)
 //! - fail: Always returns an error
+//! - env_digest: with `--env-digest NAME`, the FNV-1a digest of the server's
+//!   own `NAME` environment value (`absent` without one), so a test can
+//!   check what a launch received without the value crossing the protocol
 
 use schemars::JsonSchema;
 use serde_json::{Map, Value, json};
@@ -54,6 +57,10 @@ struct SlowArgs {
 
 #[derive(JsonSchema)]
 #[allow(dead_code)]
+struct EnvDigestArgs {}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
 struct FailArgs {
     /// Error message
     message: String,
@@ -69,6 +76,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build()?
             .block_on(mcp_test_server::serve_forms_stdio());
     }
+    let env_digest = std::env::args()
+        .skip_while(|arg| arg != "--env-digest")
+        .nth(1);
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let reader = BufReader::new(stdin.lock());
@@ -117,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // This is a request, send a response
-        let response = handle_request(&request);
+        let response = handle_request(&request, env_digest.as_deref());
         writeln!(stdout, "{response}")?;
         stdout.flush()?;
     }
@@ -125,7 +135,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn handle_request(request: &Value) -> Value {
+/// FNV-1a (64-bit) of `value`, as 16 lowercase hex digits.
+fn fnv1a(value: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in value.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn handle_request(request: &Value, env_digest: Option<&str>) -> Value {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
@@ -154,7 +174,7 @@ fn handle_request(request: &Value) -> Value {
             })
         }
         "tools/list" => {
-            json!({
+            let mut listed = json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": {
@@ -181,7 +201,17 @@ fn handle_request(request: &Value) -> Value {
                         }
                     ]
                 }
-            })
+            });
+            if env_digest.is_some()
+                && let Some(tools) = listed["result"]["tools"].as_array_mut()
+            {
+                tools.push(json!({
+                    "name": "env_digest",
+                    "description": "Digest of this server's configured environment value",
+                    "inputSchema": schema_for::<EnvDigestArgs>()
+                }));
+            }
+            listed
         }
         "tools/call" => {
             let params = request.get("params").cloned().unwrap_or(json!({}));
@@ -227,6 +257,17 @@ fn handle_request(request: &Value) -> Value {
                         "content": [{
                             "type": "text",
                             "text": format!("Slept for {} seconds", seconds)
+                        }]
+                    })
+                }
+                "env_digest" if env_digest.is_some() => {
+                    let digest = env_digest
+                        .and_then(|name| std::env::var(name).ok())
+                        .map_or_else(|| "absent".to_owned(), |value| fnv1a(&value));
+                    json!({
+                        "content": [{
+                            "type": "text",
+                            "text": digest
                         }]
                     })
                 }

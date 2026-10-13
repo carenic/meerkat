@@ -1193,6 +1193,7 @@ pub fn register_tool_callback(
             provenance: Some(meerkat_core::types::ToolProvenance {
                 kind: meerkat_core::types::ToolSourceKind::Callback,
                 source_id: "wasm".into(),
+                artifact: None,
             }),
         });
 
@@ -1256,6 +1257,7 @@ pub fn register_js_tool(
             provenance: Some(meerkat_core::types::ToolProvenance {
                 kind: meerkat_core::types::ToolSourceKind::Callback,
                 source_id: "wasm".into(),
+                artifact: None,
             }),
         });
 

@@ -9,12 +9,16 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap};
 use sse_stream::{Error as SseError, Sse};
 use std::sync::Arc;
 
+use meerkat_auth_core::http_egress::HttpEgressError;
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
 use rmcp::service::RoleClient;
 use rmcp::transport::Transport;
 use rmcp::transport::common::http_header::{
     EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID, JSON_MIME_TYPE,
 };
+
+use super::EgressGuard;
+use super::streamable_http::{RequestDispatch, RequestDisposition, request_dispatch};
 
 #[derive(thiserror::Error, Debug)]
 pub enum SseTransportError<E: std::error::Error + Send + Sync + 'static> {
@@ -32,6 +36,8 @@ pub enum SseTransportError<E: std::error::Error + Send + Sync + 'static> {
     InvalidUri(#[from] http::uri::InvalidUri),
     #[error("Invalid uri parts: {0}")]
     InvalidUriParts(#[from] http::uri::InvalidUriParts),
+    #[error("MCP SSE message endpoint is not on the configured origin")]
+    CrossOriginMessageEndpoint,
 }
 
 pub trait SseClient: Clone + Send + Sync + 'static {
@@ -106,10 +112,10 @@ impl<C: SseClient> Transport<RoleClient> for SseClientTransport<C> {
         let uri = self.message_endpoint.clone();
         let source = self.source_endpoint.clone();
         async move {
-            if has_protected_metadata(&item) && !same_origin(&source, &uri) {
-                return Err(SseTransportError::Io(std::io::Error::other(
-                    "protected MCP message endpoint changed origin",
-                )));
+            // `start_with_client` refused another origin; every message,
+            // ordinary or protected, is still checked before it is posted.
+            if !same_origin(&source, &uri) {
+                return Err(SseTransportError::CrossOriginMessageEndpoint);
             }
             client.post_message(uri, item, None).await
         }
@@ -147,6 +153,12 @@ impl<C: SseClient> SseClientTransport<C> {
                 break message_endpoint(sse_endpoint.clone(), ep)?;
             }
         };
+        // Every message goes to the message endpoint, so it must be on the
+        // configured origin (scheme, host and effective port). An endpoint on
+        // another origin is refused here, before initialize or any post.
+        if !same_origin(&sse_endpoint, &message_endpoint) {
+            return Err(SseTransportError::CrossOriginMessageEndpoint);
+        }
 
         Ok(Self {
             client,
@@ -213,6 +225,10 @@ pub(crate) struct ReqwestSseClient {
     client: Result<reqwest::Client, meerkat_auth_core::auth_oauth::CredentialHttpClientUnavailable>,
     headers: HeaderMap,
     protected_metadata: ProtectedMetadataState,
+    /// The host egress profile every request is admitted by, the
+    /// server-selected message endpoint included; a required profile also
+    /// supplies the clients.
+    egress: EgressGuard,
 }
 
 impl std::fmt::Debug for ReqwestSseClient {
@@ -251,6 +267,7 @@ impl ReqwestSseClient {
             client: DEFAULT_SSE_CLIENT.clone(),
             headers,
             protected_metadata: Default::default(),
+            egress: EgressGuard::default(),
         }
     }
 
@@ -261,13 +278,49 @@ impl ReqwestSseClient {
             client: Ok(client),
             headers,
             protected_metadata: Default::default(),
+            egress: EgressGuard::default(),
         }
     }
 
-    fn client(&self) -> Result<&reqwest::Client, SseTransportError<reqwest::Error>> {
-        self.client.as_ref().map_err(|_| {
-            SseTransportError::Io(std::io::Error::other("MCP HTTP client unavailable"))
-        })
+    /// Apply the host egress profile of this attempt to every request.
+    pub(crate) fn with_egress(mut self, egress: EgressGuard) -> Self {
+        self.egress = egress;
+        self
+    }
+
+    /// The ordinary client: the required profile's own, or the existing
+    /// trusted-host client. A required profile never falls back to it; an
+    /// unbuildable one leaves a tool call affirmatively unsent.
+    fn client(
+        &self,
+        dispatch: Option<&RequestDispatch>,
+    ) -> Result<&reqwest::Client, SseTransportError<reqwest::Error>> {
+        match self.egress.ordinary_client() {
+            Some(Ok(client)) => Ok(client),
+            Some(Err(reason)) => Err(egress_error(
+                self.egress
+                    .refuse(dispatch, HttpEgressError::Unavailable(reason)),
+            )),
+            None => self.client.as_ref().map_err(|_| {
+                SseTransportError::Io(std::io::Error::other("MCP HTTP client unavailable"))
+            }),
+        }
+    }
+
+    /// The protected-call client: the required profile's own, or the
+    /// existing static one.
+    fn protected_client(
+        &self,
+        dispatch: Option<&RequestDispatch>,
+    ) -> Result<&reqwest::Client, SseTransportError<reqwest::Error>> {
+        match self.egress.protected_client() {
+            Some(Ok(client)) => Ok(client),
+            Some(Err(reason)) => Err(egress_error(
+                self.egress
+                    .refuse(dispatch, HttpEgressError::Unavailable(reason)),
+            )),
+            None => Ok(protected_http_client()?),
+        }
     }
 
     pub(crate) fn with_protected_metadata(mut self, state: ProtectedMetadataState) -> Self {
@@ -281,6 +334,13 @@ impl ReqwestSseClient {
         }
         builder
     }
+}
+
+/// The transport error of a request the host egress profile did not admit.
+fn egress_error(error: HttpEgressError) -> SseTransportError<reqwest::Error> {
+    SseTransportError::Io(std::io::Error::other(format!(
+        "MCP request not admitted by the host egress profile: {error}"
+    )))
 }
 
 impl From<reqwest::Error> for SseTransportError<reqwest::Error> {
@@ -298,22 +358,47 @@ impl SseClient for ReqwestSseClient {
         mut message: ClientJsonRpcMessage,
         auth_token: Option<String>,
     ) -> Result<(), SseTransportError<Self::Error>> {
+        // The actual URI, the server-selected message endpoint included, is
+        // admitted before anything is prepared; a refused tools/call is
+        // affirmatively unsent.
+        let dispatch = request_dispatch(&message);
+        let target = uri.to_string();
+        if let Err(error) = self.egress.admit(&target) {
+            if let Some(dispatch) = &dispatch {
+                dispatch.record(RequestDisposition::RefusedEgress(error));
+            }
+            return Err(egress_error(error));
+        }
         let protected = has_protected_metadata(&message);
         let client = if protected {
-            protected_http_client()?
+            self.protected_client(dispatch.as_ref())?
         } else {
-            self.client()?
+            self.client(dispatch.as_ref())?
         };
         let bytes = serialize_bounded_message(&mut message)?;
         let mut request_builder = client
-            .post(uri.to_string())
+            .post(target.as_str())
             .header(CONTENT_TYPE, JSON_MIME_TYPE)
             .body(bytes);
         request_builder = self.apply_headers(request_builder);
         if let Some(auth_header) = auth_token {
             request_builder = request_builder.bearer_auth(auth_header);
         }
-        let response = request_builder.send().await?;
+        let response = match request_builder.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                // The clients' own resolver refused the destination: nothing
+                // was connected for this request.
+                if let Some(refusal) = self.egress.observe_send_error(&error)
+                    && let Some(dispatch) = &dispatch
+                {
+                    dispatch.record(RequestDisposition::RefusedEgress(HttpEgressError::Refused(
+                        refusal,
+                    )));
+                }
+                return Err(error.into());
+            }
+        };
         // Every unfollowed redirect, protected or not, is refused here.
         refuse_redirect(response.status())?;
         response
@@ -328,9 +413,11 @@ impl SseClient for ReqwestSseClient {
         last_event_id: Option<String>,
         auth_token: Option<String>,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, SseTransportError<Self::Error>> {
+        let target = uri.to_string();
+        self.egress.admit(&target).map_err(egress_error)?;
         let mut request_builder = self
-            .client()?
-            .get(uri.to_string())
+            .client(None)?
+            .get(target.as_str())
             .header(ACCEPT, EVENT_STREAM_MIME_TYPE);
         request_builder = self.apply_headers(request_builder);
         if let Some(auth_header) = auth_token {
@@ -339,7 +426,10 @@ impl SseClient for ReqwestSseClient {
         if let Some(last_event_id) = last_event_id {
             request_builder = request_builder.header(HEADER_LAST_EVENT_ID, last_event_id);
         }
-        let response = request_builder.send().await?;
+        let response = request_builder.send().await.map_err(|error| {
+            self.egress.observe_send_error(&error);
+            SseTransportError::from(error)
+        })?;
         refuse_redirect(response.status())?;
         let response = response.error_for_status()?;
         match response.headers().get(reqwest::header::CONTENT_TYPE) {

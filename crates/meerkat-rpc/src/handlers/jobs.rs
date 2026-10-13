@@ -13,9 +13,9 @@ use meerkat_contracts::{
     JobsGetResult, JobsHealthResult, JobsListParams, JobsListResult, JobsProgressParams,
     JobsProgressResult, JobsResultParams, JobsResultResult, JobsRetryParams, JobsRetryResult,
     JobsSubscribeParams, JobsSubscribeResult, JobsUnsubscribeParams, JobsUnsubscribeResult,
-    MobkitJobCancelAckParams, MobkitJobCheckpointParams, MobkitJobCompleteParams,
-    MobkitJobFailParams, MobkitJobHeartbeatParams, MobkitJobMutationResult,
-    MobkitJobProgressParams, MonitorOutputProtocol, MonitorsStartParams, MonitorsStartResult,
+    MetaJobCancelAckParams, MetaJobCheckpointParams, MetaJobCompleteParams, MetaJobFailParams,
+    MetaJobHeartbeatParams, MetaJobMutationResult, MetaJobProgressParams, MonitorOutputProtocol,
+    MonitorsStartParams, MonitorsStartResult,
 };
 use serde::de::DeserializeOwned;
 use serde_json::value::RawValue;
@@ -692,7 +692,7 @@ macro_rules! host_mutation {
                 Ok(_) => match projected(runtime, &$job_id).await {
                     // The job service signals the delivery owner on every
                     // commit that carries an outbox entry.
-                    Ok(job) => RpcResponse::success(id, MobkitJobMutationResult { job }),
+                    Ok(job) => RpcResponse::success(id, MetaJobMutationResult { job }),
                     Err(error) => response_error(id, error),
                 },
                 Err(error) => response_error(id, error),
@@ -703,7 +703,7 @@ macro_rules! host_mutation {
 
 host_mutation!(
     handle_heartbeat,
-    MobkitJobHeartbeatParams,
+    MetaJobHeartbeatParams,
     |service, job_id, write, value| service.renew_lease(
         &job_id,
         write,
@@ -713,7 +713,7 @@ host_mutation!(
 );
 host_mutation!(
     handle_progress,
-    MobkitJobProgressParams,
+    MetaJobProgressParams,
     |service, job_id, write, value| service.report_progress(
         &job_id,
         write,
@@ -723,7 +723,7 @@ host_mutation!(
 );
 host_mutation!(
     handle_checkpoint,
-    MobkitJobCheckpointParams,
+    MetaJobCheckpointParams,
     |service, job_id, write, value| service.record_checkpoint(
         &job_id,
         write,
@@ -733,7 +733,7 @@ host_mutation!(
 );
 host_mutation!(
     handle_complete,
-    MobkitJobCompleteParams,
+    MetaJobCompleteParams,
     |service, job_id, write, value| service.complete_attempt(
         &job_id,
         write,
@@ -743,7 +743,7 @@ host_mutation!(
 );
 host_mutation!(
     handle_fail,
-    MobkitJobFailParams,
+    MetaJobFailParams,
     |service, job_id, write, value| service.fail_attempt(
         &job_id,
         write,
@@ -754,7 +754,7 @@ host_mutation!(
 );
 host_mutation!(
     handle_cancel_ack,
-    MobkitJobCancelAckParams,
+    MetaJobCancelAckParams,
     |service, job_id, write, value| service.acknowledge_cancel(
         &job_id,
         write,

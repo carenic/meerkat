@@ -30,6 +30,10 @@ struct Receiver {
     second_request: Notify,
     finish: Notify,
     authorized_requests: AtomicUsize,
+    /// When set, the held second request answers with this response (for
+    /// example one more tool call) instead of the final text, so the run
+    /// reaches one more natural boundary before its third request.
+    held_tool_response: Option<String>,
 }
 
 #[derive(Default)]
@@ -242,10 +246,14 @@ async fn receive(
     }
     receiver.second_request.notify_one();
     receiver.finish.notified().await;
+    let response = match (&receiver.held_tool_response, count) {
+        (Some(response), 2) => response.clone(),
+        _ => final_response_for_model(receiver.model.unwrap_or(E1_MODEL)),
+    };
     (
         StatusCode::OK,
         [("content-type", "text/event-stream")],
-        final_response_for_model(receiver.model.unwrap_or(E1_MODEL)),
+        response,
     )
 }
 
@@ -580,6 +588,8 @@ async fn exercise(server: &Server) {
     let machine = Arc::new(
         MeerkatMachine::ephemeral()
             .with_local_grant_authorization(NativeGrantWorkConfiguration {
+                retained_resume: None,
+                require_scoped_destination: false,
                 grants,
                 ingress,
                 invocation_owner: Arc::new(InvocationOwner),
@@ -587,6 +597,7 @@ async fn exercise(server: &Server) {
                     selection: selected.clone(),
                     endpoint: endpoint.clone(),
                 }),
+                configured_mcp_attachment: None,
             })
             .unwrap(),
     );

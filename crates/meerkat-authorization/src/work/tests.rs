@@ -999,6 +999,13 @@ fn controller_ceiling_is_independent_but_never_bypasses_other_operation_duties()
             LocalPolicyPurpose::Operation,
             false,
         ),
+        // Compaction of the controller's own context on its exact route is
+        // validated under the controller ceiling.
+        (
+            ModelAuthorizationUse::Compaction,
+            LocalPolicyPurpose::Controller,
+            true,
+        ),
         (
             ModelAuthorizationUse::Live,
             LocalPolicyPurpose::Operation,
@@ -1016,6 +1023,7 @@ fn controller_ceiling_is_independent_but_never_bypasses_other_operation_duties()
                 expires_at_ms: 2_000,
                 review_tier: meerkat_core::authorization::OperationReviewTier::R1,
             },
+            &[],
             now,
         );
         assert_eq!(result.is_ok(), succeeds);
@@ -1038,6 +1046,7 @@ fn controller_label_cannot_substitute_model_account_profile_or_backend() {
                 expires_at_ms: 2_000,
                 review_tier: meerkat_core::authorization::OperationReviewTier::R1,
             },
+            &[],
             now,
         )
     };

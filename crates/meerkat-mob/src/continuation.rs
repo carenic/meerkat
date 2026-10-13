@@ -7,7 +7,9 @@
 
 use std::sync::Arc;
 
-use meerkat::{AddressResolution, ContinuationAddressResolver, ContinuationOwner};
+use meerkat::{
+    AddressObservation, AddressResolution, ContinuationAddressResolver, ContinuationOwner,
+};
 use meerkat_runtime::LogicalRuntimeId;
 
 use crate::ids::{AgentIdentity, MobId};
@@ -111,6 +113,46 @@ impl ContinuationAddressResolver for MobContinuationResolver {
             ) => Ok(AddressResolution::Retired),
             Err(_) => Ok(AddressResolution::NotServed),
         }
+    }
+
+    /// Observed from the roster and the mob's published lifecycle only, with
+    /// nothing revived: an incarnation is retired when its identity left the
+    /// roster or was respawned at another generation, or when its mob
+    /// completed or was destroyed. A completed mob can be reset, but a reset
+    /// first retires every member incarnation, so an incarnation addressed in
+    /// a completed mob never serves again. A mob this host does not manage
+    /// now may still be registered, so its members are not proven retired.
+    async fn observe_address(
+        &self,
+        address: &LogicalRuntimeId,
+    ) -> Result<AddressObservation, String> {
+        let Some(member) = address
+            .member_address()
+            .map_err(|error| error.to_string())?
+        else {
+            return meerkat::SessionAddressResolver
+                .observe_address(address)
+                .await;
+        };
+        let Some(handle) = self
+            .mobs
+            .mob_handle(&MobId::from(member.mob_id.as_str()))
+            .await
+        else {
+            return Ok(AddressObservation::MayServe);
+        };
+        let roster = handle.roster().await;
+        let Some(entry) = roster.get_by_identity(&AgentIdentity::from(member.identity.as_str()))
+        else {
+            return Ok(AddressObservation::Retired);
+        };
+        if entry.generation.get() != member.generation {
+            return Ok(AddressObservation::Retired);
+        }
+        Ok(match handle.status_observation_snapshot() {
+            crate::MobState::Completed | crate::MobState::Destroyed => AddressObservation::Retired,
+            _ => AddressObservation::MayServe,
+        })
     }
 }
 

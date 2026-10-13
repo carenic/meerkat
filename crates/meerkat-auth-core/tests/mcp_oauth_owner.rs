@@ -256,6 +256,8 @@ impl McpOAuthAccountStrategy for FixtureAccountStrategy {
             scopes: ["mcp.read".to_owned()].into(),
             expected_account: "fixture-account-42".into(),
             strategy_id: "test-provider-authenticated-evidence".into(),
+            client_auth_profile: None,
+            protocol: None,
         }
         .try_into()
     }
@@ -4152,6 +4154,8 @@ struct SelectionStrategy {
     strategy_id: &'static str,
     preflights: std::sync::atomic::AtomicUsize,
     observations: std::sync::atomic::AtomicUsize,
+    /// The host egress profile this strategy reports it enforces.
+    egress: Mutex<Option<HttpEgressProfile>>,
 }
 
 impl SelectionStrategy {
@@ -4166,6 +4170,7 @@ impl SelectionStrategy {
             strategy_id,
             preflights: std::sync::atomic::AtomicUsize::new(0),
             observations: std::sync::atomic::AtomicUsize::new(0),
+            egress: Mutex::new(None),
         })
     }
 }
@@ -4185,6 +4190,8 @@ impl McpOAuthAccountStrategy for SelectionStrategy {
             scopes: ["mcp.read".to_owned()].into(),
             expected_account: context.account.clone(),
             strategy_id: self.strategy_id.into(),
+            client_auth_profile: None,
+            protocol: None,
         }
         .try_into()
     }
@@ -4211,6 +4218,10 @@ impl McpOAuthAccountStrategy for SelectionStrategy {
         }
         Ok(())
     }
+
+    fn http_egress(&self) -> Option<HttpEgressProfile> {
+        self.egress.lock().clone()
+    }
 }
 
 impl FixtureAuthority {
@@ -4220,17 +4231,28 @@ impl FixtureAuthority {
         owner: TestAuthAuthority,
         strategy: Arc<dyn McpOAuthAccountStrategy>,
     ) -> Self {
+        Self::with_strategy_over(
+            ProviderAuthPersistence::new(token_store, Arc::new(InMemoryCoordinator::new())),
+            browser,
+            owner,
+            strategy,
+        )
+    }
+
+    fn with_strategy_over(
+        persistence: ProviderAuthPersistence,
+        browser: Arc<dyn TestBrowser>,
+        owner: TestAuthAuthority,
+        strategy: Arc<dyn McpOAuthAccountStrategy>,
+    ) -> Self {
         let flows = Arc::new(RuntimeOAuthFlowHandle::new_with_auth_lease(
             MCP_INTERACTIVE_LOGIN_TIMEOUT,
             owner.lifecycle,
         ));
-        let native = McpOAuthAuthority::with_http(
-            ProviderAuthPersistence::new(token_store, Arc::new(InMemoryCoordinator::new())),
-            Client::new(),
-            owner.generated.clone(),
-        )
-        .with_interactive_strategy(flows.clone(), strategy)
-        .expect("fixture uses the actual matched runtime flow owner");
+        let native =
+            McpOAuthAuthority::with_http(persistence, Client::new(), owner.generated.clone())
+                .with_interactive_strategy(flows.clone(), strategy)
+                .expect("fixture uses the actual matched runtime flow owner");
         Self {
             native,
             auth_lease: owner.generated,
@@ -4610,8 +4632,9 @@ async fn known_refresh_reobserves_the_subject_and_keeps_unavailable_distinct() {
     let (base, state) = spawn_oauth_fixture().await;
     let store = Arc::new(EphemeralTokenStore::new());
     let strategy = SelectionStrategy::new("subject-7");
-    let authority = FixtureAuthority::with_strategy(
-        store.clone(),
+    let coordinator = Arc::new(EntryCountingCoordinator::default());
+    let authority = FixtureAuthority::with_strategy_over(
+        ProviderAuthPersistence::new(store.clone(), coordinator.clone()),
         recording_browser(state.clone()),
         test_auth_lease(),
         strategy.clone(),
@@ -4644,9 +4667,12 @@ async fn known_refresh_reobserves_the_subject_and_keeps_unavailable_distinct() {
             Some(expired.clone())
         );
 
-        // The subject cannot be observed: a local refresh failure, not a
-        // mismatch. It is not a token-endpoint report, so it is
-        // infrastructure (AuthLifecycle), never a caller refusal (#1737).
+        // The subject cannot be observed: the refresh itself succeeds, then
+        // account observation reports VerificationUnavailable. No mismatch
+        // and no local lifecycle failure is established, so this is an
+        // upstream refresh failure (RefreshFailed), never a caller refusal.
+        // An AuthMachine closure failure still maps to AuthLifecycle.
+        // Nothing new is published and the stored credential is kept.
         let expired = republish_stored_tokens(&authority, store.as_ref(), &target, expire).await;
         *strategy.subject.lock() = "subject-7".to_owned();
         strategy.unavailable.store(true, Ordering::SeqCst);
@@ -4655,7 +4681,7 @@ async fn known_refresh_reobserves_the_subject_and_keeps_unavailable_distinct() {
             .await
             .expect_err("an unobservable refreshed subject must not publish");
         assert!(
-            matches!(&unavailable, McpOAuthError::AuthLifecycle { reason, .. }
+            matches!(&unavailable, McpOAuthError::RefreshFailed { reason, .. }
                 if reason.contains("subject could not be observed")),
             "{unavailable:?}"
         );
@@ -4665,8 +4691,53 @@ async fn known_refresh_reobserves_the_subject_and_keeps_unavailable_distinct() {
             Some(expired)
         );
 
-        // The same subject: published, still bound to it.
+        // Under a required egress profile the verified refresh re-observes
+        // the subject only through a strategy bound to that exact profile.
+        // Unbound, or bound to an equal but separately compiled profile, it
+        // is refused typed before any refresh is coordinated: no coordinator
+        // entry, no refresh request, no observation, and the credential is
+        // retained.
         strategy.unavailable.store(false, Ordering::SeqCst);
+        let profile = fixture_egress_profile(&base);
+        let required = authority.native.clone().with_http_egress(&profile);
+        let expired = republish_stored_tokens(&authority, store.as_ref(), &target, expire).await;
+        for binding in [None, Some(fixture_egress_profile(&base))] {
+            *strategy.egress.lock() = binding;
+            let entries = coordinator.refresh_entries.load(Ordering::SeqCst);
+            let refreshes = refresh_grant_count(&state);
+            let observations = strategy.observations.load(Ordering::SeqCst);
+            let refused = required.stored_bearer_token(&target).await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(McpOAuthError::EgressUnavailable {
+                        reason: HttpEgressUnavailable::CredentialOwnerNotBound,
+                        ..
+                    })
+                ),
+                "{refused:?}"
+            );
+            assert_eq!(coordinator.refresh_entries.load(Ordering::SeqCst), entries);
+            assert_eq!(refresh_grant_count(&state), refreshes);
+            assert_eq!(strategy.observations.load(Ordering::SeqCst), observations);
+            assert_eq!(
+                store.load(&target.token_key().unwrap()).await.unwrap(),
+                Some(expired.clone())
+            );
+        }
+        // Bound to this exact profile, the verified refresh runs under it.
+        *strategy.egress.lock() = Some(profile);
+        assert_eq!(
+            required
+                .stored_bearer_token(&target)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("access-token")
+        );
+        *strategy.egress.lock() = None;
+
+        // The same subject: published, still bound to it.
         republish_stored_tokens(&authority, store.as_ref(), &target, expire).await;
         assert_eq!(
             authority
@@ -4898,6 +4969,8 @@ async fn joined_attempts_reuse_their_preflight_or_are_retired() {
             scopes: ["mcp.read".to_owned()].into(),
             expected_account: meerkat_auth_core::connector_oauth::AccountSelection::Discover,
             strategy_id: "test-selection-evidence".into(),
+            client_auth_profile: None,
+            protocol: None,
         }
         .try_into()
         .unwrap();
@@ -5376,4 +5449,782 @@ async fn dropping_complete_until_after_consume_lets_the_commit_owner_finish() {
     ));
     assert!(!format!("{closed:?}").contains("fixture-code"));
     assert_eq!(inner.list().await.unwrap().len(), 1);
+}
+
+// --- Pending login: wake on confirmed retirement ----------------------------
+
+/// A wake regression must fail, not hang: every waited future is bounded.
+async fn bounded<F: std::future::Future>(future: F) -> F::Output {
+    tokio::time::timeout(Duration::from_secs(20), future)
+        .await
+        .expect("the wait was not woken in time")
+}
+
+/// Two request-scoped authorities over ONE flow owner, as RPC builds a host
+/// service per request: a retirement through either must wake the other's
+/// wait.
+fn shared_flow_authorities(
+    runtime_store: &Arc<dyn meerkat_runtime::store::RuntimeStore>,
+) -> (McpOAuthAuthority, McpOAuthAuthority) {
+    let auth = test_auth_lease();
+    let flows = Arc::new(
+        RuntimeOAuthFlowHandle::new_with_persistent_store_and_auth_lease(
+            MCP_INTERACTIVE_LOGIN_TIMEOUT,
+            auth.lifecycle,
+            runtime_store,
+        ),
+    );
+    let persistence = ProviderAuthPersistence::new(
+        Arc::new(EphemeralTokenStore::new()),
+        Arc::new(InMemoryCoordinator::new()),
+    );
+    let wrapper = || {
+        McpOAuthAuthority::with_http(
+            persistence.clone(),
+            no_redirect_client(),
+            auth.generated.clone(),
+        )
+        .with_interactive_strategy(flows.clone(), Arc::new(FixtureAccountStrategy))
+        .unwrap()
+    };
+    (wrapper(), wrapper())
+}
+
+fn memory_runtime_store() -> Arc<dyn meerkat_runtime::store::RuntimeStore> {
+    Arc::new(meerkat_runtime::store::memory::InMemoryRuntimeStore::new())
+}
+
+#[tokio::test]
+async fn cancel_by_reference_through_another_authority_wakes_the_borrowed_wait() {
+    let (base, state) = spawn_oauth_fixture().await;
+    let runtime_store = memory_runtime_store();
+    let (waiter, canceller) = shared_flow_authorities(&runtime_store);
+    let target = split_target(&base, "wake-borrowed");
+    let mut pending = started_loopback_login(&waiter, &target).await;
+    let start = pending.start().clone();
+    let far = tokio::time::Instant::now() + MCP_INTERACTIVE_LOGIN_TIMEOUT;
+
+    let (waited, cancelled) = bounded(async {
+        tokio::join!(pending.complete_until(far), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let attempt = canceller.pending_attempt(&target).unwrap().unwrap();
+            canceller.cancel_attempt_by_ref(&target, attempt.attempt_ref.as_str())
+        })
+    })
+    .await;
+    cancelled.unwrap();
+    assert!(
+        matches!(
+            waited,
+            Err(McpOAuthError::AttemptRetired { cleanup: None, .. })
+        ),
+        "{waited:?}"
+    );
+    // The listener stayed with the login for its joined close.
+    let closed = pending.close().await;
+    assert!(
+        matches!(closed.attempt, McpOAuthAttemptCleanup::Retired),
+        "{closed:?}"
+    );
+    assert!(
+        matches!(closed.listener, McpOAuthListenerCleanup::Joined(_)),
+        "{closed:?}"
+    );
+    assert_callback_binding_retired(&start).await;
+    assert_eq!(waiter.pending_attempt(&target).unwrap(), None);
+    assert!(state.token_requests.lock().is_empty());
+    assert_fresh_continuation(&waiter, &target, &start).await;
+}
+
+#[tokio::test]
+async fn cancel_by_state_wakes_the_consuming_wait_with_its_joined_receipt() {
+    let (base, state) = spawn_oauth_fixture().await;
+    let runtime_store = memory_runtime_store();
+    let (waiter, canceller) = shared_flow_authorities(&runtime_store);
+    let target = split_target(&base, "wake-consuming");
+    let pending = started_loopback_login(&waiter, &target).await;
+    let start = pending.start().clone();
+
+    let (waited, cancelled) = bounded(async {
+        tokio::join!(pending.complete(MCP_INTERACTIVE_LOGIN_TIMEOUT), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            canceller.cancel_attempt(&target, &start.state)
+        })
+    })
+    .await;
+    cancelled.unwrap();
+    match waited {
+        Err(McpOAuthError::AttemptRetired {
+            cleanup: Some(closed),
+            ..
+        }) => {
+            assert!(
+                matches!(closed.attempt, McpOAuthAttemptCleanup::Retired),
+                "{closed:?}"
+            );
+            assert!(
+                matches!(closed.listener, McpOAuthListenerCleanup::Joined(_)),
+                "{closed:?}"
+            );
+        }
+        other => panic!("expected the retired wait with its receipt, got {other:?}"),
+    }
+    assert_callback_binding_retired(&start).await;
+    assert!(state.token_requests.lock().is_empty());
+}
+
+#[tokio::test]
+async fn a_cancel_handle_from_another_task_retires_and_wakes() {
+    let (base, _state) = spawn_oauth_fixture().await;
+    let runtime_store = memory_runtime_store();
+    let (authority, _) = shared_flow_authorities(&runtime_store);
+    let target = split_target(&base, "wake-handle");
+    let mut pending = started_loopback_login(&authority, &target).await;
+    let handle = pending.cancel_handle();
+    assert!(!format!("{handle:?}").contains(&pending.start().state));
+    let far = tokio::time::Instant::now() + MCP_INTERACTIVE_LOGIN_TIMEOUT;
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.cancel()
+    });
+    let waited = bounded(pending.complete_until(far)).await;
+    canceller.await.unwrap().unwrap();
+    assert!(
+        matches!(waited, Err(McpOAuthError::AttemptRetired { .. })),
+        "{waited:?}"
+    );
+    assert_eq!(authority.pending_attempt(&target).unwrap(), None);
+    let closed = pending.close().await;
+    assert!(matches!(closed.attempt, McpOAuthAttemptCleanup::Retired));
+}
+
+/// A retirement confirmed before the wait starts is not lost: the wait
+/// observes it at once.
+#[tokio::test]
+async fn a_retirement_before_the_wait_is_observed_by_the_wait() {
+    let (base, _state) = spawn_oauth_fixture().await;
+    let runtime_store = memory_runtime_store();
+    let (waiter, canceller) = shared_flow_authorities(&runtime_store);
+    let target = split_target(&base, "wake-early");
+    let mut pending = started_loopback_login(&waiter, &target).await;
+    let start = pending.start().clone();
+    canceller.cancel_attempt(&target, &start.state).unwrap();
+    let waited = tokio::time::timeout(
+        Duration::from_secs(5),
+        pending.complete_until(tokio::time::Instant::now() + MCP_INTERACTIVE_LOGIN_TIMEOUT),
+    )
+    .await
+    .expect("the wait observes the earlier retirement");
+    assert!(
+        matches!(waited, Err(McpOAuthError::AttemptRetired { .. })),
+        "{waited:?}"
+    );
+    let closed = pending.close().await;
+    assert!(matches!(
+        closed.listener,
+        McpOAuthListenerCleanup::Joined(_)
+    ));
+}
+
+/// A failed or absent cancellation wakes nothing: no retirement was
+/// confirmed, so the wait keeps waiting.
+#[tokio::test]
+async fn failed_and_absent_cancellations_wake_nothing() {
+    let (base, _state) = spawn_oauth_fixture().await;
+    let runtime_store = memory_runtime_store();
+    let (waiter, canceller) = shared_flow_authorities(&runtime_store);
+    let target = split_target(&base, "wake-absent");
+    let mut pending = started_loopback_login(&waiter, &target).await;
+
+    assert!(matches!(
+        canceller.cancel_attempt_by_ref(&target, "oauth-action:0000"),
+        Err(McpOAuthError::Flow(OAuthFlowError::Missing))
+    ));
+    let waited = pending
+        .complete_until(tokio::time::Instant::now() + Duration::from_millis(100))
+        .await;
+    assert!(
+        matches!(waited, Err(McpOAuthError::Callback { .. })),
+        "an absent cancellation is not a retirement: {waited:?}"
+    );
+    let _closed = pending.close().await;
+
+    // A retirement the flow owner refuses (its store is gone) is a typed
+    // failure and wakes nothing either.
+    let runtime_store = memory_runtime_store();
+    let (waiter, canceller) = shared_flow_authorities(&runtime_store);
+    let target = split_target(&base, "wake-failed");
+    let mut pending = started_loopback_login(&waiter, &target).await;
+    let start = pending.start().clone();
+    drop(runtime_store);
+    assert!(matches!(
+        canceller.cancel_attempt(&target, &start.state),
+        Err(McpOAuthError::Flow(_))
+    ));
+    let waited = pending
+        .complete_until(tokio::time::Instant::now() + Duration::from_millis(100))
+        .await;
+    assert!(
+        matches!(waited, Err(McpOAuthError::Callback { .. })),
+        "a failed retirement is not a retirement: {waited:?}"
+    );
+    let _closed = pending.close().await;
+}
+
+/// The callback was delivered and the exchange is held; a retirement then
+/// wins before the consume: nothing is published and the code is not
+/// replayed.
+#[tokio::test]
+async fn a_retirement_during_the_held_exchange_wins_before_the_consume() {
+    let (base, state) = spawn_oauth_fixture().await;
+    let store = Arc::new(EphemeralTokenStore::new());
+    let authority = split_authority(&state, store.clone());
+    let target = split_target(&base, "retire-during-exchange");
+    let mut pending = started_loopback_login(&authority, &target).await;
+    let start = pending.start().clone();
+    state.pause_code_exchange.store(true, Ordering::SeqCst);
+    let browser = tokio::spawn({
+        let url = start.authorize_url.clone();
+        async move { follow_authorize(&url).await }
+    });
+    let far = tokio::time::Instant::now() + MCP_INTERACTIVE_LOGIN_TIMEOUT;
+    let (completed, ()) = tokio::join!(pending.complete_until(far), async {
+        state.code_exchange_started.notified().await;
+        authority.cancel_attempt(&target, &start.state).unwrap();
+        state.code_exchange_release.notify_one();
+    });
+    browser.await.unwrap();
+    assert!(completed.is_err(), "{completed:?}");
+    assert!(store.list().await.unwrap().is_empty());
+    assert_eq!(state.token_requests.lock().len(), 1, "no code replay");
+    let _closed = pending.close().await;
+}
+
+/// The consume wins: a later cancel finds no attempt and reports absence,
+/// never a retirement; the credential stays.
+#[tokio::test]
+async fn a_consume_before_the_cancel_keeps_the_credential() {
+    let (base, state) = spawn_oauth_fixture().await;
+    let store = Arc::new(EphemeralTokenStore::new());
+    let authority = split_authority(&state, store.clone());
+    let target = split_target(&base, "consume-first");
+    let mut pending = started_loopback_login(&authority, &target).await;
+    let start = pending.start().clone();
+    let browser = tokio::spawn({
+        let url = start.authorize_url.clone();
+        async move { follow_authorize(&url).await }
+    });
+    let far = tokio::time::Instant::now() + MCP_INTERACTIVE_LOGIN_TIMEOUT;
+    pending.complete_until(far).await.unwrap();
+    browser.await.unwrap();
+    assert!(matches!(
+        authority.cancel_attempt(&target, &start.state),
+        Err(McpOAuthError::Flow(OAuthFlowError::Missing))
+    ));
+    assert_eq!(store.list().await.unwrap().len(), 1);
+    let closed = pending.close().await;
+    assert!(
+        matches!(closed.attempt, McpOAuthAttemptCleanup::Consumed),
+        "{closed:?}"
+    );
+}
+
+// --- Restart after an unclean exit (real process boundary) ------------------
+
+const RESTART_CHILD_STORE: &str = "MEERKAT_MCP_RESTART_CHILD_STORE";
+const RESTART_CHILD_BASE: &str = "MEERKAT_MCP_RESTART_CHILD_BASE";
+
+/// The authority and the store it persists through; the store must outlive
+/// every flow-owner call.
+fn sqlite_flow_authority(
+    path: &std::path::Path,
+) -> (
+    McpOAuthAuthority,
+    Arc<dyn meerkat_runtime::store::RuntimeStore>,
+) {
+    use meerkat_runtime::store::{RuntimeStore, sqlite::SqliteRuntimeStore};
+    let store: Arc<dyn RuntimeStore> = Arc::new(SqliteRuntimeStore::new(path).unwrap());
+    (persistent_flow_authority(&store), store)
+}
+
+/// Child half of the restart test: admit a loopback attempt into the given
+/// store, print its reference and exit at once, running no cleanup.
+#[tokio::test]
+#[ignore = "child process of a_fresh_process_retires_the_persisted_attempt_before_starting"]
+async fn restart_child_admits_an_attempt_then_exits_uncleanly() {
+    let (Ok(path), Ok(base)) = (
+        std::env::var(RESTART_CHILD_STORE),
+        std::env::var(RESTART_CHILD_BASE),
+    ) else {
+        return;
+    };
+    let (authority, _store) = sqlite_flow_authority(std::path::Path::new(&path));
+    let target = split_target(&base, "restart-unclean");
+    let pending = started_loopback_login(&authority, &target).await;
+    let attempt = authority.pending_attempt(&target).unwrap().unwrap();
+    assert_eq!(
+        pending.start().disposition,
+        McpOAuthLoginDisposition::Started
+    );
+    println!("ATTEMPT_REF={}", attempt.attempt_ref.as_str());
+    std::process::exit(0);
+}
+
+/// A process that died with an admitted attempt leaves it persisted. A fresh
+/// process reads that reference first, then a start retires it (the fresh
+/// process holds no preflight receipt for it) and admits a different one.
+#[tokio::test]
+async fn a_fresh_process_retires_the_persisted_attempt_before_starting() {
+    let (base, _state) = spawn_oauth_fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("runtime.sqlite");
+    // Async, so this runtime keeps serving the fixture the child talks to.
+    let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "restart_child_admits_an_attempt_then_exits_uncleanly",
+            "--ignored",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env(RESTART_CHILD_STORE, &path)
+        .env(RESTART_CHILD_BASE, &base)
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // The harness may print the test's name on the same line.
+    let old_ref = stdout
+        .split_once("ATTEMPT_REF=")
+        .and_then(|(_, rest)| rest.lines().next())
+        .expect("the child reported its attempt")
+        .trim()
+        .to_owned();
+
+    let (authority, _store) = sqlite_flow_authority(&path);
+    let target = split_target(&base, "restart-unclean");
+    // Before any start: the old attempt is still persisted.
+    let persisted = authority.pending_attempt(&target).unwrap().unwrap();
+    assert_eq!(persisted.attempt_ref.as_str(), old_ref);
+
+    let fresh = started_loopback_login(&authority, &target).await;
+    assert_eq!(fresh.start().disposition, McpOAuthLoginDisposition::Started);
+    let current = authority.pending_attempt(&target).unwrap().unwrap();
+    assert_ne!(current.attempt_ref.as_str(), old_ref);
+    assert!(matches!(
+        authority.cancel_attempt_by_ref(&target, &old_ref),
+        Err(McpOAuthError::Flow(OAuthFlowError::Missing))
+    ));
+    let _closed = fresh.close().await;
+}
+
+// --- Pending login: admission read-back fault and seam-level absence --------
+
+/// The runtime flow owner with two injectable faults: the read-back of an
+/// admitted attempt fails, or a retirement reports the attempt absent.
+struct FaultInjectingFlows {
+    inner: Arc<RuntimeOAuthFlowHandle>,
+    fail_admitted_read: std::sync::atomic::AtomicBool,
+    expire_reports_missing: std::sync::atomic::AtomicBool,
+}
+
+mod fault_injecting_flows {
+    use super::FaultInjectingFlows;
+    use meerkat_auth_core::oauth_flow::{
+        OAuthBrowserFlowCompletion, OAuthBrowserFlowIdentity, OAuthDeviceFlowRecord,
+        OAuthDevicePollLease, OAuthFlowAuthority, OAuthFlowError, OAuthFlowRecord,
+        OAuthProviderIdentity,
+    };
+    use meerkat_core::AuthCredentialIdentity;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    impl OAuthFlowAuthority for FaultInjectingFlows {
+        fn generated_credential_lifecycle(
+            &self,
+        ) -> Option<meerkat_core::handles::GeneratedAuthLeaseHandle> {
+            self.inner.generated_credential_lifecycle()
+        }
+        fn terminal_flow_state_is_authmachine_owned(&self) -> bool {
+            self.inner.terminal_flow_state_is_authmachine_owned()
+        }
+        fn start(
+            &self,
+            target: AuthCredentialIdentity,
+            provider: OAuthBrowserFlowIdentity,
+            redirect_uri: String,
+            pkce_verifier: String,
+        ) -> Result<String, OAuthFlowError> {
+            self.inner
+                .start(target, provider, redirect_uri, pkce_verifier)
+        }
+        fn start_with_nonce(
+            &self,
+            target: AuthCredentialIdentity,
+            provider: OAuthBrowserFlowIdentity,
+            redirect_uri: String,
+            pkce_verifier: String,
+            nonce: String,
+        ) -> Result<String, OAuthFlowError> {
+            self.inner
+                .start_with_nonce(target, provider, redirect_uri, pkce_verifier, nonce)
+        }
+        fn verify(
+            &self,
+            state: &str,
+            target: &AuthCredentialIdentity,
+            provider: OAuthBrowserFlowIdentity,
+            redirect_uri: &str,
+        ) -> Result<OAuthFlowRecord, OAuthFlowError> {
+            self.inner.verify(state, target, provider, redirect_uri)
+        }
+        fn consume(
+            &self,
+            state: &str,
+            target: &AuthCredentialIdentity,
+            provider: OAuthBrowserFlowCompletion,
+            redirect_uri: &str,
+        ) -> Result<OAuthFlowRecord, OAuthFlowError> {
+            self.inner.consume(state, target, provider, redirect_uri)
+        }
+        fn admitted_connector_browser_attempt(
+            &self,
+            state: &str,
+            target: &AuthCredentialIdentity,
+        ) -> Result<Option<OAuthFlowRecord>, OAuthFlowError> {
+            if self.fail_admitted_read.load(Ordering::SeqCst) {
+                return Err(OAuthFlowError::PersistenceFailed {
+                    operation: "admitted_oauth_browser_flow",
+                    detail: "injected read-back fault".into(),
+                });
+            }
+            self.inner.admitted_connector_browser_attempt(state, target)
+        }
+        fn pending_connector_browser_attempt(
+            &self,
+            target: &AuthCredentialIdentity,
+        ) -> Result<Option<(String, OAuthFlowRecord)>, OAuthFlowError> {
+            self.inner.pending_connector_browser_attempt(target)
+        }
+        fn expire(
+            &self,
+            state: &str,
+            target: &AuthCredentialIdentity,
+            provider: OAuthBrowserFlowIdentity,
+            redirect_uri: &str,
+        ) -> Result<(), OAuthFlowError> {
+            if self.expire_reports_missing.load(Ordering::SeqCst) {
+                return Err(OAuthFlowError::Missing);
+            }
+            self.inner.expire(state, target, provider, redirect_uri)
+        }
+        fn admit_device_code(
+            &self,
+            target: AuthCredentialIdentity,
+            provider: OAuthProviderIdentity,
+            device_code: String,
+            expires_in: Duration,
+        ) -> Result<(), OAuthFlowError> {
+            self.inner
+                .admit_device_code(target, provider, device_code, expires_in)
+        }
+        fn verify_device_code(
+            &self,
+            device_code: &str,
+            target: &AuthCredentialIdentity,
+            provider: OAuthProviderIdentity,
+        ) -> Result<OAuthDeviceFlowRecord, OAuthFlowError> {
+            self.inner.verify_device_code(device_code, target, provider)
+        }
+        fn begin_device_code_poll(
+            &self,
+            device_code: &str,
+            target: &AuthCredentialIdentity,
+            provider: OAuthProviderIdentity,
+        ) -> Result<OAuthDevicePollLease, OAuthFlowError> {
+            self.inner
+                .begin_device_code_poll(device_code, target, provider)
+        }
+    }
+}
+
+fn fault_injecting_authority(
+    runtime_store: &Arc<dyn meerkat_runtime::store::RuntimeStore>,
+) -> (McpOAuthAuthority, Arc<FaultInjectingFlows>) {
+    let auth = test_auth_lease();
+    let flows = Arc::new(FaultInjectingFlows {
+        inner: Arc::new(
+            RuntimeOAuthFlowHandle::new_with_persistent_store_and_auth_lease(
+                MCP_INTERACTIVE_LOGIN_TIMEOUT,
+                auth.lifecycle,
+                runtime_store,
+            ),
+        ),
+        fail_admitted_read: std::sync::atomic::AtomicBool::new(false),
+        expire_reports_missing: std::sync::atomic::AtomicBool::new(false),
+    });
+    let authority = McpOAuthAuthority::with_http(
+        ProviderAuthPersistence::new(
+            Arc::new(EphemeralTokenStore::new()),
+            Arc::new(InMemoryCoordinator::new()),
+        ),
+        no_redirect_client(),
+        auth.generated,
+    )
+    .with_interactive_strategy(flows.clone(), Arc::new(FixtureAccountStrategy))
+    .unwrap();
+    (authority, flows)
+}
+
+/// The admitted attempt cannot be read back: the login's own close retires
+/// it and joins the listener, and both outcomes come back beside the fault.
+#[tokio::test]
+async fn an_admission_read_back_fault_retires_the_attempt_and_joins_the_listener() {
+    let (base, state) = spawn_oauth_fixture().await;
+    let runtime_store = memory_runtime_store();
+    let (authority, flows) = fault_injecting_authority(&runtime_store);
+    let target = split_target(&base, "read-back-fault");
+    flows.fail_admitted_read.store(true, Ordering::SeqCst);
+    let begun = authority.begin_loopback_login(&target, None).await;
+    flows.fail_admitted_read.store(false, Ordering::SeqCst);
+    match begun {
+        Err(McpOAuthError::AdmissionReadFailed { read, cleanup, .. }) => {
+            assert!(
+                matches!(
+                    *read,
+                    McpOAuthError::Flow(OAuthFlowError::PersistenceFailed { .. })
+                ),
+                "{read:?}"
+            );
+            assert!(
+                matches!(cleanup.attempt, McpOAuthAttemptCleanup::Retired),
+                "{cleanup:?}"
+            );
+            assert!(
+                matches!(cleanup.listener, McpOAuthListenerCleanup::Joined(_)),
+                "{cleanup:?}"
+            );
+        }
+        Err(other) => panic!("expected the read-back fault with its cleanup, got {other:?}"),
+        Ok(_) => panic!("the read-back fault must not admit a login"),
+    }
+    // Nothing is stranded: the next login admits a fresh attempt.
+    assert_eq!(authority.pending_attempt(&target).unwrap(), None);
+    let fresh = started_loopback_login(&authority, &target).await;
+    assert_eq!(fresh.start().disposition, McpOAuthLoginDisposition::Started);
+    let _closed = fresh.close().await;
+    assert!(state.token_requests.lock().is_empty());
+}
+
+/// At the retirement seam itself, an attempt the flow owner reports absent
+/// wakes nothing: absence may be a consume.
+#[tokio::test]
+async fn an_absent_retirement_at_the_seam_wakes_nothing() {
+    let (base, _state) = spawn_oauth_fixture().await;
+    let runtime_store = memory_runtime_store();
+    let (authority, flows) = fault_injecting_authority(&runtime_store);
+    let target = split_target(&base, "seam-absent");
+    let mut pending = started_loopback_login(&authority, &target).await;
+    let handle = pending.cancel_handle();
+    flows.expire_reports_missing.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        handle.cancel(),
+        Err(McpOAuthError::Flow(OAuthFlowError::Missing))
+    ));
+    let waited = tokio::time::timeout(
+        Duration::from_secs(10),
+        pending.complete_until(tokio::time::Instant::now() + Duration::from_millis(100)),
+    )
+    .await
+    .expect("the wait ends at its own deadline");
+    assert!(
+        matches!(waited, Err(McpOAuthError::Callback { .. })),
+        "an absent retirement is not a retirement: {waited:?}"
+    );
+    flows.expire_reports_missing.store(false, Ordering::SeqCst);
+    let closed = pending.close().await;
+    assert!(
+        matches!(closed.attempt, McpOAuthAttemptCleanup::Retired),
+        "{closed:?}"
+    );
+}
+
+/// A retirement confirmed while no wait is running is still reported by the
+/// login's close as a retirement, not as absence.
+#[tokio::test]
+async fn close_reports_a_confirmed_retirement_no_wait_observed() {
+    let (base, _state) = spawn_oauth_fixture().await;
+    let runtime_store = memory_runtime_store();
+    let (waiter, canceller) = shared_flow_authorities(&runtime_store);
+    let target = split_target(&base, "close-after-signal");
+    let pending = started_loopback_login(&waiter, &target).await;
+    canceller
+        .cancel_attempt(&target, &pending.start().state)
+        .unwrap();
+    let closed = pending.close().await;
+    assert!(
+        matches!(closed.attempt, McpOAuthAttemptCleanup::Retired),
+        "{closed:?}"
+    );
+    assert!(matches!(
+        closed.listener,
+        McpOAuthListenerCleanup::Joined(_)
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Host egress profile: verified refresh under a required profile.
+// ---------------------------------------------------------------------------
+
+use meerkat_auth_core::auth_store::{
+    CredentialMutationFn, CredentialMutationOutcome, RefreshCoordinator, RefreshError, RefreshFn,
+};
+use meerkat_auth_core::http_egress::{
+    HttpEgressOrigin, HttpEgressPolicy, HttpEgressProfile, HttpEgressRefusal, HttpEgressUnavailable,
+};
+
+/// A required profile that deliberately admits exactly the fixture's own
+/// local origin.
+fn fixture_egress_profile(base: &str) -> HttpEgressProfile {
+    HttpEgressProfile::required(HttpEgressPolicy::new().allow_local(
+        HttpEgressOrigin::parse(base).unwrap(),
+        ["127.0.0.1".parse().unwrap()],
+    ))
+}
+
+fn refresh_grant_count(state: &TestState) -> usize {
+    state
+        .token_requests
+        .lock()
+        .iter()
+        .filter(|request| request["grant_type"] == "refresh_token")
+        .count()
+}
+
+/// A raw TCP destination that counts every accepted connection.
+async fn counting_listener() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let arrivals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&arrivals);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    (port, arrivals)
+}
+
+/// The in-memory coordinator, counting refresh entries so a test knows when
+/// a second reader has joined the in-flight refresh.
+#[derive(Default)]
+struct EntryCountingCoordinator {
+    inner: InMemoryCoordinator,
+    refresh_entries: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl RefreshCoordinator for EntryCountingCoordinator {
+    async fn with_exclusive_mutation(
+        &self,
+        key: TokenKey,
+        mutation_fn: CredentialMutationFn,
+    ) -> Result<CredentialMutationOutcome, meerkat_auth_core::auth_store::CredentialMutationError>
+    {
+        self.inner.with_exclusive_mutation(key, mutation_fn).await
+    }
+
+    async fn with_refresh(
+        &self,
+        key: TokenKey,
+        refresh_fn: RefreshFn,
+    ) -> Result<PersistedTokens, RefreshError> {
+        self.refresh_entries.fetch_add(1, Ordering::SeqCst);
+        self.inner.with_refresh(key, refresh_fn).await
+    }
+}
+
+impl FixtureAuthority {
+    fn with_http_egress(mut self, profile: &HttpEgressProfile) -> Self {
+        self.native = self.native.with_http_egress(profile);
+        self
+    }
+}
+
+/// One coordinated refresh, joined by a second expired reader. The verified
+/// UserInfo endpoint the bound strategy discovers is outside the required
+/// profile (another port): both readers get the same typed refusal from the
+/// one shared result, with one refresh request, no arrival at the refused
+/// endpoint and the credential unchanged.
+#[tokio::test]
+async fn coalesced_readers_share_the_typed_userinfo_egress_refusal() {
+    let (base, state) = spawn_oauth_fixture().await;
+    *state.token_scope_override.lock() = Some("openid mcp.read".to_owned());
+    let profile = fixture_egress_profile(&base);
+    let store = Arc::new(EphemeralTokenStore::new());
+    let coordinator = Arc::new(EntryCountingCoordinator::default());
+    let authority = FixtureAuthority::with_strategy_over(
+        ProviderAuthPersistence::new(store.clone(), coordinator.clone()),
+        recording_browser(state.clone()),
+        test_auth_lease(),
+        Arc::new(
+            meerkat_auth_core::mcp_oauth::OidcUserInfoAccountStrategy::new()
+                .with_http_egress(&profile),
+        ),
+    )
+    .with_http_egress(&profile);
+    let target = McpServerIdentity::from_server_config("oidc", format!("{base}/mcp"))
+        .with_expected_account("oidc-subject-7")
+        .unwrap();
+    authority.interactive_login(&target, None).await.unwrap();
+    let expired = republish_stored_tokens(&authority, store.as_ref(), &target, |tokens| {
+        tokens.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+    })
+    .await;
+
+    let (refused_port, refused_arrivals) = counting_listener().await;
+    *state.userinfo_endpoint_override.lock() =
+        Some(format!("http://127.0.0.1:{refused_port}/userinfo"));
+    state.pause_refresh.store(true, Ordering::SeqCst);
+    let read = |authority: FixtureAuthority, target: McpServerIdentity| {
+        tokio::spawn(async move { authority.stored_bearer_token(&target).await })
+    };
+    let first = read(authority.clone(), target.clone());
+    bounded(state.refresh_started.notified()).await;
+    let joined = read(authority.clone(), target.clone());
+    // The joined reader has entered the coordinator, which shares the one
+    // in-flight refresh with it.
+    bounded(async {
+        while coordinator.refresh_entries.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    state.pause_refresh.store(false, Ordering::SeqCst);
+    state.refresh_release.notify_one();
+
+    for (reader, result) in [
+        ("refresh owner", bounded(first).await.unwrap()),
+        ("joined reader", bounded(joined).await.unwrap()),
+    ] {
+        assert!(
+            matches!(
+                result,
+                Err(McpOAuthError::EgressRefused {
+                    refusal: HttpEgressRefusal::PortNotAdmitted,
+                    ..
+                })
+            ),
+            "{reader}: {result:?}"
+        );
+    }
+    assert_eq!(refresh_grant_count(&state), 1);
+    assert_eq!(refused_arrivals.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store.load(&target.token_key().unwrap()).await.unwrap(),
+        Some(expired)
+    );
 }

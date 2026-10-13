@@ -972,7 +972,7 @@ pub struct LiveExecutionProfileSelection {
 impl LiveExecutionProfileSelection {
     /// Mint a profile selection only while holding lower Gate0 qualification.
     /// Meerkat's admission owner supplies mode and atoms from its configured
-    /// catalog; surfaces and MobKit never receive this lower witness.
+    /// catalog; surfaces and Meta never receive this lower witness.
     #[cfg(feature = "live")]
     pub fn from_experimental_qualification(
         _qualification: &meerkat_llm_core::provider_runtime::ExperimentalRealtimeQualificationWitness,
@@ -1087,6 +1087,59 @@ impl LiveExecutionModeAdmission {
     #[must_use]
     pub const fn capabilities(&self) -> LiveExecutionCapabilities {
         self.capabilities
+    }
+}
+
+/// The current generated binding of one live channel: the LLM identity the
+/// machine admitted when the channel opened, and the execution profile
+/// admitted for it, if any.
+///
+/// A channel with no admitted profile follows its session's identity. A
+/// channel opened under an independently selected profile is governed by that
+/// profile, never by the session's text identity. This is a read of generated
+/// state, not a reservation: every effect taken on it still goes through its
+/// own generated authority.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveChannelBinding {
+    identity: meerkat_core::SessionLlmIdentity,
+    execution_profile_id: Option<String>,
+}
+
+impl LiveChannelBinding {
+    #[cfg(feature = "live")]
+    pub(crate) fn new(
+        identity: meerkat_core::SessionLlmIdentity,
+        execution_profile_id: Option<String>,
+    ) -> Self {
+        Self {
+            identity,
+            execution_profile_id,
+        }
+    }
+
+    /// The identity the channel was admitted with.
+    #[must_use]
+    pub fn identity(&self) -> &meerkat_core::SessionLlmIdentity {
+        &self.identity
+    }
+
+    #[must_use]
+    pub fn into_identity(self) -> meerkat_core::SessionLlmIdentity {
+        self.identity
+    }
+
+    /// The execution profile admitted for the channel, if it was opened under
+    /// an independently selected profile.
+    #[must_use]
+    pub fn execution_profile_id(&self) -> Option<&str> {
+        self.execution_profile_id.as_deref()
+    }
+
+    /// Whether the channel follows its session's identity: no execution
+    /// profile was admitted for it.
+    #[must_use]
+    pub fn follows_session_identity(&self) -> bool {
+        self.execution_profile_id.is_none()
     }
 }
 
@@ -1250,6 +1303,9 @@ impl From<crate::traits::RuntimeDriverError> for LiveBridgeOutcomeBindingError {
             | E::InterruptDispatchPanicked { .. }
             // The session's hosting claim clears once it can be taken.
             | E::HostingUnavailable { .. }
+            // Clears once the issuing consent owner completes the owner-loss
+            // settlement the session's claim lineage owes.
+            | E::ConsentOwnerLossUnsettled { .. }
             | E::Internal(_) => Self::Transient(error),
             E::InputRefused { .. }
             | E::ControllerInUse
@@ -1261,6 +1317,7 @@ impl From<crate::traits::RuntimeDriverError> for LiveBridgeOutcomeBindingError {
             | E::LiveContextBarrierRevoked { .. }
             | E::RecoveryCorruption { .. }
             | E::InputTerminalWithoutReceipt { .. }
+            | E::ScopedResultWithheld { .. }
             | E::RecoveryRepairBlocked { .. }
             // Superseded exact witnesses: a same-state retry is wrong.
             | E::StaleAuthority { .. }

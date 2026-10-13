@@ -350,6 +350,18 @@ def _history_result(message: dict[str, Any]) -> dict[str, Any]:
             "blocks": [{"type": "comms"}],
         },
         {
+            "role": "system_notice",
+            "created_at": "2026-07-12T10:00:00Z",
+            "kind": "generic",
+            "blocks": [
+                {
+                    "type": "runtime_notice",
+                    "category": "consent_attempt",
+                    "content": [{"garbage": True}],
+                }
+            ],
+        },
+        {
             "role": "block_assistant",
             "created_at": "2026-07-12T10:00:00Z",
             "blocks": [{"block_type": "tool_use", "data": {"args": {}}}],
@@ -440,6 +452,11 @@ def test_history_validator_accepts_only_schema_nullable_nested_fields() -> None:
             },
             {"type": "auth", "state": "ready", "binding": None, "detail": None},
             {"type": "runtime_notice", "category": "runtime", "detail": None},
+            {
+                "type": "runtime_notice",
+                "category": "consent_attempt",
+                "content": [{"type": "text", "text": "result"}],
+            },
             {"type": "unknown", "summary": None},
         ],
     }

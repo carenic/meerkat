@@ -525,6 +525,14 @@ impl DetachedJobStore for SqliteDetachedJobStore {
         self.with_connection(|conn| select_by_id(conn, job_id))
     }
 
+    async fn get_by_submission_key(
+        &self,
+        realm_id: &str,
+        submission_key: &crate::JobSubmissionKey,
+    ) -> Result<Option<StoredJob>, DetachedJobError> {
+        self.with_connection(|conn| select_by_submission(conn, realm_id, submission_key))
+    }
+
     async fn compare_and_swap(
         &self,
         expected_revision: u64,

@@ -303,7 +303,8 @@ async fn make_stack(
         64,
         persistence,
         NotificationSink::noop(),
-    );
+    )
+    .expect("compose the RPC session runtime");
     runtime.set_default_llm_client(Some(Arc::clone(&client)));
     let config_store: Arc<dyn meerkat_core::ConfigStore> =
         Arc::new(MemoryConfigStore::new(config, meerkat_models::canonical()));

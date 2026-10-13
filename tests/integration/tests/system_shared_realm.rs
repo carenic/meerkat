@@ -447,9 +447,12 @@ async fn spawn_rest(
 ) -> Result<Child, Box<dyn std::error::Error>> {
     let mut cmd = Command::new(binary);
     command_base(&mut cmd, cwd);
+    // A failed assertion drops the handle without shutdown_child: the server
+    // must die with it, not outlive the test holding its binary and realm.
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .args(args);
     let mut child = cmd.spawn()?;
     let client = reqwest::Client::new();
@@ -754,22 +757,70 @@ async fn rpc_rest_rpc_default_sqlite_shared_realm_roundtrip()
         Some(session_id_str.as_str())
     );
 
-    let continue_response = client
-        .post(format!(
-            "http://127.0.0.1:{port}/sessions/{session_id_str}/messages"
-        ))
-        .json(&json!({
-            "session_id": session_id_str.clone(),
-            "prompt": "Continue the shared sqlite session."
-        }))
+    // #1813: one runtime hosts a session at a time. While the RPC host that
+    // created it is alive and serving it, REST may read it (above), but its
+    // continue is refused as served elsewhere, with no appended messages.
+    let continue_url = format!("http://127.0.0.1:{port}/sessions/{session_id_str}/messages");
+    let continue_request = json!({
+        "session_id": session_id_str.clone(),
+        "prompt": "Continue the shared sqlite session."
+    });
+    let refused = client
+        .post(continue_url.as_str())
+        .json(&continue_request)
         .send()
         .await?;
-    assert!(continue_response.status().is_success());
-    let _continued: Value = continue_response.json().await?;
+    let refused_status = refused.status();
+    let refused_body: Value = refused.json().await?;
+    assert_eq!(
+        refused_status,
+        reqwest::StatusCode::CONFLICT,
+        "REST continue while the RPC host serves the session: {refused_body}"
+    );
+    assert_eq!(
+        refused_body["code"].as_str(),
+        Some("SESSION_BUSY"),
+        "{refused_body}"
+    );
+    assert_eq!(
+        refused_body["details"]["kind"].as_str(),
+        Some("session_served_elsewhere"),
+        "{refused_body}"
+    );
+    assert_eq!(
+        refused_body["details"]["session_id"].as_str(),
+        Some(session_id_str.as_str()),
+        "{refused_body}"
+    );
+    assert_eq!(
+        session_message_count(&state_root, realm_id, &session_id).await?,
+        count_before,
+        "a continue refused as served elsewhere must leave no appended messages"
+    );
+
+    // The host keeps its hosting claim, an OS file lock, while it serves the
+    // session; the kernel releases it when the host process exits. No surface
+    // hands a served session to another host while it lives, so the RPC host
+    // exits first, and the REST continue then takes the claim and succeeds.
+    shutdown_rpc(rpc).await?;
+    let continue_response = client
+        .post(continue_url.as_str())
+        .json(&continue_request)
+        .send()
+        .await?;
+    let continue_status = continue_response.status();
+    let continue_body = continue_response.text().await?;
+    assert!(
+        continue_status.is_success(),
+        "REST continue after the RPC host exited returned {continue_status}: {continue_body}"
+    );
+    let _continued: Value = serde_json::from_str(&continue_body)?;
     let count_after_rest = session_message_count(&state_root, realm_id, &session_id).await?;
     assert!(count_after_rest > count_before);
 
-    shutdown_rpc(rpc).await?;
+    // REST now serves the session and holds its claim the same way, so it
+    // exits before the next RPC host continues.
+    shutdown_child(rest).await?;
     let mut rpc = spawn_rpc(
         &rkat_rpc,
         &project_dir,
@@ -807,7 +858,6 @@ async fn rpc_rest_rpc_default_sqlite_shared_realm_roundtrip()
         "expected RPC handoff to advance durable message count: before={count_before}, after_rest={count_after_rest}, after_rpc={count_after_rpc}"
     );
 
-    shutdown_child(rest).await?;
     shutdown_rpc(rpc).await?;
     Ok(())
 }

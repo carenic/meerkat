@@ -89,7 +89,7 @@ When updating architecture docs or reviewing current code, do not stop at the
   customization, mob task-workflow guidance preloads, peer wake fixes, and safer
   active-turn retirement/respawn behavior.
 - RuntimeStore-owned session authority and atomic catalog projection,
-  preserving explicit broken/lost states and keeping MobKit/UnifiedRuntime
+  preserving explicit broken/lost states and keeping Meta/UnifiedRuntime
   observations in sync with the physical commit.
 - Active-turn live-boundary steer injection is a two-owner transaction:
   session services may stage boundary context, but the runtime machine remains
@@ -133,7 +133,7 @@ Since the PR #759 dogma campaign (and its follow-up lanes), additionally:
   newly issued store authority. Older state must be migrated with an older
   binary before a deployment repins.
 
-Since 0.7.12 (PR #821, the MobKit upstream asks):
+Since 0.7.12 (PR #821, the Meta upstream asks):
 
 - **Typed injected context** — `TranscriptUserRole::InjectedContext` marks
   host-attached ambient context delivered as SEPARATE user-channel messages

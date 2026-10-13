@@ -34,6 +34,8 @@ pub fn handle_initialize(
         workgraph_enabled: cfg!(feature = "workgraph"),
         skills_enabled,
         live_webrtc_enabled,
+        // Only the stock governed stdio pipe delivers consent notices.
+        consent_enabled: false,
     };
     let caps = ServerCapabilities {
         server_info: ServerInfo {

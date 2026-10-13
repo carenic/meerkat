@@ -210,18 +210,32 @@ impl OperationReviewer for ModelOperationReviewer {
         // This await is inside the existing review owner's deadline. Dropping
         // that future drops the read or model stream; no task is detached.
         let context = self.source.read_context(candidate).await?;
+        // The owners' passive account and mandate for this exact operation,
+        // read once by the review owner. Absent only when they stated it is
+        // not applicable.
+        let operation_context = candidate.operation_context();
+        let action_account = operation_context.and_then(|context| context.action_account());
+        let mandate = operation_context.and_then(|context| context.mandate());
         let bytes = context
             .as_str()
             .len()
+            .saturating_add(action_account.map_or(0, str::len))
+            .saturating_add(mandate.map_or(0, str::len))
             .saturating_add(candidate.arguments().get().len())
             .saturating_add(candidate.tool_name().len())
             .saturating_add(candidate.tool_call_id().len());
+        // Early refusal on the raw lengths only. JSON escaping can grow them,
+        // so the bound itself is enforced on the serialized payload below.
         if bytes > MAX_REVIEW_INPUT_BYTES {
             return Err(ReviewerFailure::Unavailable);
         }
         #[derive(Serialize)]
         struct CandidateInput<'a> {
             owner_supplied_context: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            owner_selected_action_account: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            current_mandate: Option<&'a str>,
             proposed_operation: ProposedOperation<'a>,
         }
         #[derive(Serialize)]
@@ -232,6 +246,8 @@ impl OperationReviewer for ModelOperationReviewer {
         }
         let content = serde_json::to_string(&CandidateInput {
             owner_supplied_context: context.as_str(),
+            owner_selected_action_account: action_account,
+            current_mandate: mandate,
             proposed_operation: ProposedOperation {
                 tool: candidate.tool_name(),
                 call_id: candidate.tool_call_id(),

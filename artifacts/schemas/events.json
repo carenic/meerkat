@@ -2368,6 +2368,23 @@
         ],
         "type": "object"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "MeerkatSchema": {
         "description": "A Meerkat-native JSON schema."
       },
@@ -4488,13 +4505,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -4812,6 +4838,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [
@@ -11043,6 +11080,23 @@
         ],
         "type": "object"
       },
+      "McpAttachmentRestoreWireOutcome": {
+        "description": "The typed outcome a resumed session's recorded MCP attachment reports on\nthe wire when restore did not simply re-stage it.",
+        "enum": [
+          "suppressed",
+          "retired",
+          "rebound",
+          "account_changed",
+          "denied",
+          "unavailable",
+          "not_current",
+          "review_required",
+          "mismatch",
+          "stage_failed",
+          "renewal_required"
+        ],
+        "type": "string"
+      },
       "MeerkatSchema": {
         "description": "A Meerkat-native JSON schema."
       },
@@ -13206,13 +13260,22 @@
               "category": {
                 "type": "string"
               },
+              "content": {
+                "description": "Typed content the model receives after the detail (for example\nthe published result of a later attempt correlated with an\nearlier call). It is stored, hydrated, replayed and lowered as\ncomms and external-event notice content is.",
+                "items": {
+                  "$ref": "#/$defs/ContentBlock"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "payload": true,
+              "payload": {
+                "description": "Persisted with the notice; never sent to the model."
+              },
               "type": {
                 "const": "runtime_notice",
                 "type": "string"
@@ -13530,6 +13593,17 @@
               },
               "phase": {
                 "$ref": "#/$defs/ExternalToolDeltaPhase"
+              },
+              "restore": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/McpAttachmentRestoreWireOutcome"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Restore outcome of a resumed session's recorded attachment."
               }
             },
             "required": [

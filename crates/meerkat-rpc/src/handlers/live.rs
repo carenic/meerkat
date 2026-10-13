@@ -340,6 +340,7 @@ fn live_open_error_response(id: Option<RpcId>, error: LiveOpenError) -> RpcRespo
         | LiveOpenError::AdmissionRejectedChannelCollision { .. }
         | LiveOpenError::AdmissionRejectedRevokedChannel { .. }
         | LiveOpenError::AdmissionRejectedNoReason
+        | LiveOpenError::ExecutionProfileAdmission(_)
         | LiveOpenError::MissingHostHandoff
         | LiveOpenError::HostOpenSessionAlreadyBound { .. }
         | LiveOpenError::HostOpen(_)

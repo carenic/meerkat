@@ -353,7 +353,8 @@ impl ReplayApplication<'_> {
         for (notice_block_index, projected_block) in projected.blocks.iter_mut().enumerate() {
             let projected_content = match projected_block {
                 SystemNoticeBlock::Comms { content, .. }
-                | SystemNoticeBlock::ExternalEvent { content, .. } => content,
+                | SystemNoticeBlock::ExternalEvent { content, .. }
+                | SystemNoticeBlock::RuntimeNotice { content, .. } => content,
                 _ => continue,
             };
             for (content_index, projected) in projected_content.iter_mut().enumerate() {
@@ -546,7 +547,8 @@ impl ReplayPlan {
                     for (notice_block, block) in notice.blocks.iter().enumerate() {
                         let content = match block {
                             SystemNoticeBlock::Comms { content, .. }
-                            | SystemNoticeBlock::ExternalEvent { content, .. } => content,
+                            | SystemNoticeBlock::ExternalEvent { content, .. }
+                            | SystemNoticeBlock::RuntimeNotice { content, .. } => content,
                             _ => continue,
                         };
                         for (content_block, content) in content.iter().enumerate() {
@@ -885,7 +887,8 @@ fn project_system_notice_for_target(
     for (notice_block_index, block) in projected.blocks.iter_mut().enumerate() {
         match block {
             SystemNoticeBlock::Comms { content, .. }
-            | SystemNoticeBlock::ExternalEvent { content, .. } => {
+            | SystemNoticeBlock::ExternalEvent { content, .. }
+            | SystemNoticeBlock::RuntimeNotice { content, .. } => {
                 *content = content
                     .iter()
                     .enumerate()

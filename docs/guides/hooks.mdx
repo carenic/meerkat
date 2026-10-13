@@ -60,6 +60,57 @@ failure cannot change or delay the committed fact.
 
 The former `Rewrite` capability is deleted entirely; semantic patch authority is removed.
 
+### Mandatory model-request hooks stay local
+
+A foreground `Guardrail` at `PreLlmRequest` or `PostLlmResponse` is a
+prerequisite for one model operation, not for the run. When it denies, or its
+launch is refused by confinement, the agent withholds only that operation and
+sends a bounded typed notice (`mandatory_hook_prerequisite_failed`) to the
+admitted retained controller in the same run. The run then continues with
+permitted work.
+
+- `PreLlmRequest` withholds the model request itself.
+- `PostLlmResponse` runs after the response was transported. Text may already
+  have streamed and provider-native tools may already have run; those effects
+  are not undone. Only the later local tool dispatch and the commit to the
+  conversation are withheld, and the rejected body is dropped.
+
+The follow-up is a distinct controller-feedback request. Each hook entry
+states whether it governs that request with `model_operations`:
+
+| `model_operations` | Governs |
+|--------------------|---------|
+| `all` (default) | Every model request, including controller feedback |
+| `ordinary_only` | Ordinary model requests only |
+
+The scope is never applied for you. Because a prerequisite that also governs
+the feedback request could block it in turn, configuration and run admission
+reject, before anything is published:
+
+- a model-request `Guardrail` left at `all`;
+- a model-request `Guardrail` on work without a retained authorized
+  controller;
+- a `Guardrail` at `RunStarted` or `TurnBoundary` (an interim gap: per-item
+  boundary withholding is not implemented yet);
+- `model_operations` on a point without a model operation.
+
+Each withholding is also recorded in the work's protected native audit,
+under the actual model operation, before the feedback request is attempted.
+If that record cannot be staged, the operation still stays withheld, the
+record is not retried, and the feedback says the protected record is
+unavailable rather than claiming one; permitted work continues.
+
+A configuration update that is rejected this way leaves the previous valid
+configuration and already admitted work in place. Feedback does not waive the
+original prerequisite: the withheld operation stays withheld. Later ordinary
+requests on the same controller must still pass their mandatory hooks.
+
+Each ordinary operation gets one feedback request, and a feedback request is
+never itself recovered. Only a gate that the run's admission validated is
+recovered this way; any other denial keeps the fail-closed path. Hook
+timeouts, handler errors and invalid configuration are infrastructure
+failures and still fail closed.
+
 ## Execution modes
 
 | HookExecutionMode | Behavior |
@@ -172,7 +223,9 @@ Required launches need the factory's native runtime-root custody on a supported
 platform. Missing custody, unsupported isolation and invalid launch data refuse
 the attempt without trusted-host fallback. At `PreToolExecution`, this refusal
 blocks the affected tool and returns local model feedback, so the model can
-continue. It does not skip a guardrail or permit the guarded tool. Failure
+continue. It does not skip a guardrail or permit the guarded tool. At
+`PreLlmRequest` and `PostLlmResponse` a mandatory launch refusal withholds
+only its model operation, as described under Capabilities. Failure
 dispositions at other lifecycle points are unchanged and can still fail a run.
 
 Required confinement cannot be combined with an opaque `hook_engine_override`;
@@ -350,6 +403,7 @@ args = ["hooks/safety_check.py"]
 | `capability` | `HookCapability` | `Observe` | What the hook can do |
 | `priority` | `i32` | `100` | Execution order (lower runs first) |
 | `timeout_ms` | `Option<u64>` | `None` | Override default timeout |
+| `model_operations` | `HookModelOperationScope` | `all` | Model operations governed at `PreLlmRequest`/`PostLlmResponse` |
 | `runtime` | `HookAdapterConfig` | in_process/noop | Runtime configuration |
 </Accordion>
 

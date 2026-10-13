@@ -117,7 +117,8 @@ pub async fn preflight_messages_for_durable_fork(
                 for block in &mut notice.blocks {
                     match block {
                         SystemNoticeBlock::Comms { content, .. }
-                        | SystemNoticeBlock::ExternalEvent { content, .. } => {
+                        | SystemNoticeBlock::ExternalEvent { content, .. }
+                        | SystemNoticeBlock::RuntimeNotice { content, .. } => {
                             preflight_blocks(blob_store, content).await?;
                         }
                         _ => {}
@@ -740,14 +741,14 @@ fn content_blocks_have_inline_media(blocks: &[ContentBlock]) -> bool {
 fn system_notice_block_has_inline_media(block: &crate::types::SystemNoticeBlock) -> bool {
     match block {
         crate::types::SystemNoticeBlock::Comms { content, .. }
-        | crate::types::SystemNoticeBlock::ExternalEvent { content, .. } => {
+        | crate::types::SystemNoticeBlock::ExternalEvent { content, .. }
+        | crate::types::SystemNoticeBlock::RuntimeNotice { content, .. } => {
             content_blocks_have_inline_media(content)
         }
         crate::types::SystemNoticeBlock::ToolConfig { .. }
         | crate::types::SystemNoticeBlock::Mcp { .. }
         | crate::types::SystemNoticeBlock::BackgroundJob { .. }
         | crate::types::SystemNoticeBlock::Auth { .. }
-        | crate::types::SystemNoticeBlock::RuntimeNotice { .. }
         | crate::types::SystemNoticeBlock::ToolProcessInterrupted { .. }
         | crate::types::SystemNoticeBlock::Unknown { .. } => false,
     }
@@ -850,7 +851,8 @@ async fn externalize_system_notice_blocks_reporting_mutation(
     for block in blocks {
         match block {
             SystemNoticeBlock::Comms { content, .. }
-            | SystemNoticeBlock::ExternalEvent { content, .. } => {
+            | SystemNoticeBlock::ExternalEvent { content, .. }
+            | SystemNoticeBlock::RuntimeNotice { content, .. } => {
                 mutated |=
                     externalize_content_blocks_reporting_mutation(blob_store, content).await?;
             }
@@ -868,7 +870,8 @@ async fn hydrate_system_notice_blocks(
     for block in blocks {
         match block {
             SystemNoticeBlock::Comms { content, .. }
-            | SystemNoticeBlock::ExternalEvent { content, .. } => {
+            | SystemNoticeBlock::ExternalEvent { content, .. }
+            | SystemNoticeBlock::RuntimeNotice { content, .. } => {
                 hydrate_content_blocks(blob_store, content, missing_behavior).await?;
             }
             _ => {}
@@ -956,7 +959,8 @@ pub fn collect_blob_ids_from_messages(messages: &[Message]) -> BTreeSet<BlobId> 
                 for block in &notice.blocks {
                     match block {
                         SystemNoticeBlock::Comms { content, .. }
-                        | SystemNoticeBlock::ExternalEvent { content, .. } => {
+                        | SystemNoticeBlock::ExternalEvent { content, .. }
+                        | SystemNoticeBlock::RuntimeNotice { content, .. } => {
                             ids.extend(collect_blob_ids_from_blocks(content));
                         }
                         _ => {}
@@ -1101,6 +1105,51 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn externalizes_and_hydrates_runtime_notice_content()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = TestBlobStore::default();
+        let inline = ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: ImageData::Inline {
+                data: "iVBORw0KGgo=".to_string(),
+            },
+        };
+        let mut messages = vec![Message::SystemNotice(SystemNoticeMessage::with_block(
+            SystemNoticeKind::Generic,
+            None,
+            SystemNoticeBlock::RuntimeNotice {
+                category: "consent_attempt".to_string(),
+                detail: Some("a correlated result".to_string()),
+                payload: None,
+                content: vec![inline.clone()],
+            },
+        ))];
+        assert!(messages_have_inline_media(&messages));
+
+        externalize_messages_from(&store, &mut messages, 0).await?;
+        assert!(
+            !messages_have_inline_media(&messages),
+            "the notice image is stored once, by reference"
+        );
+        assert_eq!(collect_blob_ids_from_messages(&messages).len(), 1);
+
+        hydrate_messages_for_execution(
+            &store,
+            &mut messages,
+            MissingBlobBehavior::HistoricalPlaceholder,
+        )
+        .await?;
+        let Message::SystemNotice(notice) = &messages[0] else {
+            return Err(std::io::Error::other("expected system notice").into());
+        };
+        let SystemNoticeBlock::RuntimeNotice { content, .. } = &notice.blocks[0] else {
+            return Err(std::io::Error::other("expected runtime notice block").into());
+        };
+        assert_eq!(content, &vec![inline]);
+        Ok(())
+    }
+
     #[test]
     fn realtime_image_decoder_stops_at_the_cumulative_budget_boundary() {
         let decoded = vec![0_u8; 64 * 1024];
@@ -1212,7 +1261,7 @@ mod tests {
     /// A 1x1 PNG, valid for the durable-fork signature and size gates.
     const LEGACY_TEST_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
-    /// Mirrors MobKit's blob store before 0.8.41: meerkat images were stored
+    /// Mirrors Meta's blob store before 0.8.41: meerkat images were stored
     /// under a raw-bytes address, `sha256(media_type || 0x00 || decoded)`,
     /// not meerkat's content address. New writes use the content address.
     struct LegacyAddressStore {
@@ -1336,7 +1385,7 @@ mod tests {
     }
 
     /// Regression (downstream fork_off calls): a source transcript holding
-    /// an image written under MobKit's pre-0.8.41 raw-bytes address failed
+    /// an image written under Meta's pre-0.8.41 raw-bytes address failed
     /// every fork with "blob identity mismatch". A store that attests the
     /// address now lets the fork proceed, and the child's reference is
     /// re-homed to the meerkat content address.
@@ -1451,7 +1500,7 @@ mod tests {
 
     /// A store's own-address attestation must not let a non-image object be
     /// hydrated under an image block: the stored media type must match the
-    /// block's and be a valid image (review finding on MobKit #440).
+    /// block's and be a valid image (review finding on Meta #440).
     #[tokio::test]
     async fn realtime_projection_refuses_attested_object_with_foreign_media_type() {
         let store = LegacyAddressStore::new(true);

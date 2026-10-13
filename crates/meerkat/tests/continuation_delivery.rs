@@ -277,11 +277,24 @@ impl RuntimeDeliveryHost for Host {
     }
 }
 
-/// The committed owner of fork_off jobs, as a table the test edits.
+/// The committed owner of one producer's jobs (fork_off unless a test
+/// says otherwise), as a table the test edits. It holds no other
+/// producer's jobs.
 #[derive(Default)]
 struct FakeJobs {
     jobs: Mutex<HashMap<String, RetainedJobFacts>>,
     unavailable: Mutex<Option<String>>,
+    /// The producer this owner holds jobs for; `None` is fork_off.
+    producer: Mutex<Option<ContinuationProducer>>,
+    /// Every lookup asked of this owner.
+    lookups: std::sync::atomic::AtomicUsize,
+    /// Parks the next lookup after it decided its answer, until released.
+    held: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 impl FakeJobs {
@@ -303,6 +316,46 @@ impl FakeJobs {
                 .expect("job"),
         );
     }
+
+    fn lookups(&self) -> usize {
+        self.lookups.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Park the next lookup once it decided its answer: the owner asking is
+    /// then inside a pass, past the marks of its signals. The first receiver
+    /// fires when it parks; the lookup answers once the sender fires.
+    fn hold_next_lookup(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.held.lock().expect("lock") = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    fn answer(&self, producer: &ContinuationProducer, job_id: &str) -> RetainedJobLookup {
+        let owned = self
+            .producer
+            .lock()
+            .expect("lock")
+            .clone()
+            .unwrap_or(ContinuationProducer::ForkOff);
+        if let Some(error) = self.unavailable.lock().expect("lock").clone() {
+            return RetainedJobLookup::Unavailable(error);
+        }
+        if producer != &owned {
+            return RetainedJobLookup::Absent;
+        }
+        self.jobs
+            .lock()
+            .expect("lock")
+            .get(job_id)
+            .cloned()
+            .map_or(RetainedJobLookup::Absent, RetainedJobLookup::Found)
+    }
 }
 
 #[async_trait::async_trait]
@@ -312,16 +365,15 @@ impl RetainedJobSource for FakeJobs {
         producer: &ContinuationProducer,
         job_id: &str,
     ) -> RetainedJobLookup {
-        assert_eq!(producer, &ContinuationProducer::ForkOff);
-        if let Some(error) = self.unavailable.lock().expect("lock").clone() {
-            return RetainedJobLookup::Unavailable(error);
+        self.lookups
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let answer = self.answer(producer, job_id);
+        let held = self.held.lock().expect("lock").take();
+        if let Some((entered, release)) = held {
+            let _ = entered.send(());
+            let _ = release.await;
         }
-        self.jobs
-            .lock()
-            .expect("lock")
-            .get(job_id)
-            .cloned()
-            .map_or(RetainedJobLookup::Absent, RetainedJobLookup::Found)
+        answer
     }
 }
 
@@ -1460,6 +1512,256 @@ async fn an_absent_job_is_refused_and_an_unreadable_owner_keeps_the_row_pending(
     }
 }
 
+const SETUP_NAMESPACE: &str = "app.setup";
+
+fn setup_producer(namespace: &str) -> ContinuationProducer {
+    ContinuationProducer::Host {
+        namespace: namespace.into(),
+    }
+}
+
+/// A host's committed setup result, owed to `session`, as its owner
+/// confirms it, committed as a retained continuation.
+async fn retained_setup_completion(
+    fixture: &Fixture,
+    session: &SessionId,
+    identity: &RetainedWorkIdentity,
+) -> (Arc<FakeJobs>, meerkat::ContinuationReceipt) {
+    let jobs = FakeJobs::holding("setup-1", committed_job(session, identity));
+    *jobs.producer.lock().expect("lock") = Some(setup_producer(SETUP_NAMESPACE));
+    let record = RetainedJobRecord::from_owner(&*jobs, setup_producer(SETUP_NAMESPACE), "setup-1")
+        .await
+        .expect("read the setup owner")
+        .expect("the setup result is committed");
+    let receipt = fixture
+        .continuations
+        .submit_retained_completion(
+            &ContinuationOwner::Session {
+                session_id: session.clone(),
+            },
+            ContinuationDelivery {
+                key: ContinuationKey::new("setup:setup-1").expect("key"),
+                result: ContinuationResultRef {
+                    producer: setup_producer(SETUP_NAMESPACE),
+                    producer_id: "setup-1".into(),
+                    result_digest: "sha256:result".into(),
+                    summary: None,
+                },
+                body: "setup finished".into(),
+                handling: ContinuationHandling::Queue,
+            },
+            &record,
+            1,
+        )
+        .await
+        .expect("commit the setup completion");
+    (jobs, receipt)
+}
+
+/// A host's committed setup result is confirmed through the same configured
+/// job source as a fork_off or council completion, and resumes its retained
+/// work on a governed runtime.
+#[tokio::test]
+async fn a_confirmed_host_setup_completion_is_resumed_on_a_governed_runtime() {
+    let fixture = Fixture::new();
+    let session = SessionId::new();
+    let identity = work_identity("setup");
+    let (jobs, receipt) = retained_setup_completion(&fixture, &session, &identity).await;
+    let sink = Arc::new(RecordingSink::governed());
+    let handle = fixture
+        .owner()
+        .arm(Host::with_jobs(sink.clone(), jobs))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    let owner = ContinuationOwner::Session {
+        session_id: session.clone(),
+    };
+    let status = wait_for_status(&fixture, &owner, "setup:setup-1", &mut passes, |status| {
+        matches!(status, ContinuationStatus::Applied { .. })
+    })
+    .await;
+    let resumes = sink.resumes();
+    assert_eq!(resumes.len(), 1);
+    assert_eq!(resumes[0].0, session);
+    assert_eq!(
+        resumes[0].2, identity,
+        "the resume names the setup's retained work"
+    );
+    assert!(sink.admissions().is_empty(), "never admitted unbound");
+    assert!(
+        matches!(status, ContinuationStatus::Applied { receipt: applied, .. } if applied == receipt)
+    );
+}
+
+/// A host completion is confirmed only by a source that owns its exact
+/// namespace and job: once the configured source no longer owns that
+/// namespace, or its committed facts differ, the row is an immutably invalid
+/// binding; an unreadable owner keeps it pending.
+#[tokio::test]
+async fn a_host_completion_needs_its_namespaces_owner_to_confirm_it_exactly() {
+    for case in [
+        "other_namespace",
+        "other_result",
+        "other_session",
+        "unreadable",
+    ] {
+        let fixture = Fixture::new();
+        let session = SessionId::new();
+        let identity = work_identity("setup");
+        let (jobs, receipt) = retained_setup_completion(&fixture, &session, &identity).await;
+        match case {
+            "other_namespace" => {
+                *jobs.producer.lock().expect("lock") = Some(setup_producer("app.other"));
+            }
+            "other_result" => jobs.change("setup-1", |facts| {
+                facts.result_digest = "sha256:another-result".into();
+            }),
+            "other_session" => jobs.change("setup-1", |facts| {
+                facts.owner_session_id = SessionId::new();
+            }),
+            _ => *jobs.unavailable.lock().expect("lock") = Some("setup owner offline".into()),
+        }
+        let sink = Arc::new(RecordingSink::governed());
+        let handle = fixture
+            .owner()
+            .arm(Host::with_jobs(sink.clone(), jobs))
+            .expect("arm");
+        let mut passes = handle.subscribe_passes();
+        let pass = wait_for_pass(&mut passes, "the confirmation verdict applied", |pass| {
+            pass.refused > 0 || !pass.blocked_runtimes.is_empty()
+        })
+        .await;
+        assert!(
+            sink.resumes().is_empty() && sink.admissions().is_empty(),
+            "{case}"
+        );
+        let status = fixture
+            .continuations
+            .continuation_status(
+                &ContinuationOwner::Session {
+                    session_id: session.clone(),
+                },
+                &ContinuationKey::new("setup:setup-1").expect("key"),
+            )
+            .await
+            .expect("status");
+        if case == "unreadable" {
+            assert_eq!(pass.refused, 0, "{case}: never settled");
+            assert!(
+                matches!(status, ContinuationStatus::Pending { .. }),
+                "{case}"
+            );
+        } else {
+            assert_eq!(
+                status,
+                ContinuationStatus::Refused {
+                    receipt,
+                    sequence: 1,
+                    reason: meerkat_runtime::RuntimeDeliveryRefusalReason::NoAdmissibleWorkBinding
+                },
+                "{case}"
+            );
+        }
+    }
+}
+
+fn setup_delivery(body: &str) -> ContinuationDelivery {
+    ContinuationDelivery {
+        key: ContinuationKey::new("setup:setup-1").expect("key"),
+        result: ContinuationResultRef {
+            producer: setup_producer(SETUP_NAMESPACE),
+            producer_id: "setup-1".into(),
+            result_digest: "sha256:result".into(),
+            summary: None,
+        },
+        body: body.into(),
+        handling: ContinuationHandling::Queue,
+    }
+}
+
+/// The exact-content observation never commits: before a submission it
+/// reports nothing submitted (and the key stays unbound); after it, the
+/// exact content matches with its status; other content under the same key
+/// is a typed mismatch, never that continuation's status.
+#[tokio::test]
+async fn an_exact_content_observation_never_commits_and_tells_other_content_apart() {
+    let fixture = Fixture::new();
+    let session = SessionId::new();
+    let identity = work_identity("setup");
+    let jobs = FakeJobs::holding("setup-1", committed_job(&session, &identity));
+    *jobs.producer.lock().expect("lock") = Some(setup_producer(SETUP_NAMESPACE));
+    let record = RetainedJobRecord::from_owner(&*jobs, setup_producer(SETUP_NAMESPACE), "setup-1")
+        .await
+        .expect("read the setup owner")
+        .expect("the setup result is committed");
+    let owner = ContinuationOwner::Session {
+        session_id: session.clone(),
+    };
+    let key = ContinuationKey::new("setup:setup-1").expect("key");
+
+    assert_eq!(
+        fixture
+            .continuations
+            .observe_retained_completion(&owner, &setup_delivery("setup finished"), &record)
+            .await
+            .expect("observe"),
+        meerkat::ContinuationObservation::NotSubmitted
+    );
+    assert_eq!(
+        fixture
+            .continuations
+            .continuation_status(&owner, &key)
+            .await
+            .expect("status"),
+        ContinuationStatus::NotCommitted,
+        "observing committed nothing"
+    );
+
+    let receipt = fixture
+        .continuations
+        .submit_retained_completion(&owner, setup_delivery("setup finished"), &record, 1)
+        .await
+        .expect("commit the setup completion");
+    match fixture
+        .continuations
+        .observe_retained_completion(&owner, &setup_delivery("setup finished"), &record)
+        .await
+        .expect("observe")
+    {
+        meerkat::ContinuationObservation::Matched {
+            receipt: observed,
+            status,
+        } => {
+            assert_eq!(observed, receipt);
+            assert_eq!(
+                status,
+                fixture
+                    .continuations
+                    .continuation_status(&owner, &key)
+                    .await
+                    .expect("status")
+            );
+        }
+        other => panic!("the exact content matches: {other:?}"),
+    }
+    assert!(matches!(
+        fixture
+            .continuations
+            .observe_retained_completion(&owner, &setup_delivery("another body"), &record)
+            .await,
+        Err(meerkat::ContinuationObserveError::ContentMismatch { existing }) if *existing == receipt
+    ));
+    let mut other_result = setup_delivery("setup finished");
+    other_result.result.result_digest = "sha256:another-result".into();
+    assert!(matches!(
+        fixture
+            .continuations
+            .observe_retained_completion(&owner, &other_result, &record)
+            .await,
+        Err(meerkat::ContinuationObserveError::Invalid(_))
+    ));
+}
+
 /// A delivery host whose member resolution and job owner come from late-bound
 /// [`meerkat::ContinuationHostBindings`], as the product hosts' do.
 struct BindingsHost {
@@ -1625,6 +1927,323 @@ async fn a_retained_completion_before_the_host_binds_stays_pending_until_a_wake_
     .await;
     assert_eq!(sink.resumes().len(), 1);
     assert_eq!(sink.resumes()[0].2, identity);
+}
+
+/// An acknowledged cutpoint of the owner loop: commit an unrelated
+/// continuation and wait for the pass that settles it. The loop captures
+/// every signal before the pass it runs, so each signal published before
+/// this call has been consumed, and acted on if it had work, when it
+/// returns.
+async fn loop_cutpoint(
+    fixture: &Fixture,
+    passes: &mut watch::Receiver<RuntimeDeliveryPass>,
+) -> RuntimeDeliveryPass {
+    let before = passes.borrow().generation;
+    fixture
+        .continuations
+        .submit(
+            &ContinuationOwner::Session {
+                session_id: SessionId::new(),
+            },
+            delivery(&format!("cutpoint-{before}"), host_producer()),
+            1,
+        )
+        .await
+        .expect("commit the cutpoint row");
+    wait_for_pass(passes, "the cutpoint pass", |pass| {
+        pass.generation > before && pass.applied + pass.refused > 0
+    })
+    .await
+}
+
+/// A retained completion whose job owner is bound after the owner armed,
+/// while its custody is absent (the host's pin is not recorded yet), stays
+/// blocked. Restoring the custody alone wakes nothing: up to an acknowledged
+/// cutpoint no one asked the source again. The job owner's announcement
+/// wakes the same owner, which asks the source once and resumes the
+/// completion exactly once with its exact retained work. A repeated
+/// announcement with nothing blocked runs no pass and replays nothing.
+#[tokio::test]
+async fn a_source_hint_retries_a_blocked_retained_completion_exactly_once() {
+    let fixture = Fixture::new();
+    let session = SessionId::new();
+    let identity = work_identity("custody");
+    let jobs = FakeJobs::holding("job-1", committed_job(&session, &identity));
+    retained_fork_completion(&fixture, &session, &jobs).await;
+    *jobs.unavailable.lock().expect("lock") = Some("custody is not restored".into());
+    let sink = Arc::new(RecordingSink::governed());
+    let bindings = Arc::new(meerkat::ContinuationHostBindings::default());
+    let handle = fixture
+        .owner()
+        .with_source_changes(bindings.subscribe_source_changes())
+        .arm(Arc::new(BindingsHost {
+            bindings: Arc::clone(&bindings),
+            sink: sink.clone(),
+        }))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    let unbound = wait_for_pass(&mut passes, "the unbound completion blocked", |pass| {
+        !pass.blocked_runtimes.is_empty()
+    })
+    .await;
+    let blocked = unbound.blocked_runtimes.clone();
+
+    // Bound after arming while its custody is absent: the binding wakes the
+    // owner, the source cannot answer, and the row stays blocked.
+    let asked = jobs.lookups();
+    let _binding = bindings
+        .bind(Arc::new(SessionAddressResolver), jobs.clone())
+        .expect("bind");
+    let bound = wait_for_pass(&mut passes, "the bound source was asked", |pass| {
+        pass.generation > unbound.generation
+    })
+    .await;
+    assert_eq!(bound.blocked_runtimes, blocked, "still blocked");
+    assert_eq!((bound.applied, bound.refused), (0, 0), "never settled");
+    assert_eq!(
+        jobs.lookups(),
+        asked + 1,
+        "the binding asked the source once"
+    );
+
+    // Custody restored but not announced: nothing retried it by the cutpoint.
+    *jobs.unavailable.lock().expect("lock") = None;
+    let asked = jobs.lookups();
+    let quiet = loop_cutpoint(&fixture, &mut passes).await;
+    assert_eq!(quiet.blocked_runtimes, blocked, "still blocked");
+    assert_eq!(jobs.lookups(), asked, "nobody asked the source");
+    assert!(sink.resumes().is_empty());
+
+    // Announced: the same owner asks again and resumes it exactly once.
+    bindings.source_custody_changed();
+    let resumed = wait_for_pass(&mut passes, "the announced completion resumed", |pass| {
+        pass.applied > 0
+    })
+    .await;
+    assert!(resumed.blocked_runtimes.is_empty());
+    assert_eq!(jobs.lookups(), asked + 1, "one fresh read of the source");
+    assert_eq!(sink.resumes().len(), 1);
+    assert_eq!(sink.resumes()[0].0, session);
+    assert_eq!(sink.resumes()[0].2, identity);
+
+    // Announced again: nothing is blocked, so no pass runs for it (the next
+    // pass is the cutpoint's own) and nothing is replayed.
+    bindings.source_custody_changed();
+    let after = loop_cutpoint(&fixture, &mut passes).await;
+    assert_eq!(
+        after.generation,
+        resumed.generation + 1,
+        "no pass for the hint"
+    );
+    assert_eq!(jobs.lookups(), asked + 1, "the source was not asked again");
+    assert_eq!(sink.resumes().len(), 1, "no replay");
+    assert!(!handle.is_stopped());
+}
+
+/// A job owner bound before the owner armed is asked by the arming
+/// reconcile. A custody change announced while a pass is inside its source
+/// read (after it captured and marked the source revision) is not
+/// swallowed: that read still answers what it saw, and the owner retries
+/// once more, which resumes the completion exactly once.
+#[tokio::test]
+async fn a_source_change_published_during_a_blocked_pass_is_retried() {
+    let fixture = Fixture::new();
+    let session = SessionId::new();
+    let identity = work_identity("during");
+    let jobs = FakeJobs::holding("job-1", committed_job(&session, &identity));
+    retained_fork_completion(&fixture, &session, &jobs).await;
+    *jobs.unavailable.lock().expect("lock") = Some("custody is not restored".into());
+    let sink = Arc::new(RecordingSink::governed());
+    let bindings = Arc::new(meerkat::ContinuationHostBindings::default());
+    let _binding = bindings
+        .bind(Arc::new(SessionAddressResolver), jobs.clone())
+        .expect("bind before arming");
+    let asked = jobs.lookups();
+    let handle = fixture
+        .owner()
+        .with_source_changes(bindings.subscribe_source_changes())
+        .arm(Arc::new(BindingsHost {
+            bindings: Arc::clone(&bindings),
+            sink: sink.clone(),
+        }))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    let armed = wait_for_pass(
+        &mut passes,
+        "the arming reconcile asked the source",
+        |pass| !pass.blocked_runtimes.is_empty(),
+    )
+    .await;
+    assert_eq!(
+        jobs.lookups(),
+        asked + 1,
+        "the reconcile asked the bound source"
+    );
+
+    // A retry whose source read parks after deciding "unavailable".
+    let (entered, release) = jobs.hold_next_lookup();
+    bindings.source_custody_changed();
+    entered.await.expect("the retry is inside its source read");
+    // Published after that pass captured and marked the revision.
+    *jobs.unavailable.lock().expect("lock") = None;
+    bindings.source_custody_changed();
+    release.send(()).expect("release the parked read");
+
+    let resumed = wait_for_pass(
+        &mut passes,
+        "the change during the pass was retried",
+        |pass| pass.applied > 0,
+    )
+    .await;
+    assert!(
+        resumed.generation >= armed.generation + 2,
+        "a pass after the parked one"
+    );
+    assert_eq!(jobs.lookups(), asked + 3, "the parked read and one retry");
+    assert_eq!(sink.resumes().len(), 1);
+    assert_eq!(sink.resumes()[0].2, identity);
+}
+
+/// Through the bundle's own delivery owner and bindings, the composition
+/// every facade host arms: a retained completion that blocked before its job
+/// owner was bound is resumed by the binding alone, with no attachment, run
+/// or custody signal ever raised.
+#[tokio::test]
+async fn binding_the_job_owner_alone_resumes_a_blocked_retained_completion() {
+    let session_store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
+    let bundle = meerkat::PersistenceBundle::new(
+        session_store,
+        Arc::new(InMemoryRuntimeStore::new()),
+        Arc::new(meerkat::MemoryBlobStore::new()),
+    )
+    .expect("bundle");
+    let continuations = ContinuationOwnerService::new(
+        bundle.runtime_delivery_inbox(),
+        Arc::new(SessionAddressResolver),
+        Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
+    );
+    let session = SessionId::new();
+    let identity = work_identity("bind-alone");
+    let jobs = FakeJobs::holding("job-1", committed_job(&session, &identity));
+    let record = RetainedJobRecord::from_owner(&*jobs, ContinuationProducer::ForkOff, "job-1")
+        .await
+        .expect("read the job owner")
+        .expect("the job is committed");
+    continuations
+        .submit_retained_completion(
+            &ContinuationOwner::Session {
+                session_id: session.clone(),
+            },
+            fork_completion("job-1", "sha256:result"),
+            &record,
+            1,
+        )
+        .await
+        .expect("commit the completion");
+    let sink = Arc::new(RecordingSink::governed());
+    let bindings = bundle.continuation_bindings();
+    let handle = bundle
+        .runtime_delivery_owner()
+        .arm(Arc::new(BindingsHost {
+            bindings: Arc::clone(&bindings),
+            sink: sink.clone(),
+        }))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    wait_for_pass(&mut passes, "the unbound completion blocked", |pass| {
+        !pass.blocked_runtimes.is_empty()
+    })
+    .await;
+    assert!(sink.resumes().is_empty());
+
+    let _binding = bindings
+        .bind(Arc::new(SessionAddressResolver), jobs)
+        .expect("bind");
+    wait_for_pass(&mut passes, "the binding resumed the completion", |pass| {
+        pass.applied > 0
+    })
+    .await;
+    assert_eq!(sink.resumes().len(), 1);
+    assert_eq!(sink.resumes()[0].2, identity);
+}
+
+/// A source hint grants nothing: the retry it wakes re-reads the job
+/// owner's committed facts, and a completion they no longer confirm is
+/// refused, never resumed.
+#[tokio::test]
+async fn a_source_hint_never_bypasses_the_current_refusal_checks() {
+    let fixture = Fixture::new();
+    let session = SessionId::new();
+    let identity = work_identity("refused");
+    let jobs = FakeJobs::holding("job-1", committed_job(&session, &identity));
+    retained_fork_completion(&fixture, &session, &jobs).await;
+    *jobs.unavailable.lock().expect("lock") = Some("custody is not restored".into());
+    let sink = Arc::new(RecordingSink::governed());
+    let bindings = Arc::new(meerkat::ContinuationHostBindings::default());
+    let _binding = bindings
+        .bind(Arc::new(SessionAddressResolver), jobs.clone())
+        .expect("bind");
+    let handle = fixture
+        .owner()
+        .with_source_changes(bindings.subscribe_source_changes())
+        .arm(Arc::new(BindingsHost {
+            bindings: Arc::clone(&bindings),
+            sink: sink.clone(),
+        }))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    wait_for_pass(&mut passes, "the completion blocked", |pass| {
+        !pass.blocked_runtimes.is_empty()
+    })
+    .await;
+
+    jobs.change("job-1", |facts| {
+        facts.retained_work = Some(work_identity("another"));
+    });
+    *jobs.unavailable.lock().expect("lock") = None;
+    bindings.source_custody_changed();
+    let refused = wait_for_pass(&mut passes, "the retried completion refused", |pass| {
+        pass.refused > 0
+    })
+    .await;
+    assert!(refused.blocked_runtimes.is_empty(), "settled as refused");
+    assert_eq!(refused.applied, 0);
+    assert!(sink.resumes().is_empty(), "never resumed");
+}
+
+/// Dropping the bindings ends their source hint: the owner neither stops
+/// nor runs a pass for the closed signal (the next pass is the cutpoint's
+/// own), and it keeps serving its other signals.
+#[tokio::test]
+async fn dropped_bindings_end_their_source_hint_and_the_owner_keeps_serving() {
+    let fixture = Fixture::new();
+    let sink = Arc::new(RecordingSink::default());
+    let hinting = Arc::new(meerkat::ContinuationHostBindings::default());
+    let handle = fixture
+        .owner()
+        .with_source_changes(hinting.subscribe_source_changes())
+        .arm(Arc::new(BindingsHost {
+            bindings: Arc::new(meerkat::ContinuationHostBindings::default()),
+            sink: sink.clone(),
+        }))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    let armed = wait_for_pass(&mut passes, "the reconcile pass", |pass| {
+        pass.generation >= 1
+    })
+    .await;
+
+    drop(hinting);
+    let first = loop_cutpoint(&fixture, &mut passes).await;
+    assert_eq!(
+        first.generation,
+        armed.generation + 1,
+        "no pass for the closure"
+    );
+    let second = loop_cutpoint(&fixture, &mut passes).await;
+    assert_eq!(second.generation, first.generation + 1);
+    assert!(!handle.is_stopped(), "a closed hint never stops the owner");
+    assert_eq!(sink.admissions().len(), 2, "both cutpoint rows admitted");
 }
 
 /// The binding slot is set once per binder. A second binder is refused while

@@ -84,6 +84,16 @@ pub enum RuntimeDriverError {
         session_id: meerkat_core::types::SessionId,
     },
 
+    /// This registration's claim lineage excluded every earlier holder of
+    /// the session's hosting claim, and the issuing consent owner could not
+    /// settle yet what a lost owner left in the session's scope (consent
+    /// owner loss). No registration was created and nothing was admitted.
+    /// The refusal clears once the settlement succeeds.
+    #[error("consent owner-loss settlement for session {session_id} is not settled yet")]
+    ConsentOwnerLossUnsettled {
+        session_id: meerkat_core::types::SessionId,
+    },
+
     /// An admission's durable commit met another writer's mapping in the
     /// input idempotency index (#1813). Admission requires the session's
     /// owner-scoped hosting claim, so the other writer bypassed it: a hosting
@@ -159,11 +169,15 @@ pub enum RuntimeDriverError {
     #[error("Runtime stop cleanup is still in progress for runtime {runtime_id}")]
     RuntimeStopInProgress { runtime_id: LogicalRuntimeId },
 
-    /// An exact hard-interrupt callback exceeded the caller acknowledgement
-    /// bound. The process-owned callback still owns reconciliation; callers
-    /// may retry the same run to join its result and must retain their durable
-    /// lifecycle retry anchor.
-    #[error("Hard interrupt outcome is still pending for run {run_id}: {reason}")]
+    /// An exact-run interrupt or boundary cancel was accepted for the run, but
+    /// its outcome is not settled. For a hard interrupt, the callback exceeded
+    /// the caller acknowledgement bound and the process-owned callback still
+    /// owns reconciliation; callers may retry the same run to join its result
+    /// and must retain their durable lifecycle retry anchor. For an exact-run
+    /// boundary cancel, the run's cancel is recorded in its turn state but its
+    /// live delivery failed; the attachment may be gone, so no callback need
+    /// still be running.
+    #[error("Interrupt outcome is not settled for run {run_id}: {reason}")]
     InterruptDispatchOutcomeUnknown { run_id: RunId, reason: String },
 
     /// A custom exact hard-interrupt callback panicked. The process-owned
@@ -182,6 +196,12 @@ pub enum RuntimeDriverError {
     /// runtime owner. Retrying from the same in-memory state is forbidden.
     #[error("Stale runtime authority: {reason}")]
     StaleAuthority { reason: String },
+
+    /// The input's result exists and is preserved, but its scoped
+    /// destination is not the session document's current binding, so this
+    /// reader may not receive it. Lifecycle facts stay readable.
+    #[error("the result of scoped input {input_id} is withheld: its destination is not current")]
+    ScopedResultWithheld { input_id: InputId },
 
     #[error("materialization registration for session {session_id} is no longer current")]
     MaterializationRegistrationNotCurrent { session_id: meerkat_core::SessionId },
@@ -266,6 +286,15 @@ pub enum RuntimeControlPlaneError {
     RetirementInProgress {
         runtime_id: LogicalRuntimeId,
         stage: String,
+    },
+
+    /// This session's claim lineage owes a consent owner-loss settlement
+    /// that the issuing consent owner could not complete yet: nothing was
+    /// registered or admitted. Retryable: the refusal clears once the
+    /// settlement completes.
+    #[error("consent owner-loss settlement for session {session_id} is not settled yet")]
+    ConsentOwnerLossUnsettled {
+        session_id: meerkat_core::types::SessionId,
     },
 
     /// Internal error.

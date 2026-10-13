@@ -53,6 +53,7 @@ impl BuiltinTool for BrowseSkillsTool {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Builtin,
                 source_id: "skills".into(),
+                artifact: None,
             }),
         }
     }

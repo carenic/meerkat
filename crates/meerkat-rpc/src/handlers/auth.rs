@@ -30,8 +30,8 @@ use meerkat_core::{
 use meerkat_providers::auth_oauth::{OAuthError, PkcePair, exchange_authorization_code_with_state};
 use meerkat_providers::auth_store::{
     CredentialMutationError, CredentialMutationOutcome, PersistedAuthMode, PersistedTokens,
-    RefreshCoordinator, TokenKey, TokenStore, credential_source_uses_persisted_store,
-    persisted_auth_mode_is_oauth_login,
+    RefreshCoordinator, TokenKey, TokenStore, TokenStoreAccess,
+    credential_source_uses_persisted_store, persisted_auth_mode_is_oauth_login,
 };
 use meerkat_providers::oauth_flow::{
     OAuthDevicePollLease, OAuthFlowError, OAuthProviderIdentity, validate_oauth_login_binding,
@@ -50,10 +50,21 @@ fn host_auth_service(
         .provider_auth_persistence()
         .map_err(meerkat::HostAuthError::Factory)?
         .ok_or(meerkat::HostAuthError::PersistenceUnavailable)?;
-    Ok(meerkat::HostAuthService::new(
-        persistence,
-        runtime.provider_auth_runtime_authority(),
-    ))
+    let service =
+        meerkat::HostAuthService::new(persistence, runtime.provider_auth_runtime_authority())
+            .with_connector_client_auth_profiles(runtime.connector_client_auth_profiles());
+    // MCP logins, status and logout address the runtime realm's own slot;
+    // connector logins use the realm's configured clients.
+    Ok(match runtime.realm_id() {
+        Some(realm) => {
+            let service = match runtime.realm_config_source() {
+                Some(source) => service.with_realm_connector_clients(source, realm.clone()),
+                None => service,
+            };
+            service.with_mcp_realm(realm)
+        }
+        None => service,
+    })
 }
 
 fn host_auth_target(
@@ -112,9 +123,14 @@ fn host_auth_error_response(id: Option<RpcId>, error_value: meerkat::HostAuthErr
         meerkat::HostAuthError::ConnectorTarget(_) => error::INVALID_PARAMS,
     };
     let reason = error_value.reason();
-    if reason == meerkat_contracts::WireAuthErrorReason::Infrastructure {
+    if error_value.withholds_detail() {
         // Protected diagnostics only: the public text is fixed.
-        tracing::warn!(target: "meerkat::auth", error = %error_value, "auth infrastructure failure");
+        tracing::warn!(
+            target: "meerkat::auth",
+            error = %error_value,
+            reason = ?reason,
+            "auth failure; detail withheld from the public text"
+        );
     }
     match serde_json::to_value(meerkat_contracts::WireAuthErrorData { reason }) {
         Ok(data) => RpcResponse::error_with_data(id, code, error_value.public_message(), data),
@@ -811,7 +827,14 @@ async fn save_marked_token_commit_unlocked(
             return Err(RpcResponse::error(id, error::INTERNAL_ERROR, message));
         }
     };
-    if let Err(e) = store.save(&commit.key, &committed_tokens).await {
+    if let Err(e) = store
+        .save_for(
+            &commit.key,
+            &committed_tokens,
+            TokenStoreAccess::Interactive,
+        )
+        .await
+    {
         let message = match rollback_token_commit(store, auth_lease, commit).await {
             Ok(()) => {
                 format!("TokenStore save failed{failure_context}: {e}; acquired lease rolled back")
@@ -912,7 +935,7 @@ async fn rollback_token_commit(
                     .release_credential_lifecycle(&commit.lease_key)
                     .map_err(|e| format!("AuthMachine lifecycle rollback release failed: {e}"))?;
                 store
-                    .save(&commit.key, previous)
+                    .save_for(&commit.key, previous, TokenStoreAccess::Interactive)
                     .await
                     .map_err(|e| format!("TokenStore rollback save failed: {e}"))?;
                 let restored_transition = meerkat_core::restore_token_lifecycle_snapshot(
@@ -929,7 +952,11 @@ async fn rollback_token_commit(
                         )
                         .map_err(|e| format!("AuthMachine rollback marker handoff failed: {e}"))?;
                     store
-                        .save(&commit.key, &restored_previous)
+                        .save_for(
+                            &commit.key,
+                            &restored_previous,
+                            TokenStoreAccess::Interactive,
+                        )
                         .await
                         .map_err(|e| format!("TokenStore rollback marker save failed: {e}"))?;
                 }
@@ -939,7 +966,7 @@ async fn rollback_token_commit(
                     .release_credential_lifecycle(&commit.lease_key)
                     .map_err(|e| format!("AuthMachine lifecycle rollback release failed: {e}"))?;
                 store
-                    .save(&commit.key, previous)
+                    .save_for(&commit.key, previous, TokenStoreAccess::Interactive)
                     .await
                     .map_err(|e| format!("TokenStore rollback save failed: {e}"))?;
             }
@@ -949,7 +976,7 @@ async fn rollback_token_commit(
                 .release_credential_lifecycle(&commit.lease_key)
                 .map_err(|e| format!("AuthMachine lifecycle rollback release failed: {e}"))?;
             store
-                .clear(&commit.key)
+                .clear_for(&commit.key, TokenStoreAccess::Interactive)
                 .await
                 .map_err(|e| format!("TokenStore rollback clear failed: {e}"))?;
         }
@@ -1084,9 +1111,9 @@ async fn save_tokens_and_consume_device_flow(
                         return Err(rpc_response_to_credential_mutation_error(response));
                     }
                     let committed = mutation_store
-                        .load(&load_key)
+                        .load_for(&load_key, TokenStoreAccess::Interactive)
                         .await
-                        .map_err(|error| CredentialMutationError::TokenStore(error.to_string()))?
+                        .map_err(CredentialMutationError::from_token_store)?
                         .ok_or_else(|| {
                             CredentialMutationError::TokenStore(
                                 "successful device login left no persisted credential".to_string(),
@@ -1215,9 +1242,9 @@ async fn save_tokens_and_consume_browser_flow(
                     .await
                     .map_err(rpc_response_to_credential_mutation_error)?;
                     let committed = mutation_store
-                        .load(&load_key)
+                        .load_for(&load_key, TokenStoreAccess::Interactive)
                         .await
-                        .map_err(|error| CredentialMutationError::TokenStore(error.to_string()))?
+                        .map_err(CredentialMutationError::from_token_store)?
                         .ok_or_else(|| {
                             CredentialMutationError::TokenStore(
                                 "successful browser login left no persisted credential".to_string(),
@@ -1568,9 +1595,12 @@ pub async fn handle_auth_login_start(
                 Ok(target) => target,
                 Err(response) => return response,
             };
-            // Discovery falls back to the server's well-known metadata.
-            let started = match service
-                .mcp_login_start(&target, &parsed.redirect_uri, None)
+            // Discovery falls back to the server's well-known metadata. A
+            // started attempt is recorded for shutdown before this responds.
+            let started = match runtime
+                .admit_mcp_wire_login(&target, || {
+                    service.mcp_login_start(&target, &parsed.redirect_uri, None)
+                })
                 .await
             {
                 Ok(started) => started,
@@ -1669,6 +1699,7 @@ pub async fn handle_auth_login_complete(
                 Ok(target) => target,
                 Err(response) => return response,
             };
+            let state = parsed.state.clone();
             let completed = match service
                 .mcp_login_complete(
                     &target,
@@ -1681,8 +1712,15 @@ pub async fn handle_auth_login_complete(
                 .await
             {
                 Ok(completed) => completed,
+                // A failed completion does not prove the attempt's removal:
+                // it stays recorded for shutdown.
                 Err(error_value) => return host_auth_error_response(id, error_value),
             };
+            runtime.forget_mcp_wire_attempt(&state);
+            // Wake the exact operation awaiting this target in this runtime's
+            // sessions; it retries at its next boundary.
+            #[cfg(feature = "mcp")]
+            runtime.mcp_credential_landed(&completed.target).await;
             tracing::info!(
                 target: "meerkat::auth::audit",
                 mcp_server = %mcp.server_name,
@@ -1718,6 +1756,7 @@ pub async fn handle_auth_login_complete(
                                 redirect_uri: parsed.redirect_uri,
                                 state: parsed.state,
                                 code: parsed.code,
+                                host_attempt_handle: None,
                             },
                         )
                         .await
@@ -1815,7 +1854,10 @@ pub async fn handle_auth_login_cancel(
             };
             service
                 .mcp_login_cancel_by_state(&target, &parsed.state)
-                .map(|()| WireLoginCancelledTarget::Mcp(WireMcpLoginTarget { mcp: parsed.mcp }))
+                .map(|()| {
+                    runtime.forget_mcp_wire_attempt(&parsed.state);
+                    WireLoginCancelledTarget::Mcp(WireMcpLoginTarget { mcp: parsed.mcp })
+                })
         }
         LoginCancelParams::McpAttempt(parsed) => {
             let target = match configured_mcp_target(&id, runtime, &parsed.mcp).await {
@@ -1824,7 +1866,10 @@ pub async fn handle_auth_login_cancel(
             };
             service
                 .mcp_login_cancel_by_attempt_ref(&target, &parsed.attempt_ref)
-                .map(|()| WireLoginCancelledTarget::Mcp(WireMcpLoginTarget { mcp: parsed.mcp }))
+                .map(|()| {
+                    runtime.forget_mcp_wire_attempt_ref(&target, &parsed.attempt_ref);
+                    WireLoginCancelledTarget::Mcp(WireMcpLoginTarget { mcp: parsed.mcp })
+                })
         }
         LoginCancelParams::Connector(parsed) => {
             meerkat::connector_slot_from_wire(&parsed.connector)
@@ -2210,42 +2255,46 @@ pub async fn handle_auth_status_get(
         }
     };
     let mut stored = None;
+    let mut credential_observation = None;
     if source_uses_store {
-        if phase.is_no_live_lease() {
-            if let (Some(expected_mode), Some(store)) = (expected_mode, token_store.as_ref()) {
-                // A store fault during rehydration is a real error, not
-                // absent credentials: collapsing it would report a store
-                // failure as "no credentials"/Unknown status.
-                match meerkat_core::rehydrate_marked_tokens_for_status_for_identity(
-                    store.as_ref(),
-                    &generated_auth_lease,
-                    &credential_identity,
-                    expected_mode,
-                    now,
-                )
-                .await
-                {
-                    Ok(Some(rehydrated)) => {
-                        stored = Some(rehydrated);
-                        snapshot = auth_lease.snapshot(&lease_key);
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        return RpcResponse::error(
-                            id,
-                            error::INTERNAL_ERROR,
-                            format!("TokenStore rehydration failed: {err}"),
-                        );
+        // Status never waits behind credential work and never starts an
+        // operating-system credential read. A store fault is a real error,
+        // not absent credentials, and an unanswered read is reported as such.
+        let read = if phase.is_no_live_lease() {
+            match (expected_mode, token_store.as_ref()) {
+                (Some(expected_mode), Some(store)) => {
+                    match meerkat_core::observe_marked_tokens_for_status_for_identity(
+                        store.as_ref(),
+                        &generated_auth_lease,
+                        &credential_identity,
+                        expected_mode,
+                        now,
+                    )
+                    .await
+                    {
+                        Ok(read) => {
+                            snapshot = auth_lease.snapshot(&lease_key);
+                            Some(read)
+                        }
+                        Err(err) => {
+                            return RpcResponse::error(
+                                id,
+                                error::INTERNAL_ERROR,
+                                format!("TokenStore rehydration failed: {err}"),
+                            );
+                        }
                     }
                 }
+                _ => None,
             }
         } else if let Some(store) = token_store.as_ref() {
-            // A store-load fault is a real error, not absent credentials.
-            stored = match store
-                .load(&TokenKey::from_credential_identity(&credential_identity))
+            match store
+                .observe_status(&TokenKey::from_credential_identity(&credential_identity))
                 .await
             {
-                Ok(stored) => stored,
+                Ok(observation) => Some(meerkat_core::CredentialStatusRead::from_observation(
+                    observation,
+                )),
                 Err(err) => {
                     return RpcResponse::error(
                         id,
@@ -2253,7 +2302,13 @@ pub async fn handle_auth_status_get(
                         format!("TokenStore load failed: {err}"),
                     );
                 }
-            };
+            }
+        } else {
+            None
+        };
+        if let Some(read) = read {
+            credential_observation = read.observation();
+            stored = read.into_tokens();
         }
     }
     if stored
@@ -2304,6 +2359,7 @@ pub async fn handle_auth_status_get(
             last_refresh_at: tokens.and_then(|t| t.last_refresh.map(|e| e.to_rfc3339())),
             account_id: tokens.and_then(|t| t.account_id.clone()),
             has_refresh_token: tokens.map(|t| t.refresh_token.is_some()).unwrap_or(false),
+            credential_observation,
         }),
     )
 }
@@ -2328,8 +2384,25 @@ pub async fn handle_auth_logout(
                 Ok(service) => service,
                 Err(error_value) => return host_auth_error_response(id, error_value),
             };
+            // Wire custody records stay: a start admitted while this logout
+            // ran must not be erased by it. Shutdown's exact sweep settles
+            // retired ones as absent.
             if let Err(error_value) = service.mcp_logout(&target).await {
                 return host_auth_error_response(id, error_value);
+            }
+            // Stop offering the servers that used this credential in this
+            // runtime's sessions; a later sign-in adds them back. Live
+            // connections report the realm-scoped identity of the slot.
+            #[cfg(feature = "mcp")]
+            match service.mcp_target_in_service_realm(&target) {
+                Ok(released) => {
+                    runtime.mcp_credential_released(&released).await;
+                }
+                Err(error) => tracing::warn!(
+                    server_name = target.server_name(),
+                    %error,
+                    "could not scope the logged-out MCP target; live sessions keep it until a call is refused"
+                ),
             }
             tracing::info!(
                 target: "meerkat::auth::audit",
@@ -2465,14 +2538,18 @@ mod tests {
         handle.acquire_lease(lease_key, expires_at).unwrap()
     }
 
+    /// Mark fixture tokens as lifecycle-published under `auth_binding`'s own
+    /// token key and lifecycle lease, so a fixture in its own realm does not
+    /// share the `dev/default_openai` lease with its neighbours.
     fn mark_tokens_lifecycle_published_for_test(
+        auth_binding: &AuthBindingRef,
         tokens: &PersistedTokens,
         generation: u64,
         credential_published_at_millis: Option<u64>,
     ) -> PersistedTokens {
         let _ = (generation, credential_published_at_millis);
-        let key = TokenKey::from_auth_binding(&openai_auth_binding());
-        let lease_key = LeaseKey::from_auth_binding(&openai_auth_binding());
+        let key = TokenKey::from_auth_binding(auth_binding);
+        let lease_key = LeaseKey::from_auth_binding(auth_binding);
         let transition = generated_auth_transition_for_test(
             &lease_key,
             meerkat_core::persisted_token_expires_at_epoch_secs(tokens),
@@ -2510,7 +2587,8 @@ mod tests {
             )
             .expect("construct runtime authority"),
             crate::router::NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
         runtime.set_config_runtime(Arc::new(meerkat_core::ConfigRuntime::new(
             config_store,
             temp.path().join("config_state.json"),
@@ -2547,7 +2625,8 @@ mod tests {
             )
             .expect("construct runtime authority"),
             crate::router::NotificationSink::noop(),
-        );
+        )
+        .expect("compose the RPC session runtime");
         runtime.set_config_runtime(Arc::new(meerkat_core::ConfigRuntime::new(
             config_store,
             temp.path().join("config_state.json"),
@@ -3126,6 +3205,19 @@ mod tests {
 
         fn backend_name(&self) -> &'static str {
             "load_failing"
+        }
+
+        /// The same fault answers a status observation.
+        async fn observe_status(
+            &self,
+            _key: &TokenKey,
+        ) -> Result<
+            meerkat_providers::auth_store::TokenStoreObservation,
+            meerkat_providers::auth_store::TokenStoreError,
+        > {
+            Err(meerkat_providers::auth_store::TokenStoreError::Serde(
+                "malformed token fixture".into(),
+            ))
         }
     }
 
@@ -4820,10 +4912,20 @@ mod tests {
 
     #[tokio::test]
     async fn auth_status_rehydrates_marked_oauth_token_after_restart() {
-        let runtime = test_runtime_with_config(config_with_openai_oauth_binding(
-            CredentialSourceSpec::ManagedStore,
-        ));
-        let auth_binding = openai_auth_binding();
+        // Its own realm in the config, the binding, the request and the
+        // lifecycle token marker: the lifecycle owner registry is process
+        // wide, so a neighbouring test's credential work on dev/default_openai
+        // must not hold this binding's lease while the status hydrates.
+        let mut config = config_with_openai_oauth_binding(CredentialSourceSpec::ManagedStore);
+        let section = config.realm.remove("dev").unwrap();
+        config.realm.insert("rehydrate-rpc".into(), section);
+        let runtime = test_runtime_with_config(config);
+        let auth_binding = AuthBindingRef {
+            realm: meerkat_core::RealmId::parse("rehydrate-rpc").unwrap(),
+            binding: meerkat_core::BindingId::parse("default_openai").unwrap(),
+            profile: None,
+            origin: meerkat_core::connection::BindingOrigin::Configured,
+        };
         let lease_key = LeaseKey::from_auth_binding(&auth_binding);
         let store = runtime
             .token_store()
@@ -4833,12 +4935,12 @@ mod tests {
         store
             .save(
                 &TokenKey::from_auth_binding(&auth_binding),
-                &mark_tokens_lifecycle_published_for_test(&tokens, 1, None),
+                &mark_tokens_lifecycle_published_for_test(&auth_binding, &tokens, 1, None),
             )
             .await
             .unwrap();
         let params = raw_params(serde_json::json!({
-            "realm_id": "dev",
+            "realm_id": "rehydrate-rpc",
             "binding_id": "default_openai"
         }));
 
@@ -4846,13 +4948,13 @@ mod tests {
             handle_auth_status_get(Some(RpcId::Num(1)), Some(params.as_ref()), &runtime).await;
 
         let status = auth_status_value(resp);
-        assert_eq!(status["state"], "valid");
-        assert!(status.get("expires_at").is_some());
-        assert_eq!(status["account_id"], "acct-1");
-        assert_eq!(status["has_refresh_token"], true);
+        assert_eq!(status["state"], "valid", "{status}");
+        assert!(status.get("expires_at").is_some(), "{status}");
+        assert_eq!(status["account_id"], "acct-1", "{status}");
+        assert_eq!(status["has_refresh_token"], true, "{status}");
         let snapshot = runtime.auth_lease_handle().snapshot(&lease_key);
-        assert_eq!(snapshot.phase, Some(AuthLeasePhase::Valid));
-        assert!(snapshot.credential_present);
+        assert_eq!(snapshot.phase, Some(AuthLeasePhase::Valid), "{status}");
+        assert!(snapshot.credential_present, "{status}");
     }
 
     #[tokio::test]
@@ -5039,6 +5141,141 @@ mod tests {
         assert!(status.get("last_refresh_at").is_none());
         assert!(status.get("account_id").is_none());
         assert_eq!(status["has_refresh_token"], false);
+    }
+
+    /// A store whose plain reads (an interactive mutation reads through them)
+    /// park until released, counting every read and every status observation.
+    struct ParkedReadTokenStore {
+        inner: meerkat_providers::auth_store::EphemeralTokenStore,
+        reads: std::sync::atomic::AtomicUsize,
+        observations: std::sync::atomic::AtomicUsize,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl ParkedReadTokenStore {
+        fn new() -> Self {
+            Self {
+                inner: meerkat_providers::auth_store::EphemeralTokenStore::new(),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+                observations: std::sync::atomic::AtomicUsize::new(0),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_providers::auth_store::TokenStore for ParkedReadTokenStore {
+        async fn load(
+            &self,
+            key: &meerkat_providers::auth_store::TokenKey,
+        ) -> Result<
+            Option<meerkat_providers::auth_store::PersistedTokens>,
+            meerkat_providers::auth_store::TokenStoreError,
+        > {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.entered.notify_one();
+            let _permit = self.release.acquire().await;
+            self.inner.load(key).await
+        }
+
+        async fn save(
+            &self,
+            key: &meerkat_providers::auth_store::TokenKey,
+            tokens: &meerkat_providers::auth_store::PersistedTokens,
+        ) -> Result<(), meerkat_providers::auth_store::TokenStoreError> {
+            self.inner.save(key, tokens).await
+        }
+
+        async fn clear(
+            &self,
+            key: &meerkat_providers::auth_store::TokenKey,
+        ) -> Result<(), meerkat_providers::auth_store::TokenStoreError> {
+            self.inner.clear(key).await
+        }
+
+        async fn list(
+            &self,
+        ) -> Result<
+            Vec<meerkat_providers::auth_store::TokenKey>,
+            meerkat_providers::auth_store::TokenStoreError,
+        > {
+            self.inner.list().await
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "parked_read"
+        }
+
+        async fn observe_status(
+            &self,
+            key: &meerkat_providers::auth_store::TokenKey,
+        ) -> Result<
+            meerkat_providers::auth_store::TokenStoreObservation,
+            meerkat_providers::auth_store::TokenStoreError,
+        > {
+            self.observations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.observe_status(key).await
+        }
+    }
+
+    /// T1 at the public RPC status entry: an interactive save holds the
+    /// actual lifecycle guard while its durable read is in flight. Status
+    /// answers at once that the owner is busy, and reads nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_status_with_the_owner_busy_answers_at_once_without_reading() {
+        // Its own realm: the lifecycle owner registry is process wide.
+        let mut config = config_with_openai_managed_store_binding();
+        let section = config.realm.remove("dev").unwrap();
+        config.realm.insert("t1-rpc".into(), section);
+        let store = Arc::new(ParkedReadTokenStore::new());
+        let runtime = test_runtime_with_config_and_token_store(config, store.clone());
+        let auth_binding = AuthBindingRef {
+            realm: meerkat_core::RealmId::parse("t1-rpc").unwrap(),
+            binding: meerkat_core::BindingId::parse("default_openai").unwrap(),
+            profile: None,
+            origin: meerkat_core::connection::BindingOrigin::Configured,
+        };
+        let tokens = PersistedTokens::api_key("sk-new");
+        let save = save_tokens_and_publish_lifecycle(
+            Some(RpcId::Num(1)),
+            &runtime,
+            &auth_binding,
+            &tokens,
+        );
+        tokio::pin!(save);
+        tokio::select! {
+            _ = &mut save => panic!("the save cannot finish while its read is parked"),
+            () = store.entered.notified() => {}
+        }
+        let params = raw_params(serde_json::json!({
+            "realm_id": "t1-rpc",
+            "binding_id": "default_openai"
+        }));
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle_auth_status_get(Some(RpcId::Num(2)), Some(params.as_ref()), &runtime),
+        )
+        .await
+        .expect("status answers at once, without waiting for the interactive save");
+
+        let status = auth_status_value(resp);
+        assert_eq!(status["credential_observation"], "owner_busy");
+        assert_eq!(
+            store.observations.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "status read nothing"
+        );
+        assert_eq!(
+            store.reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the interactive save read the store"
+        );
+        store.release.add_permits(1);
+        assert!(save.await.is_ok(), "the interactive save completes");
     }
 
     #[tokio::test]

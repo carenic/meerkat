@@ -1335,6 +1335,7 @@ fn flow_step_run_renderable(flow_step: &FlowStepInput) -> CoreRenderable {
             category: "flow_step".to_string(),
             detail: Some(flow_step.content.text_content()),
             payload: None,
+            content: Vec::new(),
         }],
     }
 }
@@ -1662,6 +1663,7 @@ mod tests {
                     category: "test".to_string(),
                     detail: Some(detail.to_string()),
                     payload: None,
+                    content: Vec::new(),
                 }],
             },
             identity: None,

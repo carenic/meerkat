@@ -236,6 +236,19 @@ pub struct SessionRuntimeBindings {
     /// Hand-off of the session's interrupted-run evidence from agent
     /// construction (host process custody) to runtime materialization.
     interrupted_tool_evidence: Arc<crate::tool_process::InterruptedToolEvidenceSlot>,
+    /// Present only when the runtime has an installed native work host: the
+    /// host's authority for each configured MCP server of this session,
+    /// asked before discovery, spawn or first use. A configured row is not
+    /// authority. `None` keeps the ungoverned behavior.
+    configured_mcp_attachment:
+        Option<Arc<dyn crate::mcp_attachment::ConfiguredMcpAttachmentAuthority>>,
+    /// The session registration's tool-surface gate slot, when the runtime
+    /// has one: a gate its trusted host installed is asked on the agent's
+    /// prepared surface before the agent is finished.
+    tool_surface_gate: Option<crate::tool_surface::ToolSurfaceGateSlot>,
+    /// The session registration's MCP observation slot, when the runtime has
+    /// one: the factory installs each finished construction's MCP adapter.
+    mcp_observation: Option<crate::mcp_observation::McpObservationSlot>,
     runtime_authority: Arc<dyn Any + Send + Sync>,
 }
 
@@ -294,8 +307,68 @@ impl SessionRuntimeBindings {
             compaction_commit_coordinator,
             post_commit_hooks,
             interrupted_tool_evidence: Arc::default(),
+            configured_mcp_attachment: None,
+            tool_surface_gate: None,
+            mcp_observation: None,
             runtime_authority,
         }
+    }
+
+    /// Carry the session registration's tool-surface gate slot. Set by the
+    /// runtime when it prepares bindings for a registration.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __with_tool_surface_gate(
+        mut self,
+        slot: crate::tool_surface::ToolSurfaceGateSlot,
+    ) -> Self {
+        self.tool_surface_gate = Some(slot);
+        self
+    }
+
+    /// Carry the session registration's MCP observation slot. Set by the
+    /// runtime when it prepares bindings for a registration.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __with_mcp_observation_slot(
+        mut self,
+        slot: crate::mcp_observation::McpObservationSlot,
+    ) -> Self {
+        self.mcp_observation = Some(slot);
+        self
+    }
+
+    /// The session registration's MCP observation slot, if the runtime has
+    /// one.
+    pub fn mcp_observation_slot(&self) -> Option<&crate::mcp_observation::McpObservationSlot> {
+        self.mcp_observation.as_ref()
+    }
+
+    /// The tool-surface gate installed for this session's registration, if
+    /// any.
+    pub fn tool_surface_gate(&self) -> Option<Arc<dyn crate::tool_surface::ToolSurfaceGate>> {
+        self.tool_surface_gate
+            .as_ref()
+            .and_then(crate::tool_surface::ToolSurfaceGateSlot::current)
+    }
+
+    /// Install the governed runtime's configured-attachment authority. Set
+    /// by the runtime when it prepares bindings on a governed machine.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __with_configured_mcp_attachment(
+        mut self,
+        authority: Arc<dyn crate::mcp_attachment::ConfiguredMcpAttachmentAuthority>,
+    ) -> Self {
+        self.configured_mcp_attachment = Some(authority);
+        self
+    }
+
+    /// The governed runtime's authority for configured MCP servers, if any.
+    pub fn configured_mcp_attachment(
+        &self,
+    ) -> Option<&Arc<dyn crate::mcp_attachment::ConfiguredMcpAttachmentAuthority>> {
+        self.configured_mcp_attachment.as_ref()
     }
 
     pub fn session_id(&self) -> &SessionId {
@@ -439,6 +512,9 @@ impl SessionRuntimeBindings {
             compaction_commit_coordinator: Arc::clone(&self.compaction_commit_coordinator),
             post_commit_hooks: Arc::clone(&self.post_commit_hooks),
             interrupted_tool_evidence: Arc::clone(&self.interrupted_tool_evidence),
+            configured_mcp_attachment: self.configured_mcp_attachment.clone(),
+            tool_surface_gate: self.tool_surface_gate.clone(),
+            mcp_observation: self.mcp_observation.clone(),
             runtime_authority,
         }
     }

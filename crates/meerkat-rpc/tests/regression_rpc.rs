@@ -110,7 +110,8 @@ fn spawn_test_server() -> (
         )
         .expect("construct runtime authority"),
         meerkat_rpc::router::NotificationSink::noop(),
-    );
+    )
+    .expect("compose the RPC session runtime");
     let config_store: Arc<dyn meerkat_core::ConfigStore> = Arc::new(MemoryConfigStore::new(
         Config::default(),
         meerkat_models::canonical(),

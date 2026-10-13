@@ -43,15 +43,17 @@ function assertLanes(plan, label) {
     assert.ok(plan.closure.includes(name), `${label}: closure includes ${name}`);
   }
   // Unit plan: every changed package is either in a pull-request unit shard
-  // or named as deferred to the push-to-main run, never dropped.
+  // or named as deferred to the push-to-main run, never dropped. The only
+  // other unit package is a chain exception that a changed trigger selected.
   const unitCovered = plan.unit_shards.flatMap((shard) => shard.packages);
   assert.deepEqual(
     [...unitCovered, ...plan.unit_deferred].sort(),
-    [...plan.packages].sort(),
-    `${label}: unit shards plus deferred packages partition the changed packages`,
+    [...new Set([...plan.packages, ...plan.unit_chain_exceptions])].sort(),
+    `${label}: unit shards plus deferred packages partition the changed packages and selected exceptions`,
   );
   for (const name of plan.unit_deferred) {
     assert.equal(plan.package_model[name].heavy_chain, true, `${label}: ${name} is deferred only because it compiles meerkat-mob`);
+    assert.ok(!plan.unit_chain_exceptions.includes(name), `${label}: selected exception ${name} is not deferred`);
   }
   for (const shard of plan.unit_shards) {
     assert.ok(
@@ -59,8 +61,16 @@ function assertLanes(plan, label) {
       `${label}: pull-request unit lane ${shard.name} models ${shard.estimated_minutes} min, over the ${plan.pr_unit_budget_minutes} min budget`,
     );
     for (const name of shard.packages) {
-      assert.equal(plan.package_model[name].heavy_chain, false, `${label}: ${name} must not run its unit tests in the pull request`);
+      assert.ok(
+        !plan.package_model[name].heavy_chain || plan.unit_chain_exceptions.includes(name),
+        `${label}: ${name} must not run its unit tests in the pull request`,
+      );
     }
+  }
+  // An exception covers its default-feature row only: no pull-request
+  // feature suite compiles meerkat-mob.
+  for (const suite of plan.unit_feature_shards) {
+    assert.equal(plan.package_model[suite.packages[0]].heavy_chain, false, `${label}: ${suite.name} must not run in the pull request`);
   }
   // The push-to-main plan covers the whole workspace: the packed shards
   // plus the archived (build once, partitioned run) lanes, never both.
@@ -103,8 +113,9 @@ function assertArchivedLanes(plan, label) {
   );
 }
 
-// Core touch: the direct lane is meerkat-core alone; the closure is nearly
-// the whole workspace (everything depends on core).
+// Core touch: the direct lanes are meerkat-core's and, because core is a
+// trigger of meerkat-rpc's restart controls, the rpc exception lane; the
+// closure is nearly the whole workspace (everything depends on core).
 {
   const plan = planFor(["crates/meerkat-core/src/lib.rs"]);
   assert.equal(plan.mode, "packages");
@@ -114,7 +125,12 @@ function assertArchivedLanes(plan, label) {
   assert.ok(plan.closure.includes("meerkat-mob"), "core closure includes meerkat-mob");
   assert.ok(plan.closure.includes("rkat"), "core closure includes rkat");
   assert.equal(plan.shards.length, 1);
-  assert.deepEqual(plan.unit_shards.map((shard) => shard.packages), [["meerkat-core"]], "core runs its unit tests in the pull request");
+  assert.deepEqual(
+    plan.unit_shards.map((shard) => shard.packages).sort(),
+    [["meerkat-core"], ["meerkat-rpc"]],
+    "core runs its unit tests in the pull request, and so does the rpc exception it selects",
+  );
+  assert.deepEqual(plan.unit_chain_exceptions, ["meerkat-rpc"]);
   assert.deepEqual(plan.unit_deferred, []);
   assert.equal(plan.wasm, true, "core is in the wasm runtime closure");
   assert.equal(plan.machine_authority, false);
@@ -130,6 +146,7 @@ function assertArchivedLanes(plan, label) {
   assert.equal(plan.shards.length, 1, "clippy lane for mob");
   assert.deepEqual(plan.unit_shards, [], "no pull-request unit lane may compile meerkat-mob");
   assert.deepEqual(plan.unit_deferred, ["meerkat-mob"]);
+  assert.deepEqual(plan.unit_chain_exceptions, [], "a meerkat-mob change alone selects no exception");
   assert.ok(plan.package_model["meerkat-mob"].estimated_minutes > plan.pr_unit_budget_minutes, "mob's own lane models over budget");
   assertLanes(plan, "mob touch");
   for (const name of ["meerkat-mob", "meerkat-rpc", "meerkat-rest", "rkat", "meerkat-mob-mcp", "meerkat-integration-tests", "meerkat-web-runtime", "meerkat-machine-codegen"]) {
@@ -142,9 +159,10 @@ function assertArchivedLanes(plan, label) {
   }
 }
 {
+  // A session change also selects the rpc exception lane; rkat stays deferred.
   const plan = planFor(["crates/meerkat-cli/src/main.rs", "crates/meerkat-session/src/lib.rs"]);
   assert.deepEqual(plan.unit_deferred, ["rkat"]);
-  assert.deepEqual(plan.unit_shards.map((shard) => shard.packages), [["meerkat-session"]]);
+  assert.deepEqual(plan.unit_shards.map((shard) => shard.packages).sort(), [["meerkat-rpc"], ["meerkat-session"]]);
   assertLanes(plan, "cli + session");
 }
 
@@ -152,16 +170,22 @@ function assertArchivedLanes(plan, label) {
 // authorization dependency has native facade fixtures in its own dev graph.
 {
   const plan = planFor(["crates/meerkat-runtime/src/lib.rs"]);
-  assert.equal(plan.pr_unit_budget_minutes, 16, "runtime uses the unchanged pull-request unit budget");
-  assert.deepEqual(plan.unit_shards.map((shard) => shard.packages), [["meerkat-runtime"]], "runtime retains its pull-request unit lane");
+  assert.equal(plan.pr_unit_budget_minutes, 17, "runtime uses the 17-minute surrogate packing cap");
+  assert.deepEqual(
+    plan.unit_shards.map((shard) => shard.packages).sort(),
+    [["meerkat-rpc"], ["meerkat-runtime"]],
+    "runtime retains its pull-request unit lane, beside the rpc exception lane it selects",
+  );
   assert.deepEqual(plan.unit_deferred, [], "runtime unit tests are not deferred");
   assert.ok(!plan.unit_deferred_chain.includes("meerkat-runtime"), "runtime remains outside the mob build chain");
-  assert.ok(plan.unit_shards[0].estimated_minutes <= plan.pr_unit_budget_minutes, "runtime's unit lane fits the budget");
+  const runtimeLane = plan.unit_shards.find((shard) => shard.packages.includes("meerkat-runtime"));
+  assert.ok(runtimeLane.estimated_minutes <= plan.pr_unit_budget_minutes, "runtime's unit lane fits the budget");
 }
 
 // Budget by construction: every package outside the chain models under the
 // pull-request unit budget on its own, so no changed-package plan can
-// exceed it; every package inside the chain is deferred.
+// exceed it; so does each chain exception; every other package inside the
+// chain is deferred.
 {
   const plan = planFor(["Cargo.lock"]);
   for (const [name, model] of Object.entries(plan.package_model)) {
@@ -169,7 +193,78 @@ function assertArchivedLanes(plan, label) {
       assert.ok(model.estimated_minutes <= plan.pr_unit_budget_minutes, `${name} models ${model.estimated_minutes} min alone, over budget`);
     }
   }
-  assert.equal(plan.unit_deferred.length, plan.unit_deferred_chain.length, "workspace mode defers exactly the chain");
+  assert.deepEqual(plan.unit_chain_exceptions, ["meerkat-rpc"], "a workspace plan changes every exception trigger");
+  for (const name of plan.unit_chain_exceptions) {
+    assert.equal(plan.package_model[name].heavy_chain, true, `${name} is an exception to the chain`);
+    assert.ok(plan.package_model[name].estimated_minutes <= plan.pr_unit_budget_minutes, `${name} models ${plan.package_model[name].estimated_minutes} min alone, over budget`);
+  }
+  assert.deepEqual(
+    plan.unit_deferred,
+    plan.unit_deferred_chain.filter((name) => !plan.unit_chain_exceptions.includes(name)),
+    "workspace mode defers exactly the chain less its exceptions",
+  );
+  assertLanes(plan, "workspace with exceptions");
+}
+
+// The one chain exception: meerkat-rpc's existing default-feature unit row
+// (its MCP restart controls) runs in the pull request when meerkat-rpc or one
+// of its trigger packages changed directly. It is packed under the budget like
+// any unit lane; its feature suites and the rest of the chain stay deferred.
+{
+  const rpc = planFor(["crates/meerkat-rpc/src/governed_jsonl/tests.rs"]);
+  assert.deepEqual(rpc.packages, ["meerkat-rpc"]);
+  assert.deepEqual(rpc.unit_chain_exceptions, ["meerkat-rpc"]);
+  assert.deepEqual(rpc.unit_deferred, [], "an rpc change runs rpc's unit tests in the pull request");
+  assert.deepEqual(rpc.unit_shards.map((shard) => shard.package_flags), ["-p meerkat-rpc"], "one default-feature unit row");
+  assert.equal(rpc.package_model["meerkat-rpc"].heavy_chain, true, "rpc still compiles meerkat-mob");
+  assert.ok(rpc.unit_deferred_chain.includes("meerkat-rpc"), "rpc stays in the computed chain");
+  assert.deepEqual(rpc.unit_feature_shards, [], "rpc's feature suites stay on main");
+  assert.ok(rpc.unit_shards[0].estimated_minutes <= rpc.pr_unit_budget_minutes, `rpc's lane models ${rpc.unit_shards[0].estimated_minutes} min`);
+  assertLanes(rpc, "rpc touch");
+  // The native packages its restart controls exercise select the same row.
+  for (const path of [
+    "crates/meerkat/src/governed_realm/stock/mod.rs",
+    "crates/meerkat-core/src/mcp_attachment.rs",
+    "crates/meerkat-store/src/lib.rs",
+    "crates/meerkat-sqlite/src/lib.rs",
+    "crates/meerkat-runtime/src/lib.rs",
+    "crates/meerkat-session/src/lib.rs",
+    "crates/meerkat-mcp/src/router.rs",
+    "crates/meerkat-authorization/src/grant_policy.rs",
+    "crates/meerkat-authorization-contracts/src/grant.rs",
+  ]) {
+    const plan = planFor([path]);
+    assert.deepEqual(plan.unit_chain_exceptions, ["meerkat-rpc"], `${path} selects the rpc restart controls`);
+    assert.ok(plan.unit_shards.some((shard) => shard.packages.includes("meerkat-rpc")), `${path}: rpc has a pull-request unit lane`);
+    assert.ok(!plan.unit_feature_shards.some((suite) => suite.packages[0] === "meerkat-rpc"), `${path}: rpc's feature suites stay on main`);
+    assertLanes(plan, `${path} selects rpc`);
+  }
+  // Other packages, including the rest of the chain, leave rpc deferred.
+  for (const path of [
+    "crates/meerkat-mob/src/lib.rs",
+    "crates/meerkat-mob-mcp/src/lib.rs",
+    "crates/meerkat-rest/src/lib.rs",
+    "crates/meerkat-cli/src/main.rs",
+    "crates/meerkat-openai/src/public_live.rs",
+    "crates/meerkat-tools/src/lib.rs",
+    "crates/xtask/src/main.rs",
+  ]) {
+    const plan = planFor([path]);
+    assert.deepEqual(plan.unit_chain_exceptions, [], `${path} does not select rpc's unit lane`);
+    assert.ok(!plan.unit_shards.some((shard) => shard.packages.includes("meerkat-rpc")), `${path}: no rpc unit lane`);
+  }
+  // Two chain packages changed together: rpc runs, rest stays deferred.
+  const both = planFor(["crates/meerkat-rpc/src/lib.rs", "crates/meerkat-rest/src/lib.rs"]);
+  assert.deepEqual(both.unit_deferred, ["meerkat-rest"]);
+  assert.deepEqual(both.unit_shards.map((shard) => shard.packages), [["meerkat-rpc"]]);
+  assertLanes(both, "rpc + rest");
+  // GitHub output: the rpc row is an ordinary unit matrix row.
+  const github = run(["--format", "github", "--", "crates/meerkat-rpc/src/lib.rs"]);
+  assert.equal(github.status, 0, github.stderr);
+  const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+  assert.equal(lines.unit_shard_count, "1");
+  assert.equal(lines.unit_deferred, "");
+  assert.deepEqual(JSON.parse(lines.unit_shard_matrix).include, [{ name: "rpc", packages: "-p meerkat-rpc" }]);
 }
 
 // Docs-only: no Cargo lanes, and the plan says so explicitly rather than
@@ -387,9 +482,25 @@ for (const path of [
   for (const key of ["unit_shard_count", "unit_shard_matrix", "unit_deferred", "unit_deferred_count", "main_unit_shard_count", "main_unit_shard_matrix"]) {
     assert.ok(key in lines, `github output has ${key}`);
   }
-  assert.equal(lines.unit_shard_count, "1");
+  // Core's unit row and the rpc exception row a core change selects.
+  assert.equal(lines.unit_shard_count, "2");
+  assert.deepEqual(
+    JSON.parse(lines.unit_shard_matrix).include.map((row) => row.packages).sort(),
+    ["-p meerkat-core", "-p meerkat-rpc"],
+  );
   assert.equal(lines.unit_deferred, "");
   assert.ok(Number(lines.main_unit_shard_count) >= 2);
+  const integrationRows = JSON.parse(lines.integration_matrix).include;
+  assert.deepEqual(integrationRows.find((row) => row.name === "standalone-turn-lifecycle"), {
+    name: "standalone-turn-lifecycle",
+    packages: "-p meerkat",
+    tests: "--test standalone_turn_lifecycle",
+  });
+  assert.deepEqual(integrationRows.find((row) => row.name === "rpc-configured-turn-limit"), {
+    name: "rpc-configured-turn-limit",
+    packages: "-p meerkat-rpc",
+    tests: "--test configured_turn_limit",
+  });
 }
 {
   const result = run(["--format", "github", "--", "crates/meerkat-mob/src/lib.rs"]);
@@ -495,7 +606,7 @@ for (const path of [
   const names = (plan) => plan.integration_suites.map((suite) => suite.packages[0]);
   assert.deepEqual(
     names(planFor(["crates/meerkat-runtime/src/lib.rs"])),
-    ["meerkat-runtime", "meerkat-machine-codegen", "meerkat", "meerkat-integration-tests", "meerkat-authorization"],
+    ["meerkat-runtime", "meerkat-machine-codegen", "meerkat", "meerkat", "meerkat-integration-tests", "meerkat-authorization"],
   );
   assert.deepEqual(
     names(planFor(["crates/meerkat-machine-schema/src/lib.rs"])),
@@ -511,17 +622,43 @@ for (const path of [
   // The store and cold-restart suites follow every store backend change.
   assert.deepEqual(names(planFor(["crates/meerkat-sqlite/src/lib.rs"])), ["meerkat"]);
   const store = planFor(["crates/meerkat-store/src/lib.rs"]);
-  assert.deepEqual(names(store), ["meerkat"]);
+  assert.deepEqual(names(store), ["meerkat", "meerkat"]);
   assert.equal(store.integration_suites[0].name, "meerkat-store-restart");
+  // The governed realm suite follows its store, runtime and MCP owners.
+  assert.equal(store.integration_suites[1].name, "meerkat-governed-realm");
+  assert.match(store.integration_suites[1].package_flags, /^-p meerkat --features .*\blocal-authorization\b/);
+  assert.match(store.integration_suites[1].test_flags, /^--test governed_realm$/);
   assert.match(store.integration_suites[0].package_flags, /^-p meerkat --features .*\bsession-store\b/);
   assert.match(store.integration_suites[0].test_flags, /--test cold_restart_resume_after_compaction\b/);
   assert.deepEqual(names(planFor(["crates/meerkat-tools/src/lib.rs"])), ["meerkat-authorization"]);
   assert.deepEqual(names(planFor(["docs/index.mdx"])), []);
   assert.deepEqual(
     names(planFor(["Cargo.toml"])),
-    ["meerkat-runtime", "meerkat-machine-codegen", "xtask", "meerkat-machine-kernels", "meerkat", "meerkat-integration-tests", "meerkat-authorization"],
+    ["meerkat-runtime", "meerkat-machine-codegen", "xtask", "meerkat-machine-kernels", "meerkat", "meerkat", "meerkat", "meerkat-rpc", "meerkat-integration-tests", "meerkat-authorization"],
     "workspace mode runs every suite",
   );
+  // Config layering, core construction and facade changes must execute both
+  // regressions; an RPC-only change selects its own test binary.
+  const limitNames = (plan) => plan.integration_suites
+    .map((suite) => suite.name)
+    .filter((name) => ["standalone-turn-lifecycle", "rpc-configured-turn-limit"].includes(name));
+  for (const path of [
+    "crates/meerkat-core/src/config.rs",
+    "crates/meerkat-core/src/agent/builder.rs",
+    "crates/meerkat/src/factory.rs",
+    "crates/meerkat/tests/standalone_turn_lifecycle.rs",
+  ]) {
+    assert.deepEqual(limitNames(planFor([path])), ["standalone-turn-lifecycle", "rpc-configured-turn-limit"], `${path} runs both limit regressions`);
+  }
+  for (const path of [
+    "crates/meerkat-rpc/src/session_runtime.rs",
+    "crates/meerkat-rpc/tests/configured_turn_limit.rs",
+  ]) {
+    assert.deepEqual(limitNames(planFor([path])), ["rpc-configured-turn-limit"], `${path} runs the RPC limit regression`);
+  }
+  for (const path of ["crates/meerkat-openai/src/lib.rs", "docs/index.mdx"]) {
+    assert.deepEqual(limitNames(planFor([path])), [], `${path} does not add limit regression lanes`);
+  }
   // The gpt-live replays: a public Live path package or a fixture change
   // runs exactly the replay target with its feature.
   const replay = planFor(["crates/meerkat-openai/src/public_live.rs"]);
@@ -571,23 +708,30 @@ for (const path of [
   const workflow = planFor([".github/workflows/nightly.yml"]);
   assert.equal(workflow.rust_changed, false);
   assert.deepEqual(names(workflow), ["xtask"], "a workflow-only edit runs the xtask workflow pins");
+  // buildbuddy_static_lanes reads the SDK manifests and generated types.
+  for (const path of ["sdks/web/package.json", "sdks/typescript/src/generated/types.ts", "sdks/python/meerkat/generated/types.py"]) {
+    assert.ok(names(planFor([path])).includes("xtask"), `${path} runs the xtask integration suite`);
+  }
   const github = run(["--format", "github", "--", "crates/meerkat-runtime/src/lib.rs"]);
   assert.equal(github.status, 0, github.stderr);
   const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
   const rows = JSON.parse(lines.integration_matrix).include;
-  assert.equal(Number(lines.integration_count), 5);
+  assert.equal(Number(lines.integration_count), 6);
   assert.deepEqual(rows.map((row) => row.packages.split(" --features")[0]), [
     "-p meerkat-runtime",
     "-p meerkat-machine-codegen",
     "-p meerkat",
+    "-p meerkat",
     "-p meerkat-integration-tests",
     "-p meerkat-authorization",
   ]);
-  assert.equal(rows[3].packages, "-p meerkat-integration-tests --features gpt-live-replay");
+  assert.equal(rows[3].packages, "-p meerkat --features session-store,local-authorization,mcp");
+  assert.equal(rows[4].packages, "-p meerkat-integration-tests --features gpt-live-replay");
   assert.deepEqual(rows.map((row) => row.tests), [
     undefined,
     undefined,
     "--test cold_restart_resume_after_compaction --test cold_restart_resume --test persistence_contract --test storage_provider_seam --test brain_swap_surface_parity",
+    "--test governed_realm",
     "--test gpt_live_replay",
     undefined,
   ]);
@@ -704,6 +848,83 @@ for (const path of [
     const lines = Object.fromEntries(result.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
     assert.equal(lines.example_web, "true", `${path} selects the suites in GitHub output`);
   }
+}
+
+// Feature-combination checks (#1687): each clippy shard gives a Bazel-set job
+// (its packages under their Bazel test feature set) and a matrix job (their
+// other Bazel library/binary sets and their Make feature-matrix rows).
+{
+  const rows = (plan) => plan.feature_check_jobs.flatMap((job) => job.commands);
+  // #1595: meerkat-mob-mcp's lib tests under Bazel's `openai-live` alone.
+  const mobMcp = planFor(["crates/meerkat-mob-mcp/src/lib.rs"]);
+  assert.deepEqual(
+    mobMcp.feature_check_jobs.map((job) => job.name),
+    mobMcp.shards.flatMap((shard) => [`${shard.name} bazel set`, `${shard.name} matrix`]).filter((name) =>
+      mobMcp.feature_check_jobs.some((job) => job.name === name),
+    ),
+  );
+  assert.equal(mobMcp.feature_check_jobs[0].name, `${mobMcp.shards[0].name} bazel set`);
+  assert.equal(mobMcp.feature_check_jobs[0].commands.length, 1, "the Bazel-set job holds only the Bazel row");
+  assert.equal(
+    rows(mobMcp)[0],
+    "-p meerkat-mob-mcp --no-default-features --features meerkat-mob-mcp/openai-live --lib --bins --tests",
+  );
+  // #1558: `meerkat-mob --no-default-features` from the Make feature matrix,
+  // and the production library variant without `test-support`.
+  const mob = planFor(["crates/meerkat-mob/src/lib.rs"]);
+  assert.match(rows(mob)[0], /^-p meerkat-mob --no-default-features --features \S*meerkat-mob\/test-support\S* --lib --tests$/);
+  assert.ok(rows(mob).includes("-p meerkat-mob --no-default-features"), "the Make matrix row for meerkat-mob runs");
+  assert.ok(rows(mob).includes("-p meerkat-mob --no-default-features --features runtime-adapter"));
+  assert.ok(
+    rows(mob).some((row) => /^-p meerkat-mob --no-default-features --features \S+ --lib$/.test(row) && !row.includes("test-support")),
+    "the production library set without test-support is checked",
+  );
+  // A bin-only package gets no --lib; weak dependency features stay out.
+  const cli = planFor(["crates/meerkat-cli/src/main.rs"]);
+  assert.match(rows(cli)[0], /^-p rkat --no-default-features --features \S+ --bins --tests$/);
+  assert.ok(!rows(cli)[0].includes("?"), "weak dependency features are not passed to Cargo");
+  for (const row of rows(cli)) {
+    assert.match(row, /^-p rkat /, `${row} belongs to the changed package`);
+  }
+  // A workspace plan checks every package, shard by shard, and runs every
+  // Make feature-matrix check row with the shard that holds its package.
+  const workspace = planFor(["Cargo.toml"]);
+  assert.ok(workspace.feature_check_jobs.length <= 2 * workspace.shards.length);
+  for (const job of workspace.feature_check_jobs) {
+    const shard = workspace.shards.find(
+      (candidate) => job.name === `${candidate.name} bazel set` || job.name === `${candidate.name} matrix`,
+    );
+    assert.ok(shard, `feature-check job ${job.name} follows a clippy shard`);
+    for (const row of job.commands) {
+      for (const [, name] of row.matchAll(/-p (\S+)/g)) {
+        assert.ok(shard.packages.includes(name), `${job.name}: ${name} belongs to the shard`);
+      }
+    }
+  }
+  const bazelChecked = new Set(
+    workspace.feature_check_jobs
+      .filter((job) => job.name.endsWith(" bazel set"))
+      .flatMap((job) => [...job.commands[0].matchAll(/-p (\S+)/g)].map((match) => match[1])),
+  );
+  for (const name of ["meerkat", "meerkat-mob", "meerkat-mob-mcp", "rkat", "meerkat-core"]) {
+    assert.ok(bazelChecked.has(name), `the workspace plan checks ${name} under its Bazel test set`);
+  }
+  for (const row of [
+    "-p meerkat-client --no-default-features",
+    "-p meerkat-tools --no-default-features --features comms,mcp",
+    "-p meerkat --no-default-features --features session-store,meerkat-store/jsonl",
+  ]) {
+    assert.ok(rows(workspace).includes(row), `workspace plan runs the Make row ${row}`);
+  }
+  // A plan without a Rust change has no feature checks; GitHub output keeps
+  // a well-formed placeholder matrix behind a zero count.
+  const docs = planFor(["docs/guides/deploying.mdx"]);
+  assert.deepEqual(docs.feature_check_jobs, []);
+  const github = run(["--format", "github", "--", "docs/guides/deploying.mdx"]);
+  assert.equal(github.status, 0, github.stderr);
+  const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+  assert.equal(lines.feature_check_count, "0");
+  assert.deepEqual(JSON.parse(lines.feature_check_matrix).include, [{ name: "none", commands: "" }]);
 }
 
 // A change to the lane definitions runs the lanes they define.

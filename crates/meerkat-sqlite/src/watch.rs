@@ -15,9 +15,16 @@
 //!
 //! This is the contract the mob event bus has used since its external watch
 //! landed, extracted so every store shares one implementation.
+//!
+//! Teardown is explicit. Dropping a watch, or [`SqliteWatchStopHandle::request_stop`],
+//! only asks the worker to return and never blocks: a tick already running
+//! finishes on its own thread, unjoined. [`SqliteChangeWatch::stop_and_join`]
+//! is the one operation that waits for the worker, and it cannot do so from
+//! the worker's own thread.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -53,15 +60,149 @@ pub enum SqliteWatchControl {
     Stop,
 }
 
-/// A running watch. Dropping it stops the notifications, and the worker
-/// thread exits at its next wait.
+/// How [`SqliteChangeWatch::stop_and_join`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum SqliteWatchJoin {
+    /// The worker returned and was joined: no tick is running and none will
+    /// run.
+    Joined,
+    /// The worker was joined after a tick panicked: no tick is running and
+    /// none will run.
+    JoinedAfterPanic,
+    /// Called on the worker's own thread, from inside a tick. The stop is
+    /// requested, but a thread cannot join itself: the worker returns after
+    /// the current tick, unjoined. The join handle stays in this watch, so
+    /// whoever holds the watch must keep it and join it from another thread.
+    /// Never a settled outcome.
+    UnjoinedOnWorkerThread,
+}
+
+/// Asks a watch's worker to return, without owning the worker. Cheap to clone;
+/// never blocks and never joins.
+#[derive(Debug, Clone)]
+pub struct SqliteWatchStopHandle {
+    control: Arc<WatchControl>,
+}
+
+impl SqliteWatchStopHandle {
+    /// Ask the worker to return. Once it observes the request it starts no
+    /// further tick; a tick already running finishes first. Never blocks.
+    pub fn request_stop(&self) {
+        self.control.request_stop();
+    }
+}
+
+#[derive(Debug)]
+struct WatchControl {
+    stop_requested: Arc<AtomicBool>,
+    wake: mpsc::Sender<()>,
+}
+
+impl WatchControl {
+    fn request_stop(&self) {
+        self.stop_requested.store(true, Ordering::Release);
+        // Wake a worker waiting for its next tick. A worker that already
+        // returned has dropped the receiver; nothing is left to wake.
+        let _ = self.wake.send(());
+    }
+}
+
+/// Join custody of a watch's worker thread.
+enum WorkerCustody {
+    Running(thread::JoinHandle<()>),
+    Joined(SqliteWatchJoin),
+}
+
+/// A running watch: the notification source plus custody of its worker
+/// thread.
+///
+/// Dropping it requests the stop and never blocks or joins: the worker
+/// returns at its next wake, after any tick that is running, unjoined. Use
+/// [`Self::stop_and_join`] to wait for the worker.
 pub struct SqliteChangeWatch {
-    _watcher: notify::RecommendedWatcher,
+    control: Arc<WatchControl>,
+    watcher: Option<notify::RecommendedWatcher>,
+    worker: WorkerCustody,
 }
 
 impl std::fmt::Debug for SqliteChangeWatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteChangeWatch").finish_non_exhaustive()
+    }
+}
+
+impl SqliteChangeWatch {
+    /// A handle that can request this watch's stop after the watch itself has
+    /// moved elsewhere.
+    pub fn stop_handle(&self) -> SqliteWatchStopHandle {
+        SqliteWatchStopHandle {
+            control: Arc::clone(&self.control),
+        }
+    }
+
+    /// Ask the worker to return; see [`SqliteWatchStopHandle::request_stop`].
+    pub fn request_stop(&self) {
+        self.control.request_stop();
+    }
+
+    /// Whether the calling thread is this watch's worker, i.e. the caller is
+    /// running inside one of its ticks.
+    pub fn on_worker_thread(&self) -> bool {
+        self.worker_thread_id() == Some(thread::current().id())
+    }
+
+    /// The worker thread's identity until the worker is joined.
+    pub fn worker_thread_id(&self) -> Option<thread::ThreadId> {
+        match &self.worker {
+            WorkerCustody::Running(worker) => Some(worker.thread().id()),
+            WorkerCustody::Joined(_) => None,
+        }
+    }
+
+    /// Whether the worker has returned (joined or not). A returned worker
+    /// runs no tick again.
+    pub fn is_finished(&self) -> bool {
+        match &self.worker {
+            WorkerCustody::Running(worker) => worker.is_finished(),
+            WorkerCustody::Joined(_) => true,
+        }
+    }
+
+    /// Request the stop, stop the notifications, and wait for the worker to
+    /// return: a tick that is running finishes first. Unbounded by design: it
+    /// waits exactly as long as that tick runs.
+    ///
+    /// On the worker's own thread it cannot wait; it returns
+    /// [`SqliteWatchJoin::UnjoinedOnWorkerThread`] and keeps the join handle
+    /// in this watch, so a later call from another thread still joins.
+    /// Calling it again after a join returns the recorded outcome.
+    pub fn stop_and_join(&mut self) -> SqliteWatchJoin {
+        self.control.request_stop();
+        drop(self.watcher.take());
+        if self.on_worker_thread() {
+            return SqliteWatchJoin::UnjoinedOnWorkerThread;
+        }
+        let outcome = match std::mem::replace(
+            &mut self.worker,
+            WorkerCustody::Joined(SqliteWatchJoin::Joined),
+        ) {
+            WorkerCustody::Running(worker) => match worker.join() {
+                Ok(()) => SqliteWatchJoin::Joined,
+                Err(_) => SqliteWatchJoin::JoinedAfterPanic,
+            },
+            WorkerCustody::Joined(outcome) => outcome,
+        };
+        self.worker = WorkerCustody::Joined(outcome);
+        outcome
+    }
+}
+
+impl Drop for SqliteChangeWatch {
+    fn drop(&mut self) {
+        // Never block or join here: the last owner can drop a watch on any
+        // thread, including its own worker's.
+        self.control.request_stop();
     }
 }
 
@@ -125,7 +266,8 @@ pub fn sqlite_watch_event_relevant(
 
 /// Start watching `db_path`. `on_tick` runs on a dedicated thread named
 /// `thread_name`, once per coalesced notification and once per `sweep`
-/// without one.
+/// without one, until the watch is stopped or `on_tick` returns
+/// [`SqliteWatchControl::Stop`].
 pub fn start_sqlite_change_watch(
     db_path: &Path,
     thread_name: &str,
@@ -134,12 +276,15 @@ pub fn start_sqlite_change_watch(
 ) -> Result<SqliteChangeWatch, String> {
     let (parent, watched_paths) = sqlite_watch_targets(db_path)?;
     let (wake_tx, wake_rx) = mpsc::channel::<()>();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let worker_stop_requested = Arc::clone(&stop_requested);
 
     let callback_parent = parent.clone();
+    let notification_wake = wake_tx.clone();
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
         match result {
             Ok(event) if sqlite_watch_event_relevant(&event, &callback_parent, &watched_paths) => {
-                let _ = wake_tx.send(());
+                let _ = notification_wake.send(());
             }
             Ok(_) => {}
             Err(error) => {
@@ -153,7 +298,7 @@ pub fn start_sqlite_change_watch(
         .watch(&parent, RecursiveMode::NonRecursive)
         .map_err(|error| format!("cannot watch {}: {error}", parent.display()))?;
 
-    thread::Builder::new()
+    let worker = thread::Builder::new()
         .name(thread_name.to_string())
         .spawn(move || {
             let mut recovery_backoff = SQLITE_WATCH_RECOVERY_BACKOFF_MIN;
@@ -168,10 +313,18 @@ pub fn start_sqlite_change_watch(
                     // The watcher (and every sender) is gone: stop.
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
+                if worker_stop_requested.load(Ordering::Acquire) {
+                    break;
+                }
                 if tick == SqliteWatchTick::Changed {
                     thread::sleep(SQLITE_WATCH_COALESCE);
                 }
                 while wake_rx.try_recv().is_ok() {}
+                // A stop requested while the burst settled still precedes
+                // this tick.
+                if worker_stop_requested.load(Ordering::Acquire) {
+                    break;
+                }
                 if recovery_deadline.is_some_and(|deadline| Instant::now() < deadline) {
                     // A notification storm must not bypass a failed read's
                     // recovery deadline.
@@ -194,13 +347,21 @@ pub fn start_sqlite_change_watch(
         })
         .map_err(|error| format!("cannot start the sqlite change watch thread: {error}"))?;
 
-    Ok(SqliteChangeWatch { _watcher: watcher })
+    Ok(SqliteChangeWatch {
+        control: Arc::new(WatchControl {
+            stop_requested,
+            wake: wake_tx,
+        }),
+        watcher: Some(watcher),
+        worker: WorkerCustody::Running(worker),
+    })
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     fn assert_database_write_ticks_changed(db: &Path) {
         std::fs::write(db, b"").unwrap();
@@ -315,6 +476,178 @@ mod tests {
         assert!(
             tick_rx.recv_timeout(Duration::from_millis(500)).is_err(),
             "no tick after Stop: the worker ended (its sender is gone)"
+        );
+    }
+
+    /// A WAL database holding one row, as the stores keep theirs.
+    fn wal_database(dir: &Path) -> PathBuf {
+        let db = dir.join("store.sqlite3");
+        let conn = crate::open(&db, crate::ConnectionProfile::PRIMARY).unwrap();
+        conn.execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t (v) VALUES (1);")
+            .unwrap();
+        db
+    }
+
+    /// Counts ticks, and reports once when the worker drops its tick closure,
+    /// which it does as it returns.
+    struct TickProbe {
+        ticks: Arc<AtomicUsize>,
+        returned: mpsc::Sender<()>,
+    }
+
+    impl TickProbe {
+        fn tick(&self) {
+            self.ticks.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for TickProbe {
+        fn drop(&mut self) {
+            let _ = self.returned.send(());
+        }
+    }
+
+    #[test]
+    fn stop_and_join_waits_for_the_tick_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = wal_database(dir.path());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let finished = Arc::new(AtomicBool::new(false));
+        let tick_finished = Arc::clone(&finished);
+        let tick_db = db.clone();
+        let mut watch = start_sqlite_change_watch(
+            &db,
+            "test-held-tick",
+            Duration::from_millis(20),
+            move |_tick| {
+                if tick_finished.load(Ordering::SeqCst) {
+                    return SqliteWatchControl::Handled;
+                }
+                // The held tick keeps a read connection open, as a store
+                // catch-up does.
+                let conn = crate::open(&tick_db, crate::ConnectionProfile::ReadOnly).unwrap();
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+                let value: i64 = conn
+                    .query_row("SELECT v FROM t", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(value, 1);
+                drop(conn);
+                tick_finished.store(true, Ordering::SeqCst);
+                SqliteWatchControl::Handled
+            },
+        )
+        .expect("watch starts");
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a tick is held within the hang guard");
+
+        let (stopping_tx, stopping_rx) = mpsc::channel();
+        let stopper_finished = Arc::clone(&finished);
+        let stopper = thread::spawn(move || {
+            let _ = stopping_tx.send(());
+            let outcome = watch.stop_and_join();
+            (outcome, stopper_finished.load(Ordering::SeqCst))
+        });
+        stopping_rx.recv().unwrap();
+        release_tx.send(()).unwrap();
+        let (outcome, finished_at_return) = stopper.join().unwrap();
+
+        assert!(
+            finished_at_return,
+            "stop_and_join returned while a tick still held its connection"
+        );
+        assert_eq!(outcome, SqliteWatchJoin::Joined);
+        // The joined worker can never open the database again, so nothing
+        // recreates a file while the directory goes: no sleep, no retry.
+        std::fs::remove_dir_all(dir.path()).unwrap();
+        assert!(!dir.path().exists());
+    }
+
+    #[test]
+    fn stop_and_join_on_the_worker_thread_is_unjoined_and_keeps_custody() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("store.sqlite3");
+        let custody: Arc<std::sync::Mutex<Option<SqliteChangeWatch>>> = Arc::default();
+        let tick_custody = Arc::clone(&custody);
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let watch = start_sqlite_change_watch(
+            &db,
+            "test-self-stop",
+            Duration::from_millis(20),
+            move |_| {
+                let outcome = tick_custody
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .map(SqliteChangeWatch::stop_and_join);
+                if let Some(outcome) = outcome {
+                    let _ = outcome_tx.send(outcome);
+                }
+                SqliteWatchControl::Handled
+            },
+        )
+        .expect("watch starts");
+        *custody.lock().unwrap() = Some(watch);
+
+        let on_worker = outcome_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a tick stops its own watch within the hang guard");
+        assert_eq!(on_worker, SqliteWatchJoin::UnjoinedOnWorkerThread);
+
+        // The self-stop kept the join handle, so from here the worker is
+        // really joined rather than reported as gone.
+        let mut watch = custody
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the watch stays in custody");
+        assert!(!watch.on_worker_thread());
+        assert_eq!(watch.stop_and_join(), SqliteWatchJoin::Joined);
+        assert!(watch.is_finished());
+        assert_eq!(
+            watch.stop_and_join(),
+            SqliteWatchJoin::Joined,
+            "a repeated stop reports the recorded join"
+        );
+    }
+
+    #[test]
+    fn dropping_the_watch_requests_the_stop_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("store.sqlite3");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let probe = TickProbe {
+            ticks: Arc::clone(&ticks),
+            returned: returned_tx,
+        };
+        let watch =
+            start_sqlite_change_watch(&db, "test-drop", Duration::from_millis(20), move |_| {
+                probe.tick();
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+                SqliteWatchControl::Handled
+            })
+            .expect("watch starts");
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a tick is held within the hang guard");
+
+        // Dropping never waits for the held tick: this thread releases the
+        // tick only after the drop returned.
+        drop(watch);
+        release_tx.send(()).unwrap();
+        returned_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the worker returns after the held tick");
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            1,
+            "no tick starts after the stop request"
         );
     }
 }

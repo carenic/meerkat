@@ -1050,6 +1050,7 @@ mod tests {
             generated_self_owned_operation_owner: None,
             runtime_revival_intent: RuntimeRevivalIntent::None,
             direct_member_incarnation: None,
+            held_bound: None,
         };
 
         let failure = provisioner

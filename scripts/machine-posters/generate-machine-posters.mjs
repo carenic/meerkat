@@ -242,6 +242,7 @@ const MACHINE_SPECS = [
             "SurfaceFinalizeRemovalForced",
             "SurfaceSnapshotAligned",
             "SurfaceShutdown",
+            "SurfaceRelease",
           ],
         },
         {

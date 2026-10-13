@@ -121,7 +121,11 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
             .await
             .map_err(MeerkatMachine::driver_error_from_command_error)?
         {
-            MeerkatMachineCommandResult::InputState(state) => Ok(state),
+            // A public row read releases its result payload only to a reader
+            // the input's scoped destination permits; lifecycle facts stay.
+            MeerkatMachineCommandResult::InputState(state) => {
+                Ok(self.release_public_row(session_id, state).await)
+            }
             other => Err(RuntimeDriverError::Internal(format!(
                 "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::input_state: {other:?}"
             ))),
@@ -139,8 +143,16 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
         };
         if let Some(driver) = driver {
             let driver = driver.lock().await;
-            if driver.as_driver().stored_input_state(input_id).is_some() {
-                return driver.exact_input_terminal_completion_outcome(input_id);
+            if let Some(row) = driver.as_driver().stored_input_state(input_id) {
+                let outcome = driver.exact_input_terminal_completion_outcome(input_id)?;
+                let permitted = super::scoped_context::disclosure_permitted_with(
+                    Some(&driver.shared_dsl_authority()),
+                    &row.state,
+                    super::scoped_context::scoped_host_posture(
+                        &self.native_work_authorization_host,
+                    ),
+                );
+                return super::scoped_context::withhold_undisclosed(outcome, permitted, input_id);
             }
             // Completed inputs leave the hot machine after their durable
             // terminal receipt commits. An attached session must read that
@@ -178,11 +190,18 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
                 })
             };
         };
+        let row = target.state.clone();
         let witnesses =
             Self::load_durable_terminal_completion_rows(store.as_ref(), &runtime_id, target)
                 .await?;
-        crate::input_state::input_terminal_completion_outcome(&witnesses, input_id)
-            .map_err(crate::input_state::InputTerminalCompletionReadError::into_driver_error)
+        let outcome =
+            crate::input_state::input_terminal_completion_outcome(&witnesses, input_id)
+                .map_err(crate::input_state::InputTerminalCompletionReadError::into_driver_error)?;
+        // Decided after the last awaited load, immediately before release.
+        let permitted = self
+            .stored_result_disclosure_permitted(session_id, &row)
+            .await;
+        super::scoped_context::withhold_undisclosed(outcome, permitted, input_id)
     }
 
     async fn input_state_by_idempotency_key(
@@ -201,7 +220,11 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
             .await
             .map_err(MeerkatMachine::driver_error_from_command_error)?
         {
-            MeerkatMachineCommandResult::InputState(state) => Ok(state),
+            // A public row read releases its result payload only to a reader
+            // the input's scoped destination permits; lifecycle facts stay.
+            MeerkatMachineCommandResult::InputState(state) => {
+                Ok(self.release_public_row(session_id, state).await)
+            }
             other => Err(RuntimeDriverError::Internal(format!(
                 "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::input_state_by_idempotency_key: {other:?}"
             ))),
@@ -224,7 +247,11 @@ impl SessionServiceRuntimeExt for MeerkatMachine {
             .await
             .map_err(MeerkatMachine::driver_error_from_command_error)?
         {
-            MeerkatMachineCommandResult::InputState(state) => Ok(state),
+            // A public row read releases its result payload only to a reader
+            // the input's scoped destination permits; lifecycle facts stay.
+            MeerkatMachineCommandResult::InputState(state) => {
+                Ok(self.release_public_row(session_id, state).await)
+            }
             other => Err(RuntimeDriverError::Internal(format!(
                 "unexpected MeerkatMachineCommandResult for SessionServiceRuntimeExt::durable_input_state_by_idempotency_key: {other:?}"
             ))),
@@ -987,6 +1014,9 @@ impl MeerkatMachine {
             RuntimeDriverError::ControllerReadinessUnavailable { reason } => {
                 RuntimeControlPlaneError::ControllerReadinessUnavailable { reason }
             }
+            RuntimeDriverError::ConsentOwnerLossUnsettled { session_id } => {
+                RuntimeControlPlaneError::ConsentOwnerLossUnsettled { session_id }
+            }
             error => RuntimeControlPlaneError::Internal(error.to_string()),
         }
     }
@@ -1009,6 +1039,9 @@ impl MeerkatMachine {
             }
             RuntimeControlPlaneError::RetirementInProgress { runtime_id, .. } => {
                 RuntimeDriverError::RuntimeTerminalPublicationInProgress { runtime_id }
+            }
+            RuntimeControlPlaneError::ConsentOwnerLossUnsettled { session_id } => {
+                RuntimeDriverError::ConsentOwnerLossUnsettled { session_id }
             }
             RuntimeControlPlaneError::StoreError(message)
             | RuntimeControlPlaneError::Internal(message) => RuntimeDriverError::Internal(message),
@@ -2074,6 +2107,9 @@ impl MeerkatMachine {
             &meerkat_contracts::wire::supervisor_bridge::BridgeDirectMemberFence,
         >,
     ) -> Result<RetireReport, super::DirectMemberRetireError> {
+        // Bound before every guard of this retirement, the member slot's
+        // included, so that the inputs it abandons are told after them.
+        let mut runless_terminal = self.runless_terminal_announcement();
         // Resolve only the transaction key optimistically. The authoritative
         // entry capture happens after the stable registration transaction is
         // held, so an old entry can never dispose a replacement's live state.
@@ -2171,13 +2207,23 @@ impl MeerkatMachine {
             _mutation_guard: mutation_guard,
         };
         let result = self
-            .realize_retire_with_archive_lease(lease, None, deadline, None, &[])
+            .realize_retire_with_archive_lease_announcing(
+                lease,
+                None,
+                deadline,
+                None,
+                &[],
+                &mut runless_terminal,
+            )
             .await
             .map(|(report, _)| report);
         drop(direct_member_slot_guard);
         result.map_err(super::DirectMemberRetireError::Runtime)
     }
 
+    /// [`Self::realize_retire_with_archive_lease_announcing`] that tells the
+    /// inputs the retirement abandons once it returns, after the lease's
+    /// guards are released, however the realization ends.
     async fn realize_retire_with_archive_lease(
         &self,
         lease: super::MachineSessionArchiveLease,
@@ -2187,6 +2233,38 @@ impl MeerkatMachine {
         deadline: Option<meerkat_core::time_compat::Instant>,
         post_commit_hook: Option<Arc<dyn super::MachineSessionArchivePostCommitHook>>,
         archive_handoffs: &[crate::meerkat_machine_types::CommittedModelRoutingHandoff],
+    ) -> Result<
+        (
+            RetireReport,
+            Vec<meerkat_core::image_generation::SwitchTurnRequestId>,
+        ),
+        RuntimeControlPlaneError,
+    > {
+        let mut runless_terminal = self.runless_terminal_announcement();
+        self.realize_retire_with_archive_lease_announcing(
+            lease,
+            archive_publication_handle,
+            deadline,
+            post_commit_hook,
+            archive_handoffs,
+            &mut runless_terminal,
+        )
+        .await
+    }
+
+    /// Realize Retire under `lease`, owing `runless_terminal` the inputs it
+    /// abandons. The caller took the announcement before every guard it holds
+    /// around this realization, so that it is told after them.
+    async fn realize_retire_with_archive_lease_announcing(
+        &self,
+        lease: super::MachineSessionArchiveLease,
+        archive_publication_handle: Option<
+            Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
+        >,
+        deadline: Option<meerkat_core::time_compat::Instant>,
+        post_commit_hook: Option<Arc<dyn super::MachineSessionArchivePostCommitHook>>,
+        archive_handoffs: &[crate::meerkat_machine_types::CommittedModelRoutingHandoff],
+        runless_terminal: &mut super::RunlessTerminalAnnouncement,
     ) -> Result<
         (
             RetireReport,
@@ -2300,6 +2378,9 @@ impl MeerkatMachine {
                             return Err(RuntimeControlPlaneError::Internal(error.to_string()));
                         }
                     };
+                    if abandoned > 0 {
+                        runless_terminal.owe();
+                    }
                     let candidate_owner_input_id = crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
                     (abandoned, completion_input_ids, candidate_owner_input_id)
                 };

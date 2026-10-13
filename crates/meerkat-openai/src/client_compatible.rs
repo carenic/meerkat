@@ -100,6 +100,10 @@ pub struct OpenAiCompatibleClient {
     supports_image_input: bool,
     supports_image_tool_results: bool,
     post_finish_trailer_window: Duration,
+    /// The credential was fixed when this client was built: a resolved
+    /// static secret, or none for an authless server. There is then nothing
+    /// to prepare before a controller request.
+    static_credential: bool,
 }
 
 impl OpenAiCompatibleClient {
@@ -162,7 +166,19 @@ impl OpenAiCompatibleClient {
             supports_image_input: true,
             supports_image_tool_results: options.supports_image_tool_results,
             post_finish_trailer_window: DEFAULT_POST_FINISH_TRAILER_WINDOW,
+            static_credential: false,
         }
+    }
+
+    /// Declare that this client's credential was fixed when it was built (a
+    /// resolved static secret, or none for an authless server) and that no
+    /// authorizer will refresh it: controller credential preparation then
+    /// has nothing to do. A client with an authorizer still prepares
+    /// through it.
+    #[must_use]
+    pub fn with_static_credential(mut self) -> Self {
+        self.static_credential = true;
+        self
     }
 
     pub fn with_authorizer(mut self, authorizer: Arc<dyn HttpAuthorizer>) -> Self {
@@ -266,7 +282,7 @@ impl OpenAiCompatibleClient {
     }
 
     fn system_notice_chat_content(notice: &SystemNoticeMessage) -> Value {
-        let rendered = notice.model_projection_text();
+        let rendered = notice.model_projection_lead_text();
         let mut parts = Vec::new();
         if !rendered.trim().is_empty() {
             parts.push(serde_json::json!({
@@ -278,10 +294,23 @@ impl OpenAiCompatibleClient {
         for block in &notice.blocks {
             match block {
                 SystemNoticeBlock::Comms { content, .. }
-                | SystemNoticeBlock::ExternalEvent { content, .. } => {
-                    for content_block in content {
-                        if !matches!(content_block, ContentBlock::Text { .. }) {
-                            parts.push(Self::content_block_to_chat_part(content_block));
+                | SystemNoticeBlock::ExternalEvent { content, .. }
+                | SystemNoticeBlock::RuntimeNotice { content, .. } => {
+                    if block.content_follows_notice_text() {
+                        // Runtime notice content and comms response blocks
+                        // follow the notice text in their own order, each
+                        // block lowered once.
+                        parts.extend(content.iter().map(Self::content_block_to_chat_part));
+                    } else {
+                        // The content's text is part of the notice text;
+                        // only its media follows it.
+                        for content_block in content {
+                            if matches!(
+                                content_block,
+                                ContentBlock::Image { .. } | ContentBlock::Video { .. }
+                            ) {
+                                parts.push(Self::content_block_to_chat_part(content_block));
+                            }
                         }
                     }
                 }
@@ -1228,11 +1257,13 @@ impl OpenAiCompatibleClient {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl LlmClient for OpenAiCompatibleClient {
     async fn prepare_controller_credential(&self) -> Result<(), meerkat_core::auth::AuthError> {
-        let authorizer = self
-            .authorizer
-            .as_ref()
-            .ok_or(meerkat_core::auth::AuthError::HostOwnedUnavailable)?;
-        authorizer.prepare_request().await
+        match &self.authorizer {
+            Some(authorizer) => authorizer.prepare_request().await,
+            // A credential fixed at construction (or none): nothing to
+            // refresh or acquire.
+            None if self.static_credential => Ok(()),
+            None => Err(meerkat_core::auth::AuthError::HostOwnedUnavailable),
+        }
     }
 
     fn plain_model_route(
@@ -2238,6 +2269,162 @@ mod tests {
         assert_eq!(
             content[1]["image_url"]["url"],
             "data:image/png;base64,iVBOR..."
+        );
+    }
+
+    #[test]
+    fn chat_completions_comms_response_blocks_lower_once() {
+        use meerkat_core::{
+            ContentBlock, SystemNoticeDirection, SystemNoticeKind, SystemNoticeMessage,
+            SystemNoticePeer,
+        };
+
+        let client = OpenAiCompatibleClient::new_with_options(
+            OpenAiCompatibleMode::ChatCompletions,
+            "remote-model".to_string(),
+            "https://example.test".to_string(),
+            None,
+            options(true, true, true, true),
+        )
+        .with_image_input_support(true);
+        let projected = client
+            .project_replay_messages(&[Message::SystemNotice(SystemNoticeMessage::with_block(
+                SystemNoticeKind::Comms,
+                None,
+                SystemNoticeBlock::Comms {
+                    kind: meerkat_core::types::CommsNoticeKind::ResponseTerminal,
+                    direction: SystemNoticeDirection::Incoming,
+                    peer: Some(SystemNoticePeer {
+                        id: meerkat_core::comms::PeerId::new(),
+                        display_name: Some("operator".to_string()),
+                    }),
+                    sender_taint: None,
+                    request_id: Some("request-7".to_string()),
+                    intent: None,
+                    status: Some("completed".to_string()),
+                    summary: None,
+                    payload: Some(serde_json::json!({"result_marker_q7": true})),
+                    content: vec![
+                        ContentBlock::structured(&serde_json::json!({"block_marker_z9": 2}))
+                            .expect("structured response block"),
+                    ],
+                },
+            ))])
+            .expect("project chat messages");
+        let messages =
+            OpenAiCompatibleClient::convert_to_chat_messages(&projected).expect("convert chat");
+        let rendered = messages[0]["content"].to_string();
+        assert_eq!(
+            rendered.matches("result_marker_q7").count(),
+            1,
+            "the response result appears once: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches("block_marker_z9").count(),
+            1,
+            "the response block appears once: {rendered}"
+        );
+    }
+
+    #[test]
+    fn chat_completions_runtime_notice_content_lowers_in_order_once() {
+        use meerkat_core::{ContentBlock, ImageData, SystemNoticeKind, SystemNoticeMessage};
+
+        let notice = Message::SystemNotice(SystemNoticeMessage::with_block(
+            SystemNoticeKind::Generic,
+            None,
+            SystemNoticeBlock::RuntimeNotice {
+                category: "consent_attempt".to_string(),
+                detail: Some("correlated result".to_string()),
+                payload: None,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "first".to_string(),
+                    },
+                    ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        data: ImageData::Inline {
+                            data: "aW1hZ2Ux".to_string(),
+                        },
+                    },
+                    ContentBlock::Text {
+                        text: "second".to_string(),
+                    },
+                    ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        data: ImageData::Inline {
+                            data: "aW1hZ2Uy".to_string(),
+                        },
+                    },
+                    ContentBlock::structured(&serde_json::json!({"rows": 2}))
+                        .expect("structured content"),
+                ],
+            },
+        ));
+        let client = |image_input| {
+            OpenAiCompatibleClient::new_with_options(
+                OpenAiCompatibleMode::ChatCompletions,
+                "remote-model".to_string(),
+                "https://example.test".to_string(),
+                None,
+                options(true, true, true, true),
+            )
+            .with_image_input_support(image_input)
+        };
+        let parts = |image_input| -> Vec<(String, String)> {
+            let projected = client(image_input)
+                .project_replay_messages(std::slice::from_ref(&notice))
+                .expect("project chat messages");
+            let messages =
+                OpenAiCompatibleClient::convert_to_chat_messages(&projected).expect("convert chat");
+            assert_eq!(messages[0]["role"], "user");
+            messages[0]["content"]
+                .as_array()
+                .expect("content array")
+                .iter()
+                .map(|part| {
+                    (
+                        part["type"].as_str().unwrap_or_default().to_owned(),
+                        part["text"]
+                            .as_str()
+                            .or_else(|| part["image_url"]["url"].as_str())
+                            .unwrap_or_default()
+                            .to_owned(),
+                    )
+                })
+                .collect()
+        };
+        let expected = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(kind, value)| ((*kind).to_owned(), (*value).to_owned()))
+                .collect()
+        };
+        assert_eq!(
+            parts(true),
+            expected(&[
+                ("text", "correlated result"),
+                ("text", "first"),
+                ("image_url", "data:image/png;base64,aW1hZ2Ux"),
+                ("text", "second"),
+                ("image_url", "data:image/png;base64,aW1hZ2Uy"),
+                ("text", "{\"rows\":2}"),
+            ]),
+            "detail first, then the content in order, once"
+        );
+        // A target without image input receives each image's text projection
+        // in its place, through the same replay capability lowering.
+        assert_eq!(
+            parts(false),
+            expected(&[
+                ("text", "correlated result"),
+                ("text", "first"),
+                ("text", "[image: image/png]"),
+                ("text", "second"),
+                ("text", "[image: image/png]"),
+                ("text", "{\"rows\":2}"),
+            ]),
+            "a text-only target keeps the same order"
         );
     }
 

@@ -326,6 +326,12 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the maximum number of agent-loop turns in each run.
+    pub fn max_turns(mut self, turns: u32) -> Self {
+        self.config.max_turns = Some(turns);
+        self
+    }
+
     /// Set temperature
     pub fn temperature(mut self, temp: f32) -> Self {
         self.config.temperature = Some(temp);
@@ -576,23 +582,6 @@ impl AgentBuilder {
         let budget = Budget::new(self.budget_limits.unwrap_or_default());
         let catalog_mode = select_tool_catalog_mode(tools.as_ref());
         let catalog_capabilities = tools.tool_catalog_capabilities();
-        // What this agent mounts, to fit a handed-off ceiling to it (below).
-        let mounted_tool_names: Option<std::collections::HashSet<String>> =
-            initial_visibility_authority.as_ref().map(|_| {
-                if catalog_capabilities.exact_catalog {
-                    tools
-                        .tool_catalog()
-                        .iter()
-                        .map(|entry| entry.tool.name.to_string())
-                        .collect()
-                } else {
-                    tools
-                        .tools()
-                        .iter()
-                        .map(|tool| tool.name.to_string())
-                        .collect()
-                }
-            });
         let (control_tool_names, deferred_tool_names) = if catalog_capabilities.exact_catalog {
             let catalog = tools.tool_catalog();
             let control_names = catalog
@@ -728,6 +717,7 @@ impl AgentBuilder {
             comms_runtime: self.comms_runtime,
             hook_engine: self.hook_engine,
             hook_run_overrides: self.hook_run_overrides,
+            admitted_hook_topology: crate::hooks::HookMandatoryTopology::none(),
             post_commit_hooks,
             compactor: self.compactor,
             compaction_curator: self.compaction_curator,
@@ -787,6 +777,7 @@ impl AgentBuilder {
             effective_model_registry: self.effective_model_registry,
             active_model_profile,
             external_tool_surface_handle: self.external_tool_surface_handle,
+            live_mcp_attachment: None,
             auth_lease_handle: self.auth_lease_handle,
             auth_credential_identity: self.auth_credential_identity,
             mcp_server_lifecycle_handle: self.mcp_server_lifecycle_handle,
@@ -799,12 +790,14 @@ impl AgentBuilder {
             last_pending_catalog_sources: Default::default(),
             tool_dispatch_context: Default::default(),
             operation_review: self.operation_review,
+            run_consent_attempts: Default::default(),
             live_bridge_dispatch_admission: None,
             live_bridge_tool_defs: None,
             noncommitting_live_bridge_run: false,
             turn_tool_dispatch_metadata: Default::default(),
             turn_tool_choice_plan: Vec::new(),
             tools_config: self.tools_config,
+            owned_releases: Vec::new(),
         };
 
         let has_canonical_visibility_state = agent
@@ -896,24 +889,11 @@ impl AgentBuilder {
         let has_initial_visibility_state = initial_visibility_authority.is_some();
         if let Some(incoming) = initial_visibility_authority {
             let mut incoming = incoming.into_initial_visibility_state();
-            // An allow-ceiling bounds only what this agent mounts: a name it
-            // never mounts can be neither listed nor called, and keeping it
-            // would leave a ceiling name the owner's authority catalog cannot
-            // witness. Dropping such names never widens the ceiling; tools
-            // that appear later outside it stay hidden.
-            if let (ToolFilter::Allow(names), Some(mounted)) =
-                (&incoming.inherited_base_filter, mounted_tool_names.as_ref())
-            {
-                let kept: crate::types::ToolNameSet = names
-                    .iter()
-                    .filter(|name| mounted.contains(name.as_str()))
-                    .cloned()
-                    .collect();
-                incoming
-                    .filter_witnesses
-                    .retain(|name, _| kept.contains(name.as_str()));
-                incoming.inherited_base_filter = ToolFilter::Allow(kept);
-            }
+            // The handed-off ceiling is an exact witnessed upper bound, not a
+            // claim that this agent mounts the tool now: a name whose source
+            // is still connecting keeps its witness, and its tool lists only
+            // once a projection from that exact source arrives.
+            //
             // A retained identity witness is never reinterpreted: a handoff
             // naming a tool the durable state already witnesses under a
             // different identity admits nothing for that name, and a handoff
@@ -1427,6 +1407,7 @@ mod tests {
             provenance: Some(ToolProvenance {
                 kind: ToolSourceKind::Callback,
                 source_id: source_id.into(),
+                artifact: None,
             }),
         })
     }
@@ -1644,6 +1625,7 @@ mod tests {
                 .with_provenance(crate::ToolProvenance {
                     kind: crate::ToolSourceKind::Callback,
                     source_id: "restore-fixture".into(),
+                    artifact: None,
                 }),
             );
             let deferred_b = Arc::new(
@@ -1655,6 +1637,7 @@ mod tests {
                 .with_provenance(crate::ToolProvenance {
                     kind: crate::ToolSourceKind::Callback,
                     source_id: "restore-fixture".into(),
+                    artifact: None,
                 }),
             );
             let control = Arc::new(ToolDef::new(
@@ -1681,6 +1664,7 @@ mod tests {
                         crate::ToolProvenance {
                             kind: crate::ToolSourceKind::Callback,
                             source_id: "restore-fixture".into(),
+                            artifact: None,
                         },
                     ),
                     crate::ToolCatalogEntry::session_deferred(
@@ -1689,6 +1673,7 @@ mod tests {
                         crate::ToolProvenance {
                             kind: crate::ToolSourceKind::Callback,
                             source_id: "restore-fixture".into(),
+                            artifact: None,
                         },
                     ),
                     crate::ToolCatalogEntry::control_inline(control, true),
@@ -2398,6 +2383,93 @@ mod tests {
                 "a conflicting handoff leaves a permitted sibling visible"
             );
         }
+    }
+
+    /// A ceiling name whose source is still connecting keeps the parent's
+    /// witnessed identity. A same-name tool of another source that arrives
+    /// first stays hidden at every later boundary while the rest of the
+    /// ceiling stays usable, and the witnessed tool lists once a projection
+    /// from its own source arrives.
+    #[tokio::test]
+    async fn a_pending_ceiling_name_stays_hidden_from_a_same_name_tool_of_another_source() {
+        let client = Arc::new(MockClient);
+        let kept = test_tool_with_provenance("kept", "kept-source");
+        let witnessed = test_tool_with_provenance("echo", "parent-source");
+        let other_source = test_tool_with_provenance("echo", "other-source");
+        // The child mounts `kept`; the source of `echo` is still connecting.
+        let tools = Arc::new(StaticTools::new(vec![Arc::clone(&kept)].into()));
+        let store = Arc::new(MockStore);
+        let witness = |tool: &Arc<ToolDef>| crate::ToolVisibilityWitness {
+            last_seen_provenance: tool.provenance.clone(),
+        };
+        let ceiling = InheritedToolVisibilityAuthority::from_generated_composition_authority(
+            ToolFilter::Allow(
+                ["kept".to_string(), "echo".to_string()]
+                    .into_iter()
+                    .collect(),
+            ),
+            [
+                (kept.name.clone(), witness(&kept)),
+                (witnessed.name.clone(), witness(&witnessed)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let owner = Arc::new(crate::tool_scope::GeneratedTestToolVisibilityOwner::new());
+        let agent = AgentBuilder::new()
+            .resume_session(Session::new())
+            .with_epoch_cursor_state(Arc::new(crate::runtime_epoch::EpochCursorState::new()))
+            .with_runtime_test_visibility_owner(generated_visibility_owner_from(owner.clone()))
+            .with_initial_tool_visibility_state(ceiling)
+            .build_inner(client, tools, store)
+            .await
+            .expect("the child builds while a ceiling source is pending");
+        let names = |list: &[&str]| -> BTreeSet<crate::types::ToolName> {
+            list.iter()
+                .map(|name| crate::types::ToolName::from(*name))
+                .collect()
+        };
+
+        assert_eq!(
+            owner
+                .visibility_state()
+                .unwrap()
+                .filter_witnesses
+                .get("echo"),
+            Some(&witness(&witnessed)),
+            "the ceiling keeps the parent's witnessed identity while its source is pending"
+        );
+        assert_eq!(
+            agent.tool_scope.visible_tool_names().unwrap(),
+            names(&["kept"])
+        );
+
+        for boundary in 1..=2 {
+            agent
+                .tool_scope
+                .apply_staged(vec![Arc::clone(&kept), Arc::clone(&other_source)].into())
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "boundary {boundary} with a same-name tool of another source applies: {err}"
+                    )
+                });
+            assert_eq!(
+                agent.tool_scope.visible_tool_names().unwrap(),
+                names(&["kept"]),
+                "boundary {boundary}: the other source's tool stays hidden and the rest of \
+                 the ceiling stays usable"
+            );
+        }
+
+        agent
+            .tool_scope
+            .apply_staged(vec![Arc::clone(&kept), Arc::clone(&witnessed)].into())
+            .expect("the witnessed source's projection arrives at a boundary");
+        assert_eq!(
+            agent.tool_scope.visible_tool_names().unwrap(),
+            names(&["echo", "kept"]),
+            "the witnessed tool lists once a projection from its own source arrives"
+        );
     }
 
     #[tokio::test]

@@ -6,7 +6,9 @@
 //! sessions with exclusive backend execution custody. Restart and unloaded
 //! administrative controller scope are not established by this adapter.
 
+pub(crate) mod agent_grant;
 mod review_context;
+pub use agent_grant::{AgentConfiguredMcpProvider, AgentInstallationGrant, ConfiguredMcpConjuncts};
 
 use std::sync::{Arc, Weak};
 
@@ -17,9 +19,9 @@ use meerkat_authorization::grants::LocalGrantAuthority;
 use meerkat_authorization::policy::LocalPolicyPurpose;
 use meerkat_authorization_contracts::work_association::InputAuthorityAssociation;
 use meerkat_core::authorization::{
-    OperationObservation, OperationObservationError, OperationRefusalKind, OperationRefused,
-    PreparedAuthorizationBinding, PreparedOperationAuthorization, WorkAuthorization,
-    WorkAuthorizationContext,
+    AuthorizationOperation, OperationObservation, OperationObservationError, OperationRefusalKind,
+    OperationRefused, PreparedAuthorizationBinding, PreparedOperationAuthorization,
+    WorkAuthorization, WorkAuthorizationContext,
 };
 use meerkat_core::exact_operation::OperationExecutionScope;
 
@@ -49,6 +51,86 @@ pub type NativeIngressCheck = dyn Fn(
     + Send
     + Sync;
 
+/// Host-installed owner of a governed retained-work resume (an internal
+/// completion admitted to the runtime that staged the original run, with no
+/// fresh transport authentication). It validates the internal evidence and
+/// reacquires the current original invocation/mandate through its existing
+/// owners, then returns the usable controller client it supplies itself; the
+/// evidence's controller selection is data, never a client. It must not
+/// deserialize a permit or fabricate a replacement original. Verdicts are
+/// typed exactly as [`NativeWorkAuthorizationHost::authenticate_retained_resume`]
+/// documents.
+pub type NativeRetainedResumeCheck = dyn Fn(
+        &LogicalRuntimeId,
+        &Input,
+        &crate::retained_work::RetainedResumeEvidence,
+    )
+        -> Result<meerkat_core::ControllerModelClient, crate::retained_work::RetainedResumeError>
+    + Send
+    + Sync;
+
+/// Host-installed provider of the configured MCP attachment authority for
+/// each session registration, and, for a per-agent host, of the agent
+/// selection conjunct of its MCP attachment controls.
+///
+/// A plain closure `Fn(&SessionId, SessionAgentBinding) -> Option<..>` is a
+/// provider that decides configured servers only.
+/// [`super::AgentConfiguredMcpProvider`] decides both from one agent grant
+/// owner.
+pub trait ConfiguredMcpAttachmentProvider: Send + Sync {
+    /// The configured-server authority of one session registration. It is
+    /// called with the exact session whose configured servers are being
+    /// staged and that registration's own agent binding, and must decide
+    /// from that registration's current realm, mandate, account and grant
+    /// context, never from a process-wide allowlist or a session label.
+    ///
+    /// The binding is the registration's live slot: the trusted host may
+    /// bind the agent's mandate after this authority is assembled, and the
+    /// registration's end must still be observed. Keep the slot and read it
+    /// at each decision, as [`super::AgentInstallationGrant::for_agent`]
+    /// does; never resolve it once and cache the answer. `None` refuses every
+    /// configured server of that session.
+    fn configured(
+        &self,
+        session_id: &meerkat_core::SessionId,
+        agent: super::SessionAgentBinding,
+    ) -> Option<Arc<dyn meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority>>;
+
+    /// The agent selection conjunct of an MCP attachment control for the
+    /// registration whose live agent binding is `agent`, from the same owner
+    /// that decides its configured servers (see
+    /// [`super::AgentInstallationGrant::agent_selection`]). `None`: this
+    /// provider does not decide per agent, and attachment controls keep
+    /// their other checks without this conjunct. A per-agent provider
+    /// returns its selection, which refuses an unbound registration or a
+    /// server the agent has no selected lineage for.
+    fn agent_selection(
+        &self,
+        _agent: super::SessionAgentBinding,
+    ) -> Option<Arc<dyn meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority>> {
+        None
+    }
+}
+
+impl<F> ConfiguredMcpAttachmentProvider for F
+where
+    F: Fn(
+            &meerkat_core::SessionId,
+            super::SessionAgentBinding,
+        )
+            -> Option<Arc<dyn meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority>>
+        + Send
+        + Sync,
+{
+    fn configured(
+        &self,
+        session_id: &meerkat_core::SessionId,
+        agent: super::SessionAgentBinding,
+    ) -> Option<Arc<dyn meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority>> {
+        self(session_id, agent)
+    }
+}
+
 /// Trusted embedding composition. None of these owners is selected by claims.
 /// Sharing grants with another machine requires complete controller-mutation
 /// custody for that additional scope before enabling administrative removal.
@@ -57,6 +139,18 @@ pub struct NativeGrantWorkConfiguration {
     pub ingress: Arc<NativeIngressCheck>,
     pub invocation_owner: Arc<dyn AdmittedWorkPolicyOwner>,
     pub operation_owner: Arc<dyn OperationPolicyOwner>,
+    /// Owner of governed retained-work resume. Without it, this composition
+    /// admits no retained resume (`UnsupportedScope`).
+    pub retained_resume: Option<Arc<NativeRetainedResumeCheck>>,
+    /// Every governed input must name the session document's bound scoped
+    /// destination (see `NativeWorkAuthorizationHost::requires_scoped_destination`).
+    pub require_scoped_destination: bool,
+    /// Per-registration owner of configured MCP servers, asked with the
+    /// registration's own agent binding. Without it, or when it returns `None`
+    /// for a session, every configured server of that session is refused as
+    /// unavailable. The returned authority is still asked at each
+    /// connection's physical entry, after preparation.
+    pub configured_mcp_attachment: Option<Arc<dyn ConfiguredMcpAttachmentProvider>>,
 }
 
 impl std::fmt::Debug for NativeGrantWorkConfiguration {
@@ -94,28 +188,54 @@ impl MeerkatMachine {
         self,
         configuration: NativeGrantWorkConfiguration,
     ) -> Result<Self, RuntimeDriverError> {
-        self.install_native_work_authorization(|machine| {
-            // Admission and operation preparation retain the same actual
-            // generated grant authority and trusted policy owners.
-            let policy = Arc::new(GrantBackedWorkPolicy::new(
-                Arc::clone(&configuration.grants),
-                Arc::clone(&configuration.invocation_owner),
-                Arc::clone(&configuration.operation_owner),
-            ));
-            Arc::new(NativeGrantWorkAuthorizationHost {
-                ingress: configuration.ingress,
-                policy,
-                grants: configuration.grants,
-                invocation_owner: configuration.invocation_owner,
-                operation_owner: configuration.operation_owner,
-                machine,
-            })
-        })
+        self.install_native_work_authorization(|machine| local_grant_host(configuration, machine))
     }
+}
+
+impl super::StagedMeerkatMachine {
+    /// Install the native/grant host on the staged governed machine, exactly
+    /// as [`MeerkatMachine::persistent_with_local_grant_authorization`] does
+    /// on a freshly opened one. Refuses while a clone of the stage is shared
+    /// or a session is registered.
+    pub fn install_local_grant_authorization(
+        self,
+        configuration: NativeGrantWorkConfiguration,
+    ) -> Result<MeerkatMachine, RuntimeDriverError> {
+        self.machine
+            .install_local_grant_authorization(configuration)
+    }
+}
+
+/// The native/grant host of `configuration` for the machine `machine`.
+pub(super) fn local_grant_host(
+    configuration: NativeGrantWorkConfiguration,
+    machine: Weak<MeerkatMachineShared>,
+) -> Arc<dyn NativeWorkAuthorizationHost> {
+    // Admission and operation preparation retain the same actual
+    // generated grant authority and trusted policy owners.
+    let policy = Arc::new(GrantBackedWorkPolicy::new(
+        Arc::clone(&configuration.grants),
+        Arc::clone(&configuration.invocation_owner),
+        Arc::clone(&configuration.operation_owner),
+    ));
+    Arc::new(NativeGrantWorkAuthorizationHost {
+        ingress: configuration.ingress,
+        retained_resume: configuration.retained_resume,
+        require_scoped_destination: configuration.require_scoped_destination,
+        configured_mcp_attachment: configuration.configured_mcp_attachment,
+        policy,
+        grants: configuration.grants,
+        invocation_owner: configuration.invocation_owner,
+        operation_owner: configuration.operation_owner,
+        machine,
+    })
 }
 
 struct NativeGrantWorkAuthorizationHost {
     ingress: Arc<NativeIngressCheck>,
+    retained_resume: Option<Arc<NativeRetainedResumeCheck>>,
+    require_scoped_destination: bool,
+    configured_mcp_attachment: Option<Arc<dyn ConfiguredMcpAttachmentProvider>>,
     policy: Arc<GrantBackedWorkPolicy>,
     grants: Arc<LocalGrantAuthority>,
     invocation_owner: Arc<dyn AdmittedWorkPolicyOwner>,
@@ -124,6 +244,42 @@ struct NativeGrantWorkAuthorizationHost {
 }
 
 impl NativeWorkAuthorizationHost for NativeGrantWorkAuthorizationHost {
+    fn requires_scoped_destination(&self) -> bool {
+        self.require_scoped_destination
+    }
+
+    /// Without the registration's agent binding nothing is decided: the
+    /// configured provider is only ever asked with it.
+    fn configured_mcp_attachment(
+        &self,
+        _session_id: &meerkat_core::SessionId,
+    ) -> Arc<dyn meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority> {
+        Arc::new(crate::input_authority::RefuseConfiguredMcpAttachment)
+    }
+
+    fn configured_mcp_attachment_for_agent(
+        &self,
+        session_id: &meerkat_core::SessionId,
+        agent: super::SessionAgentBinding,
+    ) -> Arc<dyn meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority> {
+        self.configured_mcp_attachment
+            .as_ref()
+            .and_then(|provider| provider.configured(session_id, agent))
+            .unwrap_or_else(|| Arc::new(crate::input_authority::RefuseConfiguredMcpAttachment))
+    }
+
+    /// A per-agent configured provider also decides the agent selection of
+    /// each MCP attachment control, from the same owner and the
+    /// registration's own binding.
+    fn mcp_attachment_agent_selection(
+        &self,
+        agent: super::SessionAgentBinding,
+    ) -> Option<Arc<dyn meerkat_core::mcp_attachment::ConfiguredMcpAttachmentAuthority>> {
+        self.configured_mcp_attachment
+            .as_ref()
+            .and_then(|provider| provider.agent_selection(agent))
+    }
+
     fn tool_application_authorization(
         &self,
         control: Arc<meerkat_core::ToolApplicationControlRequest>,
@@ -167,6 +323,27 @@ impl NativeWorkAuthorizationHost for NativeGrantWorkAuthorizationHost {
         ))
     }
 
+    fn mcp_attachment_authorization(
+        &self,
+        control: Arc<meerkat_core::mcp_attachment_control::McpAttachmentControlRequest>,
+    ) -> Result<WorkAuthorizationContext, meerkat_core::OperationAuthorizationError> {
+        let owner = self
+            .machine
+            .upgrade()
+            .ok_or(meerkat_core::OperationAuthorizationError::Unavailable)?;
+        owner
+            .require_governed_execution_custody()
+            .map_err(|_| meerkat_core::OperationAuthorizationError::Unavailable)?;
+        let context = self.policy.mcp_attachment_authorization(control);
+        Ok(WorkAuthorizationContext::new(
+            Arc::new(NativeControlAuthorization {
+                inner: Arc::clone(context.authorization()),
+                machine: self.machine.clone(),
+            }),
+            OperationExecutionScope::Domain,
+        ))
+    }
+
     fn authenticate_association(
         &self,
         runtime: &LogicalRuntimeId,
@@ -199,6 +376,64 @@ impl NativeWorkAuthorizationHost for NativeGrantWorkAuthorizationHost {
         self.policy
             .validate_controller_admission(association, &facts)
             .map_err(NativeAdmissionError::from)
+    }
+
+    fn authenticate_retained_resume(
+        &self,
+        runtime: &LogicalRuntimeId,
+        input: &Input,
+        evidence: &crate::retained_work::RetainedResumeEvidence,
+    ) -> Result<meerkat_core::ControllerModelClient, crate::retained_work::RetainedResumeError>
+    {
+        use crate::retained_work::RetainedResumeError;
+        use crate::traits::ControllerReadinessFailure;
+        let check = self
+            .retained_resume
+            .as_ref()
+            .ok_or(RetainedResumeError::Readiness(
+                ControllerReadinessFailure::UnsupportedScope,
+            ))?;
+        let machine = self
+            .machine
+            .upgrade()
+            .ok_or(RetainedResumeError::Readiness(
+                ControllerReadinessFailure::PolicyUnavailable,
+            ))?;
+        machine.require_governed_execution_custody().map_err(|_| {
+            RetainedResumeError::Readiness(ControllerReadinessFailure::PolicyUnavailable)
+        })?;
+        // Every original contributor must name this runtime; the runtime has
+        // already checked their rows are present and exact in its ledger.
+        if evidence.contributors().is_empty()
+            || evidence.contributors().iter().any(|original| {
+                original
+                    .association()
+                    .candidate()
+                    .target
+                    .logical_runtime
+                    .as_str()
+                    != runtime.to_string()
+            })
+        {
+            return Err(RetainedResumeError::Refused(malformed()));
+        }
+        // The installed owner reacquires the current original invocation and
+        // supplies the actual controller client.
+        let client = check(runtime, input, evidence)?;
+        if client.client().controller_model_selection().as_ref() != Some(client.selection()) {
+            return Err(RetainedResumeError::Refused(malformed()));
+        }
+        // Current controller grant, account, model and ceilings for every
+        // original contributor, through the same owner as fresh admission.
+        let facts = client.plain_facts().map_err(|_| {
+            RetainedResumeError::Readiness(ControllerReadinessFailure::FactsUnavailable)
+        })?;
+        for original in evidence.contributors() {
+            self.policy
+                .validate_controller_admission(original.association(), &facts)
+                .map_err(RetainedResumeError::from)?;
+        }
+        Ok(client)
     }
 
     fn work_context(
@@ -283,7 +518,7 @@ impl NativeAcceptedWorkOwner {
                 .lock()
                 .map_err(|_| meerkat_core::OperationAuthorizationError::Unavailable)?;
             let state = current.state();
-            self.run.check_state(state)?;
+            self.run.check_state(state, binding)?;
             let OperationExecutionScope::RuntimeInput {
                 canonical_input_id, ..
             } = &self.run.execution_scope
@@ -335,6 +570,24 @@ impl AdmittedWorkPolicyOwner for NativeAcceptedWorkOwner {
         // Current invocation, grant and resource owners remain independent.
         self.invocation_owner
             .authorize_admitted_work(association, binding, purpose, now_ms)
+    }
+
+    /// The installed invocation owner's current mandate, behind the same
+    /// native membership and association checks as its authorization.
+    fn review_mandate(
+        &self,
+        association: &InputAuthorityAssociation,
+        binding: &PreparedAuthorizationBinding,
+        now_ms: u64,
+    ) -> Result<Option<String>, meerkat_core::OperationAuthorizationError> {
+        self.check_current_membership(binding)?;
+        if association.candidate().target.logical_runtime.as_str() != self.runtime_id.as_str()
+            || !self.associations.contains(association)
+        {
+            return Err(malformed().into());
+        }
+        self.invocation_owner
+            .review_mandate(association, binding, now_ms)
     }
 }
 
@@ -391,7 +644,11 @@ impl NativeRunCustody {
         Ok(())
     }
 
-    fn check_state(&self, state: &dsl::MeerkatMachineState) -> Result<(), OperationRefused> {
+    fn check_state(
+        &self,
+        state: &dsl::MeerkatMachineState,
+        binding: &PreparedAuthorizationBinding,
+    ) -> Result<(), OperationRefused> {
         if state.session_id.as_ref() != Some(&self.session_id)
             || state.active_runtime_epoch_id.as_ref() != Some(&self.epoch_id)
             || state.current_run_id.as_ref() != Some(&self.run_id)
@@ -399,6 +656,15 @@ impl NativeRunCustody {
             || state.turn_terminal_run_id.as_ref() == Some(&self.run_id)
         {
             return Err(malformed());
+        }
+        // The accepted controller keeps its run: its model operations are
+        // never refused for the destination, so it receives this audience-safe
+        // refusal as local feedback for every destination-scoped operation
+        // (tools, sources, publication) once its destination is not current.
+        if !matches!(binding.facts().operation, AuthorizationOperation::Model(_))
+            && !super::scoped_context::run_destination_current(state, &self.run_id)
+        {
+            return Err(OperationRefused::new(OperationRefusalKind::Denied));
         }
         Ok(())
     }
@@ -429,7 +695,8 @@ impl NativeRunCustody {
             .authority
             .lock()
             .map_err(|_| meerkat_core::OperationAuthorizationError::Unavailable)?;
-        self.check_state(authority.state()).map_err(Into::into)
+        self.check_state(authority.state(), binding)
+            .map_err(Into::into)
     }
 }
 
@@ -443,6 +710,29 @@ struct NativeRunAuthorization {
 }
 
 impl WorkAuthorization for NativeRunAuthorization {
+    /// Historical, like an outcome: forwarded to the retained audited owner
+    /// without re-checking current run or grant permission.
+    fn observe_mandatory_hook_withholding(
+        &self,
+        record: &meerkat_core::authorization::MandatoryHookWithholdingRecord,
+    ) -> Result<(), OperationObservationError> {
+        self.inner.observe_mandatory_hook_withholding(record)
+    }
+
+    /// The inner owner reads the material; run custody is checked after it,
+    /// so an ended run cannot present or review stale material.
+    fn review_operation_context(
+        &self,
+        binding: &PreparedAuthorizationBinding,
+    ) -> Result<
+        meerkat_core::authorization::ReviewOperationContextResolution,
+        meerkat_core::OperationAuthorizationError,
+    > {
+        let resolution = self.inner.review_operation_context(binding)?;
+        self.run.check(binding)?;
+        Ok(resolution)
+    }
+
     fn read_review_context<'a>(
         &'a self,
         binding: &'a PreparedAuthorizationBinding,
@@ -453,6 +743,42 @@ impl WorkAuthorization for NativeRunAuthorization {
 
     fn controller_model_selection(&self) -> Option<meerkat_core::ControllerModelSelection> {
         self.inner.controller_model_selection()
+    }
+
+    fn run_if_current_within(
+        &self,
+        binding: &PreparedAuthorizationBinding,
+        prepared: Option<&meerkat_core::authorization::OperationValidity>,
+        further: &(dyn std::any::Any + Send + Sync),
+        operation: &mut dyn FnMut(),
+    ) -> Result<(), meerkat_core::OperationAuthorizationError> {
+        // Run custody first. The inner owner's decision under its exclusion
+        // still reads native authority custody (the accepted-work owner's
+        // admitted-work and membership checks), as ordinary preparation does.
+        self.run.check(binding)?;
+        self.inner
+            .run_if_current_within(binding, prepared, further, operation)
+    }
+
+    fn validate_child_issuance(
+        &self,
+        further: &(dyn std::any::Any + Send + Sync),
+        intent: &(dyn std::any::Any + Send + Sync),
+    ) -> Result<(), meerkat_core::OperationAuthorizationError> {
+        self.inner.validate_child_issuance(further, intent)
+    }
+
+    fn issue_child_if_current_within(
+        &self,
+        binding: &PreparedAuthorizationBinding,
+        prepared: Option<&meerkat_core::authorization::OperationValidity>,
+        further: &(dyn std::any::Any + Send + Sync),
+        intent: &(dyn std::any::Any + Send + Sync),
+        entered_tier: meerkat_core::authorization::OperationReviewTier,
+    ) -> Result<Box<dyn std::any::Any + Send>, meerkat_core::OperationAuthorizationError> {
+        self.run.check(binding)?;
+        self.inner
+            .issue_child_if_current_within(binding, prepared, further, intent, entered_tier)
     }
 
     fn prepare(
@@ -500,6 +826,10 @@ impl PreparedOperationAuthorization for NativePreparedAuthorization {
 
     fn review_tier(&self) -> meerkat_core::authorization::OperationReviewTier {
         self.prepared.review_tier()
+    }
+
+    fn validity(&self) -> Option<meerkat_core::authorization::OperationValidity> {
+        self.prepared.validity()
     }
 
     fn check_current(
@@ -585,13 +915,38 @@ mod tests {
                 expires_at_ms: 10_000,
             })
         }
+
+        /// The installed invocation owner's literal current mandate.
+        fn review_mandate(
+            &self,
+            association: &InputAuthorityAssociation,
+            _: &PreparedAuthorizationBinding,
+            _: u64,
+        ) -> Result<Option<String>, meerkat_core::OperationAuthorizationError> {
+            if association.candidate().requester != self.requester {
+                return Err(denied().into());
+            }
+            Ok(Some(INSTALLED_MANDATE.to_owned()))
+        }
     }
+
+    const INSTALLED_MANDATE: &str = "Read the reviewed record for the weekly summary";
 
     struct ResourceOwner {
         domain: ResourceDomain,
         processor: PrincipalRef,
     }
     impl OperationPolicyOwner for ResourceOwner {
+        /// Fixture records have no separately selected action account.
+        fn review_action_account(
+            &self,
+            _: &InputAuthorityAssociation,
+            _: &PreparedAuthorizationBinding,
+            _: u64,
+        ) -> Result<Option<String>, meerkat_core::OperationAuthorizationError> {
+            Ok(None)
+        }
+
         fn authorize_controller_admission(
             &self,
             association: &InputAuthorityAssociation,
@@ -726,8 +1081,29 @@ mod tests {
         }
     }
 
+    /// A credential account of this fixture alone: the credential lifecycle
+    /// lease is process-wide per credential, so concurrently running tests
+    /// must not share one.
+    fn fixture_account() -> String {
+        format!("controller-{}", meerkat_core::time_compat::new_uuid_v7())
+    }
+
     fn configuration() -> (NativeGrantWorkConfiguration, Input, ResourceDomain) {
-        let mut prompt = input("caller");
+        let (configuration, prompt, domain, _) = configuration_with_publication();
+        (configuration, prompt, domain)
+    }
+
+    /// [`configuration`] with the grant owner's publication, for owners
+    /// that must publish their changes on it.
+    fn configuration_with_publication() -> (
+        NativeGrantWorkConfiguration,
+        Input,
+        ResourceDomain,
+        LocalAuthorizationPublication,
+    ) {
+        let publication = LocalAuthorizationPublication::new();
+        let mut prompt =
+            crate::input_authority::tests::input_for_account("caller", &fixture_account());
         let candidate = prompt
             .header()
             .authority_association
@@ -748,7 +1124,7 @@ mod tests {
                     namespace: EvidenceId::new("controller").expect("id"),
                     generation: 1,
                 },
-                LocalAuthorizationPublication::new(),
+                publication.clone(),
                 Arc::new(Clock),
             )
             .expect("real generated grant owner"),
@@ -764,6 +1140,28 @@ mod tests {
             .expect("real issued controller");
         let mut candidate = candidate.clone();
         candidate.controller_grant_lineage = vec![grant];
+        // Isolate the process-wide credential lease between fixture instances.
+        // Clones and fresh inputs derived from this fixture keep this selection.
+        let selection = candidate.controller_model.as_ref().expect("controller");
+        candidate.controller_model = Some(ControllerModelSelection::new(
+            meerkat_core::SessionLlmIdentity {
+                model: selection.model().into(),
+                provider: selection.provider(),
+                self_hosted_server_id: selection.self_hosted_server_id().map(str::to_owned),
+                provider_params: None,
+                auth_binding: selection.auth_binding().cloned(),
+            },
+            meerkat_core::AuthCredentialIdentity::Account(meerkat_core::CredentialAccountRef {
+                realm: meerkat_core::RealmId::parse("native-test").expect("realm"),
+                account: meerkat_core::CredentialAccountId::parse(format!(
+                    "controller-{}",
+                    prompt.id()
+                ))
+                .expect("fixture account"),
+            }),
+            selection.backend_profile_id().into(),
+            selection.backend_kind().into(),
+        ));
         prompt.header_mut().authority_association =
             Some(InputAuthorityAssociation::new(candidate).expect("claims"));
         let expected_requester = requester.clone();
@@ -780,6 +1178,8 @@ mod tests {
         });
         (
             NativeGrantWorkConfiguration {
+                retained_resume: None,
+                require_scoped_destination: false,
                 grants,
                 ingress,
                 invocation_owner: Arc::new(Invocation {
@@ -790,9 +1190,11 @@ mod tests {
                     domain: domain.clone(),
                     processor: executor,
                 }),
+                configured_mcp_attachment: None,
             },
             prompt,
             domain,
+            publication,
         )
     }
 
@@ -994,6 +1396,23 @@ mod tests {
         let current = reviewed.current().expect("unchanged owners");
         assert!(current.same_check(&reviewed));
         assert_eq!(current.review_tier(), OperationReviewTier::R2);
+    }
+
+    #[tokio::test]
+    async fn native_run_authorization_forwards_the_installed_owner_mandate() {
+        use meerkat_core::authorization::ReviewOperationContextResolution;
+        let (_machine, _session, _id, run, context, domain) = accepted().await;
+        // Through the actual native chain: NativeRunAuthorization -> audited
+        // grant-backed policy -> NativeAcceptedWorkOwner -> installed owner.
+        let resolution = context
+            .authorization()
+            .review_operation_context(&binding_for(&context, &run, &domain, "reviewed-record"))
+            .expect("current native owners supply the material");
+        let ReviewOperationContextResolution::Material(material) = resolution else {
+            unreachable!("the installed owner holds a mandate");
+        };
+        assert_eq!(material.mandate(), Some(INSTALLED_MANDATE));
+        assert_eq!(material.action_account(), None);
     }
 
     #[tokio::test]
@@ -2451,6 +2870,24 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     mod batch_custody;
 
+    #[cfg(not(target_arch = "wasm32"))]
+    mod scoped_context;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod cold_continuation;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod scoped_disclosure;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod mcp_attachment;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod scoped_conjunction;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod scoped_retained_resume;
+
     // Exercise the actual ordinary constructor without wrapping a bundle or
     // replacing its runtime owner.
     fn memory_persistent_constructor_fixture()
@@ -2542,6 +2979,8 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     mod memory_persistence;
+
+    mod agent_mandate;
 }
 
 /// Recheck physical native custody at the final control entry, after service

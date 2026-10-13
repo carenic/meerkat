@@ -91,6 +91,9 @@ pub use meerkat_core::{
     HookExecutionReport,
     HookId,
     HookInvocation,
+    HookMandatoryTopology,
+    HookModelOperation,
+    HookModelOperationScope,
     HookOutcome,
     HookPoint,
     HookReasonCode,
@@ -202,12 +205,12 @@ pub use job_delivery::{
 mod continuation;
 #[cfg(not(target_arch = "wasm32"))]
 pub use continuation::{
-    AddressResolution, ContinuationAddressResolver, ContinuationBody, ContinuationDelivery,
-    ContinuationDeliverySink, ContinuationHandling, ContinuationKey, ContinuationOwner,
-    ContinuationOwnerService, ContinuationProducer, ContinuationReceipt, ContinuationResultRef,
-    ContinuationStatus, ContinuationStatusError, ContinuationSubmitError,
-    MAX_CONTINUATION_KEY_BYTES, MachineContinuationSink, SessionAddressResolver, StrandedCause,
-    member_delivery_address,
+    AddressObservation, AddressResolution, ContinuationAddressResolver, ContinuationBody,
+    ContinuationDelivery, ContinuationDeliverySink, ContinuationHandling, ContinuationKey,
+    ContinuationObservation, ContinuationObserveError, ContinuationOwner, ContinuationOwnerService,
+    ContinuationProducer, ContinuationReceipt, ContinuationResultRef, ContinuationStatus,
+    ContinuationStatusError, ContinuationSubmitError, MAX_CONTINUATION_KEY_BYTES,
+    MachineContinuationSink, SessionAddressResolver, StrandedCause, member_delivery_address,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use continuation::{
@@ -219,8 +222,15 @@ pub use continuation::{
 mod runtime_delivery_owner;
 #[cfg(not(target_arch = "wasm32"))]
 pub use runtime_delivery_owner::{
-    RuntimeDeliveryHost, RuntimeDeliveryOwner, RuntimeDeliveryOwnerHandle, RuntimeDeliveryPass,
-    default_address_resolution,
+    OwedContinuationCursor, OwedContinuationProjection, RuntimeDeliveryHost, RuntimeDeliveryOwner,
+    RuntimeDeliveryOwnerHandle, RuntimeDeliveryOwnerRetirement,
+    RuntimeDeliveryOwnerRetirementIncomplete, RuntimeDeliveryPass, default_address_resolution,
+};
+#[cfg(not(target_arch = "wasm32"))]
+mod consent_delivery;
+#[cfg(not(target_arch = "wasm32"))]
+pub use consent_delivery::{
+    ConsentNoticeJobSource, ConsentNoticeProjector, consent_notice_producer,
 };
 mod job_composition;
 pub use job_composition::{
@@ -319,9 +329,10 @@ pub use meerkat_workgraph::{
     MobAgentOwner, ObserveLeaseExpiryRequest, ObserveReadinessRequest, PolicyEscalateRequest,
     ProjectedAttentionAuthority, PublicGoalCompletionPolicy, PublicGoalCreateRequest,
     PublicGoalRequestCloseRequest, ReadyWorkFilter, ReleaseWorkItemRequest, UpdateWorkItemRequest,
-    WORKGRAPH_ATTENTION_DISPATCH_CONTEXT_KEY, WorkAttentionBinding, WorkAttentionBindingId,
-    WorkAttentionMachine, WorkAttentionMachineState, WorkAttentionMode, WorkAttentionStatus,
-    WorkAttentionTarget, WorkClaim, WorkCompletionPolicy, WorkEdge, WorkEdgeKind, WorkEvidenceRef,
+    WORKGRAPH_ATTENTION_DISPATCH_CONTEXT_KEY, WorkAdmission, WorkAdmissionKey,
+    WorkAdmissionOutcome, WorkAttentionBinding, WorkAttentionBindingId, WorkAttentionMachine,
+    WorkAttentionMachineState, WorkAttentionMode, WorkAttentionStatus, WorkAttentionTarget,
+    WorkClaim, WorkCompletionPolicy, WorkEdge, WorkEdgeKind, WorkEvidenceRef,
     WorkExecutionAuthority, WorkExecutionBinding, WorkExecutionBindingFilter,
     WorkExecutionBindingId, WorkExecutionBridge, WorkExecutionEvidenceKind,
     WorkExecutionEvidenceProjection, WorkExecutionLifecycleEffect, WorkExecutionLifecycleState,
@@ -344,10 +355,38 @@ pub use meerkat_workgraph::{
 // AgentFactory and build_agent types
 #[cfg(not(target_arch = "wasm32"))]
 mod command_hook_confinement;
+#[cfg(not(target_arch = "wasm32"))]
+mod connector_clients;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod controller_route;
 mod factory;
 #[cfg(not(target_arch = "wasm32"))]
 mod host_auth;
+#[cfg(not(target_arch = "wasm32"))]
+mod mcp_service_secrets;
+#[cfg(not(target_arch = "wasm32"))]
+pub use connector_clients::{
+    ConnectorClientSecretUpdate, ConnectorClientUpdateError, RealmConnectorClients,
+    connector_client_auth_profiles, put_connector_client, remove_connector_client,
+    rotate_connector_client_secret,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use mcp_service_secrets::{McpServiceSecretObservation, RealmMcpServiceSecrets};
+#[cfg(all(
+    feature = "session-store",
+    feature = "local-authorization",
+    not(target_arch = "wasm32")
+))]
+pub use mcp_service_secrets::{
+    McpServiceSecretRemoval, McpServiceSecretUpdateError, remove_mcp_service_secret,
+    remove_mcp_service_secret_entered, set_mcp_service_secret, set_mcp_service_secret_entered,
+};
 mod model_fallback;
+mod prepared_controller;
+pub use prepared_controller::{
+    PreparedControllerDisposal, PreparedControllerRefusal, PreparedControllerTicket,
+    encode_prepared_controller_for_service,
+};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod process_custody;
 #[cfg(not(target_arch = "wasm32"))]
@@ -355,12 +394,15 @@ pub use factory::ExperimentalLiveTargetPreparation;
 pub use factory::{
     AgentBuildConfig, AgentFactory, BuildAgentError, CreateSessionModelResolution,
     CreateSessionModelResolutionError, CreateSessionModelResolutionRequest, DynAgent,
-    LlmIdentityPreflightError, decode_llm_client_override_from_service,
+    LlmIdentityPreflightError, PreparedAgent, PreparedCatalogEntry, PreparedToolCatalog,
+    PreparedToolSurface, decode_llm_client_override_from_service,
     encode_llm_client_override_for_service, provider_key, resolve_create_session_default_model,
     resolve_create_session_model, resolve_provider_catalog_default_model,
 };
 #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
-pub use host_auth::default_mcp_auth_resolver;
+pub use factory::{
+    McpAdapterComposeRefusal, McpAdapterComposer, McpAdapterCustody, McpAdapterCustodyClosed,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use host_auth::{
     HostAuthDevicePoll, HostAuthDeviceStart, HostAuthError, HostAuthLoginComplete,
@@ -370,27 +412,41 @@ pub use host_auth::{
     mcp_account_verification_to_wire, mcp_auth_target_to_wire, mcp_login_disposition_to_wire,
     resolve_configured_mcp_target, resolve_configured_mcp_target_in_realm,
 };
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+pub use host_auth::{default_mcp_auth_resolver, default_mcp_auth_resolver_in_realm};
 #[cfg(not(target_arch = "wasm32"))]
 pub use meerkat_providers::auth_store::{ProviderAuthPersistence, TokenStoreBackend};
 #[cfg(not(target_arch = "wasm32"))]
 pub use meerkat_providers::connector_login::{
     CONNECTOR_OAUTH_CALLBACK_PATH, ConnectorAccountStrategy, ConnectorAuthPhase,
-    ConnectorAuthStatus, ConnectorLoginComplete, ConnectorLoginError, ConnectorLoginStart,
-    ConnectorOAuthAuthority, ConnectorOAuthCallback, ConnectorOAuthTarget, ConnectorStrategies,
-    ConnectorVerifiedAccount,
+    ConnectorAuthStatus, ConnectorCallCredential, ConnectorCallExpectation,
+    ConnectorClientAuthProfile, ConnectorClientAuthSource, ConnectorClientSecret,
+    ConnectorLoginComplete, ConnectorLoginError, ConnectorLoginStart, ConnectorOAuthAuthority,
+    ConnectorOAuthCallback, ConnectorOAuthTarget, ConnectorStrategies, ConnectorVerifiedAccount,
+    clear_connector_client_secret, load_connector_client_secret, save_connector_client_secret,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use meerkat_providers::mcp_oauth::{
     MCP_INTERACTIVE_LOGIN_TIMEOUT, MCP_OAUTH_CALLBACK_PATH, McpAuthMode, McpOAuthAccountStrategy,
     McpOAuthAttemptCleanup, McpOAuthAuthority, McpOAuthBrowserLaunch, McpOAuthCallback,
-    McpOAuthCeremonyContext, McpOAuthError, McpOAuthListenerCleanup, McpOAuthLoginComplete,
-    McpOAuthLoginDisposition, McpOAuthLoginStart, McpOAuthLoopbackBegin, McpOAuthPendingAttempt,
-    McpOAuthPendingClose, McpOAuthPendingLogin, McpServerIdentity, OidcUserInfoAccountStrategy,
-    open_system_browser,
+    McpOAuthCancelHandle, McpOAuthCeremonyContext, McpOAuthError, McpOAuthListenerCleanup,
+    McpOAuthLoginComplete, McpOAuthLoginDisposition, McpOAuthLoginStart, McpOAuthLoopbackBegin,
+    McpOAuthPendingAttempt, McpOAuthPendingClose, McpOAuthPendingLogin, McpServerIdentity,
+    OidcUserInfoAccountStrategy, open_system_browser,
 };
 
 pub mod help;
 
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+mod approval_issuer;
+#[cfg(all(
+    feature = "session-store",
+    feature = "local-authorization",
+    not(target_arch = "wasm32")
+))]
+pub mod governed_realm;
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+pub use approval_issuer::{ApprovalIssuerSelection, ApprovalIssuerSelectionError};
 mod persistence;
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
 pub mod storage_provider;
@@ -609,12 +665,23 @@ pub use meerkat_tools::{FileTaskStore, ensure_rkat_dir, find_project_root};
 // Re-export MCP client
 #[cfg(feature = "mcp")]
 pub use meerkat_mcp::{
-    McpApplyDelta, McpApplyResult, McpAuthResolver, McpConnection, McpError, McpLifecycleAction,
-    McpLifecyclePhase, McpReloadTarget, McpRouter, McpRouterAdapter, McpServerLifecycleState,
-    McpStdioLaunchProfile,
+    AuthorizedRetry, CheckedMcpRoute, CheckedMcpRouteError, CheckedMcpRouteSpec,
+    HttpEgressAddresses, HttpEgressError, HttpEgressOrigin, HttpEgressOriginError,
+    HttpEgressPolicy, HttpEgressProfile, HttpEgressRefusal, HttpEgressScheme,
+    HttpEgressUnavailable, McpApplyDelta, McpApplyResult, McpAttemptSettlement, McpAuthResolver,
+    McpConnectAttempt, McpConnection, McpError, McpLifecycleAction, McpLifecyclePhase,
+    McpLocalTermination, McpReloadTarget, McpRemoteSession, McpRouter, McpRouterAdapter,
+    McpServerLifecycleState, McpStdioLaunchProfile, ReleasedCredential,
 };
 #[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+mod connector_mcp;
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
 pub mod mcp;
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+pub use connector_mcp::{
+    CONNECTOR_CREDENTIAL_META_KEY, ConnectorMcpCallContextProvider, ConnectorMcpInstallation,
+    ConnectorOperationBinding,
+};
 
 // Skill types re-exports
 pub use meerkat_core::skills::{

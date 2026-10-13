@@ -3173,7 +3173,8 @@ pub struct BridgeRunStartReleasePayload {
 pub enum BridgeHeldRun {
     /// The member had no run.
     NoRun,
-    /// The current run was cancelled at its next boundary.
+    /// A cancel at its next boundary was recorded for the current run. The
+    /// reply does not wait for the run to reach that boundary.
     CancelledAtBoundary { run_id: meerkat_core::RunId },
     /// The current run ended on its own between the hold and the cancel.
     RunEndedBeforeCancel { run_id: meerkat_core::RunId },

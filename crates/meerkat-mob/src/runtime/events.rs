@@ -206,6 +206,24 @@ impl MobEventEmitter {
         .await
     }
 
+    /// Report that an orchestrator resume notification held by the actor's
+    /// lifecycle owner did not deliver to its planned target.
+    ///
+    /// Diagnostic only: it never changes the mob's phase.
+    pub async fn orchestrator_resume_notification_failed(
+        &self,
+        member_id: AgentIdentity,
+        session_id: meerkat_core::types::SessionId,
+        reason: String,
+    ) -> Result<MobEvent, MobError> {
+        self.append(MobEventKind::OrchestratorResumeNotificationFailed {
+            member_id,
+            session_id,
+            reason,
+        })
+        .await
+    }
+
     /// Report that an escalation MobMachine decided on could not be delivered.
     ///
     /// Audit only: it never changes the run's terminal class.

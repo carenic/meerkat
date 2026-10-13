@@ -7,7 +7,7 @@ use crate::mcp_config::McpServerConfig;
 use crate::model_profile::catalog::ModelTier;
 use crate::{
     budget::BudgetLimits,
-    hooks::{HookCapability, HookExecutionMode, HookId, HookPoint},
+    hooks::{HookCapability, HookExecutionMode, HookId, HookModelOperationScope, HookPoint},
     retry::RetryPolicy,
     types::{OutputSchema, SecurityMode},
 };
@@ -60,6 +60,13 @@ pub struct Config {
     pub provider_tools: ProviderToolsConfig,
     pub model_fallback: ModelFallbackConfig,
     pub presentation: PresentationConfig,
+    /// Governance of the realm's native composition: the stock governed
+    /// host's review rules and reviewer. `None` when the document states no
+    /// section, so the realm inherits its parent's; a present section, even
+    /// an empty one, replaces the inherited one as a whole, and is written
+    /// back as present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governance: Option<crate::GovernanceConfig>,
     /// Realm-scoped connection sets (backend profiles, auth profiles,
     /// bindings). TOML keys use the singular `[realm.<id>.*]` namespace
     /// even though the Rust field is plural-adjacent — `#[serde(rename)]`
@@ -96,6 +103,7 @@ impl Default for Config {
             provider_tools: ProviderToolsConfig::default(),
             model_fallback: ModelFallbackConfig::default(),
             presentation: PresentationConfig::default(),
+            governance: None,
             realm: BTreeMap::new(),
         }
     }
@@ -338,6 +346,9 @@ impl Config {
         if other.agent.max_tokens_per_turn.is_some() {
             self.agent.max_tokens_per_turn = other.agent.max_tokens_per_turn;
         }
+        if other.agent.max_turns.is_some() {
+            self.agent.max_turns = other.agent.max_turns;
+        }
         if other.agent.extraction_prompt.is_some() {
             self.agent.extraction_prompt = other.agent.extraction_prompt;
         }
@@ -472,6 +483,11 @@ impl Config {
         }
         if other.model_fallback != ModelFallbackConfig::default() {
             self.model_fallback = other.model_fallback;
+        }
+        // A present section, even an empty one, replaces the inherited one
+        // as a whole; an absent one inherits it.
+        if other.governance.is_some() {
+            self.governance = other.governance;
         }
 
         // Skills: scalar toggles and health policy are child-wins when
@@ -976,7 +992,14 @@ impl Config {
     ///   over the injected catalog) constructs without conflicts
     pub fn validate(&self, catalog: crate::model_profile::ModelCatalog) -> Result<(), ConfigError> {
         self.reject_unwired_agent_provider_params()?;
+        // An unsupported mandatory hook topology is rejected before the
+        // configuration activates, never discovered as a run failure.
+        crate::hooks::validate_hook_activation(&self.hooks.entries)
+            .map_err(|error| ConfigError::Validation(error.to_string()))?;
         self.model_fallback.validate()?;
+        if let Some(governance) = &self.governance {
+            governance.validate()?;
+        }
         if self.max_tokens == Some(0) {
             return Err(ConfigError::Validation(
                 "max_tokens must be greater than 0 when set".to_string(),
@@ -2152,8 +2175,9 @@ pub enum CommsRuntimeMode {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HostingMode {
-    /// One process uses the realm at a time (today's behavior). Compatible
-    /// with every store; makes no multi-process claim.
+    /// Compatible with every store; does not require cross-process hosting
+    /// support. Stores with OS-locked claims still enforce one host per
+    /// session.
     #[default]
     SingleProcess,
     /// Several processes may serve the realm at once. Each session is hosted
@@ -2616,6 +2640,11 @@ pub struct HookEntryConfig {
     pub priority: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Which model operations this entry governs. Only meaningful at
+    /// `pre_llm_request` and `post_llm_response`; absent means every model
+    /// request, including the separate controller-feedback request.
+    #[serde(default, skip_serializing_if = "HookModelOperationScope::is_all")]
+    pub model_operations: HookModelOperationScope,
     pub runtime: HookAdapterConfig,
 }
 
@@ -2629,6 +2658,7 @@ impl Default for HookEntryConfig {
             capability: HookCapability::Observe,
             priority: 100,
             timeout_ms: None,
+            model_operations: HookModelOperationScope::All,
             runtime: HookAdapterConfig::in_process("noop"),
         }
     }
@@ -2929,6 +2959,16 @@ pub enum ConfigError {
     #[error(transparent)]
     RealmMcpServerEnvReference(#[from] crate::mcp_config::McpRealmServerEnvReference),
 
+    /// A write would change, remove or restate the document's governance
+    /// section ([`crate::GovernanceConfig`]). Ordinary config write
+    /// permission is not governance administration: the realm's trusted
+    /// host administers the section in the document itself. Nothing is
+    /// written.
+    #[error(
+        "the governance section is administered by the realm's trusted host; a config write cannot change, remove or restate it"
+    )]
+    GovernanceAdministration,
+
     #[error("realm inheritance chain error: {0}")]
     RealmChain(#[from] crate::connection::RealmChainError),
 }
@@ -3201,17 +3241,7 @@ pub(crate) fn compose_effective_config_with_chain(
     raw_docs: &std::collections::BTreeMap<crate::connection::RealmId, toml::Value>,
     head: &crate::connection::RealmId,
 ) -> Result<(Config, crate::connection::RealmChain), crate::connection::RealmChainError> {
-    use crate::connection::RealmChain;
-    // Combined topology: union every fetched doc's realm sections so the chain
-    // authority sees each member's parent edge regardless of which doc carried
-    // it. Outer-key only — sub-maps are never merged across realms.
-    let mut topology = Config::default();
-    for doc in docs.values() {
-        for (realm_id, section) in &doc.realm {
-            topology.realm.insert(realm_id.clone(), section.clone());
-        }
-    }
-    let chain = RealmChain::resolve(&topology, head)?;
+    let chain = composition_chain(docs, head)?;
     // Fold root-first (chain is head-first, so iterate reversed) — the
     // most-derived head merges last and wins.
     let mut effective = Config::default();
@@ -3273,6 +3303,53 @@ pub(crate) fn compose_effective_config_with_chain(
     // `[realm.b]`, ... is how the CLI and surfaces resolve a `--realm`/section
     // that is not itself a chain member). Tracked, not gated.
     Ok((effective, chain))
+}
+
+/// The chain [`compose_effective_config`] folds for `head`: the chain
+/// authority over the union of every fetched document's realm sections, so it
+/// sees each member's parent edge regardless of which document carried it.
+/// Outer-key only: sub-maps are never merged across realms.
+fn composition_chain(
+    docs: &std::collections::BTreeMap<crate::connection::RealmId, Config>,
+    head: &crate::connection::RealmId,
+) -> Result<crate::connection::RealmChain, crate::connection::RealmChainError> {
+    let mut topology = Config::default();
+    for doc in docs.values() {
+        for (realm_id, section) in &doc.realm {
+            topology.realm.insert(realm_id.clone(), section.clone());
+        }
+    }
+    crate::connection::RealmChain::resolve(&topology, head)
+}
+
+/// The realm whose OWN document defines the MCP server `name` in `head`'s
+/// effective configuration, with that definition: the nearest member of the
+/// chain [`compose_effective_config`] folds (head first) whose document lists
+/// the name, and that document's last entry of the name. Servers fold by
+/// name with the later entry and the child winning, so this is exactly the
+/// definition the composition yields for the name, from the same documents
+/// and chain authority. `None` when no document on the chain defines it.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn mcp_server_definition_owner(
+    docs: &std::collections::BTreeMap<crate::connection::RealmId, Config>,
+    head: &crate::connection::RealmId,
+    name: &str,
+) -> Result<
+    Option<(
+        crate::connection::RealmId,
+        crate::mcp_config::McpServerConfig,
+    )>,
+    crate::connection::RealmChainError,
+> {
+    let chain = composition_chain(docs, head)?;
+    Ok(chain.realms().iter().find_map(|member| {
+        docs.get(member)?
+            .tools
+            .mcp_servers
+            .iter()
+            .rfind(|server| server.name == name)
+            .map(|server| (member.clone(), server.clone()))
+    }))
 }
 
 /// Serde helpers for `Option<Duration>` with humantime format.
@@ -3556,6 +3633,50 @@ max_sessions = 7
     }
 
     #[test]
+    fn test_agent_max_turns_survives_config_layering() {
+        let parent_id = crate::connection::RealmId::parse("parent").unwrap();
+        let child_id = crate::connection::RealmId::parse("child").unwrap();
+        for (parent_limit, child_limit, expected) in [
+            (None, None, None),
+            (Some(7), None, Some(7)),
+            (Some(7), Some(0), Some(0)),
+            (Some(7), Some(DEFAULT_MAX_TURNS), Some(DEFAULT_MAX_TURNS)),
+            (Some(7), Some(2), Some(2)),
+        ] {
+            let mut parent = Config::default();
+            parent.agent.max_turns = parent_limit;
+            parent.realm.insert(
+                parent_id.to_string(),
+                crate::connection::RealmConfigSection::default(),
+            );
+            let mut child = Config::default();
+            child.agent.max_turns = child_limit;
+            child.realm.insert(
+                child_id.to_string(),
+                crate::connection::RealmConfigSection {
+                    parent: Some(parent_id.clone()),
+                    ..Default::default()
+                },
+            );
+            let docs = std::collections::BTreeMap::from([
+                (parent_id.clone(), parent.clone()),
+                (child_id.clone(), child),
+            ]);
+            let effective =
+                compose_effective_config(&docs, &std::collections::BTreeMap::new(), &child_id)
+                    .unwrap();
+            assert_eq!(effective.agent.max_turns, expected);
+
+            let child_toml = child_limit.map_or_else(
+                || "[agent]\n".to_owned(),
+                |limit| format!("[agent]\nmax_turns = {limit}\n"),
+            );
+            parent.merge_toml_str(&child_toml).unwrap();
+            assert_eq!(parent.agent.max_turns, expected);
+        }
+    }
+
+    #[test]
     fn test_merge_extraction_prompt_survives_layering() {
         let mut base = Config::default();
         assert!(base.agent.extraction_prompt.is_none());
@@ -3621,10 +3742,14 @@ model = "custom-model"
                     command: command.to_string(),
                     args: Vec::new(),
                     env: std::collections::HashMap::new(),
+                    secret_env: std::collections::BTreeSet::new(),
                 },
             ),
             connect_timeout_secs: None,
             tool_names: Default::default(),
+            access: None,
+            connector: None,
+            account: None,
         }
     }
 
@@ -5405,7 +5530,7 @@ enabled = false
             .expect("merged legacy layer validates");
     }
 
-    /// Layered loads (SDK / MobKit `merge_toml_str`): a legacy layer over a
+    /// Layered loads (SDK / Meta `merge_toml_str`): a legacy layer over a
     /// base with an explicit chain is a no-op for fallback, as in 0.8.36, and
     /// still reports the typed warning. Over no explicit policy it is off.
     #[test]

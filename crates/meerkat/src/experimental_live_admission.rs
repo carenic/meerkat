@@ -221,7 +221,7 @@ impl ExperimentalLiveOperatorConfig {
     /// top-level GPT Live session instruction overlay.
     ///
     /// The host composition owns this semantic text. Live callers select only
-    /// the stable `profile_id`; MobKit and provider request parameters cannot
+    /// the stable `profile_id`; Meta and provider request parameters cannot
     /// replace the text per open. Dynamic room or user context remains in the
     /// canonical transcript projection rather than this profile.
     pub fn with_execution_profile_session_instructions(
@@ -265,7 +265,7 @@ impl ExperimentalLiveOperatorConfig {
     }
 
     /// Register Meerkat's canonical GPT Live Responses profile without
-    /// requiring a surface or MobKit host to duplicate the provider profile
+    /// requiring a surface or Meta host to duplicate the provider profile
     /// identifier or reconstruct its provider-neutral capability atoms.
     /// Composition must call this only when the durable-member bridge host is
     /// installed; otherwise admission correctly remains unadvertised.
@@ -966,7 +966,7 @@ mod tests {
     #[test]
     fn voice_session_instructions_name_no_product() {
         let instructions = GPT_LIVE_CLIENT_CONTEXT_SESSION_INSTRUCTIONS.to_ascii_lowercase();
-        for name in ["meerkat", "rkat", "mobkit", "openai", "gpt"] {
+        for name in ["meerkat", "rkat", "meta", "openai", "gpt"] {
             assert!(
                 !instructions.contains(name),
                 "the voice session instructions name {name:?}: {GPT_LIVE_CLIENT_CONTEXT_SESSION_INSTRUCTIONS}"
