@@ -11,8 +11,14 @@ find_tool() {
 }
 
 case "$(uname -s)-$(uname -m)" in
-  Darwin-arm64) host_triple="aarch64-apple-darwin" ;;
-  Linux-x86_64) host_triple="x86_64-unknown-linux-gnu" ;;
+  Darwin-arm64)
+    host_triple="aarch64-apple-darwin"
+    cargo_nextest_repo="cargo_nextest_darwin_arm64"
+    ;;
+  Linux-x86_64)
+    host_triple="x86_64-unknown-linux-gnu"
+    cargo_nextest_repo="cargo_nextest_linux_x86_64"
+    ;;
   *)
     echo "unsupported BuildBuddy cargo lane host: $(uname -s)-$(uname -m)" >&2
     exit 127
@@ -93,6 +99,32 @@ cd "${work_root}"
 # fallback pick `<workspace>/meerkat` and fail every read on the 09-16 lane.
 export MEERKAT_WORKSPACE_ROOT="${work_root}"
 
+# The pinned cargo-nextest from runfiles, invoked directly (`cargo-nextest
+# nextest run ...`) as in full_lane_test.sh: `cargo nextest` would resolve the
+# subcommand from $CARGO_HOME/bin first.
+configure_cargo_nextest() {
+  CARGO_NEXTEST="$(find "${TEST_SRCDIR}" -path "*${cargo_nextest_repo}/cargo-nextest" \( -type f -o -type l \) | head -1)"
+  if [[ -z "${CARGO_NEXTEST}" ]]; then
+    echo "pinned cargo-nextest runfile was not found" >&2
+    exit 127
+  fi
+  export CARGO_NEXTEST
+}
+
+# meerkat's MCP tests spawn the exact mcp-test-server binary named by
+# MEERKAT_MCP_TEST_SERVER and fail without it (the Bazel-native targets set it
+# from runfiles). Build it with the lane's cargo and target dir and name the
+# artifact explicitly, as full_lane_test.sh does.
+export_mcp_test_server_fixture() {
+  "${CARGO}" build -p mcp-test-server --bin mcp-test-server --locked
+  MEERKAT_MCP_TEST_SERVER="${CARGO_TARGET_DIR}/debug/mcp-test-server"
+  if [[ ! -x "${MEERKAT_MCP_TEST_SERVER}" ]]; then
+    echo "mcp-test-server fixture was not built at ${MEERKAT_MCP_TEST_SERVER}" >&2
+    exit 1
+  fi
+  export MEERKAT_MCP_TEST_SERVER
+}
+
 run_feature_matrix_lane() {
   local feature_lane="$1"
   case "${feature_lane}" in
@@ -120,8 +152,18 @@ run_feature_matrix_lane() {
     test-feature-matrix-mob-runtime-adapter)
       "${CARGO}" check -p meerkat-mob --no-default-features --features runtime-adapter
       ;;
+    # As `make test-feature-matrix-lib` runs it: nextest, one process per
+    # test. The suite relies on process-per-test isolation (see the Native
+    # unit lanes in BUILD.bazel); in one `cargo test` process, interference
+    # between concurrent tests failed the 0.9 graph (a reviewed connector's
+    # grant refused as ConfigurationUnavailable, head-canonical brain-swap
+    # turns past their 5 s settle budget), and local runs failed a different
+    # set each time. They all pass under nextest.
     test-feature-matrix-meerkat-all-providers-tests)
-      "${CARGO}" test -p meerkat --features all-providers,comms,mcp --lib --tests
+      configure_cargo_nextest
+      export_mcp_test_server_fixture
+      "${CARGO_NEXTEST}" nextest run -p meerkat --features all-providers,comms,mcp \
+        --lib --tests --no-fail-fast
       ;;
     *)
       echo "unknown cargo-equivalent feature-matrix lane: ${feature_lane}" >&2

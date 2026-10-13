@@ -58,6 +58,17 @@ SDK_TOOL_DATA = [
     "@python_linux_x86_64//:python",
 ]
 
+# The pinned nextest the feature-matrix lane that runs meerkat's tests uses
+# (cargo_lane_test.sh), as `make test-feature-matrix-lib` does. Its timeout
+# is eternal: .config/nextest.toml runs the downstream Cargo canaries (cold
+# nested builds) one at a time, where one `cargo test` process overlapped
+# them, and on the 0.9 graph the build and the lib tests alone took 465 s of
+# the long (900 s) budget.
+FEATURE_MATRIX_NEXTEST_DATA = [
+    "@cargo_nextest_darwin_arm64//:cargo-nextest",
+    "@cargo_nextest_linux_x86_64//:cargo-nextest",
+]
+
 CARGO_EQUIVALENT_EXEC_PROPERTIES = {
     "network": "external",
     "test.network": "external",
@@ -98,10 +109,10 @@ sh_test(
         data = [
             ":lane_scripts",
             "//:workspace_runfiles",
-        ] + RUST_TOOLCHAIN_DATA,
+        ] + RUST_TOOLCHAIN_DATA + FEATURE_MATRIX_NEXTEST_DATA,
         exec_properties = CARGO_EQUIVALENT_EXEC_PROPERTIES,
         size = "enormous",
-        timeout = "long",
+        timeout = "eternal",
         tags = CARGO_EQUIVALENT_TAGS,
     )
     for name, lane in {
@@ -130,10 +141,10 @@ FEATURE_MATRIX_LIB_CARGO_EQUIVALENT_TESTS = {
         data = [
             ":lane_scripts",
             "//:workspace_runfiles",
-        ] + RUST_TOOLCHAIN_DATA,
+        ] + RUST_TOOLCHAIN_DATA + FEATURE_MATRIX_NEXTEST_DATA,
         exec_properties = CARGO_EQUIVALENT_EXEC_PROPERTIES,
         size = "enormous",
-        timeout = "long",
+        timeout = "eternal",
         tags = CARGO_EQUIVALENT_TAGS,
     )
     for name, lane in FEATURE_MATRIX_LIB_CARGO_EQUIVALENT_TESTS.items()
