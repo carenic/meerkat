@@ -884,9 +884,10 @@ jobs:
     # lanes; this lane selects exactly them. A backend refusal fails it,
     # and so does a selection of zero tests. On ubuntu-24.04 the native
     # backend's probe needs an unprivileged user+mount+IPC namespace that
-    # AppArmor restricts by default. The step before the tests prints the
-    # restriction and a matching shell probe, lifts the restriction on this
-    # ephemeral runner only, and must then pass the same probe.
+    # AppArmor restricts by default. On a GitHub-hosted runner only, the
+    # step before the tests prints the restriction and a matching shell
+    # probe, records the setting, lifts it and must then pass the same
+    # probe; an always() step after the tests restores the recorded value.
     if: ${{ needs.changes.outputs.rust_changed == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -925,6 +926,11 @@ jobs:
       - name: Confinement eligibility on this runner (evidence before and after)
         shell: bash
         run: |
+          # Kernel settings change only on a GitHub-hosted Actions runner.
+          if [ "${GITHUB_ACTIONS:-}" != "true" ] || [ "${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]; then
+            echo "refusing to change kernel settings: not a GitHub-hosted Actions runner (GITHUB_ACTIONS=${GITHUB_ACTIONS:-unset} RUNNER_ENVIRONMENT=${RUNNER_ENVIRONMENT:-unset})"
+            exit 1
+          fi
           # Mirrors the backend probe up to its chroot: user+mount+IPC
           # namespaces, root uid/gid map with setgroups denied, private
           # propagation, a tmpfs, and read-only bind remounts of a
@@ -944,6 +950,10 @@ jobs:
           for path in / /dev /tmp; do findmnt -no TARGET,FSTYPE,OPTIONS --target "$path" || true; done
           echo "BEFORE: $(sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces 2>&1 | tr '\n' ' ')"
           if probe; then echo "BEFORE: namespace probe ok"; else echo "BEFORE: namespace probe refused (rc=$?)"; fi
+          orig="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)"
+          case "$orig" in 0|1) ;; *) echo "unexpected kernel.apparmor_restrict_unprivileged_userns value: $orig"; exit 1;; esac
+          # Recorded before the change so the restore step below always has it.
+          echo "CONFINEMENT_USERNS_RESTRICT_ORIGINAL=$orig" >> "$GITHUB_ENV"
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           echo "AFTER: $(sysctl kernel.apparmor_restrict_unprivileged_userns)"
           probe
@@ -952,6 +962,22 @@ jobs:
       - name: MCP confinement positive acceptance
         shell: bash
         run: make test-mcp-confinement-positive
+
+      - name: Restore the AppArmor userns restriction
+        if: ${{ always() && env.CONFINEMENT_USERNS_RESTRICT_ORIGINAL != '' }}
+        shell: bash
+        run: |
+          if [ "${GITHUB_ACTIONS:-}" != "true" ] || [ "${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]; then
+            echo "refusing to change kernel settings: not a GitHub-hosted Actions runner (GITHUB_ACTIONS=${GITHUB_ACTIONS:-unset} RUNNER_ENVIRONMENT=${RUNNER_ENVIRONMENT:-unset})"
+            exit 1
+          fi
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns="${CONFINEMENT_USERNS_RESTRICT_ORIGINAL}"
+          restored="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)"
+          echo "RESTORED: kernel.apparmor_restrict_unprivileged_userns=${restored} (original ${CONFINEMENT_USERNS_RESTRICT_ORIGINAL})"
+          if [ "${restored}" != "${CONFINEMENT_USERNS_RESTRICT_ORIGINAL}" ]; then
+            echo "::error::the AppArmor userns restriction was not restored"
+            exit 1
+          fi
 
   integration:
     name: Integration tests (${{ matrix.name }})
