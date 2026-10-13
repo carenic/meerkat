@@ -867,6 +867,7 @@ pub(crate) async fn run_mob_host(args: MobHostArgs, scope: &RuntimeScope) -> any
             .join("config_state.json"),
         default_schedule_tools,
         None,
+        Some(&scope),
     )?;
     let capability_source_runtime: Arc<dyn ForkedParticipantSourceRuntime> = service.clone();
 

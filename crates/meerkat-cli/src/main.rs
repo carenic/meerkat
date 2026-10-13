@@ -5279,6 +5279,16 @@ fn cli_filesystem_realm_config_source(
     )
 }
 
+/// The scope's storage as the facade's realm owners address it.
+#[cfg(all(feature = "mcp", feature = "local-authorization"))]
+fn cli_resolved_storage(scope: &RuntimeScope) -> meerkat_core::ResolvedStorage {
+    meerkat_core::ResolvedStorage {
+        layout: scope.layout.clone(),
+        locator: scope.locator.clone(),
+        root_choice: scope.root_choice,
+    }
+}
+
 async fn load_config(scope: &RuntimeScope) -> anyhow::Result<(Config, PathBuf)> {
     let (config, root, warnings) = load_config_with_warnings(scope).await?;
     report_config_load_warnings(scope, &warnings);
@@ -10695,19 +10705,33 @@ fn report_mcp_login_close(
 }
 
 #[cfg(feature = "mcp")]
+fn open_cli_mcp_auth_persistence()
+-> anyhow::Result<meerkat_providers::auth_store::ProviderAuthPersistence> {
+    meerkat_providers::auth_store::TokenStoreBackend::default_auto()
+        .map_err(|error| anyhow::anyhow!("Cannot open MCP OAuth TokenStore: {error}"))?
+        .open_with_refresh_authority()
+        .map_err(|error| anyhow::anyhow!("Cannot open MCP OAuth TokenStore: {error}"))
+}
+
+#[cfg(feature = "mcp")]
 fn open_cli_mcp_host_auth_service(
     scope: &RuntimeScope,
 ) -> anyhow::Result<meerkat::HostAuthService> {
-    let persistence = meerkat_providers::auth_store::TokenStoreBackend::default_auto()
-        .map_err(|error| anyhow::anyhow!("Cannot open MCP OAuth TokenStore: {error}"))?
-        .open_with_refresh_authority()
-        .map_err(|error| anyhow::anyhow!("Cannot open MCP OAuth TokenStore: {error}"))?;
+    Ok(cli_mcp_host_auth_service(
+        scope,
+        open_cli_mcp_auth_persistence()?,
+    ))
+}
+
+#[cfg(feature = "mcp")]
+fn cli_mcp_host_auth_service(
+    scope: &RuntimeScope,
+    persistence: meerkat_providers::auth_store::ProviderAuthPersistence,
+) -> meerkat::HostAuthService {
     // MCP logins and the session resolver address the scope realm's own
     // credential slots.
-    Ok(
-        meerkat::HostAuthService::new(persistence, scope.provider_auth_authority.clone())
-            .with_mcp_realm(scope.locator.realm.clone()),
-    )
+    meerkat::HostAuthService::new(persistence, scope.provider_auth_authority.clone())
+        .with_mcp_realm(scope.locator.realm.clone())
 }
 
 #[cfg(feature = "mcp")]
@@ -10722,6 +10746,62 @@ fn open_mcp_auth_resolver(
         authority,
         mode,
     })))
+}
+
+/// The CLI loader's MCP credential source: the CLI host resolver with the
+/// scope realm's service-secret custody over the same credential store.
+#[cfg(feature = "mcp")]
+fn open_cli_mcp_loader_auth_resolver(
+    scope: &RuntimeScope,
+    mode: CliMcpAuthMode,
+) -> anyhow::Result<Arc<dyn meerkat_mcp::McpAuthResolver>> {
+    let persistence = open_cli_mcp_auth_persistence()?;
+    let token_store = persistence.token_store();
+    let service = cli_mcp_host_auth_service(scope, persistence);
+    let authority = service.mcp_oauth_authority()?;
+    Ok(with_cli_realm_service_secrets(
+        scope,
+        token_store,
+        Arc::new(CliMcpHostAuthResolver {
+            service,
+            authority,
+            mode,
+        }),
+    ))
+}
+
+/// `inner` serving the declared service secrets of the servers the scope
+/// realm's own config documents define (the documents [`load_config`]
+/// composes), with values in `token_store`; every other answer is `inner`'s.
+/// A server no realm document defines (an `mcp.toml` server) is refused as
+/// ownerless.
+#[cfg(feature = "mcp")]
+fn with_cli_realm_service_secrets(
+    scope: &RuntimeScope,
+    token_store: Arc<dyn meerkat_core::auth::TokenStore>,
+    inner: Arc<dyn meerkat_mcp::McpAuthResolver>,
+) -> Arc<dyn meerkat_mcp::McpAuthResolver> {
+    meerkat::RealmMcpServiceSecrets::from_realm_source(
+        cli_realm_config_source(scope),
+        scope.locator.realm.clone(),
+        token_store,
+    )
+    .serve_for(inner)
+}
+
+/// Whether the CLI loader's router needs a credential source: a server that
+/// may need OAuth, or a stdio server that declares service secrets.
+#[cfg(feature = "mcp")]
+fn cli_mcp_loader_needs_auth_resolver<'a>(
+    servers: impl IntoIterator<Item = &'a meerkat_core::McpServerConfig>,
+) -> bool {
+    servers.into_iter().any(|server| {
+        mcp_server_may_need_oauth(server)
+            || matches!(
+                &server.transport,
+                McpTransportConfig::Stdio(stdio) if !stdio.secret_env.is_empty()
+            )
+    })
 }
 
 #[cfg(feature = "mcp")]
@@ -10812,11 +10892,12 @@ async fn create_mcp_tools(
     let has_oauth_candidate = servers_with_scope
         .iter()
         .any(|server| mcp_server_may_need_oauth(&server.server));
-    let mcp_auth_resolver = if has_oauth_candidate {
-        open_mcp_auth_resolver(scope, mcp_auth)?
-    } else {
-        None
-    };
+    let mcp_auth_resolver =
+        if cli_mcp_loader_needs_auth_resolver(servers_with_scope.iter().map(|s| &s.server)) {
+            Some(open_cli_mcp_loader_auth_resolver(scope, mcp_auth)?)
+        } else {
+            None
+        };
 
     // Stage all servers for parallel connection through the generated
     // session-owned surface authority.
@@ -12770,6 +12851,7 @@ fn build_cli_runtime_backed_service_with_defaults(
     config_state_path: std::path::PathBuf,
     default_schedule_tools: Option<Arc<dyn AgentToolDispatcher>>,
     default_workgraph_tools: Option<Arc<dyn AgentToolDispatcher>>,
+    storage: Option<&RuntimeScope>,
 ) -> Result<
     (
         Arc<meerkat::PersistentSessionService<FactoryAgentBuilder>>,
@@ -12784,6 +12866,7 @@ fn build_cli_runtime_backed_service_with_defaults(
         config_state_path,
         default_schedule_tools,
         default_workgraph_tools,
+        storage,
         false,
     )
 }
@@ -12791,6 +12874,14 @@ fn build_cli_runtime_backed_service_with_defaults(
 /// [`build_cli_runtime_backed_service_with_defaults`] whose factory waits for
 /// the build's declarative MCP servers before the first prompt when
 /// `wait_for_mcp` is set.
+///
+/// `storage` is the scope whose realm `persistence` opened. The builder's
+/// configuration is a snapshot, which names no server's defining realm, so
+/// without it every service secret a factory-launched stdio server declares
+/// is refused as ownerless; with it, that realm's own config documents serve
+/// them ([`meerkat::surface::install_default_mcp_auth_resolver_for_realm`]).
+/// `None` only for compositions over stores without realm documents.
+#[allow(clippy::too_many_arguments)]
 fn build_cli_runtime_backed_service_waiting_for_mcp(
     factory: AgentFactory,
     config: Config,
@@ -12798,6 +12889,7 @@ fn build_cli_runtime_backed_service_waiting_for_mcp(
     config_state_path: std::path::PathBuf,
     default_schedule_tools: Option<Arc<dyn AgentToolDispatcher>>,
     default_workgraph_tools: Option<Arc<dyn AgentToolDispatcher>>,
+    storage: Option<&RuntimeScope>,
     wait_for_mcp: bool,
 ) -> Result<
     (
@@ -12823,6 +12915,18 @@ fn build_cli_runtime_backed_service_waiting_for_mcp(
             ),
         );
     }
+    // Installed before the shared composition, whose own service-secret
+    // custody keeps every answer of an installed credential source.
+    #[cfg(all(feature = "mcp", feature = "local-authorization"))]
+    if let Some(storage) = storage {
+        builder = meerkat::surface::install_default_mcp_auth_resolver_for_realm(
+            builder,
+            &persistence.runtime_adapter(),
+            &cli_resolved_storage(storage),
+        );
+    }
+    #[cfg(not(all(feature = "mcp", feature = "local-authorization")))]
+    let _ = storage;
     let (service, runtime_adapter) =
         meerkat::surface::build_runtime_backed_service_with_default_reconfigure_host(
             builder,
@@ -13275,6 +13379,7 @@ async fn run_agent(
             config_base_dir.join("config_state.json"),
             default_schedule_tools,
             default_workgraph_tools,
+            Some(storage_scope),
             governed_mcp_wait(governed_mcp.as_deref(), wait_for_mcp),
         )?;
 
@@ -14054,6 +14159,7 @@ async fn resume_session_with_llm_override(
             config_base_dir.join("config_state.json"),
             default_schedule_tools,
             default_workgraph_tools,
+            Some(scope),
             governed_mcp_wait(governed_mcp.as_deref(), wait_for_mcp),
         )?;
 
@@ -14559,6 +14665,7 @@ async fn get_or_create_cli_persistent_surface_from_bundle(
             .join("config_state.json"),
         default_schedule_tools,
         default_workgraph_tools,
+        Some(scope),
     )?;
     #[cfg(all(feature = "mob", feature = "session-store"))]
     let mob_state_cache = Arc::new(CliMobStateCache::default());
@@ -21643,6 +21750,362 @@ mod tests {
             Some(std::slice::from_ref(&remote)),
             false
         ));
+    }
+
+    /// A stdio "server" declaring `slot` that writes the value its launch
+    /// received to `seen` and exits, so its MCP handshake fails.
+    #[cfg(all(feature = "mcp", feature = "local-authorization"))]
+    fn env_recording_stdio_server(
+        name: &str,
+        slot: &str,
+        seen: &std::path::Path,
+    ) -> meerkat_core::McpServerConfig {
+        let mut server = meerkat_core::McpServerConfig::stdio(
+            name,
+            "/bin/sh",
+            vec![
+                "-c".to_owned(),
+                format!("printf %s \"${slot}\" > \"$0\""),
+                seen.display().to_string(),
+            ],
+            HashMap::new(),
+        );
+        if let McpTransportConfig::Stdio(stdio) = &mut server.transport {
+            stdio.secret_env.insert(slot.to_owned());
+        }
+        server
+    }
+
+    /// Lists `servers` in the scope realm's own config document.
+    #[cfg(all(feature = "mcp", feature = "local-authorization"))]
+    async fn list_in_realm_document(
+        scope: &RuntimeScope,
+        servers: &[meerkat_core::McpServerConfig],
+    ) {
+        let document =
+            cli_filesystem_realm_config_source(scope).config_doc_path(&scope.locator.realm);
+        tokio::fs::create_dir_all(document.parent().expect("the document's directory"))
+            .await
+            .expect("create the realm's config directory");
+        let runtime = meerkat_core::ConfigRuntime::new(
+            Arc::new(meerkat_core::FileConfigStore::new(
+                document.clone(),
+                meerkat_models::canonical(),
+            )),
+            document.with_file_name("config_state.json"),
+        );
+        let realm = meerkat_core::McpRealmPersistTarget::new(&runtime);
+        for server in servers {
+            realm
+                .add(server.clone(), None)
+                .await
+                .expect("listed in the realm's own document");
+        }
+    }
+
+    #[cfg(all(feature = "mcp", feature = "local-authorization"))]
+    fn in_memory_mcp_auth_persistence() -> meerkat_providers::auth_store::ProviderAuthPersistence {
+        meerkat_providers::auth_store::ProviderAuthPersistence::new(
+            Arc::new(meerkat_providers::auth_store::EphemeralTokenStore::new()),
+            Arc::new(meerkat_providers::auth_store::InMemoryCoordinator::new()),
+        )
+    }
+
+    /// A host's MCP OAuth credential source, installed as the CLI installs
+    /// its own: it records each bearer read, answers with its own bearer and
+    /// serves no service secret.
+    #[cfg(all(feature = "mcp", feature = "local-authorization"))]
+    #[derive(Default)]
+    struct HostBearerProbe {
+        reads: Mutex<Vec<String>>,
+    }
+
+    #[cfg(all(feature = "mcp", feature = "local-authorization"))]
+    #[async_trait]
+    impl meerkat_mcp::McpAuthResolver for HostBearerProbe {
+        async fn stored_bearer_token(
+            &self,
+            target: &meerkat::McpServerIdentity,
+        ) -> Result<Option<String>, meerkat::McpOAuthError> {
+            self.reads
+                .lock()
+                .unwrap()
+                .push(target.server_name().to_owned());
+            Ok(Some("host-bearer".to_owned()))
+        }
+
+        async fn interactive_login(
+            &self,
+            target: &meerkat::McpServerIdentity,
+            _www_authenticate: Option<&str>,
+        ) -> Result<String, meerkat::McpOAuthError> {
+            Err(meerkat::McpOAuthError::HumanAuthorizationRequired {
+                server_name: target.server_name().to_owned(),
+            })
+        }
+    }
+
+    /// The CLI loader (`run` and `resume` on an ordinary realm) builds its
+    /// credential source for a stdio server that declares secrets, and that
+    /// source serves the value the realm stored for a server its own
+    /// document lists, refuses an unstored slot as not stored and a server
+    /// no realm document defines (an `mcp.toml` one) as ownerless, and
+    /// leaves every bearer read to the host's OAuth source.
+    #[cfg(all(feature = "mcp", feature = "local-authorization"))]
+    #[tokio::test]
+    async fn the_cli_loader_serves_realm_service_secrets_beside_host_oauth() {
+        use meerkat_core::auth::McpServiceSecretRefusal;
+        const VALUE: &str = "sk-stored-for-the-loader";
+        let (state, seen) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let scope = test_scope(state.path().to_path_buf(), "team");
+        let stored =
+            env_recording_stdio_server("search", "SEARCH_API_KEY", &seen.path().join("search"));
+        let unstored =
+            env_recording_stdio_server("lookup", "LOOKUP_API_KEY", &seen.path().join("lookup"));
+        list_in_realm_document(&scope, &[stored.clone(), unstored.clone()]).await;
+        let auth = in_memory_mcp_auth_persistence();
+        meerkat::set_mcp_service_secret(
+            &cli_resolved_storage(&scope),
+            &auth,
+            &stored,
+            "SEARCH_API_KEY",
+            VALUE,
+        )
+        .await
+        .expect("stored for the listed definition");
+        let mut filed = stored.clone();
+        filed.name = "filed".to_owned();
+
+        let plain =
+            meerkat_core::McpServerConfig::stdio("plain", "true", Vec::new(), HashMap::new());
+        assert!(!cli_mcp_loader_needs_auth_resolver([&plain]));
+        assert!(cli_mcp_loader_needs_auth_resolver([&plain, &stored]));
+
+        let host = Arc::new(HostBearerProbe::default());
+        let resolver = with_cli_realm_service_secrets(&scope, auth.token_store(), host.clone());
+        assert_eq!(
+            resolver
+                .stdio_service_secrets(&stored)
+                .await
+                .expect("the stored value")
+                .into_env()
+                .collect::<Vec<_>>(),
+            vec![("SEARCH_API_KEY".to_owned(), VALUE.to_owned())]
+        );
+        assert_eq!(
+            resolver.stdio_service_secrets(&unstored).await,
+            Err(McpServiceSecretRefusal::NotStored {
+                env: "LOOKUP_API_KEY".to_owned()
+            })
+        );
+        assert_eq!(
+            resolver.stdio_service_secrets(&filed).await,
+            Err(McpServiceSecretRefusal::NoOwner)
+        );
+        let remote = meerkat::McpServerIdentity::from_server_config(
+            "remote",
+            "https://mcp.example.test/mcp",
+        );
+        assert_eq!(
+            resolver
+                .stored_bearer_token(&remote)
+                .await
+                .expect("the host's answer"),
+            Some("host-bearer".to_owned())
+        );
+        assert_eq!(*host.reads.lock().unwrap(), ["remote"]);
+    }
+
+    /// One session with `servers`, created through the CLI's runtime-backed
+    /// composition over the scope realm's persistence, whose factory holds
+    /// `auth` and the host's OAuth source `host`: its MCP router's notices
+    /// once every launch settled.
+    #[cfg(all(unix, feature = "mcp", feature = "local-authorization"))]
+    async fn launch_through_cli_composition(
+        scope: &RuntimeScope,
+        storage: Option<&RuntimeScope>,
+        auth: meerkat_providers::auth_store::ProviderAuthPersistence,
+        host: Arc<dyn meerkat_mcp::McpAuthResolver>,
+        servers: Vec<meerkat_core::McpServerConfig>,
+    ) -> Vec<meerkat_core::ExternalToolDelta> {
+        let (_, persistence) = create_persistence_bundle(scope)
+            .await
+            .expect("the realm's persistence opens");
+        let router = Arc::new(Mutex::new(None));
+        let factory = AgentFactory::new(scope.locator.state_root.join("sessions"))
+            .session_store(persistence.session_store())
+            .builtins(false)
+            .shell(false)
+            .with_provider_auth_persistence(auth)
+            .mcp_auth_resolver(host)
+            .with_mcp_router_observer_for_test({
+                let router = Arc::clone(&router);
+                move |adapter| *router.lock().unwrap() = Some(adapter)
+            });
+        let (service, _runtime_adapter) = build_cli_runtime_backed_service_with_defaults(
+            factory,
+            Config::default(),
+            persistence,
+            scope.locator.state_root.join("config_state.json"),
+            None,
+            None,
+            storage,
+        )
+        .expect("compose the CLI runtime-backed service");
+        let llm: Arc<dyn LlmClient> = Arc::new(CapturingLlmClient::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(None)),
+        ));
+        service
+            .create_session(CreateSessionRequest {
+                injected_context: Vec::new(),
+                model: "gpt-5.4".to_string(),
+                prompt: "seed".to_string().into(),
+                system_prompt: meerkat::SystemPromptOverride::Inherit,
+                max_tokens: Some(32),
+                event_tx: None,
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                deferred_prompt_policy: DeferredPromptPolicy::Discard,
+                build: Some(SessionBuildOptions {
+                    llm_client_override: Some(meerkat::encode_llm_client_override_for_service(llm)),
+                    mcp_servers: servers,
+                    ..SessionBuildOptions::default()
+                }),
+                labels: None,
+            })
+            .await
+            .expect("a failed launch fails alone; the session is created");
+        let adapter = router
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the factory built the session's MCP router");
+        adapter
+            .wait_until_ready(Duration::from_secs(30))
+            .await
+            .expect("every launch settles")
+    }
+
+    /// A loopback HTTP endpoint nothing listens on.
+    #[cfg(all(unix, feature = "mcp", feature = "local-authorization"))]
+    fn closed_loopback_mcp_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+        let port = listener.local_addr().expect("its address").port();
+        format!("http://127.0.0.1:{port}/mcp")
+    }
+
+    /// `run` and `resume` on a governed realm, and the persistent surface,
+    /// launch configured servers through the factory. Through the CLI
+    /// composition a launch receives the value its realm stored for the
+    /// definition the realm's own document lists, an unstored slot is
+    /// refused as not stored with nothing spawned, and an HTTP server's
+    /// bearer read still reaches the host's OAuth source.
+    #[cfg(all(unix, feature = "mcp", feature = "local-authorization"))]
+    #[tokio::test]
+    async fn the_cli_composition_launches_factory_servers_with_realm_service_secrets() {
+        const VALUE: &str = "sk-stored-for-the-factory";
+        let (state, seen) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let scope = test_scope(state.path().to_path_buf(), "team");
+        let (search_seen, lookup_seen) = (seen.path().join("search"), seen.path().join("lookup"));
+        let stored = env_recording_stdio_server("search", "SEARCH_API_KEY", &search_seen);
+        let unstored = env_recording_stdio_server("lookup", "LOOKUP_API_KEY", &lookup_seen);
+        list_in_realm_document(&scope, &[stored.clone(), unstored.clone()]).await;
+        let auth = in_memory_mcp_auth_persistence();
+        meerkat::set_mcp_service_secret(
+            &cli_resolved_storage(&scope),
+            &auth,
+            &stored,
+            "SEARCH_API_KEY",
+            VALUE,
+        )
+        .await
+        .expect("stored for the listed definition");
+        let remote = meerkat_core::McpServerConfig::streamable_http(
+            "remote",
+            closed_loopback_mcp_url(),
+            HashMap::new(),
+        );
+        let host = Arc::new(HostBearerProbe::default());
+
+        let notices = launch_through_cli_composition(
+            &scope,
+            Some(&scope),
+            auth,
+            host.clone(),
+            vec![stored, unstored, remote],
+        )
+        .await;
+
+        assert_eq!(
+            std::fs::read_to_string(&search_seen).expect("the launch ran"),
+            VALUE,
+            "the launch received the stored value"
+        );
+        assert!(!lookup_seen.exists(), "an unstored slot spawns nothing");
+        let not_stored = meerkat_mcp::McpError::ServiceSecretRefused {
+            server: "lookup".to_owned(),
+            refusal: meerkat_core::auth::McpServiceSecretRefusal::NotStored {
+                env: "LOOKUP_API_KEY".to_owned(),
+            },
+        }
+        .to_string();
+        assert!(
+            notices.iter().any(|notice| notice.target == "lookup"
+                && notice.phase == meerkat_core::ExternalToolDeltaPhase::Failed
+                && notice.detail.as_deref() == Some(not_stored.as_str())),
+            "the unstored slot is refused as not stored: {notices:?}"
+        );
+        assert!(
+            host.reads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|read| read == "remote"),
+            "the HTTP server's bearer read reaches the host's OAuth source"
+        );
+    }
+
+    /// Control: the same composition without the realm's storage, as every
+    /// CLI caller composed before, refuses the stored slot as ownerless.
+    #[cfg(all(unix, feature = "mcp", feature = "local-authorization"))]
+    #[tokio::test]
+    async fn without_its_storage_the_cli_composition_refuses_service_secrets_as_ownerless() {
+        let (state, seen) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let scope = test_scope(state.path().to_path_buf(), "team");
+        let search_seen = seen.path().join("search");
+        let stored = env_recording_stdio_server("search", "SEARCH_API_KEY", &search_seen);
+        list_in_realm_document(&scope, std::slice::from_ref(&stored)).await;
+        let auth = in_memory_mcp_auth_persistence();
+        meerkat::set_mcp_service_secret(
+            &cli_resolved_storage(&scope),
+            &auth,
+            &stored,
+            "SEARCH_API_KEY",
+            "sk-stored-but-unreachable",
+        )
+        .await
+        .expect("stored for the listed definition");
+
+        let notices = launch_through_cli_composition(
+            &scope,
+            None,
+            auth,
+            Arc::new(HostBearerProbe::default()),
+            vec![stored],
+        )
+        .await;
+
+        assert!(!search_seen.exists(), "an ownerless slot spawns nothing");
+        let no_owner = meerkat_mcp::McpError::ServiceSecretRefused {
+            server: "search".to_owned(),
+            refusal: meerkat_core::auth::McpServiceSecretRefusal::NoOwner,
+        }
+        .to_string();
+        assert!(
+            notices.iter().any(|notice| notice.target == "search"
+                && notice.detail.as_deref() == Some(no_owner.as_str())),
+            "refused as ownerless: {notices:?}"
+        );
     }
 
     /// A governed workspace realm whose storage cannot open never falls
@@ -29974,6 +30437,7 @@ default_model = "gpt-5.4"
             temp.path().join("config_state.json"),
             None,
             None,
+            None,
         )
         .expect("compose the CLI runtime-backed service");
         let wrapper = MobCliSessionService::new(Arc::clone(&inner));
@@ -30111,6 +30575,7 @@ default_model = "gpt-5.4"
             Config::default(),
             persistence,
             temp.path().join("config_state.json"),
+            None,
             None,
             None,
         )
@@ -30312,6 +30777,7 @@ default_model = "gpt-5.4"
             temp.path().join("config_state.json"),
             None,
             None,
+            None,
         )
         .expect("compose the CLI runtime-backed service");
         let wrapper = Arc::new(MobCliSessionService::new(service));
@@ -30342,6 +30808,7 @@ default_model = "gpt-5.4"
             Config::default(),
             persistence,
             temp.path().join("config_state.json"),
+            None,
             None,
             None,
         )
@@ -30711,6 +31178,7 @@ default_model = "gpt-5.4"
             temp.path().join("config_state.json"),
             None,
             None,
+            None,
         )
         .expect("compose the CLI runtime-backed service");
         let flow = runtime_adapter
@@ -30748,6 +31216,7 @@ default_model = "gpt-5.4"
             Config::default(),
             persistence,
             temp.path().join("config_state.json"),
+            None,
             None,
             None,
         )
@@ -30853,6 +31322,7 @@ default_model = "gpt-5.4"
             Config::default(),
             persistence,
             temp.path().join("config_state.json"),
+            None,
             None,
             None,
         )
