@@ -2462,6 +2462,15 @@ them.
   refuses the launch, and a server only an `mcp.toml` defines is still
   refused as ownerless.
 
+- Runtime-backed hosts keep the OAuth account selected for an MCP server
+  (`oauth_account`) when realm service-secret custody wraps the host's MCP
+  credential source (`RealmMcpServiceSecrets::serve_for`), as every
+  runtime-backed composition with provider-auth persistence does. The
+  custody did not forward `McpAuthResolver::selected_account`, so the
+  account was reported as unavailable, and the stock policy refused each
+  reviewed operation on such a server. A source that states no account
+  still states none through the custody.
+
 - A governed realm whose selected controller is an explicitly authless
   self-hosted server (`auth_method = "none"`) now admits its first input.
   The controller's model selection carries the credential requirement its

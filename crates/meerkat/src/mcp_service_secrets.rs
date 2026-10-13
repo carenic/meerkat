@@ -216,10 +216,11 @@ impl RealmMcpServiceSecrets {
     }
 
     /// `inner` serving this custody's service secrets. Every other method
-    /// (stored and interactive OAuth credentials, the credential realm and
-    /// the HTTP egress profile) is `inner`'s own, and a service-secret answer
-    /// from `inner` other than [`McpServiceSecretRefusal::NoCustody`] stands,
-    /// so an explicit resolver's own custody is never replaced.
+    /// (stored and interactive OAuth credentials, the credential realm, the
+    /// HTTP egress profile and the selected account) is `inner`'s own, and a
+    /// service-secret answer from `inner` other than
+    /// [`McpServiceSecretRefusal::NoCustody`] stands, so an explicit
+    /// resolver's own custody is never replaced.
     #[cfg(feature = "mcp")]
     pub fn serve_for(
         self,
@@ -274,6 +275,13 @@ impl meerkat_mcp::McpAuthResolver for ServiceSecretCustodyResolver {
             Err(McpServiceSecretRefusal::NoCustody) => self.custody.resolve(server).await,
             answered => answered,
         }
+    }
+
+    fn selected_account(
+        &self,
+        target: &meerkat_providers::mcp_oauth::McpServerIdentity,
+    ) -> meerkat_core::OperationAccount {
+        self.inner.selected_account(target)
     }
 }
 
