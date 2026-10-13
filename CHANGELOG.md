@@ -2798,9 +2798,13 @@ them.
   host mount has it, as on the `noexec` `/dev` of Ubuntu 24.04, because a
   remount in the unprivileged namespace may not clear it. A probe child
   whose setup step fails now exits with 64 plus that step's number, for
-  diagnosis; the refusal stays `BackendUnavailable`. Linux positive
-  confinement acceptance stays open until the
-  `make test-mcp-confinement-positive` lane passes on an eligible host.
+  diagnosis; the refusal stays `BackendUnavailable`. The confined process's
+  seccomp filter now admits `ioctl(FIONBIO)`, the `ioctl` form of
+  `O_NONBLOCK` that std uses for nonblocking sockets, so
+  `TcpStream::connect_timeout` works where IP is unrestricted; every other
+  `ioctl` stays refused. Linux positive confinement acceptance stays open
+  until the `make test-mcp-confinement-positive` lane passes on an eligible
+  host.
 
 ### Changed
 

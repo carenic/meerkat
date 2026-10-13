@@ -849,7 +849,6 @@ fn filter(architecture: u32, ip: bool) -> Vec<libc::sock_filter> {
         libc::SYS_capset,
         libc::SYS_setpgid,
         libc::SYS_setsid,
-        libc::SYS_ioctl,
         libc::SYS_kill,
         libc::SYS_tkill,
         libc::SYS_tgkill,
@@ -913,6 +912,18 @@ fn filter(architecture: u32, ip: bool) -> Vec<libc::sock_filter> {
         jump(equal, libc::F_SETFL as u32, 0, 3),
         statement(load, 32),
         jump(bits, libc::O_ASYNC as u32, 0, 1),
+        statement(ret, refuse),
+        statement(ret, allow),
+    ]);
+    // ioctl reaches terminal, device and filesystem controls (TIOCSTI input
+    // injection, FIOASYNC signal ownership and more), so every command is
+    // refused except FIONBIO: the ioctl form of O_NONBLOCK on the caller's own
+    // descriptor, which std uses for nonblocking sockets. The kernel reads
+    // the command as 32 bits, so the low word of the argument decides.
+    code.extend([
+        jump(equal, libc::SYS_ioctl as u32, 0, 4),
+        statement(load, 24),
+        jump(equal, libc::FIONBIO as u32, 1, 0),
         statement(ret, refuse),
         statement(ret, allow),
     ]);
@@ -1224,5 +1235,92 @@ mod tests {
         );
         let host = unsafe { host.assume_init() };
         assert_eq!(null.noexec, (host.f_flag & libc::ST_NOEXEC) != 0);
+    }
+
+    // Runs `program` on one native syscall the way the kernel does and
+    // returns its action. Covers exactly the instructions `filter` emits.
+    fn run_filter(
+        program: &[libc::sock_filter],
+        architecture: u32,
+        nr: u32,
+        args: [u64; 6],
+    ) -> u32 {
+        let load = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
+        let equal = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
+        let bits = (libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16;
+        let ret = (libc::BPF_RET | libc::BPF_K) as u16;
+        // struct seccomp_data: nr, arch, instruction pointer, six arguments.
+        let mut data = [0_u8; 64];
+        data[0..4].copy_from_slice(&nr.to_ne_bytes());
+        data[4..8].copy_from_slice(&architecture.to_ne_bytes());
+        for (index, argument) in args.iter().enumerate() {
+            data[16 + 8 * index..24 + 8 * index].copy_from_slice(&argument.to_ne_bytes());
+        }
+        let mut accumulator = 0_u32;
+        let mut counter = 0;
+        loop {
+            let instruction = program[counter];
+            let skip = match instruction.code {
+                code if code == load => {
+                    let offset = instruction.k as usize;
+                    accumulator = u32::from_ne_bytes(data[offset..offset + 4].try_into().unwrap());
+                    0
+                }
+                code if code == equal => {
+                    if accumulator == instruction.k {
+                        instruction.jt
+                    } else {
+                        instruction.jf
+                    }
+                }
+                code if code == bits => {
+                    if accumulator & instruction.k != 0 {
+                        instruction.jt
+                    } else {
+                        instruction.jf
+                    }
+                }
+                code if code == ret => return instruction.k,
+                code => unreachable!("filter emits no instruction {code:#x}"),
+            };
+            counter += 1 + usize::from(skip);
+        }
+    }
+
+    /// ioctl admits only FIONBIO, the ioctl form of O_NONBLOCK that std uses
+    /// for nonblocking sockets; every other command stays refused, whatever
+    /// the IP policy.
+    #[test]
+    fn seccomp_admits_only_fionbio_among_ioctl_commands() {
+        let Some(architecture) = native_audit_arch() else {
+            return;
+        };
+        let refuse = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
+        let fionbio = u64::from(libc::FIONBIO as u32);
+        for ip in [false, true] {
+            let program = filter(architecture, ip);
+            let ioctl = |command: u64| {
+                run_filter(
+                    &program,
+                    architecture,
+                    libc::SYS_ioctl as u32,
+                    [0, command, 0, 0, 0, 0],
+                )
+            };
+            assert_eq!(ioctl(fionbio), libc::SECCOMP_RET_ALLOW);
+            // The kernel takes the command as 32 bits.
+            assert_eq!(ioctl((1 << 32) | fionbio), libc::SECCOMP_RET_ALLOW);
+            for command in [libc::FIOASYNC, libc::TIOCSTI, libc::FIONREAD, libc::FIOCLEX] {
+                assert_eq!(ioctl(u64::from(command as u32)), refuse);
+            }
+            assert_eq!(
+                run_filter(&program, architecture, libc::SYS_getpid as u32, [0; 6]),
+                libc::SECCOMP_RET_ALLOW
+            );
+            assert_eq!(
+                run_filter(&program, architecture, libc::SYS_mount as u32, [0; 6]),
+                refuse
+            );
+        }
     }
 }
