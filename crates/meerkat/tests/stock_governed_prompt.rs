@@ -299,7 +299,7 @@ async fn open_as(root: &Path, agent: &str, model: Arc<ScriptedModel>) -> StockRe
     )
     .await
     .expect("the governed realm opens");
-    compose(root, agent, model, bundle)
+    compose(root, agent, model, bundle).await
 }
 
 /// Open the governed realm as the default agent for a trusted host whose
@@ -323,12 +323,12 @@ async fn open_for_host(
     )
     .await
     .expect("the governed realm opens for the host");
-    compose(root, DEFAULT_STOCK_AGENT, model, bundle)
+    compose(root, DEFAULT_STOCK_AGENT, model, bundle).await
 }
 
 /// The persistent runtime-backed service and the real factory over an
 /// opened stock realm.
-fn compose(
+async fn compose(
     root: &Path,
     agent: &str,
     model: Arc<ScriptedModel>,
@@ -352,11 +352,13 @@ fn compose(
     .expect("compose the runtime-backed service");
     // The realm's one owner holds its scripted controller credential from
     // the open: published once, for this fixture's own identity.
-    meerkat_core::publish_token_lifecycle_acquired_for_identity(
+    meerkat_core::publish_token_lifecycle_acquired_for_identity_within(
         &machine.generated_auth_lease_handle(),
         model.selection().credential(),
         &meerkat_core::auth::PersistedTokens::api_key("synthetic-stock-prompt-credential"),
+        tokio::time::Instant::now() + WAIT,
     )
+    .await
     .expect("controller credential");
     StockRealm {
         model,
@@ -818,7 +820,8 @@ fn server_call_params(log: &Path) -> Vec<(String, Value)> {
 /// refusing its non-waiting controller-custody open while busy ("current
 /// schema catalog is not ready without waiting", once "database is
 /// locked"). That is neither a global credential lifecycle rule nor a rule
-/// about pinned controllers.
+/// about pinned controllers. Publishing at open meets the same busy custody
+/// under load, so the open retries only that typed Busy refusal, until WAIT.
 static CONTROLLER_CREDENTIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn catalog() -> BTreeSet<String> {

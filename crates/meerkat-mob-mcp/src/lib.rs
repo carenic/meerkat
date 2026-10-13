@@ -16588,6 +16588,18 @@ mod tests {
             .await
             .expect_err("the held reader keeps the storage cleanup outstanding");
         drop(reader);
+        // Dropping the reader only asks its observer's watch worker to stop; a
+        // catch-up read still in flight reopens the WAL. Settle it the way the
+        // destroy's own retry does, before the replacement takes the path.
+        let path = storage_path.clone();
+        MobMcpState::observer_drain_settled(
+            tokio::task::spawn_blocking(move || {
+                meerkat_mob::SqliteMobStores::drain_observers(&path)
+            })
+            .await
+            .expect("observer drain thread"),
+        )
+        .expect("nothing of the dropped reader's observer keeps running");
         // Renamed over the path, so the replacement never shares the
         // destroyed database's inode.
         let staged = storage_path.with_extension("replacement");
@@ -16635,6 +16647,18 @@ mod tests {
             .await
             .expect_err("the held reader keeps the storage cleanup outstanding");
         drop(reader);
+        // Dropping the reader only asks its observer's watch worker to stop; a
+        // catch-up read still in flight reopens the WAL. Settle it the way the
+        // destroy's own retry does, before planting the obstacle.
+        let path = storage_path.clone();
+        MobMcpState::observer_drain_settled(
+            tokio::task::spawn_blocking(move || {
+                meerkat_mob::SqliteMobStores::drain_observers(&path)
+            })
+            .await
+            .expect("observer drain thread"),
+        )
+        .expect("nothing of the dropped reader's observer keeps running");
         let [_, wal, _] = MobMcpState::storage_file_paths(&storage_path);
         if wal.exists() {
             std::fs::remove_file(&wal).expect("clear the WAL sidecar");
