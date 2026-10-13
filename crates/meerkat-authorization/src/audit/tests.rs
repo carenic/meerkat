@@ -431,3 +431,306 @@ fn mandatory_hook_withholding_reaches_the_sink_without_policy_or_preparation() {
         meerkat_authorization_contracts::audit::SafeAuditObservation::MandatoryHookWithheld
     );
 }
+
+// One bounded rebuild of the audited preparation, as the publication states
+// for `observe`: "The caller may rebuild once; it must not relabel old facts
+// with a newer stamp." The scripted owner publishes an owner change during the
+// attempts its script names, then answers that attempt's outcome.
+
+struct RebuildClock;
+impl LocalAuthorizationClock for RebuildClock {
+    fn now(&self) -> Result<crate::work::LocalAuthorizationTime, crate::clock::LocalClockError> {
+        Ok(crate::work::LocalAuthorizationTime {
+            unix_ms: 1,
+            monotonic: meerkat_core::time_compat::Instant::now(),
+        })
+    }
+}
+
+struct RebuildDecision;
+impl PreparedOperationAuthorization for RebuildDecision {
+    fn review_tier(&self) -> meerkat_core::authorization::OperationReviewTier {
+        meerkat_core::authorization::OperationReviewTier::R1
+    }
+
+    fn check_current(
+        &self,
+        _: &PreparedAuthorizationBinding,
+    ) -> Result<(), OperationAuthorizationError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RebuildOutcome {
+    Prepared,
+    Refused(OperationRefusalKind),
+    Unavailable,
+    ObservationUnavailable,
+}
+
+struct ScriptedInner {
+    publication: LocalAuthorizationPublication,
+    /// Per attempt: whether it publishes an owner change, then its answer.
+    script: Vec<(bool, RebuildOutcome)>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl WorkAuthorization for ScriptedInner {
+    fn prepare(
+        &self,
+        _: &PreparedAuthorizationBinding,
+    ) -> Result<Arc<dyn PreparedOperationAuthorization>, OperationAuthorizationError> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (publishes, outcome) = self
+            .script
+            .get(call)
+            .copied()
+            .expect("no attempt beyond the script");
+        if publishes {
+            drop(
+                self.publication
+                    .begin_owner_change()
+                    .expect("actual publication"),
+            );
+        }
+        match outcome {
+            RebuildOutcome::Prepared => Ok(Arc::new(RebuildDecision)),
+            RebuildOutcome::Refused(kind) => Err(OperationRefused::new(kind).into()),
+            RebuildOutcome::Unavailable => Err(OperationAuthorizationError::Unavailable),
+            RebuildOutcome::ObservationUnavailable => Err(
+                OperationAuthorizationError::ObservationUnavailable(OperationObservationError),
+            ),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RecordingSink(std::sync::Mutex<Vec<AuthorizationAuditObservation>>);
+impl AuthorizationAuditSink for RecordingSink {
+    fn append(
+        &self,
+        observation: AuthorizationAuditObservation,
+    ) -> Result<(), OperationObservationError> {
+        self.0.lock().expect("observations").push(observation);
+        Ok(())
+    }
+}
+
+/// The scripted preparation's result, the attempts the inner owner saw,
+/// every record the sink received, and the prepared operation's id.
+struct ScriptedPreparation {
+    result: Result<Arc<dyn PreparedOperationAuthorization>, OperationAuthorizationError>,
+    attempts: usize,
+    records: Vec<AuthorizationAuditObservation>,
+    operation_id: OperationId,
+}
+
+fn prepare_scripted(script: Vec<(bool, RebuildOutcome)>) -> ScriptedPreparation {
+    let publication = LocalAuthorizationPublication::new();
+    let inner = Arc::new(ScriptedInner {
+        publication: publication.clone(),
+        script,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let sink = Arc::new(RecordingSink::default());
+    let work = AuditedWorkAuthorization {
+        inner: inner.clone(),
+        associations: Vec::new().into(),
+        publication,
+        clock: Arc::new(RebuildClock),
+        sink: sink.clone(),
+    };
+    let binding = PreparedAuthorizationBinding::new(OperationAuthorizationFacts {
+        operation_id: OperationId::new(),
+        execution_scope: OperationExecutionScope::Domain,
+        run_id: None,
+        context_revision: None,
+        operation: AuthorizationOperation::Source(SourceAuthorizationFacts {
+            target: SourceAuthorizationTarget::External(OwnerQualifiedTarget {
+                authority: PrincipalRef::in_domain(
+                    PrincipalKind::ServiceAccount,
+                    "owner",
+                    TrustDomainId::new("domain").expect("domain"),
+                )
+                .expect("principal"),
+                namespace: "fixture".into(),
+                id: "fixture".into(),
+            }),
+            usage: SourceAuthorizationUse::Read,
+        }),
+    });
+    let result = work.prepare(&binding);
+    let records = sink.0.lock().expect("observations").clone();
+    ScriptedPreparation {
+        result,
+        attempts: inner.calls.load(std::sync::atomic::Ordering::SeqCst),
+        records,
+        operation_id: binding.facts().operation_id.clone(),
+    }
+}
+
+#[test]
+fn one_owner_change_during_preparation_is_rebuilt_once_and_recorded_once() {
+    let prepared = prepare_scripted(vec![
+        (true, RebuildOutcome::Prepared),
+        (false, RebuildOutcome::Prepared),
+    ]);
+    assert!(
+        prepared.result.is_ok(),
+        "one concurrent owner change is rebuilt from current owners"
+    );
+    assert_eq!(prepared.attempts, 2, "exactly one rebuild");
+    assert_eq!(
+        prepared.records.len(),
+        1,
+        "only the final attempt is recorded"
+    );
+    assert_eq!(prepared.records[0].operation_id, prepared.operation_id);
+    assert!(
+        matches!(
+            &prepared.records[0].observation,
+            AuditObservation::Prepared { policy, .. } if policy.publication_sequence == 2
+        ),
+        "one Prepared record carrying the rebuilt attempt's own stamp"
+    );
+}
+
+#[test]
+fn a_second_owner_change_still_refuses_with_one_refused_record() {
+    let prepared = prepare_scripted(vec![
+        (true, RebuildOutcome::Prepared),
+        (true, RebuildOutcome::Prepared),
+    ]);
+    assert!(matches!(
+        prepared.result,
+        Err(OperationAuthorizationError::Refused(refusal))
+            if refusal.kind() == OperationRefusalKind::ReprepareRequired
+    ));
+    assert_eq!(prepared.attempts, 2, "one rebuild, then fail closed");
+    assert_eq!(
+        prepared.records.len(),
+        1,
+        "only the final attempt is recorded"
+    );
+    assert_eq!(prepared.records[0].operation_id, prepared.operation_id);
+    assert!(matches!(
+        prepared.records[0].observation,
+        AuditObservation::Refused {
+            reason: OperationRefusalKind::ReprepareRequired,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn known_infrastructure_failure_during_an_owner_change_is_not_rebuilt() {
+    let unavailable = prepare_scripted(vec![(true, RebuildOutcome::Unavailable)]);
+    assert!(matches!(
+        unavailable.result,
+        Err(OperationAuthorizationError::Unavailable)
+    ));
+    assert_eq!(unavailable.attempts, 1, "no retry of failed infrastructure");
+    assert_eq!(unavailable.records.len(), 1);
+    assert!(matches!(
+        unavailable.records[0].observation,
+        AuditObservation::AuthorizationUnavailable { .. }
+    ));
+
+    let unobserved = prepare_scripted(vec![(true, RebuildOutcome::ObservationUnavailable)]);
+    assert!(matches!(
+        unobserved.result,
+        Err(OperationAuthorizationError::ObservationUnavailable(_))
+    ));
+    assert_eq!(unobserved.attempts, 1, "no retry of failed infrastructure");
+    assert!(unobserved.records.is_empty());
+}
+
+#[test]
+fn infrastructure_failure_on_the_rebuild_is_kept_and_not_retried_again() {
+    let unavailable = prepare_scripted(vec![
+        (true, RebuildOutcome::Prepared),
+        (false, RebuildOutcome::Unavailable),
+    ]);
+    assert!(matches!(
+        unavailable.result,
+        Err(OperationAuthorizationError::Unavailable)
+    ));
+    assert_eq!(unavailable.attempts, 2);
+    assert_eq!(unavailable.records.len(), 1);
+    assert!(matches!(
+        unavailable.records[0].observation,
+        AuditObservation::AuthorizationUnavailable { .. }
+    ));
+
+    let unobserved = prepare_scripted(vec![
+        (true, RebuildOutcome::Prepared),
+        (false, RebuildOutcome::ObservationUnavailable),
+    ]);
+    assert!(matches!(
+        unobserved.result,
+        Err(OperationAuthorizationError::ObservationUnavailable(_))
+    ));
+    assert_eq!(unobserved.attempts, 2);
+    assert!(unobserved.records.is_empty());
+}
+
+#[test]
+fn a_coherent_policy_refusal_is_final_and_not_rebuilt() {
+    for kind in [
+        OperationRefusalKind::Denied,
+        OperationRefusalKind::MalformedFacts,
+    ] {
+        let refused = prepare_scripted(vec![(false, RebuildOutcome::Refused(kind))]);
+        assert!(matches!(
+            refused.result,
+            Err(OperationAuthorizationError::Refused(refusal)) if refusal.kind() == kind
+        ));
+        assert_eq!(refused.attempts, 1, "no retry of a coherent refusal");
+        assert_eq!(refused.records.len(), 1);
+        assert!(matches!(
+            refused.records[0].observation,
+            AuditObservation::Refused { reason, .. } if reason == kind
+        ));
+    }
+}
+
+#[test]
+fn the_rebuild_answers_from_current_owners_not_from_the_changed_read() {
+    // A revocation published during the first read is honored.
+    let revoked = prepare_scripted(vec![
+        (true, RebuildOutcome::Prepared),
+        (false, RebuildOutcome::Refused(OperationRefusalKind::Denied)),
+    ]);
+    assert!(
+        matches!(
+            revoked.result,
+            Err(OperationAuthorizationError::Refused(refusal))
+                if refusal.kind() == OperationRefusalKind::Denied
+        ),
+        "the rebuilt read refuses"
+    );
+    assert_eq!(revoked.attempts, 2);
+    assert_eq!(revoked.records.len(), 1);
+    assert!(matches!(
+        revoked.records[0].observation,
+        AuditObservation::Refused {
+            reason: OperationRefusalKind::Denied,
+            ..
+        }
+    ));
+
+    // A refusal read during an owner change is no verdict; the current owners
+    // answer.
+    let granted = prepare_scripted(vec![
+        (true, RebuildOutcome::Refused(OperationRefusalKind::Denied)),
+        (false, RebuildOutcome::Prepared),
+    ]);
+    assert!(granted.result.is_ok());
+    assert_eq!(granted.attempts, 2);
+    assert_eq!(granted.records.len(), 1);
+    assert!(matches!(
+        &granted.records[0].observation,
+        AuditObservation::Prepared { policy, .. } if policy.publication_sequence == 2
+    ));
+}

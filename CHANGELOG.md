@@ -2492,6 +2492,18 @@ them.
   `additionalProperties` that is not a boolean, a root `required` that is not
   an array of strings, and an empty root `oneOf` or `anyOf` are refused with a
   typed error naming the tool; an empty root `allOf` is removed.
+- `meerkat-authorization`: an operation prepared under audited local
+  authorization while an owner change was being published is no longer
+  refused with `reprepare_required` because of that change alone. The audited
+  preparation now rebuilds once from the current owners, as the publication
+  contract allows, and records only the final attempt: one `Prepared` record
+  under that attempt's own publication stamp, or one `Refused` record.
+  Before, any owner change during a preparation refused it, even one the
+  authorization compiler had already recovered from. A second change during
+  the rebuild still refuses with `reprepare_required`. Unavailable
+  authorization and an unavailable observation are never retried, and a
+  `denied` or `malformed_facts` refusal read under a stable publication is
+  final.
 
 ### Changed
 

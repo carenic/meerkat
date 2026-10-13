@@ -116,32 +116,50 @@ impl WorkAuthorization for AuditedWorkAuthorization {
         let result =
             (|| -> Result<Arc<dyn PreparedOperationAuthorization>, OperationAuthorizationError> {
                 let target = Arc::new(target(binding));
-                let now = match self.clock.now() {
-                    Ok(now) => now,
-                    Err(_) => {
-                        self.sink.append(observation(
-                            binding,
-                            AuditObservation::AuthorizationUnavailable { target },
-                        ))?;
-                        return Err(OperationAuthorizationError::Unavailable);
+                // On a concurrent owner change the publication contract is: "The
+                // caller may rebuild once; it must not relabel old facts with a
+                // newer stamp" (publication.rs). So a changed attempt is rebuilt
+                // once, from a fresh clock read, and only the final attempt is
+                // classified and recorded below, under its own stamp.
+                let mut rebuilt = false;
+                let (now, known_failure, observed) = loop {
+                    let now = match self.clock.now() {
+                        Ok(now) => now,
+                        Err(_) => {
+                            self.sink.append(observation(
+                                binding,
+                                AuditObservation::AuthorizationUnavailable { target },
+                            ))?;
+                            return Err(OperationAuthorizationError::Unavailable);
+                        }
+                    };
+                    // This enclosing observation binds the audit's diagnostic revision to
+                    // the same successful compiler read. It cannot retag an old decision.
+                    // A changed stamp invalidates policy data, but must not erase a known
+                    // infrastructure failure or turn it into another refusal to observe.
+                    let mut known_failure = None;
+                    let observed = self.publication.observe(|| {
+                        let result = self.inner.prepare(binding);
+                        if matches!(
+                            result,
+                            Err(OperationAuthorizationError::Unavailable
+                                | OperationAuthorizationError::ObservationUnavailable(_))
+                        ) {
+                            known_failure = result.as_ref().err().copied();
+                        }
+                        result
+                    });
+                    // A known infrastructure failure is never retried, and a
+                    // second change refuses below.
+                    if !rebuilt
+                        && known_failure.is_none()
+                        && matches!(observed, Err(PublicationError::Changed))
+                    {
+                        rebuilt = true;
+                        continue;
                     }
+                    break (now, known_failure, observed);
                 };
-                // This enclosing observation binds the audit's diagnostic revision to
-                // the same successful compiler read. It cannot retag an old decision.
-                // A changed stamp invalidates policy data, but must not erase a known
-                // infrastructure failure or turn it into another refusal to observe.
-                let mut known_failure = None;
-                let observed = self.publication.observe(|| {
-                    let result = self.inner.prepare(binding);
-                    if matches!(
-                        result,
-                        Err(OperationAuthorizationError::Unavailable
-                            | OperationAuthorizationError::ObservationUnavailable(_))
-                    ) {
-                        known_failure = result.as_ref().err().copied();
-                    }
-                    result
-                });
                 let (result, revision) = if let Some(error) = known_failure {
                     (Err(error), None)
                 } else {
