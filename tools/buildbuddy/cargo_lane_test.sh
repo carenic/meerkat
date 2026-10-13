@@ -153,12 +153,12 @@ run_feature_matrix_lane() {
       "${CARGO}" check -p meerkat-mob --no-default-features --features runtime-adapter
       ;;
     # As `make test-feature-matrix-lib` runs it: nextest, one process per
-    # test. The suite relies on process-per-test isolation (see the Native
-    # unit lanes in BUILD.bazel); in one `cargo test` process, interference
-    # between concurrent tests failed the 0.9 graph (a reviewed connector's
-    # grant refused as ConfigurationUnavailable, head-canonical brain-swap
-    # turns past their 5 s settle budget), and local runs failed a different
-    # set each time. They all pass under nextest.
+    # test (see the Native unit lanes in BUILD.bazel). Run as one `cargo test`
+    # process, the 0.9 graph failed tests that pass in isolation (a reviewed
+    # connector's grant refused as ConfigurationUnavailable, head-canonical
+    # brain-swap turns past their 5 s settle budget), and local single-process
+    # runs failed a different set each time; the cause is not established.
+    # Under nextest the whole selection passed locally.
     test-feature-matrix-meerkat-all-providers-tests)
       configure_cargo_nextest
       export_mcp_test_server_fixture

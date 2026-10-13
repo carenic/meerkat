@@ -30,9 +30,7 @@ name: CI
 #   governed-jsonl  - exact three non-MCP native-authorized JSONL tests on Rust changes
 #   mcp-confinement-positive - the Linux positive confinement cases: 6 MCP,
 #                     2 command-hook, 21 sandbox and 4 shell
-#                     (make test-mcp-confinement-positive) on Rust changes;
-#                     advisory: it runs and reports, but does not fail the
-#                     run or the CI gate (see the job)
+#                     (make test-mcp-confinement-positive) on Rust changes
 #   integration     - (xN) the tests/*.rs binaries of each integration
 #                     suite whose trigger packages or paths changed
 #                     (INTEGRATION_SUITES in scripts/ci-cargo-lanes.mjs):
@@ -890,13 +888,7 @@ jobs:
     # step before the tests prints the restriction and a matching shell
     # probe, records the setting, lifts it and must then pass the same
     # probe; an always() step after the tests restores the recorded value.
-    # Advisory for now: with the restriction lifted the shell probe passes,
-    # but the native backend still refuses every case with
-    # BackendUnavailable on the hosted runner. Until the lane runs on a
-    # runner where the backend is available, a failure here is reported
-    # (a warning in the CI gate) and does not fail the run or the gate.
     if: ${{ needs.changes.outputs.rust_changed == 'true' }}
-    continue-on-error: true
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
@@ -1972,10 +1964,7 @@ jobs:
             require_ran "Clippy" "${CLIPPY_RESULT}"
             require_ran "Closure check" "${CLOSURE_CHECK_RESULT}"
             require_ran "Governed JSONL" "${GOVERNED_JSONL_RESULT}"
-            # Advisory lane (see the mcp-confinement-positive job): report, never fail.
-            if [[ "${MCP_CONFINEMENT_POSITIVE_RESULT}" != "success" ]]; then
-              echo "::warning title=MCP confinement positive (advisory)::the positive confinement lane did not succeed (result: ${MCP_CONFINEMENT_POSITIVE_RESULT}); it does not fail the CI gate."
-            fi
+            require_ran "MCP confinement positive" "${MCP_CONFINEMENT_POSITIVE_RESULT}"
             if [[ "${FEATURE_CHECK_COUNT}" =~ ^[0-9]+$ ]] && (( FEATURE_CHECK_COUNT > 0 )); then
               require_ran "Feature combinations" "${FEATURE_CHECK_RESULT}"
             elif [[ "${FEATURE_CHECK_COUNT}" =~ ^[0-9]+$ ]]; then
