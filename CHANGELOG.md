@@ -2515,7 +2515,9 @@ them.
   updated" instead of repeating counters that cannot tell the two apart. The
   `tool_config_changed` event and its `deferred_catalog_delta` payload are
   unchanged: `removed_hidden_names` and the status counts still cover both
-  cases. Notices already stored in a session keep their original text.
+  cases. Stored notice bodies and typed payloads are not rewritten; retained
+  deferred-catalog blocks use the updated summary when projected into model
+  context.
 
 ### Changed
 
