@@ -882,8 +882,11 @@ jobs:
     # The Linux positive confinement cases (6 MCP supported-native, 2
     # command-hook, 21 sandbox and 4 shell) are ignored on Linux in the unit
     # lanes; this lane selects exactly them. A backend refusal fails it,
-    # and so does a selection of zero tests. Runner eligibility for direct
-    # user namespaces, mounts and seccomp is not established yet.
+    # and so does a selection of zero tests. On ubuntu-24.04 the native
+    # backend's probe needs an unprivileged user+mount+IPC namespace that
+    # AppArmor restricts by default. The step before the tests prints the
+    # restriction and a matching shell probe, lifts the restriction on this
+    # ephemeral runner only, and must then pass the same probe.
     if: ${{ needs.changes.outputs.rust_changed == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -918,6 +921,33 @@ jobs:
 
       - name: Install nextest
         uses: taiki-e/install-action@nextest
+
+      - name: Confinement eligibility on this runner (evidence before and after)
+        shell: bash
+        run: |
+          # Mirrors the backend probe up to its chroot: user+mount+IPC
+          # namespaces, root uid/gid map with setgroups denied, private
+          # propagation, a tmpfs, and read-only bind remounts of a
+          # directory and of a device node.
+          probe() {
+            unshare --user --map-root-user --mount --ipc --propagation private sh -euc '
+              mount -t tmpfs -o mode=0755,size=16m tmpfs /tmp
+              mkdir /tmp/usr
+              touch /tmp/null
+              mount --bind /usr /tmp/usr
+              mount -o remount,bind,ro,nosuid,nodev /tmp/usr
+              mount --bind /dev/null /tmp/null
+              mount -o remount,bind,ro,nosuid /tmp/null
+            '
+          }
+          echo "kernel: $(uname -r); apparmor label: $(cat /proc/self/attr/current 2>/dev/null || echo unknown)"
+          for path in / /dev /tmp; do findmnt -no TARGET,FSTYPE,OPTIONS --target "$path" || true; done
+          echo "BEFORE: $(sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces 2>&1 | tr '\n' ' ')"
+          if probe; then echo "BEFORE: namespace probe ok"; else echo "BEFORE: namespace probe refused (rc=$?)"; fi
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          echo "AFTER: $(sysctl kernel.apparmor_restrict_unprivileged_userns)"
+          probe
+          echo "AFTER: namespace probe ok"
 
       - name: MCP confinement positive acceptance
         shell: bash
