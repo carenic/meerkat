@@ -35,19 +35,6 @@ them.
 
 ## [Unreleased]
 
-### Fixed
-
-- The CLI launches a realm-defined MCP stdio server with the service secrets
-  its realm stored for the server's declared `secret_env` slots. It refused
-  every declared slot before: the MCP loader of `rkat run` and `rkat resume`
-  on an ordinary realm held no service-secret custody, and the servers
-  launched through the CLI's runtime-backed composition (such as a governed
-  realm's configured servers) were refused as ownerless, because that
-  composition's configuration is a snapshot. Both now read the realm's own
-  config documents and the CLI's credential store. An unstored slot still
-  refuses the launch, and a server only an `mcp.toml` defines is still
-  refused as ownerless.
-
 ## [0.9.0] - 2026-10-13
 
 ### Breaking
@@ -2463,6 +2450,17 @@ them.
   turn, as the shared runtime-backed executor does, instead of every
   governed prompt being refused as "governed executor support is
   unavailable".
+
+- The CLI launches a realm-defined MCP stdio server with the service secrets
+  its realm stored for the server's declared `secret_env` slots. It refused
+  every declared slot before: the MCP loader of `rkat run` and `rkat resume`
+  on an ordinary realm held no service-secret custody, and the servers
+  launched through the CLI's runtime-backed composition (such as a governed
+  realm's configured servers) were refused as ownerless, because that
+  composition's configuration is a snapshot. Both now read the realm's own
+  config documents and the CLI's credential store. An unstored slot still
+  refuses the launch, and a server only an `mcp.toml` defines is still
+  refused as ownerless.
 
 - A governed realm whose selected controller is an explicitly authless
   self-hosted server (`auth_method = "none"`) now admits its first input.
