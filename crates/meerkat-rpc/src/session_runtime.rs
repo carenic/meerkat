@@ -7441,6 +7441,68 @@ impl SessionRuntime {
             })
     }
 
+    /// Whether work this runtime routes to `witness`, a session's committed
+    /// executor attachment on `adapter`, reaches an owner that publishes it:
+    /// this runtime, through its exact publication authority for that
+    /// attachment, or, for a mob member, the member's own mob runtime, whose
+    /// exact publisher for the attachment serves the live actor the mob
+    /// published to this runtime. An attachment served by neither is refused.
+    async fn require_attachment_publication_authority(
+        self: &Arc<Self>,
+        adapter: &Arc<MeerkatMachine>,
+        witness: &meerkat_runtime::RuntimeExecutorAttachmentWitness,
+    ) -> Result<(), RpcError> {
+        let missing = match self.runtime_publication_handle_for_attachment(witness) {
+            Ok(_) => return Ok(()),
+            Err(missing) => missing,
+        };
+        #[cfg(feature = "mob")]
+        if self.mob_actor_publishes_attachment(adapter, witness).await {
+            return Ok(());
+        }
+        #[cfg(not(feature = "mob"))]
+        let _ = adapter;
+        Err(missing)
+    }
+
+    /// Whether `witness` is the attachment a mob member's own mob runtime
+    /// published for the live actor the mob published to this runtime. The
+    /// mob must own the session, and the machine's exact publisher for the
+    /// attachment (same machine, epoch and attachment, with its retained
+    /// capability) must serve that very actor. The publisher and the actor's
+    /// liveness are read after the awaited ownership queries, so an
+    /// attachment replaced or an actor revoked meanwhile is refused.
+    #[cfg(feature = "mob")]
+    async fn mob_actor_publishes_attachment(
+        self: &Arc<Self>,
+        adapter: &Arc<MeerkatMachine>,
+        witness: &meerkat_runtime::RuntimeExecutorAttachmentWitness,
+    ) -> bool {
+        let session_id = witness.session_id();
+        let Some(mob_state) = self.mob_state() else {
+            return false;
+        };
+        let Ok(actor_witness) = self.mob_actor_witness(session_id) else {
+            return false;
+        };
+        let owned = mob_state.owns_live_bridge_session(session_id).await
+            || mob_state.owns_persisted_bridge_session(session_id).await;
+        if !owned {
+            return false;
+        }
+        let Ok(publisher) = adapter
+            .publication_handle_for_executor_attachment(witness)
+            .await
+        else {
+            return false;
+        };
+        let actor = actor_witness.executor_actor_identity();
+        publisher
+            .actor_identity()
+            .is_some_and(|serving| serving.is_same_actor(&actor))
+            && actor.is_live()
+    }
+
     fn actor_publication_refresh_callback(
         &self,
         session_id: &SessionId,
@@ -7692,11 +7754,12 @@ impl SessionRuntime {
         //
         // Executor presence is not readiness: reuse needs the same exact
         // committed attachment and publication authority the boundary-held
-        // path below checks. An attachment still pending its commit, or one
-        // without this runtime's exact publication authority, joins that
-        // path, which waits for the attaching owner and checks again. This
-        // check takes no turn boundary: a running turn holds it for its whole
-        // lap, and input admission must not queue behind the turn.
+        // path below checks (this runtime's, or a mob member's own runtime's).
+        // An attachment still pending its commit, or one without that
+        // authority, joins that path, which waits for the attaching owner and
+        // checks again. This check takes no turn boundary: a running turn
+        // holds it for its whole lap, and input admission must not queue
+        // behind the turn.
         if adapter
             .session_has_executor(session_id)
             .await
@@ -7705,7 +7768,8 @@ impl SessionRuntime {
                 .current_executor_attachment_witness(session_id)
                 .await
             && self
-                .runtime_publication_handle_for_attachment(&witness)
+                .require_attachment_publication_authority(adapter, &witness)
+                .await
                 .is_ok()
         {
             self.continuation_bindings.source_custody_changed();
@@ -7755,7 +7819,8 @@ impl SessionRuntime {
                     ),
                     data: None,
                 })?;
-            self.runtime_publication_handle_for_attachment(&witness)?;
+            self.require_attachment_publication_authority(adapter, &witness)
+                .await?;
             self.continuation_bindings.source_custody_changed();
             return Ok(());
         }
@@ -7795,7 +7860,8 @@ impl SessionRuntime {
                 }
             }
             meerkat_runtime::EnsureRuntimeExecutorAttachment::Existing(witness) => {
-                self.runtime_publication_handle_for_attachment(&witness)?;
+                self.require_attachment_publication_authority(adapter, &witness)
+                    .await?;
             }
         }
         // Fresh or reused, the session is served by the exact attachment this
@@ -21678,6 +21744,171 @@ mod tests {
             *source_changes.borrow(),
             before,
             "a refused reuse announces nothing"
+        );
+    }
+
+    /// A mob member's executor is attached by the member's own mob runtime,
+    /// so this runtime holds no publication authority of its own for it.
+    /// Reuse needs the machine's exact publisher for that attachment to serve
+    /// the live actor the mob published to this runtime: then it serves, and
+    /// announces once. An attachment whose publisher serves another actor, or
+    /// a same-ID attachment of another machine, is refused and announces
+    /// nothing.
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn a_mob_members_own_attachment_is_reused_only_through_its_exact_publisher() {
+        use meerkat_core::lifecycle::core_executor::CoreExecutor;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime = make_runtime_with_runtime_store(temp_factory(&temp), 10);
+        let mob_state = rpc_mob_state_with_realm(&runtime);
+        runtime.set_mob_state(Arc::clone(&mob_state));
+        // Unique per test: the mob id names the process-global in-process
+        // supervisor participant.
+        let mut definition = meerkat_mob::MobDefinition::explicit(meerkat_mob::MobId::from(
+            format!("rpc-mob-own-attachment-{}", uuid::Uuid::new_v4().simple()),
+        ));
+        definition.profiles.insert(
+            meerkat_mob::ProfileName::from("worker"),
+            meerkat_mob::ProfileBinding::Inline(Box::new(meerkat_mob::Profile {
+                model_fallback: None,
+                model: "claude-sonnet-4-5".to_string(),
+                provider: None,
+                self_hosted_server_id: None,
+                image_generation_provider: None,
+                auto_compact_threshold: None,
+                resume_overrides: Vec::new(),
+                skills: Vec::new(),
+                tools: meerkat_mob::ToolConfig {
+                    comms: true,
+                    ..meerkat_mob::ToolConfig::default()
+                },
+                peer_description: "worker".to_string(),
+                external_addressable: false,
+                backend: None,
+                runtime_mode: meerkat_mob::MobRuntimeMode::TurnDriven,
+                max_inline_peer_notifications: None,
+                output_schema: None,
+                provider_params: None,
+            })),
+        );
+        let mob_id = mob_state
+            .mob_create_definition(definition)
+            .await
+            .expect("create the mob");
+        let mut members = Vec::new();
+        for name in ["worker-1", "worker-2"] {
+            mob_state
+                .mob_spawn_spec(&mob_id, meerkat_mob::SpawnMemberSpec::new("worker", name))
+                .await
+                .expect("spawn a turn-driven member");
+            let status = mob_state
+                .mob_member_status(&mob_id, &meerkat_mob::AgentIdentity::from(name))
+                .await
+                .expect("member status");
+            members.push(
+                status
+                    .current_session_id
+                    .expect("a turn-driven member has a session"),
+            );
+        }
+        let (member, other) = (&members[0], &members[1]);
+
+        let attachment = runtime
+            .runtime_adapter
+            .current_executor_attachment_witness(member)
+            .await
+            .expect("the member's own mob runtime attached its executor");
+        assert!(
+            runtime
+                .runtime_publication_handle_for_attachment(&attachment)
+                .is_err(),
+            "this runtime published nothing for the member's attachment"
+        );
+        let source_changes = runtime.continuation_bindings().subscribe_source_changes();
+        let announced = || *source_changes.borrow();
+
+        let before = announced();
+        runtime
+            .ensure_runtime_executor(member)
+            .await
+            .expect("the member's attachment serves the actor its mob published");
+        assert_eq!(
+            announced(),
+            before + 1,
+            "the reuse announces its custody once"
+        );
+
+        // The other member's actor in place of the one the mob published for
+        // this member: the attachment's publisher serves another actor.
+        let published = runtime
+            .mob_actor_witness(member)
+            .expect("the mob published the member's live actor");
+        let other_actor = runtime
+            .mob_actor_witness(other)
+            .expect("the mob published the other member's live actor");
+        runtime
+            .mob_actor_witnesses
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(member.clone(), other_actor);
+        let before = announced();
+        let refused = runtime
+            .ensure_runtime_executor(member)
+            .await
+            .expect_err("an attachment whose publisher serves another actor is refused");
+        assert_eq!(refused.code, error::INTERNAL_ERROR);
+        assert_eq!(announced(), before, "a refused reuse announces nothing");
+        runtime
+            .mob_actor_witnesses
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(member.clone(), published);
+        runtime
+            .ensure_runtime_executor(member)
+            .await
+            .expect("the member's own actor is served again");
+
+        // The same session attached on another machine: its witness names no
+        // attachment of this runtime's machine.
+        let foreign_machine = Arc::new(MeerkatMachine::ephemeral());
+        let foreign_runtime = Arc::clone(&runtime);
+        let foreign_session_id = member.clone();
+        let foreign = match foreign_machine
+            .ensure_session_with_executor_factory(member.clone(), move |_witness| {
+                Box::new(
+                    crate::session_executor::SessionRuntimeExecutor::new_for_actor_slot(
+                        foreign_runtime,
+                        foreign_session_id,
+                        meerkat::LiveSessionActorWitnessSlot::default(),
+                    ),
+                ) as Box<dyn CoreExecutor>
+            })
+            .await
+            .expect("prepare a same-ID attachment on another machine")
+        {
+            meerkat_runtime::EnsureRuntimeExecutorAttachment::Pending(pending) => pending
+                .commit()
+                .await
+                .expect("commit the same-ID attachment"),
+            meerkat_runtime::EnsureRuntimeExecutorAttachment::Existing(_) => {
+                panic!("another machine mints its own attachment")
+            }
+        };
+        runtime
+            .require_attachment_publication_authority(&runtime.runtime_adapter, &attachment)
+            .await
+            .expect("the member's own attachment is still served");
+        let before = announced();
+        let refused = runtime
+            .require_attachment_publication_authority(&runtime.runtime_adapter, &foreign)
+            .await
+            .expect_err("a same-ID attachment of another machine is refused");
+        assert_eq!(refused.code, error::INTERNAL_ERROR);
+        assert_eq!(
+            announced(),
+            before,
+            "a refused attachment announces nothing"
         );
     }
 
