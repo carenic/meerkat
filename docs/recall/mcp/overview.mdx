@@ -1,0 +1,197 @@
+---
+title: MCP Overview
+description: Connect an agent, choose a tool profile, and handle readiness and tool results correctly.
+icon: plug
+---
+
+Meerkat Recall exposes knowledge operations through MCP over Streamable HTTP. An
+agent can discover tool schemas, submit evidence, search the graph, and inspect
+cited context using the caller's space and permissions.
+
+## Connect
+
+Start a server using the [quickstart](/recall/quickstart), then configure your client's
+**HTTP MCP** connection with:
+
+```text
+http://localhost:3000/mcp
+```
+
+Send `Authorization: Bearer <token>` when authentication is enabled. The token
+must authorize the requested operations. Send `X-Space-Id` to explicitly select
+one authorized named space; a multi-space token does not select its first entry.
+Current local grants intersect the signed ceiling on each request. In local
+`SKIP_AUTH` mode, `X-Space-Id` selects the development principal's space.
+
+`meerkat-recall serve` runs an HTTP server. The separate `elephant-local-helper` is a
+stdio service for client-side file ingestion. The server's Full-profile file
+tools read paths on the **server**; the helper reads paths on the **client**.
+See [ingesting data](/recall/guides/ingesting-data) before choosing either path.
+
+For remote connections, configure `MCP_ALLOWED_HOSTS`; browser clients may also
+need `MCP_ALLOWED_ORIGINS`. These are transport protections, separate from data
+authorization. See [deployment](/recall/operations/deployment).
+
+### Try calls from a terminal
+
+The [MCP Inspector CLI](https://github.com/modelcontextprotocol/inspector/blob/main/clients/cli/README.md)
+handles initialization and tool calls. Install Node.js 22.19 or newer, then
+define this helper. It uses the same `TOKEN` as the HTTP examples; leave it
+unset only for local `SKIP_AUTH` development.
+
+```bash
+export MCP_URL="http://127.0.0.1:3000/mcp"
+
+elephant_mcp() {
+  if [ -n "${TOKEN:-}" ]; then
+    npx --yes @modelcontextprotocol/inspector@2.8.0 \
+      --cli "$MCP_URL" \
+      --transport http --stored-auth-only --format json \
+      --header "Authorization: Bearer $TOKEN" "$@"
+  else
+    npx --yes @modelcontextprotocol/inspector@2.8.0 \
+      --cli "$MCP_URL" \
+      --transport http --stored-auth-only --format json "$@"
+  fi
+}
+
+elephant_mcp --method tools/list
+elephant_mcp --method tools/call \
+  --tool-name get_runtime_status
+```
+
+Check the returned status before ingesting. Inspector wraps the MCP response
+in `result`; inspect its error/content fields as described below. To call a
+tool with an argument object, use `--tool-args-json`:
+
+```bash
+elephant_mcp --method tools/call --tool-name search_all \
+  --tool-args-json '{"query":"Project Cedar","limit":5}'
+```
+
+Change `MCP_URL` to the desired profile endpoint, then list its tools again.
+These commands connect directly to your Meerkat Recall server; they do not require
+an Inspector web session.
+
+## Choose a profile
+
+A profile limits the available operations. It does not grant permission to
+perform them. Use `tools/list` on the connected endpoint to discover its current
+schemas; runtime state and authorization can further restrict the surface.
+
+| Endpoint | Use it for | Important boundary |
+| --- | --- | --- |
+| `/mcp` | Everyday ingest, discovery, entity context, provenance, and timeline access | Curated tools; does not include all document or assertion reads |
+| `/mcp/agent` | Read-only graph and evidence access, including extraction agents | No direct writes or runtime configuration |
+| `/mcp/maintenance` | Read tools plus identity, predicates, wiki, source freshness, and maintenance operations | No general document ingestion or entity creation |
+| `/mcp/full` | Operator and application integrations needing the complete core registry | Requires the same data authorization as other profiles; not a superset of every Default-only convenience handler |
+
+The internal Pipeline profile provides work-queue operations to Rust callers;
+there is no `/mcp/pipeline` HTTP endpoint. Per-tool profile labels live in the
+[tool reference](/recall/mcp/tools).
+
+The Default `get_provenance` handler checks the complete authorized evidence
+chain, including original assertions, revisions, nodes and parent documents.
+Missing or inaccessible evidence refuses the request; it does not return a
+partial chain. Raw excerpts require raw-document authority. See
+[security boundaries](/recall/concepts/security#authorization-boundaries).
+
+## Check readiness before ingesting
+
+Call `get_runtime_status` with `{}` first. It remains available even before
+storage is configured.
+
+| Observed state | What it means | Next action |
+| --- | --- | --- |
+| Cannot connect | No usable transport connection | Check the process, URL, proxy, and transport host settings |
+| `bootstrap_mode: true` | No effective runtime configuration | An eligible administrator can use `initialize_runtime` with its discovered schema |
+| `configured: true`, `semantic_ingest_ready: false` | Configuration exists, but semantic ingest is unavailable | Inspect `issues`, storage, workers, and extractor readiness |
+| `semantic_ingest_ready: true` | The semantic ingest gate is open | Rediscover tools, then submit evidence and track processing |
+
+Runtime environment settings such as `ELEPHANT_DB` or `SURREALDB_URL` select
+configured mode. They do not automatically make the extractor ready. If the
+extractor connects to Meerkat Recall's own `/mcp/agent`, startup retries after the
+listener binds; a brief initial `extractor_ready: false` can be expected.
+
+Ingest tools are hidden while semantic ingest is unavailable. Configuration
+reads and writes have separate permission checks: `get_runtime_config` requires
+system read or write permission, while `configure_runtime` and
+`initialize_runtime` require system write permission (or development bypass).
+The Agent profile only exposes runtime status.
+
+## Make a call and interpret the result
+
+After MCP initialization, this is a `tools/call` request body:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "search_all",
+    "arguments": {"query": "Project Cedar", "limit": 5}
+  }
+}
+```
+
+An MCP client library normally handles the protocol envelope. Tool reference
+examples show only the `arguments` object.
+
+Meerkat Recall has several result layers. Check each layer instead of treating a
+successful HTTP request as a successful operation:
+
+1. A transport or JSON-RPC error means the request failed before a usable tool
+   result was returned.
+2. An MCP result with `isError: true` means dispatch or execution failed. Read
+   its content for the error.
+3. Many core handlers return JSON in a text content block using the following
+   Meerkat Recall envelope. Check `ok` before consuming `data`.
+
+```json
+{
+  "ok": true,
+  "data": {}
+}
+```
+
+Absent optional fields are omitted. For a Meerkat Recall-level failure, `ok` is
+`false` and `error` contains the reason; do not require null-valued optional keys.
+Runtime-control tools return their own JSON response directly; do not require
+this envelope for `get_runtime_status` or configuration calls. Consult the
+specific tool for its data shape.
+
+Search results are scoped and filtered. An empty bucket can mean there is no
+match visible to this principal. Unified search can also report per-bucket
+errors; inspect them before interpreting an empty result as absence.
+
+## Use the Rust dispatcher
+
+Embedded callers can invoke the same handlers without HTTP. They must supply a
+trusted principal and configured storage; these constructors do not authenticate
+users or supply the managed server's runtime-control tools.
+
+```rust
+use elephant_mcp::create_default_dispatcher;
+use elephant_policy::Principal;
+use elephant_storage::StorageClient;
+use serde_json::json;
+
+async fn search(
+    storage: StorageClient,
+    principal: Principal,
+) -> elephant_mcp::McpResult<serde_json::Value> {
+    let dispatcher = create_default_dispatcher(storage, principal);
+    dispatcher.execute("search_all", json!({
+        "query": "Project Cedar",
+        "limit": 10
+    })).await
+}
+```
+
+Other constructors include `create_agent_dispatcher`,
+`create_maintenance_dispatcher`, and `create_dispatcher` for the Full registry.
+
+Continue with [MCP workflows](/recall/mcp/workflows) for complete tasks or use the
+[tool reference](/recall/mcp/tools) to look up arguments. Application code that needs
+HTTP status codes, resource routes, or SSE can use the [HTTP API](/recall/api/overview).

@@ -1,0 +1,244 @@
+---
+title: "Assertions"
+description: "Query and manage assertions extracted from documents in the Meerkat Recall knowledge pipeline."
+icon: "check-double"
+---
+
+## Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/v1/assertions/search` | Search assertions with filters |
+| POST | `/v1/assertions` | Create manual assertion |
+| GET | `/v1/assertions/{id}` | Get assertion by ID |
+| PATCH | `/v1/assertions/{id}/resolution` | Update resolution status |
+| DELETE | `/v1/assertions/{id}` | Soft-delete an assertion |
+| POST | `/v1/assertions/{id}/restore` | Restore a soft-deleted assertion |
+
+Assertions are source claims with evidence spans and resolved identity links.
+Resolution status describes processing of the claim; `resolved` does not prove
+that the claim is true. See [assertion concepts](/recall/concepts/assertions) for the
+lifecycle and the distinction from truth maintenance.
+
+---
+
+## Search Assertions
+
+`POST /v1/assertions/search`
+
+Search assertions using text or resolved entity links, with optional status,
+source, and predicate filters. Prefer identity filters when you already know
+the entity; text search also helps find unresolved mentions.
+
+Search requires `read:assertion`; a missing scope returns `403` even when no
+records match. Results, counts, and pagination are computed after record
+authorization, including searches filtered by entity links.
+
+`total` counts authorized matches in the current scan. Without a text query,
+it counts matches remaining after the supplied cursor; with a text query,
+it counts all authorized matches before the page offset is applied. Continue
+with the returned `cursor` unchanged and the same filters while `has_more` is
+`true`.
+
+<ParamField body="query" type="string">
+  Text query over subject, predicate, object text, and object literal.
+</ParamField>
+
+<ParamField body="entity_id" type="string">
+  Resolved entity ID appearing as either subject or object.
+</ParamField>
+
+<ParamField body="subject_entity" type="string">
+  Resolved subject entity ID.
+</ParamField>
+
+<ParamField body="object_entity" type="string">
+  Resolved object entity ID.
+</ParamField>
+
+<ParamField body="status" type="string">
+  Filter by resolution status. One of: `pending`, `resolved`, `partial`, `abstained`, `failed`, `superseded`.
+</ParamField>
+
+<ParamField body="source_id" type="string">
+  Filter by source record ID.
+</ParamField>
+
+<ParamField body="predicate" type="string">
+  Filter by predicate string (e.g., `works_at`).
+</ParamField>
+
+<ParamField body="include_deleted" type="boolean" default="false">
+  Include soft-deleted assertions.
+</ParamField>
+
+<ParamField body="limit" type="integer" default="50">
+  Maximum results to return.
+</ParamField>
+
+<ParamField body="cursor" type="string">
+  Pagination cursor from a previous response.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl -X POST http://localhost:3000/v1/assertions/search \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"status": "pending", "limit": 10}'
+```
+
+```json Response
+{
+  "results": [
+    {
+      "id": "assertion:550e8400-...",
+      "space_id": "default",
+      "subject_text": "Alex Chen",
+      "predicate_raw": "works_at",
+      "object_text": "NeuralFlow",
+      "resolution_status": "pending",
+      "created_at": "2026-01-20T09:00:00Z"
+    }
+  ],
+  "cursor": null,
+  "has_more": false,
+  "total": 1
+}
+```
+</CodeGroup>
+
+---
+
+## Create Assertion
+
+`POST /v1/assertions` accepts a complete `Assertion` record and returns `201`
+with the stored record. It does not generate evidence or queue extraction from
+a three-field claim. Prefer [document ingestion](/recall/api/documents) when adding
+new source material.
+
+The JSON body must include the [common record fields](/recall/api/entities#entity-wire-format)
+(`id`, `space_id`, `created_at`, `updated_at`, `created_by`, `provenance`, and
+`security`) plus these assertion fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `subject_text` | string | Raw subject mention |
+| `predicate_raw` | string | Predicate text |
+| `object_text` | string, optional | Object mention for an entity claim |
+| `object_literal` | JSON, optional | Literal value for an attribute claim |
+| `evidence` | object | Real document evidence span |
+| `observed_at` | timestamp | When the source was observed |
+| `asserted_at` | timestamp | When the claim was produced |
+| `assertion_key` | string | Stable deduplication key |
+
+`evidence` requires `revision` (a document revision record ID), `start`, `end`,
+and `quote_hash`; `node` is optional. Supply verified offsets and a hash of the
+actual source quote. Do not invent provenance to satisfy this schema.
+
+Optional fields include `predicate_id`, `source_event_time`, `resolution_status`
+(default `pending`), `subject_entity`, `object_entity`, `confidence`, and resolution
+metadata. Returned search/get examples below are abbreviated; full records
+include all required fields.
+
+---
+
+## Get Assertion
+
+`GET /v1/assertions/{id}`
+
+Retrieve a single assertion by its ID.
+
+<ParamField path="id" type="string" required>
+  Assertion record ID (e.g., `assertion:550e8400-...`).
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl http://localhost:3000/v1/assertions/assertion:550e8400-e29b-41d4-a716-446655440000 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+{
+  "id": "assertion:550e8400-...",
+  "subject_text": "Alex Chen",
+  "predicate_raw": "works_at",
+  "object_text": "NeuralFlow",
+  "resolution_status": "resolved",
+  "subject_entity": "entity:aaa...",
+  "object_entity": "entity:bbb..."
+}
+```
+</CodeGroup>
+
+---
+
+## Delete and restore
+
+`DELETE /v1/assertions/{id}` requires `write:assertion` and record write
+authorization. It sets `deleted_at` and returns `204` without a record body.
+Ordinary reads then return `404`; search excludes the record unless the caller
+requests `include_deleted` and is authorized to read it. Deleting an already
+deleted or missing assertion returns `404`.
+
+`POST /v1/assertions/{id}/restore` clears the soft-deletion marker and returns
+the assertion as JSON. It requires both `write:assertion` and `read:assertion`
+with their record checks before changing the row. A write-only caller receives
+`403`, including when the requested row is already active. A missing row in the
+caller's space returns `404`. Restoration retains the existing security
+classification and evidence; it does not create a new extraction or adjudicate
+the claim.
+
+Delete, restore, and resolution updates can return `409` if authorization
+fields or the soft-deletion marker change before the write. See
+[authorization conflicts](/recall/api/overview#authorization-conflicts).
+
+## Update Resolution Status
+
+`PATCH /v1/assertions/{id}/resolution`
+
+Update the resolution status of an existing assertion. Because the response
+contains the existing assertion's content, this route requires both
+`write:assertion` and `read:assertion` with their record checks before changing
+the status. A write-only caller receives `403` without a status change.
+Changing this field alone does not resolve entity references, generate evidence,
+or perform truth adjudication.
+
+The update writes the resolution status and supplied rationale without replacing
+security, subjects, entity links, or evidence. Omitting `rationale` keeps the
+stored `retry_state.abstention_reason` unchanged.
+
+<ParamField path="id" type="string" required>
+  Assertion record ID.
+</ParamField>
+
+<ParamField body="status" type="string" required>
+  New resolution status. One of: `pending`, `resolved`, `partial`, `abstained`, `failed`, `superseded`.
+</ParamField>
+
+<ParamField body="rationale" type="string">
+  Optional rationale for the status change.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl -X PATCH http://localhost:3000/v1/assertions/assertion:550e8400-.../resolution \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "status": "resolved",
+    "rationale": "Confirmed via official company records"
+  }'
+```
+
+```json Response
+{
+  "id": "assertion:550e8400-...",
+  "resolution_status": "resolved",
+  "retry_state": {
+    "abstention_reason": "Confirmed via official company records"
+  }
+}
+```
+</CodeGroup>

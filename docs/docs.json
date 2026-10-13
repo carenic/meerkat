@@ -329,6 +329,133 @@
             ]
           }
         ]
+      },
+      {
+        "product": "Recall",
+        "description": "Shared, evidence-backed knowledge for applications and agents through HTTP and MCP.",
+        "icon": "brain",
+        "tabs": [
+          {
+            "tab": "Documentation",
+            "groups": [
+              {
+                "group": "Getting started",
+                "pages": [
+                  "recall/introduction",
+                  "recall/installation",
+                  "recall/quickstart"
+                ]
+              },
+              {
+                "group": "Core concepts",
+                "pages": [
+                  "recall/concepts/overview",
+                  "recall/concepts/spaces",
+                  "recall/concepts/entities",
+                  "recall/concepts/relationships",
+                  "recall/concepts/documents",
+                  "recall/concepts/assertions",
+                  "recall/concepts/events",
+                  "recall/concepts/truth-maintenance",
+                  "recall/concepts/predicates",
+                  "recall/concepts/security"
+                ]
+              },
+              {
+                "group": "By example",
+                "pages": [
+                  "recall/guides/putting-it-together",
+                  "recall/guides/putting-it-together-part2"
+                ]
+              },
+              {
+                "group": "Guides",
+                "pages": [
+                  "recall/guides/ingesting-data",
+                  "recall/guides/searching",
+                  "recall/guides/building-graphs",
+                  "recall/guides/truth-slots",
+                  "recall/guides/event-streaming"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "API, MCP & CLI",
+            "groups": [
+              {
+                "group": "HTTP API",
+                "pages": [
+                  "recall/api/overview",
+                  "recall/api/entities",
+                  "recall/api/documents",
+                  "recall/api/relationships",
+                  "recall/api/assertions",
+                  "recall/api/sources",
+                  "recall/api/predicates",
+                  "recall/api/system"
+                ]
+              },
+              {
+                "group": "MCP",
+                "pages": [
+                  "recall/mcp/overview",
+                  "recall/mcp/tools",
+                  "recall/mcp/workflows"
+                ]
+              },
+              {
+                "group": "Command line",
+                "pages": [
+                  "recall/cli/overview"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Pipeline & Architecture",
+            "groups": [
+              {
+                "group": "Pipeline",
+                "pages": [
+                  "recall/pipeline/overview",
+                  "recall/pipeline/extraction",
+                  "recall/pipeline/truth-maintenance",
+                  "recall/pipeline/work-queue"
+                ]
+              },
+              {
+                "group": "Architecture",
+                "pages": [
+                  "recall/architecture/overview",
+                  "recall/architecture/domain-model",
+                  "recall/architecture/living-wiki"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Developer Reference",
+            "groups": [
+              {
+                "group": "Operations",
+                "pages": [
+                  "recall/operations/service-setup",
+                  "recall/operations/deployment",
+                  "recall/operations/observability"
+                ]
+              },
+              {
+                "group": "Contributing",
+                "pages": [
+                  "recall/operations/development",
+                  "recall/operations/scenarios",
+                  "recall/operations/surrealdb-patterns"
+                ]
+              }
+            ]
+          }
+        ]
       }
     ]
   },

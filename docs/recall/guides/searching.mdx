@@ -1,0 +1,307 @@
+---
+title: "Searching"
+description: "How to search documents, entities, and relationships using text, vector similarity, and unified search."
+icon: "magnifying-glass"
+---
+
+Meerkat Recall supports text search, vector similarity search, and a unified search that spans all record types. This guide covers each approach. Examples use fictional data. HTTP examples
+assume local `SKIP_AUTH` development; authenticated instances require an
+`Authorization: Bearer <token>` header. MCP tool availability depends on the
+[endpoint profile](/recall/mcp/overview).
+
+## Search an exact source revision
+
+Use `POST /v1/spaces/{space}/search` or MCP `search_scoped` for explicit source
+coverage and byte-addressed evidence:
+
+```json
+{
+  "query": "Who owns the test plan?",
+  "ranking_mode": "hybrid",
+  "limit": 5,
+  "source_revision_constraints": {"meeting-42":"r1"}
+}
+```
+
+Select the authorized named space and use `read:doc:raw`. The response contains
+`results`, `coverage` and `partial`; evidence binds source/revision, exact quotes
+and half-open UTF-8 byte spans. Rendered evidence also identifies its immutable
+rendered revision. `complete` coverage with zero results can mean no match;
+pending, stale, missing or withdrawn coverage does not establish that conclusion.
+
+Choose `lexical`, `semantic` or `hybrid` explicitly. Lexical needs no model;
+semantic requires an approved indexed profile and does not silently fall back
+to lexical results. The retained `search_docs` route below has a different
+compatibility contract and reports any fallback explicitly. Do not infer the
+scoped API's coverage from those legacy aggregate results.
+
+## Choose the question before the search
+
+| Question | Start with | Inspect next |
+|---|---|---|
+| Which records mention this topic? | `search_all` | The returned type buckets |
+| Which document discusses this idea? | `search_docs` | Actual search mode and document evidence |
+| Which entity is this? | `search_entities` | Type, identity, and context |
+| What claims are linked to a known entity? | `search_assertions` with `entity_id` | Assertion evidence and resolution status |
+| What does the graph currently say? | `get_entity_context_bundle` and truth slots | Relationship provenance and current-value state |
+
+Results are limited to the caller's authorized space and records. An empty
+result is not proof that no matching record exists elsewhere or behind a
+clearance boundary. Keep IDs from search results for subsequent reads.
+Multiword document and assertion text queries apply the selected space and
+soft-deletion conditions to the entire term expression, including result-count
+queries. Term matching does not widen the authorized space.
+
+## Vector similarity search
+
+Search documents using embedding-based similarity. The query is embedded using the space's configured model and matched against document chunk vectors.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "query": "quarterly revenue projections",
+      "k": 5
+    }
+    ```
+    Tool: `search_docs`
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    curl -s -X POST http://localhost:3000/v1/docs/search \
+      -H "content-type: application/json" \
+      -d '{
+        "space_id": "default",
+        "query": "quarterly revenue projections",
+        "k": 5,
+        "limit": 5
+      }'
+    ```
+  </Tab>
+</Tabs>
+
+MCP `search_docs` reports the path actually used in `data.mode`:
+
+| Mode | Meaning |
+|---|---|
+| `semantic` | Document candidates came from embedding similarity |
+| `semantic+lexical` | Lexical matches were blended with semantic candidates |
+| `lexical-fallback` | Semantic search was unavailable or failed and text search was used |
+
+Inspect `data.items`, which contain a document redaction envelope and a score.
+Scores rank search results; they are not probabilities that the document's
+claims are true. A successful lexical fallback should not be described to a
+reader as embedding-based evidence.
+
+Governed embeddings bind an immutable provider/model/preprocessing profile.
+The full-input preprocessing mode preserves all input through bounded segmentation
+and aggregation; exact-input mode refuses an oversized input instead of silently
+embedding a prefix. Provider limits or unavailable approvals can make semantic
+search unavailable. A progressing worker is not proof that every pending record
+already has an embedding. See [processing approvals](/recall/operations/service-setup#approve-processing).
+
+The REST route enters semantic mode only when both `query` and `k` are present.
+Omit `k` for a lexical query. Its response shape differs from the MCP envelope;
+see [Documents](/recall/api/documents).
+
+## Filter by collection
+
+Organize documents into collections via metadata and filter searches to a specific collection.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "query": "security incident",
+      "k": 10,
+      "filters": {
+        "collection": "incident-reports"
+      }
+    }
+    ```
+    Tool: `search_docs`
+  </Tab>
+  <Tab title="REST limitation">
+    The REST document search request does not accept a collection filter.
+    Use MCP `search_docs` for a collection-restricted search. A `filters`
+    object sent to the REST route is not applied.
+  </Tab>
+</Tabs>
+
+To see all available collections, use the `list_doc_collections` tool with an empty input (`{}`).
+
+## Search entities
+
+Find entities by name, type, or free-text query. Filter by `entity_type` to narrow results.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "query": "Alex Chen",
+      "filters": { "entity_type": "person" },
+      "limit": 10
+    }
+    ```
+    Tool: `search_entities`
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    curl -s -X POST http://localhost:3000/v1/entities/search \
+      -H "content-type: application/json" \
+      -d '{
+        "query": "Alex Chen",
+        "space_id": "default",
+        "entity_type": "person",
+        "limit": 10
+      }'
+    ```
+  </Tab>
+</Tabs>
+
+For the SurrealDB backend, MCP entity search can reuse a vector snapshot for
+up to 60 seconds, keyed by space and vector dimension. New or changed vectors
+may therefore take that long to affect ranking. Search reloads current entity
+records and applies the caller's record authorization; the snapshot does not
+cache access decisions. Identity resolution uses the uncached path so that
+newly created entities remain immediately eligible for resolution.
+
+## Unified search with search_all
+
+Search across entities, documents, sources, and relationships in a single call. Use the `include` array to restrict which record types are searched.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "query": "Acme Corp funding",
+      "limit": 10,
+      "include": ["entities", "docs", "relationships"]
+    }
+    ```
+    Tool: `search_all`
+  </Tab>
+  <Tab title="REST alternatives">
+    There is no `/v1/search` REST route. Call the individual document, entity,
+    source, and relationship search routes or use MCP `search_all`.
+  </Tab>
+</Tabs>
+
+The tool envelope's `data` contains separate buckets for each requested type.
+For example, a no-match result can contain:
+
+```json
+{
+  "entities": { "items": [], "has_more": false },
+  "docs": { "items": [], "has_more": false },
+  "relationships": { "items": [], "has_more": false }
+}
+```
+
+<Note>
+  If you omit the `include` parameter, all four types (entities, docs, sources, relationships) are searched.
+</Note>
+
+## Search assertions
+
+When the entity is already known, use its returned ID to retrieve resolved
+assertions directly. This avoids a broad text scan and preserves identity even
+when names have changed. On MCP, call `search_assertions`:
+
+```json
+{
+  "entity_id": "<returned entity ID>",
+  "limit": 25
+}
+```
+
+`entity_id` matches resolved subject or object links. To investigate unresolved
+mentions, search text across subject, predicate, and object fields instead:
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "query": "works at",
+      "limit": 10
+    }
+    ```
+    Tool: `search_assertions`
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    curl -s -X POST http://localhost:3000/v1/assertions/search \
+      -H "content-type: application/json" \
+      -d '{ "query": "works at", "limit": 10 }'
+    ```
+  </Tab>
+</Tabs>
+
+## Entity context bundles
+
+Get a bounded view of an entity for a profile or model context. MCP limits
+sections independently and applies the historical window to ended
+relationships/attributes, assertions, and events. Do not interpret this bundle
+as a complete relationship or evidence export. The REST context route has a
+separate, smaller response shape.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "id": "entity:550e8400-e29b-41d4-a716-446655440000",
+      "window": 30,
+      "limit": 10
+    }
+    ```
+    Tool: `get_entity_context_bundle`
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    curl -s "http://localhost:3000/v1/entities/$ENTITY_ID/context?window_days=30&event_limit=10"
+    ```
+  </Tab>
+</Tabs>
+
+For the REST example, set `ENTITY_ID` to the complete ID returned by search.
+The bundle returns:
+
+| Field | Description |
+|---|---|
+| `entity` | The entity record |
+| `outgoing_relations` | Relationships where this entity is the subject |
+| `incoming_relations` | Relationships where this entity is the object |
+| `recent_events` (REST) / `events` (MCP) | Authorized timeline context |
+| `stats` (MCP) | Counts and the effective time window |
+
+<Accordion title="Advanced: include deleted records">
+  For MCP `search_docs` and `search_entities`, set
+  `filters.include_deleted: true`; `search_all` uses top-level
+  `include_deleted: true`. REST search routes use top-level `include_deleted`. This is useful for audit trails.
+</Accordion>
+
+## Turn a result into a supported answer
+
+The `get_provenance` convenience path below is restricted to trusted callers
+entitled to all content in the space. It currently lacks per-record clearance
+checks on returned evidence. For restricted readers, inspect claims and
+documents through individually authorized read tools. See
+[security boundaries](/recall/concepts/security#authorization-boundaries).
+
+1. Read the selected document or entity rather than answering from its title.
+2. For a graph relationship, use `get_provenance` on the Default profile
+   to inspect its assertion and immutable source quote.
+3. Check truth-slot and temporal state before describing a historical claim as
+   current.
+4. Retain uncertainty when evidence is absent, redacted, or conflicting.
+
+If a known document is missing, first check the caller's space, permissions,
+collection filter, deleted state, and pipeline status. Then inspect the search
+mode and try an exact phrase from the source. Re-ingestion is not a retrieval
+troubleshooting step.
+
+## Next steps
+
+- [Building graphs](/recall/guides/building-graphs) -- Create entities and relationships
+- [Truth slots](/recall/guides/truth-slots) -- Inspect how assertions compete for ground truth
+- [Event streaming](/recall/guides/event-streaming) -- Monitor system and domain events

@@ -1,0 +1,264 @@
+---
+title: "MCP Workflows"
+description: "Chain tool results into evidence retrieval, ingestion, identity review, and predicate governance."
+icon: "list-check"
+---
+
+Use these workflows when you already have an MCP client connected to Meerkat Recall.
+Each JSON block contains the arguments for the named tool. Your MCP client wraps
+those arguments in a `tools/call` request. Angle-bracket values are placeholders:
+replace them with complete IDs returned by earlier calls.
+
+## Choose the profile for the whole workflow
+
+Profiles expose different tool sets; they are not interchangeable roles. A
+visible tool still requires the principal's operation scopes, clearances, and
+space authorization. Check `tools/list` on your actual connection.
+
+| Workflow | Endpoint | Why |
+|---|---|---|
+| Search, entity context, and graph provenance | `/mcp` | `get_provenance` is registered only on Default |
+| Read documents and assertions | `/mcp/agent`, `/mcp/maintenance`, or `/mcp/full` | These include `get_doc` and assertion reads |
+| Ingest and inspect document pipeline status | `/mcp/full` | Default ingests, but does not expose `get_doc_pipeline_status` |
+| Review and merge duplicate identities | `/mcp/maintenance` or `/mcp/full` | Requires maintenance writes |
+| Validate and approve a staged predicate artifact | `/mcp/full` | Validation is a Full-profile tool |
+
+Check MCP errors and, for core handlers, the Meerkat Recall response envelope:
+`ok: false` is a failed operation even if transport succeeded. Carry values from
+`data` only after success. Runtime-control tools such as `get_runtime_status`
+return JSON directly, without this envelope. Keep the same authenticated space
+throughout a workflow. See [response handling](/recall/mcp/overview#make-a-call-and-interpret-the-result).
+
+## Retrieve an answer with its evidence
+
+Use the default `/mcp` endpoint for this workflow. `get_provenance` is
+registered there and is not exposed by the Full dispatcher. This convenience
+path is for trusted callers entitled to **all content in the space**: the
+current provenance handler does not enforce per-record clearance on every
+returned evidence record. See [security boundaries](/recall/concepts/security#authorization-boundaries).
+For readers with restricted clearances, use individually authorized assertion
+and document reads on Agent, Maintenance, or Full.
+
+<Steps>
+  <Step title="Find the subject">
+    Call `search_entities`:
+
+    ```json
+    {
+      "query": "Cedar API",
+      "limit": 10
+    }
+    ```
+
+    Inspect the names and types in `data.items`. Select the intended entity and
+    save its complete ID. Matching names alone do not establish identity.
+  </Step>
+  <Step title="Read its context">
+    Call `get_entity_context_bundle`:
+
+    ```json
+    {
+      "id": "<selected entity ID>",
+      "window": 30,
+      "limit": 10
+    }
+    ```
+
+    Inspect the entity, relationships, attributes, truth slots, events,
+    assertions, freshness, and statistics. Sections are bounded by `limit`;
+    the historical window affects ended relationships/attributes, assertions,
+    and events. This is a context sample, not a complete evidence export.
+  </Step>
+  <Step title="Trace a relevant relationship">
+    Copy a returned relationship's ID into `get_provenance`:
+
+    ```json
+    {
+      "id": "<returned relationship ID>"
+    }
+    ```
+
+    Read `data.chain` for the linked assertions, immutable revision spans, and
+    available source quotes. The tool accepts relationship and attribute IDs,
+    not an entity ID.
+  </Step>
+  <Step title="Answer only what the evidence supports">
+    Use the source quote to verify the relationship's meaning. Include relevant
+    time or uncertainty qualifications. If the graph has no evidence links,
+    report that limit instead of treating the relationship as a verified quote.
+  </Step>
+</Steps>
+
+When you do not know whether a result is an entity, source, document, or
+relationship, start with `search_all` and inspect its separate result buckets.
+See [Searching](/recall/guides/searching) for choosing a retrieval method.
+
+## Ingest and verify a document
+
+Use `/mcp/full` to run every step on one connection. This workflow performs
+model-backed extraction and uses the configured provider.
+
+<Steps>
+  <Step title="Check runtime readiness">
+    Call `get_runtime_status` with `{}`. Continue only when
+    `semantic_ingest_ready` is `true`. Otherwise inspect `issues` and the
+    storage, worker, and extractor readiness fields.
+  </Step>
+  <Step title="Stage the source and its content">
+    Call `ingest_source_simple`:
+
+    ```json
+    {
+      "name": "Cedar architecture note",
+      "uri": "https://docs.example.com/cedar/architecture",
+      "source_type": "web",
+      "title": "Cedar dependencies",
+      "text": "Cedar API depends on Cedar Storage. Cedar Storage uses PostgreSQL.",
+      "collection": "cedar-tutorial",
+      "ingest_mode": "graph",
+      "extraction_skill": "extraction/technical-docs"
+    }
+    ```
+
+    Save `data.source_id`, `data.doc_id`, and `data.work_item_id`. This request
+    supplies the text directly; the URI is provenance metadata. A success
+    receipt confirms staging and enqueueing, not finished extraction.
+  </Step>
+  <Step title="Inspect progress">
+    Call `get_doc_pipeline_status`:
+
+    ```json
+    {
+      "id": "<returned document ID>"
+    }
+    ```
+
+    `extraction_state` is `pending`, `running`, `completed`, `failed`, or
+    `not_triggered`. Inspect `extraction_guidance` if the selected purpose or
+    skill differs from your request. Space configuration has higher priority.
+    Use `get_source` with the saved source ID to inspect lifecycle and decisions.
+  </Step>
+  <Step title="Read the claims from this source">
+    Call `list_assertions`:
+
+    ```json
+    {
+      "source_id": "<returned source ID>",
+      "limit": 50
+    }
+    ```
+
+    Inspect the actual claims, their entity links, evidence, and resolution
+    statuses. Follow `next_cursor` while `has_more` is true. A count of generated
+    assertions does not establish their factual correctness.
+  </Step>
+</Steps>
+
+If the source failed, inspect its work and error before retrying. Repeated calls
+to convenience ingest tools can create additional records. Save the original
+receipt and do not use blind resubmission as a status check.
+
+For a runnable REST version, follow [From a Source to Evidence-Backed Claims](/recall/guides/putting-it-together).
+
+## Review an identity merge
+
+Use `/mcp/maintenance` or `/mcp/full`. Merging changes graph references and
+soft-deletes one entity, so first establish that both records identify the same
+real-world subject.
+
+<Steps>
+  <Step title="Inspect both candidates">
+    Use `search_entities`, then call `get_entity_context_bundle` separately for
+    each returned ID. Compare identity keys, type, evidence, and relationships.
+    Shared names or employers alone are weak evidence.
+  </Step>
+  <Step title="Record the proposal">
+    Call `propose_identity_candidate`:
+
+    ```json
+    {
+      "candidate": {
+        "entity_a": "<first entity ID>",
+        "entity_b": "<second entity ID>",
+        "confidence": 0.92,
+        "evidence": "Verified matching external identifier in the reviewed source records.",
+        "signal_type": "manual_review"
+      }
+    }
+    ```
+
+    Replace the sample evidence with what you actually checked. A proposal
+    records a candidate; it does not merge the entities. Review proposals with
+    `list_identity_candidates` and `filters.status: "pending"`.
+  </Step>
+  <Step title="Choose the survivor and merge">
+    Once identity is established, call `merge_entities`:
+
+    ```json
+    {
+      "entity_a": "<first entity ID>",
+      "entity_b": "<second entity ID>",
+      "strategy": "prefer_a"
+    }
+    ```
+
+    `prefer_a` selects the first record. `prefer_b` selects the second, and
+    `prefer_newer` selects by the records' update timestamps. Choose based on
+    the desired canonical entity, not on an assumption about result ordering.
+  </Step>
+  <Step title="Verify the returned survivor">
+    Read `data.survivor.id`, `data.merged_id`, and `data.relations_updated`.
+    Fetch `get_entity_context_bundle` using the returned survivor ID and check
+    the resulting relationships. Never assume entity A survived when using
+    `prefer_newer`.
+  </Step>
+</Steps>
+
+## Govern predicate vocabulary
+
+Start with `list_predicates` and `get_predicate` to inspect the existing canonical
+vocabulary, aliases, and semantics. Reuse an appropriate predicate before
+registering another spelling.
+
+### Propose an alias
+
+On `/mcp/maintenance` or `/mcp/full`, call `propose_predicate_alias`:
+
+```json
+{
+  "alias_name": "requires",
+  "canonical_predicate_id": "<existing canonical predicate ID>",
+  "confidence": 0.9
+}
+```
+
+This creates a `predicate_alias` record with `status: "proposed"`. It does not
+return a `work_artifact` proposal. Do not pass this alias record ID to the
+artifact validation or approval tools.
+
+### Approve a separately staged proposal
+
+When your pipeline or operator workflow has produced a predicate proposal
+**work artifact**, use `/mcp/full` and its actual artifact ID:
+
+1. Call `validate_predicate_proposal` with `{"proposal_id":"<work artifact ID>"}`.
+2. Inspect the validation response. Only continue for a validated proposal.
+3. Call `approve_predicate_proposal` with the same `proposal_id` and an optional
+   `confidence` override.
+4. Call `get_predicate` with `include_aliases: true` and verify the active alias.
+
+These are distinct record lifecycles. The public alias-proposal tool does not
+supply an end-to-end alias-to-artifact conversion step. See
+[Predicates](/recall/concepts/predicates) for canonical semantics and
+[Tool reference](/recall/mcp/tools) for exact input fields.
+
+## Handle common failures
+
+| Symptom | Check |
+|---|---|
+| Tool missing from `tools/list` | Endpoint profile, principal scopes, backend, and runtime readiness |
+| Ingest accepted but no graph yet | Saved source lifecycle, pipeline state, and work item error |
+| Search returns no result | Caller space, authorization, mode, filters, and processing state |
+| A document's text is omitted | Metadata access and raw-evidence access are separate permissions |
+| A later step cannot find an ID | Carry IDs from the successful prior response and preserve the same space |
+| A proposal cannot be approved | Confirm it is a validated work artifact, not an alias or identity candidate |

@@ -1,0 +1,103 @@
+---
+title: "SurrealDB Patterns"
+description: "Preserve native database types and reject invalid stored records at the storage boundary"
+icon: "database"
+---
+
+These patterns apply when changing a SurrealDB repository or a type that the
+native driver deserializes. Domain records may use convenient JSON shapes for
+the HTTP and MCP APIs; the database boundary needs its own representation.
+
+## Keep storage proxies separate from domain records
+
+Meerkat Recall's domain records flatten `BaseFields` for API JSON. Do not send those
+flattened structs directly through the SurrealDB driver. Use a database proxy
+with explicit fields, then convert it with `TryFrom`.
+
+For example, the entity repository's `EntityDb` holds an ID as
+`surrealdb::sql::Thing`, native timestamps as `DateTime<Utc>`, and each base field
+separately. Its conversion constructs the domain `BaseFields` and validates ID
+conversion before returning an `Entity`.
+
+Read the actual
+[entity storage proxy and conversion](https://github.com/lukacf/meerkat-recall/blob/main/crates/storage/src/entity_repository.rs)
+as the starting point for a new repository. Copying a partial domain struct
+into a proxy risks dropping security or provenance fields.
+
+## Deserialize native shapes without a JSON intermediate
+
+A custom deserializer must consume the driver's actual data shape. Converting
+first to `serde_json::Value` can lose native record-ID or datetime information.
+Use a Serde `Visitor` with the methods required for the type: string, map, or
+native enum access.
+
+A map visitor is not a replacement for `visit_enum`. The current
+[record ID deserializers](https://github.com/lukacf/meerkat-recall/blob/main/crates/types/src/ids.rs)
+show how Meerkat Recall handles the supported native and string representations.
+Reject unknown representations explicitly rather than guessing a value.
+
+When changing a deserializer, test both the public JSON representation and a
+round trip through the in-memory SurrealDB backend. A JSON-only test does not
+exercise the native driver boundary.
+
+## Reject missing mandatory data
+
+Do not replace a missing creation timestamp with the current time or a missing
+space ID with an empty string. That would turn an invalid stored record into
+apparently valid knowledge under the wrong history or scope.
+
+Use required proxy fields where absence should fail deserialization. If a
+compatibility projection needs optional fields, validate them during conversion.
+`StorageError::DataIntegrityError` takes a message string:
+
+```rust
+fn require_created_at(
+    id: &elephant_types::RecordId,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<chrono::DateTime<chrono::Utc>, elephant_storage::StorageError> {
+    created_at.ok_or_else(|| {
+        elephant_storage::StorageError::DataIntegrityError(format!(
+            "entity {id}: mandatory created_at is missing"
+        ))
+    })
+}
+```
+
+Include the record and field in the error so an operator can identify the
+corrupt row. Repair or migrate the data through an explicit procedure; do not
+hide the repair inside a read fallback.
+
+## Project raw native values
+
+Keep timestamps native until after storage conversion:
+
+```sql
+SELECT id, display_name, created_at, updated_at
+FROM entity
+WHERE space_id = $space_id;
+```
+
+Using `time::format(created_at, ...)` in that projection returns a string where
+a native timestamp is expected. Format for display only after the Rust value
+has been decoded and validated.
+
+## Verify a storage-boundary change
+
+A focused repository test should establish the properties affected by the
+change:
+
+- A create/read round trip preserves IDs, timestamps, security, provenance, and
+  subject scope.
+- Invalid mandatory data returns an explicit error.
+- Supported native and JSON representations deserialize consistently.
+- Existing space isolation and soft-delete filtering still hold.
+
+Use the repository Cargo wrapper to avoid sharing build outputs between
+worktrees:
+
+```bash
+./scripts/repo-cargo test -p elephant-storage entity_repository
+```
+
+See [development](/recall/operations/development) for the full validation lanes and
+[the domain model](/recall/architecture/domain-model) for shared record fields.
