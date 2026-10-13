@@ -1,0 +1,249 @@
+---
+title: "Event Streaming"
+description: "How to consume system events with cursors, list recent and upcoming domain events, and search the event timeline."
+icon: "timeline-arrow"
+---
+
+Meerkat Recall emits two categories of events: system events (internal pipeline activity) and domain events (real-world occurrences extracted from documents). This guide covers how to consume both.
+
+System event consumption and timeline queries have different purposes. Use the
+system stream to invalidate a cache or trigger downstream work after committed
+changes. Use timeline queries to answer when something happened in the source
+material. Neither an outbox event nor its delivery establishes that model-backed
+processing has completed.
+
+MCP `stream_events` requires `/mcp/full`; timeline read tools are available on
+all four HTTP profiles. Authenticate every protected HTTP/SSE connection and
+retain the same authorized space when reusing cursors. HTTP examples below
+assume explicit local `SKIP_AUTH` development.
+
+## Stream system events
+
+System events track internal operations like document ingestion, assertion extraction, and entity creation. Use `stream_events` with a cursor for reliable, ordered consumption.
+
+<Steps>
+  <Step title="Start from the beginning">
+    For MCP, use cursor `"0"` or omit it. For REST, omit the cursor on the
+    first request and then reuse the opaque value returned by that endpoint;
+    MCP and REST cursors have different encodings.
+
+    <Tabs>
+      <Tab title="MCP Tool">
+        ```json
+        {
+          "space_id": "default",
+          "cursor": "0",
+          "limit": 100
+        }
+        ```
+        Tool: `stream_events`
+      </Tab>
+      <Tab title="curl">
+        ```bash
+        curl -s "http://localhost:3000/v1/events/stream?limit=100"
+        ```
+      </Tab>
+    </Tabs>
+  </Step>
+  <Step title="Save the next cursor">
+    The MCP data envelope includes `next_cursor` and `has_more`. Store the
+    cursor after successfully processing the batch. The following is a
+    schematic MCP response; REST cursors are opaque encoded strings.
+
+    ```json
+    {
+      "events": [],
+      "next_cursor": "42",
+      "has_more": false
+    }
+    ```
+  </Step>
+  <Step title="Poll for new events">
+    On your next call, pass the saved cursor to resume where you left off.
+
+    <Tabs>
+      <Tab title="MCP Tool">
+        ```json
+        {
+          "space_id": "default",
+          "cursor": "42",
+          "limit": 100
+        }
+        ```
+        Tool: `stream_events`
+      </Tab>
+      <Tab title="curl">
+        ```bash
+        curl -sG http://localhost:3000/v1/events/stream \
+          --data-urlencode "cursor=$REST_CURSOR" \
+          --data-urlencode "limit=100"
+        ```
+      </Tab>
+    </Tabs>
+
+    Drain REST pages while `has_more` is true. The REST JSON endpoint can
+    return a null cursor when the page is exhausted; do not replace a saved
+    checkpoint with null. For continuous REST consumption, prefer
+    `/v1/events/sse` and persist its emitted resume cursor.
+  </Step>
+</Steps>
+
+## Receive system events over SSE
+
+REST clients that want a persistent connection can use the SSE endpoint:
+
+```bash
+curl -N -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:3000/v1/events/sse
+```
+
+Read and persist the resume cursor carried by the stream. On reconnect, use the
+endpoint's cursor contract rather than sending an MCP sequence cursor. See
+[System API](/recall/api/system#events) for the exact event transport fields. A network
+connection can end independently of pipeline work, so reconnecting clients
+must tolerate replay and avoid applying the same change twice.
+
+## List recent domain events
+
+Domain events represent real-world occurrences extracted from documents (e.g., "Product launch on March 15"). Use `list_recent_events` to see the latest.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "limit": 20,
+      "include_candidates": false
+    }
+    ```
+    Tool: `list_recent_events`
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    curl -s "http://localhost:3000/v1/timeline/recent?limit=20"
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  Set `include_candidates` to `true` to also see events that have not yet been approved. By default, only approved, superseded, and rejected events are returned.
+</Note>
+
+## List upcoming events
+
+Query future domain events within a time window. Useful for reminders and forecasting.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "days": 14,
+      "include_candidates": false
+    }
+    ```
+    Tool: `list_upcoming_events`
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    curl -s "http://localhost:3000/v1/timeline/upcoming?days=14"
+    ```
+  </Tab>
+</Tabs>
+
+The `days` parameter accepts values from 1 to 365.
+
+## Search domain events
+
+Search events by text query, status, or associated entities.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "query": "product launch",
+      "limit": 10,
+      "include_candidates": false
+    }
+    ```
+    Tool: `search_events`
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    curl -s -X POST http://localhost:3000/v1/timeline/search \
+      -H "content-type: application/json" \
+      -d '{ "query": "product launch", "limit": 10 }'
+    ```
+  </Tab>
+</Tabs>
+
+### Filter by status
+
+Restrict results to specific event statuses.
+
+```json
+{
+  "query": "launch",
+  "statuses": ["approved", "candidate"],
+  "limit": 10
+}
+```
+
+Valid statuses: `candidate`, `approved`, `superseded`, `rejected`.
+
+### Filter by entity
+
+Find events associated with specific entities. Use `mode` to control matching.
+
+```json
+{
+  "entity_ids": [
+    "entity:550e8400-e29b-41d4-a716-446655440000",
+    "entity:550e8400-e29b-41d4-a716-446655440001"
+  ],
+  "mode": "any",
+  "limit": 10
+}
+```
+
+| Mode | Behavior |
+|---|---|
+| `any` | Events involving any of the listed entities |
+| `all` | Events involving all of the listed entities |
+
+## Get a single event
+
+Retrieve full details for a specific domain event by ID.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "id": "event:550e8400-e29b-41d4-a716-446655440000"
+    }
+    ```
+    Tool: `get_event`
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    curl -s "http://localhost:3000/v1/timeline/event:550e8400-e29b-41d4-a716-446655440000"
+    ```
+  </Tab>
+</Tabs>
+
+<Accordion title="Advanced: cursor-based consumption pattern">
+  For resumable event consumption:
+
+  1. Store the last processed `next_cursor` in your application state
+  2. On startup, resume from the stored cursor
+  3. Process events in order, updating the cursor after each batch
+  4. When `has_more` is `false`, wait before polling again
+
+  Persist the cursor only after processing succeeds and make handling
+  idempotent. Replay after a crash can duplicate events; retention, stream
+  resets, and authorization changes must be handled by the integration.
+</Accordion>
+
+## Next steps
+
+- [Ingesting data](/recall/guides/ingesting-data) -- Feed documents to generate events
+- [Truth slots](/recall/guides/truth-slots) -- Inspect how assertions from events resolve
+- [Searching](/recall/guides/searching) -- Query across all record types

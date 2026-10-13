@@ -1,0 +1,189 @@
+---
+title: "Follow Updates and Conflicting Claims"
+description: "Add a second source, inspect the resulting claims, and distinguish current truth from evidence history."
+icon: "scale-balanced"
+---
+
+Continue from [From a Source to Evidence-Backed Claims](/recall/guides/putting-it-together).
+Keep its `BASE_URL`, `elephant_http` and `elephant_mcp` helpers, source/document receipts, and the
+actual Cedar API entity ID. This tutorial uses the Full MCP profile for truth
+inspection alongside the REST ingestion calls.
+
+The first note said Cedar API depends on Cedar Storage. A second note says the
+API now uses Cedar Cache for reads while retaining Cedar Storage for writes.
+That additional value may describe coexistence rather than a contradiction.
+The job is to inspect the evidence and predicate semantics before deciding.
+
+## 1. Add the new evidence
+
+Keep the first note intact. Submit this as a distinct source with a distinct
+rendition key so both pieces of evidence remain inspectable:
+
+```bash
+cat > cedar-update.json <<'JSON'
+{
+  "name": "Cedar architecture update",
+  "uri": "https://docs.example.com/cedar/architecture/v2",
+  "source_type": "web",
+  "title": "Cedar read path update",
+  "text": "Cedar API now depends on Cedar Cache for reads. Cedar API still depends on Cedar Storage for writes. Cedar Cache uses Redis. This note adds the cache and does not remove the storage dependency.",
+  "collection": "cedar-tutorial",
+  "rendition_key": "cedar-architecture-v2",
+  "ingest_mode": "graph",
+  "extraction_skill": "extraction/technical-docs",
+  "extraction_purpose": "Identify named software components and explicitly stated dependencies. Preserve the distinction between reads and writes."
+}
+JSON
+
+elephant_http "$BASE_URL/v1/sources/ingest" \
+  -H 'Content-Type: application/json' \
+  --data-binary @cedar-update.json > cedar-update-ingest.json
+jq . cedar-update-ingest.json
+
+export UPDATE_SOURCE_ID=$(jq -er '.source_id' cedar-update-ingest.json)
+export UPDATE_DOC_ID=$(jq -er '.doc_id' cedar-update-ingest.json)
+
+elephant_http "$BASE_URL/v1/docs/$UPDATE_DOC_ID/pipeline-status" | jq
+```
+
+Follow the lifecycle as in Part 1. Do not interpret a newly queued source as an
+already updated graph. Likewise, absence from a new document is not an explicit
+retraction of an older claim.
+
+## 2. Compare claims before comparing winners
+
+Select `/mcp/full` with the same principal and space:
+
+```bash
+export MCP_URL="$BASE_URL/mcp/full"
+elephant_mcp --method tools/list
+```
+
+Examples below are tool arguments, not JSON-RPC envelopes. Replace every angle-bracket
+placeholder with an ID or predicate returned by your server.
+
+Call `search_assertions` for the known component:
+
+```json
+{
+  "entity_id": "<Cedar API entity ID>",
+  "limit": 50
+}
+```
+
+With the terminal helper, the same call uses your saved `ENTITY_ID`:
+
+```bash
+elephant_mcp --method tools/call --tool-name search_assertions \
+  --tool-args-json "$(jq -cn --arg id "$ENTITY_ID" '{entity_id:$id,limit:50}')"
+```
+
+Use this pattern for each named tool below, passing its argument object to
+`--tool-args-json`. See [MCP setup](/recall/mcp/overview#try-calls-from-a-terminal)
+if you are continuing in a new shell.
+
+Compare each assertion's value, source provenance, evidence revision, and
+resolution status. `entity_id` selects resolved subject/object links and is
+preferable to a broad text scan when the entity is known. Use a text query if
+you are investigating unresolved mentions that have no entity link yet.
+
+Questions to answer from the returned evidence:
+
+- Did the second note resolve Cedar API to the same entity as the first?
+- Are the storage and cache dependencies both present?
+- Does the claimed purpose of each dependency agree with the note?
+- Which predicate IDs were assigned, and are those predicates governed?
+
+If the component was duplicated, follow the [identity workflow](/recall/mcp/workflows#review-an-identity-merge)
+before treating the two entity histories as one.
+
+## 3. Inspect predicate semantics and truth slots
+
+Use `get_predicate` with the actual predicate ID from an assertion or relationship:
+
+```json
+{
+  "predicate_id": "<returned predicate ID>",
+  "include_aliases": true
+}
+```
+
+Then call `list_truth_slots`:
+
+```json
+{
+  "subject_entity_id": "<Cedar API entity ID>",
+  "predicate_id": "<returned predicate ID>",
+  "limit": 25
+}
+```
+
+The response's `data.items` contains slot fields directly, plus
+`conflict_count` and `has_conflict`; there is no nested `slot` object in this
+list response. Inspect each item's `current_values`, `stale`, and security
+envelope. A slot groups claims according to its slot type, predicate,
+and security context; it is not a universal winner for every statement about
+that entity.
+
+| Observation | Interpretation |
+|---|---|
+| Repeated claims with the same value | Can corroborate the value by combining evidence |
+| Several objects under a configured many-valued predicate | May coexist without a cross-object conflict |
+| Different values for a single-valued or unknown-semantics predicate | Can form a conflict group for adjudication |
+| `stale: true` | The current slot needs recomputation |
+| `needs_review` adjudication | Evidence was insufficient for an automatic decision |
+
+Inspect the actual conflict group with `get_truth_slot_history`, passing the
+returned slot `id`:
+
+```json
+{
+  "id": "<returned truth slot ID>"
+}
+```
+
+This tool is available on `/mcp/full`. Its history includes the slot, an optional
+conflict group, and any assertion records the handler can resolve and authorize
+from the claim references. For the full set of entity claims, keep using
+`search_assertions`; do not treat the history array as an exhaustive audit log.
+
+## 4. Explain the result with evidence
+
+Meerkat Recall's LLM adjudicator can select a winner, allow coexistence, supersede a
+value with temporal context, or request review. When no adjudicator is
+configured, deterministic predicate policies provide the fallback. Unknown
+semantics do not justify automatically replacing one value with another.
+
+For the Cedar example, the text explicitly says the storage dependency remains.
+A useful answer should preserve that qualification and cite the source. If the
+extracted graph says the API abandoned storage, the pipeline has completed but
+the interpretation is wrong. Inspect the assertion and extraction guidance;
+do not repair that by merely changing an assertion's status to `resolved`.
+
+The following are separate checks:
+
+| Check | What it establishes |
+|---|---|
+| Ingestion receipt | Input was staged and work enqueued |
+| Completed extraction | Relevant work reached completion |
+| Governed current values | Meerkat Recall's current decision under predicate semantics |
+| Verified evidence | The source actually supports the claimed statement |
+
+## 5. Keep security and history in the explanation
+
+All reads are restricted to the caller's space and authorization. Claims in
+different security envelopes do not share a truth-maintenance conflict group.
+A caller's missing result can therefore reflect visibility rather than missing
+storage or a globally resolved conflict.
+
+Source revisions preserve what was observed. Truth maintenance describes which
+values are currently accepted. A derived [Living Wiki](/recall/architecture/living-wiki)
+page adds a publication layer with its own evidence and freshness checks.
+Publishing a wiki is a separate operation and requires its explicit service
+authority; ingestion alone does not promise that a new article exists.
+
+## Next steps
+
+- [Truth slots](/recall/guides/truth-slots) explains slot fields and stale-state inspection.
+- [MCP workflows](/recall/mcp/workflows) covers evidence retrieval, identity review, and predicate governance.
+- [Event streaming](/recall/guides/event-streaming) explains how an application follows committed changes.

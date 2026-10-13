@@ -1,0 +1,696 @@
+---
+title: "System"
+description: "Health checks, spaces, work items, truth slots, identity resolution, events, and audit operations."
+icon: "gear"
+---
+
+Use these routes to inspect runtime state and operate a configured instance.
+Health, ingest readiness, work completion, and claim correctness are separate
+observations. Read the relevant result fields rather than using HTTP success
+alone as a readiness or completion check.
+
+| Task | Section |
+| --- | --- |
+| Check ingest readiness | [Managed runtime status](#managed-runtime-status) |
+| Check dependencies | [Health](#health), [Capabilities](#capabilities) |
+| Save or restore a whole store | [Managed snapshots](#managed-snapshots) |
+| Configure a tenant | [Spaces](#spaces) |
+| Diagnose processing | [Work items](#work-items) |
+| Inspect current claims | [Truth slots](#truth-slots) |
+| Review duplicate identities | [Identity resolution](#identity-resolution) |
+| Consume changes | [Events](#events) |
+
+## Managed Runtime Status
+
+### GET /v1/runtime/status
+
+Returns bootstrap/configuration state plus semantic-ingest readiness for the managed runtime.
+
+<CodeGroup>
+```bash Request
+curl http://localhost:3000/v1/runtime/status \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Space-Id: household"
+```
+
+```json Response
+{
+  "configured": true,
+  "bootstrap_mode": false,
+  "runtime_mode": "local_memory",
+  "storage_ready": true,
+  "worker_ready": true,
+  "extractor_ready": true,
+  "semantic_ingest_ready": true,
+  "issues": []
+}
+```
+</CodeGroup>
+
+Use this endpoint to distinguish:
+- Meerkat Recall unreachable
+- reachable but not configured
+- configured but not ingest-ready
+- fully semantic-ingest ready
+
+`config_path` and private worker diagnostics are not exposed here. This route requires authentication and `read:status` (retained alternatives `read:system` or `read:space_config`), plus current space-grant attenuation when applicable. Only `/v1/health` is unauthenticated liveness. `/v1/readiness` reports 200/503 for the runtime role; `/v1/spaces/{space}/status` separately reports named-space provider and guidance capabilities.
+
+<ResponseField name="configured" type="boolean" required>
+  Whether Meerkat Recall has a persisted config or equivalent env-driven runtime configuration.
+</ResponseField>
+
+<ResponseField name="bootstrap_mode" type="boolean" required>
+  True when Meerkat Recall is exposing only bootstrap-safe runtime surfaces.
+</ResponseField>
+
+<ResponseField name="runtime_mode" type="string" required>
+  One of `local_memory`, `shared_memory`, `read_only`, or `maintenance`.
+</ResponseField>
+
+<ResponseField name="storage_ready" type="boolean" required>
+  Whether the currently configured storage backend is live.
+</ResponseField>
+
+<ResponseField name="worker_ready" type="boolean" required>
+  Whether managed background worker loops are running.
+</ResponseField>
+
+<ResponseField name="extractor_ready" type="boolean" required>
+  Whether the semantic extractor is reachable and healthy.
+</ResponseField>
+
+<ResponseField name="semantic_ingest_ready" type="boolean" required>
+  Whether the configured worker/extractor path can currently process semantic ingestion. Durable API admission can remain available while this is false; this does not certify any source revision complete.
+</ResponseField>
+
+<ResponseField name="issues" type="array" required>
+  Machine-readable readiness problems such as `semantic_extractor_unavailable`.
+</ResponseField>
+
+## Health
+
+### GET /v1/health
+
+Reports process liveness without authentication, storage, worker or provider
+checks. It remains live while the runtime drains or recovers.
+
+<CodeGroup>
+```bash Request
+curl http://localhost:3000/v1/health
+```
+
+```json Response (200)
+{ "status": "healthy" }
+```
+</CodeGroup>
+
+Use authenticated `/v1/readiness` for runtime readiness and named-space status
+for configured capabilities. A live process is not a successful database,
+provider, recovery or source-publication check.
+
+---
+
+## Capabilities
+
+### GET /v1/capabilities
+
+Returns the server's capabilities including supported policies, installed extensions, and feature flags.
+
+<CodeGroup>
+```bash Request
+curl http://localhost:3000/v1/capabilities \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+{
+  "backend": "surreal-db",
+  "policies": ["default"],
+  "extensions": ["sample-app"],
+  "features": ["vector_search", "identity_resolution", "outbox_stream"]
+}
+```
+</CodeGroup>
+
+`features` are derived from the caller-visible MCP capability surface. For example, `embedded_snapshots` only appears when the current principal can use snapshot tools.
+
+---
+
+## Managed Snapshots
+
+CLI and HTTP export/restore support `elephant-db` and retained `surreal-db`.
+MCP snapshot tools remain advertised only for globally authorized embedded hosts.
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/v1/system/snapshot/export` | Quiesce and export the live whole store into a new server directory |
+| POST | `/v1/system/snapshot/restore` | Guarded replacement from a server snapshot directory |
+| POST | `/v1/system/snapshot/import` | Retained alias for restore |
+
+Export request (configure `ELEPHANT_SNAPSHOT_DIR=/backups` on the server):
+
+```json
+{
+  "path": "/backups/nightly-UNIQUE",
+  "name": "nightly",
+  "retention_seconds": 604800,
+  "quiesce_timeout_seconds": 30
+}
+```
+
+Restore requires `{"path":"/backups/nightly-UNIQUE"}`. Success includes
+`success`, `backend`, `path`, `message` and `manifest`. The immutable directory
+contains `manifest.json` and `data.snapshot`, format `recall-snapshot-v1`:
+version, backend, original journal identity, snapshot identity/name,
+creation/expiry, byte length and SHA-256. Existing export directories are refused.
+The payload is the selected backend's real snapshot/export, not a generic legacy
+migration; restore requires the same backend and original independent journal.
+
+Paths are on the server within `ELEPHANT_SNAPSHOT_DIR` (default server working
+directory `.elephant-snapshots`). Export needs a global `read:system` principal;
+restore needs global `write:system`. A named-space service token cannot operate
+a whole-store backup. The compatibility CLI name `elephant` and positional path
+spellings remain, but consumers of an old single JSON file must adapt to the
+manifest/payload directory.
+
+Export pauses admission/scheduling and drains running work before exclusive
+capture. Quiescence defaults to 30 seconds (maximum 60); retention defaults to
+7 days (maximum 30). A request timeout is an uncertain outcome: inspect the
+operator result before retrying. Restore replaces the selected database/store
+under an exclusive barrier, including nonempty SurrealDB databases. A failed or
+interrupted restore stays unready until durable erasure replay, attempt fencing
+and final persistence finish. Native private-guard migration 039 initialization
+belongs to explicit migration; privileged restore reinstalls required current
+and historical guards under its barrier, never ordinary serve-time schema DDL.
+
+See [deployment snapshots](/recall/operations/deployment#managed-snapshots) for CLI
+commands and bounded retention/cleanup. A successful export is not by itself a
+passing restore or source-erasure qualification receipt.
+
+---
+
+## Spaces
+
+Space configuration stores embedding policy and optional extraction guidance.
+These routes use space names in their paths, not `space_config:` record IDs.
+
+Space reads require `read:space_config`; create and update require both
+`write:space_config` and read authority for the returned configuration. The
+principal must match the target space and pass the record's clearance and subject
+checks. Lists contain only authorized configurations. Configuration updates
+compare the authorized state at the storage write; a stale update returns `409`.
+
+| Method | Path | Result |
+| --- | --- | --- |
+| GET | `/v1/spaces` | Authorized configurations for the caller's space |
+| POST | `/v1/spaces` | Create configuration, returning `201` or `409` if the name exists |
+| GET | `/v1/spaces/{space_id}` | Configuration for the named space, or `404` |
+| PUT | `/v1/spaces/{space_id}` | Update supplied configuration fields |
+
+Creation accepts `name`, `embedding_provider`, `embedding_model`, and
+`embedding_dims`, plus optional `purpose` and `skill`. Updates accept the same
+configuration fields except `name`. Omitted fields retain their previous values;
+null `purpose` or `skill` does not clear an existing value.
+
+```json
+{
+  "name":"cedar-tutorial",
+  "embedding_provider":"openai",
+  "embedding_model":"text-embedding-3-small",
+  "embedding_dims":1536,
+  "purpose":"Extract software components and their explicit dependencies.",
+  "skill":"extraction/technical-docs"
+}
+```
+
+This configuration selects the provider but does not supply its credentials.
+Check [spaces](/recall/concepts/spaces) before changing an existing embedding policy.
+
+---
+
+## Work Items
+
+Work items represent dispatched tasks such as rendering, extraction, artifact validation/commit, and truth resolution. Use these endpoints to monitor and retry pipeline work.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/v1/work-items` | List work items |
+| GET | `/v1/work-items/{id}` | Get work item by ID |
+| POST | `/v1/work-items/{id}/retry` | Retry a failed work item |
+
+### List Work Items
+
+`GET /v1/work-items`
+
+<ParamField query="kind" type="string">
+  Filter by work item kind (for example `render_doc`, `plan_extraction`, `extract_assertions`, `tm_detect_conflicts`, `freshness_sweep`).
+</ParamField>
+
+<ParamField query="status" type="string">
+  Filter by status: `pending`, `runnable`, `running`, `done`, `failed`, `cancelled`.
+</ParamField>
+
+<ParamField query="min_age_secs" type="integer">
+  Filter by minimum age in seconds (useful for finding stuck items).
+</ParamField>
+
+<ParamField query="limit" type="integer" default="50">
+  Maximum results to return.
+</ParamField>
+
+<ParamField query="cursor" type="string">
+  Pagination cursor.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl "http://localhost:3000/v1/work-items?status=failed&limit=20" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+{
+  "results": [
+    {
+      "id": "work_item:550e8400-...",
+      "kind": "extract_assertions",
+      "status": "failed",
+      "attempts": 3,
+      "last_error": "LLM provider timeout",
+      "created_at": "2026-02-01T12:00:00Z"
+    }
+  ],
+  "total": 1,
+  "cursor": null
+}
+```
+</CodeGroup>
+
+The current list handler returns `total` for the authorized records in this
+response and always returns `cursor: null`; do not use it as a complete queue
+export. A status-filtered request does not consume `cursor`. `kind` is applied
+when supplied together with `status`. Consult [work queue](/recall/pipeline/work-queue)
+for scheduler behavior and operational diagnosis.
+
+### Get Work Item
+
+`GET /v1/work-items/{id}`
+
+<ParamField path="id" type="string" required>
+  Work item record ID (e.g., `work_item:550e8400-...`).
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl http://localhost:3000/v1/work-items/work_item:550e8400-e29b-41d4-a716-446655440000 \
+  -H "Authorization: Bearer $TOKEN"
+```
+</CodeGroup>
+
+### Retry Work Item
+
+Work-item reads require `read:work_item`; retry additionally requires
+`write:work_item`. Both operation scopes and record authorization apply before
+retrying or returning a record. A concurrent status, security, or payload change
+returns `409`, without reactivating stale work. Archived retries use the same
+atomic guard.
+
+`POST /v1/work-items/{id}/retry`
+
+Reset a failed work item to `runnable` status so the pipeline picks it up again. Only items with `failed` status can be retried.
+
+<ParamField path="id" type="string" required>
+  Work item record ID.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl -X POST http://localhost:3000/v1/work-items/work_item:550e8400-.../retry \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+{
+  "id": "work_item:550e8400-...",
+  "kind": "extract_assertions",
+  "status": "runnable",
+  "attempts": 3
+}
+```
+</CodeGroup>
+
+---
+
+## Truth Slots
+
+Truth slots represent the current "truth" for a subject-predicate pair. They track which assertion currently holds the winning value and whether conflicts exist.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/v1/truth-slots` | List truth slots |
+| GET | `/v1/truth-slots/{id}/history` | Get truth slot with conflict group |
+
+### List Truth Slots
+
+The result contains full `TruthSlot` records; the example below is abbreviated. `current_values` can hold multiple accepted claims or be empty.
+
+`GET /v1/truth-slots`
+
+<ParamField query="subject_entity_id" type="string">
+  Filter by subject entity ID.
+</ParamField>
+
+<ParamField query="predicate_id" type="string">
+  Filter by predicate ID.
+</ParamField>
+
+<ParamField query="stale_only" type="boolean" default="false">
+  Only return stale slots (truth needs re-evaluation).
+</ParamField>
+
+<ParamField query="limit" type="integer" default="50">
+  Maximum results to return.
+</ParamField>
+
+<ParamField query="cursor" type="string">
+  Pagination cursor.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl "http://localhost:3000/v1/truth-slots?subject_entity_id=entity:aaa...&limit=10" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+{
+  "results": [
+    {
+      "id": "truth_slot:550e8400-...",
+      "slot_key": "entity:aaa...|works_at",
+      "subject_entity": "entity:aaa...",
+      "predicate_id": "works_at",
+      "current_values": [],
+      "stale": false
+    }
+  ],
+  "total": 1,
+  "cursor": null
+}
+```
+</CodeGroup>
+
+### Get Truth Slot History
+
+`GET /v1/truth-slots/{id}/history`
+
+Returns a full truth slot and, when present, its conflict group. The abbreviated examples omit common record fields. `conflict_group` is omitted when absent. Unlike the MCP history tool, this endpoint does not include an `assertions` array.
+
+<ParamField path="id" type="string" required>
+  Truth slot record ID (e.g., `truth_slot:550e8400-...`).
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl http://localhost:3000/v1/truth-slots/truth_slot:550e8400-.../history \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+{
+  "slot": {
+    "id": "truth_slot:550e8400-...",
+    "slot_key": "entity:aaa...|works_at",
+    "current_values": []
+  }
+}
+```
+</CodeGroup>
+
+---
+
+## Identity Resolution
+
+Identity resolution endpoints manage duplicate detection and entity merging.
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/v1/identity/candidates` | Create identity candidate |
+| GET | `/v1/identity/candidates` | List identity candidates |
+| POST | `/v1/identity/merge` | Merge two entities |
+
+### Create Identity Candidate
+
+`POST /v1/identity/candidates`
+
+This REST route accepts a complete `IdentityCandidate` record, including the
+[common record fields](/recall/api/entities#entity-wire-format). It returns `201` with
+the stored candidate. It does not accept the MCP convenience proposal shape.
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `entity_a` | string | Yes | First existing entity ID |
+| `entity_b` | string | Yes | Second existing entity ID |
+| `signals` | JSON | Yes | Signals supporting the identity match |
+| `confidence` | number | Yes | Proposed match confidence |
+| `proposed_by` | string | Yes | Proposer identity |
+| `status` | string | No | `pending` (default), `approved`, or `rejected` |
+| `decided_by` | string | No | Decision-maker identity |
+| `decided_at` | timestamp | No | Decision time |
+
+Supply valid IDs, actual timestamps, and the correct provenance/security fields
+alongside these values. For a smaller input that generates base fields, use
+MCP [`propose_identity_candidate`](/recall/mcp/tools#propose_identity_candidate) on
+Maintenance or Full. A candidate records a proposed match; it does not itself
+merge entities or establish their identity.
+
+### List Identity Candidates
+
+`GET /v1/identity/candidates`
+
+<ParamField query="pending_only" type="boolean" default="false">
+  Only return pending (unresolved) candidates.
+</ParamField>
+
+<ParamField query="min_confidence" type="number">
+  Minimum confidence threshold.
+</ParamField>
+
+<ParamField query="limit" type="integer" default="50">
+  Maximum results to return.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl "http://localhost:3000/v1/identity/candidates?pending_only=true&min_confidence=0.85" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+[
+  {
+    "id": "identity_candidate:550e8400-...",
+    "entity_a": "entity:aaa...",
+    "entity_b": "entity:bbb...",
+    "confidence": 0.92,
+    "status": "pending"
+  }
+]
+```
+</CodeGroup>
+
+### Merge Entities
+
+`POST /v1/identity/merge`
+
+<Warning>
+  Merge is a destructive operation. The merged entity is soft-deleted and all its relationships and events are repointed to the surviving entity. This cannot be undone through the API.
+</Warning>
+
+Merge two entities into one. Relationships and events from the merged entity are repointed to the survivor. Both entities must be in the same space.
+
+<ParamField body="entity_a" type="string" required>
+  First entity ID.
+</ParamField>
+
+<ParamField body="entity_b" type="string" required>
+  Second entity ID.
+</ParamField>
+
+<ParamField body="strategy" type="string" required>
+  Merge strategy: `keep_a` (keep entity A), `keep_b` (keep entity B), or `combine` (create a new merged entity).
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl -X POST http://localhost:3000/v1/identity/merge \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "entity_a": "entity:aaa...",
+    "entity_b": "entity:bbb...",
+    "strategy": "keep_a"
+  }'
+```
+
+```json Response
+{
+  "entity": {
+    "id": "entity:aaa...",
+    "display_name": "Alex Chen",
+    "aliases": ["A. Chen", "Alexander Chen"]
+  },
+  "message": "Merge completed. 5 relationships and 3 events repointed.",
+  "relationships_repointed": 5,
+  "events_repointed": 3,
+  "merge_record_ids": ["entity_merge:ccc..."]
+}
+```
+</CodeGroup>
+
+---
+
+## Events
+
+System events provide an append-only audit stream of changes across the knowledge graph.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/v1/events/stream` | Stream events (JSON polling) |
+| GET | `/v1/events/sse` | Stream events (Server-Sent Events) |
+| GET | `/v1/events/latest` | Get latest sequence number |
+
+### Stream Events (JSON)
+
+`GET /v1/events/stream`
+
+<ParamField query="cursor" type="string">
+  Base64-encoded cursor to resume from. Encodes the space ID and sequence number.
+</ParamField>
+
+<ParamField query="limit" type="integer" default="100">
+  Maximum events to return (max 1000).
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl "http://localhost:3000/v1/events/stream?limit=50" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+{
+  "events": [
+    {
+      "id": "system_event:550e8400-...",
+      "seq": 42,
+      "event_type": "entity.created",
+      "payload": {
+        "space_id": "default",
+        "event_type": "entity.created",
+        "actor": "example-client",
+        "run_id": null,
+        "records": [
+          {
+            "id": "entity:550e8400-e29b-41d4-a716-446655440000",
+            "table": "entity",
+            "op": "create"
+          }
+        ]
+      },
+      "created_at": "2026-02-01T12:00:00Z"
+    }
+  ],
+  "next_cursor": "eyJzcGFjZV9pZCI6ImRlZmF1bHQiLCJzZXEiOjQyfQ==",
+  "has_more": true
+}
+```
+</CodeGroup>
+
+### Stream Events (SSE)
+
+`GET /v1/events/sse`
+
+Opens a persistent Server-Sent Events stream. The server polls storage at the
+configured cadence and pushes batches to the connected client. Preserve the
+returned cursor to resume after disconnection. Example events below omit
+common base fields for readability.
+
+<ParamField query="cursor" type="string">
+  Base64-encoded cursor to resume from.
+</ParamField>
+
+<ParamField query="poll_interval_ms" type="integer" default="1000">
+  Polling interval in milliseconds for checking new events.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl -N "http://localhost:3000/v1/events/sse?poll_interval_ms=500" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Accept: text/event-stream"
+```
+
+```text SSE Response
+event: events
+data: {"events":[...],"cursor":"..."}
+
+event: events
+data: {"events":[...],"cursor":"..."}
+```
+</CodeGroup>
+
+### Get Latest Sequence
+
+`GET /v1/events/latest`
+
+Returns the latest event sequence number for a space.
+
+<ParamField query="space_id" type="string" required>
+  Space ID to query.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl "http://localhost:3000/v1/events/latest?space_id=default" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+{
+  "space_id": "default",
+  "seq": 142
+}
+```
+</CodeGroup>
+
+---
+
+## Audit Revert
+
+### POST /v1/audit/revert/{audit_id}
+
+Revert changes recorded in an audit log entry. Supports reverting create, update, delete, and restore actions on entities, relationships, documents, sources, and identity candidates.
+
+<ParamField path="audit_id" type="string" required>
+  Audit log record ID (e.g., `audit_log:550e8400-...`).
+</ParamField>
+
+<Note>
+  Promote, merge, and purge actions cannot be reverted through this endpoint.
+</Note>
+
+<CodeGroup>
+```bash Request
+curl -X POST http://localhost:3000/v1/audit/revert/audit_log:550e8400-e29b-41d4-a716-446655440000 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+{
+  "success": true,
+  "message": "Revert requested for audit log audit_log:550e8400-.... Action: Update, Record: entity:aaa...",
+  "audit_id": "audit_log:550e8400-..."
+}
+```
+</CodeGroup>

@@ -1,0 +1,17 @@
+{
+  "generated": true,
+  "source_repository": "https://github.com/lukacf/meerkat-recall",
+  "source_branch": "codex/canonical-public-import-20261013",
+  "source_ref": "codex/canonical-public-import-20261013",
+  "source_commit": "13be7b1a1c4a9bb5fcf8c46d1a7ce1c3137fdfd3",
+  "source_version": "0.1.0",
+  "source_docs_dirty": false,
+  "public_pages": 45,
+  "content_sha256": "56feb306eaba51cc958f843d743da4c5a57ecfd660ebc091505a6d3a135a6c66",
+  "mirror_adjustments": [
+    "Local routes namespaced under /recall.",
+    "Non-navigation technical Markdown links point to the exact canonical source commit.",
+    "Missing Living Wiki page icon supplied.",
+    "Pipeline Work Queue heading uses punctuation-free text for stable Mintlify/GitHub fragment."
+  ]
+}

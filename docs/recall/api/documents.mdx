@@ -1,0 +1,420 @@
+---
+title: "Documents"
+description: "Ingest, search, and manage documents in the Meerkat Recall knowledge pipeline."
+icon: "file-lines"
+---
+
+Document routes enforce record authorization, but the current REST responses
+return the authorized document directly. They do not apply the MCP document
+helper's separate raw-text redaction. Treat permission to these REST reads as
+permission to the returned text and metadata. See [security](/recall/concepts/security).
+
+Response examples are abbreviated to highlight relevant fields; they are not
+complete write request bodies. Use the normalized ingest route for new evidence.
+
+## Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/v1/docs/search` | Search documents (text + vector) |
+| POST | `/v1/docs/ingest` | Ingest a new document |
+| POST | `/v1/docs/batch` | Batch create/update documents |
+| GET | `/v1/docs/collections` | List distinct collections |
+| GET | `/v1/docs/{id}` | Get document by ID |
+| PUT | `/v1/docs/{id}` | Update document |
+| DELETE | `/v1/docs/{id}` | Soft delete document |
+| POST | `/v1/docs/{id}/restore` | Restore soft-deleted document |
+| GET | `/v1/docs/{id}/chunks` | Get document chunks (structural nodes) |
+| GET | `/v1/docs/{id}/pipeline-status` | Get document pipeline status |
+
+---
+
+## Search Documents
+
+`POST /v1/docs/search`
+
+Search documents using text matching or vector similarity. When a `query` is provided with `k`, the endpoint performs semantic vector search against document chunk embeddings.
+
+<ParamField body="query" type="string">
+  Free-text search query. Used for both keyword and vector similarity search.
+</ParamField>
+
+<ParamField body="k" type="integer">
+  Number of top-k similarity results for vector search. When set, enables semantic search mode.
+</ParamField>
+
+<ParamField body="include_deleted" type="boolean" default="false">
+  Include soft-deleted documents in results.
+</ParamField>
+
+<ParamField body="limit" type="integer" default="50">
+  Maximum results to return.
+</ParamField>
+
+<ParamField body="cursor" type="string">
+  Pagination cursor from a previous response.
+</ParamField>
+
+<CodeGroup>
+```bash Keyword Search
+curl -X POST http://localhost:3000/v1/docs/search \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "incident report", "limit": 10}'
+```
+
+```bash Vector Search
+curl -X POST http://localhost:3000/v1/docs/search \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "suspicious network activity", "k": 5}'
+```
+
+```json Response
+{
+  "results": [
+    {
+      "id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6",
+      "space_id": "default",
+      "title": "Incident Report Q1",
+      "text": "Observed suspicious domain...",
+      "rendition_key": "abc123",
+      "created_at": "2026-01-20T09:00:00Z"
+    }
+  ],
+  "cursor": null,
+  "has_more": false,
+  "total": 1
+}
+```
+</CodeGroup>
+
+---
+
+## Ingest Document
+
+`POST /v1/docs/ingest`
+
+Ingest a new document into the processing pipeline. Meerkat Recall stages a source-backed document and enqueues source-first work so the pipeline can triage, render, chunk, embed, and extract knowledge from it.
+
+<ParamField body="title" type="string" required>
+  Document title.
+</ParamField>
+
+<ParamField body="text" type="string">
+  Document text content or sidecar text for media-backed ingest. Required unless `media` is present.
+</ParamField>
+
+<ParamField body="media" type="object[]">
+  Optional typed image/video inputs. Each item must include `kind`, `media_type`, and exactly one of `inline_base64`, `path`, or `uri`.
+</ParamField>
+
+<ParamField body="metadata" type="object">
+  Arbitrary metadata (e.g., `{"collection": "notes", "tags": ["security"]}`).
+</ParamField>
+
+<ParamField body="collection" type="string">
+  Optional collection override for organizing documents.
+</ParamField>
+
+<ParamField body="rendition_key" type="string">
+  Optional rendition label used in source/document processing. Normalized
+  requests generate fresh document/source IDs; repeating this key alone does
+  not guarantee that retried HTTP submissions deduplicate.
+</ParamField>
+
+<ParamField body="sync" type="boolean" default="false">
+  Must be omitted or false. `true` is rejected; use the asynchronous work item flow.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl -X POST http://localhost:3000/v1/docs/ingest \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "Meeting Notes",
+    "text": "Alice met Bob on 2026-02-02 to discuss Project Meerkat Recall.",
+    "collection": "meeting-notes"
+  }'
+```
+
+```json Response (201)
+{
+  "doc_id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "source_id": "source:550e8400-e29b-41d4-a716-446655440000",
+  "lifecycle_status": "discovered",
+  "current_ingest_mode": null,
+  "work_item_id": "work_item:1f47da04-fb31-4e49-bbec-c0cd7fb08c9f",
+  "enqueued": true
+}
+```
+</CodeGroup>
+
+---
+
+## Batch Documents
+
+`POST /v1/docs/batch`
+
+Create or update multiple documents in a single request. Each document is staged into the source-first pipeline for triage, rendering, chunking, embedding, and extraction.
+
+<ParamField body="items" type="object[]" required>
+  Array of normalized document ingest inputs. Each item uses the same public fields as `POST /v1/docs/ingest`.
+</ParamField>
+
+<ParamField body="atomic" type="boolean" default="false">
+  Accepted by the shared request schema but not implemented as a transaction. Items can succeed or fail independently; do not rely on rollback.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl -X POST http://localhost:3000/v1/docs/batch \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "items": [
+      {"title": "Doc A", "text": "Content of document A."},
+      {
+        "title": "Frame B",
+        "text": "Observed terminal window",
+        "media": [
+          {"kind": "image", "media_type": "image/jpeg", "uri": "https://example.com/frame-b.jpg"}
+        ]
+      }
+    ]
+  }'
+```
+
+```json Response
+{
+  "succeeded": [
+    {"id": "doc:aaa...", "title": "Doc A", "source": "source:aaa..."},
+    {"id": "doc:bbb...", "title": "Doc B", "source": "source:bbb..."}
+  ],
+  "failed": []
+}
+```
+</CodeGroup>
+
+---
+
+## Get Collections
+
+`GET /v1/docs/collections`
+
+Returns a list of distinct document collection names within the caller's space.
+
+<CodeGroup>
+```bash Request
+curl http://localhost:3000/v1/docs/collections \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+["meeting-notes", "incident-reports", "research"]
+```
+</CodeGroup>
+
+---
+
+## Get Document
+
+`GET /v1/docs/{id}`
+
+Retrieve a single document by its ID.
+
+<ParamField path="id" type="string" required>
+  Document record ID (e.g., `doc:3fa85f64-...`).
+</ParamField>
+
+<ParamField query="include_deleted" type="boolean" default="false">
+  If true, return even if the document was soft-deleted.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl http://localhost:3000/v1/docs/doc:3fa85f64-5717-4562-b3fc-2c963f66afa6 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+{
+  "id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "space_id": "default",
+  "title": "Meeting Notes",
+  "text": "Alice met Bob on 2026-02-02...",
+  "rendition_key": "f8a9b2c1",
+  "created_at": "2026-02-02T15:00:00Z",
+  "updated_at": "2026-02-02T15:00:00Z"
+}
+```
+</CodeGroup>
+
+---
+
+## Update Document
+
+`PUT /v1/docs/{id}`
+
+Replace a document's fields. The document must exist and the caller must have write authorization.
+
+<ParamField path="id" type="string" required>
+  Document record ID.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl -X PUT http://localhost:3000/v1/docs/doc:3fa85f64-5717-4562-b3fc-2c963f66afa6 \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "Meeting Notes (Updated)",
+    "text": "Alice met Bob and Carol on 2026-02-02."
+  }'
+```
+</CodeGroup>
+
+---
+
+## Delete Document
+
+`DELETE /v1/docs/{id}`
+
+<Warning>
+  Soft deletes the document. The record remains in the database with a `deleted_at` timestamp. Use the restore endpoint to undo.
+</Warning>
+
+Returns `204 No Content` on success.
+
+<ParamField path="id" type="string" required>
+  Document record ID.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl -X DELETE http://localhost:3000/v1/docs/doc:3fa85f64-5717-4562-b3fc-2c963f66afa6 \
+  -H "Authorization: Bearer $TOKEN"
+```
+</CodeGroup>
+
+---
+
+## Restore Document
+
+`POST /v1/docs/{id}/restore`
+
+Restore a soft-deleted document.
+
+<ParamField path="id" type="string" required>
+  Document record ID.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl -X POST http://localhost:3000/v1/docs/doc:3fa85f64-5717-4562-b3fc-2c963f66afa6/restore \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+{
+  "id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "title": "Meeting Notes",
+  "deleted_at": null
+}
+```
+</CodeGroup>
+
+---
+
+## Get Document Chunks
+
+`GET /v1/docs/{id}/chunks`
+
+Returns structural nodes for the document's selected revision. `revision`
+identifies immutable evidence; `span.start` and `span.end` are UTF-8 byte
+offsets into that revision. A node's `text` is optional, commonly used for
+summaries, so do not assume every node includes its excerpt inline. The
+example below omits common record fields.
+
+<ParamField path="id" type="string" required>
+  Document record ID.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl http://localhost:3000/v1/docs/doc:3fa85f64-5717-4562-b3fc-2c963f66afa6/chunks \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+[
+  {
+    "id": "doc_node:1c0d6c6f-91ca-4b83-834a-1e077296bc5b",
+    "revision": "doc_revision:7427e72c-404a-4c1d-a2dc-c0a4b5c0d5ef",
+    "role": "paragraph",
+    "span": {"start": 0, "end": 42},
+    "node_key": "paragraph-0",
+    "position": 0,
+    "depth": 1
+  }
+]
+```
+</CodeGroup>
+
+---
+
+## Get Document Pipeline Status
+
+`GET /v1/docs/{id}/pipeline-status`
+
+Returns the processing status of a document across the active document pipeline: rendering, doc-tree construction, embedding, extraction, and staged artifact validation/commit.
+
+<ParamField path="id" type="string" required>
+  Document record ID.
+</ParamField>
+
+<CodeGroup>
+```bash Request
+curl http://localhost:3000/v1/docs/doc:3fa85f64-5717-4562-b3fc-2c963f66afa6/pipeline-status \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json Response
+{
+  "doc_id": "doc:3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "chunks": {
+    "total": 5,
+    "embedded": 5
+  },
+  "revision": "doc_revision:7427e72c-404a-4c1d-a2dc-c0a4b5c0d5ef",
+  "nodes_count": 8,
+  "extraction_state": "completed",
+  "assertions_count": 12,
+  "entities_created": 4
+}
+```
+</CodeGroup>
+
+Counts above are illustrative. `revision` is omitted until a current revision
+exists. The optional `extraction_guidance` object describes how the purpose and
+extraction skill were resolved. Embedding progress is independent of the
+extraction state: compare `chunks.embedded` with `chunks.total`.
+
+### Extraction state
+
+`extraction_state` summarizes relevant work for the document and its current
+revision. When work items have different states, `failed` takes precedence over
+`running`, which takes precedence over `pending`.
+
+| Value | Meaning | What to do next |
+|-------|---------|-----------------|
+| `pending` | Relevant work is pending or runnable. | Check again after the workers have had time to process it. |
+| `running` | Relevant work is running. | Wait for a terminal outcome. |
+| `failed` | At least one relevant work item failed. | [Inspect the failure and retry eligible work](/recall/pipeline/work-queue#inspect-and-retry-failed-work). |
+| `completed` | Relevant work is terminal with no failed item, or assertions exist without tracked work. | Inspect the resulting assertions and evidence. Cancelled work also falls into this state, so it does not prove successful extraction. |
+| `not_triggered` | No relevant work or assertions were found. | Check the ingestion mode, runtime readiness, and work queue if extraction was expected. |
+
+The response does not include individual work items. Use the
+[work queue](/recall/pipeline/work-queue) for stage details. Neither a `completed`
+state nor an assertion count proves that the extracted claims are true.

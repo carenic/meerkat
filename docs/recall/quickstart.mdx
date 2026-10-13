@@ -1,0 +1,199 @@
+---
+title: Quickstart
+description: Start a local Meerkat Recall server, verify readiness, ingest a synthetic document, and inspect the result.
+icon: rocket
+---
+
+Choose the credential-free source demo to explore existing evidence and
+projections. Choose the persistent stack to submit new evidence and run model
+extraction. The HTTP examples below require `curl` and `jq`.
+
+For a released native executable, follow [binary installation](/recall/installation).
+That default-feature binary runs the model-backed `demo-wiki` and needs provider
+credentials. The credential-free command below compiles a different feature
+set; it is not a runtime switch on the distributed binary.
+
+## Get the source
+
+Both routes start from a checkout. With Git installed, run:
+
+```bash
+git clone https://github.com/lukacf/meerkat-recall.git
+cd meerkat-recall
+```
+
+Run the remaining commands from this directory.
+
+## Try the demo first
+
+The Living Wiki demo needs Rust 1.94 or newer, but no database service or model
+credentials:
+
+```bash
+./scripts/repo-cargo run -p meerkat-recall-bin --no-default-features -- demo-wiki
+```
+
+The first source build can take several minutes. Once the server starts:
+
+1. Open the `Editorial context projection` URL printed in the terminal, or find
+   **Meerkat Recall Living Wiki architecture** in the
+   [context inspector](http://localhost:3000/inspect/knowledge-views).
+2. Read the projected context and its **Compilation receipt**. The receipt
+   records what was compiled; it is not a judgment that every claim is true.
+3. Open the [evidence browser](http://localhost:3000/evidence) and read the
+   architecture source. Its **Technical details** link opens the inspector.
+
+You have completed the demo when you have inspected a projection, its receipt,
+and the source evidence. Stop it with **Ctrl-C**. Demo data is held in memory
+and disappears when the process stops.
+
+This credential-free build leaves the article wiki at `/wiki` empty. The
+[full demo](/recall/architecture/living-wiki#runnable-projection-demo) uses a configured
+model to write articles. Continue below if you want to ingest your own evidence;
+stop the demo first so port 3000 is available.
+
+## Start a persistent local stack
+
+Install Docker with Compose, then build and load the matching patched server
+using the [paired server recipe](https://github.com/lukacf/meerkat-recall/blob/main/packaging/recall-surreal/README.md). Set
+`RECALL_SURREAL_IMAGE` to its actual local tag or digest; an upstream SurrealDB
+image lacks the required capability. Compose refuses to start without this
+explicit selection.
+
+Copy `.env.example` to `.env`. The default Compose configuration uses OpenAI
+embeddings and an Anthropic extraction model. Set `OPENAI_API_KEY` and
+`ANTHROPIC_API_KEY` in `.env` before starting; model calls can incur charges.
+Credentials do not create per-space processing approvals.
+
+```bash
+cp .env.example .env
+# Edit .env with your provider credentials.
+export RECALL_SURREAL_IMAGE=recall-surreal:REVIEWED_SOURCE
+docker compose up -d surrealdb
+docker compose run --rm elephant meerkat-recall migrate
+docker compose up -d elephant
+```
+
+Migrations must run against the same namespace and database as the server.
+Running the migration inside the Compose service uses that service's settings.
+Meerkat Recall runs managed workers in the server process by default. Create the
+named space and its approved query/document embedding, extraction and support
+verification bindings before semantic ingestion. See the
+[service setup](/recall/operations/service-setup#approve-processing)
+for the current named-space setup; environment keys alone do not make it ready.
+
+<Warning>
+Compose is a local development configuration with authentication bypass.
+Before exposing an instance, configure authentication and network access as
+described in [Deployment](/recall/operations/deployment).
+</Warning>
+
+## Check readiness
+
+```bash
+curl -fsS http://localhost:3000/v1/runtime/status | jq
+```
+
+Wait for `semantic_ingest_ready` to be `true`. If it remains false, inspect
+`issues`, provider configuration, and service logs. `GET /v1/health` checks
+service health; it does not substitute for semantic readiness.
+
+For MCP, connect using Streamable HTTP at `http://localhost:3000/mcp` and call
+`get_runtime_status` with `{}`. Ingest tools are hidden until the runtime is
+ready. See [MCP profiles](/recall/mcp/overview) for tool availability.
+
+## Ingest synthetic evidence
+
+The following example is fictional. With local development authentication,
+`X-Space-Id` selects the space. When authentication is enabled, send a Bearer
+token whose `space_id` and permissions authorize the request instead.
+
+```bash
+curl -fsS http://localhost:3000/v1/docs/ingest \
+  -H 'Content-Type: application/json' \
+  -H 'X-Space-Id: default' \
+  -d '{
+    "title": "Example project meeting",
+    "text": "On 2026-01-15, Alice and Bob met to discuss Project Cedar. Alice owns the test plan. Bob will review the results."
+  }' | tee /tmp/elephant-ingest.json | jq
+```
+
+The response includes `doc_id`, `source_id`, and `work_item_id`. Acceptance
+means the work was queued, not that extraction has finished. To use MCP,
+call `ingest_doc_simple` with the same `title` and `text`.
+
+## Track processing
+
+```bash
+doc_id=$(jq -r '.doc_id' /tmp/elephant-ingest.json)
+curl -fsS "http://localhost:3000/v1/docs/$doc_id/pipeline-status" \
+  -H 'X-Space-Id: default' | jq
+```
+
+The MCP equivalent is `get_doc_pipeline_status` with `{"id":"doc:YOUR_ID"}`,
+available on `/mcp/full` to authorized callers.
+
+Check `extraction_state` before moving on:
+
+- For `pending` or `running`, repeat the status request after the workers have
+  had time to process the document.
+- For `failed`, [inspect and resolve the failed work](/recall/pipeline/work-queue#inspect-and-retry-failed-work)
+  before retrying it.
+- For `not_triggered`, check readiness and the work queue if the state persists
+  after ingestion was accepted.
+- For `completed`, inspect `assertions_count` and the results below. This state
+  describes tracked work, so it does not guarantee useful or correct claims.
+
+See the [state definitions](/recall/api/documents#extraction-state) for the exact
+meaning of each value. For semantic search, also check that `chunks.embedded`
+has caught up with `chunks.total`; extraction and embedding finish separately.
+
+The source-first flow stages metadata, renders immutable document evidence,
+plans extraction, validates and commits artifacts, and emits outbox events for
+truth maintenance. The exact runtime stages are documented in the
+[Pipeline overview](/recall/pipeline/overview).
+
+## Search and inspect
+
+Use `k` to request semantic document search; without it, this REST route uses
+its lexical search path. Semantic search can fall back to lexical retrieval
+when embeddings are unavailable.
+
+```bash
+curl -fsS http://localhost:3000/v1/docs/search \
+  -H 'Content-Type: application/json' \
+  -H 'X-Space-Id: default' \
+  -d '{"query":"test plan","k":5,"limit":5}' | jq
+
+curl -fsS http://localhost:3000/v1/entities/search \
+  -H 'Content-Type: application/json' \
+  -H 'X-Space-Id: default' \
+  -d '{"query":"Alice","limit":10}' | jq
+```
+
+On the default MCP profile, use `search_all` for discovery and `get_entity`
+for returned entity IDs. Extraction is model-driven, so inspect the assertions
+and evidence rather than assuming exact entity names or relationship counts.
+
+You have completed this walkthrough when the server is ingest-ready, the
+submitted document has a processing outcome, and you have inspected the
+resulting evidence and search results. For the bigger picture, continue with
+the [knowledge model](/recall/concepts/overview) or the
+[worked example](/recall/guides/putting-it-together).
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Ingesting data" icon="file-import" href="/recall/guides/ingesting-data">
+    Work with files, sources, URLs, and media-backed evidence.
+  </Card>
+  <Card title="Security" icon="shield-halved" href="/recall/concepts/security">
+    Configure space isolation, scopes, clearances, and subject restrictions.
+  </Card>
+  <Card title="HTTP API" icon="code" href="/recall/api/overview">
+    Integrate application code with the REST surface.
+  </Card>
+  <Card title="MCP tools" icon="wrench" href="/recall/mcp/tools">
+    Inspect the available schemas and agent workflows.
+  </Card>
+</CardGroup>

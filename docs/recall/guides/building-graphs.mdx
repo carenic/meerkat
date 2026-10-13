@@ -1,0 +1,227 @@
+---
+title: "Building Knowledge Graphs"
+description: "How to create entities, relate them, attach evidence, and resolve duplicate identities."
+icon: "diagram-project"
+---
+
+Use direct graph writes when your application already knows the entities and
+relationships it intends to record. For claims learned from documents, prefer
+[ingestion](/recall/guides/ingesting-data) so the pipeline can retain immutable evidence.
+
+These MCP creation examples require `/mcp/full` and the appropriate write
+scopes. Identity maintenance is also available on `/mcp/maintenance`. HTTP
+examples assume local `SKIP_AUTH` development; add a bearer token on an
+authenticated server. Replace sample IDs with complete IDs from your responses.
+
+## Create an entity
+
+Use `create_entity_simple` for a quick entity with auto-generated base fields.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "entity_type": "person",
+      "display_name": "Alex Chen",
+      "summary": "Founder of NeuralFlow"
+    }
+    ```
+    Tool: `create_entity_simple`
+  </Tab>
+  <Tab title="REST API">
+    For REST creation, send the complete entity record described in [Entities](/recall/api/entities), including base fields and `type`.
+  </Tab>
+</Tabs>
+
+Save the returned ID before creating relationships.
+
+Common entity types include `person`, `org`, `topic`, `location`, and `domain`. You can use any string as a type.
+
+## Create multiple entities at once
+
+Use `batch_entities` to create several entities in a single call.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "items": [
+        { "type": "person", "display_name": "Alex Chen", "summary": "Security researcher" },
+        { "type": "org", "display_name": "NeuralFlow", "summary": "AI startup" }
+      ]
+    }
+    ```
+    Tool: `batch_entities`
+  </Tab>
+  <Tab title="REST API">
+    REST batch writes require full entity records. See [batch writes](/recall/api/entities#upsert-and-batch-writes).
+  </Tab>
+</Tabs>
+
+## Create a relationship
+
+Connect two entities with a typed, weighted relationship using `relate_entities`.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "from_id": "entity:550e8400-e29b-41d4-a716-446655440000",
+      "to_id": "entity:550e8400-e29b-41d4-a716-446655440001",
+      "rel_type": "works_at",
+      "weight": 0.9
+    }
+    ```
+    Tool: `relate_entities`
+  </Tab>
+  <Tab title="REST API">
+    REST relationships use full records with `in`, `out`, and `rel_type`. See [Relationships](/recall/api/relationships).
+  </Tab>
+</Tabs>
+
+The `weight` field (0.0 to 1.0) becomes the record's confidence. The current convenience creation handler accepts but does not persist `description`, `properties`, `valid_from`, or `valid_to`. For a validity window, update the stored relationship's `validity_window` field explicitly.
+
+## Understand manual evidence limits
+
+`relate_entities` accepts `evidence_text` and `evidence_source` and creates a
+manual assertion, but this convenience path does not validate the text against
+an existing document revision. It records a span starting at byte zero; a
+`doc:` ID is not resolved into that document's revision and can leave the
+assertion pointing at a generated revision ID with no stored evidence.
+
+Use [source ingestion](/recall/guides/ingesting-data) for a relationship that must be
+traceable to verified source material. For a direct operator assertion, retain
+its manual origin and do not describe the supplied string as a verified
+citation merely because the write succeeded.
+
+## Upsert a relationship
+
+Use `upsert_relationship` to create a new relationship or update an existing one matching the same `from_id`, `to_id`, and `rel_type` triple.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "from_id": "entity:550e8400-e29b-41d4-a716-446655440000",
+      "to_id": "entity:550e8400-e29b-41d4-a716-446655440001",
+      "rel_type": "works_at"
+    }
+    ```
+    Tool: `upsert_relationship`
+  </Tab>
+</Tabs>
+
+For subsequent field changes, use `update_relationship` with serialized record fields such as `confidence`, `status`, or `validity_window`. The upsert creation path currently ignores its `fields` object.
+
+## View an entity with its relationships
+
+Retrieve an entity with its incoming and outgoing relationships. For the HTTP
+example, set `ENTITY_ID` to the complete entity ID saved from creation.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "id": "entity:550e8400-e29b-41d4-a716-446655440000"
+    }
+    ```
+    Tool: `get_entity_with_relations`
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    curl -s "http://localhost:3000/v1/entities/$ENTITY_ID/with-relations"
+    ```
+  </Tab>
+</Tabs>
+
+## Propose a duplicate (identity resolution)
+
+When you suspect two entities refer to the same real-world thing, propose them as an identity candidate.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "candidate": {
+        "entity_a": "entity:550e8400-e29b-41d4-a716-446655440000",
+        "entity_b": "entity:550e8400-e29b-41d4-a716-446655440001",
+        "confidence": 0.92,
+        "evidence": "Same name and email address",
+        "signal_type": "heuristic"
+      }
+    }
+    ```
+    Tool: `propose_identity_candidate`
+  </Tab>
+</Tabs>
+
+## Review identity candidates
+
+List pending merge candidates, optionally filtered by confidence threshold.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "filters": { "status": "pending", "min_confidence": 0.85 },
+      "limit": 50
+    }
+    ```
+    Tool: `list_identity_candidates`
+  </Tab>
+</Tabs>
+
+## Merge entities
+
+Merge two entities into one. The `strategy` controls which entity's fields take precedence on conflicts.
+
+<Tabs>
+  <Tab title="MCP Tool">
+    ```json
+    {
+      "entity_a": "entity:550e8400-e29b-41d4-a716-446655440000",
+      "entity_b": "entity:550e8400-e29b-41d4-a716-446655440001",
+      "strategy": "prefer_newer"
+    }
+    ```
+    Tool: `merge_entities`
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    curl -s -X POST http://localhost:3000/v1/identity/merge \
+      -H "content-type: application/json" \
+      -d '{
+        "entity_a": "entity:550e8400-e29b-41d4-a716-446655440000",
+        "entity_b": "entity:550e8400-e29b-41d4-a716-446655440001",
+        "strategy": "keep_a"
+      }'
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+  Merging rewrites graph references and soft-deletes the losing entity. Review
+  identity evidence and choose the survivor before executing the merge. There
+  is no dedicated unmerge tool.
+</Warning>
+
+Available strategies:
+
+| Strategy | Behavior |
+|---|---|
+| `prefer_newer` | The more recently updated entity's fields win |
+| `prefer_older` | The older entity's fields win |
+| `prefer_a` | Entity A's fields always win |
+| `prefer_b` | Entity B's fields always win |
+
+After a successful MCP merge, read `data.survivor.id` and fetch that entity
+again to verify its relationships. With `prefer_newer`, do not assume that
+entity A survived.
+
+The REST merge endpoint instead accepts `keep_a`, `keep_b`, or `combine` (create a new combined entity). See [identity resolution](/recall/api/system#identity-resolution).
+
+## Next steps
+
+- [Truth slots](/recall/guides/truth-slots) -- Understand how extracted assertions compete for truth
+- [Searching](/recall/guides/searching) -- Find entities and relationships across the graph
+- [Event streaming](/recall/guides/event-streaming) -- Monitor changes to the knowledge graph

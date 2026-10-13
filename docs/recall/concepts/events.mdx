@@ -1,0 +1,119 @@
+---
+title: "Events"
+description: "Represent occurrences with participants, evidence, and explicit uncertainty about time."
+icon: "calendar"
+---
+
+A domain event records something that happened or is expected to happen: a
+meeting, a launch, an incident, or a person joining a project. It has a title,
+optional time range, participant references, confidence, and source evidence.
+
+In the [running example](/recall/concepts/overview), "Mara joined Northstar Labs in
+March 2026" can support both an employment relationship and a joining event.
+The relationship describes a state; the event describes an occurrence.
+
+## Domain events and system events
+
+| Kind | Example | Read through |
+|------|---------|--------------|
+| Domain `Event` | A project launch or joining date | Timeline REST routes and event MCP tools |
+| System/outbox event | A document changed or graph record was committed | [Event streaming](/recall/guides/event-streaming) |
+
+A pipeline notification is not automatically a domain timeline entry. Likewise,
+reading the timeline does not subscribe you to work-item completion notices.
+
+## Keep time precision explicit
+
+Events have `time_start`, `time_end`, and `time_precision`. An extracted month
+or year can be represented with a normalized timestamp while its precision
+preserves what is actually known.
+
+| Precision | Known information | Example representation |
+|-----------|-------------------|------------------------|
+| `exact` | Full timestamp | `2026-03-12T09:30:24Z` |
+| `minute` | Minute | `2026-03-12T09:30:00Z` |
+| `hour` | Hour | `2026-03-12T09:00:00Z` |
+| `day` | Calendar date | `2026-03-12T00:00:00Z` |
+| `month` | Year and month | `2026-03-01T00:00:00Z` |
+| `year` | Year | `2026-01-01T00:00:00Z` |
+| `unknown` | No usable time | Time fields may be absent |
+
+Display "March 2026" for a month-precision event. Rendering its normalized
+first-of-month timestamp as an exact appointment would invent precision.
+
+`time_confidence` expresses confidence in the temporal interpretation.
+`confidence` expresses confidence in the event claim itself. They describe separate questions: a source can clearly describe a launch
+without giving its date. Current inline promotion initializes both scores from
+the extraction confidence; two populated fields do not imply two independent
+confidence estimates.
+
+## Participants and provenance
+
+Participants are entity references in `base.subjects`. They also contribute
+to [subject-based authorization](/recall/concepts/security#subject-restrictions).
+A principal that can read Mara is not necessarily authorized for an event
+whose participant list includes other restricted people.
+
+`assertion_refs` points to the claims supporting the event; `source_refs` can
+point to originating source records. Current inline promotion populates the
+assertion references and leaves `source_refs` empty, so follow the assertion
+evidence to inspect the exact passage and revision behind those entries.
+
+## Status affects timeline results
+
+| Status | Meaning |
+|--------|---------|
+| `candidate` | Proposed event awaiting a truth decision |
+| `approved` | Accepted event |
+| `superseded` | Replaced by newer or better evidence |
+| `rejected` | Rejected event claim |
+
+Inline promotion auto-approves events at or above
+`EVENT_AUTO_APPROVE_THRESHOLD` (default `0.85`) and creates lower-confidence
+events as candidates. Truth maintenance can subsequently approve, supersede,
+or reject them. Direct-write surfaces can also supply an initial status, so
+inspect the record rather than assuming a common origin for every event.
+
+Timeline queries exclude `candidate` by default. This filter does not mean
+"approved only". MCP search supports `statuses: ["approved"]` when your
+application requires approved events exclusively. The REST search request has
+no `statuses` field; filter returned event statuses in your client.
+
+## Query events
+
+With an MCP connection authorized for the space, call
+[`search_events`](/recall/mcp/tools#search_events) with:
+
+```json
+{
+  "query": "Northstar Labs",
+  "statuses": ["approved"],
+  "limit": 10
+}
+```
+
+Inspect candidates with `include_candidates: true` when troubleshooting why an
+extracted event has not appeared in ordinary results. Event search also
+supports participant IDs and `any`/`all` matching; the exact fields are in the
+[MCP tool reference](/recall/mcp/tools#search_events).
+
+For a running authenticated HTTP server, set `TOKEN` to your issued token and
+use the matching timeline route:
+
+```bash
+curl --fail-with-body -sS http://127.0.0.1:3000/v1/timeline/search \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"Northstar Labs","include_candidates":false,"limit":10}'
+```
+
+[`list_recent_events`](/recall/mcp/tools#list_recent_events) and
+[`list_upcoming_events`](/recall/mcp/tools#list_upcoming_events) provide convenience
+views. An event without usable time may be searchable by text while absent
+from a time-bounded upcoming list.
+
+## Next steps
+
+- [Assertions](/recall/concepts/assertions) explains the evidence chain.
+- [Truth maintenance](/recall/concepts/truth-maintenance) explains competing event claims.
+- [Event streaming](/recall/guides/event-streaming) covers system notifications separately.

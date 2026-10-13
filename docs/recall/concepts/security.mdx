@@ -1,0 +1,211 @@
+---
+title: "Security"
+description: "Understand authentication, record authorization, subject restrictions, and derived-data visibility."
+icon: "shield-halved"
+---
+
+Meerkat Recall combines bearer-token authentication with attribute-based access
+control (ABAC). Authentication identifies the caller. Record authorization
+compares that principal's space, operation scopes, clearance, and subject
+restrictions with the record being read or written.
+
+A valid token is therefore only the start of an access decision. It does not
+make every record in a space visible.
+
+## Authorization boundaries
+
+Most HTTP and MCP record handlers invoke the policy engine. Lower-level Rust
+storage repositories do not carry a request principal; an embedding
+application must authorize their use at its own boundary.
+
+REST and MCP space configuration operations require `read:space_config` or
+`write:space_config`, as appropriate, plus record authorization. A tenant token
+can manage only its own named space. Wildcard operation scopes do not grant
+access to another space. Updates that return a configuration also require read
+access, and compare the authorized envelope at the storage write.
+
+The Default MCP `get_provenance` handler authorizes the claim, each assertion,
+revision, node and parent document before returning the chain. Missing, deleted,
+foreign-space or inaccessible evidence fails the request without returning a
+partial chain. Raw document authority is required for excerpts and node text.
+
+REST work-item reads use `read:work_item`. Retrying a failed item additionally
+requires `write:work_item` and record authorization. The retry compares the
+observed state at the atomic write and preserves that check when reactivating
+archived work. A concurrent status or security change returns a conflict.
+
+Managed REST data routes enforce the current runtime mode in shared middleware.
+In `read_only`, mutations are rejected even for wildcard and development bypass
+principals. Existing searches, batch entity reads and authorized snapshot export
+remain available. Runtime capabilities are separate from caller permissions.
+
+The explicit local-development bypass disables record ABAC. Use it only with
+isolated development data and loopback access.
+
+## Record security envelope
+
+Each record's `security` object describes its policy and restrictions:
+
+```json
+{
+  "policy_id": "project_policy_v1",
+  "level": 2,
+  "labels": ["project:atlas"],
+  "handling": ["handling:trusted_context"]
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `policy_id` | Policy namespace under which the record is classified |
+| `level` | Ordered sensitivity level |
+| `labels` | Compartments the caller must be cleared for |
+| `handling` | Additional caveats the caller must be allowed to handle |
+
+The strings are exact policy values. Naming a label `public` or a caveat
+`trusted` does not create special behavior by itself.
+
+## Principal clearance
+
+The corresponding principal needs an operation scope such as `read:entity`
+and a clearance for the record's policy. This is an illustrative clearance,
+not a complete JWT:
+
+```json
+{
+  "policy_id": "project_policy_v1",
+  "max_level": 2,
+  "labels": ["project:atlas"],
+  "handling_allow": ["handling:trusted_context"]
+}
+```
+
+For ordinary record access, every check must succeed:
+
+1. The principal and record have the same `space_id`.
+2. The principal has the required operation scope.
+3. A clearance matches the record's `policy_id`.
+4. The record's `level` is within `max_level`.
+5. Every record label is present in the clearance's labels.
+6. Every handling caveat is present in `handling_allow`.
+7. Any subject restriction is satisfied.
+8. Any purposes required by the configured policy engine are present.
+
+The request adapters support wildcard operation scopes and compatibility
+aliases, such as raw-document access implying document metadata access.
+Wildcard scopes do not by themselves override space, clearance, or subject
+checks.
+
+Use explicit `clearances` in new tokens. The HTTP adapter retains a legacy
+fallback that constructs clearances from flat security fields when the
+clearance list is empty. Exact authentication claims are documented in the
+[API overview](/recall/api/overview#authentication).
+
+## Subject restrictions
+
+A principal can be restricted to a set of entity IDs with
+`subject_allowlist`. A record also declares `subjects` and `subjects_state`:
+
+| State | Meaning |
+|-------|---------|
+| `complete` | The record's relevant subjects are known |
+| `partial` | Some subjects remain unresolved |
+| `unknown` | Subject inference has not been completed |
+
+For a restricted principal, the normal rule requires a complete, non-empty
+subject list, with every subject in the allowlist. If a meeting record names
+both Mara and Ivo, a principal restricted to Mara alone cannot read it.
+
+The `handling:subjectless_ok` caveat permits incomplete or empty subject
+metadata when the clearance also allows that caveat. It does not exempt a
+known subject from the allowlist.
+
+An omitted or `null` `subject_allowlist` means no subject restriction. An
+explicit empty array stays restricted to no subjects: it denies access to every
+subject-bearing record, including entities, even with wildcard operation scopes.
+The `handling:subjectless_ok` exception described above still applies to records
+with no known subjects.
+
+## Entity security changes
+
+Ordinary entity updates require read and write access to both the existing and
+proposed record, and preserve the complete `security` object: `policy_id`,
+`level`, `labels`, and `handling`. Being cleared for both classifications does
+not grant permission to reclassify an existing entity. This applies to REST
+replacement, upsert, and batch writes and to MCP `update_entity` and
+`batch_entities`, including restoration of deleted records.
+
+Ordinary replacements also preserve record identity, the subject set and raw
+subject completeness. They compare the authorized timestamp, lifecycle and
+complete security/subject envelope at the atomic storage write, so a stale
+content edit cannot undo a concurrent classification or subject change. A rejected update does not restore a
+deleted entity. These ordinary interfaces expose no declassification permission;
+trusted internal maintenance remains responsible for intentional security changes.
+REST relationship replacement, upsert and batch writes use the same ordinary
+security-envelope rule, requiring read/write authority on both versions. The
+atomic write also compares the observed endpoints, lifecycle and timestamp.
+Rejected replacements cannot revive protected tombstones. Trusted pipeline
+writers retain their own contracts.
+
+The REST timeline update, `PUT /v1/timeline/{id}`, also preserves the existing
+`security` fields. A payload that changes them returns `403`, even when the
+caller is cleared for both classifications. If stored security changes after
+authorization, the write returns `409`; fetch the current event before retrying
+a content edit.
+
+## Raw content and redaction
+
+The policy vocabulary separates document metadata access from raw-text access.
+Without `read:doc:raw`, REST document projections clear `text`, `sidecar_text`
+and `media_attachments`. This applies to get/search and legacy space document
+routes, as well as returned mutation records. The existing REST response shape
+is preserved. Document chunks require raw access to the parent document and
+revision, and authorize each returned node.
+
+MCP document response helpers clear `doc.text` without raw authority and return
+a `RedactionEnvelope` listing affected fields. These receipts describe that
+specific projection. Neither helper is a general scrubber for arbitrary
+application-defined `metadata`; classify the whole record appropriately when
+those fields contain sensitive information.
+
+The current source handlers return authorized source records directly. Do not
+assume the `read:source:raw` scope automatically hides `source.uri` or
+`source.path` on every source API or MCP response. Protect sensitive source
+locations through the record envelope and deployment access policy.
+
+## Derived answers retain restrictions
+
+Truth slots are partitioned by a fingerprint of the security envelope.
+Claims in different envelopes are not combined into a shared conflict group.
+This prevents a restricted claim from silently changing an answer in a less
+restricted partition, but it also means contradictions across partitions are
+not detected by truth maintenance.
+
+Knowledge-view publication uses exact security-envelope matching. Its
+projection records retain the union of contributing subjects, including
+relationship endpoints and evidence. Source projections additionally require
+`read:doc:raw` because they contain immutable document excerpts.
+
+The managed Living Wiki has a separate service grant. Creating or compiling
+that service requires explicit `manage:wiki` and unrestricted subject scope;
+a wildcard operation scope alone does not grant it. See the
+[Living Wiki architecture](/recall/architecture/living-wiki) for publication and
+revocation behavior.
+
+## Development bypass
+
+`SKIP_AUTH=true` injects a development principal and bypasses ABAC. The HTTP
+server selects its space from `X-Space-Id`, falling back to `default`. This
+makes loopback examples easy to run, but their successful requests do not
+validate your production authorization policy.
+
+For authenticated service startup, configure the supported HS256 JWT secret
+and the intended issuer/audience constraints. MCP clients send their bearer
+token on each request; a server-side fallback token is not used to authorize
+an incoming caller. See [deployment](/recall/operations/deployment).
+
+## Next steps
+
+- [Spaces](/recall/concepts/spaces) explains request scoping and per-space configuration.
+- [API authentication](/recall/api/overview#authentication) documents token claims.
+- [MCP overview](/recall/mcp/overview) explains transport and tool visibility.

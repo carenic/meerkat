@@ -1,0 +1,229 @@
+---
+title: "API Overview"
+description: "Base URL, authentication, versioning, response format, pagination, and error handling for the Meerkat Recall HTTP API."
+icon: "book"
+---
+
+Use the HTTP API from application code and scripts. For a first integration:
+
+1. Start a server with the [quickstart](/recall/quickstart).
+2. Obtain a token for the intended space and operations.
+3. Check runtime readiness before ingestion, then track the returned work.
+4. Handle authorization, pagination, and processing failures explicitly.
+
+| Task | Reference |
+| --- | --- |
+| Synchronize source revisions | [Versioned source lifecycle](/recall/api/sources#versioned-source-ingestion) |
+| Ingest and inspect evidence | [Documents](/recall/api/documents), [Sources](/recall/api/sources) |
+| Read or edit the graph | [Entities](/recall/api/entities), [Relationships](/recall/api/relationships) |
+| Inspect claims and vocabulary | [Assertions](/recall/api/assertions), [Predicates](/recall/api/predicates) |
+| Inspect readiness, work, truth, or events | [System](/recall/api/system) |
+
+## Base URL
+
+All API endpoints are served by `meerkat-recall serve` (Axum, default port 3000):
+
+```
+http://localhost:3000
+```
+
+In production deployments, place the API behind a TLS-terminating reverse proxy so that clients connect over `https://`.
+
+## API Versioning
+
+The primary REST routes use `/v1/`. Compatibility routes also exist under
+`/api/v1/`; browser pages and MCP have separate paths. This pre-1.0 project does
+not promise a fixed deprecation window.
+
+## Authentication
+
+Meerkat Recall uses **JWT Bearer tokens** for authentication. Include the token in the `Authorization` header of every request:
+
+```
+Authorization: Bearer <your-jwt-token>
+```
+
+The token's `sub` and `exp` claims identify the principal and expiration.
+Data operations also need an appropriate space, permission scopes, and policy
+clearances. Some fields deserialize with defaults; an omitted permission field
+does not grant access. Configured issuer and audience restrictions also apply.
+
+| Claim | Description |
+|---|---|
+| `sub` | Principal subject identifier |
+| `exp` | Expiration time as a Unix timestamp in seconds |
+| `space_id` | Explicit single-space selection when signed |
+| `spaces` | Authorized multi-space ceiling; requests still select one space |
+| `scopes` | Array of permission scopes (e.g., `read:entity`, `write:doc`) |
+| `clearances` | ABAC policy clearances for the principal |
+
+Issue credentials with the local `service-token` CLI and create current local
+service grants separately. Path-selected space and `X-Space-Id` must agree;
+MCP and operation polling use the header. A signed multi-space ceiling does not
+select a default or override a revoked grant. Global management tokens cannot
+perform ordinary data access. See [service setup](/recall/operations/service-setup).
+
+<Note>
+  In development mode, set the environment variable `SKIP_AUTH=true` to bypass JWT validation entirely. Never use this in production.
+</Note>
+
+## Response Format
+
+Most REST data responses return JSON; SSE and no-content responses are exceptions. The HTTP status code indicates the outcome:
+
+| Status | Meaning |
+|---|---|
+| `200 OK` | Request succeeded |
+| `201 Created` | Resource created successfully |
+| `204 No Content` | Deletion succeeded (no response body) |
+| `400 Bad Request` | Invalid input or validation error |
+| `401 Unauthorized` | Missing, invalid, or expired authentication token |
+| `403 Forbidden` | Authorization denied |
+| `404 Not Found` | Resource does not exist |
+| `409 Conflict` | Resource already exists or a guarded write conflicts with the current record |
+| `500 Internal Server Error` | Unexpected server failure |
+| `503 Service Unavailable` | A required dependency or runtime capability is unavailable |
+
+## Error Responses
+
+The versioned source and scoped-search APIs use
+`{error_code, message, retryable}`. Handle codes such as `conflict_generation`,
+`not_ready`, `unknown_space`, `provider_unapproved` and `payload_too_large`;
+retryability does not reconcile a stale generation on the caller's behalf.
+
+Retained resource handlers use the structured JSON body below:
+
+
+```json
+{
+  "code": "VALIDATION_ERROR",
+  "message": "Human-readable description of the problem",
+  "details": null
+}
+```
+
+<ResponseField name="code" type="string" required>
+  Machine-readable error code. Common values include: `VALIDATION_ERROR`, `NOT_FOUND`, `ACCESS_DENIED`, `CONFLICT`, `INTERNAL_ERROR`.
+</ResponseField>
+
+<ResponseField name="message" type="string" required>
+  Human-readable error description.
+</ResponseField>
+
+<ResponseField name="details" type="object">
+  Optional structured details for the error.
+</ResponseField>
+
+Authentication errors instead use `{"error":"missing_token","message":"..."}`
+with HTTP 401 or 403. Malformed HTTP/JSON input can fail before a resource
+handler runs, so clients should check status and content type before decoding.
+
+### Authorization conflicts
+
+REST restore endpoints for documents, entities, relationships, sources, timeline
+events, and assertions check that the authorized record still matches at the
+write. Assertion delete and resolution updates use the same protection. If
+security, subjects or their completeness state, relevant entity links, or the
+exact soft-deletion marker changes before the mutation, the request returns `409` with code
+`CONFLICT`, without applying the requested change or returning record content.
+The same conflict occurs if the record disappears after authorization.
+
+Fetch the current record and reassess the operation before retrying. MCP
+`restore_entity` reports an equivalent concurrent change as a tool error.
+
+## Asynchronous processing
+
+An ingest response can return `doc_id`, `source_id`, and `work_item_id` before
+extraction finishes. Save those IDs. Inspect the document's pipeline status and
+work failures before concluding that graph data should be present. A `201`
+response establishes acceptance or creation according to the endpoint; it does
+not establish the quality or completeness of model extraction.
+
+See [ingesting data](/recall/guides/ingesting-data) for the complete workflow.
+
+## Cursor-Based Pagination
+
+Many list and search endpoints use cursor-based pagination; consult the
+individual endpoint for its exact response and limits. Pass the `cursor` value from a previous response to fetch the next page.
+
+**Request parameters:**
+
+<ParamField body="limit" type="integer" default="50">
+  Maximum number of results to return. Defaults and clamps vary by endpoint.
+</ParamField>
+
+<ParamField body="cursor" type="string">
+  Opaque pagination cursor from a previous response.
+</ParamField>
+
+**Common search response fields (not universal to every list endpoint):**
+
+<ResponseField name="results" type="array" required>
+  Array of result objects.
+</ResponseField>
+
+<ResponseField name="cursor" type="string">
+  Cursor for the next page. `null` when no more results exist.
+</ResponseField>
+
+<ResponseField name="has_more" type="boolean" required>
+  Whether additional pages are available beyond the current result set.
+</ResponseField>
+
+<ResponseField name="total" type="integer" required>
+  Total count of authorized results in the current scan.
+</ResponseField>
+
+**Example pagination flow:**
+
+These commands require `curl`, `jq`, and a Bearer token in `TOKEN`. Preserve
+filters between pages and send the returned cursor unchanged.
+
+```bash
+curl -fsS http://localhost:3000/v1/entities/search \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"Alice","limit":10}' > /tmp/elephant-page.json
+
+jq '.results' /tmp/elephant-page.json
+if jq -e '.has_more and (.cursor != null)' /tmp/elephant-page.json >/dev/null; then
+  jq '{query:"Alice", limit:10, cursor:.cursor}' /tmp/elephant-page.json \
+    > /tmp/elephant-next-page.json
+  curl -fsS http://localhost:3000/v1/entities/search \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    --data-binary @/tmp/elephant-next-page.json
+fi
+```
+
+## Record IDs
+
+Record IDs use a table prefix and an identifier, often a UUID. Treat the
+identifier as opaque. The prefix indicates the table:
+
+| Prefix | Resource |
+|---|---|
+| `entity:` | Entity |
+| `rel:` | Relationship |
+| `doc:` | Document |
+| `source:` | Source |
+| `assertion:` | Assertion |
+| `work_item:` | Work Item |
+| `truth_slot:` | Truth Slot |
+| `predicate_registry:` | Predicate |
+| `predicate_alias:` | Predicate Alias |
+| `audit_log:` | Audit Log Entry |
+
+When referencing a record by ID in path parameters, use the full prefixed form (e.g., `entity:550e8400-e29b-41d4-a716-446655440000`).
+
+## Space Isolation
+
+Data requests use the principal's `space_id` to scope record access. Policy clearances do not grant access to another space. Search endpoints that
+accept an explicit `space_id` reject a mismatch with the token's space. In
+local `SKIP_AUTH` mode, `X-Space-Id` selects the development principal's space
+(default `default`).
+
+The REST space-configuration administration routes have a different boundary:
+they currently authenticate callers without per-record authorization. Restrict
+those routes to trusted operators. See [security boundaries](/recall/concepts/security)
+and [space administration](/recall/api/system#spaces).

@@ -1,0 +1,124 @@
+---
+title: "Spaces"
+description: "Choose a knowledge boundary and configure its extraction purpose and embedding policy."
+icon: "layer-group"
+---
+
+A space is Meerkat Recall's logical knowledge boundary. Records carry a `space_id`,
+and a request principal selects the space whose records it can access. Use
+separate spaces for knowledge that should have separate identities,
+configuration, and authorization context.
+
+Within a space, [security envelopes](/recall/concepts/security) provide finer-grained
+visibility. Collections and entity types organize records; they do not replace
+those access controls.
+
+## Decide what belongs together
+
+| Use | Suggested boundary |
+|-----|--------------------|
+| Project notes that share people, organizations, and predicates | One space, with collections for retrieval groups |
+| Two tenants with independent access and identities | Separate spaces and principals |
+| Restricted documents inside one team's knowledge | One space with appropriate security envelopes |
+| An isolated fixture corpus | A separate development space |
+
+An entity named "Mara" in two spaces represents two independent records. Using
+the same space name on two independent database instances does not synchronize
+their data.
+
+## How requests select a space
+
+Authenticated requests use the token's `space_id`. Where record authorization
+is applied, it checks that this matches the record's space. Supplying a
+different ID in a JSON body or URL does not change the token's authority. The
+administrative REST exceptions described below still require deployment-level
+restriction.
+
+For loopback development with `SKIP_AUTH=true`, the HTTP server uses the
+`X-Space-Id` header, or `default` when the header is absent. Keep that header
+consistent across your ingest, search, and status calls.
+
+<Note>
+Storage repositories are lower-level Rust APIs. They do not possess the
+request principal and do not provide a universal authorization layer.
+Applications that call them directly must enforce space and record access at
+their integration boundary. Administrative HTTP routes also need deployment
+access controls; see [security](/recall/concepts/security#authorization-boundaries).
+</Note>
+
+## Configure the space
+
+A `SpaceConfig` record stores embedding settings and extraction guidance.
+
+| Setting | Why it matters |
+|---------|----------------|
+| `embedding_provider` | Selects the embedding implementation available in this build |
+| `embedding_model` | Selects the model used for document-node vectors |
+| `embedding_dims` | Declares the vector dimension expected by that policy |
+| `purpose` | Explains which knowledge is useful to this space |
+| `skill` | Selects domain guidance for extraction |
+
+For project notes, a purpose could be "Track project decisions, ownership,
+and dependencies." The built-in `extraction/technical-docs` skill provides
+related extraction guidance. Fiction-oriented corpora can select
+`extraction/fiction`; applications can supply additional skills.
+
+## Extraction skill routing
+
+A space-level purpose or skill takes precedence over document and source
+metadata. Use a broad space-level value when every document shares that
+intent. Leave it unset when per-document guidance should make the decision.
+The complete fallback order is documented in
+[extraction skill routing](/recall/pipeline/extraction#skill-resolution-cascade).
+
+## Create an isolated development space
+
+This example assumes the server from the [quickstart](/recall/quickstart) is bound to
+loopback with development bypass enabled. It selects the deterministic `fake`
+provider for a configuration example; that provider is not a semantic
+embedding model.
+
+```bash
+curl --fail-with-body -sS http://127.0.0.1:3000/v1/spaces \
+  -H 'Content-Type: application/json' \
+  -H 'X-Space-Id: project-notes' \
+  -d '{
+    "name": "project-notes",
+    "embedding_provider": "fake",
+    "embedding_model": "default",
+    "embedding_dims": 384,
+    "purpose": "Track project decisions, ownership, and dependencies",
+    "skill": "extraction/technical-docs"
+  }'
+```
+
+The response is the created `SpaceConfig`; its `space_id` is `project-notes`.
+Creating it again returns a conflict. Keep using
+`X-Space-Id: project-notes` for subsequent development requests.
+
+The MCP [`create_space`](/recall/mcp/tools#create_space) and
+[`update_space`](/recall/mcp/tools#update_space) tools currently expose embedding
+configuration only. The HTTP space configuration surface also accepts
+`purpose` and `skill`. The two request shapes differ: HTTP embedding fields are
+at the top level; MCP uses a `config` object.
+
+## Changing embedding policy
+
+Embedding model, vector dimension, and indexed content must agree. Changing a
+space's configuration does not rewrite vectors already stored for its nodes.
+
+Before changing a populated space, plan and verify the supported reprocessing
+path for your deployment, or rebuild a new space from the retained sources.
+The standalone `reembed` work kind is planned and is not an active worker
+command. Do not enqueue it and assume the index will be repaired.
+
+Provider names describe configured implementations, not a promise that every
+binary contains them. Consult the deployment's build features and provider
+readiness before enabling semantic retrieval.
+
+## Next steps
+
+- [Security](/recall/concepts/security) explains record-level visibility within a space.
+- [Documents](/recall/concepts/documents) explains processing depth and searchable content.
+- [Extraction](/recall/pipeline/extraction) documents purpose and skill resolution.
+- [System API](/recall/api/system#spaces) documents space configuration endpoints.
