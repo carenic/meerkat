@@ -1154,6 +1154,14 @@ Start a new turn on an existing session.
 
 Returns the same run-result shape as `session/create`. Fails with error code `-32002` (SESSION_BUSY) if a turn is already in progress.
 
+A turn that fails returns the JSON-RPC code of its typed cause, as the
+[session error mapping](/reference/capability-matrix#error-codes) does for the
+same causes: `-32010` (provider error) for `llm_failure` and
+`retry_exhausted`, `-32011` (budget exhausted) for `budget_exhausted` and
+`time_budget_exceeded`, `-32012` (hook denied) for `hook_denied`, and
+`-32005` for cancellation. Any other cause is `-32603`. The typed turn error
+(`kind`, `detail`, and the provider facts when known) is in `data.error`.
+
 <ParamField body="session_id" type="string" required>
   Session ID to continue.
 </ParamField>

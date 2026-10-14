@@ -119,7 +119,7 @@ parsing messages.
 
 ### Transport error mapping summary
 
-- **JSON-RPC**: `NotFound`/`Busy` keep dedicated codes (-32001/-32002), durable resume holds use `SessionNotRunning` (-32003), and typed agent causes use the canonical `meerkat_contracts::ErrorCode::jsonrpc_code()` values. Remaining session variants collapse to -32603 with the message preserved.
+- **JSON-RPC**: `NotFound`/`Busy` keep dedicated codes (-32001/-32002), durable resume holds use `SessionNotRunning` (-32003), and typed agent causes use the canonical `meerkat_contracts::ErrorCode::jsonrpc_code()` values. Remaining session variants collapse to -32603 with the message preserved. A failed runtime-routed turn (`turn/start`, `mob/turn_start`) maps the typed cause of its terminal to the same codes (`llm_failure` and `retry_exhausted` -32010, `budget_exhausted` and `time_budget_exceeded` -32011, `hook_denied` -32012, other causes -32603), with the typed turn error in `data.error`.
 - **REST**: Endpoint-typed `ApiError` mapping (`NotFound` -> 404; `Busy` -> 400 on create/turn, 409 on interrupt conflicts; archived/unavailable history -> 400; agent/internal -> 500). Where canonical wire errors are emitted, `ErrorCode::http_status()` decides the status. Error body includes `{ "code": "...", "message": "..." }`.
 - **MCP Server**: Tool calls return `is_error: true` with the error message and code in the content.
 - **CLI**: General commands use 0 for success, 1 for error, and 2 for graceful budget exhaustion. Multi-host mob commands additionally preserve the typed operator failures: 45 scope denied, 46 host unavailable, 47 stale cursor, and 48 stale fence. Error details are printed to stderr.

@@ -13164,6 +13164,106 @@ mod tests {
         }
     }
 
+    /// Answers the first provider call and fails every later one with a
+    /// non-retryable provider error.
+    struct FailAfterFirstLlmClient {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmClient for FailAfterFirstLlmClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a meerkat_client::LlmRequest,
+        ) -> Pin<
+            Box<dyn futures::Stream<Item = Result<meerkat_client::LlmEvent, LlmError>> + Send + 'a>,
+        > {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                return Box::pin(stream::iter(vec![Err(LlmError::InvalidRequest {
+                    message: "synthetic provider refusal".to_string(),
+                })]));
+            }
+            Box::pin(stream::iter(vec![
+                Ok(meerkat_client::LlmEvent::TextDelta {
+                    delta: "first turn succeeds".to_string(),
+                    meta: None,
+                }),
+                Ok(meerkat_client::LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        meerkat_core::Provider::Anthropic,
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
+                }),
+                Ok(meerkat_client::LlmEvent::Done {
+                    outcome: meerkat_client::LlmDoneOutcome::Success {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                }),
+            ]))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Anthropic
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// A turn whose provider call fails reports the canonical provider-error
+    /// code, as the documented session-error mapping does for the same
+    /// cause, with the typed turn error kept in `data.error`; never the
+    /// generic internal error.
+    #[tokio::test]
+    async fn turn_start_provider_failure_reports_provider_error_code() {
+        let (router, _notif_rx) = test_router_with_llm(Arc::new(FailAfterFirstLlmClient {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }))
+        .await;
+        let created = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({ "prompt": "the first turn succeeds" }),
+            ))
+            .await
+            .unwrap();
+        let session_id = result_value(&created)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let failed = router
+            .dispatch(make_request(
+                "turn/start",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "prompt": "this turn's provider call fails"
+                }),
+            ))
+            .await
+            .unwrap();
+        let error = failed
+            .error
+            .as_ref()
+            .expect("a failed provider call fails the turn");
+        assert_eq!(
+            error.code,
+            error::PROVIDER_ERROR,
+            "a provider failure reports PROVIDER_ERROR: {error:?}"
+        );
+        let data = error.data.as_ref().expect("typed turn error data");
+        assert_eq!(data["error"]["kind"], "llm_failure", "{data}");
+    }
+
     /// 8. `turn/start` emits notifications via the notification sink.
     #[tokio::test]
     async fn turn_start_emits_notifications() {

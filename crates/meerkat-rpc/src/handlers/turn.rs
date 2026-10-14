@@ -356,8 +356,13 @@ pub async fn start_turn_with_params(
         .await
     {
         Ok(r) => r,
+        // The typed data (the turn error, a callback-pending payload) stays
+        // on the response with its typed code.
         Err(rpc_err) => {
-            return RpcResponse::error(id, rpc_err.code, rpc_err.message);
+            return match rpc_err.data {
+                Some(data) => RpcResponse::error_with_data(id, rpc_err.code, rpc_err.message, data),
+                None => RpcResponse::error(id, rpc_err.code, rpc_err.message),
+            };
         }
     };
 
