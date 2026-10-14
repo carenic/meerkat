@@ -444,7 +444,7 @@ pub async fn handle_stop_run(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod start_turn_params_tests {
     use super::StartTurnParams;
     use meerkat_core::ContentInput;
