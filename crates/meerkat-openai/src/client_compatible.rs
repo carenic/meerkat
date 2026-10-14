@@ -104,6 +104,13 @@ pub struct OpenAiCompatibleClient {
     /// static secret, or none for an authless server. There is then nothing
     /// to prepare before a controller request.
     static_credential: bool,
+    /// The OpenAI backend this client speaks to, when it is one (a GitHub
+    /// Copilot route); `None` for a self-hosted or other OpenAI-compatible
+    /// server. Prompt-cache fields reach the wire only through a backend that
+    /// has admitted them
+    /// ([`meerkat_core::provider_matrix::OpenAiBackendKind::admits_prompt_cache_fields`]),
+    /// so a server outside the OpenAI backend matrix receives none.
+    openai_backend: Option<meerkat_core::provider_matrix::OpenAiBackendKind>,
 }
 
 impl OpenAiCompatibleClient {
@@ -167,7 +174,26 @@ impl OpenAiCompatibleClient {
             supports_image_tool_results: options.supports_image_tool_results,
             post_finish_trailer_window: DEFAULT_POST_FINISH_TRAILER_WINDOW,
             static_credential: false,
+            openai_backend: None,
         }
+    }
+
+    /// Declare the OpenAI backend this client speaks to (a GitHub Copilot
+    /// route). Whether its requests carry prompt-cache fields is that
+    /// backend's admission.
+    #[must_use]
+    pub fn with_openai_backend(
+        mut self,
+        backend: meerkat_core::provider_matrix::OpenAiBackendKind,
+    ) -> Self {
+        self.openai_backend = Some(backend);
+        self
+    }
+
+    fn admits_prompt_cache_fields(&self) -> bool {
+        self.openai_backend.is_some_and(
+            meerkat_core::provider_matrix::OpenAiBackendKind::admits_prompt_cache_fields,
+        )
     }
 
     /// Declare that this client's credential was fixed when it was built (a
@@ -230,6 +256,12 @@ impl OpenAiCompatibleClient {
         };
         tag.supports_temperature_override = Some(self.supports_temperature);
         tag.supports_reasoning_override = Some(self.supports_reasoning);
+        // The Responses delegate speaks the public API's wire to this
+        // client's server, which admits the fields only as this client's
+        // backend does.
+        if !self.admits_prompt_cache_fields() {
+            crate::client::clear_prompt_cache_fields(&mut tag);
+        }
         request.provider_params = Some(ProviderTag::OpenAi(tag));
         request
     }
@@ -335,7 +367,9 @@ impl OpenAiCompatibleClient {
     /// `openai_compatible` transport path). It is not a supported host API.
     #[doc(hidden)]
     pub fn build_chat_completions_body(&self, request: &LlmRequest) -> Result<Value, LlmError> {
-        let tag = crate::client::openai_tag(request);
+        let wire_tag =
+            crate::client::admitted_openai_tag(request, self.admits_prompt_cache_fields());
+        let tag = wire_tag.as_deref();
         let author_explicit_breakpoints = tag.is_some_and(|tag| {
             tag.prompt_cache_enabled != Some(false)
                 && tag.prompt_cache_options.is_some_and(|options| {
@@ -3231,13 +3265,16 @@ mod tests {
             OpenAiPromptCacheMode, OpenAiPromptCacheTtl,
         };
 
+        // The lowering a backend that has admitted the prompt-cache fields
+        // receives; no compatible route's backend has today.
         let client = OpenAiCompatibleClient::new_with_options(
             OpenAiCompatibleMode::ChatCompletions,
             "gpt-5.6-sol".to_string(),
             "http://localhost:11434/v1".to_string(),
             None,
             options(true, true, true, false),
-        );
+        )
+        .with_openai_backend(meerkat_core::provider_matrix::OpenAiBackendKind::OpenAiApi);
         let request = LlmRequest::new(
             "gpt-5.6-sol",
             vec![Message::User(UserMessage::text("hello".to_string()))],
@@ -3283,13 +3320,16 @@ mod tests {
         use meerkat_core::lifecycle::run_primitive::OpenAiPromptCacheOptions;
         use meerkat_core::model_profile::capabilities::OpenAiPromptCacheMode;
 
+        // The lowering a backend that has admitted the prompt-cache fields
+        // receives; no compatible route's backend has today.
         let client = OpenAiCompatibleClient::new_with_options(
             OpenAiCompatibleMode::ChatCompletions,
             "gpt-5.6-sol".to_string(),
             "http://localhost:11434/v1".to_string(),
             None,
             options(true, true, true, false),
-        );
+        )
+        .with_openai_backend(meerkat_core::provider_matrix::OpenAiBackendKind::OpenAiApi);
         let first_request = LlmRequest::new(
             "gpt-5.6-sol",
             vec![Message::User(UserMessage::text("hello".to_string()))],
@@ -3327,13 +3367,16 @@ mod tests {
         use meerkat_core::lifecycle::run_primitive::OpenAiPromptCacheOptions;
         use meerkat_core::model_profile::capabilities::OpenAiPromptCacheMode;
 
+        // The lowering a backend that has admitted the prompt-cache fields
+        // receives; no compatible route's backend has today.
         let client = OpenAiCompatibleClient::new_with_options(
             OpenAiCompatibleMode::ChatCompletions,
             "gpt-5.6-sol".to_string(),
             "http://localhost:11434/v1".to_string(),
             None,
             options(true, true, true, false),
-        );
+        )
+        .with_openai_backend(meerkat_core::provider_matrix::OpenAiBackendKind::OpenAiApi);
         let explicit = |messages| {
             LlmRequest::new("gpt-5.6-sol", messages).with_openai_tag_merge(|tag| {
                 tag.prompt_cache_options = Some(OpenAiPromptCacheOptions {
@@ -3382,13 +3425,16 @@ mod tests {
         use meerkat_core::lifecycle::run_primitive::OpenAiPromptCacheOptions;
         use meerkat_core::model_profile::capabilities::OpenAiPromptCacheMode;
 
+        // The lowering a backend that has admitted the prompt-cache fields
+        // receives; no compatible route's backend has today.
         let client = OpenAiCompatibleClient::new_with_options(
             OpenAiCompatibleMode::ChatCompletions,
             "gpt-5.6-sol".to_string(),
             "http://localhost:11434/v1".to_string(),
             None,
             options(true, true, true, false),
-        );
+        )
+        .with_openai_backend(meerkat_core::provider_matrix::OpenAiBackendKind::OpenAiApi);
         let request = LlmRequest::new(
             "gpt-5.6-sol",
             vec![

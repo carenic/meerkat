@@ -384,6 +384,14 @@ unrepresentable; rebinding to an exact provider can execute the same Session
 unchanged. Adapters never hoist later System rows into a top-level prefix or
 merge or delimiter-join distinct canonical System rows.
 
+A session's resolved `supports_mid_conversation_system_messages` capability is
+the model's catalog row as the session's backend serves it: through the private
+ChatGPT backend it is `false`, whatever the row says. Instruction activation
+refuses on it with `UnsupportedCurrentLowering` before anything is appended. A
+model change or binding clear is planned with the binding the session's client
+resolution selects, so one that would put recorded activations on such a
+backend is refused before anything changes.
+
 Anthropic's `supports_mid_conversation_system_messages` catalog capability
 gates later System rows. Supported placements must follow a user turn
 (including user-role notice/tool-result projections) or an assistant whose last

@@ -369,6 +369,28 @@ impl ModelRegistry {
             .cloned()
     }
 
+    /// The capability profile of `identity` as its backend serves it: the
+    /// model's profile, less what the backend its configured binding names in
+    /// `config` cannot carry
+    /// ([`crate::BackendProfile::admits_mid_conversation_system_messages`]).
+    /// An identity that names no binding, or one `config` does not resolve,
+    /// keeps the model's profile.
+    pub fn profile_for_identity(
+        &self,
+        config: &crate::Config,
+        identity: &crate::SessionLlmIdentity,
+    ) -> Option<ModelProfile> {
+        let mut profile = self.profile_for_provider(identity.provider, &identity.model)?;
+        if profile.supports_mid_conversation_system_messages
+            && let Some(auth_binding) = identity.auth_binding.as_ref()
+            && let Ok(target) = crate::resolve_explicit_auth_binding_target(config, auth_binding)
+            && !target.backend.admits_mid_conversation_system_messages()
+        {
+            profile.supports_mid_conversation_system_messages = false;
+        }
+        Some(profile)
+    }
+
     /// Mint provenance for the exact provider/model profile in this registry.
     ///
     /// Unknown pairs and provider/model mismatches fail closed. The returned

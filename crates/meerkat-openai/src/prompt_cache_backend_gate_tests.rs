@@ -173,3 +173,263 @@ fn the_public_openai_wire_keeps_explicit_cache_params() {
         "explicit mode on the public API claims its breakpoints"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The OpenAI-compatible and GitHub Copilot routes
+// ---------------------------------------------------------------------------
+//
+// Every route that lowers an OpenAI tag applies the same rule: a self-hosted
+// server through the compatible client (Chat Completions and Responses), and
+// the Copilot `/responses` and `/chat/completions` routes. None of those
+// backends has admitted the fields, so a request through them carries none,
+// a disabled cache included.
+
+use std::sync::{Arc, Mutex};
+
+use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
+use futures::StreamExt;
+use tokio::net::TcpListener;
+
+use crate::client_compatible::OpenAiCompatibleMode;
+use crate::{OpenAiCompatibleClient, OpenAiCompatibleClientOptions};
+
+const RESPONSES_SSE: &str = concat!(
+    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",",
+    "\"usage\":{\"input_tokens\":4,\"output_tokens\":1}}}\n",
+    "data: [DONE]\n",
+);
+
+const CHAT_SSE: &str = concat!(
+    "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},",
+    "\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],",
+    "\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":1}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// A remote model outside the catalog, as a self-hosted server serves one: no
+/// catalog row refuses a cache mode or retention before the request is sent.
+const SELF_HOSTED_REMOTE_MODEL: &str = "served-model";
+
+/// Every way a tag asks for caching: explicit params, a bare enable (lowered
+/// to implicit mode on an admitted backend), the durable opt-out
+/// (explicit-only mode on an admitted backend) and a retention.
+fn cache_tags() -> Vec<(&'static str, OpenAiProviderTag)> {
+    vec![
+        ("explicit params", explicit_cache_tag()),
+        (
+            "bare enable",
+            OpenAiProviderTag {
+                prompt_cache_enabled: Some(true),
+                ..Default::default()
+            },
+        ),
+        (
+            "disabled cache",
+            OpenAiProviderTag {
+                prompt_cache_enabled: Some(false),
+                ..Default::default()
+            },
+        ),
+        (
+            "retention",
+            OpenAiProviderTag {
+                prompt_cache_retention: Some(OpenAiPromptCacheRetention::TwentyFourHours),
+                ..Default::default()
+            },
+        ),
+    ]
+}
+
+/// Assert that no request body carries a cache field or breakpoint, naming
+/// every tag whose request did.
+fn assert_no_cache_on_the_wire(wire: &str, bodies: &[(&'static str, Value)]) {
+    let leaks: Vec<String> = bodies
+        .iter()
+        .filter_map(|(label, body)| {
+            let fields = cache_body_fields(body);
+            let markers = breakpoint_markers(body);
+            (!fields.is_empty() || markers > 0)
+                .then(|| format!("{label}: fields {fields:?}, {markers} breakpoint(s)"))
+        })
+        .collect();
+    assert!(
+        leaks.is_empty(),
+        "{wire}: cache params reached the wire: {leaks:#?}"
+    );
+}
+
+/// A self-hosted client as the factory builds one.
+fn self_hosted(mode: OpenAiCompatibleMode, base_url: String) -> OpenAiCompatibleClient {
+    OpenAiCompatibleClient::new_with_options(
+        mode,
+        SELF_HOSTED_REMOTE_MODEL.to_string(),
+        base_url,
+        None,
+        OpenAiCompatibleClientOptions {
+            supports_temperature: true,
+            supports_thinking: true,
+            supports_reasoning: true,
+            supports_image_tool_results: false,
+        },
+    )
+    .with_image_input_support(true)
+    .with_static_credential()
+}
+
+#[derive(Clone)]
+struct BodyCapture {
+    bodies: Arc<Mutex<Vec<Value>>>,
+    payload: &'static str,
+}
+
+async fn capture_body(
+    State(capture): State<BodyCapture>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    capture.bodies.lock().expect("capture lock").push(body);
+    ([("content-type", "text/event-stream")], capture.payload)
+}
+
+/// Send one request per tag through the client `build` makes for a local
+/// server answering `path`, and return the body each request put on the wire.
+async fn bodies_on_the_wire(
+    path: &str,
+    payload: &'static str,
+    build: impl Fn(String) -> Arc<dyn LlmClient>,
+) -> Vec<(&'static str, Value)> {
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route(path, post(capture_body))
+        .with_state(BodyCapture {
+            bodies: Arc::clone(&bodies),
+            payload,
+        });
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let client = build(format!("http://{addr}"));
+    let tags = cache_tags();
+    for (_, tag) in &tags {
+        let request = request(tag.clone());
+        let mut stream = client.stream(&request);
+        while stream.next().await.is_some() {}
+    }
+    server.abort();
+    let bodies = std::mem::take(&mut *bodies.lock().expect("capture lock"));
+    assert_eq!(
+        bodies.len(),
+        tags.len(),
+        "every request reached the wire: {bodies:?}"
+    );
+    tags.into_iter()
+        .map(|(label, _)| label)
+        .zip(bodies)
+        .collect()
+}
+
+#[test]
+fn cache_params_never_reach_a_self_hosted_chat_completions_wire() {
+    let client = self_hosted(
+        OpenAiCompatibleMode::ChatCompletions,
+        "http://127.0.0.1:9/v1".to_string(),
+    );
+    let bodies: Vec<(&'static str, Value)> = cache_tags()
+        .into_iter()
+        .map(|(label, tag)| {
+            let body = client
+                .build_chat_completions_body(&request(tag))
+                .expect("chat completions body");
+            (label, body)
+        })
+        .collect();
+    assert_no_cache_on_the_wire("self-hosted chat completions", &bodies);
+}
+
+#[tokio::test]
+async fn cache_params_never_reach_a_self_hosted_responses_wire() {
+    let bodies = bodies_on_the_wire("/v1/responses", RESPONSES_SSE, |base| {
+        Arc::new(self_hosted(
+            OpenAiCompatibleMode::Responses,
+            format!("{base}/v1"),
+        ))
+    })
+    .await;
+    assert_no_cache_on_the_wire("self-hosted responses", &bodies);
+}
+
+#[cfg(feature = "copilot")]
+mod copilot_routes {
+    use super::*;
+    use crate::runtime::{CopilotOpenAiRouteTarget, copilot_openai_route_client};
+
+    struct CopilotTokenAuthorizer;
+
+    #[async_trait::async_trait]
+    impl meerkat_core::HttpAuthorizer for CopilotTokenAuthorizer {
+        async fn authorize(
+            &self,
+            request: &mut meerkat_core::HttpAuthorizationRequest<'_>,
+        ) -> Result<(), meerkat_core::AuthError> {
+            request.headers.push((
+                "Authorization".to_string(),
+                "Bearer copilot-token".to_string(),
+            ));
+            Ok(())
+        }
+
+        fn label(&self) -> &str {
+            meerkat_copilot::GITHUB_COPILOT_AUTHORIZER_LABEL
+        }
+    }
+
+    /// The client the OpenAI Copilot route builds for `endpoint`.
+    fn copilot_route(
+        endpoint: meerkat_copilot::CopilotEndpoint,
+        api_base: String,
+    ) -> Arc<dyn LlmClient> {
+        copilot_openai_route_client(
+            endpoint,
+            api_base,
+            Arc::new(CopilotTokenAuthorizer),
+            &CopilotOpenAiRouteTarget {
+                model: MODEL.to_string(),
+                supports_temperature: false,
+                supports_image_input: true,
+                supports_image_tool_results: true,
+            },
+        )
+        .expect("Copilot route client")
+    }
+
+    #[tokio::test]
+    async fn cache_params_never_reach_the_copilot_responses_wire() {
+        let bodies = bodies_on_the_wire("/responses", RESPONSES_SSE, |base| {
+            copilot_route(meerkat_copilot::CopilotEndpoint::Responses, base)
+        })
+        .await;
+        assert_no_cache_on_the_wire("copilot responses", &bodies);
+    }
+
+    #[tokio::test]
+    async fn cache_params_never_reach_the_copilot_chat_completions_wire() {
+        let bodies = bodies_on_the_wire("/chat/completions", CHAT_SSE, |base| {
+            copilot_route(meerkat_copilot::CopilotEndpoint::ChatCompletions, base)
+        })
+        .await;
+        assert_no_cache_on_the_wire("copilot chat completions", &bodies);
+    }
+}
+
+/// The Copilot `/responses` wire also authors no cache breakpoint claim.
+#[test]
+fn explicit_cache_params_never_reach_the_copilot_responses_wire_or_its_claims() {
+    assert_no_cache_on_wire(
+        &OpenAiClient::new("test-key".to_string()).with_copilot_backend_wire(),
+        explicit_cache_tag(),
+        "copilot responses",
+    );
+}

@@ -623,6 +623,62 @@ impl meerkat_copilot::CopilotChatCompletionsClientFactory
     }
 }
 
+/// The catalog capabilities an OpenAI model's GitHub Copilot route client is
+/// built with.
+#[cfg(all(feature = "copilot", not(target_arch = "wasm32")))]
+#[derive(Debug)]
+pub(crate) struct CopilotOpenAiRouteTarget {
+    pub(crate) model: String,
+    pub(crate) supports_temperature: bool,
+    pub(crate) supports_image_input: bool,
+    pub(crate) supports_image_tool_results: bool,
+}
+
+/// The client that serves an OpenAI model's GitHub Copilot route on the
+/// endpoint Copilot advertised for it. Both clients speak to the Copilot
+/// backend ([`OpenAiBackendKind::Copilot`]), whose admissions they apply.
+#[cfg(all(feature = "copilot", not(target_arch = "wasm32")))]
+pub(crate) fn copilot_openai_route_client(
+    endpoint: meerkat_copilot::CopilotEndpoint,
+    api_base: String,
+    authorizer: Arc<dyn meerkat_core::HttpAuthorizer>,
+    target: &CopilotOpenAiRouteTarget,
+) -> Result<Arc<dyn LlmClient>, ProviderClientError> {
+    match endpoint {
+        meerkat_copilot::CopilotEndpoint::Responses => Ok(Arc::new(
+            crate::OpenAiClient::new_with_optional_api_key_and_base_url(None, api_base)
+                .with_image_input_support(target.supports_image_input)
+                .with_authorizer(authorizer)
+                .with_responses_path("responses")
+                .with_copilot_responses_item_identity()
+                .with_copilot_backend_wire(),
+        )),
+        meerkat_copilot::CopilotEndpoint::ChatCompletions => Ok(Arc::new(
+            crate::OpenAiCompatibleClient::new_with_options(
+                crate::client_compatible::OpenAiCompatibleMode::ChatCompletions,
+                target.model.clone(),
+                api_base,
+                None,
+                crate::OpenAiCompatibleClientOptions {
+                    supports_temperature: target.supports_temperature,
+                    supports_thinking: true,
+                    supports_reasoning: true,
+                    supports_image_tool_results: target.supports_image_tool_results,
+                },
+            )
+            .with_image_input_support(target.supports_image_input)
+            .with_authorizer(authorizer)
+            .with_provider(Provider::OpenAI)
+            .with_openai_backend(OpenAiBackendKind::Copilot),
+        )),
+        meerkat_copilot::CopilotEndpoint::Messages | meerkat_copilot::CopilotEndpoint::Unknown => {
+            Err(ProviderClientError::ClientInit(
+                "Copilot advertised an incompatible endpoint for an OpenAI model".to_string(),
+            ))
+        }
+    }
+}
+
 impl OpenAiProviderRuntime {
     #[cfg(all(feature = "copilot", not(target_arch = "wasm32")))]
     pub fn with_copilot(copilot: Arc<meerkat_copilot::CopilotRuntime>) -> Self {
@@ -980,10 +1036,12 @@ impl ProviderRuntime for OpenAiProviderRuntime {
                 )
             })?;
             let (identity, profile, connection) = target.into_parts();
-            let model = identity.model.clone();
-            let supports_temperature = profile.profile().supports_temperature;
-            let supports_image_input = profile.profile().image_input;
-            let supports_image_tool_results = profile.profile().image_tool_results;
+            let route_target = CopilotOpenAiRouteTarget {
+                model: identity.model.clone(),
+                supports_temperature: profile.profile().supports_temperature,
+                supports_image_input: profile.profile().image_input,
+                supports_image_tool_results: profile.profile().image_tool_results,
+            };
             let factory: meerkat_copilot::CopilotRouteClientFactory =
                 Arc::new(move |route, connection| {
                     let endpoint = match route.access {
@@ -992,7 +1050,7 @@ impl ProviderRuntime for OpenAiProviderRuntime {
                             return Err(ProviderClientError::ClientInit(
                                 route.unavailable_message(
                                     Provider::OpenAI,
-                                    &model,
+                                    &route_target.model,
                                     meerkat_copilot::CopilotEndpoint::Responses,
                                 ),
                             ));
@@ -1011,45 +1069,12 @@ impl ProviderRuntime for OpenAiProviderRuntime {
                     let authorizer = connection
                         .resolved_authorizer()
                         .ok_or(ProviderClientError::NoCredentialMaterial)?;
-                    let authorizer = route.bind_authorizer(authorizer);
-                    match endpoint {
-                        meerkat_copilot::CopilotEndpoint::Responses => Ok(Arc::new(
-                            crate::OpenAiClient::new_with_optional_api_key_and_base_url(
-                                None,
-                                route.api_base.clone(),
-                            )
-                            .with_image_input_support(supports_image_input)
-                            .with_authorizer(authorizer)
-                            .with_responses_path("responses")
-                            .with_copilot_responses_item_identity(),
-                        )
-                            as Arc<dyn LlmClient>),
-                        meerkat_copilot::CopilotEndpoint::ChatCompletions => Ok(Arc::new(
-                            crate::OpenAiCompatibleClient::new_with_options(
-                                crate::client_compatible::OpenAiCompatibleMode::ChatCompletions,
-                                model.clone(),
-                                route.api_base.clone(),
-                                None,
-                                crate::OpenAiCompatibleClientOptions {
-                                    supports_temperature,
-                                    supports_thinking: true,
-                                    supports_reasoning: true,
-                                    supports_image_tool_results,
-                                },
-                            )
-                            .with_image_input_support(supports_image_input)
-                            .with_authorizer(authorizer)
-                            .with_provider(Provider::OpenAI),
-                        )
-                            as Arc<dyn LlmClient>),
-                        meerkat_copilot::CopilotEndpoint::Messages
-                        | meerkat_copilot::CopilotEndpoint::Unknown => {
-                            Err(ProviderClientError::ClientInit(
-                                "Copilot advertised an incompatible endpoint for an OpenAI model"
-                                    .to_string(),
-                            ))
-                        }
-                    }
+                    copilot_openai_route_client(
+                        endpoint,
+                        route.api_base.clone(),
+                        route.bind_authorizer(authorizer),
+                        &route_target,
+                    )
                 });
             meerkat_copilot::routed_client(
                 Arc::clone(runtime),

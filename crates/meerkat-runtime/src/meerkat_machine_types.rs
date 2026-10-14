@@ -303,6 +303,24 @@ pub trait SessionLlmReconfigureHost: Send + Sync {
         current_identity: &meerkat_core::SessionLlmIdentity,
     ) -> Result<ResolvedSessionLlmReconfigure, RuntimeDriverError>;
 
+    /// The one target a reconfiguration of `session_id` plans, admits and
+    /// applies: [`Self::resolve_target_session_llm_identity`], where a host
+    /// completes a target that names no binding with the binding the
+    /// session's client resolution selects for it whenever that binding can
+    /// narrow the target's capability surface, and resolves the surface
+    /// through it. Capability planning and the capability admission then see
+    /// the backend the applied identity names. The default resolves the
+    /// target without the session.
+    async fn resolve_target_session_llm_identity_for_session(
+        &self,
+        _session_id: &SessionId,
+        request: &SessionLlmReconfigureRequest,
+        current_identity: &meerkat_core::SessionLlmIdentity,
+    ) -> Result<ResolvedSessionLlmReconfigure, RuntimeDriverError> {
+        self.resolve_target_session_llm_identity(request, current_identity)
+            .await
+    }
+
     /// Prove that the resolved target can construct a usable turn client now.
     ///
     /// Committed cross-run handoffs call this before entering the persistent
