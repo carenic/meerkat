@@ -1,0 +1,5 @@
+# Internal notes, audits, designs and archives under docs/internal are not
+# Mintlify pages (scripts/validate-mintlify-docs.py, INTERNAL_DOCS_DIR). Many
+# are plain Markdown that MDX cannot parse, so `mint broken-links` must skip
+# them. Public pages link to these files on GitHub instead.
+internal/
