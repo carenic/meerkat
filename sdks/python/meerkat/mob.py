@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Literal, NotRequired, TypedDict
+import sys
+from typing import Any, Literal
+
+# Python 3.10 has no typing.NotRequired, and its TypedDict ignores it.
+if sys.version_info >= (3, 11):
+    from typing import NotRequired, TypedDict
+else:
+    from typing_extensions import NotRequired, TypedDict
 
 from .generated.types import (
     BridgeLiveControlOutcome,

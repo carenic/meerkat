@@ -15,6 +15,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# Python 3.10, the SDK's floor, has no typing.NotRequired/Required, and its
+# typing.TypedDict ignores them; typing_extensions supplies all three there.
+# Generated modules import `sys` before this block.
+PYTHON_TYPED_DICT_IMPORTS = (
+    "if sys.version_info >= (3, 11):\n"
+    "    from typing import NotRequired, Required, TypedDict\n"
+    "else:\n"
+    "    from typing_extensions import NotRequired, Required, TypedDict\n"
+)
+
 # K20: catalog-named contract types adopted by the totalized RPC method
 # catalog (config/get|set|patch, turn/interrupt, workgraph list/ready/events,
 # initialize, skills/list). Schema-driven; the inventory-coverage ratchet
@@ -3360,8 +3370,10 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
 
     types_content = "from __future__ import annotations\n\n"
     types_content += f'"""Generated wire types for Meerkat SDK.\n\nContract version: {contract_version}\n"""\n\n'
+    types_content += "import sys\n"
     types_content += "from dataclasses import dataclass, field\n"
-    types_content += "from typing import Any, Literal, NotRequired, Optional, Required, TypedDict\n\n"
+    types_content += "from typing import Any, Literal, Optional\n\n"
+    types_content += PYTHON_TYPED_DICT_IMPORTS + "\n"
     types_content += "from .errors import MeerkatError\n\n\n"
     types_content += f'CONTRACT_VERSION = "{contract_version}"\n\n\n'
     types_content += "Value = Any\n\n\n"
@@ -4311,10 +4323,9 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
     # Generate error types
     errors_content = '"""Generated error types for Meerkat SDK."""\n\n'
     errors_content += "from __future__ import annotations\n\n"
-    errors_content += (
-        "from typing import Any, Literal, NotRequired, Optional, Required, "
-        "TypeGuard, TypedDict\n\n\n"
-    )
+    errors_content += "import sys\n"
+    errors_content += "from typing import Any, Literal, Optional, TypeGuard\n\n"
+    errors_content += PYTHON_TYPED_DICT_IMPORTS + "\n\n"
     errors_content += _python_multi_host_error_types(schemas) + "\n\n"
     errors_content += "class MeerkatError(Exception):\n"
     errors_content += '    """Base error for Meerkat SDK."""\n\n'
@@ -5332,7 +5343,10 @@ def generate_python_event_types(schemas: dict, output_dir: Path) -> None:
         "",
         "from __future__ import annotations",
         "",
-        "from typing import Any, Literal, NotRequired, Optional, Required, TypedDict",
+        "import sys",
+        "from typing import Any, Literal, Optional",
+        "",
+        *PYTHON_TYPED_DICT_IMPORTS.splitlines(),
         "",
     ]
     if reused:

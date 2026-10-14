@@ -10,7 +10,13 @@ publishes instead of mirroring them by hand. Coverage is asserted by
 
 from __future__ import annotations
 
-from typing import Any, Literal, NotRequired, Optional, Required, TypedDict
+import sys
+from typing import Any, Literal, Optional
+
+if sys.version_info >= (3, 11):
+    from typing import NotRequired, Required, TypedDict
+else:
+    from typing_extensions import NotRequired, Required, TypedDict
 
 from .types import (  # noqa: F401
     AssistantImageId,

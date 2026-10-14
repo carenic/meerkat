@@ -7,8 +7,15 @@ prefixed generated types which are now an internal implementation detail.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
-from typing import Any, Literal, NewType, NotRequired, TypedDict, Union
+from typing import Any, Literal, NewType, Union
+
+# Python 3.10 has no typing.NotRequired, and its TypedDict ignores it.
+if sys.version_info >= (3, 11):
+    from typing import NotRequired, TypedDict
+else:
+    from typing_extensions import NotRequired, TypedDict
 
 from .generated.types import CONTRACT_VERSION as CONTRACT_VERSION  # re-export
 from .generated.types import (

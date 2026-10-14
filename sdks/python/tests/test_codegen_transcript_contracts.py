@@ -1,4 +1,12 @@
-from typing import NotRequired, Optional, Required, get_args, get_origin, get_type_hints
+import sys
+from typing import Optional, get_args, get_origin
+
+# Python 3.10's typing lacks NotRequired/Required, and its get_type_hints keeps
+# the typing_extensions qualifiers that 3.11+ strips.
+if sys.version_info >= (3, 11):
+    from typing import NotRequired, Required, get_type_hints
+else:
+    from typing_extensions import NotRequired, Required, get_type_hints
 
 from meerkat.generated.types import (
     McpAttachmentRestoreWireOutcome,

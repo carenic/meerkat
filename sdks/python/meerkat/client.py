@@ -25,6 +25,7 @@ import logging
 import os
 import platform
 import shutil
+import sys
 import tarfile
 import tempfile
 import urllib.request
@@ -32,8 +33,14 @@ import warnings
 import zipfile
 from dataclasses import fields, is_dataclass
 from pathlib import Path
-from typing import Any, Callable, Literal, NotRequired, TypedDict, cast, get_args, get_origin
+from typing import Any, Callable, Literal, cast, get_args, get_origin
 from urllib.error import URLError
+
+# Python 3.10 has no typing.NotRequired, and its TypedDict ignores it.
+if sys.version_info >= (3, 11):
+    from typing import NotRequired, TypedDict
+else:
+    from typing_extensions import NotRequired, TypedDict
 
 from .errors import CapabilityUnavailableError, MeerkatError
 from .event_envelope import parse_agent_event_envelope
