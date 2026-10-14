@@ -181,27 +181,45 @@ run_with_timeout() {
   wait "$cmd_pid"
 }
 
+# The pre-push dispatcher names a file in MEERKAT_PRE_PUSH_LANE_TIMINGS and
+# reports each lane's wall time from it after the gate. Recording never
+# decides the gate.
+record_lane_time() {
+  [[ -n "${MEERKAT_PRE_PUSH_LANE_TIMINGS:-}" ]] || return 0
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"$MEERKAT_PRE_PUSH_LANE_TIMINGS" 2>/dev/null || true
+}
+
 retry_lane() {
   local label="$1"
   local timeout_secs="$2"
   shift 2
   local lane_cmd=("$@")
   local status
+  local lane_started="$SECONDS"
 
   echo "Running ${label}..."
   if run_with_timeout "$timeout_secs" "${lane_cmd[@]}"; then
+    record_lane_time "$label" "$((SECONDS - lane_started))" passed
     return 0
   else
     status=$?
   fi
 
   if [[ "$status" -ne 124 ]]; then
+    record_lane_time "$label" "$((SECONDS - lane_started))" "failed-${status}"
     return "$status"
   fi
 
   echo "${label} timed out; retrying once with a clean process tree..." >&2
   sleep 1
-  run_with_timeout "$timeout_secs" "${lane_cmd[@]}"
+  if run_with_timeout "$timeout_secs" "${lane_cmd[@]}"; then
+    record_lane_time "$label" "$((SECONDS - lane_started))" passed-after-retry
+    return 0
+  else
+    status=$?
+  fi
+  record_lane_time "$label" "$((SECONDS - lane_started))" "failed-${status}"
+  return "$status"
 }
 
 NEXTEST_REUSE_DIR=""

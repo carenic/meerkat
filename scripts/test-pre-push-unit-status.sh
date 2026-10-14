@@ -312,6 +312,7 @@ git -C "$TEST_ROOT" -c user.name=Meerkat -c user.email=meerkat@example.invalid \
   commit -qm "source repair"
 test_head="$(git -C "$TEST_ROOT" rev-parse HEAD)"
 : > "$LANE_LOG"
+LANE_TIMES="$HARNESS_ROOT/lane-times.tsv"
 (
   cd "$TEST_ROOT"
   ROOT="$REPO_ROOT" \
@@ -323,9 +324,22 @@ test_head="$(git -C "$TEST_ROOT" rev-parse HEAD)"
     MEERKAT_PRE_PUSH_TEST_LANE_LOG="$LANE_LOG" \
     MEERKAT_PRE_PUSH_TEST_FAIL_LANE="" \
     MEERKAT_PRE_PUSH_TEST_FAIL_STATUS=99 \
+    MEERKAT_PRE_PUSH_LANE_TIMINGS="$LANE_TIMES" \
     PRE_COMMIT_TO_REF="$test_head" \
     "$REPO_ROOT/scripts/pre-push-unit.sh"
 )
+# The dispatcher reports these: one line per lane, in order, with its
+# whole-second wall time and outcome.
+expected_lane_times="workspace default-feature test build:passed,workspace unit lane:passed,workspace integration lane:passed,HeadCanonical cold-restart build:passed,HeadCanonical cold-restart lane:passed,e2e-fast lane:passed"
+if [[ ! -s "$LANE_TIMES" ]]; then
+  echo "the deterministic gate recorded no lane timings in ${LANE_TIMES}" >&2
+  exit 1
+fi
+actual_lane_times="$(awk -F '\t' '$2 ~ /^[0-9]+$/ { print $1 ":" $3 }' "$LANE_TIMES" | paste -sd , -)"
+if [[ "$actual_lane_times" != "$expected_lane_times" ]]; then
+  echo "lane timings were '${actual_lane_times}'; expected '${expected_lane_times}'" >&2
+  exit 1
+fi
 expected_source_lanes="workspace-build unit integration headcanonical-build headcanonical-process-death e2e-fast"
 if [[ "$(paste -sd ' ' "$LANE_LOG")" != "$expected_source_lanes" ]]; then
   echo "source change lane order was '$(paste -sd ' ' "$LANE_LOG")'; expected '${expected_source_lanes}'" >&2

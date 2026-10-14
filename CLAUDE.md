@@ -554,6 +554,10 @@ hook was skipped. A push with `SKIP=<hook ids>` records partial evidence labeled
 with the skipped set, reusable only by a later push of that tree that skips the
 same hooks; a push without that `SKIP` re-runs them.
 
+After the gate, passed or failed, the dispatcher prints each hook's wall time
+and the deterministic gate's lane times, and appends them to
+`.git/meerkat-hook-cache/timings.tsv`.
+
 **Manual local preflight**:
 - `pre-commit run --hook-stage manual agent-check-changed` (runs `scripts/agent-gate --staged`)
 - `scripts/test-changed-crates.sh`
