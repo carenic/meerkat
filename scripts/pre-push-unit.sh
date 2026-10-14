@@ -49,8 +49,10 @@ source_test_fingerprint() {
   local revision="${1:-HEAD}"
   local tree_record tree_path
   # Root dependency locks are validated by the preceding Cargo and Bazel lock
-  # gates, while CI remains authoritative for advisories. The always-run
-  # changed-crate Clippy gate also compiles their resolved workspace graph.
+  # gates, while CI remains authoritative for advisories. CI's required
+  # Clippy lanes compile their resolved workspace graph before merge:
+  # Cargo.lock is a global path for the CI planner, so a lock change runs
+  # Clippy over every package with --all-targets --all-features.
   # Excluding only these two generated lock artifacts lets that narrow
   # dependency evidence reuse source-test results; every other tracked byte
   # remains fail-closed because tests may read fixtures or configuration with
@@ -224,7 +226,7 @@ PID_FILE="${LOCK_DIR}/pid"
 
 if [[ "${MEERKAT_SKIP_PRE_PUSH_UNIT_CACHE:-0}" != "1" && -f "$stamp_path" ]]; then
   echo "reusing deterministic source-test evidence for fingerprint ${source_fingerprint}."
-  echo "Current root lock graph was compiled by pre-push Clippy but is not re-tested locally; CI is authoritative."
+  echo "Current root lock graph is compiled by the required CI Clippy lanes and is not re-tested locally; CI is authoritative."
   exit 0
 fi
 
@@ -294,7 +296,7 @@ acquire_lock
 # process waited. Reuse its evidence instead of rebuilding the same graph.
 if [[ "${MEERKAT_SKIP_PRE_PUSH_UNIT_CACHE:-0}" != "1" && -f "$stamp_path" ]]; then
   echo "reusing deterministic source-test evidence for fingerprint ${source_fingerprint}."
-  echo "Current root lock graph was compiled by pre-push Clippy but is not re-tested locally; CI is authoritative."
+  echo "Current root lock graph is compiled by the required CI Clippy lanes and is not re-tested locally; CI is authoritative."
   exit 0
 fi
 

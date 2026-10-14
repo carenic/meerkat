@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
+# Pre-push changed-path ratchets: the formal/governance targets, generated
+# contract freshness, Web SDK tests and wasm check that cargo-agent-gate runs
+# for the exact pushed range. Clippy does not run here. It is a required CI
+# check: the CI planner gives every package this hook used to lint a Clippy
+# lane with the same flags, and the CI gate requires those lanes whenever
+# Rust changed. scripts/test-pre-push-ratchets.sh pins both. The ratchets are
+# make targets, so this always uses the Cargo gate, whatever the backend.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="${ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 RELEASE_PROJECTION_ONLY="${RELEASE_PROJECTION_ONLY:-$SCRIPT_DIR/release-projection-only.mjs}"
 VERIFY_VERSION_PARITY="${VERIFY_VERSION_PARITY:-$ROOT/scripts/verify-version-parity.sh}"
-AGENT_GATE="${AGENT_GATE:-$ROOT/scripts/agent-gate}"
+AGENT_GATE="${AGENT_GATE:-$ROOT/scripts/cargo-agent-gate}"
 
 if [[ -n "${PRE_COMMIT_FROM_REF:-}" && -n "${PRE_COMMIT_TO_REF:-}" ]]; then
   if "$RELEASE_PROJECTION_ONLY" \
@@ -21,4 +28,4 @@ if [[ -n "${PRE_COMMIT_FROM_REF:-}" && -n "${PRE_COMMIT_TO_REF:-}" ]]; then
   fi
 fi
 
-exec "$AGENT_GATE" --committed --clippy-only --machine-drift-by-hook "$@"
+exec "$AGENT_GATE" --committed --ratchets-only --machine-drift-by-hook "$@"

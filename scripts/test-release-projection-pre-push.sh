@@ -122,10 +122,10 @@ fi
     MEERKAT_RELEASE_PROJECTION_CALL_LOG="$CALL_LOG" \
     PRE_COMMIT_FROM_REF="$base" \
     PRE_COMMIT_TO_REF="$head" \
-    "$REPO_ROOT/scripts/pre-push-clippy.sh"
+    "$REPO_ROOT/scripts/pre-push-ratchets.sh"
 )
 if [[ "$(cat "$CALL_LOG")" != "verify-version-parity" ]]; then
-  echo "release projection clippy seam did not run only version parity" >&2
+  echo "release projection ratchets seam did not run only version parity" >&2
   cat "$CALL_LOG" >&2
   exit 1
 fi
@@ -167,10 +167,10 @@ semantic_head="$(git -C "$TEST_ROOT" rev-parse HEAD)"
     MEERKAT_RELEASE_PROJECTION_CALL_LOG="$CALL_LOG" \
     PRE_COMMIT_FROM_REF="$base" \
     PRE_COMMIT_TO_REF="$semantic_head" \
-    "$REPO_ROOT/scripts/pre-push-clippy.sh"
+    "$REPO_ROOT/scripts/pre-push-ratchets.sh"
 )
-if [[ "$(cat "$CALL_LOG")" != "agent-gate --committed --clippy-only --machine-drift-by-hook" ]]; then
-  echo "semantic change bypassed the ordinary clippy gate" >&2
+if [[ "$(cat "$CALL_LOG")" != "agent-gate --committed --ratchets-only --machine-drift-by-hook" ]]; then
+  echo "semantic change bypassed the ordinary ratchets gate" >&2
   cat "$CALL_LOG" >&2
   exit 1
 fi
@@ -227,7 +227,7 @@ assert_range_gate() {
       ROOT="$TEST_ROOT" \
         RELEASE_PROJECTION_ONLY="$REPO_ROOT/scripts/release-projection-only.mjs" \
         AGENT_GATE="$TEST_ROOT/scripts/cargo-agent-gate" \
-        "$REPO_ROOT/scripts/pre-push-clippy.sh" --dry-run "$@"
+        "$REPO_ROOT/scripts/pre-push-ratchets.sh" --dry-run "$@"
     elif [[ "$mode" == env-override ]]; then
       CARGO_AGENT_BASE="$range_base" ./scripts/cargo-agent-gate --committed --clippy-only --dry-run "$@"
     elif [[ "$mode" == diff-error ]]; then
@@ -238,6 +238,20 @@ assert_range_gate() {
   )" || status=$?
   local passed=0
   case "$expected" in
+    ratchets-quiet)
+      # The hook lints nothing: a runtime-only range runs no ratchet, no
+      # Clippy and no tests.
+      if [[ "$status" -eq 0 ]] && printf '%s' "$output" | grep -Fq 'ratchets only' \
+        && ! printf '%s' "$output" | grep -Eq 'clippy|test-sdk-web|wasm-check|fast --no-run|nextest run'; then
+        passed=1
+      fi
+      ;;
+    ratchets-web)
+      if [[ "$status" -eq 0 ]] && printf '%s' "$output" | grep -Fq 'DRY-RUN make test-sdk-web' \
+        && ! printf '%s' "$output" | grep -Eq 'clippy|fast --no-run|nextest run'; then
+        passed=1
+      fi
+      ;;
     runtime-only)
       if [[ "$status" -eq 0 ]] && printf '%s' "$output" | grep -Fq -- 'clippy -p meerkat-runtime' \
         && ! printf '%s' "$output" | grep -Eq 'test-sdk-web|wasm-check|fast --no-run|nextest run'; then
@@ -275,7 +289,9 @@ assert_range_gate() {
     range_failures=$((range_failures + 1))
   fi
 }
-assert_range_gate exact-push-parent runtime-only "$range_parent" "$range_head" hook
+assert_range_gate exact-push-parent ratchets-quiet "$range_parent" "$range_head" hook
+assert_range_gate exact-push-range-with-web ratchets-web "$range_base" "$range_head" hook
+assert_range_gate exact-push-parent-gate runtime-only "$range_parent" "$range_head" direct
 assert_range_gate zero-oid-new-branch whole-tree 0000000000000000000000000000000000000000 "$range_head" direct
 assert_range_gate empty-tree-new-branch whole-tree "$empty_tree" "$range_head" direct
 assert_range_gate explicit-base-override full-history "$range_parent" "$range_head" direct --base "$range_base"

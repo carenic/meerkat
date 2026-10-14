@@ -145,7 +145,7 @@ hook_stamp="${hook_cache_dir}/${CACHE_VERSION}-${pushed_tree}.ok"
 skip_set="$(normalize_skip_set "${SKIP:-}")"
 # Hooks that are the only local check of their contract and are cheap enough
 # never to need skipping. machine-codegen-drift is the one machine/protocol
-# drift check: the clippy hook's governance gate leaves drift to it.
+# drift check: the ratchets hook's governance gate leaves drift to it.
 unskippable_hooks="machine-codegen-drift"
 for unskippable in ${unskippable_hooks}; do
   case ",${skip_set}," in
