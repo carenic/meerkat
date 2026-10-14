@@ -151,6 +151,7 @@ impl Config {
         self.model_fallback
             .normalize_persisted()
             .into_iter()
+            .chain(self.agent.normalize_persisted())
             .collect()
     }
 }
@@ -1019,13 +1020,6 @@ impl Config {
                 "agent.max_tokens_per_turn must be greater than 0 when set".to_string(),
             ));
         }
-        let threshold = self.agent.budget_warning_threshold;
-        if threshold.is_nan() || threshold <= 0.0 || threshold > 1.0 {
-            return Err(ConfigError::Validation(format!(
-                "agent.budget_warning_threshold must be greater than 0 and at most 1, got \
-                 {threshold}"
-            )));
-        }
         if self.budget.max_tokens == Some(0) {
             return Err(ConfigError::Validation(
                 "budget.max_tokens must be greater than 0 when set".to_string(),
@@ -1153,7 +1147,9 @@ pub struct AgentConfig {
     pub temperature: Option<f32>,
     /// Fraction of each budget limit (tokens, tool calls, time) at which the
     /// agent emits one early `BudgetWarning`, before the limit is reached.
-    /// Must be in `(0, 1]`; `1.0` keeps only the warning at the limit.
+    /// Takes effect in `(0, 1]`; `1.0` keeps only the warning at the limit.
+    /// A persisted value outside that range loads as the default, with
+    /// [`ConfigWarning::OutOfRangeBudgetWarningThreshold`].
     pub budget_warning_threshold: f32,
     /// Maximum turns before forced stop
     pub max_turns: Option<u32>,
@@ -1256,6 +1252,18 @@ impl AgentConfig {
             })
             .filter(|value| *value > 0)
             .unwrap_or(DEFAULT_MAX_TOKENS_PER_TURN)
+    }
+
+    /// Load normalization for `[agent]`: a `budget_warning_threshold` outside
+    /// `(0, 1]` loads as the default. Releases through 0.9.0 never read the
+    /// key, so documents they wrote may hold any value.
+    fn normalize_persisted(&mut self) -> Option<ConfigWarning> {
+        let threshold = self.budget_warning_threshold;
+        if threshold > 0.0 && threshold <= 1.0 {
+            return None;
+        }
+        self.budget_warning_threshold = Self::default().budget_warning_threshold;
+        Some(ConfigWarning::OutOfRangeBudgetWarningThreshold)
     }
 }
 
@@ -3045,6 +3053,11 @@ pub enum ConfigWarning {
     /// setting, so the realm value applies to no session; the document still
     /// loads.
     UnappliedAgentOutputSchema,
+    /// `[agent] budget_warning_threshold` outside `(0, 1]`. Releases through
+    /// 0.9.0 never read the key, so the document still loads: the value is
+    /// ignored and the threshold is inherited from the parent realm, or the
+    /// default if there is none.
+    OutOfRangeBudgetWarningThreshold,
 }
 
 impl std::fmt::Display for ConfigWarning {
@@ -3072,6 +3085,14 @@ impl std::fmt::Display for ConfigWarning {
                  output is requested per run (rkat run --schema, output_schema on session \
                  create or turn start, or AgentBuildConfig.output_schema). To silence this \
                  warning, delete the key",
+            ),
+            Self::OutOfRangeBudgetWarningThreshold => write!(
+                f,
+                "[agent] budget_warning_threshold must be greater than 0 and at most 1; the \
+                 value is ignored, so the threshold is inherited from the parent realm, or \
+                 is the default {} if there is none. To silence this warning, set a value \
+                 in that range or delete the key",
+                AgentConfig::default().budget_warning_threshold
             ),
         }
     }
@@ -3792,24 +3813,63 @@ model = "custom-model"
         );
     }
 
+    /// Releases through 0.9.0 never read `[agent] budget_warning_threshold`,
+    /// so a document they wrote may hold any value. It still loads and
+    /// validates: an out-of-range value warns and falls back to the default,
+    /// and a layer that holds one keeps the threshold it inherits.
     #[test]
-    fn test_validate_rejects_budget_warning_threshold_outside_unit_interval() {
-        for threshold in [0.0, -0.5, 1.5, f32::NAN] {
-            let mut config = Config::default();
-            config.agent.budget_warning_threshold = threshold;
-            let err = config
-                .validate(*crate::model_profile::test_catalog::TEST_CATALOG)
-                .expect_err("an out-of-range warning threshold should be invalid");
-            assert!(
-                err.to_string().contains("agent.budget_warning_threshold"),
-                "{threshold}: {err}"
+    fn test_out_of_range_budget_warning_threshold_loads_as_the_default_with_a_warning() {
+        let default = AgentConfig::default().budget_warning_threshold;
+        assert_eq!(default, 0.8, "the template default");
+        for threshold in ["0.0", "-0.5", "1.5", "nan", "inf"] {
+            let (config, warnings) = Config::from_persisted_toml(&format!(
+                "[agent]\nbudget_warning_threshold = {threshold}\n"
+            ))
+            .expect("a document with any threshold loads");
+            assert_eq!(
+                config.agent.budget_warning_threshold, default,
+                "{threshold} falls back to the default"
             );
+            assert_eq!(
+                warnings,
+                vec![ConfigWarning::OutOfRangeBudgetWarningThreshold],
+                "{threshold}"
+            );
+            config
+                .validate(*crate::model_profile::test_catalog::TEST_CATALOG)
+                .expect("the loaded document validates");
         }
+        for (text, threshold) in [("0.5", 0.5), ("1.0", 1.0)] {
+            let (config, warnings) = Config::from_persisted_toml(&format!(
+                "[agent]\nbudget_warning_threshold = {text}\n"
+            ))
+            .expect("an in-range threshold loads");
+            assert_eq!(config.agent.budget_warning_threshold, threshold, "{text}");
+            assert!(warnings.is_empty(), "{text}: {warnings:?}");
+        }
+
+        let mut layered = Config::default();
+        layered
+            .merge_toml_str("[agent]\nbudget_warning_threshold = 0.5\n")
+            .expect("merge the parent layer");
+        let warnings = layered
+            .merge_toml_str_with_warnings("[agent]\nbudget_warning_threshold = 7.0\n")
+            .expect("merge the out-of-range layer");
+        assert_eq!(
+            warnings,
+            vec![ConfigWarning::OutOfRangeBudgetWarningThreshold]
+        );
+        assert_eq!(
+            layered.agent.budget_warning_threshold, 0.5,
+            "an ignored value keeps the inherited threshold"
+        );
+
+        // A config that bypassed the load boundary is not refused either.
         let mut config = Config::default();
-        config.agent.budget_warning_threshold = 1.0;
+        config.agent.budget_warning_threshold = 1.5;
         config
             .validate(*crate::model_profile::test_catalog::TEST_CATALOG)
-            .expect("1.0 keeps only the warning at the limit");
+            .expect("an out-of-range threshold never fails validation");
     }
 
     #[test]

@@ -342,9 +342,11 @@ per-tool-call timeout, since calls in a batch run their clocks together).
 Before a limit stops a run, the agent warns once: when tokens, tool calls, or
 a time horizon reach `[agent] budget_warning_threshold` of their limit (`0.8`
 by default), it emits a `budget_warning` event whose `percent` is the fraction
-used. The per-turn horizon warns again each turn. The value must be greater
-than 0 and at most 1; `1.0` keeps only the `budget_warning` emitted when a
-limit is reached.
+used. The per-turn horizon warns again each turn. The value takes effect when
+it is greater than 0 and at most 1; `1.0` keeps only the `budget_warning`
+emitted when a limit is reached. A config with a value outside that range
+still loads, with a warning, and keeps the inherited threshold (the default if
+no parent realm sets one).
 
 ```toml
 [agent]
