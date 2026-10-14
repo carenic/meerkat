@@ -8,13 +8,46 @@ trap 'rm -rf -- "$TEST_ROOT"' EXIT
 LOG="${TEST_ROOT}/commands.log"
 FAKE_CARGO="${TEST_ROOT}/repo-cargo"
 FAKE_NEXTEST="${TEST_ROOT}/cargo-nextest"
+FAKE_METADATA="${TEST_ROOT}/metadata.json"
+FAKE_FIXTURE_BINARY="${TEST_ROOT}/mcp-test-server"
 
+# The archive build asks scripts/mcp-test-server-fixture whether a selected
+# package dev-depends on mcp-test-server, and builds the fixture first if so.
+# The fake answers that `cargo metadata` call and the fixture build, so the
+# fixture's real selection runs and any fixture error fails this test.
 cat >"$FAKE_CARGO" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'cargo' >>"$COMMAND_LOG"
 printf ' <%s>' "$@" >>"$COMMAND_LOG"
 printf '\n' >>"$COMMAND_LOG"
+case "${1:-}" in
+  metadata)
+    [[ "$*" == 'metadata --format-version=1 --no-deps' ]] || {
+      echo "fake cargo: unexpected metadata call: $*" >&2
+      exit 93
+    }
+    case "${FAKE_CARGO_METADATA:-ok}" in
+      ok) cat "$FAKE_METADATA" ;;
+      invalid) echo 'not cargo metadata' ;;
+      *)
+        echo "fake cargo: metadata failed" >&2
+        exit 94
+        ;;
+    esac
+    exit 0
+    ;;
+  build)
+    [[ "$*" == 'build -p mcp-test-server --bin mcp-test-server --locked --message-format=json-render-diagnostics' ]] || {
+      echo "fake cargo: unexpected build call: $*" >&2
+      exit 95
+    }
+    printf '{"reason":"compiler-artifact","target":{"name":"mcp-test-server","kind":["bin"]},"executable":"%s"}\n' \
+      "$FAKE_FIXTURE_BINARY"
+    printf '{"reason":"build-finished","success":true}\n'
+    exit 0
+    ;;
+esac
 archive_file=""
 while (($#)); do
   if [[ "$1" == "--archive-file" ]]; then
@@ -40,11 +73,28 @@ printf '\n' >>"$COMMAND_LOG"
 EOF
 
 chmod +x "$FAKE_CARGO" "$FAKE_NEXTEST"
+# The workspace's mcp-test-server dev-dependents (meerkat, meerkat-mcp,
+# meerkat-rpc, meerkat-integration-tests) and two packages without one.
+cat >"$FAKE_METADATA" <<'EOF'
+{"packages": [
+  {"name": "meerkat", "dependencies": [{"name": "mcp-test-server", "kind": "dev"}]},
+  {"name": "meerkat-mcp", "dependencies": [{"name": "mcp-test-server", "kind": "dev"}]},
+  {"name": "meerkat-rpc", "dependencies": [{"name": "mcp-test-server", "kind": "dev"}]},
+  {"name": "meerkat-integration-tests", "dependencies": [{"name": "mcp-test-server", "kind": "dev"}]},
+  {"name": "meerkat-mob", "dependencies": []},
+  {"name": "mcp-test-server", "dependencies": []}
+]}
+EOF
+printf '#!/bin/sh\nexit 0\n' >"$FAKE_FIXTURE_BINARY"
+chmod +x "$FAKE_FIXTURE_BINARY"
 export COMMAND_LOG="$LOG"
 export EXPECTED_WORKSPACE_ROOT="$ROOT"
 export ROOT
 export CARGO="$FAKE_CARGO"
 export NEXTEST_BIN="$FAKE_NEXTEST"
+export FAKE_METADATA FAKE_FIXTURE_BINARY
+# An exported fixture path would skip the fixture build this test observes.
+unset MEERKAT_MCP_TEST_SERVER FAKE_CARGO_METADATA
 
 families=(unit unit-mob int-heavy int-mob int-everything-else)
 for family in "${families[@]}"; do
@@ -72,6 +122,37 @@ assert_line_contains 'cargo <nextest> <archive> <--workspace> <--lib>'
 assert_line_contains 'cargo <nextest> <archive> <-p> <meerkat-integration-tests> <--tests> <--profile> <fast>'
 assert_line_contains '<-p> <meerkat-mob> <-p> <meerkat-mob-adaptive>'
 assert_line_contains '<--workspace> <--exclude> <meerkat-integration-tests> <--exclude> <meerkat-mob>'
+
+# Per family, in order: the fixture check, then the fixture build when a
+# selected package dev-depends on mcp-test-server (so the binary rides in the
+# archive), then the archive. unit-mob and int-mob select no such package.
+cargo_sequence="$(sed -n 's/^cargo <\([^>]*\)>.*/\1/p' "$LOG" | tr '\n' ' ')"
+expected_cargo_sequence='metadata build nextest metadata nextest metadata build nextest metadata nextest metadata build nextest '
+[[ "$cargo_sequence" == "$expected_cargo_sequence" ]] || {
+  echo "archive builds did not check and build the mcp-test-server fixture before archiving" >&2
+  echo "  expected cargo calls: ${expected_cargo_sequence}" >&2
+  echo "  actual cargo calls:   ${cargo_sequence}" >&2
+  exit 1
+}
+# A fixture check that cannot read the package graph stops the archive build;
+# it must never be taken for "no package needs the fixture".
+for metadata_mode in fail invalid; do
+  metadata_archive="${TEST_ROOT}/metadata-${metadata_mode}.tar.zst"
+  if COMMAND_LOG="${TEST_ROOT}/metadata-${metadata_mode}.log" \
+    FAKE_CARGO_METADATA="$metadata_mode" \
+    "$ROOT/scripts/ci-nextest-archive.sh" build unit "$metadata_archive" \
+    >"${TEST_ROOT}/metadata-${metadata_mode}.out" 2>&1; then
+    echo "archive build ignored a failed mcp-test-server fixture check (cargo metadata: ${metadata_mode})" >&2
+    cat "${TEST_ROOT}/metadata-${metadata_mode}.out" >&2
+    exit 1
+  fi
+  if ! grep -Fq 'mcp-test-server-fixture: ' "${TEST_ROOT}/metadata-${metadata_mode}.out" ||
+    [[ -e "$metadata_archive" ]]; then
+    echo "archive build did not stop at the failed fixture check (cargo metadata: ${metadata_mode})" >&2
+    cat "${TEST_ROOT}/metadata-${metadata_mode}.out" >&2
+    exit 1
+  fi
+done
 
 run_count="$(grep -c '^nextest ' "$LOG")"
 [[ "$run_count" == 6 ]] || {

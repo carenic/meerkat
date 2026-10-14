@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
+import contextlib
 import hashlib
 import importlib.util
+import io
 from pathlib import Path
 import subprocess
 import tempfile
@@ -87,14 +89,19 @@ class ArchiveReuseTests(unittest.TestCase):
                 )
 
     def test_discovery_includes_dispatched_runs(self):
-        with patch.object(
-            RESTORE, "github_json", return_value={"workflow_runs": []}
-        ) as request:
-            RESTORE.restore("owner/repo", COMMIT, 11, Path("unused.tar.zst"))
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with patch.object(
+                RESTORE, "github_json", return_value={"workflow_runs": []}
+            ) as request:
+                RESTORE.restore("owner/repo", COMMIT, 11, Path("unused.tar.zst"))
         endpoint = request.call_args.args[0]
         self.assertNotIn("event=", endpoint)
         self.assertIn(f"head_sha={COMMIT}", endpoint)
         self.assertIn("status=success", endpoint)
+        # The build action reads this line to decide whether to build.
+        self.assertEqual(stdout.getvalue(), "reused=false\n")
+        self.assertIn("building from source", stderr.getvalue())
 
     def test_artifact_identity_digest_and_uniqueness_are_required(self):
         row = self.artifact()
