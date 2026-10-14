@@ -367,6 +367,15 @@ jobs:
       - name: MODULE.bazel.lock recorded inputs
         run: make verify-bazel-module-lock-inputs
 
+      # Release binaries must compile no test-only code: the release builds
+      # pass the release define, under which no target they link enables a
+      # non-shipping feature; the packaged-binary marker scan is the backstop.
+      - name: Release builds exclude test-only features
+        run: make verify-bazel-release-features
+
+      - name: Release test-code guards still fail on their defects
+        run: make release-test-code-guards-selftest
+
       - name: Verify Rust release configuration
         run: make check-rust-release-config
 

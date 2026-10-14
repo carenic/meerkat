@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# check-release-binary-markers: refuse a release binary that carries test-only
+# code.
+#
+# Each marker is a string that only compiled-in test code contains: a string
+# literal inside a test hook, the name of a test-only static, or the text of a
+# test-only log line. No release binary may contain one. Plain names that
+# documentation may mention (environment variables, feature names) are not
+# markers: the binaries embed the help corpus. The release packaging runs this
+# on every binary before archiving it, and the publisher again on the exact
+# bytes it publishes. scripts/test_check_release_binary_markers.py binds every
+# workspace marker to its gated source and keeps the docs and the embedded
+# help corpus free of them.
+#
+# Usage: check-release-binary-markers <binary>...
+#        check-release-binary-markers --list       (marker|source|gate, one per line)
+#        check-release-binary-markers --allowed    (the allowed marker)
+# Exit 0 = no marker but the allowed one, 1 = a binary carries test-only code,
+# 2 = usage or read error.
+
+set -euo pipefail
+
+# marker|source that compiles it in|the gate it compiles under
+MARKERS=(
+  "time is not frozen|external:tokio src/time/clock.rs|tokio feature test-util"
+  "WHOLE_BLOB_DECODES_BY_SESSION|crates/meerkat-core/src/digest_observability.rs|feature test-support"
+  "injected pre-commit failure|crates/meerkat-live/src/host.rs|feature test-support"
+  "injected post-commit receipt failure|crates/meerkat-live/src/host.rs|feature test-support"
+  "scripted input persistence acknowledgement lost after commit|crates/meerkat-runtime/src/store/sqlite.rs|feature test-support"
+  "forced mob event store|crates/meerkat-mob/src/store/in_memory.rs|feature test-support"
+  "injected delivery input settle cancellation failure|crates/meerkat-mob/src/runtime/delivery_wait.rs|feature test-support"
+  "deterministic TestClient replaces the provider client|crates/meerkat/src/factory.rs|debug_assertions"
+)
+
+# The one allowed marker, until 0.9.2. tokio's test-util feature reaches the
+# Bazel (BuildBuddy) release binaries because crate_universe resolves one
+# feature set per external crate across every workspace dependency kind, dev
+# included (26 members dev-depend on tokio with test-util), and a crate
+# annotation can add features but never remove one. Its time-control APIs
+# (tokio::time::pause, advance, resume) are not used by production code;
+# runtime bookkeeping remains. The 0.9.2 fix overrides tokio's crate target
+# with one that drops test-util under //tools/bazel:release_build; delete this
+# entry with it.
+# Cargo release builds never contain it.
+ALLOWED_MARKER="time is not frozen"
+
+if [[ $# -eq 0 ]]; then
+  echo "usage: check-release-binary-markers <binary>... | --list | --allowed" >&2
+  exit 2
+fi
+
+if [[ "$1" == "--list" ]]; then
+  printf '%s\n' "${MARKERS[@]}"
+  exit 0
+fi
+
+if [[ "$1" == "--allowed" ]]; then
+  printf '%s\n' "${ALLOWED_MARKER}"
+  exit 0
+fi
+
+patterns=()
+for entry in "${MARKERS[@]}"; do
+  patterns+=(-e "${entry%%|*}")
+done
+
+status=0
+for binary in "$@"; do
+  if [[ ! -f "${binary}" || ! -r "${binary}" ]]; then
+    echo "check-release-binary-markers: cannot read ${binary}" >&2
+    exit 2
+  fi
+  set +e
+  found="$(LC_ALL=C grep -a -o -F "${patterns[@]}" -- "${binary}")"
+  rc=$?
+  set -e
+  if [[ "${rc}" -gt 1 ]]; then
+    echo "check-release-binary-markers: grep failed on ${binary} (exit ${rc})" >&2
+    exit 2
+  fi
+  failed=0
+  allowed=0
+  if [[ "${rc}" -eq 0 ]]; then
+    for entry in "${MARKERS[@]}"; do
+      marker="${entry%%|*}"
+      rest="${entry#*|}"
+      grep -qxF -- "${marker}" <<<"${found}" || continue
+      if [[ "${marker}" == "${ALLOWED_MARKER}" ]]; then
+        echo "notice: ${binary} carries the allowed marker \"${marker}\" (${rest%%|*}, ${rest#*|}; time-control APIs are not used by production code; runtime bookkeeping remains; removed in 0.9.2)"
+        allowed=1
+        continue
+      fi
+      failed=1
+      echo "error: ${binary} carries test-only code: \"${marker}\" (${rest%%|*}, ${rest#*|})" >&2
+    done
+  fi
+  if [[ "${failed}" -eq 1 ]]; then
+    status=1
+  elif [[ "${allowed}" -eq 1 ]]; then
+    echo "no test-only markers in ${binary} beyond the allowed one"
+  else
+    echo "no test-only markers in ${binary}"
+  fi
+done
+exit "${status}"
