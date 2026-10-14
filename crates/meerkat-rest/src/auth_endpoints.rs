@@ -2844,20 +2844,20 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let state_token = result["state"].as_str().expect("state");
-        assert!(matches!(
-            unrelated_state.oauth_flow_authority().consume(
+        // A state another runtime admitted is an attempt this runtime does
+        // not hold: attempt_missing, never an authority fault.
+        let foreign = unrelated_state
+            .oauth_flow_authority()
+            .consume(
                 state_token,
                 &credential_identity(&openai_auth_binding()),
                 meerkat_providers::oauth_flow::OAuthBrowserFlowCompletion::from(
-                    meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt
+                    meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 ),
                 redirect_uri,
-            ),
-            Err(OAuthFlowError::LifecycleRejected {
-                operation: "verify_oauth_browser_flow",
-                ..
-            })
-        ));
+            )
+            .expect_err("an unrelated runtime holds no attempt with this state");
+        assert_eq!(foreign, OAuthFlowError::Missing);
         let flow = state
             .oauth_flow_authority()
             .consume(
@@ -2870,6 +2870,59 @@ mod tests {
             )
             .expect("starting runtime owns the flow");
         assert!(!flow.pkce_verifier.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rest_login_complete_with_an_unknown_state_is_attempt_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::load_from(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        state
+            .config_runtime
+            .set(
+                config_with_openai_oauth_binding(CredentialSourceSpec::ManagedStore),
+                None,
+            )
+            .await
+            .unwrap();
+        let redirect_uri = "http://127.0.0.1:0/callback";
+        let target = || {
+            WireLoginTarget::Provider(meerkat_contracts::WireProviderLoginTarget {
+                provider: WireOAuthProvider::OpenAi,
+                realm_id: "dev".to_string(),
+                binding_id: "default_openai".to_string(),
+                profile_id: None,
+            })
+        };
+        let started = start_login(
+            State(state.clone()),
+            Json(LoginStartBody {
+                target: target(),
+                redirect_uri: redirect_uri.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(started.status(), StatusCode::OK);
+
+        // A wrong, expired or already-used callback state is the caller's
+        // missing attempt: 400 attempt_missing, not a 500 infrastructure failure.
+        let response = complete_login(
+            State(state),
+            Json(LoginCompleteBody {
+                target: target(),
+                code: "provider-code".to_string(),
+                state: "st-never-admitted".to_string(),
+                redirect_uri: redirect_uri.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = rest_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["reason"], "attempt_missing");
+        assert_eq!(body["error"], "oauth state is missing or expired");
     }
 
     #[tokio::test]
@@ -4372,7 +4425,7 @@ mod tests {
 
         assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(err.1.contains("oauth state terminal consume failed"));
-        assert!(err.1.contains("verify_oauth_browser_flow"));
+        assert!(err.1.contains("oauth state is missing or expired"));
         assert!(store.load(&key).await.unwrap().is_none());
         let snapshot = auth_lease.snapshot(&LeaseKey::from_auth_binding(&auth_binding));
         assert_eq!(snapshot.phase, None);

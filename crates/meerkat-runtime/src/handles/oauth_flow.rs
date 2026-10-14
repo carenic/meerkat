@@ -461,6 +461,21 @@ impl RuntimeOAuthFlowHandle {
         )
     }
 
+    /// A browser attempt the AuthMachine does not hold (never admitted,
+    /// already consumed, expired or cancelled) is the caller's missing
+    /// attempt, not an authority fault.
+    fn require_admitted_browser_flow(
+        &self,
+        target: &AuthCredentialIdentity,
+        flow_id: &str,
+    ) -> Result<(), OAuthFlowError> {
+        if self.lifecycle.has_oauth_browser_flow(target, flow_id) {
+            Ok(())
+        } else {
+            Err(OAuthFlowError::Missing)
+        }
+    }
+
     fn verify_browser(
         &self,
         target: &AuthCredentialIdentity,
@@ -1742,6 +1757,7 @@ impl OAuthFlowAuthority for RuntimeOAuthFlowHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.sync_persisted_payloads("verify_oauth_browser_flow")?;
+        self.require_admitted_browser_flow(target, state)?;
         self.verify_browser(target, state, &provider, redirect_uri)?;
         match self.registry.verify(state, target, provider, redirect_uri) {
             Ok(record) => Ok(record),
@@ -1766,6 +1782,7 @@ impl OAuthFlowAuthority for RuntimeOAuthFlowHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.sync_persisted_payloads("consume_oauth_browser_flow")?;
+        self.require_admitted_browser_flow(target, state)?;
         self.verify_browser(target, state, &provider, redirect_uri)?;
         let record = match self
             .registry
@@ -2922,13 +2939,13 @@ pub(crate) mod tests {
             Arc::new(RuntimeAuthLeaseHandle::new()),
             &store_dyn,
         );
-        assert!(matches!(
-            restarted.consume(&consumed_state, &target, provider, redirect_uri),
-            Err(OAuthFlowError::LifecycleRejected {
-                operation: "verify_oauth_browser_flow",
-                ..
-            })
-        ));
+        assert_eq!(
+            restarted
+                .consume(&consumed_state, &target, provider, redirect_uri)
+                .err(),
+            Some(OAuthFlowError::Missing),
+            "a consumed browser state is a missing attempt after restart"
+        );
         restarted
             .consume(
                 &replacement_state,
@@ -3790,13 +3807,7 @@ pub(crate) mod tests {
         let device_after_release =
             restarted.verify_device_code(device_code, &target, device_provider);
         assert!(
-            matches!(
-                browser_after_release,
-                Err(OAuthFlowError::LifecycleRejected {
-                    operation: "verify_oauth_browser_flow",
-                    ..
-                })
-            ),
+            matches!(browser_after_release, Err(OAuthFlowError::Missing)),
             "release from a stale authority must prune durable browser flow, got {browser_after_release:?}"
         );
         assert!(
@@ -4116,13 +4127,12 @@ pub(crate) mod tests {
             .consume(&new_state, &target, provider, redirect_uri)
             .expect("release observer must not prune newly admitted flow");
         assert_eq!(flow.pkce_verifier, "new-verifier");
-        assert!(matches!(
-            authority.consume(&old_state, &target, provider, redirect_uri),
-            Err(OAuthFlowError::LifecycleRejected {
-                operation: "verify_oauth_browser_flow",
-                ..
-            })
-        ));
+        assert_eq!(
+            authority
+                .consume(&old_state, &target, provider, redirect_uri)
+                .err(),
+            Some(OAuthFlowError::Missing)
+        );
     }
 
     #[test]
@@ -4189,13 +4199,12 @@ pub(crate) mod tests {
             .consume(&new_state, &target, provider, redirect_uri)
             .expect("release observer must not prune newly admitted flow");
         assert_eq!(flow.pkce_verifier, "new-verifier");
-        assert!(matches!(
-            authority.consume(&old_state, &target, provider, redirect_uri),
-            Err(OAuthFlowError::LifecycleRejected {
-                operation: "verify_oauth_browser_flow",
-                ..
-            })
-        ));
+        assert_eq!(
+            authority
+                .consume(&old_state, &target, provider, redirect_uri)
+                .err(),
+            Some(OAuthFlowError::Missing)
+        );
     }
 
     #[test]
@@ -4231,6 +4240,43 @@ pub(crate) mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn unknown_or_replayed_browser_state_is_a_missing_attempt() {
+        let lifecycle = Arc::new(RuntimeAuthLeaseHandle::new());
+        let authority =
+            RuntimeOAuthFlowHandle::new_with_auth_lease(Duration::from_secs(60), lifecycle);
+        let target = target();
+        let provider = OAuthProviderIdentity::OpenAiChatGpt;
+        let redirect_uri = "http://127.0.0.1/callback";
+        let state = authority
+            .start(
+                target.clone(),
+                provider,
+                redirect_uri.to_string(),
+                "verifier".to_string(),
+            )
+            .expect("browser flow admitted");
+
+        // A callback with a state the AuthMachine never admitted is the
+        // caller's missing attempt, not an authority fault.
+        assert_eq!(
+            authority
+                .verify("st-never-admitted", &target, provider, redirect_uri)
+                .err(),
+            Some(OAuthFlowError::Missing)
+        );
+        authority
+            .consume(&state, &target, provider, redirect_uri)
+            .expect("the admitted flow completes once");
+        // Replaying a consumed state is a missing attempt too.
+        assert_eq!(
+            authority
+                .consume(&state, &target, provider, redirect_uri)
+                .err(),
+            Some(OAuthFlowError::Missing)
+        );
     }
 
     #[test]
@@ -4303,11 +4349,14 @@ pub(crate) mod tests {
             "pending flow must be terminally cancelled by the release drain"
         );
 
-        // The flow is dead: completing the login is a typed rejection.
-        assert!(matches!(
-            authority.consume(&state, &target, provider, redirect_uri),
-            Err(OAuthFlowError::LifecycleRejected { .. })
-        ));
+        // The flow is dead: completing the login is the caller's missing
+        // attempt.
+        assert_eq!(
+            authority
+                .consume(&state, &target, provider, redirect_uri)
+                .err(),
+            Some(OAuthFlowError::Missing)
+        );
 
         // A late error-handler/prune compensation fire for the cancelled
         // flow lands on the Released machine as a benign no-op
@@ -4553,13 +4602,12 @@ mod connector_owner_tests {
                 .unwrap();
             assert_eq!(persisted_snapshot(&store).browser.len(), 1);
             std::thread::sleep(Duration::from_millis(550));
-            assert!(matches!(
-                owner.verify(&state, &target, descriptor("account-a"), REDIRECT),
-                Err(OAuthFlowError::LifecycleRejected {
-                    operation: "verify_oauth_browser_flow",
-                    ..
-                })
-            ));
+            assert_eq!(
+                owner
+                    .verify(&state, &target, descriptor("account-a"), REDIRECT)
+                    .err(),
+                Some(OAuthFlowError::Missing)
+            );
             assert!(!lifecycle.has_oauth_browser_flow_for_test(&target, &state));
             let snapshot = persisted_snapshot(&store);
             assert!(
