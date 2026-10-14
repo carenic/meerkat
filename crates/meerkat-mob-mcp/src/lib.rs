@@ -16393,8 +16393,17 @@ mod tests {
         })
         .await
         .expect("the destroy removes its storage without its caller");
+        // The files are gone before the cleanup attempt ends: it still
+        // verifies the removal before it records that nothing is owed, and
+        // a running attempt counts as owed.
         let recorded = recorded_destroy(&state, &mob_id).await;
-        assert!(!recorded.cleanup_owed());
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while recorded.cleanup_owed() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the destroy records its storage cleanup as settled without its caller");
 
         let collected = dispatch_destroy(&surface, &mob_id)
             .await
