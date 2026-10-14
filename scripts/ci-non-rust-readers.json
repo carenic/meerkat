@@ -1,0 +1,2115 @@
+{
+  "schema_version": 1,
+  "description": [
+    "Repository paths outside a crate that Rust code reads, and their readers.",
+    "Keys are exact repository paths, directory prefixes ending in '/', or './' for a reader of the whole checkout.",
+    "Each reader names the package and target holding the reference, its scope (target: test-only code; package: library, binary or build-script code any test of the package can reach), optional nextest test names, and the source files.",
+    "scripts/ci-non-rust-readers-guard.mjs regenerates the facts from the sources and fails on any difference; scripts/ci-non-rust-readers.mjs maps changed paths onto readers."
+  ],
+  "paths": {
+    "./": [
+      {
+        "package": "meerkat-integration-tests",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "tests/integration/src/e2e_lanes.rs"
+        ]
+      },
+      {
+        "package": "meerkat-integration-tests",
+        "target": "test:phase6_cleanup_sweep",
+        "scope": "target",
+        "tests": [
+          "phase6_deleted_symbols_have_zero_production_hits",
+          "sweep_infrastructure_finds_known_pattern"
+        ],
+        "sources": [
+          "tests/integration/tests/phase6_cleanup_sweep.rs"
+        ]
+      },
+      {
+        "package": "meerkat-tools",
+        "target": "test:rct_contracts",
+        "scope": "target",
+        "tests": [
+          "test_rct_contracts_no_manual_tool_schema_literals"
+        ],
+        "sources": [
+          "crates/meerkat-tools/tests/rct_contracts.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/audit_generated_headers.rs",
+          "crates/xtask/src/bridge_classifier.rs",
+          "crates/xtask/src/effect_authority.rs",
+          "crates/xtask/src/machines.rs",
+          "crates/xtask/src/ownership_ledger.rs",
+          "crates/xtask/src/rmat_audit.rs",
+          "crates/xtask/src/runtime_authority_bypass.rs",
+          "crates/xtask/src/storage_ambient_gate.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "deprecated_backend_references_stay_rejected_only",
+          "generated_header_truthfulness_is_clean"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:effect_authority",
+        "scope": "target",
+        "tests": [
+          "live_workspace_bridge_classifier_gate_is_clean",
+          "live_workspace_effect_authority_audit_is_clean"
+        ],
+        "sources": [
+          "crates/xtask/tests/effect_authority.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:machines_contracts",
+        "scope": "target",
+        "features": [
+          "machine-authority"
+        ],
+        "tests": [
+          "canonical_machine_inventory_matches_docs_and_artifact_bundle",
+          "live_flow_runtime_reducer_transitions_are_mob_machine_command_gated",
+          "live_mob_runtime_catalog_commands_fail_close_on_matching_machine_inputs"
+        ],
+        "sources": [
+          "crates/xtask/tests/machines_contracts.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:protocol_codegen_drift",
+        "scope": "target",
+        "tests": [
+          "comms_trust_authority_minting_is_generated_only"
+        ],
+        "sources": [
+          "crates/xtask/tests/protocol_codegen_drift.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:runtime_authority_bypass",
+        "scope": "target",
+        "tests": [
+          "live_workspace_runtime_authority_bypass_audit_is_clean"
+        ],
+        "sources": [
+          "crates/xtask/tests/runtime_authority_bypass.rs"
+        ]
+      }
+    ],
+    ".cargo/config.toml": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "e2e_smoke_lane_launchers_allow_parallel_test_processes"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    ".claude/skills/": [
+      {
+        "package": "meerkat-machine-schema",
+        "target": "test:docs_machine_authority_alignment",
+        "scope": "target",
+        "tests": [
+          "doctrine_count_claims_match_canonical_registry"
+        ],
+        "sources": [
+          "crates/meerkat-machine-schema/tests/docs_machine_authority_alignment.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "deprecated_backend_references_stay_rejected_only"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-cli-reference/SKILL.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "retired_public_surface_tokens_stay_out_of_unowned_paths"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/SKILL.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/references/api_reference.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/references/migration_0_5.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".claude/skills/meerkat-platform/references/mobs.md": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/meerkat/src/help.rs"
+        ]
+      }
+    ],
+    ".github/actions/setup-buildbuddy-ci/action.yml": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "gcp_feature_matrix_lane_fans_out_remote_cargo_actions"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    ".github/actions/setup-rust-ci/": [
+      {
+        "package": "xtask",
+        "target": "test:release_workflow_asset_manifest",
+        "scope": "target",
+        "tests": [
+          "release_workflows_use_the_repository_pinned_rust_toolchain"
+        ],
+        "sources": [
+          "crates/xtask/tests/release_workflow_asset_manifest.rs"
+        ]
+      }
+    ],
+    ".github/workflows/": [
+      {
+        "package": "xtask",
+        "target": "test:ci_gate_requires_rmat",
+        "scope": "target",
+        "sources": [
+          "crates/xtask/tests/ci_gate_requires_rmat.rs"
+        ]
+      }
+    ],
+    ".github/workflows/buildbuddy.yml": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "gcp_feature_matrix_lane_fans_out_remote_cargo_actions"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    ".github/workflows/ci.yml": [
+      {
+        "package": "xtask",
+        "target": "test:ci_gate_requires_rmat",
+        "scope": "target",
+        "tests": [
+          "machine_authority_classifier_protects_required_gate_owners"
+        ],
+        "sources": [
+          "crates/xtask/tests/ci_gate_requires_rmat.rs"
+        ]
+      }
+    ],
+    "BUILD.bazel": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "adr_e1_native_control_has_exact_remote_and_foundation_artifact",
+          "e2e_smoke_lane_launchers_allow_parallel_test_processes"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "CHANGELOG.md": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "retired_public_surface_tokens_stay_out_of_unowned_paths"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "Cargo.toml": [
+      {
+        "package": "rkat",
+        "target": "test:slim_feature_graph",
+        "scope": "target",
+        "tests": [
+          "slim_cli_mob_feature_does_not_inherit_rpc_realtime_defaults"
+        ],
+        "sources": [
+          "crates/meerkat-cli/tests/slim_feature_graph.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "public_version_surfaces_are_in_sync"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "MODULE.bazel": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "linux_release_rbe_provides_hermetic_cmake_for_vendored_opus"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "Makefile": [
+      {
+        "package": "xtask",
+        "target": "test:rmat_audit",
+        "scope": "target",
+        "tests": [
+          "legacy_rmat_read_seam_script_is_removed"
+        ],
+        "sources": [
+          "crates/xtask/tests/rmat_audit.rs"
+        ]
+      }
+    ],
+    "artifacts/": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "retired_session_control_names_are_absent"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "artifacts/schemas/": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/public_contracts.rs"
+        ]
+      }
+    ],
+    "artifacts/schemas/version.json": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "public_version_surfaces_are_in_sync"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-authorization/BUILD.bazel": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "adr_e1_native_control_has_exact_remote_and_foundation_artifact"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-contracts/src/": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "supervisor_bridge_protocol_version_checks_stay_in_typed_owner"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-contracts/src/rpc_catalog.rs": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "rpc_catalog_router_docs_and_sdk_wrappers_are_aligned"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-contracts/src/version.rs": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "public_version_surfaces_are_in_sync"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-contracts/src/wire/supervisor_bridge.rs": [
+      {
+        "package": "meerkat-runtime",
+        "target": "lib",
+        "scope": "target",
+        "tests": [
+          "supervisor_bridge_command_manifest_matches_wire_enum"
+        ],
+        "sources": [
+          "crates/meerkat-runtime/src/meerkat_machine_tests.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-core/src/generated/approval_lifecycle.rs": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/protocol_codegen.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:protocol_codegen_drift",
+        "scope": "target",
+        "tests": [
+          "approval_lifecycle_matches_codegen_output"
+        ],
+        "sources": [
+          "crates/xtask/tests/protocol_codegen_drift.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-core/src/generated/auth_lease_durable_lifecycle_marker.rs": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/protocol_codegen.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:protocol_codegen_drift",
+        "scope": "target",
+        "tests": [
+          "auth_lease_durable_lifecycle_marker_matches_codegen_output"
+        ],
+        "sources": [
+          "crates/xtask/tests/protocol_codegen_drift.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-core/src/generated/auth_lease_transition_authority_sources.rs": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/protocol_codegen.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:protocol_codegen_drift",
+        "scope": "target",
+        "tests": [
+          "auth_lease_transition_authority_sources_matches_codegen_output"
+        ],
+        "sources": [
+          "crates/xtask/tests/protocol_codegen_drift.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-core/src/generated/comms_trust_authority_sources.rs": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/protocol_codegen.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:protocol_codegen_drift",
+        "scope": "target",
+        "tests": [
+          "comms_trust_authority_sources_matches_codegen_output"
+        ],
+        "sources": [
+          "crates/xtask/tests/protocol_codegen_drift.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-core/src/generated/protocol_tool_visibility_owner.rs": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/protocol_codegen.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-core/src/generated/session_document.rs": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/protocol_codegen.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:protocol_codegen_drift",
+        "scope": "target",
+        "tests": [
+          "session_document_authority_matches_codegen_output"
+        ],
+        "sources": [
+          "crates/xtask/tests/protocol_codegen_drift.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-core/src/generated/session_persistence_version_authority.rs": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/protocol_codegen.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:protocol_codegen_drift",
+        "scope": "target",
+        "tests": [
+          "session_persistence_version_authority_matches_codegen_output"
+        ],
+        "sources": [
+          "crates/xtask/tests/protocol_codegen_drift.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-core/src/generated/terminal_surface_mapping.rs": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/protocol_codegen.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:protocol_codegen_drift",
+        "scope": "target",
+        "tests": [
+          "terminal_surface_mapping_matches_codegen_output"
+        ],
+        "sources": [
+          "crates/xtask/tests/protocol_codegen_drift.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-core/src/interaction.rs": [
+      {
+        "package": "meerkat-runtime",
+        "target": "test:peer_ingress_fact_ratchet",
+        "scope": "target",
+        "tests": [
+          "peer_input_candidate_does_not_duplicate_ingress_class_or_auth"
+        ],
+        "sources": [
+          "crates/meerkat-runtime/tests/peer_ingress_fact_ratchet.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-core/src/lifecycle/core_executor.rs": [
+      {
+        "package": "meerkat-runtime",
+        "target": "test:core_apply_terminal_truth",
+        "scope": "target",
+        "tests": [
+          "core_apply_terminal_truth_has_one_authority"
+        ],
+        "sources": [
+          "crates/meerkat-runtime/tests/core_apply_terminal_truth.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-core/tests/fixtures/compiled_application_tool_policy_absent_default_deny_v1.json": [
+      {
+        "package": "meerkat-contracts",
+        "target": "lib",
+        "scope": "target",
+        "sources": [
+          "crates/meerkat-contracts/src/emit.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-core/tests/fixtures/compiled_application_tool_policy_unknown_field_v1.json": [
+      {
+        "package": "meerkat-contracts",
+        "target": "lib",
+        "scope": "target",
+        "sources": [
+          "crates/meerkat-contracts/src/emit.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-core/tests/fixtures/compiled_application_tool_policy_valid_v1.json": [
+      {
+        "package": "meerkat-contracts",
+        "target": "lib",
+        "scope": "target",
+        "sources": [
+          "crates/meerkat-contracts/src/emit.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-core/tests/fixtures/v0_8_10_recovery_migration_session.json": [
+      {
+        "package": "meerkat-runtime",
+        "target": "lib",
+        "scope": "target",
+        "tests": [
+          "runtime_v2_migrates_published_v1_rows_to_current_schema"
+        ],
+        "sources": [
+          "crates/meerkat-runtime/src/store/sqlite.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-machine-kernels/src/generated/meerkat.rs": [
+      {
+        "package": "meerkat-machine-codegen",
+        "target": "test:runtime_schema_parity",
+        "scope": "target",
+        "tests": [
+          "command_plan_capability_types_are_generated_for_runtime_and_mob_pilots"
+        ],
+        "sources": [
+          "crates/meerkat-machine-codegen/tests/runtime_schema_parity.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-machine-kernels/src/generated/mob.rs": [
+      {
+        "package": "meerkat-machine-codegen",
+        "target": "test:runtime_schema_parity",
+        "scope": "target",
+        "tests": [
+          "command_plan_capability_types_are_generated_for_runtime_and_mob_pilots"
+        ],
+        "sources": [
+          "crates/meerkat-machine-codegen/tests/runtime_schema_parity.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-machine-kernels/src/generated/mod.rs": [
+      {
+        "package": "xtask",
+        "target": "test:machines_contracts",
+        "scope": "target",
+        "features": [
+          "machine-authority"
+        ],
+        "tests": [
+          "kernel_generated_inventory_is_canonical_seven_only"
+        ],
+        "sources": [
+          "crates/xtask/tests/machines_contracts.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-machine-kernels/src/lib.rs": [
+      {
+        "package": "xtask",
+        "target": "test:machines_contracts",
+        "scope": "target",
+        "features": [
+          "machine-authority"
+        ],
+        "tests": [
+          "row22_kernel_public_api_contract_rejects_legacy_exports"
+        ],
+        "sources": [
+          "crates/xtask/tests/machines_contracts.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-machine-schema/src/": [
+      {
+        "package": "xtask",
+        "target": "test:machines_contracts",
+        "scope": "target",
+        "features": [
+          "machine-authority"
+        ],
+        "tests": [
+          "flow_runtime_until_feedback_does_not_use_loop_iteration_authority_bridge"
+        ],
+        "sources": [
+          "crates/xtask/tests/machines_contracts.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-machine-schema/src/catalog/dsl/meerkat_machine.rs": [
+      {
+        "package": "meerkat-runtime",
+        "target": "test:core_apply_terminal_truth",
+        "scope": "target",
+        "tests": [
+          "core_apply_terminal_truth_has_one_authority"
+        ],
+        "sources": [
+          "crates/meerkat-runtime/tests/core_apply_terminal_truth.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-mcp-server/src/runtime_ingress.rs": [
+      {
+        "package": "meerkat-runtime",
+        "target": "test:core_apply_terminal_truth",
+        "scope": "target",
+        "tests": [
+          "terminal_notices_flow_through_canonical_typed_appends"
+        ],
+        "sources": [
+          "crates/meerkat-runtime/tests/core_apply_terminal_truth.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-mob-mcp/tests/support/mod.rs": [
+      {
+        "package": "meerkat-integration-tests",
+        "target": "test:e2e_fast_lane",
+        "scope": "target",
+        "sources": [
+          "tests/integration/tests/e2e_fast_lane.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-mob/src/": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "supervisor_bridge_protocol_version_checks_stay_in_typed_owner"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-mob/src/generated/catalog_input.rs": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/protocol_codegen.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-mob/src/runtime/flow_frame_engine.rs": [
+      {
+        "package": "xtask",
+        "target": "test:machines_contracts",
+        "scope": "target",
+        "features": [
+          "machine-authority"
+        ],
+        "tests": [
+          "flow_runtime_until_feedback_does_not_use_loop_iteration_authority_bridge"
+        ],
+        "sources": [
+          "crates/xtask/tests/machines_contracts.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-mob/tests/support/live_plane.rs": [
+      {
+        "package": "meerkat-integration-tests",
+        "target": "test:e2e_fast_lane",
+        "scope": "target",
+        "sources": [
+          "tests/integration/tests/e2e_fast_lane.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-mob/tests/support/mod.rs": [
+      {
+        "package": "meerkat-integration-tests",
+        "target": "test:e2e_fast_lane",
+        "scope": "target",
+        "sources": [
+          "tests/integration/tests/e2e_fast_lane.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-mob/tests/support/probe.rs": [
+      {
+        "package": "rkat",
+        "target": "test:system_mob_host_daemon",
+        "scope": "target",
+        "features": [
+          "comms",
+          "integration-real-tests",
+          "mob"
+        ],
+        "sources": [
+          "crates/meerkat-cli/tests/system_mob_host_daemon.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-mob/tests/support/probe_shared.rs": [
+      {
+        "package": "meerkat-integration-tests",
+        "target": "test:e2e_fast_lane",
+        "scope": "target",
+        "sources": [
+          "crates/meerkat-mob/tests/support/shared.rs"
+        ]
+      },
+      {
+        "package": "rkat",
+        "target": "test:system_mob_host_daemon",
+        "scope": "target",
+        "features": [
+          "comms",
+          "integration-real-tests",
+          "mob"
+        ],
+        "sources": [
+          "crates/meerkat-mob/tests/support/probe.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-openai/src/public_live.rs": [
+      {
+        "package": "meerkat-integration-tests",
+        "target": "test:gpt_live_replay",
+        "scope": "target",
+        "features": [
+          "gpt-live-replay"
+        ],
+        "tests": [
+          "the_duck_release_burst_gap_is_the_peer_end_hysteresis"
+        ],
+        "sources": [
+          "tests/integration/tests/gpt_live_replay.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-rpc/": [
+      {
+        "package": "rkat",
+        "target": "test:slim_feature_graph",
+        "scope": "target",
+        "tests": [
+          "slim_cli_mob_feature_does_not_inherit_rpc_realtime_defaults"
+        ],
+        "sources": [
+          "crates/meerkat-cli/tests/slim_feature_graph.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-rpc/src/router.rs": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "rpc_catalog_router_docs_and_sdk_wrappers_are_aligned"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-runtime/BUILD.bazel": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "adr_e1_native_control_has_exact_remote_and_foundation_artifact"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-runtime/src/": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "supervisor_bridge_protocol_version_checks_stay_in_typed_owner"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-runtime/tests/fixtures/v0_7_x_pre_ledger_realm/corpus/realms/": [
+      {
+        "package": "meerkat",
+        "target": "lib",
+        "scope": "target",
+        "sources": [
+          "crates/meerkat/src/persistence.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-runtime/tests/fixtures/v0_8_10_released_realm/corpus/realm/config.toml": [
+      {
+        "package": "rkat",
+        "target": "bin:rkat",
+        "scope": "target",
+        "tests": [
+          "test_load_config_accepts_released_realm_legacy_model_fallback_default"
+        ],
+        "sources": [
+          "crates/meerkat-cli/src/main.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-runtime/tests/fixtures/v0_8_10_released_realm/corpus/realm/sessions.sqlite3": [
+      {
+        "package": "meerkat-store",
+        "target": "lib",
+        "scope": "target",
+        "tests": [
+          "exact_released_0810_corpus_imports_and_fully_loads_current_session"
+        ],
+        "sources": [
+          "crates/meerkat-store/src/sqlite_store.rs"
+        ]
+      }
+    ],
+    "crates/meerkat-session/src/generated/session_turn_admission.rs": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/protocol_codegen.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:protocol_codegen_drift",
+        "scope": "target",
+        "tests": [
+          "session_turn_admission_authority_matches_codegen_output"
+        ],
+        "sources": [
+          "crates/xtask/tests/protocol_codegen_drift.rs"
+        ]
+      }
+    ],
+    "crates/meerkat/": [
+      {
+        "package": "rkat",
+        "target": "test:slim_feature_graph",
+        "scope": "target",
+        "tests": [
+          "facade_does_not_pull_websocket_transport_without_live_features"
+        ],
+        "sources": [
+          "crates/meerkat-cli/tests/slim_feature_graph.rs"
+        ]
+      }
+    ],
+    "crates/meerkat/BUILD.bazel": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "adr_e1_native_control_has_exact_remote_and_foundation_artifact"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "crates/meerkat/src/surface/runtime_backed.rs": [
+      {
+        "package": "meerkat-runtime",
+        "target": "test:core_apply_terminal_truth",
+        "scope": "target",
+        "tests": [
+          "terminal_notices_flow_through_canonical_typed_appends"
+        ],
+        "sources": [
+          "crates/meerkat-runtime/tests/core_apply_terminal_truth.rs"
+        ]
+      }
+    ],
+    "docs/": [
+      {
+        "package": "meerkat-machine-schema",
+        "target": "test:docs_machine_authority_alignment",
+        "scope": "target",
+        "tests": [
+          "doctrine_count_claims_match_canonical_registry"
+        ],
+        "sources": [
+          "crates/meerkat-machine-schema/tests/docs_machine_authority_alignment.rs"
+        ]
+      },
+      {
+        "package": "rkat",
+        "target": "bin:rkat",
+        "scope": "target",
+        "tests": [
+          "fenced_rkat_doc_examples_parse_against_clap"
+        ],
+        "sources": [
+          "crates/meerkat-cli/src/main.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/machines.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "retired_public_surface_tokens_stay_out_of_unowned_paths",
+          "retired_session_control_names_are_absent"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "docs/api/": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/public_contracts.rs"
+        ]
+      }
+    ],
+    "docs/api/rpc.mdx": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "rpc_catalog_router_docs_and_sdk_wrappers_are_aligned"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "docs/cli/commands.mdx": [
+      {
+        "package": "rkat",
+        "target": "test:help_mobpack_contract",
+        "scope": "target",
+        "sources": [
+          "crates/meerkat-cli/tests/help_mobpack_contract.rs"
+        ]
+      }
+    ],
+    "docs/docs.json": [
+      {
+        "package": "rkat",
+        "target": "test:help_mobpack_contract",
+        "scope": "target",
+        "sources": [
+          "crates/meerkat-cli/tests/help_mobpack_contract.rs"
+        ]
+      }
+    ],
+    "docs/examples/mobpack.mdx": [
+      {
+        "package": "rkat",
+        "target": "test:help_mobpack_contract",
+        "scope": "target",
+        "sources": [
+          "crates/meerkat-cli/tests/help_mobpack_contract.rs"
+        ]
+      }
+    ],
+    "docs/examples/wasm.mdx": [
+      {
+        "package": "rkat",
+        "target": "test:help_mobpack_contract",
+        "scope": "target",
+        "sources": [
+          "crates/meerkat-cli/tests/help_mobpack_contract.rs"
+        ]
+      }
+    ],
+    "docs/guides/mobpack.mdx": [
+      {
+        "package": "rkat",
+        "target": "test:help_mobpack_contract",
+        "scope": "target",
+        "sources": [
+          "crates/meerkat-cli/tests/help_mobpack_contract.rs"
+        ]
+      }
+    ],
+    "docs/guides/mobs.mdx": [
+      {
+        "package": "rkat",
+        "target": "test:help_mobpack_contract",
+        "scope": "target",
+        "sources": [
+          "crates/meerkat-cli/tests/help_mobpack_contract.rs"
+        ]
+      }
+    ],
+    "docs/internal/": [
+      {
+        "package": "meerkat-machine-schema",
+        "target": "test:docs_machine_authority_alignment",
+        "scope": "target",
+        "tests": [
+          "doctrine_count_claims_match_canonical_registry"
+        ],
+        "sources": [
+          "crates/meerkat-machine-schema/tests/docs_machine_authority_alignment.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "retired_session_control_names_are_absent"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "docs/internal/archive/public-docs-removed-2026-05-11/architecture/finite-ownership-ledger.md": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/ownership_ledger.rs",
+          "crates/xtask/src/rmat_audit.rs"
+        ]
+      }
+    ],
+    "docs/reference/machine-authority.mdx": [
+      {
+        "package": "meerkat-machine-schema",
+        "target": "test:docs_machine_authority_alignment",
+        "scope": "target",
+        "tests": [
+          "machine_authority_doc_composition_table_matches_canonical_registry",
+          "machine_authority_doc_table_matches_canonical_registry"
+        ],
+        "sources": [
+          "crates/meerkat-machine-schema/tests/docs_machine_authority_alignment.rs"
+        ]
+      }
+    ],
+    "docs/reference/mob-architecture.mdx": [
+      {
+        "package": "rkat",
+        "target": "test:help_mobpack_contract",
+        "scope": "target",
+        "sources": [
+          "crates/meerkat-cli/tests/help_mobpack_contract.rs"
+        ]
+      }
+    ],
+    "docs/rust/": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/public_contracts.rs"
+        ]
+      }
+    ],
+    "docs/sdks/": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/public_contracts.rs"
+        ]
+      }
+    ],
+    "examples/": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/public_contracts.rs"
+        ]
+      }
+    ],
+    "examples/011-hooks-guardrails-rs/cost_tracker.py": [
+      {
+        "package": "meerkat",
+        "target": "example:011-hooks-guardrails",
+        "scope": "target",
+        "features": [
+          "jsonl-store"
+        ],
+        "tests": [
+          "documented_cost_tracker_runs_through_hook_engine"
+        ],
+        "sources": [
+          "examples/011-hooks-guardrails-rs/tests.rs"
+        ]
+      }
+    ],
+    "examples/017-mob-coding-swarm-rs/mob.toml": [
+      {
+        "package": "meerkat-mob",
+        "target": "example:017-mob-coding-swarm",
+        "scope": "target",
+        "sources": [
+          "examples/017-mob-coding-swarm-rs/tracked_turn.rs"
+        ]
+      },
+      {
+        "package": "meerkat-mob",
+        "target": "example:018-mob-research-team",
+        "scope": "target",
+        "sources": [
+          "examples/017-mob-coding-swarm-rs/tracked_turn.rs"
+        ]
+      },
+      {
+        "package": "meerkat-mob",
+        "target": "example:019-mob-pipeline",
+        "scope": "target",
+        "sources": [
+          "examples/017-mob-coding-swarm-rs/tracked_turn.rs"
+        ]
+      }
+    ],
+    "examples/017-mob-coding-swarm-rs/tracked_turn.rs": [
+      {
+        "package": "meerkat-mob",
+        "target": "example:018-mob-research-team",
+        "scope": "target",
+        "sources": [
+          "examples/018-mob-research-team-rs/main.rs"
+        ]
+      },
+      {
+        "package": "meerkat-mob",
+        "target": "example:019-mob-pipeline",
+        "scope": "target",
+        "sources": [
+          "examples/019-mob-pipeline-rs/main.rs"
+        ]
+      }
+    ],
+    "examples/034-codemob-mcp/src/tools/consult.rs": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/effect_authority.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:effect_authority",
+        "scope": "target",
+        "tests": [
+          "allowlisted_example_stays_clean"
+        ],
+        "sources": [
+          "crates/xtask/tests/effect_authority.rs"
+        ]
+      }
+    ],
+    "scripts/buildbuddy-bazel-poc": [
+      {
+        "package": "meerkat-integration-tests",
+        "target": "lib",
+        "scope": "target",
+        "tests": [
+          "smoke_foundation_selector_covers_every_smoke_plan_bazel_artifact"
+        ],
+        "sources": [
+          "tests/integration/src/e2e_lanes.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "adr_e1_native_control_has_exact_remote_and_foundation_artifact",
+          "buildbuddy_external_repo_cache_repair_catches_replanting_symlink_failures",
+          "buildbuddy_machine_authority_lane_runs_tlc_machine_verify",
+          "e2e_smoke_lane_launchers_allow_parallel_test_processes",
+          "gcp_feature_matrix_lane_fans_out_remote_cargo_actions"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "scripts/buildbuddy-dev": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "e2e_smoke_lane_launchers_allow_parallel_test_processes"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "scripts/buildbuddy-doctor": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "buildbuddy_external_repo_cache_repair_catches_replanting_symlink_failures",
+          "buildbuddy_machine_authority_lane_runs_tlc_machine_verify"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "scripts/buildbuddy-e2e-smoke-flow-runtime-shard-test": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "e2e_smoke_lane_launchers_allow_parallel_test_processes"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "scripts/ci-cargo-lanes.mjs": [
+      {
+        "package": "xtask",
+        "target": "test:ci_gate_requires_rmat",
+        "scope": "target",
+        "tests": [
+          "ci_runs_fail_closed_cargo_lanes_on_hosted_runners"
+        ],
+        "sources": [
+          "crates/xtask/tests/ci_gate_requires_rmat.rs"
+        ]
+      }
+    ],
+    "scripts/deprecated_backend_scan.sh": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "deprecated_backend_references_stay_rejected_only"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "scripts/generate-bazel-rust-builds.mjs": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "adr_e1_native_control_has_exact_remote_and_foundation_artifact"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "scripts/machine-authority-changed": [
+      {
+        "package": "xtask",
+        "target": "test:ci_gate_requires_rmat",
+        "scope": "target",
+        "tests": [
+          "cargo_diagnostic_workflow_preserves_the_full_gate_set",
+          "machine_authority_classifier_protects_required_gate_owners"
+        ],
+        "sources": [
+          "crates/xtask/tests/ci_gate_requires_rmat.rs"
+        ]
+      }
+    ],
+    "scripts/repo-cargo": [
+      {
+        "package": "meerkat",
+        "target": "test:agent_builder_policy_canary",
+        "scope": "target",
+        "tests": [
+          "facade_cargo_does_not_feature_unify_standalone_builder_by_default"
+        ],
+        "sources": [
+          "crates/meerkat/tests/agent_builder_policy_canary.rs"
+        ]
+      },
+      {
+        "package": "meerkat-integration-tests",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "tests/integration/src/e2e_lanes.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/machines.rs",
+          "crates/xtask/src/machines_test_support.rs"
+        ]
+      }
+    ],
+    "scripts/run-build-backend-lane": [
+      {
+        "package": "meerkat-integration-tests",
+        "target": "lib",
+        "scope": "target",
+        "tests": [
+          "system_lane_prebuild_builds_every_system_suites_test_target",
+          "system_lane_prebuild_builds_exactly_the_system_suites_pre_command_binaries"
+        ],
+        "sources": [
+          "tests/integration/src/e2e_lanes.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "e2e_smoke_lane_launchers_allow_parallel_test_processes"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "scripts/test-ci-nextest-archive.sh": [
+      {
+        "package": "xtask",
+        "target": "test:ci_gate_requires_rmat",
+        "scope": "target",
+        "tests": [
+          "cargo_diagnostic_workflow_preserves_the_full_gate_set"
+        ],
+        "sources": [
+          "crates/xtask/tests/ci_gate_requires_rmat.rs"
+        ]
+      }
+    ],
+    "scripts/tests/xtask_scripts_dogma_gates.sh": [
+      {
+        "package": "xtask",
+        "target": "test:ci_gate_requires_rmat",
+        "scope": "target",
+        "tests": [
+          "machine_authority_classifier_protects_required_gate_owners"
+        ],
+        "sources": [
+          "crates/xtask/tests/ci_gate_requires_rmat.rs"
+        ]
+      }
+    ],
+    "sdks/": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "retired_public_surface_tokens_stay_out_of_unowned_paths",
+          "retired_session_control_names_are_absent"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "sdks/python/": [
+      {
+        "package": "meerkat-integration-tests",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "tests/integration/src/e2e_lanes.rs"
+        ]
+      }
+    ],
+    "sdks/python/meerkat/": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "rpc_catalog_router_docs_and_sdk_wrappers_are_aligned"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "sdks/python/meerkat/generated/": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/public_contracts.rs"
+        ]
+      }
+    ],
+    "sdks/python/meerkat/generated/types.py": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "public_version_surfaces_are_in_sync"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "sdks/python/pyproject.toml": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "public_version_surfaces_are_in_sync"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "sdks/typescript/": [
+      {
+        "package": "meerkat-integration-tests",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "tests/integration/src/e2e_lanes.rs"
+        ]
+      }
+    ],
+    "sdks/typescript/package.json": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "public_version_surfaces_are_in_sync"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "sdks/typescript/src/": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "rpc_catalog_router_docs_and_sdk_wrappers_are_aligned"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "sdks/typescript/src/generated/": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/public_contracts.rs"
+        ]
+      }
+    ],
+    "sdks/typescript/src/generated/types.ts": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "public_version_surfaces_are_in_sync"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "sdks/web/": [
+      {
+        "package": "meerkat-integration-tests",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "tests/integration/src/e2e_lanes.rs"
+        ]
+      }
+    ],
+    "sdks/web/package.json": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "public_version_surfaces_are_in_sync"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "specs/compositions/": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/machines.rs",
+          "crates/xtask/src/machines_test_support.rs"
+        ]
+      }
+    ],
+    "specs/compositions/README.md": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/machines.rs"
+        ]
+      }
+    ],
+    "specs/compositions/meerkat_mob_seam/model.tla": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "target",
+        "tests": [
+          "output_paths_land_under_canonical_specs_dirs"
+        ],
+        "sources": [
+          "crates/xtask/src/machines_tests.rs"
+        ]
+      }
+    ],
+    "specs/machines/": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/machines.rs",
+          "crates/xtask/src/machines_test_support.rs"
+        ]
+      }
+    ],
+    "specs/machines/README.md": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/machines.rs"
+        ]
+      }
+    ],
+    "specs/machines/meerkat_machine/contract.md": [
+      {
+        "package": "meerkat-runtime",
+        "target": "test:core_apply_terminal_truth",
+        "scope": "target",
+        "tests": [
+          "core_apply_terminal_truth_has_one_authority"
+        ],
+        "sources": [
+          "crates/meerkat-runtime/tests/core_apply_terminal_truth.rs"
+        ]
+      }
+    ],
+    "specs/machines/meerkat_machine/model.tla": [
+      {
+        "package": "meerkat-runtime",
+        "target": "test:core_apply_terminal_truth",
+        "scope": "target",
+        "tests": [
+          "core_apply_terminal_truth_has_one_authority"
+        ],
+        "sources": [
+          "crates/meerkat-runtime/tests/core_apply_terminal_truth.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "target",
+        "tests": [
+          "output_paths_land_under_canonical_specs_dirs"
+        ],
+        "sources": [
+          "crates/xtask/src/machines_tests.rs"
+        ]
+      }
+    ],
+    "specs/machines/mob_machine/model.tla": [
+      {
+        "package": "meerkat-machine-codegen",
+        "target": "test:runtime_schema_parity",
+        "scope": "target",
+        "tests": [
+          "mob_machine_native_reducer_helpers_are_formally_defined"
+        ],
+        "sources": [
+          "crates/meerkat-machine-codegen/tests/runtime_schema_parity.rs"
+        ]
+      }
+    ],
+    "tests/fixtures/": [
+      {
+        "package": "xtask",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "crates/xtask/src/rmat_audit.rs"
+        ]
+      }
+    ],
+    "tests/fixtures/hooks/run_override.json": [
+      {
+        "package": "meerkat-core",
+        "target": "test:hooks_contracts",
+        "scope": "target",
+        "tests": [
+          "run_override_fixture_contract"
+        ],
+        "sources": [
+          "crates/meerkat-core/tests/hooks_contracts.rs"
+        ]
+      },
+      {
+        "package": "meerkat-mcp-server",
+        "target": "lib",
+        "scope": "target",
+        "sources": [
+          "crates/meerkat-mcp-server/src/lib.rs"
+        ]
+      },
+      {
+        "package": "meerkat-rest",
+        "target": "lib",
+        "scope": "target",
+        "sources": [
+          "crates/meerkat-rest/src/lib.rs"
+        ]
+      },
+      {
+        "package": "rkat",
+        "target": "bin:rkat",
+        "scope": "target",
+        "sources": [
+          "crates/meerkat-cli/src/main.rs"
+        ]
+      }
+    ],
+    "tests/fixtures/live_smoke/support.rs": [
+      {
+        "package": "meerkat-mcp-server",
+        "target": "test:live_mcp_matrix",
+        "scope": "target",
+        "sources": [
+          "crates/meerkat-mcp-server/tests/live_mcp_matrix.rs"
+        ]
+      },
+      {
+        "package": "meerkat-rest",
+        "target": "test:live_rest_matrix",
+        "scope": "target",
+        "features": [
+          "integration-real-tests"
+        ],
+        "sources": [
+          "crates/meerkat-rest/tests/live_rest_matrix.rs"
+        ]
+      },
+      {
+        "package": "meerkat-rpc",
+        "target": "test:live_rpc_regression",
+        "scope": "target",
+        "sources": [
+          "crates/meerkat-rpc/tests/live_rpc_regression.rs"
+        ]
+      },
+      {
+        "package": "meerkat-rpc",
+        "target": "test:live_smoke_rpc",
+        "scope": "target",
+        "sources": [
+          "crates/meerkat-rpc/tests/live_smoke_rpc.rs"
+        ]
+      }
+    ],
+    "tests/fixtures/surface-build-fixtures/BUILD.bazel": [
+      {
+        "package": "meerkat",
+        "target": "test:agent_builder_policy_canary",
+        "scope": "target",
+        "tests": [
+          "public_downstream_bazel_fixtures_do_not_use_private_factory_targets"
+        ],
+        "sources": [
+          "crates/meerkat/tests/agent_builder_policy_canary.rs"
+        ]
+      }
+    ],
+    "tests/integration/Cargo.toml": [
+      {
+        "package": "rkat",
+        "target": "test:slim_feature_graph",
+        "scope": "target",
+        "tests": [
+          "integration_tests_restore_rpc_default_feature_surface"
+        ],
+        "sources": [
+          "crates/meerkat-cli/tests/slim_feature_graph.rs"
+        ]
+      }
+    ],
+    "tests/live_smoke/README.md": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "e2e_smoke_lane_launchers_allow_parallel_test_processes"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "tests/live_smoke/browser/": [
+      {
+        "package": "meerkat-integration-tests",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "tests/integration/src/e2e_lanes.rs"
+        ]
+      },
+      {
+        "package": "meerkat-integration-tests",
+        "target": "test:gpt_live_public_e2e",
+        "scope": "target",
+        "features": [
+          "openai-live-e2e"
+        ],
+        "sources": [
+          "tests/integration/tests/support/gpt_live_e2e.rs"
+        ]
+      },
+      {
+        "package": "meerkat-integration-tests",
+        "target": "test:gpt_live_replay",
+        "scope": "target",
+        "features": [
+          "gpt-live-replay"
+        ],
+        "sources": [
+          "tests/integration/tests/support/gpt_live_e2e.rs"
+        ]
+      }
+    ],
+    "tests/live_smoke/browser/fixtures/gpt_live_client/": [
+      {
+        "package": "meerkat-integration-tests",
+        "target": "lib",
+        "scope": "package",
+        "sources": [
+          "tests/integration/src/voice_fixtures.rs"
+        ]
+      }
+    ],
+    "tests/live_smoke/browser/harness/gpt-live-peer-e2e.mjs": [
+      {
+        "package": "meerkat-integration-tests",
+        "target": "test:gpt_live_public_e2e",
+        "scope": "target",
+        "features": [
+          "openai-live-e2e"
+        ],
+        "sources": [
+          "tests/integration/tests/support/gpt_live_e2e.rs"
+        ]
+      },
+      {
+        "package": "meerkat-integration-tests",
+        "target": "test:gpt_live_replay",
+        "scope": "target",
+        "features": [
+          "gpt-live-replay"
+        ],
+        "sources": [
+          "tests/integration/tests/gpt_live_replay.rs",
+          "tests/integration/tests/support/gpt_live_e2e.rs"
+        ]
+      }
+    ],
+    "tools/buildbuddy/BUILD.bazel": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "gcp_feature_matrix_lane_fans_out_remote_cargo_actions"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "tools/buildbuddy/cargo_lane_test.sh": [
+      {
+        "package": "meerkat",
+        "target": "test:agent_builder_policy_canary",
+        "scope": "target",
+        "tests": [
+          "facade_cargo_does_not_feature_unify_standalone_builder_by_default"
+        ],
+        "sources": [
+          "crates/meerkat/tests/agent_builder_policy_canary.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "gcp_feature_matrix_lane_fans_out_remote_cargo_actions"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "tools/buildbuddy/full_lane_test.sh": [
+      {
+        "package": "meerkat",
+        "target": "test:agent_builder_policy_canary",
+        "scope": "target",
+        "tests": [
+          "facade_cargo_does_not_feature_unify_standalone_builder_by_default"
+        ],
+        "sources": [
+          "crates/meerkat/tests/agent_builder_policy_canary.rs"
+        ]
+      },
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "gcp_feature_matrix_lane_fans_out_remote_cargo_actions"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ],
+    "tools/sdk-builder/build.py": [
+      {
+        "package": "meerkat",
+        "target": "test:smoke_meerkat_sdk",
+        "scope": "target",
+        "features": [
+          "integration-real-tests",
+          "jsonl-store"
+        ],
+        "tests": [
+          "e2e_smoke_sdk_builder_profile"
+        ],
+        "sources": [
+          "crates/meerkat/tests/smoke_meerkat_sdk.rs"
+        ]
+      }
+    ],
+    "tools/sdk-codegen/": [
+      {
+        "package": "xtask",
+        "target": "test:buildbuddy_static_lanes",
+        "scope": "target",
+        "tests": [
+          "retired_session_control_names_are_absent"
+        ],
+        "sources": [
+          "crates/xtask/tests/buildbuddy_static_lanes.rs"
+        ]
+      }
+    ]
+  },
+  "not_readers": [
+    {
+      "source": "crates/meerkat-cli/tests/cli_auth_flow.rs",
+      "literal": "derive_workspace_realm_id(workspace_root)",
+      "why": "Derives a realm id from the checkout path; reads nothing under it."
+    },
+    {
+      "source": "crates/meerkat-contracts/src/bin/emit-schemas.rs",
+      "literal": "artifacts/schemas",
+      "why": "The schema emitter (make regen-schemas) writes artifacts/schemas; no test reads it through this binary."
+    },
+    {
+      "source": "crates/xtask/src/protocol_codegen.rs",
+      "literal": "write_protocol_files(emitted)",
+      "why": "Writes the generated protocol files; the drift check that reads them is listed under their paths."
+    }
+  ]
+}
