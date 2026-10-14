@@ -310,15 +310,22 @@ jobs:
             "${attestation}"
           echo "Verified exact-tree CI attestation for ${RELEASE_SHA} (${RELEASE_TREE})"
 
+  # Manual dispatches pick Cargo or the hosted BuildBuddy lane below. A tag
+  # push runs this job only while the self-hosted GCP graph is disabled
+  # (repository variable MEERKAT_GCP_BUILDBUDDY_ENABLED is not 'true'); it
+  # is then the tag's release validation instead of
+  # release_validate_buildbuddy_full.
   release_validate_cargo:
     name: Validate release state with Cargo
     needs: [require_ci_green]
     if: >-
-      github.event_name == 'workflow_dispatch' &&
-      github.event.inputs.publish_web_sdk_only != 'true' &&
-      github.event.inputs.publish_release_assets_only != 'true' &&
-      !(github.actor == 'lukacf' &&
-        github.event.inputs.release_backend == 'buildbuddy')
+      (github.event_name != 'workflow_dispatch' &&
+       vars.MEERKAT_GCP_BUILDBUDDY_ENABLED != 'true') ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.event.inputs.publish_web_sdk_only != 'true' &&
+       github.event.inputs.publish_release_assets_only != 'true' &&
+       !(github.actor == 'lukacf' &&
+         github.event.inputs.release_backend == 'buildbuddy'))
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -427,14 +434,17 @@ jobs:
         run: make verify-bazel-module-lock-inputs
 
   # The tag path reuses the exact-tree Cargo CI attestation for the hosted
-  # lanes and runs the whole BuildBuddy/Bazel graph (prebuild, static, native
-  # nextest, governance, SDK suites, wasm-check, minimal-feature, feature
-  # matrix, audit) in `full-fresh` mode as its release gate. Pull-request CI
+  # lanes and, while the self-hosted GCP graph is enabled
+  # (MEERKAT_GCP_BUILDBUDDY_ENABLED is 'true'), runs the whole
+  # BuildBuddy/Bazel graph (prebuild, static, native nextest, governance, SDK
+  # suites, wasm-check, minimal-feature, feature matrix, audit) in
+  # `full-fresh` mode as its release gate. While it is disabled this job is
+  # skipped and release_validate_cargo validates the tag. Pull-request CI
   # never runs that graph.
   release_validate_buildbuddy_full:
     name: Validate release tree with the full BuildBuddy graph
     needs: [require_ci_green]
-    if: ${{ github.event_name != 'workflow_dispatch' }}
+    if: ${{ github.event_name != 'workflow_dispatch' && vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}
     uses: ./.github/workflows/buildbuddy.yml
     with:
       mode: full-fresh
@@ -456,6 +466,7 @@ jobs:
           set -euo pipefail
           ci_result="${{ needs.require_ci_green.result }}"
           bb_selected="${{ github.actor == 'lukacf' && ((github.event_name == 'workflow_dispatch' && github.event.inputs.release_backend == 'buildbuddy') || (github.event_name != 'workflow_dispatch' && (vars.MEERKAT_RELEASE_BUILDBUDDY == 'true' || vars.MEERKAT_RELEASE_BUILDBUDDY == '1'))) }}"
+          gcp_graph_enabled="${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}"
           cargo_result="${{ needs.release_validate_cargo.result }}"
           buildbuddy_result="${{ needs.release_validate_buildbuddy.result }}"
           buildbuddy_full_result="${{ needs.release_validate_buildbuddy_full.result }}"
@@ -464,10 +475,16 @@ jobs:
           [[ "${ci_result}" == "success" ]]
 
           if [[ "${{ github.event_name }}" != "workflow_dispatch" ]]; then
-            echo "Exact-tree CI attestation reused; Cargo release validation: ${cargo_result}"
-            echo "Exact-tree CI attestation reused; BuildBuddy release validation: ${buildbuddy_result}"
-            echo "Full BuildBuddy graph (full-fresh) on the release tree: ${buildbuddy_full_result}"
-            [[ "${cargo_result}" == "skipped" && "${buildbuddy_result}" == "skipped" && "${buildbuddy_full_result}" == "success" ]]
+            echo "BuildBuddy release validation (manual dispatches only): ${buildbuddy_result}"
+            if [[ "${gcp_graph_enabled}" == "true" ]]; then
+              echo "Exact-tree CI attestation reused; Cargo release validation: ${cargo_result}"
+              echo "Full BuildBuddy graph (full-fresh) on the release tree: ${buildbuddy_full_result}"
+              [[ "${cargo_result}" == "skipped" && "${buildbuddy_result}" == "skipped" && "${buildbuddy_full_result}" == "success" ]]
+              exit $?
+            fi
+            echo "Self-hosted GCP graph disabled (MEERKAT_GCP_BUILDBUDDY_ENABLED is not 'true'); full graph: ${buildbuddy_full_result}"
+            echo "Cargo release validation of the tag: ${cargo_result}"
+            [[ "${cargo_result}" == "success" && "${buildbuddy_result}" == "skipped" && "${buildbuddy_full_result}" == "skipped" ]]
             exit $?
           fi
 
@@ -523,10 +540,10 @@ jobs:
 
   # Public-API breaks are allowed in 0.x patch releases and must be DECLARED.
   # This is its own job rather than a step in release_validate_cargo because
-  # that job only runs on workflow_dispatch: on a tag push (the primary release
-  # path) release_validate_gate asserts both validate jobs are `skipped`, so a
-  # step added there would never run for an actual release. Everything that
-  # makes a release public depends on this job below.
+  # that job is not the tag's validation whenever the self-hosted GCP graph
+  # is enabled: release_validate_gate then asserts it is `skipped`, so a step
+  # added there would not run for those releases. Everything that makes a
+  # release public depends on this job below.
   release_semver_gate:
     name: Breaks declared and notes stamped
     needs: [require_ci_green]

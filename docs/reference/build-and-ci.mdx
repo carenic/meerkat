@@ -411,10 +411,13 @@ demand (`.github/workflows/nightly.yml`) on GitHub-hosted runners:
 
 The tag release workflow requires successful exact-`main` CI for the release
 commit and downloads that run's schema-4 attestation (legacy schema 1-3
-attestations are still accepted for older commits). It then runs the whole
+attestations are still accepted for older commits). While the repository
+variable `MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true` it then runs the whole
 BuildBuddy/Bazel graph in `full-fresh` mode (`release_validate_buildbuddy_full`)
-as the release validation gate; the Cargo validation lane remains the
-fallback for manual dispatches on the GitHub-hosted backend. It still builds
+as the release validation gate; while that self-hosted graph is off (the
+default) the tag validates with the Cargo validation lane
+(`release_validate_cargo`), which is also the fallback for manual dispatches
+on the GitHub-hosted backend. It still builds
 and publishes the platform-specific release artifacts from the attested
 source; Windows binaries are cross-compiled and packaged with cargo-xwin
 (clang-cl, lld-link, the Windows SDK) on a hosted Ubuntu runner, then

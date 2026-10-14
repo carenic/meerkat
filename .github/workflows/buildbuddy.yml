@@ -3,6 +3,12 @@ name: GCP BuildBuddy CI
 # The whole BuildBuddy/Bazel validation graph. Nightly and the release
 # workflow call this reusable lane in `full-fresh` mode; pull-request CI
 # (ci.yml) is Cargo-only on GitHub-hosted runners and does not call it.
+#
+# Default OFF: every job that touches GCP runs only while the repository
+# variable MEERKAT_GCP_BUILDBUDDY_ENABLED is 'true'. With it unset nothing
+# starts, syncs or scales, and the gate job fails, so a caller that does not
+# skip this workflow itself (nightly and release.yml do) never reads a
+# disabled graph as a pass.
 
 on:
   workflow_call:
@@ -117,6 +123,7 @@ env:
 jobs:
   control-plane-up:
     name: Control plane up
+    if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -188,6 +195,7 @@ jobs:
   executors-up:
     name: Executors up
     needs: [control-plane-up]
+    if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
@@ -586,7 +594,7 @@ jobs:
 
   executors-down:
     name: Executors down
-    if: ${{ always() }}
+    if: ${{ always() && vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}
     needs:
       - executors-up
       - prebuild-submit
@@ -664,6 +672,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      - name: Require the self-hosted graph to be enabled
+        if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED != 'true' }}
+        run: |
+          echo "::error::BuildBuddy graph is disabled (repository variable MEERKAT_GCP_BUILDBUDDY_ENABLED is not 'true'): nothing was started and nothing was validated. Release tags validate with Cargo while it is off."
+          exit 1
       - name: Check results
         run: |
           if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then

@@ -443,7 +443,11 @@ default to Cargo.
 PR CI does not. A dispatch with `graph_only=true` runs only `gcp-buildbuddy`:
 the release final gate runs it on the release branch tip before the tag
 (`gh workflow run nightly.yml --ref release/X -f graph_only=true`), which
-also warms the remote cache for the tag run. The full nightly set is:
+also warms the remote cache for the tag run. The self-hosted graph is
+default off behind the repository variable `MEERKAT_GCP_BUILDBUDDY_ENABLED`:
+unless it is `true`, scheduled runs skip `gcp-buildbuddy` (nothing in GCP
+starts; the other nightly jobs still run) and a `graph_only` dispatch fails
+in `buildbuddy.yml`'s gate instead of finishing green. The full nightly set is:
 `workspace-unit` (`make test-unit`), `workspace-int` (`make test-int`),
 `e2e-fast`, `dense-topology` (`mob-dense-topology.yml`),
 `machine-verify` (bounded TLC, including every non-skipped composition
@@ -458,8 +462,10 @@ existing `lint` (clippy `--all-targets`), `lint-feature-matrix`,
 and cargo-deny sweep.
 
 The release tag path requires successful exact-main CI (schema-4 attestation)
-and then runs the full BuildBuddy graph (`release_validate_buildbuddy_full`)
-as its validation gate; Cargo validation remains the manual-dispatch fallback.
+and then, while `MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true`, runs the full
+BuildBuddy graph (`release_validate_buildbuddy_full`) as its validation gate;
+while it is off (the default) the tag validates with `release_validate_cargo`
+instead. Cargo validation is also the manual-dispatch fallback.
 The owner-selected BuildBuddy release backend (remote.buildbuddy.io) covers
 Linux/macOS binaries. Windows release binaries are cross-compiled with
 cargo-xwin (clang-cl, lld-link, the Windows SDK) on a GitHub-hosted Ubuntu
@@ -480,9 +486,9 @@ release semver gate; PR and manual artifacts are previews.
 | Job | Trigger | What it does |
 |-----|---------|-------------|
 | `require_ci_green` | Always | Requires successful exact-main CI for the release commit; tag runs also verify its retained exact-tree attestation (schema 4, backend `github-hosted-cargo`; legacy schemas accepted) |
-| `release_validate_buildbuddy_full` | Tag runs | Runs the whole BuildBuddy/Bazel graph (`buildbuddy.yml`, `full-fresh`) on the release tree |
-| `release_validate_cargo` / `release_validate_buildbuddy` | Eligible manual dispatches only | Validate release state through the selected lane; tag runs reuse exact-tree CI and skip both jobs |
-| `release_validate_gate` | Tags and full/package dispatches | On tags require the full BuildBuddy graph plus exact-tree CI; on manual dispatches accept the selected validation lane; Web-only and asset-only recovery skip it |
+| `release_validate_buildbuddy_full` | Tag runs while `MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true` | Runs the whole BuildBuddy/Bazel graph (`buildbuddy.yml`, `full-fresh`) on the release tree |
+| `release_validate_cargo` / `release_validate_buildbuddy` | Eligible manual dispatches; `release_validate_cargo` also on tags while the self-hosted graph is off | Validate release state through the selected lane; with the graph on, tag runs reuse exact-tree CI and skip both jobs |
+| `release_validate_gate` | Tags and full/package dispatches | On tags require exact-tree CI plus the full BuildBuddy graph (graph on) or `release_validate_cargo` (graph off); on manual dispatches accept the selected validation lane; Web-only and asset-only recovery skip it |
 | `release_semver_gate` | Tags and full/package dispatches | After `require_ci_green`, verifies unexpired exact-tree, exact-version main-push readiness evidence on the normal tag/explicit-tag path; narrower manual measurement/recovery exceptions are described in the release guide |
 | `build_binaries` / `build_binaries_buildbuddy` / `build_binaries_windows_cross` / `verify_windows_binaries` / `build_binaries_gate` | Tags or manual asset recovery | The selected BuildBuddy or GitHub-hosted lane builds Linux/macOS (4 targets); `build_binaries_windows_cross` cross-compiles Windows from Linux with cargo-xwin and `verify_windows_binaries` runs the result on windows-latest; each target packages 4 binaries (`rkat`, `rkat-rpc`, `rkat-rest`, `rkat-mcp`); the gate requires the selected lanes plus both Windows jobs |
 | `build_web_sdk_package` | Tags or package/Web recovery without a reused artifact | Builds the `@rkat/web` package artifact |
@@ -539,6 +545,7 @@ Installed via `make install-hooks`. Two stages:
 - `scripts/pre-push-bridge-no-responsestatus.sh` (thin wrapper over `xtask bridge-classifier`)
 - `scripts/pre-push-bazel-locks.sh` (generated BUILD freshness, offline MODULE.bazel.lock recorded-input check, `bb mod deps --lockfile_mode=error` when the pinned CLI is present; `--require-bb` makes that last gate mandatory and the release preflight passes it)
 - `scripts/test-lock-consistency-gate.sh`, `scripts/test-bazel-module-lock-gate.sh`, `scripts/test-crate-enumeration-gate.sh`, `scripts/test-crate-license-files-gate.sh`, `scripts/test-release-doctor-workflow-contract.sh` (contract tests: each new release-infra gate must still fail on the defect it was written for; the last one also proves the release doctor's `release.yml` assertions survive rewording)
+- `scripts/test-gcp-buildbuddy-workflow-gate.sh` (plans nightly, release and `buildbuddy.yml` jobs with `MEERKAT_GCP_BUILDBUDDY_ENABLED` unset and `true`: unset starts nothing in GCP and tags validate with Cargo; `true` keeps the full-graph route)
 - `scripts/pre-push-unit.sh` (deterministic Cargo/nextest gate: when fresh execution is needed, runs workspace unit, integration-fast, HeadCanonical cold-restart, and `e2e-fast` lanes; serializes identical source evidence and retries a timed-out lane once. `MEERKAT_BUILDBUDDY` does not switch this hook's backend)
 - `scripts/pre-push-prune-lanes.sh` (runs from the dispatcher only after a PASSED gate: keeps at most `MEERKAT_PRE_PUSH_KEEP_LANES` (default 2) `pre-push-<hash>` hook worktrees and Cargo target lanes per repo, never touching the current lane, a lane whose dispatcher lock is live, a lane referenced by any live process, a lane with any file activity inside `MEERKAT_PRE_PUSH_LANE_IDLE_SECS` (default 21600), or any non-lane name; logs one `kept:`/`pruned:` line per lane with its reason; `MEERKAT_PRE_PUSH_KEEP_LANES=all` disables it)
 

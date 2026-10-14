@@ -278,6 +278,14 @@ repos:
         always_run: true
         stages: [pre-push]
 
+      - id: gcp-buildbuddy-workflow-gate-contract
+        name: self-hosted GCP graph stays default-off and tags validate with Cargo while it is off
+        entry: scripts/test-gcp-buildbuddy-workflow-gate.sh
+        language: script
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
       - id: release-packaging-isolation-contract
         name: parallel release packaging isolates outputs and preserves failures
         entry: scripts/test-release-packaging-isolation.sh
