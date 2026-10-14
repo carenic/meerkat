@@ -47,6 +47,44 @@ pub(crate) fn openai_tag(request: &LlmRequest) -> Option<&OpenAiProviderTag> {
     }
 }
 
+/// The request's OpenAI tag as a backend receives it. A backend that has
+/// admitted Meerkat's prompt-cache fields
+/// ([`meerkat_core::provider_matrix::OpenAiBackendKind::admits_prompt_cache_fields`])
+/// gets the tag as it is. Any other gets none of them, whether they came from
+/// the factory's model defaults or a host's explicit `provider_params`, a
+/// disabled cache included: the opt-out is itself a cache field (#1669).
+pub(crate) fn admitted_openai_tag(
+    request: &LlmRequest,
+    admits_prompt_cache_fields: bool,
+) -> Option<Cow<'_, OpenAiProviderTag>> {
+    let tag = openai_tag(request)?;
+    if admits_prompt_cache_fields || !carries_prompt_cache_fields(tag) {
+        return Some(Cow::Borrowed(tag));
+    }
+    tracing::debug!(
+        model = %request.model,
+        "prompt-cache fields dropped: this OpenAI backend has not admitted them"
+    );
+    let mut gated = tag.clone();
+    clear_prompt_cache_fields(&mut gated);
+    Some(Cow::Owned(gated))
+}
+
+fn carries_prompt_cache_fields(tag: &OpenAiProviderTag) -> bool {
+    tag.prompt_cache_enabled.is_some()
+        || tag.prompt_cache_key.is_some()
+        || tag.prompt_cache_retention.is_some()
+        || tag.prompt_cache_options.is_some()
+}
+
+/// Clear every prompt-cache field of `tag`; see [`admitted_openai_tag`].
+pub(crate) fn clear_prompt_cache_fields(tag: &mut OpenAiProviderTag) {
+    tag.prompt_cache_enabled = None;
+    tag.prompt_cache_key = None;
+    tag.prompt_cache_retention = None;
+    tag.prompt_cache_options = None;
+}
+
 /// Project only the final wire target and provider-hosted capabilities. Policy
 /// remains with the work owner; ordinary function tools are client-dispatched.
 pub(crate) fn prepare_wire_authorization(
@@ -138,6 +176,8 @@ enum OpenAiBackendWire {
     PublicOpenAi,
     ChatGptBackend,
     AzureOpenAi(AzureOpenAiWireConfig),
+    /// The GitHub Copilot `/responses` route.
+    Copilot,
 }
 
 impl OpenAiBackendWire {
@@ -149,6 +189,7 @@ impl OpenAiBackendWire {
                 meerkat_core::provider_matrix::OpenAiBackendKind::ChatGptBackend
             }
             Self::AzureOpenAi(_) => meerkat_core::provider_matrix::OpenAiBackendKind::AzureOpenAi,
+            Self::Copilot => meerkat_core::provider_matrix::OpenAiBackendKind::Copilot,
         }
     }
 
@@ -790,6 +831,13 @@ impl OpenAiClient {
         self
     }
 
+    /// For the GitHub Copilot `/responses` route: requests go to the Copilot
+    /// backend, which has admitted none of Meerkat's prompt-cache fields.
+    pub fn with_copilot_backend_wire(mut self) -> Self {
+        self.backend_wire = OpenAiBackendWire::Copilot;
+        self
+    }
+
     /// Attach a dynamic authorizer. When set, overrides the
     /// `Authorization: Bearer <api_key>` path on every request with
     /// `HttpAuthorizer::authorize`. Extra headers (ChatGPT-Account-ID
@@ -816,36 +864,19 @@ impl OpenAiClient {
         matches!(self.backend_wire, OpenAiBackendWire::ChatGptBackend)
     }
 
-    /// The request's OpenAI tag as this client's backend admits it. On a
-    /// backend that has not admitted prompt-cache fields they are cleared,
-    /// whether they came from the factory's model defaults or a host's
-    /// explicit `provider_params`, so breakpoint planning, validation, the
-    /// body and the authored breakpoint claims all see none of them.
+    /// The request's OpenAI tag as this client's backend admits it
+    /// ([`admitted_openai_tag`]), so breakpoint planning, validation, the
+    /// body and the authored breakpoint claims all see what the wire carries.
     fn wire_openai_tag<'a>(&self, request: &'a LlmRequest) -> Option<Cow<'a, OpenAiProviderTag>> {
-        let tag = openai_tag(request)?;
-        let carries_cache_fields = tag.prompt_cache_enabled.is_some()
-            || tag.prompt_cache_key.is_some()
-            || tag.prompt_cache_retention.is_some()
-            || tag.prompt_cache_options.is_some();
-        if !carries_cache_fields || self.backend_wire.admits_prompt_cache_fields() {
-            return Some(Cow::Borrowed(tag));
-        }
-        tracing::debug!(
-            model = %request.model,
-            "prompt-cache fields dropped: this OpenAI backend has not admitted them"
-        );
-        let mut gated = tag.clone();
-        gated.prompt_cache_enabled = None;
-        gated.prompt_cache_key = None;
-        gated.prompt_cache_retention = None;
-        gated.prompt_cache_options = None;
-        Some(Cow::Owned(gated))
+        admitted_openai_tag(request, self.backend_wire.admits_prompt_cache_fields())
     }
 
     fn azure_openai_wire_config(&self) -> Option<&AzureOpenAiWireConfig> {
         match &self.backend_wire {
             OpenAiBackendWire::AzureOpenAi(config) => Some(config),
-            OpenAiBackendWire::PublicOpenAi | OpenAiBackendWire::ChatGptBackend => None,
+            OpenAiBackendWire::PublicOpenAi
+            | OpenAiBackendWire::ChatGptBackend
+            | OpenAiBackendWire::Copilot => None,
         }
     }
 
