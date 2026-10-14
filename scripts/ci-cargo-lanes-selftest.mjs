@@ -5,8 +5,19 @@
 // BuildBuddy mode violated: a build-relevant change always yields lanes.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import {
+  CI_COMMAND_PINS,
+  checkHookCoverage,
+  featureClosure,
+  parseFilter,
+  profileFilter,
+  workspaceFeatures,
+} from "./ci-hook-coverage.mjs";
+import { readMetadata, workspacePackages } from "./rust-test-selector.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const classifier = resolve(here, "ci-cargo-lanes.mjs");
@@ -87,6 +98,61 @@ function assertLanes(plan, label) {
     `${label}: main unit shards and archived lanes cover every workspace package`,
   );
   assertArchivedLanes(plan, label);
+  assertHookParity(plan, label);
+}
+
+const HOOK_STACK = 32 * 1024 * 1024;
+const OTHER_E2E_LANES = ["e2e_auth_lane", "e2e_build_lane", "e2e_system_lane", "e2e_live_lane", "e2e_smoke_lane", "e2e_models_lane"];
+
+// The closure-tests rows: the pre-push hook's cargo-test coverage for the
+// test scope (the reverse-dependency closure plus the readers of changed
+// non-Rust inputs), each row naming exactly the binaries it runs.
+function assertHookParity(plan, label) {
+  assert.deepEqual(
+    plan.test_scope,
+    [...new Set([...plan.closure, ...plan.reader_packages])].sort(),
+    `${label}: the test scope is the closure plus the non-Rust readers`,
+  );
+  assert.deepEqual(plan.hook_coverage.missing, [], `${label}: every hook binary in scope has a row`);
+  assert.deepEqual(plan.hook_coverage.errors, [], `${label}: every row builds`);
+  const names = plan.closure_test_rows.map((row) => row.name);
+  assert.equal(new Set(names).size, names.length, `${label}: closure test row names are unique`);
+  const runs = [];
+  for (const row of plan.closure_test_rows) {
+    assert.ok(row.binaries.length > 0, `${label}: ${row.name} names its binaries`);
+    assert.ok(["ci-unit", "ci-integration"].includes(row.profile), `${label}: ${row.name} profile ${row.profile}`);
+    assert.ok(["warn", "fail"].includes(row.no_tests), `${label}: ${row.name} no-tests policy`);
+    assert.equal(row.rust_min_stack, HOOK_STACK, `${label}: ${row.name} runs on the hook's stack`);
+    for (const feature of row.package_flags.match(/--features (\S+)/)?.[1]?.split(",") ?? []) {
+      assert.match(feature, /^[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/, `${label}: ${row.name} names each feature's package`);
+    }
+    if (row.lane === "lib") {
+      assert.equal(row.test_flags, "--lib", `${label}: ${row.name} runs lib tests`);
+      assert.deepEqual(row.binaries, row.packages, `${label}: ${row.name} lists one lib binary per package`);
+    } else {
+      // Every named target is one of the row's binaries, and the reverse.
+      const named = [...row.test_flags.matchAll(/--test (\S+)/g)].map((match) => match[1]).sort();
+      assert.deepEqual(named, row.binaries.map((binary) => binary.split("::")[1]).sort(), `${label}: ${row.name} names exactly its binaries`);
+      for (const binary of row.binaries) {
+        assert.ok(row.packages.includes(binary.split("::")[0]), `${label}: ${row.name} selects the package of ${binary}`);
+      }
+    }
+    if (row.lane !== "headcanonical") runs.push(...row.binaries);
+  }
+  assert.equal(new Set(runs).size, runs.length, `${label}: each hook binary runs in one row (HeadCanonical's own build aside)`);
+  for (const lane of OTHER_E2E_LANES) {
+    assert.ok(!runs.includes(`meerkat-integration-tests::${lane}`), `${label}: ${lane} is outside the hook's fast selection`);
+  }
+  assert.equal(
+    plan.closure_test_rows.some((row) => row.lane === "headcanonical"),
+    plan.test_scope.includes("meerkat-mob"),
+    `${label}: HeadCanonical runs exactly when meerkat-mob is in scope`,
+  );
+  assert.equal(
+    plan.closure_test_rows.some((row) => row.lane === "e2e-fast"),
+    plan.test_scope.includes("meerkat-integration-tests"),
+    `${label}: e2e-fast runs exactly when meerkat-integration-tests is in scope`,
+  );
 }
 
 // Every archive build is executed by exactly its partitions, 1..n of n, and
@@ -317,6 +383,9 @@ for (const path of [
   "scripts/repo-cargo",
   "scripts/cargo-agent-gate",
   "scripts/ci-cargo-lanes.mjs",
+  "scripts/ci-hook-coverage.mjs",
+  "scripts/ci-verify-row-binaries.mjs",
+  "scripts/ci-non-rust-readers.mjs",
   ".github/workflows/ci.yml",
   ".github/actions/setup-rust-ci/action.yml",
 ]) {
@@ -929,11 +998,201 @@ for (const path of [
 
 // A change to the lane definitions runs the lanes they define.
 {
-  for (const path of [".github/workflows/ci.yml", "scripts/ci-cargo-lanes.mjs", "scripts/ci-cargo-lanes-selftest.mjs"]) {
+  for (const path of [
+    ".github/workflows/ci.yml",
+    "scripts/ci-cargo-lanes.mjs",
+    "scripts/ci-cargo-lanes-selftest.mjs",
+    "scripts/ci-hook-coverage.mjs",
+    "scripts/ci-verify-row-binaries.mjs",
+    "scripts/ci-non-rust-readers.mjs",
+  ]) {
     const plan = planFor([path]);
     assert.equal(plan.bazel_graph, true, `${path} selects the Bazel graph check`);
     assert.equal(plan.examples_browser, true, `${path} selects the example suites`);
     assert.equal(plan.example_web, true, `${path} selects the example web suites`);
+  }
+}
+
+// Hook parity: workspace-unified features. meerkat-mcp's form_elicitation
+// and lifecycle_contract require test-support, which only the workspace's
+// feature unification enables (a package-scoped build has none), so their
+// row must carry it; the mob chain's lib tests run in the pull request.
+{
+  const plan = planFor(["crates/meerkat-mcp/src/lib.rs"]);
+  assertLanes(plan, "mcp touch");
+  const row = plan.closure_test_rows.find((candidate) => candidate.binaries.includes("meerkat-mcp::form_elicitation"));
+  assert.ok(row, "a row runs meerkat-mcp's form_elicitation");
+  assert.ok(row.binaries.includes("meerkat-mcp::lifecycle_contract"), "and lifecycle_contract");
+  assert.match(row.package_flags, /meerkat-mcp\/test-support/, "with the workspace's test-support");
+  assert.ok(
+    plan.closure_test_rows.some((candidate) => candidate.lane === "lib" && candidate.packages.includes("meerkat-mob")),
+    "meerkat-mob's lib tests run in the pull request, not only on main",
+  );
+}
+
+// The hook's named lanes keep the hook's own flags.
+{
+  const plan = planFor(["crates/meerkat-mob/src/lib.rs"]);
+  assertLanes(plan, "mob touch");
+  const pick = (lane) => {
+    const row = plan.closure_test_rows.find((candidate) => candidate.lane === lane);
+    assert.ok(row, `the mob plan has a ${lane} row`);
+    return { packages: row.package_flags, tests: row.test_flags, profile: row.profile, filter: row.filter, no_tests: row.no_tests };
+  };
+  assert.deepEqual(pick("headcanonical"), {
+    packages: "-p meerkat-mob --features meerkat-mob/test-support",
+    tests: "--test cold_restart_mob_resume",
+    profile: "ci-integration",
+    filter: "binary(cold_restart_mob_resume)",
+    no_tests: "fail",
+  });
+  assert.deepEqual(pick("e2e-fast"), {
+    packages: "-p meerkat-integration-tests",
+    tests: "--test e2e_fast_lane",
+    profile: "ci-unit",
+    filter: "binary(e2e_fast_lane)",
+    no_tests: "fail",
+  });
+}
+
+// Readers of non-Rust inputs: a docs-only change has no Cargo lanes but runs
+// the tests that read docs/ (and the whole-checkout audits), with the
+// workspace feature set, as the hook did on every push.
+{
+  const plan = planFor(["docs/index.mdx"]);
+  assert.equal(plan.rust_changed, false);
+  assert.deepEqual(plan.closure, []);
+  for (const name of ["rkat", "meerkat-machine-schema", "xtask"]) {
+    assert.ok(plan.reader_packages.includes(name), `docs/index.mdx selects its reader ${name}`);
+  }
+  assertHookParity(plan, "docs reader");
+  assert.ok(plan.closure_test_rows.length > 0, "a docs change runs its readers' rows");
+  const github = run(["--format", "github", "--", "docs/index.mdx"]);
+  assert.equal(github.status, 0, github.stderr);
+  const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+  assert.equal(lines.closure_test_count, String(plan.closure_test_rows.length));
+  assert.equal(JSON.parse(lines.closure_test_matrix).include.length, plan.closure_test_rows.length);
+}
+
+// The coverage checker on mutated plans: each mutation is a way a row change
+// could narrow what CI runs, and each must be reported.
+{
+  const plan = planFor(["crates/meerkat-mcp/src/lib.rs"]);
+  const baseline = checkHookCoverage(plan);
+  assert.deepEqual([baseline.missing, baseline.errors], [[], []], "the planned rows cover the hook");
+  const mutate = (change) => {
+    const copy = JSON.parse(JSON.stringify(plan));
+    change(copy);
+    return checkHookCoverage(copy);
+  };
+  const mcpRow = (copy) => copy.closure_test_rows.find((row) => row.binaries.includes("meerkat-mcp::form_elicitation"));
+  // A dropped row leaves its binaries uncovered.
+  const dropped = mutate((copy) => {
+    copy.closure_test_rows = copy.closure_test_rows.filter((row) => row !== mcpRow(copy));
+  });
+  assert.ok(dropped.missing.includes("meerkat-mcp::test::form_elicitation"), "a dropped row is a gap");
+  // The package-scoped feature set is not the hook's: Cargo refuses the
+  // required-features targets, and the rest of the row no longer counts.
+  const scoped = mutate((copy) => {
+    const row = mcpRow(copy);
+    row.package_flags = row.package_flags.replace(/ --features \S+/, "");
+  });
+  assert.ok(scoped.errors.some((error) => error.includes("form_elicitation requires test-support")), "Cargo would refuse the row");
+  assert.ok(scoped.missing.includes("meerkat-mcp::test::account_selection"), "the scoped set does not cover the hook");
+  // A lib row without the workspace set is a gap for that lib.
+  const libScoped = mutate((copy) => {
+    const row = copy.closure_test_rows.find((candidate) => candidate.lane === "lib" && candidate.packages.includes("meerkat-mob"));
+    row.package_flags = row.package_flags.replace(/ --features \S+/, "");
+  });
+  assert.ok(libScoped.missing.includes("meerkat-mob::lib::meerkat_mob"), "meerkat-mob's lib under its scoped set is a gap");
+  // HeadCanonical under the workspace set is not the hook's HeadCanonical.
+  const headCanonical = mutate((copy) => {
+    const row = copy.closure_test_rows.find((candidate) => candidate.lane === "headcanonical");
+    row.package_flags = "-p meerkat-mob --features meerkat-mob/test-support,meerkat-mob/schema";
+  });
+  assert.ok(headCanonical.missing.includes("HeadCanonical::meerkat-mob::cold_restart_mob_resume"), "HeadCanonical keeps the hook's flags");
+  // A profile whose default-filter drops a binary does not run it.
+  const filtered = mutate((copy) => {
+    copy.closure_test_rows.find((candidate) => candidate.lane === "e2e-fast").profile = "ci-integration";
+  });
+  assert.ok(filtered.missing.includes("meerkat-integration-tests::test::e2e_fast_lane"), "ci-integration drops e2e_fast_lane");
+  // A narrower scope than the closure is caught by the selftest's own
+  // test-scope assertion (the checker trusts plan.test_scope).
+  assert.throws(() => assertHookParity({ ...plan, test_scope: plan.packages }, "narrowed scope"));
+  // The workflow commands the checker reads the rows with are pinned.
+  const unpinned = checkHookCoverage(plan, { workflowText: "" });
+  assert.equal(unpinned.errors.length, CI_COMMAND_PINS.length, "every workflow command pin is checked");
+}
+
+// The filter subset and the profiles: ci-integration selects exactly fast's
+// binaries; ci-pr and ci-unit select every binary (nextest's `inherits`
+// does not carry a default-filter); a test() predicate cannot be decided per
+// binary and is refused rather than guessed.
+{
+  const nextest = readFileSync(resolve(root, ".config/nextest.toml"), "utf8");
+  assert.equal(profileFilter(nextest, "ci-integration"), profileFilter(nextest, "fast"));
+  assert.equal(profileFilter(nextest, "ci-pr"), "all()");
+  assert.equal(profileFilter(nextest, "ci-unit"), "all()");
+  const fast = parseFilter(profileFilter(nextest, "fast"));
+  assert.equal(fast({ kind: "test", binary: "e2e_fast_lane", package: "meerkat-integration-tests" }), false);
+  assert.equal(fast({ kind: "test", binary: "phase1_wiring", package: "meerkat-integration-tests" }), true);
+  const both = parseFilter("kind(test) & (binary(=a) | package(b))");
+  assert.equal(both({ kind: "test", binary: "a", package: "x" }), true);
+  assert.equal(both({ kind: "lib", binary: "a", package: "x" }), false);
+  assert.equal(both({ kind: "test", binary: "c", package: "b" }), true);
+  assert.throws(() => parseFilter("test(=foo)"), /cannot be decided per binary/);
+  assert.throws(() => parseFilter("binary(~e2e)"), /unsupported name matcher/);
+  assert.throws(() => profileFilter(nextest, "no-such-profile"));
+}
+
+// The planner skips a hook-parity lib row when an existing unit row already
+// builds the package with the workspace set: when the package's default
+// features imply that whole set (featureClosure). That inference must never
+// claim a feature Cargo does not enable in a package-scoped build.
+{
+  const metadata = readMetadata();
+  const packages = workspacePackages(metadata);
+  const unified = workspaceFeatures(metadata, packages);
+  for (const pkg of packages) {
+    const defaults = Object.hasOwn(pkg.features ?? {}, "default") ? ["default"] : [];
+    const inferred = featureClosure(pkg, new Set(defaults));
+    const tree = spawnSync(
+      join(root, "scripts/repo-cargo"),
+      ["tree", "-p", pkg.name, "--depth", "0", "-e", "normal,build,dev", "--prefix", "none", "-f", "{p}|{f}"],
+      { cwd: root, encoding: "utf8" },
+    );
+    assert.equal(tree.status, 0, `cargo tree -p ${pkg.name}: ${tree.stderr}`);
+    const first = tree.stdout.split("\n")[0];
+    const actual = new Set(first.slice(first.indexOf("|") + 1).split(",").filter(Boolean));
+    for (const feature of inferred) {
+      assert.ok(actual.has(feature), `${pkg.name}: inferred default feature ${feature} is enabled by Cargo`);
+      assert.ok(unified.get(pkg.name).has(feature), `${pkg.name}: ${feature} is in the workspace set`);
+    }
+  }
+}
+
+// The job's runtime check: nextest must list exactly the planned binaries,
+// and no test of theirs may be filtered out by a profile.
+{
+  const verifier = resolve(here, "ci-verify-row-binaries.mjs");
+  const scratch = mkdtempSync(join(tmpdir(), "ci-verify-row-binaries-"));
+  const verify = (suites, expected) => {
+    const listPath = join(scratch, "list.json");
+    writeFileSync(listPath, JSON.stringify({ "rust-suites": suites }));
+    return spawnSync("node", [verifier, listPath, ...expected], { encoding: "utf8" });
+  };
+  const suite = (testcases, status = "listed") => ({ status, testcases });
+  const match = { "filter-match": { status: "matches" } };
+  const ignored = { "filter-match": { status: "mismatch", reason: "ignored" } };
+  const defaultFiltered = { "filter-match": { status: "mismatch", reason: "default-filter" } };
+  try {
+    assert.equal(verify({ "p::a": suite({ t1: match, t2: ignored }), p: suite({ t3: match }) }, ["p::a", "p"]).status, 0);
+    assert.equal(verify({ "p::a": suite({ t1: match }) }, ["p::a", "p::b"]).status, 1, "a missing binary fails");
+    assert.equal(verify({ "p::a": suite({ t1: match }), "q::a": suite({ t1: match }) }, ["p::a"]).status, 1, "an extra binary fails");
+    assert.equal(verify({ "p::a": suite({ t1: defaultFiltered }) }, ["p::a"]).status, 1, "a profile-filtered test fails");
+    assert.equal(verify({ "p::a": suite({}, "skipped") }, ["p::a"]).status, 1, "a skipped binary fails");
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
   }
 }
 

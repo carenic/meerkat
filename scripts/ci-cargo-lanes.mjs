@@ -18,8 +18,8 @@
 //
 // usage:
 //   ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N]
-//                      [--workspace-shards N] [--format json|github]
-//                      [--] [changed-path ...]
+//                      [--workspace-shards N] [--closure-test-rows N]
+//                      [--format json|github] [--] [changed-path ...]
 //   ci-cargo-lanes.mjs --paths-from-stdin [...]
 //
 // Without explicit paths, --base/--head, or stdin, the plan is the whole
@@ -57,10 +57,49 @@
 // PR_UNIT_CHAIN_EXCEPTIONS selects when one of its trigger packages changed.
 // Clippy of a changed crate always runs in the pull request (worst measured
 // lane 12:24 for mob).
+//
+// Hook-parity rows. The pre-push hook's cargo-test body
+// (scripts/pre-push-unit.sh) ran the whole workspace's lib and tests/*.rs
+// binaries, HeadCanonical and e2e-fast before every push. CI runs that
+// coverage as required rows (closure_test_rows, the closure-tests job) for
+// the test scope: the reverse-dependency closure of the changed packages,
+// every member when a global input changed. A scoped package runs with the
+// features the hook's whole-workspace build gives it (cargo metadata's
+// resolve graph), not its smaller package-scoped set, so a test behind a
+// feature that only workspace unification enables still runs; on 8e1f4f21
+// that is 18 of 53 members (meerkat-mcp's test-support targets among them).
+// The rows are
+//   lib        `--lib` per package, the heavy chain included (no main-only
+//              deferral for this coverage); a package whose existing unit
+//              row already builds it with that feature set is not repeated
+//   tests      every tests/*.rs target the hook built, by name, with the
+//              hook's fast selection (ci-integration), split by
+//              CLOSURE_TESTS_PER_ROW and packed so no row selects two
+//              packages that share a target name
+//   HeadCanonical and e2e-fast, the hook's own commands
+// Each row lists the binaries it must run; the job checks nextest's list
+// against them before it runs. scripts/ci-hook-coverage.mjs re-derives the
+// hook's selection independently, and the plan fails when any hook binary in
+// scope has no row.
+// The test scope also holds the readers of changed non-Rust inputs
+// (scripts/ci-non-rust-readers.json, kept complete by its guard): a test
+// that reads docs/, specs/, sdks/, a fixture outside its crate or the whole
+// checkout ran in the hook on every push, so a change to what it reads
+// selects its package's rows, Rust change or not. Readers join the scope
+// themselves; their dependents do not read the file.
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
+import {
+  HOOK_LANES,
+  checkHookCoverage,
+  featureClosure,
+  parseFilter,
+  profileFilter,
+  workspaceFeatures,
+} from "./ci-hook-coverage.mjs";
+import { loadNonRustReaders, readerPackagesFor } from "./ci-non-rust-readers.mjs";
 import {
   normalizePath,
   packageDir,
@@ -78,6 +117,17 @@ const COST_UNITS_PER_MINUTE = 35000;
 const LANE_SETUP_MINUTES = 1;
 export const PR_UNIT_BUDGET_MINUTES = 17;
 const HEAVY_ANCHOR = "meerkat-mob";
+
+// Hook-parity rows (see the header). Every row runs on the hook's test-thread
+// stack: scripts/pre-push-unit.sh exports 32 MiB for all of its lanes.
+export const HOOK_TEST_STACK = 32 * 1024 * 1024;
+export const CLOSURE_TESTS_PER_ROW = 12;
+const CLOSURE_TEST_PROFILE = "ci-integration";
+const CLOSURE_LIB_PROFILE = "ci-unit";
+// Compile and link of one tests/*.rs binary, in cost units. Uncalibrated:
+// the first hosted closure runs measure it.
+const TEST_TARGET_COST = 15000;
+const LIB_TARGET_KINDS = new Set(["lib", "rlib", "dylib", "cdylib", "staticlib"]);
 
 // Feature-gated unit suites. Every unit lane builds its packages with their
 // default features, so a lib or bin test behind a non-default feature ran in
@@ -448,6 +498,7 @@ function parseArgs(argv) {
     head: "HEAD",
     maxShards: 6,
     workspaceShards: 8,
+    closureTestRows: 12,
     format: "json",
     pathsFromStdin: false,
     paths: [],
@@ -470,6 +521,11 @@ function parseArgs(argv) {
       if (!Number.isInteger(args.workspaceShards) || args.workspaceShards < 1) {
         throw new Error("--workspace-shards requires a positive integer");
       }
+    } else if (arg === "--closure-test-rows") {
+      args.closureTestRows = Number.parseInt(argv[++i] ?? "", 10);
+      if (!Number.isInteger(args.closureTestRows) || args.closureTestRows < 1) {
+        throw new Error("--closure-test-rows requires a positive integer");
+      }
     } else if (arg === "--format") {
       args.format = argv[++i] ?? "";
       if (!["json", "github"].includes(args.format)) {
@@ -486,7 +542,7 @@ function parseArgs(argv) {
       break;
     } else if (arg === "--help" || arg === "-h") {
       process.stdout.write(
-        "usage: ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N] [--workspace-shards N] [--format json|github] [--paths-from-stdin] [--changed-paths-only] [--] [changed-path ...]\n",
+        "usage: ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N] [--workspace-shards N] [--closure-test-rows N] [--format json|github] [--paths-from-stdin] [--changed-paths-only] [--] [changed-path ...]\n",
       );
       process.exit(0);
     } else if (arg.startsWith("-")) {
@@ -573,7 +629,10 @@ function isLaneDefinitionPath(path) {
   return (
     path === ".github/workflows/ci.yml" ||
     path === "scripts/ci-cargo-lanes.mjs" ||
-    path === "scripts/ci-cargo-lanes-selftest.mjs"
+    path === "scripts/ci-cargo-lanes-selftest.mjs" ||
+    path === "scripts/ci-hook-coverage.mjs" ||
+    path === "scripts/ci-verify-row-binaries.mjs" ||
+    path === "scripts/ci-non-rust-readers.mjs"
   );
 }
 
@@ -644,6 +703,9 @@ function isGlobalPath(path) {
     path === "scripts/rust-lane-doctor" ||
     path === "scripts/ci-cargo-lanes.mjs" ||
     path === "scripts/ci-cargo-lanes-selftest.mjs" ||
+    path === "scripts/ci-hook-coverage.mjs" ||
+    path === "scripts/ci-verify-row-binaries.mjs" ||
+    path === "scripts/ci-non-rust-readers.mjs" ||
     path === "scripts/rust-test-selector.mjs" ||
     path === "scripts/ci-pin-rust-toolchain-env" ||
     path === ".github/workflows/ci.yml"
@@ -747,6 +809,174 @@ function packShards(pkgs, weights, maxShards, model = null) {
       return shard;
     })
     .sort((a, b) => b.estimated_cost - a.estimated_cost || a.name.localeCompare(b.name));
+}
+
+// `--features` for a row's packages: each one's whole-workspace set, by name.
+function workspaceFeatureFlags(names, unified) {
+  const features = names.flatMap((name) =>
+    [...unified.get(name)]
+      .filter((feature) => feature !== "default")
+      .sort()
+      .map((feature) => `${name}/${feature}`),
+  );
+  return features.length > 0 ? ` --features ${features.join(",")}` : "";
+}
+
+function sameFeatures(a, b) {
+  return a.size === b.size && [...a].every((feature) => b.has(feature));
+}
+
+// The hook-parity rows for the test scope (see the header).
+function hookParityRows({ scope, byName, unified, weights, model, unitPackages, maxShards, maxTestRows, nextestText }) {
+  const rows = [];
+
+  // Lib tests. A package that an existing pull-request unit row already
+  // compiles with exactly the workspace set (its default features imply the
+  // whole set) runs this binary there.
+  const libPackages = scope.filter((name) => {
+    const pkg = byName.get(name);
+    if (!pkg.targets.some((target) => target.test !== false && target.kind.some((kind) => LIB_TARGET_KINDS.has(kind)))) {
+      return false;
+    }
+    if (!unitPackages.includes(name)) return true;
+    const defaults = Object.hasOwn(pkg.features ?? {}, "default") ? ["default"] : [];
+    return !sameFeatures(featureClosure(pkg, new Set(defaults)), unified.get(name));
+  });
+  for (const shard of packWithinBudget(libPackages, weights, maxShards, model)) {
+    rows.push({
+      name: `lib ${shard.name}`,
+      lane: "lib",
+      packages: shard.packages,
+      package_flags: `${shard.package_flags}${workspaceFeatureFlags(shard.packages, unified)}`,
+      test_flags: "--lib",
+      profile: CLOSURE_LIB_PROFILE,
+      binaries: [...shard.packages],
+      no_tests: "warn",
+      rust_min_stack: HOOK_TEST_STACK,
+      estimated_minutes: shard.estimated_minutes,
+    });
+  }
+
+  // Integration tests: every tests/*.rs target the hook's workspace build
+  // compiles (its required-features within the workspace set) that the fast
+  // selection keeps, named one by one, so Cargo builds no other target and
+  // refuses a renamed one. Large packages are split into parts.
+  const keep = parseFilter(profileFilter(nextestText, CLOSURE_TEST_PROFILE));
+  const testTargets = (name) =>
+    byName.get(name).targets.filter((target) => target.kind.length === 1 && target.kind[0] === "test");
+  const units = [];
+  for (const name of scope) {
+    const enabled = unified.get(name);
+    const tests = testTargets(name)
+      .filter((target) => target.test !== false)
+      .filter((target) => (target["required-features"] ?? []).every((feature) => enabled.has(feature)))
+      .filter((target) => keep({ kind: "test", binary: target.name, package: name }))
+      .map((target) => target.name)
+      .sort();
+    const parts = Math.ceil(tests.length / CLOSURE_TESTS_PER_ROW);
+    for (let index = 0; index < parts; index += 1) {
+      const slice = tests.slice(
+        Math.floor((index * tests.length) / parts),
+        Math.floor(((index + 1) * tests.length) / parts),
+      );
+      units.push({
+        package: name,
+        part: parts > 1 ? ` ${index + 1}/${parts}` : "",
+        tests: slice,
+        weight: model.lines.get(name) + LINK_COST_PER_DEP * model.closures.get(name).size + TEST_TARGET_COST * slice.length,
+      });
+    }
+  }
+  // Two packages that share a test target name never share a row: `--test
+  // NAME` would select both, and Cargo refuses a selected target whose
+  // required-features the row lacks. Two parts of one package do not share
+  // one either, or the split would not parallelize.
+  const names = new Map(scope.map((name) => [name, new Set(testTargets(name).map((target) => target.name))]));
+  const conflicts = (a, b) => a === b || [...names.get(a)].some((test) => names.get(b).has(test));
+  units.sort((a, b) => b.weight - a.weight || a.package.localeCompare(b.package) || a.part.localeCompare(b.part));
+  const bins = [];
+  for (const unit of units) {
+    const open = bins.filter((bin) => !bin.units.some((other) => conflicts(other.package, unit.package)));
+    let bin;
+    if (bins.length < maxTestRows || open.length === 0) {
+      bin = { units: [], weight: 0 };
+      bins.push(bin);
+    } else {
+      bin = open.sort((a, b) => a.weight - b.weight || a.units.length - b.units.length)[0];
+    }
+    bin.units.push(unit);
+    bin.weight += unit.weight;
+  }
+  for (const bin of bins) {
+    const packages = [...new Set(bin.units.map((unit) => unit.package))].sort();
+    const tests = bin.units
+      .flatMap((unit) => unit.tests.map((test) => ({ name: unit.package, test })))
+      .sort((a, b) => a.name.localeCompare(b.name) || a.test.localeCompare(b.test));
+    const union = new Set();
+    let lines = 0;
+    for (const name of packages) {
+      lines += model.lines.get(name);
+      for (const dep of model.closures.get(name)) union.add(dep);
+    }
+    // Label by the heaviest part, which the packing placed first.
+    const [heaviest] = bin.units;
+    rows.push({
+      name: `tests ${shortName(heaviest.package)}${heaviest.part}${bin.units.length > 1 ? `+${bin.units.length - 1}` : ""}`,
+      lane: "tests",
+      packages,
+      package_flags: `${packages.map((name) => `-p ${name}`).join(" ")}${workspaceFeatureFlags(packages, unified)}`,
+      test_flags: tests.map(({ test }) => `--test ${test}`).join(" "),
+      profile: CLOSURE_TEST_PROFILE,
+      binaries: tests.map(({ name, test }) => `${name}::${test}`),
+      no_tests: "warn",
+      rust_min_stack: HOOK_TEST_STACK,
+      estimated_minutes: estimatedMinutes(lines + LINK_COST_PER_DEP * union.size + TEST_TARGET_COST * tests.length),
+    });
+  }
+
+  // The hook's two named lanes, with its own flags.
+  const hasTest = (name, test) => testTargets(name).some((target) => target.name === test);
+  const headCanonical = HOOK_LANES.headCanonical;
+  if (scope.includes(headCanonical.package)) {
+    if (!hasTest(headCanonical.package, headCanonical.test)) {
+      throw new Error(`HeadCanonical target ${headCanonical.test} is missing from ${headCanonical.package}`);
+    }
+    rows.push({
+      name: "HeadCanonical",
+      lane: "headcanonical",
+      packages: [headCanonical.package],
+      package_flags: `-p ${headCanonical.package} --features ${headCanonical.features.map((feature) => `${headCanonical.package}/${feature}`).join(",")}`,
+      test_flags: `--test ${headCanonical.test}`,
+      profile: CLOSURE_TEST_PROFILE,
+      filter: `binary(${headCanonical.test})`,
+      binaries: [`${headCanonical.package}::${headCanonical.test}`],
+      no_tests: "fail",
+      rust_min_stack: HOOK_TEST_STACK,
+    });
+  }
+  const e2eFast = HOOK_LANES.e2eFast;
+  if (scope.includes(e2eFast.package)) {
+    if (!hasTest(e2eFast.package, e2eFast.binary)) {
+      throw new Error(`e2e-fast target ${e2eFast.binary} is missing from ${e2eFast.package}`);
+    }
+    rows.push({
+      name: "e2e-fast",
+      lane: "e2e-fast",
+      packages: [e2eFast.package],
+      package_flags: `-p ${e2eFast.package}${workspaceFeatureFlags([e2eFast.package], unified)}`,
+      test_flags: `--test ${e2eFast.binary}`,
+      profile: CLOSURE_LIB_PROFILE,
+      filter: `binary(${e2eFast.binary})`,
+      binaries: [`${e2eFast.package}::${e2eFast.binary}`],
+      no_tests: "fail",
+      rust_min_stack: HOOK_TEST_STACK,
+    });
+  }
+  const rowNames = rows.map((row) => row.name);
+  if (new Set(rowNames).size !== rowNames.length) {
+    throw new Error(`internal error: duplicate closure test row names: ${rowNames.join(", ")}`);
+  }
+  return rows;
 }
 
 function plan(args) {
@@ -1098,6 +1328,41 @@ function plan(args) {
 
   result.closure_flags = result.closure.map((name) => `-p ${name}`).join(" ");
   result.closure_beyond_packages = result.closure.filter((name) => !result.packages.includes(name));
+
+  // Hook-parity rows for the test scope. scripts/ci-hook-coverage.mjs checks
+  // them against the hook's own selection; a gap fails the plan.
+  const nextestText = readFileSync(resolve(root, ".config/nextest.toml"), "utf8");
+  result.reader_packages = changed === null ? [] : readerPackagesFor(changed, loadNonRustReaders());
+  for (const name of result.reader_packages) {
+    if (!byName.has(name)) throw new Error(`the non-Rust reader inventory names unknown package ${name}`);
+  }
+  result.test_scope = [...new Set([...result.closure, ...result.reader_packages])].sort();
+  result.closure_test_rows = result.test_scope.length > 0
+    ? hookParityRows({
+      scope: result.test_scope,
+      byName,
+      unified: workspaceFeatures(metadata, packages),
+      weights,
+      model,
+      unitPackages: result.unit_packages,
+      maxShards: result.mode === "workspace" ? args.workspaceShards : args.maxShards,
+      maxTestRows: args.closureTestRows,
+      nextestText,
+    })
+    : [];
+  const coverage = checkHookCoverage(result, { metadata, nextestText });
+  result.hook_coverage = {
+    scope_packages: coverage.scope_packages,
+    hook_binaries: coverage.hook_binaries,
+    by_lane: coverage.by_lane,
+    missing: coverage.missing,
+    errors: coverage.errors,
+  };
+  if (coverage.missing.length > 0 || coverage.errors.length > 0) {
+    throw new Error(
+      `the plan does not cover the pre-push hook's tests for its scope: missing ${coverage.missing.join(", ") || "none"}; errors ${coverage.errors.join("; ") || "none"}`,
+    );
+  }
   return result;
 }
 
@@ -1183,6 +1448,24 @@ function matrixOf(shards, { placeholder = true } = {}) {
   return JSON.stringify({ include });
 }
 
+// The closure-tests job's rows: package and target flags, the nextest
+// profile, an optional filter, the binaries the row must list before it runs,
+// its no-tests policy and its test-thread stack.
+function closureMatrixOf(rows) {
+  const include = rows.map((row) => ({
+    name: row.name,
+    packages: row.package_flags,
+    tests: row.test_flags,
+    profile: row.profile,
+    filter: row.filter ?? "",
+    binaries: row.binaries.join(" "),
+    no_tests: row.no_tests,
+    rust_min_stack: String(row.rust_min_stack),
+  }));
+  if (include.length === 0) include.push({ name: "none", packages: "" });
+  return JSON.stringify({ include });
+}
+
 function githubOutput(result) {
   const lines = [];
   const scalar = (key, value) => lines.push(`${key}=${value}`);
@@ -1221,6 +1504,10 @@ function githubOutput(result) {
   scalar("main_archive_run_matrix", archiveMatrixOf(result.main_archive_runs));
   scalar("integration_count", String(result.integration_suites.length));
   scalar("integration_matrix", matrixOf(result.integration_suites));
+  scalar("test_scope_count", String(result.test_scope.length));
+  scalar("hook_binary_count", String(result.hook_coverage.hook_binaries));
+  scalar("closure_test_count", String(result.closure_test_rows.length));
+  scalar("closure_test_matrix", closureMatrixOf(result.closure_test_rows));
   scalar("feature_check_count", String(result.feature_check_jobs.length));
   scalar(
     "feature_check_matrix",
@@ -1249,7 +1536,7 @@ function main() {
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   }
   process.stderr.write(
-    `ci-cargo-lanes: mode=${result.mode} packages=${result.packages.length} closure=${result.closure.length} clippy_shards=${result.shards.length} unit_shards=${result.unit_shards.length} feature_suites=${result.unit_feature_shards.length}/${result.main_feature_unit_shards.length} unit_deferred=${result.unit_deferred.length} unit_chain_exceptions=${result.unit_chain_exceptions.length} integration=${result.integration_suites.length} feature_check_jobs=${result.feature_check_jobs.length} (${result.reason})\n`,
+    `ci-cargo-lanes: mode=${result.mode} packages=${result.packages.length} closure=${result.closure.length} clippy_shards=${result.shards.length} unit_shards=${result.unit_shards.length} feature_suites=${result.unit_feature_shards.length}/${result.main_feature_unit_shards.length} unit_deferred=${result.unit_deferred.length} unit_chain_exceptions=${result.unit_chain_exceptions.length} integration=${result.integration_suites.length} feature_check_jobs=${result.feature_check_jobs.length} test_scope=${result.test_scope.length} closure_tests=${result.closure_test_rows.length} hook_binaries=${result.hook_coverage.hook_binaries} (${result.reason})\n`,
   );
 }
 

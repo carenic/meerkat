@@ -335,9 +335,12 @@ git -C "$TEST_ROOT" checkout -q --detach "$range_head"
 # (run in the fixture repository) must name every path a change touches, both
 # sides of a rename and type-only changes included, and the real workspace
 # plan for those paths must give the touched crates Clippy lanes. The hook no
-# longer runs Clippy, so a path the planner drops is unlinted code. The
-# planner resolves the repository from its working directory, so it runs from
-# this checkout against the fixture's commits.
+# longer runs Clippy, so a path the planner drops is unlinted code. The plan
+# must also hold the touched crates in its test scope and cover the hook's
+# cargo-test binaries for that scope: the independent checker
+# (scripts/ci-hook-coverage.mjs) re-reads the emitted plan and must report no
+# gap. The planner resolves the repository from its working directory, so it
+# runs from this checkout against the fixture's commits.
 ci_plan_failures=0
 assert_ci_plan() {
   local label="$1" from="$2" to="$3" expected_paths="$4" expected_packages="$5"
@@ -357,14 +360,27 @@ paths = json.loads(collected)["changed_paths"]
 missing = [path for path in expected_paths.split(",") if path not in paths]
 if missing:
     sys.exit(f"collection {paths} misses {missing}")
-plan = json.loads(subprocess.run(
+planned = subprocess.run(
     ["node", "scripts/ci-cargo-lanes.mjs", "--format", "json", "--", *paths],
     cwd=repo_root, check=True, capture_output=True, text=True,
-).stdout)
+).stdout
+plan = json.loads(planned)
 linted = {name for shard in plan["shards"] for name in shard["packages"]}
 unlinted = [name for name in expected_packages.split(",") if name not in linted and plan["mode"] != "workspace"]
 if not plan["rust_changed"] or unlinted:
     sys.exit(f"plan for {paths}: rust_changed={plan['rust_changed']}, Clippy lanes {sorted(linted)} miss {unlinted}")
+untested = [name for name in expected_packages.split(",") if name not in plan.get("test_scope", [])]
+if untested:
+    sys.exit(f"plan for {paths}: test scope misses {untested}")
+checked = subprocess.run(
+    ["node", "scripts/ci-hook-coverage.mjs", "--plan", "-"],
+    cwd=repo_root, input=planned, capture_output=True, text=True,
+)
+if checked.returncode != 0:
+    sys.exit(f"plan for {paths}: hook coverage check failed: {checked.stdout}{checked.stderr}")
+report = json.loads(checked.stdout)
+if report["hook_binaries"] == 0 or report["missing"] or report["errors"]:
+    sys.exit(f"plan for {paths}: hook coverage {report}")
 PY
   then
     printf 'FAIL ci plan: %s\n' "$label" >&2
