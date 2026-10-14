@@ -6604,6 +6604,21 @@ impl LoginProvider {
 #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 const GOOGLE_CODE_ASSIST_SAMPLE_MODEL: &str = "gemini-3.8-flash";
 
+/// Default model of the synthesized Copilot Gemini route binding
+/// (`copilot_gemini`).
+///
+/// Route-specific for the same reason as [`GOOGLE_CODE_ASSIST_SAMPLE_MODEL`]:
+/// Copilot serves an account-specific model list matched by exact id, and the
+/// catalog's Gemini default is chosen for the API-key route and is not
+/// verified there. Must stay a catalog Gemini model (pinned by a test).
+#[cfg(all(
+    feature = "anthropic",
+    feature = "openai",
+    feature = "gemini",
+    feature = "copilot"
+))]
+const COPILOT_GEMINI_SAMPLE_MODEL: &str = "gemini-3.8-flash";
+
 #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 const ALL_LOGIN_PROVIDERS: &[LoginProvider] = &[
     LoginProvider::Anthropic,
@@ -6931,7 +6946,13 @@ fn ensure_cli_interactive_oauth_config(
         {
             let route_id = route.binding_id();
             let route_provider = route.provider();
-            let default_model = meerkat_models::default_model(route_provider);
+            let default_model = match route {
+                meerkat_copilot::CopilotProviderRoute::Gemini => Some(COPILOT_GEMINI_SAMPLE_MODEL),
+                meerkat_copilot::CopilotProviderRoute::OpenAi
+                | meerkat_copilot::CopilotProviderRoute::Anthropic => {
+                    meerkat_models::default_model(route_provider)
+                }
+            };
             if !section.backend.contains_key(route_id) {
                 section.backend.insert(
                     route_id.to_string(),
@@ -22652,6 +22673,41 @@ mod tests {
         assert!(
             !ensure_cli_interactive_oauth_config(LoginProvider::Copilot, &mut config).unwrap(),
             "complete Copilot config should be idempotent"
+        );
+    }
+
+    #[cfg(all(
+        feature = "anthropic",
+        feature = "openai",
+        feature = "gemini",
+        feature = "copilot"
+    ))]
+    #[test]
+    fn test_cli_copilot_gemini_route_keeps_its_route_default() {
+        assert_eq!(
+            meerkat_models::infer_provider(COPILOT_GEMINI_SAMPLE_MODEL),
+            Some(meerkat_core::Provider::Gemini),
+            "the Copilot Gemini route default must stay a catalog Gemini model"
+        );
+
+        let mut config = Config::default();
+        assert!(ensure_cli_interactive_oauth_config(LoginProvider::Copilot, &mut config).unwrap());
+        let realm = config.realm.get("global").expect("global realm");
+        let default_model = |binding_id: &str| {
+            realm
+                .binding
+                .get(binding_id)
+                .and_then(|binding| binding.default_model.as_deref())
+        };
+        assert_eq!(
+            default_model("copilot_gemini"),
+            Some(COPILOT_GEMINI_SAMPLE_MODEL),
+            "the Copilot Gemini route binds its route default, not the API-key catalog default"
+        );
+        assert_eq!(
+            default_model("copilot_anthropic"),
+            meerkat_models::default_model(meerkat_core::Provider::Anthropic),
+            "the other Copilot routes keep following the catalog default"
         );
     }
 
