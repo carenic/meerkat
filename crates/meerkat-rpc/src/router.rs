@@ -5608,6 +5608,7 @@ mod tests {
 
     struct RecordingMockLlmClient {
         requests: Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
+        tool_names: Option<Arc<std::sync::Mutex<Vec<Vec<String>>>>>,
         delay_ms: Option<u64>,
     }
 
@@ -5615,6 +5616,7 @@ mod tests {
         fn new(requests: Arc<std::sync::Mutex<Vec<Vec<Message>>>>) -> Self {
             Self {
                 requests,
+                tool_names: None,
                 delay_ms: None,
             }
         }
@@ -5622,7 +5624,20 @@ mod tests {
         fn with_delay(requests: Arc<std::sync::Mutex<Vec<Vec<Message>>>>, delay_ms: u64) -> Self {
             Self {
                 requests,
+                tool_names: None,
                 delay_ms: Some(delay_ms),
+            }
+        }
+
+        /// Also record the names of the tools each request offers.
+        fn with_tool_names(
+            requests: Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
+            tool_names: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        ) -> Self {
+            Self {
+                requests,
+                tool_names: Some(tool_names),
+                delay_ms: None,
             }
         }
     }
@@ -5646,6 +5661,18 @@ mod tests {
                 .lock()
                 .expect("recorded requests lock poisoned")
                 .push(request.messages.clone());
+            if let Some(tool_names) = &self.tool_names {
+                tool_names
+                    .lock()
+                    .expect("recorded tool names lock poisoned")
+                    .push(
+                        request
+                            .tools
+                            .iter()
+                            .map(|tool| tool.name.to_string())
+                            .collect(),
+                    );
+            }
             let delay = self.delay_ms;
             let usage = meerkat_core::TurnUsage::host_declared(
                 meerkat_core::Provider::Anthropic,
@@ -7984,10 +8011,13 @@ mod tests {
     #[tokio::test]
     async fn help_ask_runs_help_session_with_platform_skill_prompt() {
         let recorded_requests = Arc::new(std::sync::Mutex::new(Vec::<Vec<Message>>::new()));
-        let (router, _notif_rx) = test_router_with_llm(Arc::new(RecordingMockLlmClient::new(
-            Arc::clone(&recorded_requests),
-        )))
-        .await;
+        let recorded_tools = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let (router, _notif_rx) =
+            test_router_with_llm(Arc::new(RecordingMockLlmClient::with_tool_names(
+                Arc::clone(&recorded_requests),
+                Arc::clone(&recorded_tools),
+            )))
+            .await;
 
         let response = router
             .dispatch(make_request(
@@ -8015,6 +8045,24 @@ mod tests {
         assert!(system_prompt.contains("dedicated help surface"));
         assert!(system_prompt.contains("meerkat-platform"));
         assert!(system_prompt.contains("Meerkat Platform Guide"));
+        // Both help skills reach the model whole, past the 32 KiB that a
+        // preload is cut at.
+        for body in [
+            meerkat::help::MEERKAT_PLATFORM_SKILL_BODY,
+            meerkat::help::MEERKAT_CLI_REFERENCE_SKILL_BODY,
+        ] {
+            assert!(system_prompt.contains(body));
+        }
+        assert!(!system_prompt.contains("[truncated]"));
+        // The session's only tools read the platform skill's references.
+        let mut tools = recorded_tools
+            .lock()
+            .expect("recorded tool names lock poisoned")
+            .first()
+            .cloned()
+            .expect("help session should reach the LLM request");
+        tools.sort();
+        assert_eq!(tools, ["skill_list_resources", "skill_read_resource"]);
     }
 
     #[cfg(feature = "mob")]

@@ -4303,6 +4303,7 @@ async fn cli_main() -> anyhow::Result<ExitCode> {
                 stdin,
                 line_format,
                 auth_binding,
+                None,
                 &cli_scope,
             ))
             .await
@@ -4481,11 +4482,25 @@ async fn handle_help_command(
         max_tokens,
     };
     let help_prompt = meerkat::help::render_help_prompt(&request)?;
+    // Like every help entry point, the CLI builds its session from the one
+    // shared help session: the embedded skills whole in the system prompt and
+    // the read-only reference tools as the session's only tools.
+    #[cfg(feature = "skills")]
+    let (system_prompt, preload_skills, help_tools) = {
+        let help = meerkat::help::help_session();
+        (help.system_prompt, Vec::new(), Some(help.tools))
+    };
+    #[cfg(not(feature = "skills"))]
+    let (system_prompt, preload_skills, help_tools) = (
+        meerkat::help::help_system_prompt().to_string(),
+        meerkat::help::platform_preload_skill_names(),
+        None,
+    );
 
     handle_run_command(
         help_prompt,
         None,
-        Some(meerkat::help::help_system_prompt().to_string()),
+        Some(system_prompt),
         model,
         provider,
         max_tokens,
@@ -4500,12 +4515,12 @@ async fn handle_help_command(
         html_template_file,
         stream,
         no_stream,
-        false,
+        true,
         false,
         Vec::new(),
         None,
         None,
-        meerkat::help::platform_preload_skill_names(),
+        preload_skills,
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -4524,12 +4539,13 @@ async fn handle_help_command(
         None,
         None,
         None,
-        false,
+        true,
         None,
         Vec::new(),
         StdinMode::Off,
         LineFormat::Text,
         None,
+        help_tools,
         scope,
     )
     .await
@@ -4585,6 +4601,7 @@ async fn handle_run_command(
     stdin: StdinMode,
     line_format: LineFormat,
     auth_binding: Option<AuthBindingRef>,
+    help_tools: Option<Arc<dyn AgentToolDispatcher>>,
     scope: &RuntimeScope,
 ) -> anyhow::Result<()> {
     // One-time, idempotent: carry any pre-`global` (`dev`) login credentials
@@ -4788,6 +4805,7 @@ async fn handle_run_command(
                 manifest,
                 persistence,
                 &storage_scope,
+                help_tools,
                 scope,
             )
             .await
@@ -5056,18 +5074,6 @@ async fn resolve_runtime_skills(
         } else {
             preload.push(skill);
         }
-    }
-    // The embedded help skills (which `rkat help` preloads) are larger than
-    // the default per-skill injection limit; a truncated preload would hide
-    // most of the help corpus.
-    if preload
-        .iter()
-        .any(|name| meerkat::help::is_help_skill_name(name))
-    {
-        config.skills.max_injection_bytes = config
-            .skills
-            .max_injection_bytes
-            .max(meerkat::help::help_skill_injection_bytes());
     }
     Ok((config, preload))
 }
@@ -13398,6 +13404,7 @@ async fn run_agent(
     manifest: meerkat_store::RealmManifest,
     persistence: PersistenceBundle,
     storage_scope: &RuntimeScope,
+    help_tools: Option<Arc<dyn AgentToolDispatcher>>,
     scope: &RuntimeScope,
 ) -> anyhow::Result<()> {
     #[cfg(not(feature = "session-store"))]
@@ -13444,6 +13451,7 @@ async fn run_agent(
             manifest,
             persistence,
             storage_scope,
+            help_tools,
             scope,
         );
         anyhow::bail!("rkat built without session-store support");
@@ -13451,8 +13459,12 @@ async fn run_agent(
     #[cfg(feature = "session-store")]
     {
         let keep_alive = resolve_keep_alive(keep_alive)?;
-        let effective_workgraph = enable_workgraph || config.tools.workgraph_enabled;
-        let effective_mob = cfg!(feature = "mob") && (enable_mob || config.tools.mob_enabled);
+        // A help run's only tools are its help tools: none of the realm's
+        // configured tool families, MCP servers or schedule tools join them.
+        let help_run = help_tools.is_some();
+        let effective_workgraph = !help_run && (enable_workgraph || config.tools.workgraph_enabled);
+        let effective_mob =
+            !help_run && cfg!(feature = "mob") && (enable_mob || config.tools.mob_enabled);
         let turn_tool_overlay = build_turn_tool_overlay(allow_tools, block_tools);
         // Wave-c C-12: the canonical runtime identity for a skill is
         // `SkillKey { source_uuid, skill_name }` (C-1 / C-4 upstream retype).
@@ -13512,7 +13524,7 @@ async fn run_agent(
             .builtins(enable_builtins)
             .shell(enable_shell)
             .workgraph(effective_workgraph)
-            .schedule(config.tools.schedule_enabled);
+            .schedule(!help_run && config.tools.schedule_enabled);
         if let Some(context_root) = scope.context_root.clone() {
             factory = factory.context_root(context_root);
         }
@@ -13522,8 +13534,11 @@ async fn run_agent(
 
         #[cfg(feature = "comms")]
         let factory = factory.comms(!comms_overrides.disabled);
-        let governed_mcp =
-            governed_configured_mcp_servers(&persistence, scope, &config.tools.mcp_servers).await?;
+        let governed_mcp = if help_run {
+            None
+        } else {
+            governed_configured_mcp_servers(&persistence, scope, &config.tools.mcp_servers).await?
+        };
         let factory = with_governed_mcp_auth(factory, scope, governed_mcp.as_deref(), mcp_auth)?;
 
         let context_root = scope
@@ -13630,7 +13645,7 @@ async fn run_agent(
 
         // Load optional MCP tools immediately before external tool composition so
         // later early-return windows cannot skip adapter shutdown.
-        let (mcp_external_tools, mcp_adapter) = if governed_mcp.is_some() {
+        let (mcp_external_tools, mcp_adapter) = if governed_mcp.is_some() || help_run {
             (None, None)
         } else {
             load_mcp_external_tools(
@@ -13643,8 +13658,8 @@ async fn run_agent(
             .await?
         };
         // Mob tools now flow through mob_tools (factory pattern), not external_tools.
-        // Only MCP tools remain as external_tools.
-        let external_tools = mcp_external_tools;
+        // Only MCP tools (or a help run's help tools) remain as external_tools.
+        let external_tools = help_tools.or(mcp_external_tools);
         #[cfg(feature = "mob")]
         let mob_tools_factory: Option<Arc<dyn meerkat_core::service::MobToolsFactory>> =
             run_mob_tools.as_ref().map(|ctx| {
@@ -13706,12 +13721,20 @@ async fn run_agent(
             override_builtins: meerkat_core::ToolCategoryOverride::from_effective(enable_builtins),
             override_shell: meerkat_core::ToolCategoryOverride::from_effective(enable_shell),
             override_memory: meerkat_core::ToolCategoryOverride::from_effective(enable_memory),
-            override_schedule: meerkat_core::ToolCategoryOverride::Inherit,
+            override_schedule: if help_run {
+                meerkat_core::ToolCategoryOverride::Disable
+            } else {
+                meerkat_core::ToolCategoryOverride::Inherit
+            },
             override_workgraph: meerkat_core::ToolCategoryOverride::from_effective(
                 effective_workgraph,
             ),
             override_mob: meerkat_core::ToolCategoryOverride::Inherit,
-            override_image_generation: meerkat_core::ToolCategoryOverride::Inherit,
+            override_image_generation: if help_run {
+                meerkat_core::ToolCategoryOverride::Disable
+            } else {
+                meerkat_core::ToolCategoryOverride::Inherit
+            },
             override_web_search: if no_web_search {
                 meerkat_core::ToolCategoryOverride::Disable
             } else {
@@ -25819,6 +25842,7 @@ default_model = "gemma"
             stdin,
             line_format,
             auth_binding,
+            None,
             &scope,
         )
         .await
@@ -27122,7 +27146,10 @@ default_model = "gemma"
     }
 
     #[tokio::test]
-    async fn test_help_skill_preloads_raise_the_skill_injection_limit() {
+    async fn test_run_preloading_the_platform_skill_keeps_the_configured_injection_limit() {
+        // Only the help entry points carry the help skills whole (through
+        // `meerkat::help::help_session`); a normal run that preloads them
+        // keeps the configured per-skill limit for every skill it injects.
         let default_limit = Config::default().skills.max_injection_bytes;
         let (config, preload) = resolve_runtime_skills(
             Config::default(),
@@ -27131,24 +27158,15 @@ default_model = "gemma"
         .await
         .expect("builtin help skills resolve");
         assert_eq!(preload, meerkat::help::platform_preload_skill_names());
-        assert_eq!(
-            config.skills.max_injection_bytes,
-            meerkat::help::help_skill_injection_bytes()
-        );
-        assert!(config.skills.max_injection_bytes > default_limit);
-
-        let (config, _) = resolve_runtime_skills(Config::default(), vec!["reviewer".to_string()])
-            .await
-            .expect("an ordinary builtin skill name resolves");
         assert_eq!(config.skills.max_injection_bytes, default_limit);
 
-        let mut raised = Config::default();
-        raised.skills.max_injection_bytes = 1024 * 1024;
+        let mut configured = Config::default();
+        configured.skills.max_injection_bytes = 48 * 1024;
         let (config, _) =
-            resolve_runtime_skills(raised, meerkat::help::platform_preload_skill_names())
+            resolve_runtime_skills(configured, meerkat::help::platform_preload_skill_names())
                 .await
                 .expect("builtin help skills resolve");
-        assert_eq!(config.skills.max_injection_bytes, 1024 * 1024);
+        assert_eq!(config.skills.max_injection_bytes, 48 * 1024);
     }
 
     #[test]

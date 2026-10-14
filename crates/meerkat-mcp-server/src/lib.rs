@@ -4063,10 +4063,14 @@ async fn handle_meerkat_help(
     let prompt = meerkat::help::render_help_prompt(&input)
         .map_err(|err| ToolCallError::invalid_params(err.to_string()))?;
     let provider = help_provider_to_mcp_provider(input.provider.clone())?;
+    // Like every help entry point, meerkat_help builds its session from the
+    // one shared help session: the embedded skills whole in the system prompt
+    // and the read-only reference tools as the session's only tools.
+    let help = meerkat::help::help_session();
     let run_input = MeerkatRunInput {
         prompt,
         transient_turn_context: None,
-        system_prompt: Some(meerkat::help::help_system_prompt().to_string()),
+        system_prompt: Some(help.system_prompt),
         model: input
             .model
             .map(meerkat_core::lifecycle::run_primitive::ModelId::new),
@@ -4093,7 +4097,7 @@ async fn handle_meerkat_help(
         enable_web_search: Some(false),
         provider_params: None,
         budget_limits: None,
-        preload_skills: Some(meerkat::help::platform_preload_skills()),
+        preload_skills: None,
         skill_refs: None,
         skill_references: None,
         labels: None,
@@ -4103,11 +4107,12 @@ async fn handle_meerkat_help(
         auth_binding: None,
     };
 
-    Box::pin(handle_meerkat_run(
+    Box::pin(handle_meerkat_run_with_help_tools(
         state,
         run_input,
         notifier,
         request_context,
+        Some(help.tools),
     ))
     .await
 }
@@ -4117,6 +4122,25 @@ async fn handle_meerkat_run(
     input: MeerkatRunInput,
     notifier: Option<EventNotifier>,
     request_context: Option<RequestContext>,
+) -> Result<Value, ToolCallError> {
+    Box::pin(handle_meerkat_run_with_help_tools(
+        state,
+        input,
+        notifier,
+        request_context,
+        None,
+    ))
+    .await
+}
+
+/// `help_tools` are a help session's only tools: they take the place of the
+/// client's callback tools and of the session's live MCP router.
+async fn handle_meerkat_run_with_help_tools(
+    state: &MeerkatMcpState,
+    input: MeerkatRunInput,
+    notifier: Option<EventNotifier>,
+    request_context: Option<RequestContext>,
+    help_tools: Option<Arc<dyn AgentToolDispatcher>>,
 ) -> Result<Value, ToolCallError> {
     validate_public_peer_meta(input.peer_meta.as_ref()).map_err(ToolCallError::invalid_params)?;
     let ingress = state.runtime_ingress_context();
@@ -4216,6 +4240,7 @@ async fn handle_meerkat_run(
     let instance_id = state.instance_id.clone();
     let backend = meerkat_core::RecoveryBackendKind::parse(&state.backend);
     let callback_tools_for_plan = callback_tools.clone();
+    let help_tools_for_plan = help_tools;
     let event_tx_for_plan = event_tx.clone();
     let request_context_for_plan = request_context.clone();
     let materialization = materialize_mcp_actor_transaction(
@@ -4232,13 +4257,25 @@ async fn handle_meerkat_run(
             {
                 return Err(request_cancelled_tool_error());
             }
-            let adapter = Arc::new(meerkat_mcp::McpRouterAdapter::new(
-                McpRouter::new_with_surface_handle(Arc::clone(bindings.external_tool_surface())),
-            ));
-            let mcp_tools: Arc<dyn AgentToolDispatcher> = adapter.clone();
-            let external_tools =
-                compose_external_tool_dispatchers(callback_tools_for_plan.clone(), Some(mcp_tools))
-                    .map_err(ToolCallError::internal)?;
+            // A help session's only tools are its help tools: it gets no live
+            // MCP router, so no MCP server or catalog control tool joins them.
+            let adapter = help_tools_for_plan.is_none().then(|| {
+                Arc::new(meerkat_mcp::McpRouterAdapter::new(
+                    McpRouter::new_with_surface_handle(Arc::clone(
+                        bindings.external_tool_surface(),
+                    )),
+                ))
+            });
+            let external_tools = match help_tools_for_plan.clone() {
+                Some(help_tools) => Some(help_tools),
+                None => compose_external_tool_dispatchers(
+                    callback_tools_for_plan.clone(),
+                    adapter
+                        .clone()
+                        .map(|adapter| adapter as Arc<dyn AgentToolDispatcher>),
+                )
+                .map_err(ToolCallError::internal)?,
+            };
             let mut build = SessionBuildOptions {
                 model_fallback: None,
                 tool_access_policy: None,
@@ -4368,7 +4405,7 @@ async fn handle_meerkat_run(
                 callback_config: runtime_ingress::McpCallbackConfig::Replace(
                     callback_tools_for_plan,
                 ),
-                router_to_publish: Some(Arc::clone(&adapter)),
+                router_to_publish: adapter,
             })
         },
     )

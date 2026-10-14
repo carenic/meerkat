@@ -57,13 +57,19 @@ them.
   surfaces. Before, the help corpus did not mention it, so `rkat help` answered
   that Meerkat has no OS-level sandboxing. The 0.9 migration notes are now
   embedded with the skill as well.
-- `rkat help` injects its whole embedded corpus. Preloaded skills are cut at
-  `skills.max_injection_bytes` (32 KiB by default), and the embedded
-  meerkat-platform skill is about three times that size, so a help session saw
-  only its first third. A session that preloads the embedded help skills
-  (`rkat help`, or `rkat run --skill meerkat-platform`) now raises its own limit
-  to fit them; other skills keep the configured limit. JSON-RPC, REST and MCP
-  help still inject at the configured limit.
+- `rkat help`, JSON-RPC `help/ask`, REST `POST /help` and the MCP
+  `meerkat_help` tool see the whole embedded platform skill and can read its
+  references. The help surfaces preloaded the skill, and a preload is cut at
+  `skills.max_injection_bytes` (32 KiB by default), so a help session saw about
+  the first third of it; its reference documents were unreachable. Every help
+  surface now builds its session from `meerkat::help::help_session()`: the
+  embedded skills whole in the system prompt, and exactly two read-only tools,
+  `skill_list_resources` and `skill_read_resource`, which read the platform
+  skill's references (an embedded skill now serves its `references/*.md`
+  documents as artifacts). Help sessions start with no MCP servers, callback
+  tools or other tool families. Normal sessions keep the configured
+  `skills.max_injection_bytes`, including a `rkat run` that preloads
+  meerkat-platform.
 - `--as-agent` works before the command name, like the other root options.
   `rkat --as-agent <AGENT> realm list` was rewritten into a prompt-first run
   whose prompt was the command name.

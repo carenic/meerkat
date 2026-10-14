@@ -29,10 +29,36 @@ pub async fn handle_ask(
         Err(err) => return RpcResponse::error(id, error::INVALID_PARAMS, err.to_string()),
     };
 
-    // K17: construct the typed `session/create` params directly and delegate
-    // to the shared typed entrypoint — no hand-shaped JSON round trip between
-    // handlers.
-    let create_params = CreateSessionParams {
+    // Like every help entry point, help/ask builds its session from the one
+    // shared help session: the embedded skills whole in the system prompt and
+    // the read-only reference tools as the session's only tools.
+    let help = meerkat::help::help_session();
+    let create_params = help_create_session_params(request, prompt, help.system_prompt);
+
+    // K17: delegate the typed `session/create` params to the shared typed
+    // entrypoint, with no callback tools and no configured MCP servers.
+    super::session::create_session_with_params_on_route_and_configured_mcp(
+        id,
+        create_params,
+        runtime,
+        notification_sink,
+        runtime_adapter,
+        request_context,
+        None,
+        Vec::new(),
+        Some(help.tools),
+    )
+    .await
+}
+
+/// The typed `session/create` params of a help session: the help system
+/// prompt, no preloaded skills, and every tool category off.
+fn help_create_session_params(
+    request: meerkat_contracts::HelpRequest,
+    prompt: String,
+    system_prompt: String,
+) -> CreateSessionParams {
+    CreateSessionParams {
         prompt: ContentInput::Text(prompt),
         injected_context: None,
         transient_turn_context: None,
@@ -40,9 +66,7 @@ pub async fn handle_ask(
         model: request.model,
         provider: request.provider,
         max_tokens: request.max_tokens,
-        system_prompt: meerkat::SystemPromptOverride::Set(
-            meerkat::help::help_system_prompt().to_string(),
-        ),
+        system_prompt: meerkat::SystemPromptOverride::Set(system_prompt),
         output_schema: None,
         structured_output_retries: None,
         hooks_override: None,
@@ -52,15 +76,15 @@ pub async fn handle_ask(
         comms_name: None,
         peer_meta: None,
         enable_memory: Some(false),
-        enable_schedule: None,
+        enable_schedule: Some(false),
         enable_mob: Some(false),
-        enable_web_search: None,
+        enable_web_search: Some(false),
         tool_filter: None,
-        enable_workgraph: None,
+        enable_workgraph: Some(false),
         budget_limits: None,
         provider_params: None,
         auth_binding: None,
-        preload_skills: Some(meerkat::help::platform_preload_skills()),
+        preload_skills: None,
         skill_refs: None,
         skill_references: None,
         labels: None,
@@ -68,15 +92,5 @@ pub async fn handle_ask(
         app_context: None,
         shell_env: None,
         external_tools: None,
-    };
-
-    super::session::create_session_with_params(
-        id,
-        create_params,
-        runtime,
-        notification_sink,
-        runtime_adapter,
-        request_context,
-    )
-    .await
+    }
 }

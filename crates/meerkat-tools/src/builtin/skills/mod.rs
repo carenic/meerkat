@@ -26,6 +26,12 @@ pub const BROWSE_SKILLS_TOOL_NAME: &str = "browse_skills";
 /// Canonical tool name of [`LoadSkillTool`].
 pub const LOAD_SKILL_TOOL_NAME: &str = "load_skill";
 
+/// Canonical tool name of [`SkillListResourcesTool`].
+pub const SKILL_LIST_RESOURCES_TOOL_NAME: &str = "skill_list_resources";
+
+/// Canonical tool name of [`SkillReadResourceTool`].
+pub const SKILL_READ_RESOURCE_TOOL_NAME: &str = "skill_read_resource";
+
 /// System-prompt guidance tying the `<available_skills>` inventory to the
 /// skill discovery tools.
 ///

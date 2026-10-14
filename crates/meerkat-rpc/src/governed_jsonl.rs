@@ -779,6 +779,7 @@ pub(crate) async fn dispatch(
                         context,
                         Some(route),
                         connection.configured_mcp_servers(),
+                        None,
                     )
                     .await;
                 if created.error.is_none() {

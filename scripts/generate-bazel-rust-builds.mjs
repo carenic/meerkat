@@ -1511,6 +1511,7 @@ function writeRootBuild(fastTestLabels, e2eSystemTestLabels, surfaceFeatureMatri
     `        ".claude/skills/meerkat-platform/SKILL.md",`,
     `        ".claude/skills/meerkat-platform/references/api_reference.md",`,
     `        ".claude/skills/meerkat-platform/references/migration_0_5.md",`,
+    `        ".claude/skills/meerkat-platform/references/migration_0_9.md",`,
     `        ".claude/skills/meerkat-platform/references/mobs.md",`,
     `    ],`,
     `    visibility = ["//visibility:public"],`,

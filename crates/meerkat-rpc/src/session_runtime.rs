@@ -9446,6 +9446,28 @@ impl SessionRuntime {
             labels,
             deferred_prompt,
             deferred_injected_context,
+            true,
+        )
+        .await
+    }
+
+    /// [`Self::create_session`] for a session whose tools are exactly its
+    /// build's external tools, such as a help session: it gets no live MCP
+    /// adapter, so no MCP server or catalog control tool joins them.
+    pub(crate) async fn create_session_without_live_mcp(
+        self: &Arc<Self>,
+        build_config: AgentBuildConfig,
+        labels: Option<BTreeMap<String, String>>,
+        deferred_prompt: Option<ContentInput>,
+        deferred_injected_context: Vec<ContentInput>,
+    ) -> Result<SessionId, RpcError> {
+        self.create_session_from_seed(
+            Session::new(),
+            build_config,
+            labels,
+            deferred_prompt,
+            deferred_injected_context,
+            false,
         )
         .await
     }
@@ -9773,7 +9795,10 @@ impl SessionRuntime {
         labels: Option<BTreeMap<String, String>>,
         deferred_prompt: Option<ContentInput>,
         deferred_injected_context: Vec<ContentInput>,
+        attach_live_mcp: bool,
     ) -> Result<SessionId, RpcError> {
+        #[cfg(not(feature = "mcp"))]
+        let _ = attach_live_mcp;
         // A session can author schedules on its first turn; the firing host
         // for this runtime's store must be live in the same process.
         self.arm_schedule_host_for_agent_tools().await;
@@ -9894,21 +9919,29 @@ impl SessionRuntime {
         }
 
         #[cfg(feature = "mcp")]
-        let build_config = match self
-            .attach_mcp_adapter_for_pending_session(session_id.clone(), build_config, Vec::new())
-            .await
-        {
-            Ok(build_config) => build_config,
-            Err(err) => {
-                return Err(self
-                    .combine_with_recovered_runtime_cleanup(
-                        &session_id,
-                        false,
-                        err,
-                        "clean up prepared runtime after MCP attachment failure",
-                    )
-                    .await);
+        let build_config = if attach_live_mcp {
+            match self
+                .attach_mcp_adapter_for_pending_session(
+                    session_id.clone(),
+                    build_config,
+                    Vec::new(),
+                )
+                .await
+            {
+                Ok(build_config) => build_config,
+                Err(err) => {
+                    return Err(self
+                        .combine_with_recovered_runtime_cleanup(
+                            &session_id,
+                            false,
+                            err,
+                            "clean up prepared runtime after MCP attachment failure",
+                        )
+                        .await);
+                }
             }
+        } else {
+            build_config
         };
 
         let now = now_unix_secs();

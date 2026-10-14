@@ -5277,7 +5277,7 @@ async fn create_session(
 ) -> Result<Json<SessionResponse>, ApiError> {
     let req_ctx = extract_request_context(&headers, &state.request_executor)?;
     let executor = state.request_executor.clone();
-    let outcome = Box::pin(create_session_inner(&state, req, req_ctx.clone())).await;
+    let outcome = Box::pin(create_session_inner(&state, req, req_ctx.clone(), None)).await;
     with_request_lifecycle(&executor, req_ctx, outcome).await
 }
 
@@ -5286,15 +5286,28 @@ async fn help(
     headers: axum::http::HeaderMap,
     Json(req): Json<meerkat_contracts::HelpRequest>,
 ) -> Result<Json<SessionResponse>, ApiError> {
-    let create_req = help_request_to_create_session(req)?;
+    // Like every help entry point, POST /help builds its session from the one
+    // shared help session: the embedded skills whole in the system prompt and
+    // the read-only reference tools as the session's only tools.
+    let help = meerkat::help::help_session();
+    let create_req = help_request_to_create_session(req, help.system_prompt)?;
     let req_ctx = extract_request_context(&headers, &state.request_executor)?;
     let executor = state.request_executor.clone();
-    let outcome = Box::pin(create_session_inner(&state, create_req, req_ctx.clone())).await;
+    let outcome = Box::pin(create_session_inner(
+        &state,
+        create_req,
+        req_ctx.clone(),
+        Some(help.tools),
+    ))
+    .await;
     with_request_lifecycle(&executor, req_ctx, outcome).await
 }
 
+/// The create request of a help session: the help system prompt, no
+/// preloaded skills, and every tool category off.
 fn help_request_to_create_session(
     req: meerkat_contracts::HelpRequest,
+    system_prompt: String,
 ) -> Result<CreateSessionRequest, ApiError> {
     let prompt = meerkat::help::render_help_prompt(&req)
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
@@ -5311,9 +5324,7 @@ fn help_request_to_create_session(
         prompt: prompt.into(),
         injected_context: None,
         transient_turn_context: None,
-        system_prompt: meerkat::SystemPromptOverride::Set(
-            meerkat::help::help_system_prompt().to_string(),
-        ),
+        system_prompt: meerkat::SystemPromptOverride::Set(system_prompt),
         model: req.model,
         provider,
         max_tokens: req.max_tokens,
@@ -5334,7 +5345,7 @@ fn help_request_to_create_session(
         enable_workgraph: Some(false),
         budget_limits: None,
         provider_params: None,
-        preload_skills: Some(meerkat::help::platform_preload_skills()),
+        preload_skills: None,
         skill_refs: None,
         labels: None,
         additional_instructions: None,
@@ -5366,10 +5377,13 @@ fn create_session_error_to_api(err: SessionError) -> ApiError {
 }
 
 /// Create and run a new session (typed-terminal inner body).
+/// `help_tools` are a help session's only tools: they replace the per-session
+/// live MCP adapter every other session gets.
 async fn create_session_inner(
     state: &AppState,
     req: CreateSessionRequest,
     req_ctx: Option<RequestContext>,
+    help_tools: Option<Arc<dyn meerkat_core::AgentToolDispatcher>>,
 ) -> RequestTerminal<Result<Json<SessionResponse>, ApiError>> {
     // --- Validation (pre-stateful work) ---
     if let Err(e) = validate_public_peer_meta(req.peer_meta.as_ref()) {
@@ -5453,9 +5467,12 @@ async fn create_session_inner(
         req.verbose,
     );
 
-    // Create MCP adapter and compose with external tools.
+    // Create MCP adapter and compose with external tools. A help session's
+    // only tools are its help tools, so it gets no live MCP adapter.
     #[cfg(feature = "mcp")]
-    let mcp_external_tools = {
+    let mcp_external_tools = if help_tools.is_some() {
+        None
+    } else {
         let adapter = Arc::new(McpRouterAdapter::new(session_mcp_router(state)));
         let adapter_dispatcher: Arc<dyn AgentToolDispatcher> = adapter.clone();
         let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
@@ -5537,7 +5554,7 @@ async fn create_session_inner(
         resume_session_intent: meerkat_core::SessionBuildIntent::Mint,
         budget_limits: req.budget_limits,
         provider_params: req.provider_params.clone().map(Into::into),
-        external_tools: mcp_external_tools,
+        external_tools: help_tools.or(mcp_external_tools),
         // The session service decides hosting when it creates the actor.
         hosting: meerkat_core::session_hosting::SessionHostingIntent::default(),
         mcp_servers: Vec::new(),
@@ -10030,7 +10047,7 @@ mod tests {
         }))
         .expect("valid REST create request fixture");
 
-        let outcome = Box::pin(create_session_inner(&state, req, None)).await;
+        let outcome = Box::pin(create_session_inner(&state, req, None, None)).await;
         match outcome {
             RequestTerminal::RespondWithoutPublish(Err(ApiError::BadRequest(message))) => {
                 assert!(
@@ -12669,7 +12686,7 @@ mod tests {
     }
 
     #[test]
-    fn test_help_request_to_create_session_preloads_platform_skill() {
+    fn test_help_request_to_create_session_carries_the_help_session_prompt() {
         let req = meerkat_contracts::HelpRequest {
             question: "How do I add an MCP server?".to_string(),
             prompt: Some("Write a game".to_string()),
@@ -12678,26 +12695,36 @@ mod tests {
             provider: Some("anthropic".to_string()),
             max_tokens: Some(512),
         };
+        let help = meerkat::help::help_session();
 
-        let create = help_request_to_create_session(req).expect("valid help request");
+        let create = help_request_to_create_session(req, help.system_prompt.clone())
+            .expect("valid help request");
         assert!(
             matches!(create.prompt, ContentInput::Text(ref text) if text.contains("Write a game"))
         );
-        assert!(
-            create
-                .system_prompt
-                .as_set_prompt()
-                .is_some_and(|prompt| prompt.contains("dedicated help surface"))
+        assert_eq!(
+            create.system_prompt.as_set_prompt(),
+            Some(help.system_prompt.as_str())
         );
+        assert!(help.system_prompt.contains("dedicated help surface"));
+        assert!(help.system_prompt.contains("Meerkat Platform Guide"));
         assert_eq!(create.model.as_deref(), Some("claude-sonnet-4-5"));
         assert_eq!(create.provider, Some(Provider::Anthropic));
         assert_eq!(create.max_tokens, Some(512));
-        assert_eq!(
-            create.preload_skills,
-            Some(meerkat::help::platform_preload_skills())
-        );
-        assert_eq!(create.enable_builtins, Some(false));
-        assert_eq!(create.enable_shell, Some(false));
+        // The skills are in the system prompt whole; preloading them would
+        // inject them again at the realm's limit.
+        assert_eq!(create.preload_skills, None);
+        for enabled in [
+            create.enable_builtins,
+            create.enable_shell,
+            create.enable_memory,
+            create.enable_mob,
+            create.enable_schedule,
+            create.enable_web_search,
+            create.enable_workgraph,
+        ] {
+            assert_eq!(enabled, Some(false));
+        }
     }
 
     #[cfg(feature = "mob")]

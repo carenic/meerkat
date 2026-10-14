@@ -7,7 +7,9 @@ description: "Build on the Meerkat agent platform (0.9 line). Covers every shipp
 
 Meerkat (`rkat`) is a library-first agent runtime exposed through multiple surfaces. One execution pipeline, realm-scoped state, runtime-backed semantics by default. This guide is task-oriented; deeper schemas live under `references/`.
 
-References:
+## Where to find details
+
+This guide is an overview. The reference documents below carry the detail; read the matching one before answering a detailed question. On a help surface (`rkat help`, JSON-RPC `help/ask`, REST `POST /help`, MCP `meerkat_help`), read a reference with the `skill_read_resource` tool, passing this skill's `source_uuid` and `skill_name` and the reference path as `path`; `skill_list_resources` lists them.
 
 - `references/api_reference.md` - per-surface methods, schemas, examples (CLI, REST, RPC, MCP, Python/TS/Rust SDKs).
 - `references/mobs.md` - multi-agent orchestration in depth.
