@@ -1152,7 +1152,18 @@ Start a new turn on an existing session.
 ```
 </CodeGroup>
 
-Returns the same run-result shape as `session/create`. Fails with error code `-32002` (SESSION_BUSY) if a turn is already in progress.
+Returns the same run-result shape as `session/create`. A `turn/start` that
+arrives while another turn on the same session is running is queued behind
+it: it runs once the running turn finishes, and the call returns its own
+result. It is not refused with `-32002` (`SESSION_BUSY`).
+
+A turn that fails returns the JSON-RPC code of its typed cause, as the
+[session error mapping](/reference/capability-matrix#error-codes) does for the
+same causes: `-32010` (provider error) for `llm_failure` and
+`retry_exhausted`, `-32011` (budget exhausted) for `budget_exhausted` and
+`time_budget_exceeded`, `-32012` (hook denied) for `hook_denied`, and
+`-32005` for cancellation. Any other cause is `-32603`. The typed turn error
+(`kind`, `detail`, and the provider facts when known) is in `data.error`.
 
 <ParamField body="session_id" type="string" required>
   Session ID to continue.
@@ -1208,9 +1219,15 @@ Returns the same run-result shape as `session/create`. Fails with error code `-3
   server-owned provenance.
 </ParamField>
 
-<ParamField body="max_tokens" type="u32 | null" default="from session">
-  Max tokens override.
-</ParamField>
+<Note>
+`max_tokens`, `output_schema` and `structured_output_retries` are build
+settings, fixed when the session's agent is built. `turn/start` (and
+`mob/turn_start`) refuses each of them while it parses its params, before any
+session work, with `-32602` (invalid params) naming the setting. Set them on
+`session/create`, including a deferred create (`"initial_turn": "deferred"`);
+a mob member's are fixed when it is spawned. An explicit `null` is accepted
+and keeps the session's setting.
+</Note>
 
 <ParamField body="skill_refs" type="object[] | null">
   Tagged structured skill references to resolve and inject for this turn. Each entry uses `{"kind":"structured","source_uuid":"...","skill_name":"..."}`.
@@ -3089,7 +3106,7 @@ Standard JSON-RPC codes plus Meerkat-specific application codes:
 | -32602 | Invalid params | Missing or invalid parameters |
 | -32603 | Internal error | Server error |
 | -32001 | Session not found | Session ID does not exist |
-| -32002 | Session busy | Turn already in progress |
+| -32002 | Session busy | The session cannot take this request now, for example a `turn/interrupt` while a deferred session is being materialized, a session hosted by another process, or a runtime teardown still in progress. A `turn/start` on a session with a running turn is queued, not refused |
 | -32003 | Session not running | Session not in running state |
 | -32004 | Duplicate input | The request or input was already admitted; a deduplicated runtime input carries `data.existing_id` |
 | -32005 | Request cancelled | Cancelled before the response was published (see above) |

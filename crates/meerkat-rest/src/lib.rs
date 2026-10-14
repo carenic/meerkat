@@ -10668,6 +10668,95 @@ mod tests {
         );
     }
 
+    /// A continue that arrives while another turn on the same session is
+    /// running waits behind it and then runs its own turn; it is not refused
+    /// as busy or conflicting.
+    #[tokio::test]
+    async fn rest_continue_while_a_turn_runs_waits_instead_of_busy() {
+        // Bounds a failure only; the passing path never waits for it.
+        const FAILURE_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+        let temp = TempDir::new().unwrap();
+        let mut state = load_rest_state_with_capacity(&temp, 4).await;
+        let calls = Arc::new(tokio::sync::watch::channel(0).0);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        state.llm_client_override = Some(Arc::new(BlockingMockLlmClient {
+            calls: Arc::clone(&calls),
+            release: Arc::clone(&release),
+        }));
+        let session_id = create_deferred_rest_runtime_session(&state).await;
+        let continue_turn = |prompt: &'static str| {
+            let state = state.clone();
+            let session_id = session_id.to_string();
+            tokio::spawn(async move {
+                Box::pin(continue_session_inner(
+                    &state,
+                    &session_id,
+                    ContinueSessionRequest {
+                        injected_context: None,
+                        transient_turn_context: None,
+                        session_id: session_id.clone(),
+                        prompt: ContentInput::Text(prompt.to_string()),
+                        system_prompt: None,
+                        output_schema: None,
+                        structured_output_retries: None,
+                        keep_alive: None,
+                        comms_name: None,
+                        peer_meta: None,
+                        verbose: false,
+                        model: None,
+                        provider: None,
+                        auth_binding: None,
+                        max_tokens: None,
+                        hooks_override: None,
+                        enable_web_search: None,
+                        skill_refs: None,
+                        turn_tool_overlay: None,
+                        additional_instructions: None,
+                    },
+                    None,
+                ))
+                .await
+            })
+        };
+
+        let first = continue_turn("first running turn");
+        wait_for_rest_llm_calls(&calls, 1, "the first turn reaches the LLM").await;
+        let mut second = continue_turn("second continue");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut second)
+                .await
+                .is_err(),
+            "a continue on a running session waits behind the running turn \
+             instead of answering at once"
+        );
+
+        // The mock returns each permit after use, so one permit releases
+        // both calls in turn.
+        release.add_permits(1);
+        let first = tokio::time::timeout(FAILURE_BOUND, first)
+            .await
+            .expect("the first turn finishes once released")
+            .expect("first turn task");
+        assert!(
+            matches!(first, RequestTerminal::Publish(Ok(_))),
+            "the first turn publishes its result: {first:?}"
+        );
+        let second = tokio::time::timeout(FAILURE_BOUND, second)
+            .await
+            .expect("the waiting continue finishes after the first turn")
+            .expect("second turn task");
+        assert!(
+            matches!(second, RequestTerminal::Publish(Ok(_))),
+            "the waiting continue publishes its own result: {second:?}"
+        );
+        assert_eq!(
+            *calls.borrow(),
+            2,
+            "the waiting continue ran its own turn after the first one"
+        );
+    }
+
     #[tokio::test]
     async fn rest_peer_terminal_webhook_allows_running_target_when_capacity_full() {
         let temp = TempDir::new().unwrap();

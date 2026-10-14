@@ -2722,6 +2722,22 @@ pub async fn handle_mob_turn_start(
         Ok(p) => p,
         Err(resp) => return resp.with_id(id),
     };
+    // A member's build settings are fixed when it is spawned: a turn cannot
+    // change them, so they are refused with the parse, before the mob is
+    // resolved.
+    if let Some(setting) = super::turn::first_build_setting_on_turn(
+        mob_params.max_tokens.is_some(),
+        mob_params.output_schema.is_some(),
+        mob_params.structured_output_retries.is_some(),
+    ) {
+        return invalid_params(
+            id,
+            super::turn::build_setting_on_turn_message(
+                setting,
+                "a mob member's build settings are fixed when it is spawned",
+            ),
+        );
+    }
     let mob_id = match parse_mob_id(id.clone(), &mob_params.mob_id) {
         Ok(m) => m,
         Err(resp) => return resp,

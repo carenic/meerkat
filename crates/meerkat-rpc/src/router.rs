@@ -211,7 +211,13 @@ pub fn compose_rpc_mob_state(
     if let Some(acceptor) = controlling_acceptor {
         state = state.with_controlling_acceptor(acceptor);
     }
-    let state = Arc::new(state);
+    // Shared with its self-reference installed, as every other host shares
+    // it: each mob create and resume then runs to its managed-set insertion
+    // as the state's own task, so a caller cancelled or disconnected
+    // mid-create cannot leave a started mob (and its durable store) outside
+    // the managed set; restoration can also schedule its own council and
+    // fork_off recovery.
+    let state = state.into_shared();
     // fork_off and council outcomes are submitted durably to this runtime's
     // delivery owner, which resolves members and confirms jobs through it.
     if let Err(error) = state.bind_continuations(
@@ -13086,6 +13092,440 @@ mod tests {
             .unwrap();
 
         assert_eq!(error_code(&turn_resp), error::REQUEST_CANCELLED);
+    }
+
+    /// The build settings a turn cannot change, with a valid value each.
+    fn turn_build_settings() -> [(&'static str, serde_json::Value); 3] {
+        [
+            ("max_tokens", serde_json::json!(1024)),
+            ("output_schema", serde_json::json!({"type": "object"})),
+            ("structured_output_retries", serde_json::json!(5)),
+        ]
+    }
+
+    /// `turn/start` refuses a build setting while it parses its params,
+    /// before any session work: even an unknown session gets the typed
+    /// invalid-params refusal that names the setting, not a session lookup
+    /// result or a refusal that only arrives after the session was touched.
+    #[tokio::test]
+    async fn turn_start_refuses_build_settings_before_session_work() {
+        let (router, _notif_rx) = test_router().await;
+        let unknown_session = SessionId::new().to_string();
+        for (field, value) in turn_build_settings() {
+            let mut params = serde_json::json!({
+                "session_id": &unknown_session,
+                "prompt": "Follow up"
+            });
+            params[field] = value;
+            let response = router
+                .dispatch(make_request("turn/start", params))
+                .await
+                .unwrap();
+            let error = response
+                .error
+                .as_ref()
+                .unwrap_or_else(|| panic!("turn/start must refuse {field}"));
+            assert_eq!(
+                error.code,
+                error::INVALID_PARAMS,
+                "{field} is refused as invalid params while parsing: {error:?}"
+            );
+            assert!(
+                error.message.contains(field) && error.message.contains("session/create"),
+                "the refusal names {field} and where to set it: {error:?}"
+            );
+        }
+    }
+
+    /// `mob/turn_start` refuses a build setting as soon as its params are
+    /// parsed, before it resolves the mob or the member.
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn mob_turn_start_refuses_build_settings_before_member_resolution() {
+        let (router, _notif_rx) = test_router().await;
+        for (field, value) in turn_build_settings() {
+            let mut params = serde_json::json!({
+                "mob_id": "no-such-mob",
+                "agent_identity": "worker-1",
+                "prompt": "Follow up"
+            });
+            params[field] = value;
+            let response = router
+                .dispatch(make_request("mob/turn_start", params))
+                .await
+                .unwrap();
+            let error = response
+                .error
+                .as_ref()
+                .unwrap_or_else(|| panic!("mob/turn_start must refuse {field}"));
+            assert_eq!(
+                error.code,
+                error::INVALID_PARAMS,
+                "{field} is refused as invalid params before member resolution: {error:?}"
+            );
+            assert!(
+                error.message.contains(field),
+                "the refusal names {field}: {error:?}"
+            );
+        }
+    }
+
+    /// Answers the first provider call and fails every later one with a
+    /// non-retryable provider error.
+    struct FailAfterFirstLlmClient {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmClient for FailAfterFirstLlmClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a meerkat_client::LlmRequest,
+        ) -> Pin<
+            Box<dyn futures::Stream<Item = Result<meerkat_client::LlmEvent, LlmError>> + Send + 'a>,
+        > {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                return Box::pin(stream::iter(vec![Err(LlmError::InvalidRequest {
+                    message: "synthetic provider refusal".to_string(),
+                })]));
+            }
+            Box::pin(stream::iter(vec![
+                Ok(meerkat_client::LlmEvent::TextDelta {
+                    delta: "first turn succeeds".to_string(),
+                    meta: None,
+                }),
+                Ok(meerkat_client::LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        meerkat_core::Provider::Anthropic,
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
+                }),
+                Ok(meerkat_client::LlmEvent::Done {
+                    outcome: meerkat_client::LlmDoneOutcome::Success {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                }),
+            ]))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Anthropic
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// A turn whose provider call fails reports the canonical provider-error
+    /// code, as the documented session-error mapping does for the same
+    /// cause, with the typed turn error kept in `data.error`; never the
+    /// generic internal error.
+    #[tokio::test]
+    async fn turn_start_provider_failure_reports_provider_error_code() {
+        let (router, _notif_rx) = test_router_with_llm(Arc::new(FailAfterFirstLlmClient {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }))
+        .await;
+        let created = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({ "prompt": "the first turn succeeds" }),
+            ))
+            .await
+            .unwrap();
+        let session_id = result_value(&created)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let failed = router
+            .dispatch(make_request(
+                "turn/start",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "prompt": "this turn's provider call fails"
+                }),
+            ))
+            .await
+            .unwrap();
+        let error = failed
+            .error
+            .as_ref()
+            .expect("a failed provider call fails the turn");
+        assert_eq!(
+            error.code,
+            error::PROVIDER_ERROR,
+            "a provider failure reports PROVIDER_ERROR: {error:?}"
+        );
+        let data = error.data.as_ref().expect("typed turn error data");
+        assert_eq!(data["error"]["kind"], "llm_failure", "{data}");
+    }
+
+    /// Holds every provider call until the test releases it, and records the
+    /// transcript each call saw.
+    struct GatedLlmClient {
+        calls: Arc<tokio::sync::watch::Sender<usize>>,
+        release: Arc<tokio::sync::Semaphore>,
+        requests: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for GatedLlmClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a meerkat_client::LlmRequest,
+        ) -> Pin<
+            Box<dyn futures::Stream<Item = Result<meerkat_client::LlmEvent, LlmError>> + Send + 'a>,
+        > {
+            self.requests
+                .lock()
+                .expect("recorded requests lock poisoned")
+                .push(serde_json::to_string(&request.messages).expect("serialize messages"));
+            self.calls.send_modify(|calls| *calls += 1);
+            let release = Arc::clone(&self.release);
+            let usage = meerkat_core::TurnUsage::host_declared(
+                meerkat_core::Provider::Anthropic,
+                &request.model,
+                meerkat_core::Usage::default(),
+            );
+            Box::pin(stream::unfold(0u8, move |state| {
+                let release = Arc::clone(&release);
+                let usage = usage.clone();
+                async move {
+                    match state {
+                        0 => {
+                            release
+                                .acquire()
+                                .await
+                                .expect("release semaphore stays open")
+                                .forget();
+                            Some((
+                                Ok(meerkat_client::LlmEvent::TextDelta {
+                                    delta: "gated reply".to_string(),
+                                    meta: None,
+                                }),
+                                1,
+                            ))
+                        }
+                        1 => Some((Ok(meerkat_client::LlmEvent::UsageUpdate { usage }), 2)),
+                        2 => Some((
+                            Ok(meerkat_client::LlmEvent::Done {
+                                outcome: meerkat_client::LlmDoneOutcome::Success {
+                                    stop_reason: StopReason::EndTurn,
+                                },
+                            }),
+                            3,
+                        )),
+                        _ => None,
+                    }
+                }
+            }))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Anthropic
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// A `turn/start` that arrives while another turn on the same session is
+    /// running is queued behind it, not refused with SESSION_BUSY: it runs
+    /// once the running turn finishes and returns its own result.
+    #[tokio::test]
+    async fn turn_start_while_a_turn_runs_queues_instead_of_session_busy() {
+        // Bounds a failure only; the passing path never waits for it.
+        const FAILURE_BOUND: Duration = Duration::from_secs(30);
+        let calls = Arc::new(tokio::sync::watch::channel(0usize).0);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let (router, _notif_rx) = test_router_with_llm(Arc::new(GatedLlmClient {
+            calls: Arc::clone(&calls),
+            release: Arc::clone(&release),
+            requests: Arc::clone(&requests),
+        }))
+        .await;
+        let created = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({ "prompt": "seed", "initial_turn": "deferred" }),
+            ))
+            .await
+            .unwrap();
+        let session_id = result_value(&created)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let turn = |id: i64, prompt: &'static str| {
+            let router = router.clone();
+            let session_id = session_id.clone();
+            tokio::spawn(async move {
+                let mut request = make_request(
+                    "turn/start",
+                    serde_json::json!({ "session_id": session_id, "prompt": prompt }),
+                );
+                request.id = Some(RpcId::Num(id));
+                router.dispatch(request).await.expect("turn/start response")
+            })
+        };
+        let mut seen = calls.subscribe();
+
+        let first = turn(1, "first running turn");
+        tokio::time::timeout(FAILURE_BOUND, seen.wait_for(|calls| *calls >= 1))
+            .await
+            .expect("the first turn reaches the provider")
+            .expect("call counter stays open");
+
+        let mut second = turn(2, "second queued turn");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut second)
+                .await
+                .is_err(),
+            "a turn/start on a running session waits behind the running turn \
+             instead of answering at once (no SESSION_BUSY)"
+        );
+
+        release.add_permits(1);
+        let first = tokio::time::timeout(FAILURE_BOUND, first)
+            .await
+            .expect("the first turn finishes once released")
+            .expect("first turn task");
+        assert!(first.error.is_none(), "first turn: {:?}", first.error);
+        tokio::time::timeout(FAILURE_BOUND, seen.wait_for(|calls| *calls >= 2))
+            .await
+            .expect("the queued turn runs after the first one")
+            .expect("call counter stays open");
+        release.add_permits(1);
+        let second = tokio::time::timeout(FAILURE_BOUND, second)
+            .await
+            .expect("the queued turn finishes once released")
+            .expect("second turn task");
+        assert!(
+            second.error.is_none(),
+            "the queued turn returns its own result, not SESSION_BUSY: {:?}",
+            second.error
+        );
+        assert_eq!(result_value(&second)["session_id"], session_id.as_str());
+
+        let requests = requests.lock().expect("recorded requests lock poisoned");
+        assert_eq!(
+            requests.len(),
+            2,
+            "one provider call per turn: {requests:?}"
+        );
+        assert!(
+            requests[0].contains("first running turn")
+                && !requests[0].contains("second queued turn"),
+            "the first call sees only the first turn: {}",
+            requests[0]
+        );
+        assert!(
+            requests[1].contains("second queued turn"),
+            "the second call is the queued turn: {}",
+            requests[1]
+        );
+    }
+
+    /// A `mob/create` whose RPC handler is dropped mid-creation (a cancelled
+    /// or disconnected caller) still registers its mob. The composed RPC mob
+    /// state runs each create as its own task, so a create that already
+    /// wrote its durable store is never left outside the managed set.
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn mob_create_dropped_mid_creation_still_registers_its_mob() {
+        // Bounds a failure only; the passing path never waits for it.
+        const FAILURE_BOUND: Duration = Duration::from_secs(10);
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+        let config_store = meerkat_core::TaggedConfigStore::new(
+            Arc::new(MemoryConfigStore::new(
+                anthropic_test_config(),
+                meerkat_models::canonical(),
+            )),
+            meerkat_core::ConfigStoreMetadata {
+                realm_id: None,
+                instance_id: None,
+                backend: None,
+                resolved_paths: Some(meerkat_core::ConfigResolvedPaths {
+                    root: root_path.display().to_string(),
+                    manifest_path: root_path.join("realm.toml").display().to_string(),
+                    config_path: root_path.join("config.toml").display().to_string(),
+                    sessions_sqlite_path: None,
+                    sessions_jsonl_dir: root_path.join("sessions").display().to_string(),
+                }),
+            },
+        );
+        let (router, _notif_rx) = test_router_with_config_store(Arc::new(config_store)).await;
+        let mob_id = "dropped-mid-create";
+        let store = root_path.join("mobs").join(format!("mob--{mob_id}.db"));
+
+        let mut create = Box::pin(router.dispatch(make_request(
+            "mob/create",
+            serde_json::json!({
+                "definition": {
+                    "id": mob_id,
+                    "profiles": { "worker": { "model": "claude-sonnet-4-5" } }
+                }
+            }),
+        )));
+        // Drive the create one step at a time until it has written its
+        // durable store, then drop it there, mid-creation.
+        let deadline = tokio::time::Instant::now() + FAILURE_BOUND;
+        loop {
+            if let std::task::Poll::Ready(response) = futures::poll!(create.as_mut()) {
+                panic!("the create finished before it could be dropped mid-creation: {response:?}");
+            }
+            if store.exists() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create never reached its durable store at {}",
+                store.display()
+            );
+            tokio::task::yield_now().await;
+        }
+        drop(create);
+
+        let registered = tokio::time::timeout(FAILURE_BOUND, async {
+            loop {
+                let listed = router
+                    .dispatch(make_request("mob/list", serde_json::json!({})))
+                    .await
+                    .unwrap();
+                if result_value(&listed)["mobs"]
+                    .as_array()
+                    .is_some_and(|mobs| mobs.iter().any(|mob| mob["mob_id"] == mob_id))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            registered.is_ok(),
+            "a create dropped mid-creation left its store at {} without a managed mob",
+            store.display()
+        );
     }
 
     /// 8. `turn/start` emits notifications via the notification sink.

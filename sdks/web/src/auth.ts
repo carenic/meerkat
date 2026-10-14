@@ -346,7 +346,11 @@ export class Auth {
     return parseWireMcpAuthStatus(result);
   }
 
-  /** Remove an MCP server target's stored credential (nothing is revoked at the provider). */
+  /**
+   * Disconnect an MCP server target: retire the login attempt pending for
+   * it and remove its stored credential (nothing is revoked at the
+   * provider). `cleared` is true even when no credential was stored.
+   */
   async mcpLogout(mcp: WireMcpAuthTarget): Promise<WireMcpLoggedOut> {
     const params: AuthLogoutParams = { mcp };
     const result = await this.transport.request<AuthLogoutParams, WireAuthLogoutResult>(

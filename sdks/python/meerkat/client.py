@@ -1123,9 +1123,15 @@ class MeerkatClient:
         *,
         oauth_account: str | None = None,
     ) -> dict[str, Any]:
-        """Remove an MCP server's stored credential via `auth/logout`:
-        `{mcp, cleared}`. Nothing is revoked at the provider, and a pending
-        login attempt is unaffected."""
+        """Disconnect an MCP server via `auth/logout`: `{mcp, cleared}`.
+
+        `server_name` and `server_url` name a server configured for this
+        host; `oauth_account`, when given, must equal its configured
+        account. Logout retires the login attempt pending for the server,
+        removes its stored credential, and stops offering the server to
+        this runtime's sessions until a later login. Nothing is revoked at
+        the provider, and `cleared` is true even when no credential was
+        stored."""
         return await self._request(
             "auth/logout",
             {"mcp": _mcp_auth_target(server_name, server_url, oauth_account)},

@@ -2172,17 +2172,61 @@ impl From<BudgetLimitsInput> for meerkat_core::BudgetLimits {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+/// Per-turn tool overlay of `meerkat_resume`: the public overlay the other
+/// surfaces take ([`meerkat_core::service::PublicTurnToolOverlay`]), with the
+/// MCP inputs' tolerance of keys they do not know. An unknown key is ignored
+/// and logged, never forwarded, so a tool call cannot supply host-only
+/// dispatch context.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct TurnToolOverlayInput {
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
     #[serde(default)]
     pub blocked_tools: Option<Vec<String>>,
+    /// Tool choice for this turn's provider calls, in order: entry `k`
+    /// applies to the turn's `k`-th call, and every call after the plan is
+    /// exhausted is `auto`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_choice_plan: Vec<meerkat_core::lifecycle::run_primitive::ToolChoice>,
+}
+
+impl<'de> Deserialize<'de> for TurnToolOverlayInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// Take `key` out of `object`; absent and `null` are the default.
+        fn take<T, E>(object: &mut serde_json::Map<String, Value>, key: &str) -> Result<T, E>
+        where
+            T: serde::de::DeserializeOwned + Default,
+            E: serde::de::Error,
+        {
+            match object.remove(key) {
+                None | Some(Value::Null) => Ok(T::default()),
+                Some(value) => serde_json::from_value(value)
+                    .map_err(|error| E::custom(format!("turn_tool_overlay.{key}: {error}"))),
+            }
+        }
+
+        let mut object = serde_json::Map::<String, Value>::deserialize(deserializer)?;
+        let overlay = Self {
+            allowed_tools: take(&mut object, "allowed_tools")?,
+            blocked_tools: take(&mut object, "blocked_tools")?,
+            tool_choice_plan: take(&mut object, "tool_choice_plan")?,
+        };
+        if !object.is_empty() {
+            tracing::warn!(
+                ignored_keys = ?object.keys().collect::<Vec<_>>(),
+                "meerkat_resume ignored unknown turn_tool_overlay keys"
+            );
+        }
+        Ok(overlay)
+    }
 }
 
 impl From<TurnToolOverlayInput> for meerkat_core::service::TurnToolOverlay {
     fn from(value: TurnToolOverlayInput) -> Self {
-        Self {
+        meerkat_core::service::PublicTurnToolOverlay {
             allowed_tools: value.allowed_tools.map(|names| {
                 names
                     .into_iter()
@@ -2195,8 +2239,9 @@ impl From<TurnToolOverlayInput> for meerkat_core::service::TurnToolOverlay {
                     .map(meerkat_core::ToolName::from)
                     .collect()
             }),
-            ..Default::default()
+            tool_choice_plan: value.tool_choice_plan,
         }
+        .into()
     }
 }
 
@@ -4798,6 +4843,7 @@ async fn handle_meerkat_resume(
         let prompt_for_plan = prompt.clone();
         let system_prompt_for_plan = input.system_prompt.clone();
         let transient_turn_context_for_plan = input.transient_turn_context.clone();
+        let turn_tool_overlay_for_plan = input.turn_tool_overlay.clone();
         let event_tx_for_plan = event_tx.clone();
         let skill_references_for_plan = skill_references.clone();
         let requested_callback_tools_for_plan = requested_callback_tools.clone();
@@ -4855,6 +4901,14 @@ async fn handle_meerkat_resume(
                         .initial_turn_metadata
                         .get_or_insert_with(Default::default)
                         .transient_turn_context = Some(context);
+                }
+                // The rebuilt agent's first turn is this resume's turn: it
+                // carries the per-turn overlay as the live path does.
+                if let Some(overlay) = turn_tool_overlay_for_plan {
+                    build
+                        .initial_turn_metadata
+                        .get_or_insert_with(Default::default)
+                        .turn_tool_overlay = Some(overlay.into());
                 }
                 let request = CreateSessionRequest {
                     injected_context: Vec::new(),
@@ -5719,6 +5773,15 @@ mod tests {
     }
 
     async fn state_with_persisted_session() -> (MeerkatMcpState, String) {
+        state_with_persisted_session_and_llm(Arc::new(TestClient::for_provider(
+            Provider::Anthropic,
+        )))
+        .await
+    }
+
+    async fn state_with_persisted_session_and_llm(
+        llm_client: Arc<dyn LlmClient>,
+    ) -> (MeerkatMcpState, String) {
         let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
         let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
             Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
@@ -5726,7 +5789,7 @@ mod tests {
             Arc::clone(&store),
             Arc::clone(&runtime_store),
             None,
-            Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
+            Some(llm_client),
         )
         .await;
         let mut session = Session::new();
@@ -6118,6 +6181,355 @@ mod tests {
                 .count(),
             1,
             "live admission must append the explicit System exactly once"
+        );
+    }
+
+    /// Records the tool choice of every provider call.
+    struct ToolChoiceRecordingLlmClient {
+        provider: meerkat_core::Provider,
+        tool_choices: Arc<std::sync::Mutex<Vec<meerkat_core::ToolChoice>>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for ToolChoiceRecordingLlmClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a LlmRequest,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>> {
+            self.tool_choices
+                .lock()
+                .expect("tool choice log lock poisoned")
+                .push(request.tool_choice.clone());
+            Box::pin(stream::iter(vec![
+                Ok(LlmEvent::TextDelta {
+                    delta: "ok".to_string(),
+                    meta: None,
+                }),
+                Ok(LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        provider_for_successful_mcp_test_model(&request.model),
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
+                }),
+                Ok(LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Success {
+                        stop_reason: meerkat_core::StopReason::EndTurn,
+                    },
+                }),
+            ]))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            self.provider
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// A state with one live session whose agent runs on `llm_client`.
+    async fn state_with_live_session(
+        llm_client: Arc<dyn LlmClient>,
+    ) -> (MeerkatMcpState, meerkat::SessionId) {
+        let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let state = MeerkatMcpState::new_with_store_options_and_llm(
+            store,
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+            None,
+            Some(Arc::new(TestClient::default())),
+        )
+        .await;
+        let session = Session::new();
+        let session_id = session.id().clone();
+        materialize_test_mcp_fixture(
+            &state,
+            &session_id,
+            McpActorMaterializationMode::Fresh,
+            move |bindings| {
+                let router = Arc::new(meerkat_mcp::McpRouterAdapter::new(
+                    McpRouter::new_with_surface_handle(Arc::clone(
+                        bindings.external_tool_surface(),
+                    )),
+                ));
+                let router_tools: Arc<dyn AgentToolDispatcher> = router.clone();
+                let mut request = mock_deferred_materialization_request(session, bindings, None);
+                let build = request.build.get_or_insert_with(Default::default);
+                build.external_tools = Some(router_tools);
+                build.llm_client_override =
+                    Some(meerkat::encode_llm_client_override_for_service(llm_client));
+                (request, router)
+            },
+        )
+        .await;
+        (state, session_id)
+    }
+
+    /// `meerkat_resume` takes the same per-turn overlay as the other
+    /// surfaces: its `tool_choice_plan` reaches the turn's provider call on a
+    /// live session instead of being dropped.
+    #[tokio::test]
+    async fn live_resume_forwards_the_turn_tool_choice_plan() {
+        let tool_choices = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (state, session_id) = state_with_live_session(Arc::new(ToolChoiceRecordingLlmClient {
+            provider: Provider::Other,
+            tool_choices: Arc::clone(&tool_choices),
+        }))
+        .await;
+        let attachment_before = state
+            .runtime_adapter
+            .current_executor_attachment_witness(&session_id)
+            .await
+            .expect("live fixture has an exact attachment");
+
+        handle_tools_call(
+            &state,
+            "meerkat_resume",
+            &json!({
+                "session_id": session_id.to_string(),
+                "prompt": "Answer without calling a tool",
+                "turn_tool_overlay": { "tool_choice_plan": [{ "mode": "none" }] }
+            }),
+        )
+        .await
+        .expect("live resume with a tool choice plan should run");
+
+        assert_eq!(
+            state
+                .runtime_adapter
+                .current_executor_attachment_witness(&session_id)
+                .await,
+            Some(attachment_before),
+            "the overlay rides the live turn without an actor rebuild"
+        );
+        assert_eq!(
+            tool_choices
+                .lock()
+                .expect("tool choice log lock poisoned")
+                .first(),
+            Some(&meerkat_core::ToolChoice::None),
+            "the plan's first entry is the first provider call's tool choice"
+        );
+    }
+
+    /// A resume that rebuilds the session's agent (here a cold session) keeps
+    /// the per-turn overlay: its `tool_choice_plan` reaches the turn's first
+    /// provider call.
+    #[tokio::test]
+    async fn cold_resume_forwards_the_turn_tool_overlay() {
+        let tool_choices = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (state, session_id) =
+            state_with_persisted_session_and_llm(Arc::new(ToolChoiceRecordingLlmClient {
+                provider: Provider::Anthropic,
+                tool_choices: Arc::clone(&tool_choices),
+            }))
+            .await;
+
+        let result = timeout(
+            NO_DEADLOCK_BOUND,
+            Box::pin(handle_tools_call(
+                &state,
+                "meerkat_resume",
+                &json!({
+                    "session_id": session_id,
+                    "prompt": "Answer without calling a tool",
+                    "turn_tool_overlay": { "tool_choice_plan": [{ "mode": "none" }] }
+                }),
+            )),
+        )
+        .await
+        .expect("cold resume with an overlay must not deadlock");
+        assert!(
+            result.is_ok()
+                || result.as_ref().is_err_and(|error| {
+                    error
+                        .message
+                        .contains("failed to update peer ingress context")
+                }),
+            "cold resume must reach its post-completion boundary: {result:?}"
+        );
+        assert_eq!(
+            tool_choices
+                .lock()
+                .expect("tool choice log lock poisoned")
+                .first(),
+            Some(&meerkat_core::ToolChoice::None),
+            "the rebuilt turn keeps the overlay's tool choice plan"
+        );
+    }
+
+    /// Unknown overlay keys stay tolerated, as on every other MCP input that
+    /// 0.9.0 clients may send: they are ignored (and logged), never
+    /// forwarded, and the known keys still apply.
+    #[test]
+    fn turn_tool_overlay_input_ignores_unknown_keys_and_keeps_known_ones() {
+        let input: MeerkatResumeInput = serde_json::from_value(json!({
+            "session_id": "unused",
+            "prompt": "x",
+            "turn_tool_overlay": {
+                "allowed_tools": ["shell"],
+                "tool_choice_plan": [{ "mode": "required" }],
+                "dispatch_context": { "trusted": true },
+                "allowed_tool": ["typo"]
+            }
+        }))
+        .expect("unknown overlay keys are tolerated");
+        let overlay = meerkat_core::service::TurnToolOverlay::from(
+            input.turn_tool_overlay.expect("overlay parsed"),
+        );
+        assert_eq!(
+            overlay.allowed_tools,
+            Some(vec![meerkat_core::ToolName::from("shell")])
+        );
+        assert_eq!(
+            overlay.tool_choice_plan,
+            vec![meerkat_core::ToolChoice::Required]
+        );
+        assert!(
+            overlay.dispatch_context.is_empty(),
+            "host-only dispatch context is never taken from a tool call"
+        );
+    }
+
+    /// Holds every provider call until the test releases it.
+    struct GatedLlmClient {
+        calls: Arc<tokio::sync::watch::Sender<usize>>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait]
+    impl LlmClient for GatedLlmClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a LlmRequest,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>> {
+            self.calls.send_modify(|calls| *calls += 1);
+            let release = Arc::clone(&self.release);
+            let usage = meerkat_core::TurnUsage::host_declared(
+                provider_for_successful_mcp_test_model(&request.model),
+                &request.model,
+                meerkat_core::Usage::default(),
+            );
+            Box::pin(stream::unfold(0u8, move |step| {
+                let release = Arc::clone(&release);
+                let usage = usage.clone();
+                async move {
+                    match step {
+                        0 => {
+                            release
+                                .acquire()
+                                .await
+                                .expect("release semaphore stays open")
+                                .forget();
+                            Some((
+                                Ok(LlmEvent::TextDelta {
+                                    delta: "ok".to_string(),
+                                    meta: None,
+                                }),
+                                1,
+                            ))
+                        }
+                        1 => Some((Ok(LlmEvent::UsageUpdate { usage }), 2)),
+                        2 => Some((
+                            Ok(LlmEvent::Done {
+                                outcome: LlmDoneOutcome::Success {
+                                    stop_reason: meerkat_core::StopReason::EndTurn,
+                                },
+                            }),
+                            3,
+                        )),
+                        _ => None,
+                    }
+                }
+            }))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Other
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// A `meerkat_resume` that arrives while another turn on the same live
+    /// session is running waits behind it and then runs; it is not refused
+    /// as busy.
+    #[tokio::test]
+    async fn resume_while_a_turn_runs_waits_instead_of_busy() {
+        // Bounds a failure only; the passing path never waits for it.
+        const FAILURE_BOUND: Duration = Duration::from_secs(30);
+        let calls = Arc::new(tokio::sync::watch::channel(0usize).0);
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (state, session_id) = state_with_live_session(Arc::new(GatedLlmClient {
+            calls: Arc::clone(&calls),
+            release: Arc::clone(&release),
+        }))
+        .await;
+        let state = Arc::new(state);
+        let resume = |prompt: &'static str| {
+            let state = Arc::clone(&state);
+            let session_id = session_id.to_string();
+            tokio::spawn(async move {
+                Box::pin(handle_tools_call(
+                    &state,
+                    "meerkat_resume",
+                    &json!({ "session_id": session_id, "prompt": prompt }),
+                ))
+                .await
+            })
+        };
+        let mut seen = calls.subscribe();
+
+        let first = resume("first running turn");
+        timeout(FAILURE_BOUND, seen.wait_for(|calls| *calls >= 1))
+            .await
+            .expect("the first resume reaches the provider")
+            .expect("call counter stays open");
+        let mut second = resume("second resume");
+        assert!(
+            timeout(Duration::from_millis(300), &mut second)
+                .await
+                .is_err(),
+            "a resume on a running session waits behind the running turn \
+             instead of answering at once"
+        );
+
+        release.add_permits(1);
+        let first = timeout(FAILURE_BOUND, first)
+            .await
+            .expect("the first resume finishes once released")
+            .expect("first resume task");
+        assert!(first.is_ok(), "first resume: {:?}", first.err());
+        timeout(FAILURE_BOUND, seen.wait_for(|calls| *calls >= 2))
+            .await
+            .expect("the waiting resume runs its turn after the first one")
+            .expect("call counter stays open");
+        release.add_permits(1);
+        let second = timeout(FAILURE_BOUND, second)
+            .await
+            .expect("the waiting resume finishes once released")
+            .expect("second resume task");
+        assert!(
+            second.is_ok(),
+            "the waiting resume returns its own result: {:?}",
+            second.err()
         );
     }
 
