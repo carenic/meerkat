@@ -8,6 +8,7 @@
 )]
 
 mod cli_parse;
+mod exit_status;
 #[cfg(feature = "mcp")]
 mod mcp;
 #[cfg(all(
@@ -96,10 +97,10 @@ use std::time::Duration;
 use tokio::process::Command as TokioCommand;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Exit codes as per DESIGN.md §12
+/// Exit codes as per DESIGN.md §12. A failed command with a typed error
+/// exits with its public code's `cli_exit_code()` (see [`exit_status`]).
 const EXIT_SUCCESS: u8 = 0;
 const EXIT_ERROR: u8 = 1;
-const EXIT_BUDGET_EXHAUSTED: u8 = 2;
 /// Usage errors mirror clap's argument-error exit code.
 const EXIT_USAGE: u8 = 2;
 
@@ -284,9 +285,9 @@ impl CliOutputPipeline {
 fn accumulate_anyhow_error(slot: &mut Option<anyhow::Error>, err: anyhow::Error) {
     match slot.take() {
         Some(existing) => {
-            *slot = Some(anyhow::anyhow!(
-                "{existing}; additionally failed during shutdown: {err}"
-            ));
+            // The first failure keeps its typed owner (and so its exit code).
+            let message = format!("{existing}; additionally failed during shutdown: {err}");
+            *slot = Some(existing.context(message));
         }
         None => {
             *slot = Some(err);
@@ -362,8 +363,12 @@ fn completion_outcome_to_cli_runtime_turn_result(
                 pending_tool_calls,
             }))
         }
+        // Typed as the shared completion projection types it, so a
+        // cancelled turn exits with the request-cancelled code.
         meerkat_runtime::completion::CompletionOutcome::Cancelled => {
-            Err(anyhow::anyhow!("request cancelled"))
+            Err(exit_status::typed_failure(AgentError::Cancelled, |_| {
+                "request cancelled".to_string()
+            }))
         }
         meerkat_runtime::completion::CompletionOutcome::Abandoned { reason, .. } => {
             Err(anyhow::anyhow!("turn abandoned: {reason}"))
@@ -629,9 +634,12 @@ where
         (Ok(result), Ok(())) => Ok(result),
         (Ok(_), Err(shutdown_err)) => Err(shutdown_err),
         (Err(turn_err), Ok(())) => Err(turn_err),
-        (Err(turn_err), Err(shutdown_err)) => Err(anyhow::anyhow!(
-            "{turn_err}; additionally failed during CLI shutdown: {shutdown_err}"
-        )),
+        (Err(turn_err), Err(shutdown_err)) => {
+            // The turn failure keeps its typed owner (and so its exit code).
+            let message =
+                format!("{turn_err}; additionally failed during CLI shutdown: {shutdown_err}");
+            Err(turn_err.context(message))
+        }
     }
 }
 
@@ -3983,10 +3991,7 @@ async fn cli_main() -> anyhow::Result<ExitCode> {
         }
         return Ok(match handle_storage_command(command, &cli).await {
             Ok(()) => ExitCode::from(EXIT_SUCCESS),
-            Err(e) => {
-                eprintln!("Error: {e}");
-                ExitCode::from(EXIT_ERROR)
-            }
+            Err(e) => exit_status::report_failure(&e),
         });
     }
 
@@ -3999,8 +4004,7 @@ async fn cli_main() -> anyhow::Result<ExitCode> {
     if let Some(model) = cli.default_model.as_deref()
         && let Err(e) = handle_set_default_model(model, &cli_scope).await
     {
-        eprintln!("Error: {e}");
-        return Ok(ExitCode::from(EXIT_ERROR));
+        return Ok(exit_status::report_failure(&e));
     }
     let Some(command) = cli.command else {
         if cli.default_model.is_some() {
@@ -4248,34 +4252,11 @@ async fn cli_main() -> anyhow::Result<ExitCode> {
         }
     };
 
-    // Map result to exit code
+    // Map result to exit code: a typed failure exits with its public code's
+    // `cli_exit_code()` (§17.4 mob codes included), anything else with 1.
     Ok(match result {
         Ok(()) => ExitCode::from(EXIT_SUCCESS),
-        Err(e) => {
-            // Check if it's a budget exhaustion error
-            if let Some(agent_err) = e.downcast_ref::<AgentError>()
-                && agent_err.is_graceful()
-            {
-                // Budget exhausted - this is a graceful termination
-                eprintln!("Budget exhausted: {agent_err}");
-                return Ok(ExitCode::from(EXIT_BUDGET_EXHAUSTED));
-            }
-            // §17.4 typed exit path (mob verb family only): the four
-            // console codes exit 45-48 with one typed `detail:` line
-            // rendered from the typed fields, never a display string.
-            #[cfg(feature = "mob")]
-            if let Some(code) = mob_exit_code(&e) {
-                eprintln!("Error: {e}");
-                if let Some(detail) = mob_wire_detail(&e)
-                    && let Ok(json) = detail.detail_value()
-                {
-                    eprintln!("detail: {json}");
-                }
-                return Ok(ExitCode::from(code));
-            }
-            eprintln!("Error: {e}");
-            ExitCode::from(EXIT_ERROR)
-        }
+        Err(e) => exit_status::report_failure(&e),
     })
 }
 
@@ -10320,13 +10301,15 @@ fn runtime_accept_failure(
     error: meerkat_runtime::RuntimeDriverError,
     route_hint: &StockRouteHint,
 ) -> anyhow::Error {
-    match (route_hint, &error) {
-        (Some(hint), meerkat_runtime::RuntimeDriverError::InputRefused { .. }) => anyhow::anyhow!(
+    let message = match (route_hint, &error) {
+        (Some(hint), meerkat_runtime::RuntimeDriverError::InputRefused { .. }) => format!(
             "runtime accept failed: {error}\nInformation only: if this refusal is due to the \
              controller route, {hint}"
         ),
-        _ => anyhow::anyhow!("runtime accept failed: {error}"),
-    }
+        _ => format!("runtime accept failed: {error}"),
+    };
+    // Kept typed: a refused or not-ready input exits with its public code.
+    exit_status::typed_failure(error, |_| message)
 }
 
 /// Admit a governed prompt's original after the runtime accepted its input.
@@ -12979,7 +12962,9 @@ async fn build_deploy_mob_session_service(
 fn session_err_to_anyhow(e: meerkat_core::service::SessionError) -> anyhow::Error {
     match e {
         meerkat_core::service::SessionError::Agent(agent_err) => anyhow::Error::from(agent_err),
-        other => anyhow::anyhow!("Session service error: {other}"),
+        other => {
+            exit_status::typed_failure(other, |other| format!("Session service error: {other}"))
+        }
     }
 }
 
@@ -13025,7 +13010,9 @@ async fn resolve_flexible_session_id(
                     labels: None,
                 })
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to list sessions: {e}"))?;
+                .map_err(|e| {
+                    exit_status::typed_failure(e, |e| format!("Failed to list sessions: {e}"))
+                })?;
             return sessions
                 .get(offset)
                 .map(|s| s.session_id.clone())
@@ -13073,7 +13060,9 @@ async fn resolve_flexible_session_id(
                 labels: None,
             })
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to list sessions: {e}"))?;
+            .map_err(|e| {
+                exit_status::typed_failure(e, |e| format!("Failed to list sessions: {e}"))
+            })?;
 
         let matches = find_session_matches_in_summaries(input, &sessions);
 
@@ -13661,7 +13650,9 @@ async fn run_agent(
                 .register_session_with_executor(session_id.clone(), executor)
                 .await
                 .map_err(|error| {
-                    anyhow::anyhow!("runtime executor registration failed: {error}")
+                    exit_status::typed_failure(error, |error| {
+                        format!("runtime executor registration failed: {error}")
+                    })
                 })?;
 
             #[cfg(feature = "comms")]
@@ -13721,7 +13712,9 @@ async fn run_agent(
                     .update_peer_ingress_context(&session_id, keep_alive, comms_rt)
                     .await
                     .map_err(|err| {
-                        anyhow::anyhow!("failed to update peer ingress context: {err}")
+                        exit_status::typed_failure(err, |err| {
+                            format!("failed to update peer ingress context: {err}")
+                        })
                     })?;
             }
 
@@ -14054,7 +14047,7 @@ async fn resume_session_with_llm_override(
             .load(&session_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to load session: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("Session not found: {session_id}"))?;
+            .ok_or_else(|| exit_status::session_not_found(&session_id))?;
         let message_count = session.messages().len();
         let stored_metadata = session
             .session_metadata()
@@ -14415,7 +14408,9 @@ async fn resume_session_with_llm_override(
                 .register_session_with_executor(session_id.clone(), executor)
                 .await
                 .map_err(|error| {
-                    anyhow::anyhow!("runtime executor registration failed: {error}")
+                    exit_status::typed_failure(error, |error| {
+                        format!("runtime executor registration failed: {error}")
+                    })
                 })?;
 
             #[cfg(feature = "comms")]
@@ -14486,7 +14481,9 @@ async fn resume_session_with_llm_override(
                     .update_peer_ingress_context(&session_id, keep_alive, comms_rt)
                     .await
                     .map_err(|err| {
-                        anyhow::anyhow!("failed to update peer ingress context: {err}")
+                        exit_status::typed_failure(err, |err| {
+                            format!("failed to update peer ingress context: {err}")
+                        })
                     })?;
             }
 
@@ -16435,10 +16432,9 @@ async fn list_sessions(
             },
         };
 
-        let sessions = service
-            .list(query)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to list sessions: {e}"))?;
+        let sessions = service.list(query).await.map_err(|e| {
+            exit_status::typed_failure(e, |e| format!("Failed to list sessions: {e}"))
+        })?;
 
         if sessions.is_empty() {
             println!("No sessions found.");
@@ -16741,8 +16737,8 @@ async fn show_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
         let session = service
             .load_authoritative_session(&session_id)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to load session: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("Session not found: {session_id}"))?;
+            .map_err(|e| exit_status::typed_failure(e, |e| format!("Failed to load session: {e}")))?
+            .ok_or_else(|| exit_status::session_not_found(&session_id))?;
 
         // Print session header
         println!("Session: {session_id}");
@@ -16869,7 +16865,9 @@ async fn delete_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
                     &session_id,
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to delete session: {e}"))?;
+                .map_err(|e| {
+                    exit_status::typed_failure(e, |e| format!("Failed to delete session: {e}"))
+                })?;
             } else {
                 service
                     .archive_with_machine_protocol(
@@ -16879,7 +16877,9 @@ async fn delete_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
                         ),
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("Failed to delete session: {e}"))?;
+                    .map_err(|e| {
+                        exit_status::typed_failure(e, |e| format!("Failed to delete session: {e}"))
+                    })?;
             }
         }
         #[cfg(not(feature = "mob"))]
@@ -16893,7 +16893,9 @@ async fn delete_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
                     ),
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to delete session: {e}"))?;
+                .map_err(|e| {
+                    exit_status::typed_failure(e, |e| format!("Failed to delete session: {e}"))
+                })?;
         }
 
         println!("Deleted session: {session_id}");
@@ -16918,10 +16920,9 @@ async fn interrupt_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()>
 
         let (config, _) = load_config(scope).await?;
         let (service, runtime_adapter) = build_cli_persistent_service(scope, config).await?;
-        service
-            .read(&session_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to interrupt session: {e}"))?;
+        service.read(&session_id).await.map_err(|e| {
+            exit_status::typed_failure(e, |e| format!("Failed to interrupt session: {e}"))
+        })?;
 
         let (result, conflict_state) = match runtime_adapter
             .hard_cancel_current_run(&session_id, "CLI session interrupt")
@@ -16968,7 +16969,11 @@ async fn interrupt_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()>
                 ),
                 Some(state),
             ),
-            Err(e) => return Err(anyhow::anyhow!("Failed to interrupt session: {e}")),
+            Err(e) => {
+                return Err(exit_status::typed_failure(e, |e| {
+                    format!("Failed to interrupt session: {e}")
+                }));
+            }
         };
 
         match result.map_err(|e| anyhow::anyhow!("Failed to classify interrupt result: {e}"))? {
@@ -16990,12 +16995,26 @@ async fn interrupt_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()>
                 );
                 Ok(())
             }
-            meerkat_runtime::UserInterruptPublicResult::NotFound => Err(anyhow::anyhow!(
-                "Failed to interrupt session: session not found"
-            )),
-            meerkat_runtime::UserInterruptPublicResult::SessionBusy => Err(anyhow::anyhow!(
-                "Failed to interrupt session: session is still being materialized"
-            )),
+            // Typed as JSON-RPC types them: session not found, session busy.
+            meerkat_runtime::UserInterruptPublicResult::NotFound => {
+                Err(exit_status::typed_failure(
+                    meerkat_core::SessionError::NotFound {
+                        id: session_id.clone(),
+                    },
+                    |_| "Failed to interrupt session: session not found".to_string(),
+                ))
+            }
+            meerkat_runtime::UserInterruptPublicResult::SessionBusy => {
+                Err(exit_status::typed_failure(
+                    meerkat_core::SessionError::Busy {
+                        id: session_id.clone(),
+                    },
+                    |_| {
+                        "Failed to interrupt session: session is still being materialized"
+                            .to_string()
+                    },
+                ))
+            }
             meerkat_runtime::UserInterruptPublicResult::Conflict => {
                 let message = match conflict_state {
                     Some(state) => {
@@ -17954,35 +17973,6 @@ where
     anyhow::Error::new(err)
 }
 
-/// The four-code console projection carried by a mob verb failure, when the
-/// error chain bottoms out in a mob-family error (§17.4).
-#[cfg(feature = "mob")]
-fn mob_wire_detail(e: &anyhow::Error) -> Option<meerkat_contracts::wire::WireMobErrorDetail> {
-    e.downcast_ref::<meerkat_mob::MobError>()
-        .and_then(meerkat_mob::MobError::wire_detail)
-        .or_else(|| {
-            e.downcast_ref::<meerkat_mob::MobRespawnError>()
-                .and_then(meerkat_mob::MobRespawnError::wire_detail)
-        })
-        .or_else(|| {
-            e.downcast_ref::<meerkat_mob_mcp::MobMcpDestroyError>()
-                .and_then(meerkat_mob_mcp::MobMcpDestroyError::wire_detail)
-        })
-}
-
-/// §17.4 typed exit path (DEC-P7B-11, ADJ-P7-7): exit codes 45-48 for the
-/// mob verb family ONLY — scoping is by construction, since only mob
-/// handler arms put mob-family errors into the chain via [`mob_anyhow`].
-/// Unmapped mob errors keep `EXIT_ERROR`. The pre-existing
-/// `EXIT_BUDGET_EXHAUSTED=2` vs `cli_exit_code(BudgetExhausted)=21`
-/// inconsistency is recorded and deliberately NOT changed (plan-pinned).
-#[cfg(feature = "mob")]
-fn mob_exit_code(e: &anyhow::Error) -> Option<u8> {
-    let detail = mob_wire_detail(e)?;
-    // 45..=48 always fit; try_from is the no-panic guard.
-    u8::try_from(detail.code().cli_exit_code()).ok()
-}
-
 /// Human host-roster row (grants-verb rendering precedent): the wire enum
 /// owns the snake_case phase spelling — rendered via serde, never a
 /// CLI-local vocabulary copy.
@@ -18169,76 +18159,6 @@ async fn handle_mob_live_command(
 mod mob_typed_exit_tests {
     use super::*;
 
-    /// T-B11: `mob_exit_code` maps exactly the four console codes —
-    /// ScopeDenied→45, HostUnavailable→46, StaleCursor→47, StaleFence→48 —
-    /// and nothing else; the typed `detail:` line renders
-    /// `{required, presented}` from the typed fields.
-    #[test]
-    fn mob_exit_code_maps_four_codes_only() {
-        let denied = mob_anyhow(meerkat_mob::MobError::ScopeDenied(
-            meerkat_mob::ScopeDenial {
-                required: meerkat_mob::machines::mob_machine::ControlScope::AdminHost,
-                presented: std::collections::BTreeSet::from([
-                    meerkat_mob::machines::mob_machine::ControlScope::List,
-                ]),
-            },
-        ));
-        assert_eq!(mob_exit_code(&denied), Some(45));
-
-        let timed_out = mob_anyhow(meerkat_mob::MobError::BridgeRequestTimedOut {
-            request_envelope_id: "env".to_string(),
-            timeout_ms: 30_000,
-        });
-        assert_eq!(mob_exit_code(&timed_out), Some(46));
-
-        let stale_cursor = mob_anyhow(meerkat_mob::MobError::StaleEventCursor {
-            after_cursor: 9,
-            latest_cursor: 4,
-        });
-        assert_eq!(mob_exit_code(&stale_cursor), Some(47));
-
-        let stale_fence = mob_anyhow(meerkat_mob::MobError::StaleFenceToken {
-            runtime_id: meerkat_mob::AgentRuntimeId::initial(meerkat_mob::AgentIdentity::from(
-                "worker",
-            )),
-            expected: meerkat_mob::FenceToken::new(2),
-            actual: meerkat_mob::FenceToken::new(1),
-        });
-        assert_eq!(mob_exit_code(&stale_fence), Some(48));
-
-        // Unmapped mob errors keep EXIT_ERROR (None here ⇒ 1 at the mapper).
-        let not_found = mob_anyhow(meerkat_mob::MobError::MobNotFound(
-            meerkat_mob::MobId::from("missing"),
-        ));
-        assert_eq!(mob_exit_code(&not_found), None);
-
-        // PeerOffline ≠ HostUnavailable — pinned non-mapping (§17.4).
-        let peer_offline = mob_anyhow(meerkat_mob::MobError::CommsError(
-            meerkat_core::comms::SendError::PeerOffline,
-        ));
-        assert_eq!(mob_exit_code(&peer_offline), None);
-
-        // Non-mob chains (incl. the budget path's AgentError) never route
-        // through the mob exit path.
-        assert_eq!(mob_exit_code(&anyhow::anyhow!("boom")), None);
-
-        // The respawn wrapper delegates.
-        let respawn = mob_anyhow(meerkat_mob::MobRespawnError::Mob(
-            meerkat_mob::MobError::BridgeRequestTimedOut {
-                request_envelope_id: "env-2".to_string(),
-                timeout_ms: 15_000,
-            },
-        ));
-        assert_eq!(mob_exit_code(&respawn), Some(46));
-
-        // The `detail:` line renders the typed pair, not a display string.
-        let detail = mob_wire_detail(&denied).expect("scope denial detail");
-        assert_eq!(
-            detail.detail_value().expect("detail serializes"),
-            serde_json::json!({ "required": "admin_host", "presented": ["list"] })
-        );
-    }
-
     #[derive(Clone)]
     struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -18376,7 +18296,7 @@ async fn run_pack_flow_foreground(
     let run_id = state
         .mob_run_flow(mob_id, flow_id, params)
         .await
-        .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
+        .map_err(|err| exit_status::typed_failure(err, |err| format!("mob run failed: {err}")))?;
     match select_pack_flow_terminal_or_shutdown(
         wait_for_terminal_flow_run(state, mob_id.as_str(), &run_id),
         shutdown_signal::wait_for_shutdown_signal(),
@@ -20229,7 +20149,7 @@ async fn execute_mob_run_pack(
             source_identity,
         )
         .await
-        .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
+        .map_err(|err| exit_status::typed_failure(err, |err| format!("mob run failed: {err}")))?;
 
     if invocation.detach {
         let Some(flow_id) = flow_id else {
@@ -20240,7 +20160,9 @@ async fn execute_mob_run_pack(
         let run_id = state
             .mob_run_flow(&mob_id, flow_id.clone(), params)
             .await
-            .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
+            .map_err(|err| {
+                exit_status::typed_failure(err, |err| format!("mob run failed: {err}"))
+            })?;
         let rendered = if invocation.json {
             serde_json::to_string_pretty(&serde_json::json!({
                 "mob_id": mob_id.to_string(),
@@ -20298,7 +20220,9 @@ async fn execute_mob_run_pack(
                 &objective,
             )
             .await
-            .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
+            .map_err(|err| {
+                exit_status::typed_failure(err, |err| format!("mob run failed: {err}"))
+            })?;
             if invocation.json {
                 serde_json::to_string_pretty(&serde_json::json!({
                     "mob_id": archive.definition.id.to_string(),
