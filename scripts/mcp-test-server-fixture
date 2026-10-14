@@ -18,7 +18,9 @@
 # - With `--if-needed <cargo package flags>` (`-p NAME`, `--workspace`,
 #   `--exclude NAME`; other flags such as `--features LIST` are ignored), it
 #   prints nothing and builds nothing unless a selected package dev-depends on
-#   mcp-test-server.
+#   mcp-test-server. A failing `cargo metadata` or package check is an error,
+#   never "not needed": skipping the build would leave the tests that need
+#   the fixture to fail later without the cause.
 #
 # Usage:
 #   MEERKAT_MCP_TEST_SERVER="$(scripts/mcp-test-server-fixture)"
@@ -33,7 +35,13 @@ cargo_bin="${CARGO:-$root/scripts/repo-cargo}"
 
 if [[ "${1:-}" == "--if-needed" ]]; then
   shift
-  "$cargo_bin" metadata --format-version=1 --no-deps | python3 -c '
+  metadata="$("$cargo_bin" metadata --format-version=1 --no-deps)" || {
+    status=$?
+    echo "mcp-test-server-fixture: cargo metadata failed (exit ${status})" >&2
+    exit "$status"
+  }
+  needed="$(
+    python3 -c '
 import json
 import sys
 
@@ -62,8 +70,21 @@ needed = any(
     )
     for package in packages
 )
-sys.exit(0 if needed else 1)
-' "$@" || exit 0
+print("yes" if needed else "no")
+' "$@" <<<"$metadata"
+  )" || {
+    status=$?
+    echo "mcp-test-server-fixture: the mcp-test-server package check failed (exit ${status})" >&2
+    exit "$status"
+  }
+  case "$needed" in
+    yes) ;;
+    no) exit 0 ;;
+    *)
+      echo "mcp-test-server-fixture: package check printed '${needed}', expected yes or no" >&2
+      exit 1
+      ;;
+  esac
 fi
 
 if [[ -n "${MEERKAT_MCP_TEST_SERVER:-}" ]]; then
