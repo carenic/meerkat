@@ -3091,6 +3091,8 @@ Standard JSON-RPC codes plus Meerkat-specific application codes:
 | -32001 | Session not found | Session ID does not exist |
 | -32002 | Session busy | Turn already in progress |
 | -32003 | Session not running | Session not in running state |
+| -32004 | Duplicate input | The request or input was already admitted; a deduplicated runtime input carries `data.existing_id` |
+| -32005 | Request cancelled | Cancelled before the response was published (see above) |
 | -32010 | Provider error | LLM provider issue (missing key, auth) |
 | -32011 | Budget exhausted | Resource limits reached |
 | -32012 | Hook denied | Hook blocked the operation |
@@ -3098,6 +3100,20 @@ Standard JSON-RPC codes plus Meerkat-specific application codes:
 | -32020 | Capability unavailable | Required capability not available |
 | -32021 | Skill not found | Requested skill does not exist |
 | -32022 | Skill resolution failed | Skill resolution error |
+| -32023 | Schedule not found | Schedule ID does not exist |
+| -32024 | Supervisor rotation incomplete | A mob supervisor rotation was not confirmed by every remote member |
+| -32025 | Scope denied | Mob control-scope denial; detail carries `required` and `presented` |
+| -32026 | Host unavailable | Mob member host unreachable or timed out |
+| -32027 | Stale cursor | Event cursor overran an ephemeral host's buffer; the reply carries the current watermark |
+| -32028 | Stale fence | Command carried a superseded generation and fence |
+| -32029 | Member reload required | Member registration is durability-degraded; only an explicit registration reload repairs it |
+| -32030 | Input refused | The native owner declined an unaccepted input |
+| -32031 | Input not ready | Native input readiness is currently unavailable |
+| -32032 | Session runtime unavailable | Runtime authority is unavailable before a session operation starts |
+| -32033 | Approval store unavailable | The approval store committed nothing; a fresh retry is valid |
+| -32034 | Approval conflict | Another owner changed the approval first; reconcile it before reuse |
+| -32035 | Approval commit unknown | The store cannot confirm the commit; reconcile from the store, never resend |
+| -32036 | Stale delivery scope | A scope-bound mob submit named a session that is no longer the member's; re-capture the delivery scope |
 
 ## Architecture
 
