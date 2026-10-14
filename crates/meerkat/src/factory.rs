@@ -11159,6 +11159,12 @@ mod tests {
             128_000,
             "reasoning-capable models need the same catalog-aware output allowance"
         );
+        assert_eq!(
+            model_aware_default_max_tokens(&registry, Provider::Gemini, "gemini-4-argon"),
+            65_536,
+            "Gemini 4 Argon defaults to its synchronous output cap, above Google's \
+             32,768 minimum recommendation"
+        );
     }
 
     #[test]
@@ -19392,7 +19398,7 @@ mod tests {
 
         assert_eq!(
             plan.machine_routing_model.as_str(),
-            "gemini-3.1-flash-image-preview"
+            "gemini-nano-banana-2.1"
         );
         assert!(
             !plan.machine_routing_realtime_capable,
@@ -19589,10 +19595,7 @@ mod tests {
                 &auto_target_image_request(),
             )
             .expect("configured image_generation_provider must satisfy Auto targets");
-        assert_eq!(
-            plan.provider_model.as_str(),
-            "gemini-3.1-flash-image-preview"
-        );
+        assert_eq!(plan.provider_model.as_str(), "gemini-nano-banana-2.1");
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -19651,7 +19654,7 @@ mod tests {
             .expect("Auto must resolve through the session's typed provider identity");
         assert_eq!(
             plan.provider_model.as_str(),
-            "gemini-3.1-flash-image-preview",
+            "gemini-nano-banana-2.1",
             "the session provider's registered image default must be selected"
         );
     }
@@ -19697,10 +19700,7 @@ mod tests {
                 &auto_target_image_request(),
             )
             .expect("Auto must follow the swapped session provider");
-        assert_eq!(
-            plan.provider_model.as_str(),
-            "gemini-3.1-flash-image-preview"
-        );
+        assert_eq!(plan.provider_model.as_str(), "gemini-nano-banana-2.1");
     }
 
     /// One condition, one path: the planner must NOT silently re-derive a

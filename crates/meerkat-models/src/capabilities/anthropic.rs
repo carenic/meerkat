@@ -33,7 +33,7 @@ const BETA_INTERLEAVED_THINKING: BetaHeader = BetaHeader {
 
 /// Headers advertised for models with adaptive thinking + compaction
 /// (Fable 5.1, Opus 5.5, Opus 5, Fable 5, Opus 4.8, Opus 4.7, Sonnet 5.5,
-/// Sonnet 5, Sonnet 4.6).
+/// Sonnet 5, Sonnet 4.6, Haiku 5.5).
 const ADAPTIVE_COMPACTION_BETAS: &[BetaHeader] = &[
     BETA_COMPACTION,
     BETA_STRUCTURED_OUTPUT,
@@ -45,7 +45,8 @@ const ADAPTIVE_COMPACTION_BETAS: &[BetaHeader] = &[
 const LEGACY_THINKING_BETAS: &[BetaHeader] = &[BETA_STRUCTURED_OUTPUT, BETA_INTERLEAVED_THINKING];
 
 /// Batch API extended-output beta (300k cap). Applies to Opus 4.8 / 4.7 /
-/// Sonnet 5.5 / Sonnet 5 / Sonnet 4.6 per the official Models overview.
+/// Sonnet 5.5 / Sonnet 5 / Sonnet 4.6 per the official Models overview, and
+/// to Haiku 5.5 per its model page.
 const BETA_OUTPUT_300K: BetaValue<u32> = BetaValue {
     header: "anthropic-beta: output-300k-2026-03-24",
     value: 300_000,
@@ -54,8 +55,8 @@ const BETA_OUTPUT_300K: BetaValue<u32> = BetaValue {
 // ── Effort tiers ──────────────────────────────────────────────────────────
 
 /// Effort tiers accepted by the Claude 5 family (Fable 5.1, Opus 5.5, Opus 5,
-/// Fable 5, Sonnet 5.5, Sonnet 5) and Opus 4.8/4.7; `xhigh` sits between
-/// `high` and `max`.
+/// Fable 5, Sonnet 5.5, Sonnet 5, Haiku 5.5) and Opus 4.8/4.7; `xhigh` sits
+/// between `high` and `max`.
 const CLAUDE_5_OPUS_48_47_EFFORT: &[EffortLevel] = &[
     EffortLevel::Low,
     EffortLevel::Medium,
@@ -721,6 +722,90 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_legacy_penalties: false,
         supports_thinking_budget_legacy: true,
         beta_headers: LEGACY_THINKING_BETAS,
+        call_timeout_secs: Some(120),
+        supports_forced_tool_choice: true,
+    },
+    // Claude Haiku 5.5
+    //
+    // Sources:
+    //   - Model page (API ID claude-haiku-5-5, a fixed id with no date suffix
+    //     and no separate alias; released October 7, 2026; 1M context; 128k
+    //     max output; 300k on the Batch API with output-300k-2026-03-24; text
+    //     and image input; adaptive thinking on by default; default effort
+    //     `medium`; omit temperature, top_p and top_k):
+    //     https://platform.claude.com/docs/en/models/haiku-5-5/overview
+    //   - What's new and migration guide (`budget_tokens` returns 400;
+    //     `{type: "disabled"}` is accepted at `high` effort or below;
+    //     temperature must be 1 and top_p 0.99 if sent, any top_k returns 400;
+    //     assistant prefill returns 400; forced `tool_choice` `any`/`tool` is
+    //     accepted, the response then starts with the tool call):
+    //     https://platform.claude.com/docs/en/models/haiku-5-5/whats-new-haiku-5-5
+    //     https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide
+    //   - Effort ("Claude Haiku 5.5 supports all five effort levels, and
+    //     medium is the default"):
+    //     https://platform.claude.com/docs/en/build-with-claude/effort
+    //   - Compaction at a token threshold (supported models list Haiku 5.5;
+    //     compact-2026-01-12):
+    //     https://platform.claude.com/docs/en/build-with-claude/compaction-threshold
+    //   - Structured outputs (supported models list Haiku 4.5 and 5.5; not
+    //     on Amazon Bedrock, which Meerkat's Anthropic client does not use):
+    //     https://platform.claude.com/docs/en/build-with-claude/structured-outputs
+    //   - Mid-conversation system messages (available on Claude Haiku 5.5):
+    //     https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages
+    //   - Data residency (`inference_geo` applies to Claude 4.6 and later
+    //     models, Haiku 5.5 included):
+    //     https://platform.claude.com/docs/en/manage-claude/data-residency
+    //
+    // Thinking is `AnthropicAdaptiveOnly`: adaptive is the default and the
+    // only mode Meerkat sends; upstream `disabled` has no Meerkat config, as
+    // for the claude-sonnet-5 row.
+    //
+    // ASSUMED (not stated for this model on the pages above):
+    //   - image_tool_results: taken from the claude-sonnet-5-5 row (vision
+    //     and tool use are documented; image blocks inside tool results are
+    //     not called out separately)
+    //   - supports_web_search: taken from the claude-haiku-4-5 row (the web
+    //     search tool page defers per-model support to the Models API
+    //     `capabilities.server_tools.web_search`, which was not queried)
+    // Meerkat-owned operational default: Sonnet-tier 120s call timeout,
+    // since adaptive thinking is on by default (Haiku 4.5 keeps 60s).
+    ModelCapabilities {
+        id: "claude-haiku-5-5",
+        provider: Provider::Anthropic,
+        display_name: "Claude Haiku 5.5",
+        tier: ModelTier::Recommended,
+        release_stage: ModelReleaseStage::Stable,
+        model_family: "claude-haiku-5",
+        context_window: Some(1_000_000),
+        max_input_tokens: None,
+        max_output_tokens: Some(128_000),
+        context_window_beta: None,
+        max_output_tokens_beta: Some(BETA_OUTPUT_300K),
+        vision: true,
+        image_tool_results: true,
+        inline_video: false,
+        realtime: false,
+        realtime_supports_provider_managed_turns: false,
+        realtime_supports_explicit_commit: false,
+        realtime_interrupt_supported: false,
+        realtime_transcript_supported: false,
+        transcription_companion_model: None,
+        image_generation: false,
+        supports_temperature: false,
+        supports_top_p: false,
+        supports_top_k: false,
+        thinking: ThinkingSupport::AnthropicAdaptiveOnly,
+        supports_reasoning: false,
+        effort_levels: CLAUDE_5_OPUS_48_47_EFFORT,
+        openai_responses_params: None,
+        supports_web_search: true,
+        supports_mid_conversation_system_messages: true,
+        supports_inference_geo: true,
+        supports_compaction: true,
+        supports_structured_output: true,
+        supports_legacy_penalties: false,
+        supports_thinking_budget_legacy: false,
+        beta_headers: ADAPTIVE_COMPACTION_BETAS,
         call_timeout_secs: Some(120),
         supports_forced_tool_choice: true,
     },
