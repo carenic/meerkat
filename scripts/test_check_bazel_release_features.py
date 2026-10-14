@@ -5,8 +5,9 @@ The release feature gate must pass a clean release graph and fail, naming the
 defect, on each way test-only code can reach a Bazel release binary: a select
 whose release branch keeps a non-shipping feature, a plain feature list or a
 dependency forward carrying one, a platform select whose branch carries one
-(with or without a release branch beside it), a select it cannot evaluate, an
-alias or proc macro on the path, a *_test_support variant in the closure, a
+(with or without a release branch beside it), a select, feature list,
+dependency list or alias it cannot read whole, an alias or proc macro on the
+path, a *_test_support variant in the closure, a
 release build without the define, a -c opt build outside the launcher, a
 config_setting that does not match the define, and release roots that
 disagree with what the workflow packages.
@@ -270,7 +271,63 @@ class ReleaseFeatureGateTests(unittest.TestCase):
         )
         result = self.run_checker()
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("cannot evaluate a select() whose branches are not all literal lists", result.stderr)
+        self.assertIn("cannot evaluate select() branch '@platforms//os:linux'", result.stderr)
+
+    def test_concatenation_inside_a_release_feature_branch_is_checked(self) -> None:
+        # The whole branch value counts, not just its first list.
+        self.edit(
+            "app/BUILD.bazel",
+            '        "//tools/bazel:release_build": [\n            "default",\n        ],\n',
+            '        "//tools/bazel:release_build": [\n            "default",\n        ] + ["test-support"],\n',
+        )
+        self.assert_fails("//app:app enables non-shipping feature 'test-support'")
+
+    def test_concatenation_inside_a_release_deps_branch_is_checked(self) -> None:
+        self.edit(
+            "tool/BUILD.bazel",
+            '    deps = [\n        "//core",\n    ],\n',
+            '    deps = select({\n'
+            '        "//tools/bazel:release_build": ["//core"] + ["//core:core_test_support"],\n'
+            '        "//conditions:default": ["//core"],\n'
+            '    }),\n',
+        )
+        self.assert_fails(
+            "//core:core_test_support is a test-support variant in the release closure",
+            "//core:core_test_support enables non-shipping feature 'integration-real-tests'",
+        )
+
+    def test_unsupported_syntax_inside_a_branch_fails_closed(self) -> None:
+        self.edit(
+            "core/BUILD.bazel",
+            self.CORE_SELECT,
+            '        "//tools/bazel:release_build": [] + RELEASE_FEATURES,\n'
+            '        "//conditions:default": [],\n',
+        )
+        result = self.run_checker()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("cannot evaluate select() branch", result.stderr)
+
+    def test_identifier_inside_a_release_feature_branch_fails_closed(self) -> None:
+        self.edit(
+            "app/BUILD.bazel",
+            '        "//tools/bazel:release_build": [\n            "default",\n        ],\n',
+            '        "//tools/bazel:release_build": [\n            "default",\n            EXTRA_FEATURES,\n        ],\n',
+        )
+        result = self.run_checker()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("//app:app: cannot evaluate select() branch '//tools/bazel:release_build'", result.stderr)
+
+    def test_dependency_term_it_cannot_read_fails_closed(self) -> None:
+        self.edit("tool/BUILD.bazel", '    deps = [\n        "//core",\n    ],\n', '    deps = [\n        "//core",\n    ] + EXTRA_DEPS,\n')
+        result = self.run_checker()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("//tool:tool deps: cannot evaluate", result.stderr)
+
+    def test_alias_it_cannot_evaluate_fails_closed(self) -> None:
+        self.edit("core/BUILD.bazel", '    actual = "//core:core",\n', "    actual = CORE_LABEL,\n")
+        result = self.run_checker()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("//core:core_agent_factory_build: cannot evaluate alias actual 'CORE_LABEL'", result.stderr)
 
     def test_feature_list_sum_with_a_select_is_checked(self) -> None:
         self.edit("tool/BUILD.bazel", '    crate_features = [\n        "cli",\n    ],\n', '    crate_features = ["cli"] + select({\n        "@platforms//os:macos": ["test-support"],\n        "//conditions:default": [],\n    }),\n')

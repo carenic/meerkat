@@ -18,7 +18,10 @@ scripts/buildbuddy-bazel-poc builds; they must match the binaries
     contributes every branch but its default (a more specific key could
     match beside the release one); any other select contributes every branch,
     since a platform or configuration key may match on some release target. A
-    select the check cannot evaluate fails it.
+    value the check cannot read whole fails it: features must be literal
+    string lists, their sums and selects of those; dependencies may also add
+    crate_universe's all_crate_deps() (external crates); an alias must name a
+    literal label.
 
 Usage: check-bazel-release-features.py [repo-root]
 Exit 0 = clean, 1 = violations, 2 = the inputs cannot be read.
@@ -52,10 +55,18 @@ SKIP_DIRS = {".git", "target", "node_modules", "bazel-out"}
 RULE = re.compile(r"^([a-z_]+)\(\n(.*?)\n\)$", re.S | re.M)
 ATTR = re.compile(r"^ {4}([a-z_]+) = ", re.M)
 SELECT = re.compile(r"select\(\{(.*?)\}\)", re.S)
-BRANCH = re.compile(r'"([^"]+)":\s*(\[[^\]]*\])', re.S)
 BRANCH_KEY = re.compile(r'"([^"]+)"\s*:')
 QUOTED = re.compile(r'"([^"]*)"')
-LIST_EXPR = re.compile(r"^\[[^\[\]]*\](?:\s*\+\s*\[[^\[\]]*\])*$", re.S)
+STRING = r'"[^"\\\n]*"'
+# A list of string literals and nothing else: an identifier, call or comment
+# inside it cannot be evaluated.
+LIST = rf"\[\s*(?:{STRING}\s*,\s*)*(?:{STRING}\s*)?\]"
+LIST_EXPR = re.compile(rf"^{LIST}(?:\s*\+\s*{LIST})*$")
+# crate_universe's macro for a package's external crates, which carry no
+# workspace feature and are not walked.
+EXTERNAL_DEPS = rf"all_crate_deps\(\s*(?:[a-z_]+\s*=\s*(?:{STRING}|True|False)\s*,\s*)*(?:[a-z_]+\s*=\s*(?:{STRING}|True|False)\s*)?\)"
+EXTERNAL_DEPS_CALL = re.compile(EXTERNAL_DEPS)
+DEPS_EXPR = re.compile(rf"^(?:{LIST}|{EXTERNAL_DEPS})(?:\s*\+\s*(?:{LIST}|{EXTERNAL_DEPS}))*$")
 DEFAULT_CONDITION = "//conditions:default"
 
 
@@ -84,6 +95,30 @@ def is_non_shipping(feature: str, features: set[str]) -> bool:
     return feature.rpartition("/")[2] in features
 
 
+def select_branches(select_body: str, where: str) -> list[tuple[str, str]]:
+    """Every (key, value) of one select(), each value consumed whole.
+
+    A value must be a literal string list or a sum of them; anything else
+    (a variable, a call, a nested select) cannot be evaluated and fails.
+    """
+    marks = list(BRANCH_KEY.finditer(select_body))
+    if not marks:
+        raise GuardError(f"{where}: cannot evaluate a select() without branches")
+    branches = []
+    for index, mark in enumerate(marks):
+        end = marks[index + 1].start() if index + 1 < len(marks) else len(select_body)
+        value = select_body[mark.end():end].strip()
+        if value.endswith(","):
+            value = value[:-1].rstrip()
+        if not LIST_EXPR.match(value):
+            raise GuardError(f"{where}: cannot evaluate select() branch {mark.group(1)!r}: {value[:60]!r}")
+        branches.append((mark.group(1), value))
+    keys = [key for key, _ in branches]
+    if len(set(keys)) != len(keys):
+        raise GuardError(f"{where}: cannot evaluate a select() that repeats a branch key")
+    return branches
+
+
 def release_alternatives(select_body: str, where: str) -> str:
     """Every branch a release build can take from one select(), as one list.
 
@@ -91,16 +126,12 @@ def release_alternatives(select_body: str, where: str) -> str:
     takes that branch or a more specific key that also matches, never its
     default; a select without that key takes whichever platform or
     configuration key matches on the target being built, or its default. The
-    check keeps every alternative it cannot rule out, and refuses a branch
-    that is not a literal list.
+    check keeps every alternative it cannot rule out.
     """
-    keys = BRANCH_KEY.findall(select_body)
-    branches = BRANCH.findall(select_body)
-    if not branches or [key for key, _ in branches] != keys:
-        raise GuardError(f"{where}: cannot evaluate a select() whose branches are not all literal lists")
-    if SETTING_LABEL in keys:
-        branches = [(key, text) for key, text in branches if key != DEFAULT_CONDITION]
-    items = [item for _, text in branches for item in QUOTED.findall(text)]
+    branches = select_branches(select_body, where)
+    if any(key == SETTING_LABEL for key, _ in branches):
+        branches = [(key, value) for key, value in branches if key != DEFAULT_CONDITION]
+    items = [item for _, value in branches for item in QUOTED.findall(value)]
     return "[" + ", ".join(f'"{item}"' for item in items) + "]"
 
 
@@ -126,6 +157,15 @@ def string_list(expr: str, where: str) -> list[str]:
     if not LIST_EXPR.match(expr):
         raise GuardError(f"{where}: cannot evaluate {expr[:60]!r} as a string list")
     return QUOTED.findall(expr)
+
+
+def dependency_labels(expr: str, package: str, where: str) -> list[str]:
+    """The workspace labels of a deps value read whole: literal string lists
+    summed with all_crate_deps() calls."""
+    expr = expr.strip()
+    if not DEPS_EXPR.match(expr):
+        raise GuardError(f"{where}: cannot evaluate {expr[:60]!r} as dependency lists")
+    return labels_in(EXTERNAL_DEPS_CALL.sub("", expr), package)
 
 
 def labels_in(expr: str, package: str) -> list[str]:
@@ -269,7 +309,10 @@ def check_closure(rules, roots: set[str], features: set[str]) -> tuple[list[str]
             continue
         kind, package, attrs = entry
         if kind == "alias":
-            stack.extend(labels_in(evaluate(attrs.get("actual", ""), label), package))
+            actual = attrs.get("actual", "").strip()
+            if not re.fullmatch(STRING, actual):
+                raise GuardError(f"{label}: cannot evaluate alias actual {actual[:60]!r}")
+            stack.extend(labels_in(actual, package))
             continue
         if kind not in RUST_RULES:
             errors.append(f"{label} is a {kind}, not a Rust library or binary, in the release closure")
@@ -282,7 +325,7 @@ def check_closure(rules, roots: set[str], features: set[str]) -> tuple[list[str]
             if is_non_shipping(feature, features):
                 errors.append(f"{label} enables non-shipping feature {feature!r} in the release configuration")
         for attr in ("deps", "proc_macro_deps"):
-            stack.extend(labels_in(evaluate(attrs.get(attr, "[]"), label), package))
+            stack.extend(dependency_labels(evaluate(attrs.get(attr, "[]"), label), package, f"{label} {attr}"))
     return errors, len(seen), selects
 
 
