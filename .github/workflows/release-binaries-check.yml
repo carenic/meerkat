@@ -1,0 +1,93 @@
+name: Release binaries check
+
+# Builds the four release binaries on the dispatched ref exactly as the
+# release workflow's BuildBuddy lane does (scripts/buildbuddy-bazel-poc
+# release-build-*, which pass --define=meerkat_release_build=1) and runs the
+# release packaging guards on every one of them: the Linux portability check
+# and scripts/check-release-binary-markers. It publishes nothing: a read-only
+# token, no archive, no attestation, no upload, no release, no registry.
+# Dispatch it on a release candidate commit before tagging, so that the tag
+# cannot fail at packaging:
+#   gh workflow run release-binaries-check.yml --ref <branch>
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and check release binaries (${{ matrix.target }})
+    # The BuildBuddy release lane is the owner's, as in release.yml.
+    if: github.actor == 'lukacf'
+    runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-24.04"') }}
+    timeout-minutes: 240
+    env:
+      BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - bb_command: release-build-linux-x86
+            target: x86_64-unknown-linux-gnu
+          - bb_command: release-build-linux-arm64
+            target: aarch64-unknown-linux-gnu
+          - bb_command: release-build-macos-arm64
+            target: aarch64-apple-darwin
+          - bb_command: release-build-macos-x86
+            target: x86_64-apple-darwin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-buildbuddy-ci
+        with:
+          profile: native
+
+      - name: Build release binaries via BuildBuddy
+        shell: bash
+        env:
+          BUILDBUDDY_BAZEL_COMMAND: ${{ matrix.bb_command }}
+          BUILDBUDDY_OUTPUT_LANE: release-check-${{ matrix.target }}
+          BUILDBUDDY_OUTPUT_BASE: ${{ runner.temp }}/bb-release-${{ matrix.target }}
+          MEERKAT_BUILDBUDDY_OUTPUT_ROOT: ${{ runner.temp }}/bb-release
+          BUILDBUDDY_RELEASE_JOBS: ${{ vars.MEERKAT_RELEASE_BUILDBUDDY_JOBS || '64' }}
+        run: |
+          set +e
+          scripts/buildbuddy-bazel-poc --jobs="${BUILDBUDDY_RELEASE_JOBS}"
+          status="$?"
+          set -e
+          # 38: the build completed but its event-stream upload failed; the
+          # next step still finds and checks every output.
+          if [[ "${status}" -ne 0 && "${status}" -ne 38 ]]; then
+            exit "${status}"
+          fi
+
+      - name: Check release binaries
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BB_OUTPUT_BASE: ${{ runner.temp }}/bb-release-${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          BAZEL_BIN="${BB_OUTPUT_BASE}/execroot/_main/bazel-out"
+          declare -A BIN_PATHS=(
+            [rkat]="crates/meerkat-cli/rkat"
+            [rkat-rpc]="crates/meerkat-rpc/rkat_rpc_bin"
+            [rkat-rest]="crates/meerkat-rest/rkat_rest_bin"
+            [rkat-mcp]="crates/meerkat-mcp-server/rkat_mcp_bin"
+          )
+          for bin in rkat rkat-rpc rkat-rest rkat-mcp; do
+            src="$(find "${BAZEL_BIN}" -path "*/${BIN_PATHS[$bin]}" -type f 2>/dev/null | head -1)"
+            if [[ -z "${src}" ]]; then
+              echo "Missing ${bin} output for ${TARGET} under ${BAZEL_BIN}" >&2
+              exit 1
+            fi
+            if [[ "${TARGET}" == *-unknown-linux-gnu ]]; then
+              ./scripts/check-linux-release-binary-portability.sh "${src}"
+            fi
+            scripts/check-release-binary-markers "${src}"
+          done
+          echo "All four ${TARGET} release binaries pass the release packaging guards"
