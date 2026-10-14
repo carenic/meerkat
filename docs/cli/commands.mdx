@@ -291,7 +291,7 @@ Examples:
 ```bash
 rkat run --resume last "keep going"
 rkat run --resume '~2' "pick this thread back up"
-cat notes.txt | rkat run --resume last "merge these notes into the plan"
+cat notes.txt | rkat run --resume "merge these notes into the plan"
 tail -f app.log | rkat run --resume --stdin lines "watch for new incidents"
 ```
 
@@ -303,8 +303,7 @@ tail -f app.log | rkat run --resume --stdin lines "watch for new incidents"
 - `last`, `~`, or `~0` for the most recent session
 - `~N` for the Nth older session (`~1` is one before the most recent)
 
-A bare `--resume` resumes `last`. When a prompt follows, name the session
-first: `rkat run --resume last "keep going"`.
+Omitting the value means `last`, so `rkat run --resume "keep going"` and `rkat run --resume last "keep going"` are equivalent.
 
 The CLI displays short handles as the final eight UUID characters. Ambiguous
 prefix/tail matches fail instead of selecting a session. A qualified locator
