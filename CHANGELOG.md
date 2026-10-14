@@ -62,6 +62,15 @@ them.
   `[limits] max_tool_calls` key also caps tool calls for any agent built
   from a realm config that sets it.
 
+### Known issues
+
+- `rkat mob deploy --surface rpc` builds the deployed members from the
+  realm's config store (the realm document and its parent chain), not from
+  the deploy config, so neither the deploy flags (`--model`,
+  `--max-total-tokens`, `--max-duration`, `--max-tool-calls`) nor the pack's
+  deploy defaults (`[budget]`, `[models]`, `max_tokens`, `[compaction]`)
+  apply to those members.
+
 ## [0.9.0] - 2026-10-13
 
 ### Breaking
