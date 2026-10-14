@@ -37,7 +37,9 @@ fn model_help_is_refused_before_any_session_without_the_skills_feature() {
     std::fs::create_dir_all(&home).expect("home");
     std::fs::create_dir_all(&context_root).expect("context root");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rkat"))
+    let rkat = std::env::var_os("CARGO_BIN_EXE_rkat")
+        .expect("Cargo or Nextest must provide the runtime rkat binary path");
+    let out = Command::new(&rkat)
         .arg("--state-root")
         .arg(&state_root)
         .arg("--context-root")
