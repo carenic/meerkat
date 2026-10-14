@@ -315,6 +315,11 @@ rust-lane-doctor:
 ci-lanes-selftest:
 	@echo "$(GREEN)Self-testing the CI lane classifier (fail-closed contracts)...$(NC)"
 	@node scripts/ci-cargo-lanes-selftest.mjs
+	@echo "$(GREEN)Checking the non-Rust reader inventory against the Rust sources...$(NC)"
+	@node scripts/ci-non-rust-readers-guard.mjs
+	@node scripts/ci-non-rust-readers-selftest.mjs
+	@scripts/test-ci-non-rust-readers.sh
+	@scripts/test-ci-clippy-sccache-wrapper.sh
 
 .PHONY: native-cost-analysis-selftest
 native-cost-analysis-selftest:

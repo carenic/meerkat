@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# RUSTC_WRAPPER for the CI Clippy lanes (ci.yml `clippy`).
+#
+# `cargo clippy` makes clippy-driver the workspace wrapper, so Cargo runs a
+# workspace member as
+#   $RUSTC_WRAPPER clippy-driver rustc ARGS
+# and every other crate as
+#   $RUSTC_WRAPPER rustc ARGS
+# sccache caches the second form only: it reports the first as
+# non-cacheable ("multiple input files"), so every Clippy lane re-checked
+# the whole workspace chain below its packages, 55-167 crates a lane, while
+# the plain `cargo check` closure lane got full hits on the same crates.
+#
+# Under `--no-deps`, clippy-driver lints only the packages Cargo was asked
+# for (CARGO_PRIMARY_PACKAGE set) and runs every other crate as plain rustc.
+# This wrapper hands exactly those crates to sccache as the rustc invocation
+# clippy-driver would have run, so they cache like any `cargo check` crate.
+# Packages Clippy lints, and every invocation when `--no-deps` is not in
+# effect, still go through clippy-driver unchanged.
+set -euo pipefail
+
+sccache="${SCCACHE_PATH:-sccache}"
+
+if (( $# >= 2 )) && [[ "$(basename -- "$1")" == clippy-driver* ]] \
+  && [[ -z "${CARGO_PRIMARY_PACKAGE:-}" ]]; then
+  # cargo-clippy passes its own arguments to clippy-driver in CLIPPY_ARGS,
+  # separated by __CLIPPY_HACKERY__; `--no-deps` is the switch that makes
+  # clippy-driver behave as rustc for non-primary crates.
+  no_deps=0
+  rest="${CLIPPY_ARGS:-}"
+  while [[ -n "${rest}" ]]; do
+    arg="${rest%%__CLIPPY_HACKERY__*}"
+    if [[ "${arg}" == "--no-deps" ]]; then
+      no_deps=1
+      break
+    fi
+    if [[ "${rest}" == *__CLIPPY_HACKERY__* ]]; then
+      rest="${rest#*__CLIPPY_HACKERY__}"
+    else
+      rest=""
+    fi
+  done
+  if (( no_deps )); then
+    shift
+  fi
+fi
+
+exec "${sccache}" "$@"

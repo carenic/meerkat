@@ -371,7 +371,12 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   TLC install for every lane: an immutable repository mirror of the tlaplus
   v1.8.0 jar pinned by sha256); the `CI gate` requires them on such a change. The `machine-verify --all` sweep is not in PR CI.
 - `clippy`: one lane per shard of every directly changed package
-  (`clippy --no-deps --all-targets --all-features -D warnings`).
+  (`clippy --no-deps --all-targets --all-features -D warnings`); a
+  whole-workspace plan gives the heads of the long check chains fixed
+  shards of their own (`CLIPPY_HEAD_SHARDS`) and packs the rest. Its
+  `RUSTC_WRAPPER` is `scripts/ci-clippy-sccache-wrapper`, which sends the
+  crates Clippy does not lint to sccache as plain rustc so they are cached;
+  the lane's own packages still go through clippy-driver.
 - `unit`: `nextest --lib --bins --profile ci-pr` (`fast` plus a 4-minute hung-test kill) for
   the changed packages outside the meerkat-mob compile chain; crates that
   compile `meerkat-mob` (mob, mob-adaptive, mob-mcp, mob-pack, rpc, rest,
@@ -397,8 +402,31 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   xtask with machine-authority, also on any `.github/workflows/` or `sdks/`
   edit, because its tests pin the workflows and read the SDK manifests and
   generated types), on PRs and main pushes.
-  The unit lanes run `--lib --bins` only, so no other PR lane runs a
-  crate's integration tests.
+  The unit lanes run `--lib --bins` only; `closure-tests` runs the
+  integration tests of every package in its test scope.
+- `closure-tests`: the pre-push hook's cargo-test coverage as required rows
+  for the test scope: the reverse-dependency closure of the changed packages
+  (every member on a global change) plus the packages whose tests read a
+  changed non-Rust input (`scripts/ci-non-rust-readers.json`, kept complete
+  by `scripts/ci-non-rust-readers-guard.mjs` in `make ci-lanes-selftest`).
+  Rows (`closure_test_rows` in `scripts/ci-cargo-lanes.mjs`) select the whole
+  workspace and name only their targets, so they compile the hook's own
+  units: every `tests/*.rs` target the hook builds (by name, `ci-integration`
+  profile, the fast selection), `e2e-fast`, and HeadCanonical with the
+  hook's own package-scoped command, all on the hook's 32 MiB test-thread
+  stack. The lib tests stay in the hook's `kind(lib)` lane: one
+  `--workspace --lib` row (filtered to the scope's packages) is planned only
+  with `--lib-row-runner LABEL`, for a runner that builds it in time (a
+  hosted 4-vCPU runner needs about 64 min), and the plan otherwise records
+  the lane it leaves to the hook (`hook_retained_lanes`). Each row lists and
+  runs one shared selection and first checks that nextest selects exactly
+  its planned binaries (`scripts/ci-verify-row-binaries.mjs`). The plan
+  fails when `scripts/ci-hook-coverage.mjs` finds a hook binary in scope
+  without a row (other than a lib binary the plan leaves to the hook): it
+  reads the hook's lanes from `scripts/pre-push-unit.sh`, binds every line
+  of the executing step that names a row input, the exported test-thread
+  stack, the selection, nextest or the binary check (so none can reassign
+  an input or the stack), and credits only whole-workspace rows.
 - `closure-check`: `cargo check --all-features` (lib and bin targets) over
   the reverse-dependency closure of the changed packages.
 - `feature-check` (two jobs per clippy shard, Bazel set and matrix): compile-only checks of the
@@ -432,9 +460,10 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   pushes. It runs under
   `!cancelled()` so superseded runs surface as cancelled.
 
-Integration-fast, e2e-fast, the dense Mob topology stress, the bounded TLC
-`machine-verify --all` sweep, the feature-matrix test runs, audit, the SDK
-suites, and the whole BuildBuddy/Bazel graph do not run in PR CI. `cargo.yml`
+The dense Mob topology stress, the bounded TLC `machine-verify --all` sweep,
+the feature-matrix test runs, audit, the SDK suites, and the whole
+BuildBuddy/Bazel graph do not run in PR CI; integration-fast and e2e-fast run
+there for the test scope only (`closure-tests`). `cargo.yml`
 remains a separate reusable/manually dispatchable Cargo workflow with its own
 `Cargo lane gate`; `ci.yml` does not call it. Local Make commands still
 default to Cargo.
@@ -580,10 +609,12 @@ push will run, retain an appropriate standalone gate before declaring the work
 qualified. This changes scheduling, not required coverage or hook behavior.
 
 Only deduplicate an inventory actually covered by the selected push backend,
-paths, test targets and features. The Cargo push lint hook uses
-`agent-gate --committed --clippy-only --machine-drift-by-hook`; its governance
-(drift is left to `machine-codegen-drift`) and generated-contract
-ratchets still run. Its path base is `CARGO_AGENT_BASE` or `origin/main` (then
+paths, test targets and features. The push runs no Clippy: its
+`changed-path-ratchets` hook runs
+`agent-gate --committed --ratchets-only --machine-drift-by-hook` (governance,
+generated-contract, Web SDK and wasm ratchets; drift is left to
+`machine-codegen-drift`), and the required CI Clippy lanes lint every package
+it used to. Its path base is `CARGO_AGENT_BASE` or `origin/main` (then
 `main`/HEAD), which can differ from the dispatcher's remote-ref range. Check that
 the committed selection includes the intended delta. The deterministic push
 lane covers workspace default-feature `kind(lib)` and `kind(test)` inventories,
