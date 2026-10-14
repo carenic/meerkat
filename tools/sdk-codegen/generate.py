@@ -283,6 +283,10 @@ COMMS_SESSION_STREAM_RPC_CONTRACT_ALIAS_TYPES = [
     "PeerIngressTerminalOutcomeKind",
     "PeerDeliveryOutcome",
     "CommsSendResult",
+    # Typed `error.data` of a failed `comms/send`, tagged on `code`.
+    "CommsPeerUnreachableReason",
+    "AdmissionDropReason",
+    "CommsSendErrorData",
     "CommsChecksumTokenResultIntent",
     "CommsPeerRequestIntent",
     "CommsPeerRequestParams",

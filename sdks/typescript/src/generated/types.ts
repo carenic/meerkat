@@ -5398,6 +5398,50 @@ export interface CommsSendResultPeerResponseSent {
 
 export type CommsSendResult = CommsSendResultInputAccepted | CommsSendResultPeerMessageSent | CommsSendResultPeerLifecycleSent | CommsSendResultPeerRequestSent | CommsSendResultPeerResponseSent;
 
+export type CommsPeerUnreachableReason = "offline_or_no_ack" | "transport_error";
+
+export type AdmissionDropReason = "untrusted_sender" | "classification_rejected" | "session_closed" | "inbox_full";
+
+export interface CommsSendErrorDataPeerNotFoundOrNotTrusted {
+  code: "peer_not_found_or_not_trusted";
+  message: string;
+  peer: string;
+}
+
+export interface CommsSendErrorDataPeerUnreachable {
+  code: "peer_unreachable";
+  details?: string | null;
+  message: string;
+  peer: string;
+  reason: CommsPeerUnreachableReason;
+}
+
+export interface CommsSendErrorDataPeerAdmissionDropped {
+  code: "peer_admission_dropped";
+  message: string;
+  peer: string;
+  reason: AdmissionDropReason;
+}
+
+export interface CommsSendErrorDataPeerInputRejected {
+  code: "peer_input_rejected";
+  envelope_id: string;
+  message: string;
+  peer: string;
+}
+
+export interface CommsSendErrorDataSendFailed {
+  code: "send_failed";
+  message: string;
+}
+
+export interface CommsSendErrorDataInvalidCommand {
+  code: "invalid_command";
+  message: string;
+}
+
+export type CommsSendErrorData = CommsSendErrorDataPeerNotFoundOrNotTrusted | CommsSendErrorDataPeerUnreachable | CommsSendErrorDataPeerAdmissionDropped | CommsSendErrorDataPeerInputRejected | CommsSendErrorDataSendFailed | CommsSendErrorDataInvalidCommand;
+
 export type CommsChecksumTokenResultIntent = "checksum_token";
 
 export type CommsPeerRequestIntent = "supervisor.bridge" | "checksum_token";

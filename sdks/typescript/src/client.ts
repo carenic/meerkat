@@ -395,6 +395,7 @@ import {
   type MobUnreachablePeer,
 } from "./mob.js";
 import { parseAgentEventEnvelope } from "./event-envelope.js";
+import { isCommsSendErrorCode } from "./comms-errors.js";
 import { EventStream, AsyncQueue } from "./streaming.js";
 import { parseUsage } from "./events.js";
 import type { RealtimeMessageOrigin } from "./events.js";
@@ -4868,7 +4869,10 @@ export class MeerkatClient {
         // `kind` for any payload that happened to also carry "reason" (e.g.
         // `mob_member_reload_required`). The whole object survives as
         // `details` unless the server explicitly nests one under "details".
-        details: parsed.details ?? rawData,
+        // A typed `comms/send` failure is such a bare payload: its own
+        // optional `details` field (a transport error's text) is part of it,
+        // not an envelope.
+        details: isCommsSendErrorCode(parsed.code) ? rawData : (parsed.details ?? rawData),
       };
     }
     // The server's typed error projection is `error.data` ({code, message,

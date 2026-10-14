@@ -2,6 +2,7 @@
 // generated wire contracts.
 import type {
   CommsCommand,
+  CommsSendErrorData,
   CommsSendReceipt,
   PeerDeliveryOutcome,
   PeerIngressTerminalOutcomeKind,
@@ -32,3 +33,14 @@ const outcome: PeerIngressTerminalOutcomeKind = "rejected";
 // @ts-expect-error terminal ingress outcomes are the generated closed vocabulary.
 const unknownOutcome: Delivery = { durably_resolved: { outcome: "dropped" } };
 void [named, outcome, unknownOutcome];
+
+// comms/send failures carry the generated CommsSendErrorData in `details`.
+const unreachable: CommsSendErrorData = {
+  code: "peer_unreachable",
+  peer: "agent-a",
+  reason: "offline_or_no_ack",
+  message: "peer is unreachable",
+};
+// @ts-expect-error error codes are the generated closed vocabulary.
+const unknownCode: CommsSendErrorData = { code: "not_a_code", message: "m" };
+void [unreachable, unknownCode];

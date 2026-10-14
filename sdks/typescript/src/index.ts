@@ -346,6 +346,19 @@ export type {
   PeerIngressTerminalOutcomeKind,
 } from "./generated/types.js";
 
+export type {
+  AdmissionDropReason,
+  CommsPeerUnreachableReason,
+  CommsSendErrorData,
+  CommsSendErrorDataInvalidCommand,
+  CommsSendErrorDataPeerAdmissionDropped,
+  CommsSendErrorDataPeerInputRejected,
+  CommsSendErrorDataPeerNotFoundOrNotTrusted,
+  CommsSendErrorDataPeerUnreachable,
+  CommsSendErrorDataSendFailed,
+} from "./generated/types.js";
+export { COMMS_SEND_ERROR_CODES, commsSendError } from "./comms-errors.js";
+
 export { CONTRACT_VERSION } from "./generated/types.js";
 export { WIRE_AUTH_ERROR_REASONS, authErrorReason } from "./auth-errors.js";
 export type { WireAuthErrorReason } from "./generated/types.js";
