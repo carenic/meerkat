@@ -112,7 +112,7 @@ Governance gates are typed syn-AST/fact gates in `xtask`, not source-text scanne
 
 - `xtask effect-authority` (`crates/xtask/src/effect_authority.rs`) — effect realization must trace to machine authority.
 - `xtask ownership-ledger --check-drift` (`crates/xtask/src/ownership_ledger.rs`) — semantic-fact ownership ledger with mechanically-resolved anchors; drift fails the gate.
-- `xtask bridge-classifier` (`crates/xtask/src/bridge_classifier.rs`) — bridge wire types must not re-interpret `ResponseStatus`; terminality goes through `meerkat_core::interaction::classify_response_terminality` (Makefile entry: `bridge-no-responsestatus-gate`).
+- `xtask bridge-classifier` (`crates/xtask/src/bridge_classifier.rs`) - bridge wire types must not re-interpret `ResponseStatus`; terminality is the machine-classified `TerminalityClass` (`response_terminality` on `PeerIngressClassification`/`PeerInputCandidate`, `PeerInteractionHandle::classify_response_reply` for outbound replies) (Makefile entry: `bridge-no-responsestatus-gate`).
 - `xtask rmat-audit --strict` (`crates/xtask/src/rmat_audit.rs`) — syn-AST read/write seam enforcement.
 - `xtask seam-inventory` (`crates/xtask/src/seam_inventory.rs`) — every Local/External effect needs an explicit classification (`EffectTeardownClass` coherence lives here) and routed effects must resolve via the typed Route table.
 

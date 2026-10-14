@@ -5901,9 +5901,12 @@ impl SpokenTurn {
             entry.kind == TimelineKind::FixtureStart && entry.schedule_id() == Some(schedule_id)
         })?;
         let speech_end_ms = start.t_ms + start.detail_u64("speech_ms").unwrap_or(0);
+        // A final at the fixture's own start closed the previous utterance (a
+        // fixture anchored on that utterance's delegation starts in the same
+        // millisecond); the fixture's own final arrives after its speech.
         let input_final = timeline
             .iter()
-            .find(|entry| entry.kind == TimelineKind::InputFinal && entry.t_ms >= start.t_ms);
+            .find(|entry| entry.kind == TimelineKind::InputFinal && entry.t_ms > start.t_ms);
         let first_audio_ms = timeline
             .iter()
             .find(|entry| {
@@ -10403,6 +10406,65 @@ fn s101_words(text: &str) -> Vec<(usize, String)> {
     words
 }
 
+/// Letters and digits only: the committed rows split a heard transcript at
+/// speaker changes, possibly inside a word, and keep their own spacing.
+fn s101_compact(text: &str) -> String {
+    normalize_words(text).replace(' ', "")
+}
+
+/// Whether each heard S101 response is committed, in heard order. `heard`
+/// holds each response's final transcript and the number of input finals
+/// before it began; `spoken_at` holds the history indexes of the spoken user
+/// rows. A response heard after `n` input finals must appear in the assistant
+/// rows after the `n`th spoken user row, and after the text the previous
+/// heard response matched: each response consumes its own committed
+/// occurrence, so one committed text cannot satisfy two heard responses.
+/// Assistant and user rows need not alternate; the model may answer two
+/// utterances in one later response.
+fn s101_committed_responses(
+    messages: &[Value],
+    spoken_at: &[usize],
+    heard: &[(&str, usize)],
+) -> Vec<bool> {
+    // The compacted assistant text in history order, and the offset in it at
+    // which each row starts.
+    let mut assistant = String::new();
+    let mut row_start = Vec::with_capacity(messages.len() + 1);
+    for row in messages {
+        row_start.push(assistant.len());
+        if row["role"]
+            .as_str()
+            .is_some_and(|role| role.contains("assistant"))
+        {
+            assistant.push_str(&s101_compact(&assistant_row_text(row)));
+        }
+    }
+    row_start.push(assistant.len());
+    let mut consumed = 0;
+    let mut committed = Vec::with_capacity(heard.len());
+    for (text, after_inputs) in heard {
+        let text = s101_compact(text);
+        // The rows after the spoken user row of the last preceding input.
+        let from = match *after_inputs {
+            0 => Some(0),
+            n => spoken_at.get(n - 1).map(|at| at + 1),
+        };
+        let end = from
+            .and_then(|from| row_start.get(from))
+            .and_then(|&first| {
+                let start = first.max(consumed);
+                assistant[start..]
+                    .find(&text)
+                    .map(|at| start + at + text.len())
+            });
+        if let Some(end) = end {
+            consumed = end;
+        }
+        committed.push(end.is_some());
+    }
+    committed
+}
+
 /// Outcome claims spoken (provider output transcript, sideband clock) before
 /// the provider learned the job was complete: the job's first commentary
 /// append after its "Started" narration, i.e. its "Finished" narration or
@@ -10990,42 +11052,94 @@ async fn run_s101_busy_backend(evidence: Journal) -> Result<(), Box<dyn std::err
             .rpc
             .session_history(json!(live.session_id), 30)
             .await?;
+        let timeline = live.peer.timeline().await?;
         // Under DurableFork the executor-input rows live in the fork sessions;
-        // the canonical (voice) session commits each delegation's final
-        // transcript as assistant rows after the spoken user row. Deterministic:
-        // three spoken user rows, each followed by at least one assistant row.
+        // the canonical (voice) session commits the spoken user rows and the
+        // model's spoken responses. Deterministic: the three spoken user rows
+        // are committed, and every response the browser heard (a
+        // `response_end` with its final transcript) is committed as its own
+        // assistant text, in heard order, after the user rows whose input
+        // final preceded it. Whether the model answers between two utterances
+        // is its own turn-taking: job 2 starts on the quick question's
+        // delegation, and the model may answer both in one later response
+        // (Live gate run 38410526290 on eee388c2).
         let rows = s100_user_rows(&history);
         let messages = history["messages"].as_array().cloned().unwrap_or_default();
         let roles: Vec<&str> = messages.iter().filter_map(|x| x["role"].as_str()).collect();
-        let mut answered_rows = 0usize;
-        let mut spoken_rows = 0usize;
-        for (index, message) in messages.iter().enumerate() {
-            if message["role"].as_str() != Some("user") {
-                continue;
-            }
-            let text = normalize_words(&history_text(&json!({"messages":[message]})));
-            if text.starts_with("result of the voice request") || text.starts_with(&normalize_words(S100_DELEGATION_CONTEXT_PREFIX)) {
-                continue;
-            }
-            spoken_rows += 1;
-            let answered = messages[index + 1..]
-                .iter()
-                .take_while(|m| m["role"].as_str() != Some("user"))
-                .any(|m| m["role"].as_str().is_some_and(|role| role.contains("assistant")));
-            if answered {
-                answered_rows += 1;
-            }
-        }
-        println!(
-            "GPT_LIVE_S101_HISTORY spoken_rows={spoken_rows} answered_rows={answered_rows} executor_inputs={:?} user_rows={:?} roles={roles:?}",
-            rows.executor_inputs, rows.spoken
-        );
-        if spoken_rows < 3 || answered_rows < 3 {
+        let delegation_prefix = normalize_words(S100_DELEGATION_CONTEXT_PREFIX);
+        let spoken_at: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| {
+                message["role"].as_str() == Some("user") && {
+                    let text = normalize_words(&history_text(&json!({"messages":[message]})));
+                    !text.starts_with("result of the voice request")
+                        && !text.starts_with(&delegation_prefix)
+                }
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if spoken_at.len() < 3 {
             deterministic_failures.push(format!(
-                "final transcripts not committed for every delegation: spoken user rows={spoken_rows}, followed by assistant rows={answered_rows} (three required)"
+                "spoken user rows not committed: {} of three",
+                spoken_at.len()
             ));
         }
-        let timeline = live.peer.timeline().await?;
+        let input_finals: Vec<u64> = timeline
+            .iter()
+            .filter(|entry| entry.kind == TimelineKind::InputFinal)
+            .map(|entry| entry.detail_u64("t_ms").unwrap_or(entry.t_ms))
+            .collect();
+        let mut heard = Vec::new();
+        let mut heard_index = Vec::new();
+        for response in timeline
+            .iter()
+            .filter(|entry| entry.kind == TimelineKind::ResponseEnd)
+        {
+            let text = response.detail_str("text").unwrap_or_default();
+            if s101_compact(text).is_empty() {
+                continue;
+            }
+            let index = response.detail_u64("index");
+            // The response began at its first audio, or at its end when no
+            // audio was detected; an input final before that preceded it.
+            let started_ms = timeline
+                .iter()
+                .find(|entry| {
+                    entry.kind == TimelineKind::AssistantAudioStart
+                        && index.is_some()
+                        && entry.detail_u64("response") == index
+                })
+                .map_or(response.t_ms, |entry| entry.t_ms.min(response.t_ms));
+            let after_inputs = input_finals.iter().filter(|t| **t < started_ms).count();
+            heard.push((text, after_inputs));
+            heard_index.push(index);
+        }
+        let mut responses = Vec::new();
+        for ((index, (text, after_inputs)), committed) in heard_index
+            .into_iter()
+            .zip(&heard)
+            .zip(s101_committed_responses(&messages, &spoken_at, &heard))
+        {
+            if !committed {
+                deterministic_failures.push(format!(
+                    "response {index:?} heard after {after_inputs} input final(s) is not committed as its own assistant text after the spoken user row of that input and the previous heard response: {text:?}"
+                ));
+            }
+            responses.push((index, *after_inputs, committed));
+        }
+        if responses.is_empty() {
+            deterministic_failures.push(
+                "no heard response with a final transcript to check against the committed assistant rows"
+                    .to_owned(),
+            );
+        }
+        println!(
+            "GPT_LIVE_S101_HISTORY spoken_rows={} responses(index, after_inputs, committed)={responses:?} executor_inputs={:?} user_rows={:?} roles={roles:?}",
+            spoken_at.len(),
+            rows.executor_inputs,
+            rows.spoken
+        );
         let report = live.peer.energy().await?;
         evidence.record(EvidenceRecord::Energy {
             channel,
@@ -13956,6 +14070,41 @@ mod config_tests {
             line(900, append("q", "There are 0 files.")),
         ];
         assert!(super::s101_premature_outcome_claims(&lines, 1).is_empty());
+    }
+
+    /// One committed text does not satisfy two heard responses: with "okay"
+    /// heard after the first and after the second utterance and "done" after
+    /// the third, a history that commits "okay" once lost a response.
+    /// Committing it twice passes, with no assistant row between the first
+    /// two utterances.
+    #[test]
+    fn s101_one_committed_response_does_not_satisfy_two_heard_ones() {
+        let user = |text: &str| serde_json::json!({"role": "user", "content": text});
+        let assistant = |text: &str| serde_json::json!({"role": "block_assistant", "blocks": [{"block_type": "text", "data": {"text": text}}]});
+        let heard = [("Okay.", 1), ("Okay.", 2), ("Done.", 3)];
+        let lost = [
+            user("Start a slow job."),
+            user("How many files are in your working directory?"),
+            assistant("Okay."),
+            user("Hand the executor a second slow job."),
+            assistant("Done."),
+        ];
+        assert_eq!(
+            super::s101_committed_responses(&lost, &[0, 1, 3], &heard),
+            [true, false, true]
+        );
+        let kept = [
+            user("Start a slow job."),
+            user("How many files are in your working directory?"),
+            assistant("Okay."),
+            assistant("Okay."),
+            user("Hand the executor a second slow job."),
+            assistant("Done."),
+        ];
+        assert_eq!(
+            super::s101_committed_responses(&kept, &[0, 1, 4], &heard),
+            [true, true, true]
+        );
     }
 
     /// The barge-in reply is judged by content: "done" in assistant speech

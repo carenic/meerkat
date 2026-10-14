@@ -394,6 +394,15 @@ async fn e2e_scenario_25_rest_reload_and_resume_on_same_realm_root() {
         .expect("session id")
         .to_string();
 
+    // #1813: one runtime hosts a session at a time, and the first host keeps
+    // its hosting claim while its session service lives. Shut that service
+    // down, which returns once every actor has released its claim, before
+    // the second host loads the same realm root.
+    state
+        .session_service
+        .try_shutdown()
+        .await
+        .expect("first REST host should shut down");
     drop(app);
     drop(state);
 

@@ -1,9 +1,11 @@
 //! W2-F bridge-classifier gate: the supervisor bridge transports typed
-//! commands/replies and must not re-interpret `ResponseStatus` — all
-//! terminal-vs-progress decisions go through
-//! `meerkat_core::interaction::classify_response_terminality` /
-//! `TerminalityClass`, so the canonical classifier stays the single source
-//! of truth. See issue #264 (W2-F).
+//! commands/replies and must not re-interpret `ResponseStatus`. Every
+//! terminal-vs-progress decision consumes the `TerminalityClass` that the
+//! generated machine authority emits (`response_terminality` on
+//! `PeerIngressClassification` and `PeerInputCandidate`, and
+//! `PeerInteractionHandle::classify_response_reply` for outbound replies),
+//! so the machine classifier stays the single source of truth. See issue
+//! #264 (W2-F).
 //!
 //! This is the structural (syn AST) port of the former
 //! `scripts/pre-push-bridge-no-responsestatus.sh` grep gate. The banned
@@ -62,7 +64,7 @@ const BRIDGE_CLASSIFIER_FILES: [&str; 15] = [
     "crates/meerkat-mob/src/runtime/member_live_proxy.rs",
 ];
 
-const BRIDGE_CLASSIFIER_LABEL: &str = "W2-F violation: bridge code interprets `ResponseStatus` directly — route through `classify_response_terminality` + `TerminalityClass`";
+const BRIDGE_CLASSIFIER_LABEL: &str = "W2-F violation: bridge code interprets `ResponseStatus` directly - consume the machine-classified `TerminalityClass` (`response_terminality`) instead";
 
 /// Run the gate against the repository root and fail on any finding.
 pub fn run_bridge_classifier() -> Result<()> {

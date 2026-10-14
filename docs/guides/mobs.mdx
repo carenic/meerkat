@@ -209,6 +209,26 @@ Anything undeclared is denied: over-denial is honest, silent admission would be
 a false guarantee. Hosts widen the read surface by implementing
 `AgentToolDispatcher::tool_mutation_class` on their own dispatcher.
 
+### Denying individual tools
+
+`tools.deny` names tools a profile's members may not run even though their
+family is enabled, for example the topology tools of `mob = true`:
+
+```toml
+[profiles.worker.tools]
+comms = true
+mob = true
+deny = ["mob_wire", "mob_unwire", "mob_spawn_member"]
+```
+
+Unlike `read_only`, a deny list works by name, so denied tools are hidden from
+the member's tool catalog (the tool list sent to the model) on every build, a
+resume included. A call to a denied name is still refused with an ordinary
+`access_denied` tool error, and a spawn cannot widen the list. An unknown name,
+such as a typo, fails the member's build with `DeclaredToolUnknown`, unless the
+profile declares an MCP server that maps no `tool_names`; then the name is
+checked only at call time.
+
 ### Profile model and provider fields
 
 Beyond `model`, a profile can pin provider identity and per-member behavior:

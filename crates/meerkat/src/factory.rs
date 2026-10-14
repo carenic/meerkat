@@ -977,9 +977,12 @@ pub struct AgentBuildConfig {
     ///
     /// Resolved into the sealed [`meerkat_core::ToolExecutionPolicy`] and
     /// applied as the OUTERMOST dispatcher composition: execution of a denied
-    /// tool fails with an ordinary `access_denied` tool error while the
-    /// LLM-visible tool list (`tools()`/`tool_catalog()`) stays byte-identical
-    /// (no prompt-cache prefix change). `Inherit` must be resolved by the
+    /// tool fails with an ordinary `access_denied` tool error. The gate itself
+    /// leaves `tools()`/`tool_catalog()` byte-identical; the tools the policy
+    /// makes unreachable by name (a deny list, or the complement of an allow
+    /// list) leave the session's visible tool scope instead
+    /// ([`meerkat_core::ToolExecutionPolicy::static_visibility_filter`]), and
+    /// read-only intent hides nothing. `Inherit` must be resolved by the
     /// spawn chain before build; an unresolved `Inherit` fails the build
     /// closed with a typed error. The effective policy is persisted into
     /// `SessionMetadata.tooling.tool_access_policy` so children can inherit
@@ -9030,13 +9033,14 @@ impl AgentFactory {
         // 12i. Call-level tool execution gate — the OUTERMOST composition.
         // Applied after every gateway/memory/catalog-control composition so
         // memory_search and every gateway-composed tool is gated. The gate
-        // forwards `tools()`/`tool_catalog()` byte-identically (the
-        // LLM-visible list — and therefore the prompt-cache prefix — is
-        // unchanged); a denied call surfaces as an ordinary `access_denied`
-        // tool error that the agent loop converts into an `is_error` tool
-        // result, and the run continues. The ops-lifecycle binding (step 9d)
-        // ran on the inner dispatcher before this wrap, and the wrapper
-        // forwards `bind_mcp_server_lifecycle_handle` /
+        // forwards `tools()`/`tool_catalog()` byte-identically (it changes
+        // neither the LLM-visible list nor the prompt-cache prefix; the names
+        // the policy makes unreachable already left the visible scope through
+        // the policy base filter above); a denied call surfaces as an ordinary
+        // `access_denied` tool error that the agent loop converts into an
+        // `is_error` tool result, and the run continues. The ops-lifecycle
+        // binding (step 9d) ran on the inner dispatcher before this wrap, and
+        // the wrapper forwards `bind_mcp_server_lifecycle_handle` /
         // `bind_external_tool_surface_handle` so later handle binds still
         // reach the inner dispatcher. Provider-native server tools never
         // traverse the dispatcher and cannot be gated here; hosts that need
