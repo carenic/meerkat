@@ -60,6 +60,8 @@ import {
   type ConfigWriteResult,
   type CommsPeersResult,
   type CommsSendResult,
+  type PeerDeliveryOutcome,
+  type PeerIngressTerminalOutcomeKind,
   type InterruptResult,
   type MobStopMemberRunResult,
   type StopRunResult,
@@ -566,25 +568,20 @@ const SETTLEMENT_FIELD_DOMAINS = {
   failure_kind: Object.keys(SETTLEMENT_FAILURE_KINDS),
 } as const;
 
-// `delivery` on every peer `comms/send` receipt is the server's
-// `PeerDeliveryOutcome` (crates/meerkat-core/src/comms.rs): a unit variant is
-// its snake_case name, and `durably_resolved` carries the receiver's
-// `PeerIngressTerminalOutcomeKind` (crates/meerkat-core/src/interaction.rs),
-// which the generated type leaves untyped.
+// `delivery` on every peer `comms/send` receipt is the generated
+// `PeerDeliveryOutcome`: a unit variant name, or `durably_resolved` carrying a
+// `PeerIngressTerminalOutcomeKind`.
 const PEER_DELIVERY_UNIT_OUTCOMES = {
   acked: true,
   volatile_handed_off: true,
   queued: true,
-} as const satisfies Record<
-  Extract<Extract<CommsSendResult, { delivery: unknown }>["delivery"], string>,
-  true
->;
+} as const satisfies Record<Extract<PeerDeliveryOutcome, string>, true>;
 
-const PEER_INGRESS_TERMINAL_OUTCOMES: ReadonlySet<string> = new Set([
-  "accepted",
-  "deduplicated",
-  "rejected",
-]);
+const PEER_INGRESS_TERMINAL_OUTCOMES = {
+  accepted: true,
+  deduplicated: true,
+  rejected: true,
+} as const satisfies Record<PeerIngressTerminalOutcomeKind, true>;
 
 const MEERKAT_REPO = "lukacf/meerkat";
 const MEERKAT_RELEASE_BINARY = "rkat-rpc";
@@ -6630,7 +6627,10 @@ export class MeerkatClient {
       );
     }
     const outcome = (resolved as Record<string, unknown>).outcome;
-    if (typeof outcome !== "string" || !PEER_INGRESS_TERMINAL_OUTCOMES.has(outcome)) {
+    if (
+      typeof outcome !== "string" ||
+      !Object.prototype.hasOwnProperty.call(PEER_INGRESS_TERMINAL_OUTCOMES, outcome)
+    ) {
       throw new MeerkatError(
         "INVALID_RESPONSE",
         `${context}: invalid delivery.durably_resolved.outcome`,

@@ -8993,6 +8993,18 @@ class CommsSendParamsPeerResponse(TypedDict, total=False):
 
 CommsSendParams = CommsSendParamsInput | CommsSendParamsPeerMessage | CommsSendParamsPeerLifecycle | CommsSendParamsPeerRequest | CommsSendParamsPeerResponse
 
+# Comms/session-stream RPC contract for PeerIngressTerminalOutcomeKind.
+PeerIngressTerminalOutcomeKind = Literal['accepted', 'deduplicated', 'rejected']
+
+# Strongest successful peer-delivery fact proved by the selected transport.
+class PeerDeliveryOutcomeDurablyResolvedPayload(TypedDict, total=False):
+    outcome: Required[PeerIngressTerminalOutcomeKind]
+
+class PeerDeliveryOutcomeDurablyResolved(TypedDict, total=False):
+    durably_resolved: Required[PeerDeliveryOutcomeDurablyResolvedPayload]
+
+PeerDeliveryOutcome = PeerDeliveryOutcomeDurablyResolved | Literal['acked'] | Literal['volatile_handed_off'] | Literal['queued']
+
 # Response payload for `comms/send`.
 class CommsSendResultInputAccepted(TypedDict, total=False):
     interaction_id: Required[str]
@@ -9000,17 +9012,17 @@ class CommsSendResultInputAccepted(TypedDict, total=False):
     stream_reserved: Required[bool]
 
 class CommsSendResultPeerMessageSent(TypedDict, total=False):
-    delivery: Required[dict[str, dict[str, Any]] | Literal['acked'] | Literal['volatile_handed_off'] | Literal['queued']]
+    delivery: Required[PeerDeliveryOutcome]
     envelope_id: Required[str]
     kind: Required[Literal['peer_message_sent']]
 
 class CommsSendResultPeerLifecycleSent(TypedDict, total=False):
-    delivery: Required[dict[str, dict[str, Any]] | Literal['acked'] | Literal['volatile_handed_off'] | Literal['queued']]
+    delivery: Required[PeerDeliveryOutcome]
     envelope_id: Required[str]
     kind: Required[Literal['peer_lifecycle_sent']]
 
 class CommsSendResultPeerRequestSent(TypedDict, total=False):
-    delivery: Required[dict[str, dict[str, Any]] | Literal['acked'] | Literal['volatile_handed_off'] | Literal['queued']]
+    delivery: Required[PeerDeliveryOutcome]
     envelope_id: Required[str]
     interaction_id: Required[str]
     kind: Required[Literal['peer_request_sent']]
@@ -9018,7 +9030,7 @@ class CommsSendResultPeerRequestSent(TypedDict, total=False):
     stream_reserved: Required[bool]
 
 class CommsSendResultPeerResponseSent(TypedDict, total=False):
-    delivery: Required[dict[str, dict[str, Any]] | Literal['acked'] | Literal['volatile_handed_off'] | Literal['queued']]
+    delivery: Required[PeerDeliveryOutcome]
     envelope_id: Required[str]
     in_reply_to: Required[str]
     kind: Required[Literal['peer_response_sent']]

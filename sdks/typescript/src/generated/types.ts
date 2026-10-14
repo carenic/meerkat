@@ -5350,6 +5350,18 @@ export interface CommsSendParamsPeerResponse {
 
 export type CommsSendParams = CommsSendParamsInput | CommsSendParamsPeerMessage | CommsSendParamsPeerLifecycle | CommsSendParamsPeerRequest | CommsSendParamsPeerResponse;
 
+export type PeerIngressTerminalOutcomeKind = "accepted" | "deduplicated" | "rejected";
+
+export interface PeerDeliveryOutcomeDurablyResolvedPayload {
+  outcome: PeerIngressTerminalOutcomeKind;
+}
+
+export interface PeerDeliveryOutcomeDurablyResolved {
+  durably_resolved: PeerDeliveryOutcomeDurablyResolvedPayload;
+}
+
+export type PeerDeliveryOutcome = PeerDeliveryOutcomeDurablyResolved | "acked" | "volatile_handed_off" | "queued";
+
 export interface CommsSendResultInputAccepted {
   interaction_id: string;
   kind: "input_accepted";
@@ -5357,19 +5369,19 @@ export interface CommsSendResultInputAccepted {
 }
 
 export interface CommsSendResultPeerMessageSent {
-  delivery: { durably_resolved: Record<string, unknown> } | "acked" | "volatile_handed_off" | "queued";
+  delivery: PeerDeliveryOutcome;
   envelope_id: string;
   kind: "peer_message_sent";
 }
 
 export interface CommsSendResultPeerLifecycleSent {
-  delivery: { durably_resolved: Record<string, unknown> } | "acked" | "volatile_handed_off" | "queued";
+  delivery: PeerDeliveryOutcome;
   envelope_id: string;
   kind: "peer_lifecycle_sent";
 }
 
 export interface CommsSendResultPeerRequestSent {
-  delivery: { durably_resolved: Record<string, unknown> } | "acked" | "volatile_handed_off" | "queued";
+  delivery: PeerDeliveryOutcome;
   envelope_id: string;
   interaction_id: string;
   kind: "peer_request_sent";
@@ -5378,7 +5390,7 @@ export interface CommsSendResultPeerRequestSent {
 }
 
 export interface CommsSendResultPeerResponseSent {
-  delivery: { durably_resolved: Record<string, unknown> } | "acked" | "volatile_handed_off" | "queued";
+  delivery: PeerDeliveryOutcome;
   envelope_id: string;
   in_reply_to: string;
   kind: "peer_response_sent";

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from typing import get_args
 
 from meerkat import MeerkatClient
 from meerkat.client import _literal_values
@@ -21,3 +22,31 @@ def test_send_lifecycle_kinds_are_the_wire_vocabulary() -> None:
 
     assert "mob.dismiss" in wire
     assert _literal_values(MeerkatClient._PeerLifecycleKind) == wire
+
+
+def test_peer_delivery_outcome_is_a_named_typed_union() -> None:
+    from meerkat.generated.types import CommsSendResultPeerMessageSent
+
+    delivery = get_type_hints(CommsSendResultPeerMessageSent)["delivery"]
+    durable_arms = [arm for arm in get_args(delivery) if hasattr(arm, "__required_keys__")]
+    assert len(durable_arms) == 1, f"durably_resolved is untyped in {delivery}"
+    payload = get_type_hints(durable_arms[0])["durably_resolved"]
+    outcome = get_type_hints(payload)["outcome"]
+    assert _literal_values(outcome) == {"accepted", "deduplicated", "rejected"}
+    assert _literal_values(delivery) == {"acked", "volatile_handed_off", "queued"}
+
+    from meerkat import PeerDeliveryOutcome, PeerIngressTerminalOutcomeKind
+
+    assert delivery == PeerDeliveryOutcome
+    assert outcome == PeerIngressTerminalOutcomeKind
+
+
+def test_delivery_validator_domains_are_the_generated_vocabulary() -> None:
+    from meerkat import PeerDeliveryOutcome, PeerIngressTerminalOutcomeKind
+    from meerkat.client import (
+        _PEER_DELIVERY_UNIT_OUTCOMES,
+        _PEER_INGRESS_TERMINAL_OUTCOMES,
+    )
+
+    assert _PEER_DELIVERY_UNIT_OUTCOMES == _literal_values(PeerDeliveryOutcome)
+    assert _PEER_INGRESS_TERMINAL_OUTCOMES == _literal_values(PeerIngressTerminalOutcomeKind)

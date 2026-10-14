@@ -167,6 +167,8 @@ from .generated.types import (
     MobWireMembersBatchResult,
     MonitorsStartParams,
     MonitorsStartResult,
+    PeerDeliveryOutcome,
+    PeerIngressTerminalOutcomeKind,
     PublicTurnToolOverlay,
     RealtimeTurningMode,
     ScheduleToolCallParams,
@@ -433,13 +435,6 @@ _MOB_CONTROL_SCOPES = frozenset(
     }
 )
 
-# `delivery` on every peer `comms/send` receipt is the server's
-# `PeerDeliveryOutcome` (crates/meerkat-core/src/comms.rs): a unit variant is
-# its snake_case name, and `durably_resolved` carries the receiver's
-# `PeerIngressTerminalOutcomeKind` (crates/meerkat-core/src/interaction.rs).
-_PEER_DELIVERY_UNIT_OUTCOMES = frozenset({"acked", "volatile_handed_off", "queued"})
-_PEER_INGRESS_TERMINAL_OUTCOMES = frozenset({"accepted", "deduplicated", "rejected"})
-
 RenderClass = Literal[
     "user_prompt",
     "peer_message",
@@ -597,6 +592,14 @@ def _literal_values(literal_type: Any) -> frozenset[Any]:
     for member in get_args(literal_type):
         values |= _literal_values(member)
     return frozenset(values)
+
+
+# `delivery` on every peer `comms/send` receipt is the generated
+# `PeerDeliveryOutcome`: a unit variant name, or `durably_resolved` carrying a
+# `PeerIngressTerminalOutcomeKind`.
+_PEER_DELIVERY_UNIT_OUTCOMES = _literal_values(PeerDeliveryOutcome)
+_PEER_INGRESS_TERMINAL_OUTCOMES = _literal_values(PeerIngressTerminalOutcomeKind)
+
 
 class MeerkatClient:
     """Async client that manages a Meerkat agent runtime via rkat-rpc.
