@@ -383,26 +383,38 @@ assert_file_contains "$TOP_LEVEL_WORKFLOW" 'cargo-nextest nextest run --archive-
 WORKFLOW_PROBE_ROOT="${TEST_ROOT}/workflow-entrypoints"
 mkdir -p "${WORKFLOW_PROBE_ROOT}/.github/workflows"
 WORKFLOW_CHECK="${TEST_ROOT}/doctor-workflow-check.sh"
+WORKFLOW_BAD='GitHub workflow Rust entrypoints bypass scripts/repo-cargo'
 cat >"${WORKFLOW_CHECK}" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 pass() { :; }
 bad() { printf '%s\n' "$1" >&2; return 1; }
 EOF
-sed -n '/^raw_cargo_workflow_hits=/,/^rust_channel=/p' \
-  "$ROOT/scripts/rust-lane-doctor" | sed '$d' >>"${WORKFLOW_CHECK}"
-grep -Fq 'bad "GitHub workflow Rust entrypoints bypass scripts/repo-cargo"' "${WORKFLOW_CHECK}" || {
+# Exactly the workflow check: from its first scan through the `fi` that ends
+# its verdict. Later doctor checks (such as the env bash version) are not
+# this contract and must not decide the probes below.
+awk '
+  /^raw_cargo_workflow_hits=/ { selected = 1 }
+  selected { print }
+  selected && /^fi$/ { exit }
+' "$ROOT/scripts/rust-lane-doctor" >>"${WORKFLOW_CHECK}"
+if ! grep -Fq "bad \"${WORKFLOW_BAD}\"" "${WORKFLOW_CHECK}" ||
+  ! grep -Fq 'pass "GitHub workflow Rust entrypoints use the repo Cargo wrapper"' "${WORKFLOW_CHECK}" ||
+  [[ "$(tail -n 1 "${WORKFLOW_CHECK}")" != 'fi' ]]; then
   echo "doctor workflow check fixture no longer selects its actual owner" >&2
   exit 1
-}
+fi
 check_workflow_entrypoints() {
   local description="$1" expected="$2" source="$3" actual
   printf '%s\n' "${source}" >"${WORKFLOW_PROBE_ROOT}/.github/workflows/probe.yml"
   if (cd "${WORKFLOW_PROBE_ROOT}" && bash "${WORKFLOW_CHECK}") \
     >"${TEST_ROOT}/workflow-check.out" 2>&1; then
     actual=pass
-  else
+  elif grep -Fxq -- "${WORKFLOW_BAD}" "${TEST_ROOT}/workflow-check.out"; then
     actual=fail
+  else
+    # Exiting without the check's own verdict is a crash, not a detection.
+    actual=error
   fi
   if [[ "${actual}" != "${expected}" ]]; then
     echo "doctor workflow check ${description}: expected ${expected}, got ${actual}" >&2
