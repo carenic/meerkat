@@ -28,6 +28,59 @@
 | Bailey (Gate) | Compliance checkpoint | Cautious, risk-evaluating |
 | Sage (Archivist) | Knowledge base | Methodical, encyclopedic |
 
+## The Office Scene
+
+The office is pixel art on a 640x360 grid, scaled to the window with
+nearest-neighbour sampling; names, speech bubbles and call lines are drawn at
+full display resolution on top. Each workstation is layered (seated character,
+then the desk that hides their legs, then the desk phone) and depth-sorted.
+
+| Asset | Contents |
+|-------|----------|
+| `web/public/office/bg.png` | Room shell with empty rugs where the desks go |
+| `web/public/office/chars/<agent>.png` | Four seated frames: typing A, typing B, on the phone, thinking |
+| `web/public/office/desks/<agent>.png` | The agent's desk and its role-specific props |
+| `web/public/office/props/` | Desk phone (on and off the hook), envelope, folder |
+| `web/public/office/cast.png` | Title-screen lineup |
+
+The art was generated with GPT Image 2.5 and then snapped to the grid:
+downsampled, palette-quantized, and (for characters) every frame registered on
+the chair base so the animation never jitters.
+
+What the animations mean:
+
+- A new event flies an envelope from the Mail Room slot into Triage's in-tray.
+- A `send_message` request flies an envelope from the sender's desk phone to
+  the recipient's, drawing a line behind it; the recipient's phone rings when
+  it lands (a request, not a delivery confirmation). The line then settles into
+  a slim trace for at least 6 seconds, so a conversation stays visible as a
+  network. Agents hold the handset while sending and while any tool executes.
+- A thought cloud means the agent's turn is running; idle agents type.
+- Speech bubbles show what an agent said or did. A turn that changed nothing
+  is logged without a bubble, unless it answers a message from you. At most
+  four bubbles show at once, placed clear of faces.
+- A stored archive record flies a folder into the filing cabinet.
+- Hover or click an agent to see their role; the selected agent gets a marker.
+
+## Agent Setup
+
+- **Quiet start.** Every member runs one kickoff turn at spawn, prompted to
+  wait silently. The runtime notifies a member's wired peers when its kickoff
+  ends, and that notice wakes them, so the office subscribes first, waits for
+  every kickoff to resolve (read from the mob roster), and only then wires the
+  26 comms edges. A failed kickoff fails startup visibly instead of wiring a
+  partial office.
+- **Host tools with real results.** `upsert_record`, `revoke_access` and
+  `restore_access` are `register_tool_callback` tools: the agent gets the
+  actual outcome (record created/updated or rejected with the reason; topology
+  change complete, partial or failed). `request_human_approval` stays
+  fire-and-forget, because the human decides later and the decision reaches
+  Gate as a `HUMAN DECISION` message.
+- **Tools per role.** The browser runtime gives every member the same tool
+  set, so each profile's `tools.deny` removes the task tools and every host
+  tool the role does not own: only Gate requests approval, only the Archivist
+  writes records, only IT changes access.
+
 ## Prerequisites
 
 ```bash
@@ -110,8 +163,9 @@ npm run test:offline
 The tests run Playwright's bundled headless Chromium (install it once with
 `npx --prefix web playwright install chromium`; `CHROME_BIN` overrides the
 binary, and `CHROME_SANDBOX=1` keeps the Chromium sandbox on), actual compiled
-TypeScript/DOM handlers and real Cytoscape. The 20 regression groups include
-Graph, Records and Log geometry and scrolling at 650x735 and 1280x900.
+TypeScript/DOM handlers and real Cytoscape. The 21 regression groups include
+Graph, Records and Log geometry and scrolling at 650x735 and 1280x900, and
+check that the office wires only after every kickoff resolves.
 The separate `test:offline` lane
 requires a healthy built-page WASM bootstrap, stop/admission and resume.
 It also verifies the unchanged admin policy in all ten initial role skills and
@@ -120,7 +174,9 @@ The offline lane serves complete synthetic Anthropic responses only at the
 expected messages endpoint. Its finite request bound is derived from the ten
 initial turns and 52 possible directed terminal-kickoff notices, each with at most
 one structured extraction, plus one isolated lifecycle control call: 125 requests
-within three minutes. Per-role/phase checks reject repeated notice deliveries,
+within three minutes. That is a ceiling: because the office wires only after
+the kickoffs resolve, a healthy bootstrap delivers no kickoff notices and makes
+just the ten initial calls. Per-role/phase checks reject repeated notice deliveries,
 unexpected work and extra extraction calls, and teardown must leave no pending
 fixture responses;
 all other external traffic is blocked and synthetic keys are used. These checks
@@ -131,7 +187,7 @@ required topology/subscriptions; roster size alone is not a healthy bootstrap.
 ### Server/Proxy Mode
 
 ```
-http://127.0.0.1:4174?proxy=http://localhost:8080&model=claude-sonnet-4-6
+http://127.0.0.1:4174?proxy=http://localhost:8080&model=claude-sonnet-5-5
 ```
 
 Provider requests are routed to the configured proxy base URL, which must own

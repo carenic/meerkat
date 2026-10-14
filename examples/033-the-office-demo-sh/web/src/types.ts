@@ -98,6 +98,8 @@ export interface RuntimeModule {
   default: () => Promise<unknown>;
   init_runtime_from_config: (configJson: string) => Promise<unknown>;
   register_js_tool: (name: string, description: string, schemaJson: string) => void;
+  /** The callback receives the JSON arguments and resolves to `{"content": string, "is_error": boolean}` JSON. */
+  register_tool_callback: (name: string, description: string, schemaJson: string, callback: (argsJson: string) => Promise<string>) => void;
   mob_create: (definitionJson: string) => Promise<unknown>;
   mob_spawn: (mobId: string, specsJson: string) => Promise<unknown>;
   mob_wire: (mobId: string, a: string, b: string) => Promise<void>;
