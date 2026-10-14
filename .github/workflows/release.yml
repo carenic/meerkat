@@ -1496,16 +1496,10 @@ jobs:
         env:
           VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
           CARGO_INCREMENTAL: "0"
-          # One Cargo job: the hosted runner has 16 GB, and the largest rustc
-          # processes of this wasm32 release build peak at 12.7 GiB
-          # (meerkat-machine-schema; 11.3 GiB even at opt-level 0, 12.5 at 16
-          # codegen units), 9.1 (meerkat-runtime) and 6.1 (meerkat-mob).
-          # Pipelining overlaps them: the cold v0.9.0 build peaked at 18.7 GiB
-          # at four jobs and 16.8 at two, and a 15 GiB (four jobs) or 13 GiB
-          # (two jobs) cgroup OOM-killed it with the schema and runtime crates
-          # in flight, the phase in which the v0.9.0 runner was lost twice. At
-          # one job it peaks at 12.8 GiB and completes inside a 13 GiB cgroup
-          # (4 CPUs, measured 2026-10-14).
+          # Serialize memory-heavy wasm32 compilations. Local capped
+          # comparisons OOM-killed at jobs 4 and 2; with jobs 1, the Cargo
+          # phase completed under a 13 GiB limit. This controls Cargo
+          # concurrency, not a total memory cap or wasm-opt's parallelism.
           CARGO_BUILD_JOBS: "1"
         run: scripts/release-build-web-sdk-package.sh "${GITHUB_WORKSPACE}/web-sdk-package"
 
