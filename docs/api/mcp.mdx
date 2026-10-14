@@ -1049,6 +1049,15 @@ even when several pending calls invoke the same tool.
   Run-scoped hook overrides.
 </ParamField>
 
+<ParamField body="turn_tool_overlay" type="object | null" default="null">
+  Per-turn tool overlay, the same shape `turn/start` takes: `allowed_tools`,
+  `blocked_tools`, and `tool_choice_plan` (entry `k` is the tool choice of the
+  turn's `k`-th provider call, for example `[{"mode": "required"}]`). It
+  applies to this turn only, on a live session and on a resume that rebuilds
+  the session's agent. Keys it does not know are ignored and logged by the
+  server.
+</ParamField>
+
 ### Response format
 
 Both `meerkat_run` and `meerkat_resume` return MCP-standard tool results.
