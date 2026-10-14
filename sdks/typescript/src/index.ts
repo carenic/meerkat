@@ -357,6 +357,7 @@ export type {
   CommsSendErrorDataPeerUnreachable,
   CommsSendErrorDataSendAmbiguous,
   CommsSendErrorDataSendFailed,
+  CommsSendRequiredAction,
 } from "./generated/types.js";
 export { COMMS_SEND_ERROR_CODES, commsSendError } from "./comms-errors.js";
 

@@ -4026,6 +4026,20 @@ fn normalize_mcp_comms_send_error(
                 })),
             )
         }
+        meerkat_core::comms::SendError::DurableAdmissionRejected { envelope_id } => {
+            typed_mcp_comms_send_error(&meerkat_contracts::CommsSendErrorData::peer_input_rejected(
+                peer_name.unwrap_or("<unknown>"),
+                *envelope_id,
+            ))
+        }
+        // Not a failed send: the envelope may already be delivered, and a
+        // caller told "failed" retries, which can duplicate the delivery.
+        meerkat_core::comms::SendError::AmbiguousDelivery {
+            envelope_id,
+            detail,
+        } => typed_mcp_comms_send_error(
+            &meerkat_contracts::CommsSendErrorData::ambiguous_delivery(*envelope_id, detail),
+        ),
         other => ToolCallError::new(
             -32603,
             other.to_string(),
@@ -4033,6 +4047,23 @@ fn normalize_mcp_comms_send_error(
                 "code": "send_failed",
                 "message": other.to_string(),
             })),
+        ),
+    }
+}
+
+/// A tool error carrying the typed `comms/send` error data RPC and REST share.
+#[cfg(feature = "comms")]
+fn typed_mcp_comms_send_error(data: &meerkat_contracts::CommsSendErrorData) -> ToolCallError {
+    match serde_json::to_value(data) {
+        Ok(value) => ToolCallError::new(
+            -32603,
+            format!("{}: {}", data.code(), data.message()),
+            Some(value),
+        ),
+        Err(error) => ToolCallError::new(
+            -32603,
+            format!("failed to serialize comms error data: {error}"),
+            None,
         ),
     }
 }
@@ -7853,6 +7884,71 @@ mod tests {
         assert_eq!(
             data.get("reason").and_then(Value::as_str),
             Some("classification_rejected")
+        );
+    }
+
+    // An ambiguous delivery may already have landed: it must reach the caller
+    // as `send_ambiguous` with its envelope id and the same reconcile fields
+    // RPC and REST carry, never as `send_failed`, which invites a retry.
+    #[cfg(feature = "comms")]
+    #[test]
+    fn test_normalize_mcp_comms_send_error_names_ambiguous_delivery() {
+        let envelope_id = uuid::Uuid::new_v4();
+        let err = normalize_mcp_comms_send_error(
+            Some("peer-a"),
+            &meerkat_core::comms::SendError::AmbiguousDelivery {
+                envelope_id,
+                detail: "ack timed out".to_string(),
+            },
+        );
+        assert_eq!(err.code, -32603);
+        assert!(
+            err.message.starts_with("send_ambiguous:"),
+            "{}",
+            err.message
+        );
+        let data = err.data.expect("structured error data");
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some("send_ambiguous")
+        );
+        assert_eq!(
+            data.get("envelope_id").and_then(Value::as_str),
+            Some(envelope_id.to_string().as_str())
+        );
+        assert_eq!(data.get("retry_safe").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            data.get("required_action").and_then(Value::as_str),
+            Some("reconcile")
+        );
+    }
+
+    // A durably rejected envelope is a terminal, unambiguous rejection: the
+    // caller gets `peer_input_rejected` with the envelope id, as on RPC and
+    // REST, not a plain `send_failed`.
+    #[cfg(feature = "comms")]
+    #[test]
+    fn test_normalize_mcp_comms_send_error_names_durable_rejection() {
+        let envelope_id = uuid::Uuid::new_v4();
+        let err = normalize_mcp_comms_send_error(
+            Some("peer-a"),
+            &meerkat_core::comms::SendError::DurableAdmissionRejected { envelope_id },
+        );
+        assert_eq!(err.code, -32603);
+        assert!(
+            err.message.starts_with("peer_input_rejected:"),
+            "{}",
+            err.message
+        );
+        let data = err.data.expect("structured error data");
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some("peer_input_rejected")
+        );
+        assert_eq!(data.get("peer").and_then(Value::as_str), Some("peer-a"));
+        assert_eq!(
+            data.get("envelope_id").and_then(Value::as_str),
+            Some(envelope_id.to_string().as_str())
         );
     }
 

@@ -639,9 +639,9 @@ deduplicated against the original peer delivery. A higher-level durable
 idempotency key helps only when it is coarser than the retry. A per-attempt or
 timestamped key is not protection.
 
-REST and JSON-RPC `comms/send` report this case as `send_ambiguous`, not
-`send_failed`, with the `envelope_id`. REST's details payload also includes
-`retry_safe: false` and `required_action: "reconcile"`.
+REST, JSON-RPC `comms/send` and the MCP `meerkat_comms_send` tool report this
+case as `send_ambiguous`, not `send_failed`, with the same typed payload: the
+`envelope_id`, `retry_safe: false` and `required_action: "reconcile"`.
 
 ## Configuration
 

@@ -84,7 +84,13 @@ describe("commsSendError", () => {
       name: "send_ambiguous",
       rpcCode: -32603,
       rpcMessage: AMBIGUOUS_MESSAGE,
-      data: { code: "send_ambiguous", envelope_id: ENVELOPE_ID, message: AMBIGUOUS_MESSAGE },
+      data: {
+        code: "send_ambiguous",
+        envelope_id: ENVELOPE_ID,
+        message: AMBIGUOUS_MESSAGE,
+        retry_safe: false,
+        required_action: "reconcile",
+      },
     },
     {
       name: "invalid_command",

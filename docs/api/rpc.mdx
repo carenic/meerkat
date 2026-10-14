@@ -3115,6 +3115,22 @@ Standard JSON-RPC codes plus Meerkat-specific application codes:
 | -32035 | Approval commit unknown | The store cannot confirm the commit; reconcile from the store, never resend |
 | -32036 | Stale delivery scope | A scope-bound mob submit named a session that is no longer the member's; re-capture the delivery scope |
 
+### comms/send error data
+
+A failed `comms/send` returns `-32603` (`-32602` for `invalid_command`) with a
+typed `CommsSendErrorData` object in `error.data`, tagged on `code`. Every
+variant also carries a `message`.
+
+| `code` | Meaning | Other fields |
+|--------|---------|--------------|
+| `peer_not_found_or_not_trusted` | The peer is unknown or not trusted | `peer` |
+| `peer_unreachable` | The peer is offline, or the transport failed | `peer`, `reason` (`offline_or_no_ack` or `transport_error`), optional `details` |
+| `peer_admission_dropped` | The peer's ingress dropped the envelope | `peer`, `reason` |
+| `peer_input_rejected` | The peer durably rejected the envelope | `peer`, `envelope_id` |
+| `send_ambiguous` | The delivery outcome is unknown: the envelope may already be delivered. Reconcile by `envelope_id` before any new attempt; a retry can duplicate it | `envelope_id`, `retry_safe` (`false`), `required_action` (`"reconcile"`) |
+| `send_failed` | Any other send failure | none |
+| `invalid_command` | The command failed validation | none |
+
 ## Architecture
 
 The RPC server is **stateful**: agents stay alive between turns through the shared runtime-backed service also used by REST and MCP. RPC's distinguishing surface is its broad JSON-RPC method catalog, scoped subscriptions, and server notifications.

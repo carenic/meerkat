@@ -106,6 +106,8 @@ _WIRE_FAILURES = [
             "code": "send_ambiguous",
             "envelope_id": _ENVELOPE_ID,
             "message": _AMBIGUOUS_MESSAGE,
+            "retry_safe": False,
+            "required_action": "reconcile",
         },
         id="send_ambiguous",
     ),

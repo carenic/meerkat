@@ -2124,7 +2124,9 @@ mod tests {
                 "message": format!(
                     "delivery outcome for envelope {} is unknown",
                     uuid::Uuid::nil()
-                )
+                ),
+                "retry_safe": false,
+                "required_action": "reconcile"
             }),
         );
         assert_schema_accepts(

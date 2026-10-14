@@ -88028,6 +88028,16 @@
           "transport_error"
         ],
         "type": "string"
+      },
+      "CommsSendRequiredAction": {
+        "description": "The caller's next safe move after an ambiguous `comms/send`.",
+        "oneOf": [
+          {
+            "const": "reconcile",
+            "description": "Reconcile against durable work truth by envelope id before any new\nattempt.",
+            "type": "string"
+          }
+        ]
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -88143,12 +88153,21 @@
           },
           "message": {
             "type": "string"
+          },
+          "required_action": {
+            "$ref": "#/$defs/CommsSendRequiredAction"
+          },
+          "retry_safe": {
+            "description": "Always `false`: a blind retry can duplicate the delivery.",
+            "type": "boolean"
           }
         },
         "required": [
           "code",
           "envelope_id",
-          "message"
+          "message",
+          "retry_safe",
+          "required_action"
         ],
         "type": "object"
       },

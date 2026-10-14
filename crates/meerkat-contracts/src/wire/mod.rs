@@ -48,9 +48,10 @@ pub use comms::{
     CommsCommandError, CommsCommandProjectionError, CommsCommandRequest, CommsPeerEntry,
     CommsPeerLifecycleParams, CommsPeerRequestIntent, CommsPeerRequestParams,
     CommsPeerResponseResult, CommsPeerUnreachableReason, CommsPeersParams, CommsPeersResult,
-    CommsSendErrorData, CommsSendParams, CommsSendResult, HandlingMode as WireCommsHandlingMode,
-    InputSource as WireCommsInputSource, InputStreamMode as WireCommsInputStreamMode, PeerAddress,
-    PeerCapabilitySet, PeerDirectoryEntry, PeerDirectoryListing, PeerDirectorySource, PeerId,
+    CommsSendErrorData, CommsSendParams, CommsSendRequiredAction, CommsSendResult,
+    HandlingMode as WireCommsHandlingMode, InputSource as WireCommsInputSource,
+    InputStreamMode as WireCommsInputStreamMode, PeerAddress, PeerCapabilitySet,
+    PeerDirectoryEntry, PeerDirectoryListing, PeerDirectorySource, PeerId,
     PeerName as WireCommsPeerName, PeerSendability, PeerTransport,
     ResponseStatus as WireCommsResponseStatus, SendTaintOverride, SenderContentTaint,
 };

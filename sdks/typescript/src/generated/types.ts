@@ -5402,6 +5402,8 @@ export type CommsPeerUnreachableReason = "offline_or_no_ack" | "transport_error"
 
 export type AdmissionDropReason = "untrusted_sender" | "classification_rejected" | "session_closed" | "inbox_full";
 
+export type CommsSendRequiredAction = "reconcile";
+
 export interface CommsSendErrorDataPeerNotFoundOrNotTrusted {
   code: "peer_not_found_or_not_trusted";
   message: string;
@@ -5434,6 +5436,8 @@ export interface CommsSendErrorDataSendAmbiguous {
   code: "send_ambiguous";
   envelope_id: string;
   message: string;
+  required_action: CommsSendRequiredAction;
+  retry_safe: boolean;
 }
 
 export interface CommsSendErrorDataSendFailed {

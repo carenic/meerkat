@@ -56,6 +56,7 @@ from .generated.types import (
     CommsSendErrorDataPeerUnreachable as CommsSendErrorDataPeerUnreachable,
     CommsSendErrorDataSendAmbiguous as CommsSendErrorDataSendAmbiguous,
     CommsSendErrorDataSendFailed as CommsSendErrorDataSendFailed,
+    CommsSendRequiredAction as CommsSendRequiredAction,
     GoalAttentionTarget as GoalAttentionTarget,
     GoalStatusRequest as GoalStatusRequest,
     GoalStatusResult as GoalStatusResult,

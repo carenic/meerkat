@@ -286,6 +286,7 @@ COMMS_SESSION_STREAM_RPC_CONTRACT_ALIAS_TYPES = [
     # Typed `error.data` of a failed `comms/send`, tagged on `code`.
     "CommsPeerUnreachableReason",
     "AdmissionDropReason",
+    "CommsSendRequiredAction",
     "CommsSendErrorData",
     "CommsChecksumTokenResultIntent",
     "CommsPeerRequestIntent",

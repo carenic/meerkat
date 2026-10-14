@@ -59,28 +59,14 @@ pub(crate) fn normalize_send_error(
             }
         }
         meerkat_core::comms::SendError::DurableAdmissionRejected { envelope_id } => {
-            let peer = peer_name.unwrap_or("<unknown>");
-            CommsSendErrorData::PeerInputRejected {
-                peer: peer.to_string(),
-                envelope_id: envelope_id.to_string(),
-                message: format!("peer '{peer}' durably rejected envelope {envelope_id}"),
-            }
+            CommsSendErrorData::peer_input_rejected(peer_name.unwrap_or("<unknown>"), *envelope_id)
         }
         // Not a failed send: the envelope may already be delivered, and a
-        // caller told "failed" retries, which can duplicate the delivery. Name
-        // the ambiguity and carry the envelope id for reconciliation, as REST's
-        // `send_ambiguous` does.
+        // caller told "failed" retries, which can duplicate the delivery.
         meerkat_core::comms::SendError::AmbiguousDelivery {
             envelope_id,
             detail,
-        } => CommsSendErrorData::SendAmbiguous {
-            envelope_id: envelope_id.to_string(),
-            message: format!(
-                "delivery outcome for envelope {envelope_id} is unknown; it may already be \
-                 delivered. Reconcile against durable work truth before any new attempt - a \
-                 retry can duplicate. ({detail})"
-            ),
-        },
+        } => CommsSendErrorData::ambiguous_delivery(*envelope_id, detail),
         other => CommsSendErrorData::SendFailed {
             message: other.to_string(),
         },
@@ -393,12 +379,20 @@ mod tests {
         );
 
         let message = data.message().to_string();
-        let json = serde_json::to_value(data).unwrap();
-        assert_eq!(json["code"], "send_ambiguous");
-        assert_eq!(json["envelope_id"], envelope_id.to_string());
         assert!(message.contains(&envelope_id.to_string()), "{message}");
         assert!(message.contains("may already be delivered"), "{message}");
         assert!(!message.contains("failed"), "{message}");
+        // Byte-for-byte REST's `send_ambiguous` details.
+        assert_eq!(
+            serde_json::to_value(data).unwrap(),
+            serde_json::json!({
+                "code": "send_ambiguous",
+                "message": message,
+                "envelope_id": envelope_id.to_string(),
+                "retry_safe": false,
+                "required_action": "reconcile",
+            })
+        );
     }
 
     // Gate (#62): `send_receipt_json` returns a typed `Result` and no longer

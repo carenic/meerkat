@@ -3617,6 +3617,18 @@ async fn comms_send(
     }
 }
 
+/// A REST error carrying the typed `comms/send` error data RPC and MCP share.
+fn typed_rest_comms_send_error(data: &CommsSendErrorData) -> ApiError {
+    match serde_json::to_value(data) {
+        Ok(details) => ApiError::InternalWithData {
+            message: format!("{}: {}", data.code(), data.message()),
+            code: data.code().to_string(),
+            details,
+        },
+        Err(error) => ApiError::Internal(format!("failed to serialize comms error data: {error}")),
+    }
+}
+
 fn normalize_rest_comms_send_error(
     peer_name: Option<&str>,
     error: &meerkat_core::comms::SendError,
@@ -3684,23 +3696,10 @@ fn normalize_rest_comms_send_error(
             }
         }
         meerkat_core::comms::SendError::DurableAdmissionRejected { envelope_id } => {
-            let peer = peer_name.unwrap_or("<unknown>");
-            let message = format!("peer '{peer}' durably rejected envelope {envelope_id}");
-            let data = CommsSendErrorData::PeerInputRejected {
-                peer: peer.to_string(),
-                envelope_id: envelope_id.to_string(),
-                message: message.clone(),
-            };
-            match serde_json::to_value(data) {
-                Ok(details) => ApiError::InternalWithData {
-                    message: format!("peer_input_rejected: {message}"),
-                    code: "peer_input_rejected".to_string(),
-                    details,
-                },
-                Err(error) => {
-                    ApiError::Internal(format!("failed to serialize comms error data: {error}"))
-                }
-            }
+            typed_rest_comms_send_error(&CommsSendErrorData::peer_input_rejected(
+                peer_name.unwrap_or("<unknown>"),
+                *envelope_id,
+            ))
         }
         // An ambiguous delivery is NOT a failed send, and it must not arrive at
         // a caller under a code that says it was. The envelope may already be on
@@ -3714,24 +3713,10 @@ fn normalize_rest_comms_send_error(
         meerkat_core::comms::SendError::AmbiguousDelivery {
             envelope_id,
             detail,
-        } => {
-            let message = format!(
-                "delivery outcome for envelope {envelope_id} is unknown; it may already be \
-                 delivered. Reconcile against durable work truth before any new attempt - a \
-                 retry can duplicate. ({detail})"
-            );
-            ApiError::InternalWithData {
-                message: format!("send_ambiguous: {message}"),
-                code: "send_ambiguous".to_string(),
-                details: json!({
-                    "code": "send_ambiguous",
-                    "message": message,
-                    "envelope_id": envelope_id.to_string(),
-                    "retry_safe": false,
-                    "required_action": "reconcile",
-                }),
-            }
-        }
+        } => typed_rest_comms_send_error(&CommsSendErrorData::ambiguous_delivery(
+            *envelope_id,
+            detail,
+        )),
         other => ApiError::InternalWithData {
             message: format!("send_failed: {other}"),
             code: "send_failed".to_string(),
@@ -12372,6 +12357,47 @@ mod tests {
                 assert_eq!(details["code"], "peer_input_rejected");
                 assert_eq!(details["peer"], "peer-a");
                 assert_eq!(details["envelope_id"], envelope_id.to_string());
+            }
+            other => panic!("expected structured internal error, got {other:?}"),
+        }
+    }
+
+    // REST's `send_ambiguous` payload, byte for byte. RPC and MCP build it from
+    // the same `CommsSendErrorData::ambiguous_delivery` constructor.
+    #[cfg(feature = "comms")]
+    #[test]
+    fn test_normalize_rest_comms_send_error_names_ambiguous_delivery() {
+        let envelope_id = uuid::Uuid::new_v4();
+        let err = normalize_rest_comms_send_error(
+            Some("peer-a"),
+            &meerkat_core::comms::SendError::AmbiguousDelivery {
+                envelope_id,
+                detail: "ack timed out".to_string(),
+            },
+        );
+        let expected_message = format!(
+            "delivery outcome for envelope {envelope_id} is unknown; it may already be \
+             delivered. Reconcile against durable work truth before any new attempt - a \
+             retry can duplicate. (ack timed out)"
+        );
+        match err {
+            ApiError::InternalWithData {
+                message,
+                code,
+                details,
+            } => {
+                assert_eq!(code, "send_ambiguous");
+                assert_eq!(message, format!("send_ambiguous: {expected_message}"));
+                assert_eq!(
+                    details,
+                    json!({
+                        "code": "send_ambiguous",
+                        "message": expected_message,
+                        "envelope_id": envelope_id.to_string(),
+                        "retry_safe": false,
+                        "required_action": "reconcile",
+                    })
+                );
             }
             other => panic!("expected structured internal error, got {other:?}"),
         }

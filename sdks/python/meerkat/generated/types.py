@@ -9049,6 +9049,9 @@ CommsPeerUnreachableReason = Literal['offline_or_no_ack', 'transport_error']
 # without collapsing both into "peer unreachable".
 AdmissionDropReason = Literal['untrusted_sender', 'classification_rejected', 'session_closed', 'inbox_full']
 
+# The caller's next safe move after an ambiguous `comms/send`.
+CommsSendRequiredAction = Literal['reconcile']
+
 # Typed error data for `comms/send` failures.
 #
 # The error taxonomy is owned here (K17): surfaces serialize this contract
@@ -9081,6 +9084,8 @@ class CommsSendErrorDataSendAmbiguous(TypedDict, total=False):
     code: Required[Literal['send_ambiguous']]
     envelope_id: Required[str]
     message: Required[str]
+    required_action: Required[CommsSendRequiredAction]
+    retry_safe: Required[bool]
 
 class CommsSendErrorDataSendFailed(TypedDict, total=False):
     code: Required[Literal['send_failed']]

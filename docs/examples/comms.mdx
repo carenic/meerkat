@@ -197,8 +197,8 @@ If REST cannot prove the terminal delivery outcome, it returns typed
 }
 ```
 
-JSON-RPC `comms/send` fails with the same `send_ambiguous` code in
-`error.data`, with the `envelope_id` and a `message`.
+JSON-RPC `comms/send` and the MCP `meerkat_comms_send` tool fail with the
+same `send_ambiguous` payload in their error data.
 
 Reconcile that envelope against durable work truth before creating another
 attempt. A new envelope id is new peer work; only a higher-level durable

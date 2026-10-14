@@ -647,6 +647,16 @@ pub enum CommsPeerUnreachableReason {
     TransportError,
 }
 
+/// The caller's next safe move after an ambiguous `comms/send`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CommsSendRequiredAction {
+    /// Reconcile against durable work truth by envelope id before any new
+    /// attempt.
+    Reconcile,
+}
+
 /// Typed error data for `comms/send` failures.
 ///
 /// The error taxonomy is owned here (K17): surfaces serialize this contract
@@ -683,6 +693,9 @@ pub enum CommsSendErrorData {
     SendAmbiguous {
         envelope_id: String,
         message: String,
+        /// Always `false`: a blind retry can duplicate the delivery.
+        retry_safe: bool,
+        required_action: CommsSendRequiredAction,
     },
     SendFailed {
         message: String,
@@ -693,6 +706,48 @@ pub enum CommsSendErrorData {
 }
 
 impl CommsSendErrorData {
+    /// A durably rejected peer envelope (`SendError::DurableAdmissionRejected`).
+    /// Every surface builds this payload here, so they cannot drift.
+    #[must_use]
+    pub fn peer_input_rejected(peer: &str, envelope_id: uuid::Uuid) -> Self {
+        Self::PeerInputRejected {
+            peer: peer.to_string(),
+            envelope_id: envelope_id.to_string(),
+            message: format!("peer '{peer}' durably rejected envelope {envelope_id}"),
+        }
+    }
+
+    /// An ambiguous peer delivery (`SendError::AmbiguousDelivery`): the
+    /// envelope may already be delivered, so the caller must reconcile, never
+    /// retry. Every surface builds this payload here, so they cannot drift.
+    #[must_use]
+    pub fn ambiguous_delivery(envelope_id: uuid::Uuid, detail: &str) -> Self {
+        Self::SendAmbiguous {
+            envelope_id: envelope_id.to_string(),
+            message: format!(
+                "delivery outcome for envelope {envelope_id} is unknown; it may already be \
+                 delivered. Reconcile against durable work truth before any new attempt - a \
+                 retry can duplicate. ({detail})"
+            ),
+            retry_safe: false,
+            required_action: CommsSendRequiredAction::Reconcile,
+        }
+    }
+
+    /// The wire `code` tag of this error.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::PeerNotFoundOrNotTrusted { .. } => "peer_not_found_or_not_trusted",
+            Self::PeerUnreachable { .. } => "peer_unreachable",
+            Self::PeerAdmissionDropped { .. } => "peer_admission_dropped",
+            Self::PeerInputRejected { .. } => "peer_input_rejected",
+            Self::SendAmbiguous { .. } => "send_ambiguous",
+            Self::SendFailed { .. } => "send_failed",
+            Self::InvalidCommand { .. } => "invalid_command",
+        }
+    }
+
     /// Human-readable message carried by every variant.
     #[must_use]
     pub fn message(&self) -> &str {
@@ -929,14 +984,20 @@ mod tests {
     #[test]
     fn comms_send_error_data_names_ambiguous_delivery() {
         let envelope_id = uuid::Uuid::new_v4();
-        let value = serde_json::to_value(CommsSendErrorData::SendAmbiguous {
-            envelope_id: envelope_id.to_string(),
-            message: format!("delivery outcome for envelope {envelope_id} is unknown"),
-        })
-        .expect("ambiguous delivery should serialize");
+        let data = CommsSendErrorData::ambiguous_delivery(envelope_id, "ack timed out");
+        let message = data.message().to_string();
+        let value = serde_json::to_value(data).expect("ambiguous delivery should serialize");
 
-        assert_eq!(value["code"], "send_ambiguous");
-        assert_eq!(value["envelope_id"], envelope_id.to_string());
+        assert_eq!(
+            value,
+            json!({
+                "code": "send_ambiguous",
+                "message": message,
+                "envelope_id": envelope_id.to_string(),
+                "retry_safe": false,
+                "required_action": "reconcile",
+            })
+        );
 
         let roundtrip: CommsSendErrorData =
             serde_json::from_value(value).expect("ambiguous delivery should deserialize");
@@ -947,6 +1008,40 @@ mod tests {
                 ..
             } if projected_id == envelope_id.to_string()
         ));
+    }
+
+    #[test]
+    fn comms_send_error_data_code_is_the_serialized_tag() {
+        let envelope_id = uuid::Uuid::new_v4();
+        let all = [
+            CommsSendErrorData::PeerNotFoundOrNotTrusted {
+                peer: "peer-a".to_string(),
+                message: "m".to_string(),
+            },
+            CommsSendErrorData::PeerUnreachable {
+                peer: "peer-a".to_string(),
+                reason: CommsPeerUnreachableReason::TransportError,
+                message: "m".to_string(),
+                details: Some("refused".to_string()),
+            },
+            CommsSendErrorData::PeerAdmissionDropped {
+                peer: "peer-a".to_string(),
+                reason: meerkat_core::comms::AdmissionDropReason::InboxFull,
+                message: "m".to_string(),
+            },
+            CommsSendErrorData::peer_input_rejected("peer-a", envelope_id),
+            CommsSendErrorData::ambiguous_delivery(envelope_id, "ack timed out"),
+            CommsSendErrorData::SendFailed {
+                message: "m".to_string(),
+            },
+            CommsSendErrorData::InvalidCommand {
+                message: "m".to_string(),
+            },
+        ];
+        for data in all {
+            let value = serde_json::to_value(&data).expect("error data should serialize");
+            assert_eq!(value["code"], data.code());
+        }
     }
 
     #[test]

@@ -143,6 +143,7 @@ pub use wire::{
     CommsPeersResult,
     CommsSendErrorData,
     CommsSendParams,
+    CommsSendRequiredAction,
     CommsSendResult,
     ConfigPatchParams,
     ConfigSetParams,

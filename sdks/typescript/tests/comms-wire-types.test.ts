@@ -46,6 +46,8 @@ const ambiguous: CommsSendErrorData = {
   code: "send_ambiguous",
   envelope_id: "00000000-0000-4000-8000-000000000001",
   message: "delivery outcome is unknown",
+  retry_safe: false,
+  required_action: "reconcile",
 };
 // @ts-expect-error error codes are the generated closed vocabulary.
 const unknownCode: CommsSendErrorData = { code: "not_a_code", message: "m" };
