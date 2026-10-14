@@ -4488,22 +4488,12 @@ async fn handle_help_command(
     // Like every help entry point, the CLI builds its session from the one
     // shared help session: the embedded skills whole in the system prompt and
     // the read-only reference tools as the session's only tools.
-    #[cfg(feature = "skills")]
-    let (system_prompt, preload_skills, help_tools) = {
-        let help = meerkat::help::help_session();
-        (help.system_prompt, Vec::new(), Some(help.tools))
-    };
-    #[cfg(not(feature = "skills"))]
-    let (system_prompt, preload_skills, help_tools) = (
-        meerkat::help::help_system_prompt().to_string(),
-        meerkat::help::platform_preload_skill_names(),
-        None,
-    );
+    let help = cli_help_session()?;
 
     handle_run_command(
         help_prompt,
         None,
-        Some(system_prompt),
+        Some(help.system_prompt),
         model,
         provider,
         max_tokens,
@@ -4523,7 +4513,7 @@ async fn handle_help_command(
         Vec::new(),
         None,
         None,
-        preload_skills,
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -4548,10 +4538,39 @@ async fn handle_help_command(
         StdinMode::Off,
         LineFormat::Text,
         None,
-        help_tools,
+        Some(help.tools),
         scope,
     )
     .await
+}
+
+/// The session `rkat help` runs: the embedded skills whole in the system
+/// prompt, and the read-only reference tools as its only tools.
+#[cfg_attr(not(feature = "skills"), allow(dead_code))]
+struct CliHelpSession {
+    system_prompt: String,
+    tools: Arc<dyn AgentToolDispatcher>,
+}
+
+#[cfg(feature = "skills")]
+fn cli_help_session() -> anyhow::Result<CliHelpSession> {
+    let help = meerkat::help::help_session();
+    Ok(CliHelpSession {
+        system_prompt: help.system_prompt,
+        tools: help.tools,
+    })
+}
+
+/// Model help answers from the embedded skills and reads their references
+/// through the help session's resource tools. A build without the `skills`
+/// feature has neither, so `rkat help` is refused here, before any session or
+/// tool is composed, instead of running as an ordinary run.
+#[cfg(not(feature = "skills"))]
+fn cli_help_session() -> anyhow::Result<CliHelpSession> {
+    anyhow::bail!(
+        "rkat help needs the `skills` feature, which this rkat was built without: \
+         help answers from the embedded skills and their reference documents"
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
