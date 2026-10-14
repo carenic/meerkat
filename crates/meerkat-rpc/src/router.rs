@@ -211,7 +211,13 @@ pub fn compose_rpc_mob_state(
     if let Some(acceptor) = controlling_acceptor {
         state = state.with_controlling_acceptor(acceptor);
     }
-    let state = Arc::new(state);
+    // Shared with its self-reference installed, as every other host shares
+    // it: each mob create and resume then runs to its managed-set insertion
+    // as the state's own task, so a caller cancelled or disconnected
+    // mid-create cannot leave a started mob (and its durable store) outside
+    // the managed set; restoration can also schedule its own council and
+    // fork_off recovery.
+    let state = state.into_shared();
     // fork_off and council outcomes are submitted durably to this runtime's
     // delivery owner, which resolves members and confirms jobs through it.
     if let Err(error) = state.bind_continuations(
@@ -13435,6 +13441,90 @@ mod tests {
             requests[1].contains("second queued turn"),
             "the second call is the queued turn: {}",
             requests[1]
+        );
+    }
+
+    /// A `mob/create` whose RPC handler is dropped mid-creation (a cancelled
+    /// or disconnected caller) still registers its mob. The composed RPC mob
+    /// state runs each create as its own task, so a create that already
+    /// wrote its durable store is never left outside the managed set.
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn mob_create_dropped_mid_creation_still_registers_its_mob() {
+        // Bounds a failure only; the passing path never waits for it.
+        const FAILURE_BOUND: Duration = Duration::from_secs(10);
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+        let config_store = meerkat_core::TaggedConfigStore::new(
+            Arc::new(MemoryConfigStore::new(
+                anthropic_test_config(),
+                meerkat_models::canonical(),
+            )),
+            meerkat_core::ConfigStoreMetadata {
+                realm_id: None,
+                instance_id: None,
+                backend: None,
+                resolved_paths: Some(meerkat_core::ConfigResolvedPaths {
+                    root: root_path.display().to_string(),
+                    manifest_path: root_path.join("realm.toml").display().to_string(),
+                    config_path: root_path.join("config.toml").display().to_string(),
+                    sessions_sqlite_path: None,
+                    sessions_jsonl_dir: root_path.join("sessions").display().to_string(),
+                }),
+            },
+        );
+        let (router, _notif_rx) = test_router_with_config_store(Arc::new(config_store)).await;
+        let mob_id = "dropped-mid-create";
+        let store = root_path.join("mobs").join(format!("mob--{mob_id}.db"));
+
+        let mut create = Box::pin(router.dispatch(make_request(
+            "mob/create",
+            serde_json::json!({
+                "definition": {
+                    "id": mob_id,
+                    "profiles": { "worker": { "model": "claude-sonnet-4-5" } }
+                }
+            }),
+        )));
+        // Drive the create one step at a time until it has written its
+        // durable store, then drop it there, mid-creation.
+        let deadline = tokio::time::Instant::now() + FAILURE_BOUND;
+        loop {
+            if let std::task::Poll::Ready(response) = futures::poll!(create.as_mut()) {
+                panic!("the create finished before it could be dropped mid-creation: {response:?}");
+            }
+            if store.exists() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create never reached its durable store at {}",
+                store.display()
+            );
+            tokio::task::yield_now().await;
+        }
+        drop(create);
+
+        let registered = tokio::time::timeout(FAILURE_BOUND, async {
+            loop {
+                let listed = router
+                    .dispatch(make_request("mob/list", serde_json::json!({})))
+                    .await
+                    .unwrap();
+                if result_value(&listed)["mobs"]
+                    .as_array()
+                    .is_some_and(|mobs| mobs.iter().any(|mob| mob["mob_id"] == mob_id))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            registered.is_ok(),
+            "a create dropped mid-creation left its store at {} without a managed mob",
+            store.display()
         );
     }
 
