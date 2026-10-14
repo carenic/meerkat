@@ -253,6 +253,7 @@ export type {
   TranscriptRewriteSelection,
   TranscriptToolResultContentBlockReplacement,
   TranscriptUserContentBlockReplacement,
+  TurnAuthBindingOverride,
   TurnOptions,
   TurnToolOverlay,
   UpdateSchedulePatch,
@@ -337,6 +338,28 @@ export type {
   WireImageGenerationToolResult,
   WireImageOperationPhase,
 } from "./generated/types.js";
+
+export type {
+  PeerDeliveryOutcome,
+  PeerDeliveryOutcomeDurablyResolved,
+  PeerDeliveryOutcomeDurablyResolvedPayload,
+  PeerIngressTerminalOutcomeKind,
+} from "./generated/types.js";
+
+export type {
+  AdmissionDropReason,
+  CommsPeerUnreachableReason,
+  CommsSendErrorData,
+  CommsSendErrorDataInvalidCommand,
+  CommsSendErrorDataPeerAdmissionDropped,
+  CommsSendErrorDataPeerInputRejected,
+  CommsSendErrorDataPeerNotFoundOrNotTrusted,
+  CommsSendErrorDataPeerUnreachable,
+  CommsSendErrorDataSendAmbiguous,
+  CommsSendErrorDataSendFailed,
+  CommsSendRequiredAction,
+} from "./generated/types.js";
+export { COMMS_SEND_ERROR_CODES, commsSendError } from "./comms-errors.js";
 
 export { CONTRACT_VERSION } from "./generated/types.js";
 export { WIRE_AUTH_ERROR_REASONS, authErrorReason } from "./auth-errors.js";

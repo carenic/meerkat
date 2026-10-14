@@ -167,6 +167,8 @@ from .generated.types import (
     MobWireMembersBatchResult,
     MonitorsStartParams,
     MonitorsStartResult,
+    PeerDeliveryOutcome,
+    PeerIngressTerminalOutcomeKind,
     PublicTurnToolOverlay,
     RealtimeTurningMode,
     ScheduleToolCallParams,
@@ -330,6 +332,7 @@ from .types import (
     TranscriptRewriteReason,
     TranscriptRewriteSelection,
     TranscriptUserRole,
+    TurnAuthBindingOverride,
     WorkGraphEvent,
     WorkGraphEventFilter,
     WorkGraphIdParams,
@@ -431,13 +434,6 @@ _MOB_CONTROL_SCOPES = frozenset(
         "admin_grants",
     }
 )
-
-# `delivery` on every peer `comms/send` receipt is the server's
-# `PeerDeliveryOutcome` (crates/meerkat-core/src/comms.rs): a unit variant is
-# its snake_case name, and `durably_resolved` carries the receiver's
-# `PeerIngressTerminalOutcomeKind` (crates/meerkat-core/src/interaction.rs).
-_PEER_DELIVERY_UNIT_OUTCOMES = frozenset({"acked", "volatile_handed_off", "queued"})
-_PEER_INGRESS_TERMINAL_OUTCOMES = frozenset({"accepted", "deduplicated", "rejected"})
 
 RenderClass = Literal[
     "user_prompt",
@@ -596,6 +592,14 @@ def _literal_values(literal_type: Any) -> frozenset[Any]:
     for member in get_args(literal_type):
         values |= _literal_values(member)
     return frozenset(values)
+
+
+# `delivery` on every peer `comms/send` receipt is the generated
+# `PeerDeliveryOutcome`: a unit variant name, or `durably_resolved` carrying a
+# `PeerIngressTerminalOutcomeKind`.
+_PEER_DELIVERY_UNIT_OUTCOMES = _literal_values(PeerDeliveryOutcome)
+_PEER_INGRESS_TERMINAL_OUTCOMES = _literal_values(PeerIngressTerminalOutcomeKind)
+
 
 class MeerkatClient:
     """Async client that manages a Meerkat agent runtime via rkat-rpc.
@@ -4387,6 +4391,7 @@ class MeerkatClient:
         output_schema: dict[str, Any] | None = None,
         structured_output_retries: int | None = None,
         provider_params: dict[str, Any] | None = None,
+        auth_binding: TurnAuthBindingOverride | None = None,
     ) -> RunResult:
         params: dict[str, Any] = {"session_id": session_id, "prompt": prompt}
         if injected_context is not None:
@@ -4418,6 +4423,8 @@ class MeerkatClient:
             params["structured_output_retries"] = structured_output_retries
         if provider_params is not None:
             params["provider_params"] = provider_params
+        if auth_binding is not None:
+            params["auth_binding"] = _wire_value(auth_binding)
         raw = await self._request("turn/start", params)
         return self._parse_run_result(raw)
 
@@ -4440,6 +4447,7 @@ class MeerkatClient:
         output_schema: dict[str, Any] | None = None,
         structured_output_retries: int | None = None,
         provider_params: dict[str, Any] | None = None,
+        auth_binding: TurnAuthBindingOverride | None = None,
         _session: Session | None = None,
     ) -> EventStream:
         if not self._dispatcher or not self._process or not self._process.stdin:
@@ -4478,6 +4486,8 @@ class MeerkatClient:
             params["structured_output_retries"] = structured_output_retries
         if provider_params is not None:
             params["provider_params"] = provider_params
+        if auth_binding is not None:
+            params["auth_binding"] = _wire_value(auth_binding)
         request = {
             "jsonrpc": "2.0",
             "id": request_id,
@@ -4575,6 +4585,7 @@ class MeerkatClient:
         "mob.peer_added",
         "mob.peer_retired",
         "mob.peer_unwired",
+        "mob.dismiss",
         "mob.kickoff_pending",
         "mob.kickoff_starting",
         "mob.kickoff_started",

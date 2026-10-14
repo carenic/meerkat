@@ -506,3 +506,24 @@ from meerkat import MeerkatError, CapabilityUnavailableError, SessionNotFoundErr
 ```
 
 All SDK errors derive from `MeerkatError`.
+
+A failed `session.send(...)` carries the server's typed `CommsSendErrorData`
+in `MeerkatError.details`, tagged on `code` (`peer_not_found_or_not_trusted`,
+`peer_unreachable`, `peer_admission_dropped`, `peer_input_rejected`,
+`send_ambiguous`, `send_failed`, `invalid_command`). `comms_send_error(error)`
+returns it, or `None` for any other error. Branch on `code`, never on the
+message text. `send_ambiguous` means the delivery may already have landed
+(`retry_safe` is `False`, `required_action` is `"reconcile"`): reconcile by its
+`envelope_id` before any new attempt, since a retry can duplicate it.
+
+```python
+from meerkat import MeerkatError, comms_send_error
+
+try:
+    await session.send(kind="peer_message", to=peer_id, body="Hello!", handling_mode="queue")
+except MeerkatError as error:
+    failure = comms_send_error(error)
+    if failure is None or failure["code"] != "peer_unreachable":
+        raise
+    print(f"{failure['peer']} is unreachable: {failure['reason']}")
+```

@@ -2116,6 +2116,21 @@ mod tests {
         );
         assert_schema_accepts(
             wire_types
+                .get("CommsSendErrorData")
+                .expect("CommsSendErrorData schema must be emitted"),
+            &serde_json::json!({
+                "code": "send_ambiguous",
+                "envelope_id": uuid::Uuid::nil().to_string(),
+                "message": format!(
+                    "delivery outcome for envelope {} is unknown",
+                    uuid::Uuid::nil()
+                ),
+                "retry_safe": false,
+                "required_action": "reconcile"
+            }),
+        );
+        assert_schema_accepts(
+            wire_types
                 .get("CommsPeersResult")
                 .expect("CommsPeersResult schema must be emitted"),
             &serde_json::json!({ "peers": [] }),

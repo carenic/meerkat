@@ -91,6 +91,9 @@ asyncio.run(main())
 - `additional_instructions`
 - `keep_alive`, `model`, `provider`, `self_hosted_server_id`, `system_prompt`
 - `provider_params`
+- `auth_binding`: a binding ref (or `{"action": "set", "value": ref}`) switches
+  the session's credential binding from this turn on, `{"action": "clear"}`
+  drops it, and omitting it keeps the current one
 
 They also accept `max_tokens`, `output_schema` and `structured_output_retries`,
 but the server refuses these on a turn with `INVALID_PARAMS`: they are build

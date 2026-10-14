@@ -28,9 +28,12 @@ from .generated.errors import (  # noqa: F401
 )
 
 
-from typing import Any as _Any, get_args as _get_args
+from typing import Any as _Any, get_args as _get_args, get_type_hints as _get_type_hints
 
-from .generated.types import WireAuthErrorReason as WireAuthErrorReason
+from .generated.types import (
+    CommsSendErrorData as CommsSendErrorData,
+    WireAuthErrorReason as WireAuthErrorReason,
+)
 
 
 def _literal_values(alias: _Any) -> frozenset[str]:
@@ -60,4 +63,28 @@ def auth_error_reason(error: BaseException) -> WireAuthErrorReason | None:
     reason = details.get("reason")
     if isinstance(reason, str) and reason in WIRE_AUTH_ERROR_REASONS:
         return reason  # type: ignore[return-value]
+    return None
+
+
+COMMS_SEND_ERROR_CODES: frozenset[str] = frozenset().union(
+    *(
+        _literal_values(_get_type_hints(arm, include_extras=True)["code"])
+        for arm in _get_args(CommsSendErrorData)
+    )
+)
+
+
+def comms_send_error(error: BaseException) -> CommsSendErrorData | None:
+    """The typed data of a failed ``comms/send``.
+
+    ``comms/send`` carries it in ``error.data``, tagged on ``code``, which the
+    SDK keeps as ``MeerkatError.details``. Branch on ``code``, never on the
+    error text. ``None`` for errors without a known ``comms/send`` code.
+    """
+    details = getattr(error, "details", None)
+    if not isinstance(details, dict):
+        return None
+    code = details.get("code")
+    if isinstance(code, str) and code in COMMS_SEND_ERROR_CODES:
+        return details  # type: ignore[return-value]
     return None

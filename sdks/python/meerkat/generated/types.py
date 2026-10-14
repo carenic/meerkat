@@ -8993,6 +8993,18 @@ class CommsSendParamsPeerResponse(TypedDict, total=False):
 
 CommsSendParams = CommsSendParamsInput | CommsSendParamsPeerMessage | CommsSendParamsPeerLifecycle | CommsSendParamsPeerRequest | CommsSendParamsPeerResponse
 
+# Comms/session-stream RPC contract for PeerIngressTerminalOutcomeKind.
+PeerIngressTerminalOutcomeKind = Literal['accepted', 'deduplicated', 'rejected']
+
+# Strongest successful peer-delivery fact proved by the selected transport.
+class PeerDeliveryOutcomeDurablyResolvedPayload(TypedDict, total=False):
+    outcome: Required[PeerIngressTerminalOutcomeKind]
+
+class PeerDeliveryOutcomeDurablyResolved(TypedDict, total=False):
+    durably_resolved: Required[PeerDeliveryOutcomeDurablyResolvedPayload]
+
+PeerDeliveryOutcome = PeerDeliveryOutcomeDurablyResolved | Literal['acked'] | Literal['volatile_handed_off'] | Literal['queued']
+
 # Response payload for `comms/send`.
 class CommsSendResultInputAccepted(TypedDict, total=False):
     interaction_id: Required[str]
@@ -9000,17 +9012,17 @@ class CommsSendResultInputAccepted(TypedDict, total=False):
     stream_reserved: Required[bool]
 
 class CommsSendResultPeerMessageSent(TypedDict, total=False):
-    delivery: Required[dict[str, dict[str, Any]] | Literal['acked'] | Literal['volatile_handed_off'] | Literal['queued']]
+    delivery: Required[PeerDeliveryOutcome]
     envelope_id: Required[str]
     kind: Required[Literal['peer_message_sent']]
 
 class CommsSendResultPeerLifecycleSent(TypedDict, total=False):
-    delivery: Required[dict[str, dict[str, Any]] | Literal['acked'] | Literal['volatile_handed_off'] | Literal['queued']]
+    delivery: Required[PeerDeliveryOutcome]
     envelope_id: Required[str]
     kind: Required[Literal['peer_lifecycle_sent']]
 
 class CommsSendResultPeerRequestSent(TypedDict, total=False):
-    delivery: Required[dict[str, dict[str, Any]] | Literal['acked'] | Literal['volatile_handed_off'] | Literal['queued']]
+    delivery: Required[PeerDeliveryOutcome]
     envelope_id: Required[str]
     interaction_id: Required[str]
     kind: Required[Literal['peer_request_sent']]
@@ -9018,12 +9030,72 @@ class CommsSendResultPeerRequestSent(TypedDict, total=False):
     stream_reserved: Required[bool]
 
 class CommsSendResultPeerResponseSent(TypedDict, total=False):
-    delivery: Required[dict[str, dict[str, Any]] | Literal['acked'] | Literal['volatile_handed_off'] | Literal['queued']]
+    delivery: Required[PeerDeliveryOutcome]
     envelope_id: Required[str]
     in_reply_to: Required[str]
     kind: Required[Literal['peer_response_sent']]
 
 CommsSendResult = CommsSendResultInputAccepted | CommsSendResultPeerMessageSent | CommsSendResultPeerLifecycleSent | CommsSendResultPeerRequestSent | CommsSendResultPeerResponseSent
+
+# Why a peer was unreachable for a `comms/send` dispatch.
+CommsPeerUnreachableReason = Literal['offline_or_no_ack', 'transport_error']
+
+# Typed reason a peer rejected our envelope at its ingress admission gate.
+#
+# This mirrors `meerkat_comms::DropReason` across the core boundary so
+# `SendError::AdmissionDropped` can carry the typed cause all the way to
+# REST/RPC/MCP error payloads. Callers distinguish transport-level failure
+# (`PeerOffline`) from policy-level rejection (`AdmissionDropped { reason }`)
+# without collapsing both into "peer unreachable".
+AdmissionDropReason = Literal['untrusted_sender', 'classification_rejected', 'session_closed', 'inbox_full']
+
+# The caller's next safe move after an ambiguous `comms/send`.
+CommsSendRequiredAction = Literal['reconcile']
+
+# Typed error data for `comms/send` failures.
+#
+# The error taxonomy is owned here (K17): surfaces serialize this contract
+# as JSON-RPC `error.data` instead of hand-shaping per-surface payloads.
+class CommsSendErrorDataPeerNotFoundOrNotTrusted(TypedDict, total=False):
+    code: Required[Literal['peer_not_found_or_not_trusted']]
+    message: Required[str]
+    peer: Required[str]
+
+class CommsSendErrorDataPeerUnreachable(TypedDict, total=False):
+    code: Required[Literal['peer_unreachable']]
+    details: NotRequired[Optional[str]]
+    message: Required[str]
+    peer: Required[str]
+    reason: Required[CommsPeerUnreachableReason]
+
+class CommsSendErrorDataPeerAdmissionDropped(TypedDict, total=False):
+    code: Required[Literal['peer_admission_dropped']]
+    message: Required[str]
+    peer: Required[str]
+    reason: Required[AdmissionDropReason]
+
+class CommsSendErrorDataPeerInputRejected(TypedDict, total=False):
+    code: Required[Literal['peer_input_rejected']]
+    envelope_id: Required[str]
+    message: Required[str]
+    peer: Required[str]
+
+class CommsSendErrorDataSendAmbiguous(TypedDict, total=False):
+    code: Required[Literal['send_ambiguous']]
+    envelope_id: Required[str]
+    message: Required[str]
+    required_action: Required[CommsSendRequiredAction]
+    retry_safe: Required[bool]
+
+class CommsSendErrorDataSendFailed(TypedDict, total=False):
+    code: Required[Literal['send_failed']]
+    message: Required[str]
+
+class CommsSendErrorDataInvalidCommand(TypedDict, total=False):
+    code: Required[Literal['invalid_command']]
+    message: Required[str]
+
+CommsSendErrorData = CommsSendErrorDataPeerNotFoundOrNotTrusted | CommsSendErrorDataPeerUnreachable | CommsSendErrorDataPeerAdmissionDropped | CommsSendErrorDataPeerInputRejected | CommsSendErrorDataSendAmbiguous | CommsSendErrorDataSendFailed | CommsSendErrorDataInvalidCommand
 
 # Closed discriminator carried in [`CommsChecksumTokenResult`].
 CommsChecksumTokenResultIntent = Literal['checksum_token']
