@@ -18,6 +18,7 @@ mod mcp;
     feature = "rpc-surface"
 ))]
 mod mob_host;
+mod resume_args;
 mod shutdown_signal;
 #[cfg(feature = "comms")]
 mod stdin_events;
@@ -885,7 +886,8 @@ fn is_root_flag_with_attached_value(arg: &str) -> bool {
 }
 
 /// Inject `run` as the default subcommand when the first positional argument
-/// is not a known command, while preserving top-level help/version handling.
+/// is not a known command, while preserving top-level help/version handling,
+/// and give `run --resume` its documented `[SESSION] PROMPT` shape.
 fn normalize_cli_args(
     args: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> Vec<std::ffi::OsString> {
@@ -913,7 +915,7 @@ fn normalize_cli_args(
         "continue",
         "c",
     ];
-    let args: Vec<std::ffi::OsString> = args.into_iter().collect();
+    let mut args: Vec<std::ffi::OsString> = args.into_iter().collect();
     let mut i = 1; // skip binary name
     while i < args.len() {
         let arg_str = args[i].to_str().unwrap_or("");
@@ -929,12 +931,17 @@ fn normalize_cli_args(
                 break;
             }
         } else {
+            if arg_str == "run" {
+                imply_run_resume_last(&mut args, i);
+                return args;
+            }
             if SUBCOMMANDS.contains(&arg_str) {
                 return args;
             }
             let mut patched = args[..i].to_vec();
             patched.push("run".into());
             patched.extend_from_slice(&args[i..]);
+            imply_run_resume_last(&mut patched, i);
             return patched;
         }
     }
@@ -943,34 +950,28 @@ fn normalize_cli_args(
         let mut patched = args[..i].to_vec();
         patched.push("run".into());
         patched.extend_from_slice(&args[i..]);
-        if let Some(resume_index) = patched
-            .iter()
-            .position(|arg| arg.to_str() == Some("--resume"))
-        {
-            let remaining_positionals = patched
-                .iter()
-                .skip(resume_index + 1)
-                .filter(|arg| !arg.to_string_lossy().starts_with('-'))
-                .count();
-            let next_value = patched
-                .get(resume_index + 1)
-                .and_then(|arg| arg.to_str())
-                .filter(|arg| !arg.starts_with('-'));
-            let should_insert_last = match (next_value, remaining_positionals) {
-                (None, _) => true,
-                (Some(_), 0) => true,
-                (Some(value), 1) => !looks_like_resume_target(value),
-                (Some(_), _) => false,
-            };
-            if should_insert_last {
-                patched.insert(resume_index + 1, "last".into());
-            }
-        }
-
+        imply_run_resume_last(&mut patched, i);
         return patched;
     }
 
     args
+}
+
+/// The documented `run --resume [SESSION] PROMPT` shape for the `run` at
+/// `run_index`, explicit or implied (see [`resume_args::imply_resume_last`]).
+fn imply_run_resume_last(args: &mut Vec<std::ffi::OsString>, run_index: usize) {
+    if !args
+        .iter()
+        .skip(run_index + 1)
+        .any(|arg| arg.to_str() == Some("--resume"))
+    {
+        return;
+    }
+    let mut command = <Cli as clap::CommandFactory>::command();
+    command.build();
+    if let Some(run) = command.find_subcommand("run") {
+        resume_args::imply_resume_last(args, run_index, run, looks_like_resume_target);
+    }
 }
 
 /// Read piped stdin content and prepend it to the prompt as context.

@@ -299,6 +299,12 @@ tail -f app.log | rkat run --resume --stdin lines "watch for new incidents"
 - `~N` for the Nth older session (`~1` is one before the most recent)
 
 Omitting the value means `last`, so `rkat run --resume "keep going"` and `rkat run --resume last "keep going"` are equivalent.
+When `--resume` is followed by the run's only positional argument, that
+argument is the prompt and the session is `last`. A lone argument that names a
+session (a UUID, `<realm>:<uuid>`, a hexadecimal handle of 8 to 36 characters,
+`last`, `~`, or `~N`) is read as the session instead, and the prompt is still
+required. Option values, such as `gpt-5.5` in `-m gpt-5.5`, are not
+positional arguments.
 
 The CLI displays short handles as the final eight UUID characters. Ambiguous
 prefix/tail matches fail instead of selecting a session. A qualified locator
