@@ -286,10 +286,9 @@ repos:
         always_run: true
         stages: [pre-push]
 
-      - id: cargo-test
-        name: workspace deterministic unit + integration + e2e gate
-        entry: scripts/pre-push-unit.sh
-        language: system
-        pass_filenames: false
-        always_run: true
-        stages: [pre-push]
+      # No cargo-test hook: the workspace test body (scripts/pre-push-unit.sh:
+      # lib tests, integration-fast, HeadCanonical, e2e-fast) runs as required
+      # CI closure-tests rows for the change's test scope, checked against
+      # the hook's selection on every plan (scripts/ci-hook-coverage.mjs). The
+      # script stays for manual whole-workspace runs;
+      # scripts/test-pre-push-cargo-test-handoff.sh pins the hand-off.

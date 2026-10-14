@@ -320,6 +320,7 @@ ci-lanes-selftest:
 	@node scripts/ci-non-rust-readers-selftest.mjs
 	@scripts/test-ci-non-rust-readers.sh
 	@scripts/test-ci-clippy-sccache-wrapper.sh
+	@scripts/test-pre-push-cargo-test-handoff.sh
 
 .PHONY: native-cost-analysis-selftest
 native-cost-analysis-selftest:
