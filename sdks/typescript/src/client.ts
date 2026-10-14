@@ -566,6 +566,26 @@ const SETTLEMENT_FIELD_DOMAINS = {
   failure_kind: Object.keys(SETTLEMENT_FAILURE_KINDS),
 } as const;
 
+// `delivery` on every peer `comms/send` receipt is the server's
+// `PeerDeliveryOutcome` (crates/meerkat-core/src/comms.rs): a unit variant is
+// its snake_case name, and `durably_resolved` carries the receiver's
+// `PeerIngressTerminalOutcomeKind` (crates/meerkat-core/src/interaction.rs),
+// which the generated type leaves untyped.
+const PEER_DELIVERY_UNIT_OUTCOMES = {
+  acked: true,
+  volatile_handed_off: true,
+  queued: true,
+} as const satisfies Record<
+  Extract<Extract<CommsSendResult, { delivery: unknown }>["delivery"], string>,
+  true
+>;
+
+const PEER_INGRESS_TERMINAL_OUTCOMES: ReadonlySet<string> = new Set([
+  "accepted",
+  "deduplicated",
+  "rejected",
+]);
+
 const MEERKAT_REPO = "lukacf/meerkat";
 const MEERKAT_RELEASE_BINARY = "rkat-rpc";
 const MEERKAT_BINARY_CACHE_ROOT = path.join(
@@ -6520,6 +6540,7 @@ export class MeerkatClient {
 
   static parseCommsSendReceipt(data: Record<string, unknown>): CommsSendResult {
     const context = "Invalid comms/send response";
+    MeerkatClient.requireRecord(data, "result", context);
     const kind = MeerkatClient.requireStringField(data, "kind", context);
     let allowed: ReadonlySet<string>;
     switch (kind) {
@@ -6528,18 +6549,11 @@ export class MeerkatClient {
         MeerkatClient.requireStringField(data, "interaction_id", context);
         MeerkatClient.requireBooleanField(data, "stream_reserved", context);
         break;
-      case "peer_message_sent": {
+      case "peer_message_sent":
+      case "peer_lifecycle_sent":
         allowed = new Set(["kind", "envelope_id", "delivery"]);
         MeerkatClient.requireStringField(data, "envelope_id", context);
-        const delivery = MeerkatClient.requireStringField(data, "delivery", context);
-        if (delivery !== "acked" && delivery !== "handed_off" && delivery !== "queued") {
-          throw new MeerkatError("INVALID_RESPONSE", `${context}: invalid delivery`);
-        }
-        break;
-      }
-      case "peer_lifecycle_sent":
-        allowed = new Set(["kind", "envelope_id"]);
-        MeerkatClient.requireStringField(data, "envelope_id", context);
+        MeerkatClient.requirePeerDeliveryOutcome(data, context);
         break;
       case "peer_request_sent":
         allowed = new Set([
@@ -6548,16 +6562,19 @@ export class MeerkatClient {
           "interaction_id",
           "request_id",
           "stream_reserved",
+          "delivery",
         ]);
         MeerkatClient.requireStringField(data, "envelope_id", context);
         MeerkatClient.requireStringField(data, "interaction_id", context);
         MeerkatClient.requireStringField(data, "request_id", context);
         MeerkatClient.requireBooleanField(data, "stream_reserved", context);
+        MeerkatClient.requirePeerDeliveryOutcome(data, context);
         break;
       case "peer_response_sent":
-        allowed = new Set(["kind", "envelope_id", "in_reply_to"]);
+        allowed = new Set(["kind", "envelope_id", "in_reply_to", "delivery"]);
         MeerkatClient.requireStringField(data, "envelope_id", context);
         MeerkatClient.requireStringField(data, "in_reply_to", context);
+        MeerkatClient.requirePeerDeliveryOutcome(data, context);
         break;
       default:
         throw new MeerkatError("INVALID_RESPONSE", `${context}: invalid kind`);
@@ -6567,6 +6584,56 @@ export class MeerkatClient {
       throw new MeerkatError("INVALID_RESPONSE", `${context}: unknown field ${unknown}`);
     }
     return data as unknown as CommsSendResult;
+  }
+
+  /**
+   * Validate `delivery` on a peer `comms/send` receipt: exactly one
+   * `PeerDeliveryOutcome` form, a unit variant name or
+   * `{"durably_resolved": {"outcome": <terminal outcome>}}`. Mirrors the
+   * Python SDK `_require_peer_delivery_outcome`.
+   */
+  private static requirePeerDeliveryOutcome(
+    data: Record<string, unknown>,
+    context: string,
+  ): void {
+    if (!Object.prototype.hasOwnProperty.call(data, "delivery")) {
+      throw new MeerkatError("INVALID_RESPONSE", `${context}: missing delivery`);
+    }
+    const delivery = data.delivery;
+    if (typeof delivery === "string") {
+      if (!Object.prototype.hasOwnProperty.call(PEER_DELIVERY_UNIT_OUTCOMES, delivery)) {
+        throw new MeerkatError("INVALID_RESPONSE", `${context}: invalid delivery`);
+      }
+      return;
+    }
+    if (typeof delivery !== "object" || delivery === null || Array.isArray(delivery)) {
+      throw new MeerkatError("INVALID_RESPONSE", `${context}: invalid delivery`);
+    }
+    const variants = Object.keys(delivery);
+    if (variants.length !== 1 || variants[0] !== "durably_resolved") {
+      throw new MeerkatError("INVALID_RESPONSE", `${context}: invalid delivery`);
+    }
+    const resolved = (delivery as Record<string, unknown>).durably_resolved;
+    if (typeof resolved !== "object" || resolved === null || Array.isArray(resolved)) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        `${context}: invalid delivery.durably_resolved`,
+      );
+    }
+    const unknown = Object.keys(resolved).find((field) => field !== "outcome");
+    if (unknown !== undefined) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        `${context}: unknown field delivery.durably_resolved.${unknown}`,
+      );
+    }
+    const outcome = (resolved as Record<string, unknown>).outcome;
+    if (typeof outcome !== "string" || !PEER_INGRESS_TERMINAL_OUTCOMES.has(outcome)) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        `${context}: invalid delivery.durably_resolved.outcome`,
+      );
+    }
   }
 
   private static parseMemberProgressSnapshot(

@@ -2724,6 +2724,7 @@ describe("Comms methods", () => {
         interaction_id: "interaction-1",
         request_id: "request-1",
         stream_reserved: false,
+        delivery: "acked",
       };
     };
     const spec = {

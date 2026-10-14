@@ -35,6 +35,13 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- Python and TypeScript SDK `comms/send` now accept the `delivery` outcome the
+  server returns on every peer send kind; previously `peer_request`,
+  `peer_response` and `peer_lifecycle` sends, and non-acked `peer_message`
+  deliveries, raised `INVALID_RESPONSE` after the send had already happened.
+
 ## [0.9.0] - 2026-10-13
 
 ### Breaking
