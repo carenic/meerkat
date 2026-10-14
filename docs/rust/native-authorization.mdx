@@ -19,7 +19,7 @@ separate processes, with
 current host grants, a stable configured provider binding and the real File token
 owner. Cold acceptance was run directly; publication and CI used their
 recorded test inventories. See the
-[implementation checkpoint](/internal/design/adr-001-implementation/implementation-progress)
+[implementation checkpoint](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-implementation/implementation-progress.md)
 for exact source and evidence scope.
 
 Stock CLI, REST, RPC and MCP paths do not acquire governed activation from this
@@ -35,7 +35,7 @@ covers supported macOS requirements. Provider login and Console access
 administration do not grant native operation permission. The measured conditional
 fresh-turn means missed the cheap-default target; full-platform and per-operation
 p99 acceptance remain open. See the
-[acceptance scope](/internal/design/adr-001-implementation/acceptance-plan)
+[acceptance scope](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-implementation/acceptance-plan.md)
 for the required coverage. No live-provider coverage is claimed.
 </Note>
 
@@ -270,7 +270,7 @@ input commit and store durability rules. Optional `BoundOperationReview::with_ob
 events are live notifications, not durable consent records. Neither those
 events nor recovered audit IDs recreate a live allowance, and review approval
 is not evidence that the tool executed. See the
-[review and consent contract](/internal/design/adr-001-model-review-and-consent)
+[review and consent contract](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-model-review-and-consent.md)
 for the boundary and remaining acceptance scope.
 
 ## Attach and pin the controller before submitting work
@@ -589,7 +589,7 @@ result and any settlement error rather than inferring delivery from a log line.
 The recipient APIs and projector integration below are candidate source.
 Canonical generated integration is included; executable qualification is pending.
 They implement
-the [local permission and refusal contract](/internal/design/adr-001-local-governed-default),
+the [local permission and refusal contract](https://github.com/lukacf/meerkat/blob/main/docs/internal/design/adr-001-local-governed-default.md),
 without establishing authorization for a producer that has not supplied its
 actual owner-bound evidence.
 </Note>
