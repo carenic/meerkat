@@ -7971,6 +7971,26 @@ impl SessionRuntime {
         use meerkat_runtime::input::{Input, PromptInput};
         #[allow(unused_mut)]
         let mut prompt = prompt;
+        // Build settings have no carrier on a runtime-routed turn: refuse
+        // them before any session work, deferred sessions included. A
+        // system_prompt is not one: it is an ordinary ordered System append
+        // applied by the shared StartTurn boundary.
+        if let Some(setting) = overrides.as_ref().and_then(|ov| {
+            crate::handlers::turn::first_build_setting_on_turn(
+                ov.max_tokens.is_some(),
+                ov.output_schema.is_some(),
+                ov.structured_output_retries.is_some(),
+            )
+        }) {
+            return Err(RpcError {
+                code: error::INVALID_PARAMS,
+                message: crate::handlers::turn::build_setting_on_turn_message(
+                    setting,
+                    crate::handlers::turn::SET_BUILD_SETTINGS_ON_CREATE,
+                ),
+                data: None,
+            });
+        }
         if request_context
             .as_ref()
             .is_some_and(RequestContext::cancel_already_requested)
@@ -8000,30 +8020,6 @@ impl SessionRuntime {
         } else {
             None
         };
-
-        // Reject build-only overrides before taking active capacity. A
-        // system_prompt is not build config: it is an ordinary ordered System
-        // append applied by the shared StartTurn boundary.
-        if let Some(ref ov) = overrides {
-            let rejected = [
-                ov.max_tokens.map(|_| "max_tokens"),
-                ov.output_schema.as_ref().map(|_| "output_schema"),
-                ov.structured_output_retries
-                    .map(|_| "structured_output_retries"),
-            ];
-            let rejected: Vec<&str> = rejected.into_iter().flatten().collect();
-            if !rejected.is_empty() {
-                return Err(RpcError {
-                    code: error::INVALID_PARAMS,
-                    message: format!(
-                        "Cannot override {} on a runtime-routed turn; \
-                         set these at session/create time or use a deferred session",
-                        rejected.join(", ")
-                    ),
-                    data: None,
-                });
-            }
-        }
 
         let runtime_registration_lock = self.runtime_registration_lock(session_id);
         let runtime_registration_guard = runtime_registration_lock.mutex().lock().await;
@@ -33250,7 +33246,9 @@ mod tests {
         }
     }
 
-    /// StartTurnParams deserializes with all fields.
+    /// StartTurnParams deserializes with all fields. The build settings
+    /// accept only `null` (inherit) on a turn; a value is refused while
+    /// parsing (see `start_turn_params_reject_build_settings_while_parsing`).
     #[test]
     fn turn_start_params_deserialize_with_all_fields() {
         use crate::handlers::turn::StartTurnParams;
@@ -33262,10 +33260,10 @@ mod tests {
             "keep_alive": true,
             "model": "claude-opus-4-8",
             "provider": "anthropic",
-            "max_tokens": 4096,
+            "max_tokens": null,
             "system_prompt": "You are helpful",
-            "output_schema": {"type": "object"},
-            "structured_output_retries": 3,
+            "output_schema": null,
+            "structured_output_retries": null,
             "provider_params": {"temperature": 0.3},
             "auth_binding": {"action": "clear"}
         });
@@ -33275,10 +33273,10 @@ mod tests {
         assert_eq!(params.keep_alive, Some(true));
         assert_eq!(params.model.as_deref(), Some("claude-opus-4-8"));
         assert_eq!(params.provider.as_deref(), Some("anthropic"));
-        assert_eq!(params.max_tokens, Some(4096));
+        assert_eq!(params.max_tokens, None);
         assert_eq!(params.system_prompt.as_deref(), Some("You are helpful"));
-        assert!(params.output_schema.is_some());
-        assert_eq!(params.structured_output_retries, Some(3));
+        assert!(params.output_schema.is_none());
+        assert_eq!(params.structured_output_retries, None);
         // Canonical tri-state: an untagged value is a Set; the tagged clear
         // is a Clear.
         assert_eq!(

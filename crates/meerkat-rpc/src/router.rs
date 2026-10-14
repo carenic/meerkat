@@ -13088,6 +13088,82 @@ mod tests {
         assert_eq!(error_code(&turn_resp), error::REQUEST_CANCELLED);
     }
 
+    /// The build settings a turn cannot change, with a valid value each.
+    fn turn_build_settings() -> [(&'static str, serde_json::Value); 3] {
+        [
+            ("max_tokens", serde_json::json!(1024)),
+            ("output_schema", serde_json::json!({"type": "object"})),
+            ("structured_output_retries", serde_json::json!(5)),
+        ]
+    }
+
+    /// `turn/start` refuses a build setting while it parses its params,
+    /// before any session work: even an unknown session gets the typed
+    /// invalid-params refusal that names the setting, not a session lookup
+    /// result or a refusal that only arrives after the session was touched.
+    #[tokio::test]
+    async fn turn_start_refuses_build_settings_before_session_work() {
+        let (router, _notif_rx) = test_router().await;
+        let unknown_session = SessionId::new().to_string();
+        for (field, value) in turn_build_settings() {
+            let mut params = serde_json::json!({
+                "session_id": &unknown_session,
+                "prompt": "Follow up"
+            });
+            params[field] = value;
+            let response = router
+                .dispatch(make_request("turn/start", params))
+                .await
+                .unwrap();
+            let error = response
+                .error
+                .as_ref()
+                .unwrap_or_else(|| panic!("turn/start must refuse {field}"));
+            assert_eq!(
+                error.code,
+                error::INVALID_PARAMS,
+                "{field} is refused as invalid params while parsing: {error:?}"
+            );
+            assert!(
+                error.message.contains(field) && error.message.contains("session/create"),
+                "the refusal names {field} and where to set it: {error:?}"
+            );
+        }
+    }
+
+    /// `mob/turn_start` refuses a build setting as soon as its params are
+    /// parsed, before it resolves the mob or the member.
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn mob_turn_start_refuses_build_settings_before_member_resolution() {
+        let (router, _notif_rx) = test_router().await;
+        for (field, value) in turn_build_settings() {
+            let mut params = serde_json::json!({
+                "mob_id": "no-such-mob",
+                "agent_identity": "worker-1",
+                "prompt": "Follow up"
+            });
+            params[field] = value;
+            let response = router
+                .dispatch(make_request("mob/turn_start", params))
+                .await
+                .unwrap();
+            let error = response
+                .error
+                .as_ref()
+                .unwrap_or_else(|| panic!("mob/turn_start must refuse {field}"));
+            assert_eq!(
+                error.code,
+                error::INVALID_PARAMS,
+                "{field} is refused as invalid params before member resolution: {error:?}"
+            );
+            assert!(
+                error.message.contains(field),
+                "the refusal names {field}: {error:?}"
+            );
+        }
+    }
+
     /// 8. `turn/start` emits notifications via the notification sink.
     #[tokio::test]
     async fn turn_start_emits_notifications() {

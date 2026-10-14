@@ -1208,9 +1208,15 @@ Returns the same run-result shape as `session/create`. Fails with error code `-3
   server-owned provenance.
 </ParamField>
 
-<ParamField body="max_tokens" type="u32 | null" default="from session">
-  Max tokens override.
-</ParamField>
+<Note>
+`max_tokens`, `output_schema` and `structured_output_retries` are build
+settings, fixed when the session's agent is built. `turn/start` (and
+`mob/turn_start`) refuses each of them while it parses its params, before any
+session work, with `-32602` (invalid params) naming the setting. Set them on
+`session/create`, including a deferred create (`"initial_turn": "deferred"`);
+a mob member's are fixed when it is spawned. An explicit `null` is accepted
+and keeps the session's setting.
+</Note>
 
 <ParamField body="skill_refs" type="object[] | null">
   Tagged structured skill references to resolve and inject for this turn. Each entry uses `{"kind":"structured","source_uuid":"...","skill_name":"..."}`.

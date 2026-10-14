@@ -36,6 +36,13 @@ use meerkat_runtime::SessionServiceRuntimeExt;
 /// (including the retired `clear_*` split wire form) fail closed at the serde
 /// boundary. This prevents cross-realm credential bleed in multi-tenant
 /// setups (deferral §2 / Dogma §10).
+///
+/// `max_tokens`, `output_schema` and `structured_output_retries` are build
+/// settings, fixed when the session's agent is built: a runtime-routed turn
+/// has no carrier for them. They are refused at the serde boundary, before
+/// any session work; an explicit `null` keeps meaning "inherit". The fields
+/// stay on the type for typed callers, which
+/// [`start_turn_with_params`] refuses the same way.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartTurnParams {
@@ -58,13 +65,16 @@ pub struct StartTurnParams {
     /// Exact configured local-server route for a self-hosted model.
     #[serde(default)]
     pub self_hosted_server_id: Option<String>,
-    #[serde(default)]
+    /// Build setting: refused on a turn (see the type docs).
+    #[serde(default, deserialize_with = "refuse_max_tokens_on_turn")]
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub system_prompt: Option<String>,
-    #[serde(default)]
+    /// Build setting: refused on a turn (see the type docs).
+    #[serde(default, deserialize_with = "refuse_output_schema_on_turn")]
     pub output_schema: Option<serde_json::Value>,
-    #[serde(default)]
+    /// Build setting: refused on a turn (see the type docs).
+    #[serde(default, deserialize_with = "refuse_structured_output_retries_on_turn")]
     pub structured_output_retries: Option<u32>,
     #[serde(default)]
     pub provider_params: Option<
@@ -81,6 +91,77 @@ pub struct StartTurnParams {
     /// Request-only host context for this runtime-owned logical turn.
     #[serde(default)]
     pub transient_turn_context: Option<meerkat_core::lifecycle::run_primitive::TurnRequestContext>,
+}
+
+/// Where a session's build settings are set, for a refusal on a turn.
+pub(crate) const SET_BUILD_SETTINGS_ON_CREATE: &str =
+    "set it on session/create, a deferred create included";
+
+/// The refusal of build setting `setting` on a turn, naming where it is set.
+pub(crate) fn build_setting_on_turn_message(setting: &str, remedy: &str) -> String {
+    format!(
+        "{setting} is a build setting fixed when the session's agent is built; \
+         a turn cannot override it ({remedy})"
+    )
+}
+
+/// The first build setting a turn names, in field order.
+pub(crate) fn first_build_setting_on_turn(
+    max_tokens: bool,
+    output_schema: bool,
+    structured_output_retries: bool,
+) -> Option<&'static str> {
+    [
+        max_tokens.then_some("max_tokens"),
+        output_schema.then_some("output_schema"),
+        structured_output_retries.then_some("structured_output_retries"),
+    ]
+    .into_iter()
+    .flatten()
+    .next()
+}
+
+/// Refuse a present build setting while the params are parsed. `null` is
+/// "inherit", as it always was.
+fn refuse_build_setting_on_turn<'de, D, T>(
+    deserializer: D,
+    setting: &'static str,
+) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<serde::de::IgnoredAny>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(_) => Err(serde::de::Error::custom(build_setting_on_turn_message(
+            setting,
+            SET_BUILD_SETTINGS_ON_CREATE,
+        ))),
+    }
+}
+
+fn refuse_max_tokens_on_turn<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    refuse_build_setting_on_turn(deserializer, "max_tokens")
+}
+
+fn refuse_output_schema_on_turn<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    refuse_build_setting_on_turn(deserializer, "output_schema")
+}
+
+fn refuse_structured_output_retries_on_turn<'de, D>(
+    deserializer: D,
+) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    refuse_build_setting_on_turn(deserializer, "structured_output_retries")
 }
 
 /// Parameters for `turn/interrupt` — canonical wire type from contracts.
@@ -180,6 +261,10 @@ pub async fn handle_start(
 /// Typed `turn/start` entrypoint shared with identity-native callers
 /// (`mob/turn_start`). Takes a fully-formed [`StartTurnParams`] so callers can
 /// route typed params without re-serializing through a JSON `Map`.
+///
+/// A build setting (`max_tokens`, `output_schema`,
+/// `structured_output_retries`) is refused first, before any session work:
+/// wire `turn/start` refuses it while parsing, and a typed caller here.
 pub async fn start_turn_with_params(
     id: Option<RpcId>,
     params: StartTurnParams,
@@ -188,6 +273,18 @@ pub async fn start_turn_with_params(
     _runtime_adapter: &Arc<meerkat_runtime::MeerkatMachine>,
     request_context: Option<RequestContext>,
 ) -> RpcResponse {
+    if let Some(setting) = first_build_setting_on_turn(
+        params.max_tokens.is_some(),
+        params.output_schema.is_some(),
+        params.structured_output_retries.is_some(),
+    ) {
+        return RpcResponse::error(
+            id,
+            error::INVALID_PARAMS,
+            build_setting_on_turn_message(setting, SET_BUILD_SETTINGS_ON_CREATE),
+        );
+    }
+
     let session_id = match parse_session_id_for_runtime(id.clone(), &params.session_id, &runtime) {
         Ok(sid) => sid,
         Err(resp) => return resp,
@@ -376,6 +473,40 @@ mod start_turn_params_tests {
         }))
         .unwrap();
         assert!(params.injected_context.is_none());
+    }
+
+    /// Build settings are fixed when a session's agent is built, so
+    /// `turn/start` refuses them while parsing its params, before any
+    /// session work. An explicit `null` still means "inherit".
+    #[test]
+    fn start_turn_params_reject_build_settings_while_parsing() {
+        for (field, value) in [
+            ("max_tokens", serde_json::json!(1024)),
+            ("output_schema", serde_json::json!({"type": "object"})),
+            ("structured_output_retries", serde_json::json!(5)),
+        ] {
+            let mut params = serde_json::json!({
+                "session_id": "session-1",
+                "prompt": "hello"
+            });
+            params[field] = value;
+            let error = serde_json::from_value::<StartTurnParams>(params)
+                .map(|_| ())
+                .expect_err("a build setting must be refused while parsing turn/start params");
+            let message = error.to_string();
+            assert!(
+                message.contains(field) && message.contains("session/create"),
+                "the refusal names the setting and where to set it: {message}"
+            );
+
+            let mut inherit = serde_json::json!({
+                "session_id": "session-1",
+                "prompt": "hello"
+            });
+            inherit[field] = serde_json::Value::Null;
+            serde_json::from_value::<StartTurnParams>(inherit)
+                .expect("an explicit null keeps inheriting the session's setting");
+        }
     }
 }
 
