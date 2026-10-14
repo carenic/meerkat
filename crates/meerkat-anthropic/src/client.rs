@@ -47,10 +47,14 @@ pub struct AnthropicClient {
     api_key: String,
     base_url: String,
     /// The provider HTTP client built for `base_url`, or why it could not be
-    /// built. A failed build fails each request with that error; no other
+    /// built. A failed build fails each request sent through it (every
+    /// request without an authorization check) with that error; no other
     /// client (a default one, or the one built for a previous base URL)
-    /// stands in for it.
+    /// stands in for it. A request with an authorization check uses
+    /// `checked_http` instead.
     http: Result<reqwest::Client, LlmError>,
+    /// The client for requests with an authorization check: built on first
+    /// use, for the `base_url` current then, with redirects and retries off.
     #[cfg(not(target_arch = "wasm32"))]
     checked_http: std::sync::OnceLock<Result<reqwest::Client, LlmError>>,
     connect_timeout: Duration,
@@ -591,9 +595,10 @@ impl AnthropicClient {
 
     /// Point this client at `url`, served by `http`: the HTTP client built
     /// for that URL, or why it could not be built. A failure is kept, so each
-    /// request fails with it; the client built for the previous URL is
-    /// dropped either way.
-    fn with_base_url_and_http(
+    /// request sent through `http` fails with it; a request with an
+    /// authorization check builds its checked client for `url` afresh. The
+    /// clients built for the previous URL are dropped either way.
+    pub(crate) fn with_base_url_and_http(
         mut self,
         url: String,
         http: Result<reqwest::Client, LlmError>,

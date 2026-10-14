@@ -274,21 +274,17 @@ fn binding() -> AuthBindingRef {
         origin: BindingOrigin::Configured,
     }
 }
-fn client(url: &str, authorizer: Arc<Authorizer>) -> Arc<dyn LlmClient> {
-    let binding = binding();
-    let identity = SessionLlmIdentity {
+fn selected_identity() -> SessionLlmIdentity {
+    SessionLlmIdentity {
         model: MODEL.to_owned(),
         provider: Provider::Anthropic,
         self_hosted_server_id: None,
         provider_params: None,
-        auth_binding: Some(binding.clone()),
-    };
-    let models =
-        ModelRegistry::from_config(&Config::default(), meerkat_models::canonical()).unwrap();
-    let profile = models
-        .profile_witness_for_provider(Provider::Anthropic, MODEL)
-        .unwrap();
-    let connection = ResolvedConnection {
+        auth_binding: Some(binding()),
+    }
+}
+fn resolved_connection(url: &str, authorizer: Arc<Authorizer>) -> ResolvedConnection {
+    ResolvedConnection {
         provider: Provider::Anthropic,
         backend: NormalizedBackendKind::Anthropic(crate::AnthropicBackendKind::AnthropicApi),
         backend_profile: Arc::new(BackendProfile {
@@ -299,16 +295,30 @@ fn client(url: &str, authorizer: Arc<Authorizer>) -> Arc<dyn LlmClient> {
             options: Value::Null,
             server: None,
         }),
-        credential_identity: AuthCredentialIdentity::Binding(binding),
+        credential_identity: AuthCredentialIdentity::Binding(binding()),
         auth_lease: Arc::new(DynamicLease::from_authorizer(
             authorizer,
             AuthMetadata::default(),
             "synthetic",
         )),
-    };
+    }
+}
+fn client(url: &str, authorizer: Arc<Authorizer>) -> Arc<dyn LlmClient> {
+    let models =
+        ModelRegistry::from_config(&Config::default(), meerkat_models::canonical()).unwrap();
+    let profile = models
+        .profile_witness_for_provider(Provider::Anthropic, MODEL)
+        .unwrap();
     ProviderRuntimeRegistry::empty()
         .with_runtime(Arc::new(crate::AnthropicProviderRuntime))
-        .build_text_client(ResolvedTextTarget::new(identity, profile, connection).unwrap())
+        .build_text_client(
+            ResolvedTextTarget::new(
+                selected_identity(),
+                profile,
+                resolved_connection(url, authorizer),
+            )
+            .unwrap(),
+        )
         .unwrap()
 }
 fn request(client: &dyn LlmClient, policy: Arc<Policy>) -> PreparedLlmRequest {
@@ -351,6 +361,47 @@ fn refused(results: &[Result<LlmEvent, LlmError>]) -> bool {
         .iter()
         .filter_map(stream_error)
         .any(|error| matches!(error, LlmError::OperationRefused { .. }))
+}
+
+/// A request with an authorization check does not go through the client whose
+/// rebuild for a new base URL failed: it builds its checked client afresh for
+/// that URL. The client built for the previous base URL serves nothing.
+#[tokio::test]
+async fn an_authorized_request_after_a_failed_rebuild_builds_its_checked_client_for_the_new_url() {
+    let previous = serve(StatusCode::OK, None).await;
+    let rebound = serve(StatusCode::OK, None).await;
+    let policy = Policy::new();
+    let authorizer = Authorizer::new(false, None);
+    let rebuilt = crate::AnthropicClient::builder(String::new())
+        .base_url(previous.url.clone())
+        .authorizer(authorizer.clone())
+        .build()
+        .unwrap()
+        .with_base_url_and_http(
+            rebound.url.clone(),
+            Err(LlmError::Unknown {
+                message: "Failed to build HTTP client: synthetic build failure".to_owned(),
+            }),
+        );
+    // Selected for its resolved target, as the factory selects a client it
+    // built itself.
+    let client = meerkat_llm_core::request_authorization::select_resolved_connection(
+        Arc::new(rebuilt),
+        selected_identity(),
+        &resolved_connection(&rebound.url, authorizer),
+    );
+    let request = request(client.as_ref(), Arc::clone(&policy));
+    let results = collect(client.as_ref(), &request).await;
+    assert!(
+        results.iter().all(|result| stream_error(result).is_none()),
+        "{results:?}"
+    );
+    assert!(previous.bodies.lock().unwrap().is_empty());
+    assert_eq!(rebound.bodies.lock().unwrap().len(), 1);
+    assert_eq!(
+        policy.facts.lock().unwrap()[0].endpoint.as_ref(),
+        format!("{}/v1/messages", rebound.url)
+    );
 }
 
 #[tokio::test]
