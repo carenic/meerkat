@@ -928,14 +928,8 @@ export interface Capability {
 // longer owns a camelCase projection of it.
 export type { ConfigEnvelope, ConfigWriteResult } from "./generated/types.js";
 
-export type CommsSendReceipt = Generated.CommsSendResult & {
-  readonly requestId?: string;
-  readonly interactionId?: string;
-  readonly inputId?: string;
-  readonly envelopeId?: string;
-  readonly streamReserved?: boolean;
-  readonly inReplyTo?: string;
-};
+/** The `comms/send` receipt exactly as the server returns it (snake_case). */
+export type CommsSendReceipt = Generated.CommsSendResult;
 
 // ---------------------------------------------------------------------------
 // comms/send typed command surface.
