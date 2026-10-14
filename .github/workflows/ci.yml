@@ -269,10 +269,15 @@ jobs:
       feature_check_count: ${{ steps.plan.outputs.feature_check_count }}
       feature_check_matrix: ${{ steps.plan.outputs.feature_check_matrix }}
     steps:
+      # Depth 2 is HEAD and its parents. The classifier diffs a pull
+      # request's merge commit against its first parent, or a push against
+      # its before-commit, which ci-cargo-lanes.mjs fetches at depth 1 when
+      # the checkout lacks it; nothing walks history. The full-history fetch
+      # took 41-63 s, once 242 s, on the path of every lane.
       - name: Checkout
         uses: actions/checkout@v6
         with:
-          fetch-depth: 0
+          fetch-depth: 2
 
       - name: Setup Rust
         uses: ./.github/actions/setup-rust-ci
