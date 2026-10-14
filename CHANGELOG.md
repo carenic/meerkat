@@ -37,47 +37,14 @@ them.
 
 ### Fixed
 
-- `rkat` help now matches 0.9 behaviour. `rkat auth login` lists the
-  `copilot` provider, and says that `--backend` and `--method` apply only
-  with `--non-interactive` and that `--secret` requires it. `rkat run
-  --auth-binding` no longer prints internal implementation notes, and the
-  `rkat mob` live, host and helper verbs no longer cite internal design
-  references. `rkat mob live open --transport` states that member channels
-  accept only websocket. The WorkGraph, mob, session and config arguments
-  that had no help are described, including that the CLI's WorkGraph grant
-  covers only the `default` namespace, so `--all-namespaces` is refused. The
-  root command list keeps one-line summaries and names every command group,
-  and `rkat help` without a question prints its usage instead of a bare
-  missing-argument error. The `rkat run --help` resume example names its
-  session (`--resume last "..."`): `--resume` takes the next word as its
-  session, so `rkat run --resume "keep going"` has no prompt. `rkat auth
-  login` lists the provider aliases it accepts and no longer says that the
-  environment key keeps handling `rkat run`: a stored login is tried before it.
-- `rkat help` knows about OS sandboxing. The embedded meerkat-platform skill
-  gains a section on execution confinement: the host-installed `Required`
-  profiles for shell tools, command hooks and stdio MCP servers, the
-  `meerkat-sandbox` backends (macOS Seatbelt, Linux namespaces with seccomp),
-  refusal semantics, backend limits and the trusted-host default of the stock
-  surfaces. Before, the help corpus did not mention it, so `rkat help` answered
-  that Meerkat has no OS-level sandboxing. The 0.9 migration notes are now
-  embedded with the skill as well.
-- `rkat help`, JSON-RPC `help/ask`, REST `POST /help` and the MCP
-  `meerkat_help` tool see the whole embedded platform skill and CLI reference,
-  and can read the platform skill's references. The help surfaces preloaded
-  both skills, and a preload is cut at `skills.max_injection_bytes` (32 KiB by
-  default), so a help session saw about the first third of the platform skill;
-  its reference documents were unreachable. Every help surface now builds its
-  session from `meerkat::help::help_session()`: both skills whole in the
-  system prompt, and exactly two read-only tools, `skill_list_resources` and
-  `skill_read_resource`, which read the references (an embedded skill now
-  serves its `references/*.md` documents as artifacts). Help sessions no
-  longer start the realm's MCP servers or attach callback tools, and get no
-  other tool family. Normal sessions keep the configured
-  `skills.max_injection_bytes`, including a `rkat run` that preloads
-  meerkat-platform.
-- `--as-agent` works before the command name, like the other root options.
-  `rkat --as-agent <AGENT> realm list` was rewritten into a prompt-first run
-  whose prompt was the command name.
+- Python and TypeScript SDK `comms/send` now accept the `delivery` outcome the
+  server returns on every peer send kind; previously `peer_request`,
+  `peer_response` and `peer_lifecycle` sends, and non-acked `peer_message`
+  deliveries, raised `INVALID_RESPONSE` after the send had already happened.
+- Python SDK: `import meerkat` works on Python 3.10, the declared minimum. It
+  imported `NotRequired` and `Required` from `typing`, which has them only from
+  3.11; on 3.10 they now come from `typing_extensions>=4.1`, a new dependency
+  there only.
 
 ## [0.9.0] - 2026-10-13
 

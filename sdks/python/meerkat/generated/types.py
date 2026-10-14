@@ -5,8 +5,14 @@ from __future__ import annotations
 Contract version: 0.9.0
 """
 
+import sys
 from dataclasses import dataclass, field
-from typing import Any, Literal, NotRequired, Optional, Required, TypedDict
+from typing import Any, Literal, Optional
+
+if sys.version_info >= (3, 11):
+    from typing import NotRequired, Required, TypedDict
+else:
+    from typing_extensions import NotRequired, Required, TypedDict
 
 from .errors import MeerkatError
 

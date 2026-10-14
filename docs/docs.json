@@ -463,5 +463,11 @@
     "socials": {
       "github": "https://github.com/lukacf/meerkat"
     }
-  }
+  },
+  "redirects": [
+    {
+      "source": "/meta/:slug*",
+      "destination": "/mobkit/:slug*"
+    }
+  ]
 }

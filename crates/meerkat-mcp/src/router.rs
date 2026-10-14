@@ -1981,9 +1981,16 @@ impl McpRouter {
     /// a generated [`ExternalToolSurfaceHandle`] through
     /// [`Self::new_with_surface_handle`] or late adapter binding.
     pub fn new() -> Self {
+        Self::new_with_stdio_profile(crate::McpStdioLaunchProfile::trusted_host())
+    }
+
+    /// [`Self::new`] with the host's immutable requirement for every local
+    /// process (see [`Self::new_with_surface_handle_and_stdio_profile`]),
+    /// retained when a generated surface handle is bound later.
+    pub fn new_with_stdio_profile(profile: crate::McpStdioLaunchProfile) -> Self {
         let surface_handle: Arc<dyn ExternalToolSurfaceHandle> =
             Arc::new(UnboundExternalToolSurfaceHandle::new());
-        Self::with_surface_owner(SurfaceOwner::runtime(surface_handle))
+        Self::with_surface_owner_and_stdio_profile(SurfaceOwner::runtime(surface_handle), profile)
     }
 
     /// Create a new empty router with a runtime-backed surface handle.

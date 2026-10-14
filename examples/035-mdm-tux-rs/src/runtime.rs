@@ -47,7 +47,7 @@ impl ManagedRpcHost {
             meerkat_models::canonical(),
         ));
         let runtime =
-            SessionRuntime::new(factory, config, 1024, persistence, NotificationSink::noop());
+            SessionRuntime::new(factory, config, 1024, persistence, NotificationSink::noop())?;
         runtime.set_realm_context(
             Some(manifest.realm),
             None,

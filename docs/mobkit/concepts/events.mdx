@@ -4,7 +4,7 @@ description: "Unified agent and module envelopes, structural mob events, lossy W
 icon: "timeline"
 ---
 
-*Mirrored from MobKit main at [552af87699c2](https://github.com/lukacf/meerkat-meta/commit/552af87699c24ffbc917d283d9da1c51574a3969) on 2026-10-14; MobKit workspace version 0.9.0 at that commit.*
+*Mirrored from MobKit main at [fa840e5a19be](https://github.com/lukacf/meerkat-meta/commit/fa840e5a19be86b996fdd1ea29c5254da890853f) on 2026-10-14; MobKit workspace version 0.9.0 at that commit.*
 
 Meta exposes three related event surfaces:
 
@@ -88,6 +88,8 @@ These strings are projections of Meerkat `AgentEvent` variants. Meta does not sy
 The console `interaction_failed` frame Meta projects from `run_failed` carries the same payload, so wire consumers read `frame.payload.error` and `frame.payload.reason` on REST/RPC/SSE timeline frames. Frames Meta mints itself (`reason: "superseded_by_later_run"`, or `error` set from a delivery failure) carry only the flat keys. Meerkat's own `interaction_failed` agent event carries a typed `reason` object (`kind` discriminator) whose `Display` is mirrored into `error`. The Python SDK exposes the report as `RunFailed.error_report` (with `error_class` and `reason_type` accessors) and derives `RunFailed.error` from it; the TypeScript SDK exposes `RunFailedEvent.errorReport`; `UnifiedAgentEvent.payload` carries it for `query_events` consumers.
 
 A retried LLM call (a 429, a network timeout) surfaces as `retrying` events before either terminal; a non-retryable failure (a 401 on a bad key) reaches `run_failed` in one round trip. The `user_input` frame of a console send terminates at `delivered` by design (the send was admitted); the turn's outcome is the sibling `interaction_complete` or `interaction_failed` frame, not a status change on the input frame.
+
+A turn still running when the gateway shuts down gracefully (`meta/shutdown`, or SIGTERM to the gateway process) also gets its terminal frame. The shutdown's mob stop ends the run, and the shutdown drains the run's terminal into the console log before the gateway exits: `interaction_failed` when the stop cancelled the run, `interaction_complete` when the run finished first. A crash or SIGKILL mid-turn can leave the turn without a terminal frame. After a restart Meerkat settles some interrupted runs without publishing a terminal, by design, so the caller's own timeout is the outcome it sees. Bound any wait on an `interaction_id` with a timeout, or check the member's status.
 
 ### Merged module event names
 

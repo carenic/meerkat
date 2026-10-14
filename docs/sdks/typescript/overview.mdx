@@ -431,9 +431,12 @@ interface SessionOptions {
 `injectedContext`, or `selfHostedServerId`: set injected context on deferred
 creation, and use `startTurn(...)` or `stream(...)` only with `skillRefs`,
 `turnToolOverlay`, `additionalInstructions`, `keepAlive`, `model`, `provider`,
-`maxTokens`, `systemPrompt`, `outputSchema`, `structuredOutputRetries`, and
-`providerParams`. Transient first-turn context and a self-hosted server route
-are not expressible through the current deferred TypeScript wrapper.
+`systemPrompt`, and `providerParams`. The turn options also carry
+`maxTokens`, `outputSchema`, and `structuredOutputRetries`, but the server
+refuses them on a turn with `INVALID_PARAMS`: they are build settings, so set
+them on `createSession(...)` or `createDeferredSession(...)`. Transient
+first-turn context and a self-hosted server route are not expressible through
+the current deferred TypeScript wrapper.
 
 ---
 
@@ -497,7 +500,7 @@ async turn(
 ): Promise<RunResult>
 ```
 
-Sends another turn to the session and returns the `RunResult`. Also updates the session's last-result shortcuts.
+Sends another turn to the session and returns the `RunResult`. Also updates the session's last-result shortcuts. `maxTokens`, `outputSchema`, and `structuredOutputRetries` are build settings: the server refuses them on a turn with `INVALID_PARAMS`, so set them when you create the session.
 
 ```typescript
 const result = await session.turn("Now explain the second point in more detail");

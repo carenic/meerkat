@@ -7971,6 +7971,26 @@ impl SessionRuntime {
         use meerkat_runtime::input::{Input, PromptInput};
         #[allow(unused_mut)]
         let mut prompt = prompt;
+        // Build settings have no carrier on a runtime-routed turn: refuse
+        // them before any session work, deferred sessions included. A
+        // system_prompt is not one: it is an ordinary ordered System append
+        // applied by the shared StartTurn boundary.
+        if let Some(setting) = overrides.as_ref().and_then(|ov| {
+            crate::handlers::turn::first_build_setting_on_turn(
+                ov.max_tokens.is_some(),
+                ov.output_schema.is_some(),
+                ov.structured_output_retries.is_some(),
+            )
+        }) {
+            return Err(RpcError {
+                code: error::INVALID_PARAMS,
+                message: crate::handlers::turn::build_setting_on_turn_message(
+                    setting,
+                    crate::handlers::turn::SET_BUILD_SETTINGS_ON_CREATE,
+                ),
+                data: None,
+            });
+        }
         if request_context
             .as_ref()
             .is_some_and(RequestContext::cancel_already_requested)
@@ -8000,30 +8020,6 @@ impl SessionRuntime {
         } else {
             None
         };
-
-        // Reject build-only overrides before taking active capacity. A
-        // system_prompt is not build config: it is an ordinary ordered System
-        // append applied by the shared StartTurn boundary.
-        if let Some(ref ov) = overrides {
-            let rejected = [
-                ov.max_tokens.map(|_| "max_tokens"),
-                ov.output_schema.as_ref().map(|_| "output_schema"),
-                ov.structured_output_retries
-                    .map(|_| "structured_output_retries"),
-            ];
-            let rejected: Vec<&str> = rejected.into_iter().flatten().collect();
-            if !rejected.is_empty() {
-                return Err(RpcError {
-                    code: error::INVALID_PARAMS,
-                    message: format!(
-                        "Cannot override {} on a runtime-routed turn; \
-                         set these at session/create time or use a deferred session",
-                        rejected.join(", ")
-                    ),
-                    data: None,
-                });
-            }
-        }
 
         let runtime_registration_lock = self.runtime_registration_lock(session_id);
         let runtime_registration_guard = runtime_registration_lock.mutex().lock().await;
@@ -13066,12 +13062,19 @@ impl SessionRuntime {
         mut build_config: AgentBuildConfig,
         intents: Vec<meerkat_core::McpSessionAttachmentIntent>,
     ) -> Result<AgentBuildConfig, RpcError> {
+        // The live router launches local stdio servers inside the host
+        // factory's own launch boundary, exactly as a factory-built router
+        // does: a live `mcp/add` never starts a server outside it.
+        let stdio_profile = self.factory.mcp_stdio_launch_profile().clone();
         let router = match &build_config.runtime_build_mode {
             meerkat_core::RuntimeBuildMode::SessionOwned(bindings) => {
-                McpRouter::new_with_surface_handle(Arc::clone(bindings.external_tool_surface()))
+                McpRouter::new_with_surface_handle_and_stdio_profile(
+                    Arc::clone(bindings.external_tool_surface()),
+                    stdio_profile,
+                )
             }
             meerkat_core::RuntimeBuildMode::StandaloneEphemeral => {
-                meerkat::mcp::standalone_router()
+                meerkat::mcp::standalone_router_with_stdio_profile(stdio_profile)
             }
         }
         // Live `mcp/add` servers use the same interactive MCP auth as
@@ -14170,42 +14173,9 @@ pub(crate) fn session_error_to_rpc(err: SessionError) -> RpcError {
             data: meerkat_contracts::error::session_error_details(&err),
         };
     }
-    let code = match err.primary_error() {
-        SessionError::NotFound { .. } => error::SESSION_NOT_FOUND,
-        // Another runtime owner hosts the session (#1813): the busy class,
-        // with `kind = "session_served_elsewhere"` in the data.
-        SessionError::Busy { .. } | SessionError::ServedElsewhere { .. } => error::SESSION_BUSY,
-        SessionError::FailedWithData { .. } if err.is_runtime_teardown_in_progress() => {
-            error::SESSION_BUSY
-        }
-        SessionError::NotRunning { .. } => error::INTERNAL_ERROR,
-        // A durable resume hold is not a service fault: the session exists,
-        // its content is retained intact, and no runnable authority may be
-        // handed out until reconciliation promotes or repairs it. Classify it
-        // as "durably present, not runnable" and let the typed
-        // `durable_resume_hold` payload carry which hold applies.
-        SessionError::DurableTailHeldForRecovery { .. }
-        | SessionError::DurableTailRecoveryRefused { .. }
-        | SessionError::DurableEvidenceQuarantined { .. }
-        | SessionError::WholeBlobAuditedEndpointDivergence { .. } => error::SESSION_NOT_RUNNING,
-        SessionError::Agent(agent_err) => match agent_err.primary_error() {
-            meerkat_core::AgentError::TokenBudgetExceeded { .. }
-            | meerkat_core::AgentError::TimeBudgetExceeded { .. }
-            | meerkat_core::AgentError::ToolCallBudgetExceeded { .. } => error::BUDGET_EXHAUSTED,
-            meerkat_core::AgentError::ConfigError(_) => error::INVALID_PARAMS,
-            meerkat_core::AgentError::HookDenied { .. } => error::HOOK_DENIED,
-            meerkat_core::AgentError::Llm { .. } => error::PROVIDER_ERROR,
-            meerkat_core::AgentError::SessionNotFound(_) => error::SESSION_NOT_FOUND,
-            meerkat_core::AgentError::BuildError(_) => error::PROVIDER_ERROR,
-            meerkat_core::AgentError::Cancelled => error::REQUEST_CANCELLED,
-            meerkat_core::AgentError::SkillResolutionFailed { .. } => {
-                error::SKILL_RESOLUTION_FAILED
-            }
-            meerkat_core::AgentError::InternalError(_) => error::INTERNAL_ERROR,
-            _ => error::INTERNAL_ERROR,
-        },
-        _ => error::INTERNAL_ERROR,
-    };
+    // The session transport mapping is owned by the contracts crate and
+    // shared with the `rkat` exit status.
+    let code = meerkat_contracts::error::session_transport_error_code(&err).jsonrpc_code();
     let core_apply_failure_cause = match err.primary_error() {
         SessionError::Agent(agent_err) => {
             use meerkat_core::lifecycle::core_executor::{
@@ -14290,6 +14260,26 @@ fn rpc_error_to_session_error(err: RpcError, session_id: &SessionId) -> SessionE
     }
 }
 
+/// The JSON-RPC code of a failed turn's typed terminal cause: the code
+/// [`session_error_to_rpc`] gives the equivalent agent error, so a turn that
+/// fails through the runtime reports the same class as one that fails
+/// through the session service.
+fn turn_failure_rpc_code(turn_error: &meerkat_core::TurnErrorMetadata) -> i32 {
+    use meerkat_core::TurnTerminalCauseKind as Cause;
+    match turn_error.kind {
+        Cause::LlmFailure | Cause::RetryExhausted => error::PROVIDER_ERROR,
+        Cause::BudgetExhausted | Cause::TimeBudgetExceeded => error::BUDGET_EXHAUSTED,
+        Cause::HookDenied => error::HOOK_DENIED,
+        Cause::Unknown
+        | Cause::HookFailure
+        | Cause::ToolFailure
+        | Cause::StructuredOutputValidationFailed
+        | Cause::TurnLimitReached
+        | Cause::RuntimeApplyFailure
+        | Cause::FatalFailure => error::INTERNAL_ERROR,
+    }
+}
+
 fn completion_outcome_to_rpc_result(
     outcome: meerkat_runtime::completion::CompletionOutcome,
     session_id: &SessionId,
@@ -14342,7 +14332,7 @@ fn completion_outcome_to_rpc_result(
             reason,
             error: turn_error,
         } => Err(RpcError {
-            code: error::INTERNAL_ERROR,
+            code: turn_failure_rpc_code(&turn_error),
             message: format!("turn abandoned: {reason}"),
             data: Some(serde_json::json!({
                 "error": turn_error,
@@ -14352,7 +14342,7 @@ fn completion_outcome_to_rpc_result(
             reason,
             error: turn_error,
         } => Err(RpcError {
-            code: error::INTERNAL_ERROR,
+            code: turn_failure_rpc_code(&turn_error),
             message: format!("turn abandoned: {reason}"),
             data: Some(serde_json::json!({
                 "error": turn_error,
@@ -14377,7 +14367,7 @@ fn completion_outcome_to_rpc_result(
             reason,
             error: turn_error,
         } => Err(RpcError {
-            code: error::INTERNAL_ERROR,
+            code: turn_failure_rpc_code(&turn_error),
             message: format!("runtime terminated: {reason}"),
             data: Some(serde_json::json!({
                 "error": turn_error,
@@ -32386,6 +32376,80 @@ mod tests {
         );
     }
 
+    /// A live `mcp/add` launches through the host factory's MCP stdio launch
+    /// profile, as a factory-built router does. Under a required profile the
+    /// backend refuses (`require_descendant_termination` is unsupported on
+    /// every backend), so the server is refused typed and its process never
+    /// starts: the live router never launches outside the host's boundary.
+    #[cfg(all(feature = "mcp", unix))]
+    #[tokio::test]
+    async fn live_mcp_add_launches_inside_the_factory_stdio_launch_profile() {
+        use meerkat_core::confinement::{
+            ConfinementRefusal, ConfinementSpec, FilesystemAccess, IpNetworkAccess, PathAccess,
+            PlatformBaseline,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let marker = root.join("live-add-launch-marker");
+        let requirement = ConfinementSpec {
+            baseline: PlatformBaseline::CommandRuntimeV1,
+            read: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.clone())]),
+            write: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.clone())]),
+            deny_read: vec![],
+            deny_write: vec![],
+            network: IpNetworkAccess::Denied,
+            unix_connect: vec![],
+            require_descendant_termination: true,
+        }
+        .try_into()
+        .unwrap();
+        let factory = temp_factory(&temp).with_mcp_stdio_launch_profile(
+            meerkat::McpStdioLaunchProfile::required(requirement, root.clone()),
+        );
+        let runtime = make_runtime(factory, 10);
+        let session_id = runtime
+            .create_session(mock_build_config(), None, None, Vec::new())
+            .await
+            .unwrap();
+        let adapter = runtime
+            .mcp_sessions
+            .read()
+            .await
+            .get(&session_id)
+            .map(|state| Arc::clone(&state.adapter))
+            .expect("the session's live MCP adapter");
+
+        adapter
+            .stage_add(McpServerConfig::stdio(
+                "confined-live-add",
+                "/bin/sh",
+                vec!["-c".into(), "printf entered > \"$MARKER\"".into()],
+                HashMap::from([("MARKER".into(), marker.display().to_string())]),
+            ))
+            .await
+            .unwrap();
+        adapter.apply_staged().await.unwrap();
+        let deltas = adapter
+            .wait_until_ready(Duration::from_secs(15))
+            .await
+            .unwrap();
+
+        assert!(
+            deltas.iter().any(|delta| {
+                delta.target == "confined-live-add"
+                    && delta.phase == meerkat_core::ExternalToolDeltaPhase::Failed
+                    && delta.confinement_refusal == Some(ConfinementRefusal::UnsupportedRequirement)
+            }),
+            "the live add is refused by the factory's launch boundary: {deltas:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "a refused live add never starts the server process"
+        );
+        adapter.shutdown().await;
+    }
+
     #[cfg(feature = "mcp")]
     #[tokio::test]
     async fn start_turn_applies_staged_mcp_ops_at_turn_boundary() {
@@ -33612,7 +33676,9 @@ mod tests {
         }
     }
 
-    /// StartTurnParams deserializes with all fields.
+    /// StartTurnParams deserializes with all fields. The build settings
+    /// accept only `null` (inherit) on a turn; a value is refused while
+    /// parsing (see `start_turn_params_reject_build_settings_while_parsing`).
     #[test]
     fn turn_start_params_deserialize_with_all_fields() {
         use crate::handlers::turn::StartTurnParams;
@@ -33624,10 +33690,10 @@ mod tests {
             "keep_alive": true,
             "model": "claude-opus-4-8",
             "provider": "anthropic",
-            "max_tokens": 4096,
+            "max_tokens": null,
             "system_prompt": "You are helpful",
-            "output_schema": {"type": "object"},
-            "structured_output_retries": 3,
+            "output_schema": null,
+            "structured_output_retries": null,
             "provider_params": {"temperature": 0.3},
             "auth_binding": {"action": "clear"}
         });
@@ -33637,10 +33703,10 @@ mod tests {
         assert_eq!(params.keep_alive, Some(true));
         assert_eq!(params.model.as_deref(), Some("claude-opus-4-8"));
         assert_eq!(params.provider.as_deref(), Some("anthropic"));
-        assert_eq!(params.max_tokens, Some(4096));
+        assert_eq!(params.max_tokens, None);
         assert_eq!(params.system_prompt.as_deref(), Some("You are helpful"));
-        assert!(params.output_schema.is_some());
-        assert_eq!(params.structured_output_retries, Some(3));
+        assert!(params.output_schema.is_none());
+        assert_eq!(params.structured_output_retries, None);
         // Canonical tri-state: an untagged value is a Set; the tagged clear
         // is a Clear.
         assert_eq!(

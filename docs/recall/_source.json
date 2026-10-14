@@ -1,18 +1,19 @@
 {
   "generated": true,
   "source_repository": "https://github.com/lukacf/meerkat-recall",
-  "source_branch": "codex/canonical-public-import-20261013",
-  "source_ref": "codex/canonical-public-import-20261013",
-  "source_commit": "d71722482183a802fcaeaaf41cb04ef7d16f4b85",
+  "source_branch": "docs/recall-09-availability",
+  "source_ref": "docs/recall-09-availability",
+  "source_commit": "ba14a43b1b6abd3c1c3d653781ce8168dae89986",
   "source_version": "0.9.0",
   "source_docs_dirty": false,
   "public_pages": 45,
-  "content_sha256": "5cd87a76a0f05d9475cfaea057b88084cc4e3ac4f81ff0144fb1e31ee8490d20",
+  "content_sha256": "55305e69173739a32d31bbde3b75012d4dc074653c3e30bfa241225569b2ed68",
   "mirror_adjustments": [
     "Local routes namespaced under /recall.",
-    "Non-navigation technical Markdown and canonical main source links point to the exact canonical source commit.",
+    "Current MDX content is pinned by source_commit. Existing technical Markdown and source links retain immutable d71722482183a802fcaeaaf41cb04ef7d16f4b85; their target content is unchanged.",
     "Missing Living Wiki page icon supplied.",
     "Pipeline Work Queue heading uses punctuation-free text for stable Mintlify/GitHub fragment.",
-    "Recall0.9 source is pending; latest published Recall release remains v0.1.0."
-  ]
+    "Recall v0.9.0 is published; macOS static compatibility starts at 13.4, with isolated CLI validation on 26.5.2."
+  ],
+  "content_hash_scope": "All mirrored files except _source.json, sorted by relative path; path NUL bytes NUL."
 }
