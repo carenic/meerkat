@@ -906,7 +906,7 @@ Shell behavior is controlled by `ShellConfig`:
 | Config Field | Type | Default | Description |
 |-------------|------|---------|-------------|
 | `enabled` | `bool` | `false` | Master switch for shell tools |
-| `default_timeout_secs` | `u64` | `30` | Default command timeout. Set with `[shell] timeout_secs`. |
+| `default_timeout_secs` | `u64` | `30` | Default command timeout. Set with `[shell] timeout_secs`; a value of 0 keeps the 30-second default. |
 | `restrict_to_project` | `bool` | `true` | Restrict working dirs to project root |
 | `shell` | `String` | `"nu"` | Shell binary name (Nushell by default; falls back to bash/zsh/sh) |
 | `shell_path` | `PathBuf?` | `None` | Explicit shell binary path |
