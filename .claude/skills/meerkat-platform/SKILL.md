@@ -1,6 +1,6 @@
 ---
 name: meerkat-platform
-description: "Build on the Meerkat agent platform. Covers every shipping surface (CLI, REST, JSON-RPC stdio/TCP, MCP, Python/TypeScript/Web/Rust SDKs), realm-scoped sessions, streaming, skills, hooks, memory, multimodal content, mob orchestration (spawn/fork/helpers/flows/profiles), durable scheduling, and provider auth via `auth_binding` + AuthMachine (env keys, OAuth, cloud IAM). Use when integrating with Meerkat, picking a surface, wiring auth, building agents, scheduling automated runs, deploying mobpacks, or asking how a feature exposes through a particular SDK."
+description: "Build on the Meerkat agent platform (0.9 line). Covers every shipping surface (CLI, REST, JSON-RPC stdio/TCP, MCP, Python/TypeScript/Web/Rust SDKs), realm-scoped sessions, streaming, skills, hooks, memory, multimodal content, MCP servers, mob orchestration (spawn/fork/helpers/flows/profiles), durable scheduling, governed realms and approvals, and provider auth via `auth_binding` + AuthMachine (env keys, OAuth, cloud IAM). Use when integrating with Meerkat, picking a surface, wiring auth, building agents, scheduling automated runs, deploying mobpacks, upgrading to 0.9, or asking how a feature exposes through a particular SDK."
 ---
 
 # Meerkat Platform Guide
@@ -9,9 +9,10 @@ Meerkat (`rkat`) is a library-first agent runtime exposed through multiple surfa
 
 References:
 
-- `references/api_reference.md` — per-surface methods, schemas, examples (CLI, REST, RPC, MCP, Python/TS/Rust SDKs).
-- `references/mobs.md` — multi-agent orchestration in depth.
-- `references/migration_0_5.md` — only if you're upgrading from 0.5 (`host_mode` → `keep_alive`, etc.).
+- `references/api_reference.md` - per-surface methods, schemas, examples (CLI, REST, RPC, MCP, Python/TS/Rust SDKs).
+- `references/mobs.md` - multi-agent orchestration in depth.
+- `references/migration_0_9.md` - upgrading a 0.8 system to 0.9 (renames, config that no longer loads, behaviour changes).
+- `references/migration_0_5.md` - only if you're upgrading from 0.5 (`host_mode` → `keep_alive`, etc.).
 
 ## Realm-first model
 
@@ -184,9 +185,9 @@ multi-host mobs, use the authoritative
 |---------|----------|----------|
 | `rkat` CLI | Shell commands | Developer workflows, scripting |
 | REST (`rkat-rest`) | HTTP/JSON + SSE | Services and language-agnostic clients |
-| JSON-RPC (`rkat-rpc`) | JSON-RPC 2.0 over stdio (default) or TCP (`--tcp <addr>`); optional live-channel WebSocket (`--live-ws`, serves `/live/ws`) | IDE integration, SDK backend, embeddable services |
+| JSON-RPC (`rkat-rpc`) | JSON-RPC 2.0 over stdio (default) or TCP (`--tcp <addr>`; non-loopback binds need `--allow-remote`, which adds no auth); optional live-channel WebSocket (`--live-ws`, serves `/live/ws`) | IDE integration, SDK backend, embeddable services |
 | MCP (`rkat-mcp`) | Model Context Protocol | Expose Meerkat as tools to other agents |
-| Python SDK (`meerkat`) | Async Python over RPC | Python applications |
+| Python SDK (PyPI `meerkat-sdk`, import `meerkat`) | Async Python over RPC | Python applications |
 | TypeScript SDK (`@rkat/sdk`) | TypeScript over RPC | Node.js applications |
 | Web SDK (`@rkat/web`) | WASM in-browser | Browser applications, mobpack deployment target |
 | Rust SDK (`meerkat`) | Direct library API | Embedded Rust systems |
@@ -209,8 +210,8 @@ A realm server and an `mcp.toml` server with the same name must be defined ident
 Command forms:
 
 ```bash
-rkat mcp add <NAME> [--transport stdio|http|sse] [--scope project|user|local|realm] [--expected-generation <N>] [-H KEY:VALUE...] [-e KEY=VALUE...] [--url <URL> | <URL> | -- <CMD...>]
-rkat mcp login <NAME> [--scope project|user|local|realm]
+rkat mcp add <NAME> [--transport stdio|http|sse] [--scope project|user|local|realm] [--expected-generation <N>] [-H KEY:VALUE...] [-e KEY=VALUE...] [--oauth-account <ACCOUNT_ID>] [--allow-operation <OP>...] [--url <URL> | <URL> | -- <CMD...>]
+rkat mcp login <NAME> [--scope project|user|local|realm] [--allow-headless]
 rkat mcp remove <NAME> [--scope project|user|local|realm] [--expected-generation <N>]
 rkat mcp list [--scope project|user|local|realm] [--json]
 rkat mcp get <NAME> [--scope project|user|local|realm] [--json]
@@ -238,8 +239,10 @@ Notes:
 
 - Use `--transport http` for streamable HTTP and `--transport sse` for legacy SSE.
 - `-H KEY:VALUE` is for HTTP/SSE headers; `-e KEY=VALUE` is for stdio process environment.
-- OAuth for HTTP MCP servers is discovered at connect/login time. Keep config to name/url/transport/headers; do not add an auth schema. `rkat mcp login <name>` runs browser OAuth explicitly. `rkat run` defaults to `--mcp-auth stored`; use `--mcp-auth interactive` for first-use browser auth in a TTY run.
-- `rkat mcp` is a config surface. Live mutation of a running session uses JSON-RPC `mcp/add|remove|reload`, REST `POST /sessions/{id}/mcp/*`, MCP-server tools, or SDK helpers.
+- OAuth for HTTP MCP servers is discovered at connect/login time; do not add an auth schema. Interactive login needs an account selection on the server entry: `oauth_account` (`rkat mcp add --oauth-account <ACCOUNT_ID>`, HTTP only) or `oauth_account_selection = "discover"` / `"unverified"`. `rkat mcp login <name>` runs the login explicitly (`--allow-headless` without a terminal). `rkat run` defaults to `--mcp-auth stored`; use `--mcp-auth interactive` for first-use browser auth in a TTY run. MCP OAuth credentials are per realm (0.9): each realm logs in for itself.
+- `--allow-operation <OP>` (repeatable) writes an access ceiling, `access = { allowed_operations = [...] }`: every other raw MCP operation is neither published nor callable. Sessions started after the write enforce it; a live session keeps its definition until that server reloads. A ceiling narrows access only; it does not make the allowed operations read-only.
+- A stdio server can name secret environment variables in `secret_env` (names only). Only servers defined in a realm's own config document have custody: that realm's credential store holds the values (set by a Rust host with `meerkat::set_mcp_service_secret`), they are read at launch for that exact definition, never from the host environment, and an `mcp.toml` or live-added server that declares `secret_env` is refused.
+- `rkat mcp` is a config surface. Live mutation of a running session uses JSON-RPC `mcp/add|remove|reload`, REST `POST /sessions/{id}/mcp/*`, MCP-server tools, or SDK helpers. After an RPC or REST `auth/login/complete` for an MCP target, live sessions awaiting that exact server (name, URL and account) re-add it at their next turn boundary; an RPC `auth/logout` releases it from the sessions connected with it the same way. No host `mcp/reload` is needed.
 
 ## WorkGraph
 
@@ -270,6 +273,30 @@ for live messages.
 For platform integration answers in this checkout, assume the current branch
 surface, not the old live-adapter/docs-refresh snapshot:
 
+- **0.9.0 (2026-10-13).** Breaking changes and an upgrade checklist are in
+  `references/migration_0_9.md`. In short:
+  - MobKit is now Meta in Core's public surface, with no aliases: JSON-RPC
+    `meta/jobs/{heartbeat,progress,checkpoint,complete,fail,cancel_ack}`
+    (host jobs: an attempt's lease, progress and terminality under its fence),
+    Python `meta_job_*`, TypeScript `metaJob*`, Rust `MetaJob*Params`.
+  - Governed realms (preview; `local-authorization`, in default `rkat` and
+    `rkat-rpc` builds): `rkat realm govern`, per-target grants with
+    `rkat realm grant`, `--as-agent`, review above R1 from
+    `[[governance.review.rules]]`, and R3 human consent on a stock governed
+    `rkat-rpc` stdio pipe. See "Governed realms and review" below.
+  - MCP: per-server access ceilings, per-realm MCP OAuth credentials, realm
+    service secrets for stdio servers (`secret_env`), automatic re-add and
+    release after MCP login and logout, bounded graceful stdio close, a
+    host-owned HTTP egress profile, and MCP Apps for UI hosts
+    (`AgentFactory::mcp_apps(true)`, off by default).
+  - A denying mandatory model-request hook withholds only that operation and
+    the run continues; Guardrail configs that this cannot serve now fail to
+    load (see Hooks).
+  - Mobs: admission closes once the last exported `MobHandle` clone drops and
+    the mob is idle; destroy can answer the retryable `mob_destroy_incomplete`;
+    host-persisted deliveries are scope-bound (`STALE_DELIVERY_SCOPE`).
+  - `rkat-rpc` shuts down gracefully on SIGTERM or an interrupt, as on stdin
+    EOF (with `--tcp`, connections drain first).
 - Default hosted text selections are OpenAI `gpt-6-astra` (backend availability
   remains independent; Azure, Copilot, and custom support are not implied),
   Anthropic `claude-opus-5-5`, and Gemini `gemini-3.8-flash` (default and
@@ -370,13 +397,21 @@ surface, not the old live-adapter/docs-refresh snapshot:
   still asynchronous best-effort derived state, not session commit authority;
   lagging live subscribers receive typed `StreamTruncated` events whose reason
   is `StreamLagged { dropped }`.
-- Approvals are currently an RPC-host surface:
-  `approval/request|list|get|decide`, with matching Python and TypeScript
-  client wrappers. Records persist in one host's `FileApprovalStore` when its
-  persistence bundle has a `store_path`; otherwise they are process-local.
-  REST, MCP, and CLI do not expose the family, remote member-host forwarding is
-  not part of multi-host v1, and a record does not automatically authorize an
-  effect or gate tool execution.
+- Approvals are an RPC-host surface: `approval/request|list|get|decide`, with
+  matching Python and TypeScript client wrappers. A host's one approval issuer
+  keeps durable records in a `FileApprovalStore` under a persistent host's
+  store path (a persistent host without one is an error, and the store needs a
+  Unix directory durability barrier, so elsewhere a persisted host's approval
+  service is unavailable) or process-local records for an explicitly
+  ephemeral host. Store failures are typed: `APPROVAL_STORE_UNAVAILABLE`
+  (-32033), `APPROVAL_CONFLICT` (-32034), `APPROVAL_COMMIT_UNKNOWN` (-32035).
+  REST, MCP, and CLI do not expose the family, remote member-host forwarding
+  is not part of multi-host v1, and a host-created record does not authorize
+  an effect or gate tool execution; governed-realm review issues and spends
+  its own approvals.
+- `turn/stop_run` (SDK `stop_run` / `stopRun`) stops one exact run, named by
+  the `run_id` of its `run_started` event; the receipt `outcome` is
+  `stopped`, `not_current` (a stale run id), or `not_stoppable`.
 - Provider cache breakpoints that no longer bind to the committed transcript
   emit `provider_cache_breakpoints_discarded`; the turn continues with reduced
   cache reuse. Genuinely unknown provider failures now enter bounded retry,
@@ -394,6 +429,7 @@ surface, not the old live-adapter/docs-refresh snapshot:
   invoke the provider without another user call. Turn-driven members and
   recovery-suppressed kickoff paths are distinct; see the mobs reference.
 - Mob persistence is SQLite/WAL-backed (`MobStorage::persistent()` opens `SqliteMobStores`). In-memory storage is used for tests and WASM. The previous exclusive-handle mob store has been removed.
+- Rust hosts: a mob closes admission once the last exported `MobHandle` clone drops and it is idle (`MobError::AdmissionClosed` for later spawns, work, flows, wiring and resume; stop, destroy, retirement and reads stay available), so keep a handle for as long as the mob must admit work. A destroy removes the mob's database files only after its actor ended and its observer drained; while a handle or store in the process still holds it, every surface answers the retryable `mob_destroy_incomplete` and keeps the files: drop the handles and retry.
 - Prefabs are gone. All mob creation uses `MobDefinition` only (CLI, REST, RPC, MCP, SDKs).
 - `AgentMobToolSurface` in `meerkat-mob-mcp` has thirteen base definitions:
   `delegate`, `conclude_objective`, `mob_create`, `mob_destroy`,
@@ -438,9 +474,9 @@ the ordinary Realtime factory.
 
 | Surface | Open channel | Observe / control |
 |---------|--------------|-------------------|
-| JSON-RPC | `live/open` (returns `LiveOpenResult` with transport bootstrap + capabilities) | `live/status`, `live/refresh`, `live/send_input`, `live/commit_input`, `live/interrupt`, `live/truncate`, `live/close`; WebRTC also answers an offer through `live/webrtc/answer` |
-| Python SDK | `client.live_open(session_id, seed_max_chars=..., transport=...)` | `client.live_status / live_refresh / live_send_input_text / live_send_input_audio / live_send_input_image / live_send_input_video_frame / live_webrtc_answer / live_commit_input / live_interrupt / live_truncate / live_close` |
-| TypeScript SDK | `client.liveOpen({ session_id: sessionId, seed_max_chars: ..., transport: ... })` or `LiveChannel.session(..., { seedMaxChars: ..., transport: ... })` | `client.liveStatus / liveRefresh / liveSendInput / liveSendInputImage / liveSendInputVideoFrame / liveWebrtcAnswer / liveCommitInput / liveInterrupt / liveTruncate / liveClose`; for WebRTC, wait for ICE gathering and send `peer.localDescription.sdp` through `client.liveWebrtcAnswer(...)` |
+| JSON-RPC | `live/open` (returns `LiveOpenResult` with transport bootstrap + capabilities) | `live/status`, `live/refresh`, `live/send_input`, `live/commit_input`, `live/interrupt`, `live/truncate`, `live/playback_complete`, `live/close`; `live-webrtc` builds also serve `live/webrtc/answer` (answer an offer) and `live/media_health` (reply to a `live/media_health_requested` notification) |
+| Python SDK | `client.live_open(session_id, seed_max_chars=..., transport=...)` | `client.live_status / live_refresh / live_send_input_text / live_send_input_audio / live_send_input_image / live_send_input_video_frame / live_webrtc_answer / live_commit_input / live_interrupt / live_truncate / live_playback_complete / live_media_health / live_close`; `client.on_live_notification(callback)` for `live/*` notifications |
+| TypeScript SDK | `client.liveOpen({ session_id: sessionId, seed_max_chars: ..., transport: ... })` or `LiveChannel.session(..., { seedMaxChars: ..., transport: ... })` | `client.liveStatus / liveRefresh / liveSendInput / liveSendInputImage / liveSendInputVideoFrame / liveWebrtcAnswer / liveCommitInput / liveInterrupt / liveTruncate / livePlaybackComplete / liveMediaHealth / liveClose`; `client.onLiveNotification(listener)`; for WebRTC, wait for ICE gathering and send `peer.localDescription.sdp` through `client.liveWebrtcAnswer(...)` |
 | Rust | `meerkat_live::LiveAdapterHost` + `meerkat_core::live_adapter` adapter trait, exercised through `SessionRuntime` | typed observations and capability reads through the live host |
 
 Seed-window contract: `seed_max_chars` must be positive; zero is rejected by
@@ -517,8 +553,8 @@ run resources, multi-host placement and grants, member history, and placed
 member live control:
 
 ```bash
-rkat mob spawn-helper <mob_id> <prompt> --agent-identity <id> --result-label <label> --max-text-bytes <n> [--profile <profile>] [--json]
-rkat mob fork-helper <mob_id> <source_member> <prompt> --agent-identity <id> --result-label <label> --max-text-bytes <n> [--profile <profile>] [--fork-context full-history|last-messages] [--last-messages N] [--json]
+rkat mob spawn-helper <mob_id> <prompt> --agent-identity <id> --result-label <label> --max-text-bytes <n> [--profile <profile>] [--model <model>] [--auth-binding <REALM:BINDING[:PROFILE]>] [--json]
+rkat mob fork-helper <mob_id> <source_member> <prompt> --agent-identity <id> --result-label <label> --max-text-bytes <n> [--profile <profile>] [--model <model>] [--auth-binding <REALM:BINDING[:PROFILE]>] [--fork-context full-history|last-messages] [--last-messages N] [--json]
 rkat mob member-status <mob_id> <agent_identity> [--json]
 rkat mob member-history <mob_id> <agent_identity> [--from-index N] [--limit N]
 rkat mob force-cancel <mob_id> <agent_identity>
@@ -532,7 +568,7 @@ rkat mob revoke-host <mob_id> <host_id>
 rkat mob hosts <mob_id> [--json]
 rkat mob route-installs <mob_id>
 rkat mob live open|status|control|close ...
-rkat mob run <pack_or_mob_id> [--flow <flow_id>] [--param key=value ...] [--prompt <text>] [--detach] [--json]
+rkat mob run <pack_or_mob_id> [--flow <flow_id>] [--param key=value ...] [--prompt <text>] [--detach] [--json] [--trust-policy permissive|strict]
 rkat mob runs <mob_id> [--flow <flow_id>] [--json]
 rkat mob status <mob_id> <run_id> [--json]
 rkat mob logs <mob_id> [--after-cursor N] [--limit N] [--json]
@@ -753,9 +789,9 @@ ScheduleStore           — persistence (Memory, SQLite)
 
 **Delivery**: The driver claims due occurrences, probes target availability, dispatches delivery (creates session + runs prompt), and monitors completion. The schedule host surface (`crates/meerkat/src/surface/schedule_host.rs`) bridges delivery to `MeerkatMachine`.
 
-**Planning**: On create/update/resume, `ScheduleService` projects occurrences within a horizon (30 days or 64 occurrences). Old occurrences are superseded atomically via `atomic_plan_mutation()`.
+**Planning**: On create/update/resume, `ScheduleService` projects occurrences within a horizon (default 30 days or 64 occurrences). The store commits a schedule mutation together with the supersession of its old pending occurrences in one transaction (`ScheduleStore::commit_schedule_mutation` / `commit_schedule_refill`, returning a `ScheduleMutationCommit`).
 
-**Stores are per-realm, not per-instance** — multiple processes may share a schedule store. Use `atomic_plan_mutation()` for safe multi-step changes.
+**Stores are per-realm, not per-instance** - multiple processes may share a schedule store; occurrence claims and transitions are lease- and revision-checked (`claim_due_occurrences`, `transition_occurrence_if_current`).
 
 ### Rust SDK usage
 
@@ -908,7 +944,7 @@ let factory = AgentFactory::new(realm.root.clone())
     .runtime_root(realm.root)
     .builtins(true)
     .shell(true);
-let service = build_persistent_service(factory, config, 64, persistence);
+let service = build_persistent_service(factory, config, 64, persistence)?;
 let result = service.create_session(CreateSessionRequest {
     model: "claude-sonnet-4-6".into(),
     prompt: "What is Rust?".into(),
@@ -933,7 +969,7 @@ For detailed surface schemas and examples, also load:
 
 - `references/api_reference.md`
 - `references/mobs.md`
-- `references/migration_0_5.md`
+- `references/migration_0_9.md` (when moving a 0.8 system to 0.9)
 
 ## Configuration
 
@@ -981,7 +1017,59 @@ For stock Web SDK deployment, keep real keys in the server-side proxy.
 `authBinding` plus `registerExternalAuthResolver` requires a custom/preconfigured
 host with a matching external-resolver binding; see the Web SDK section above.
 
-Surfaces: `auth/profile/{create,get,list,delete}`, `auth/login/{start,complete,device_start,device_complete,provision_api_key}`, `auth/status/get`, `auth/logout` over RPC; equivalent over REST and SDKs. Full walkthrough: `docs/guides/auth.mdx`.
+Surfaces: `auth/profile/{create,get,list,delete}`, `auth/login/{start,complete,cancel,device_start,device_complete,provision_api_key}`, `auth/status/get`, `auth/logout` over RPC; equivalent over REST and SDKs. Login, status and logout also take an MCP server target (`{"mcp": {...}}`), and login and status a connector slot (`{"connector": {...}}`); branch on the typed `error.data.reason` (`WireAuthErrorReason`; 0.9 adds `credential_access_denied`, `credential_interaction_required`, `credential_access_pending`, `credential_store_unavailable`), not the message. Connector OAuth clients are realm config managed by `rkat auth connector-client set|rotate-secret|list|remove` (secrets go to the credential store, never config). Full walkthrough: `docs/guides/auth.mdx`.
+
+## Governed realms and review (preview)
+
+A governed realm runs agent work under grants issued by its local operator.
+It is opt-in per realm and needs the `local-authorization` feature (default in
+`rkat` and `rkat-rpc`; the facade feature is off by default). Integration
+contract: `docs/guides/authorization-integration.mdx`.
+
+```bash
+rkat realm govern team-alpha                                     # durable; later processes open it governed
+rkat realm grant team-alpha --mcp github=search_issues,get_issue  # or <server>=*, --catalog, --controller --route <key>
+rkat --realm team-alpha run --as-agent rkat-agent "triage today's issues"
+rkat realm revoke-grant team-alpha --mcp github
+```
+
+- Each grant covers one target (an installed MCP server and its raw
+  operations, the session tool catalog, or the agent's controller routes) and
+  supersedes only that target's previous grant. A prompt refused for its
+  controller route names the exact `rkat realm grant ... --controller --route
+  <key>` to run. Pass `--as-agent` after the command name.
+- Review above R1 comes from the realm config's `[[governance.review.rules]]`
+  (an exact MCP server, raw operation or tool bundle operation with tier `r2`
+  or `r3`; `r3` also states `consent_assurance`, `device_trusted` or
+  `person_authenticated`) and `[governance.review.reviewer]` (the explicit
+  R2 reviewer model; there is no default). Without rules every stock operation
+  stays R1.
+
+```toml
+[[governance.review.rules]]
+target = { kind = "mcp_operation", server = "mail", operation = "send" }
+tier = "r3"
+consent_assurance = "device_trusted"     # the stdio pipe's operator; "person_authenticated" refuses it
+
+[[governance.review.rules]]
+target = { kind = "mcp_server", server = "calendar" }   # or kind = "tool_bundle_operation" with bundle + operation
+tier = "r2"
+
+[governance.review.reviewer]
+identity = { model = "claude-sonnet-5-5", provider = "anthropic" }
+max_output_tokens = 1024
+```
+
+- Ordinary config writes never change the `governance` section: RPC and MCP
+  `config/set|patch` answer invalid params with
+  `data: {"type": "governance_administration_required"}`; the realm's trusted
+  host edits it in the document itself.
+- R3 human consent on a stock governed `rkat-rpc` stdio pipe: the operator
+  decides with `approval/consent_decide` (`approval_id` and `decision` only)
+  and receives `approval/consent_notice` notifications (`requested`,
+  `approved`, `denied`, `used`, `withdrawn`); SDKs deliver them through
+  `on_consent_notice` / `onConsentNotice`. A decision records and notifies
+  only; the retained call runs on a fresh explicit attempt.
 
 ## Feature composition
 
@@ -1012,7 +1100,9 @@ Shipping facade features: `anthropic`, `openai`, `openai-realtime`, `openai-live
 `gemini`, `copilot`, `all-providers`, `native-keyring`, `jsonl-store`,
 `memory-store`, `sqlite-store`, `session-store`, `session-compaction`,
 `memory-store-session`, `local-authorization`, `atif`, `comms`, `mcp`, `skills`,
-`schedule`, `workgraph`, `live`, and `live-webrtc`. `all-providers` includes
+`schedule`, `workgraph`, `live`, and `live-webrtc`. `local-authorization` is
+the opt-in governed-realm composition (see "Governed realms and review").
+`all-providers` includes
 `copilot`; disable defaults for a genuinely single-provider build. `openai-live` is opt-in public GPT Live
 and pulls `openai`, `live-webrtc`, `session-store`, and the provider's `live`
 feature; its host/auth/execution-profile prerequisites are described above.
@@ -1233,6 +1323,38 @@ explicitly enables them in `BuiltinToolConfig`.
 
 Hook config is realm-aware, with compatibility layering from user/project hook files when available.
 
+Mandatory model-request hooks are operation-local (0.9). A foreground
+`guardrail` at `pre_llm_request` or `post_llm_response` that denies (or whose
+launch confinement refuses) withholds only that model operation: the agent sends
+a bounded `mandatory_hook_prerequisite_failed` notice to the run's retained
+controller and the run continues. `post_llm_response` runs after transport, so
+streamed text and provider-native tools that already ran are not undone. Each
+such entry must state `model_operations = "ordinary_only"` (the default `all`
+would also govern the controller-feedback request), and the work must carry a
+retained authorized controller (work under a host work authorization with a
+controller, as in governed realms); without one, run admission
+rejects the run with `AgentError::HookConfigInvalid` before anything is
+published. Config validation also rejects a model-request Guardrail left at
+`all`, any Guardrail at `run_started` or `turn_boundary`, and
+`model_operations` on a point without a model operation, so a 0.8 config with
+such an entry fails to load after the upgrade. Guardrails at other points
+(for example `pre_tool_execution`) are unchanged, and timeouts, handler errors
+and invalid configuration still fail closed.
+
+```toml
+[[hooks.entries]]
+id = "prompt-policy"
+point = "pre_llm_request"
+mode = "foreground"
+capability = "guardrail"
+model_operations = "ordinary_only"
+
+[hooks.entries.runtime]
+type = "command"
+command = "python3"
+args = ["hooks/prompt_policy.py"]
+```
+
 Hook payloads carry typed dispatch-time context for synchronous host classification: `HookToolCall` and `HookToolResult` include the tool's `provenance` (`ToolProvenance` — builtin/MCP-with-server-id/etc.), and `HookLlmResponse` lists provider-native `server_tool_content` kinds (e.g. web search) from the response. A foreground PreToolExecution/PostToolExecution/PostLlmResponse hook therefore sees tool-source facts before results commit — no observe-stream race.
 
 ### Injected context (host-attached ambient context)
@@ -1307,8 +1429,9 @@ Tool visibility can change during a session without restarting the agent. All ch
   is a legacy compatibility input, not a canonical field for hosts to edit;
   its fallback restore is restricted to non-runtime-owner builds.
 - **Per-turn overlay** — `TurnToolOverlay` on `StartTurnRequest.runtime.turn_tool_overlay`. Ephemeral, used by mob flow steps and attention producers to restrict tools per turn; not sticky session visibility.
-- **Configured MCP servers** — CLI `rkat mcp add/remove/list/get` edits `.rkat/mcp.toml` or `~/.rkat/mcp.toml`. New `rkat run` and `rkat run --resume` sessions load that config.
-- **MCP HTTP OAuth** — streamable HTTP servers can require OAuth without any auth schema in MCP config. Stored mode (`rkat run --mcp-auth stored`, the default) uses persisted tokens only and reports `rkat mcp login <server>` when auth is missing. Interactive mode (`--mcp-auth interactive`) may open a browser from a TTY, store tokens, reconnect, and continue the run.
+- **Configured MCP servers** - CLI `rkat mcp add/remove/list/get` edits `.rkat/mcp.toml`, `~/.rkat/mcp.toml`, or (`--scope realm`) the realm's own `[[tools.mcp_servers]]`. New `rkat run` and `rkat run --resume` sessions load that config.
+- **MCP HTTP OAuth** - streamable HTTP servers can require OAuth without any auth schema in MCP config; interactive login needs the server's account selection (`oauth_account` or `oauth_account_selection`), and credentials are per realm. Stored mode (`rkat run --mcp-auth stored`, the default) uses persisted tokens only and reports `rkat mcp login <server>` when auth is missing. Interactive mode (`--mcp-auth interactive`) may open a browser from a TTY, store tokens, reconnect, and continue the run.
+- **MCP access ceilings** - `access = { allowed_operations = [...] }` on a server entry (`rkat mcp add --allow-operation`) unpublishes every other raw operation; a call that still reaches one is refused as an `access_denied` tool result.
 - **Live MCP mutation** — JSON-RPC `mcp/add`, `mcp/remove`, `mcp/reload`, REST `POST /sessions/{id}/mcp/*`, MCP-server tools, and SDK helpers stage server changes on the `McpRouter`. Applied at next turn boundary. Removals drain in-flight calls before finalizing.
 - **Async MCP loading** — At startup, MCP servers connect in parallel in the background. The agent loop polls `poll_external_updates()` at each `CallingLlm` boundary. Tools appear as each server completes its handshake. A `[MCP_PENDING]` system notice is injected while servers are still connecting.
   - Per-server timeout: `connect_timeout_secs` in `.rkat/mcp.toml` (default: 10s)
@@ -1322,7 +1445,7 @@ Surface availability:
 
 | Surface | MCP config / live mutation | Tool filter | Status |
 |---------|----------------------------|-------------|--------|
-| CLI | `rkat mcp add/remove/list/get` edits project/user config | — | Config surface |
+| CLI | `rkat mcp add/remove/list/get` edits project/user/realm config | - | Config surface |
 | JSON-RPC | `mcp/add`, `mcp/remove`, `mcp/reload` live session mutation | Via session runtime | Fully wired |
 | REST | `POST /sessions/{id}/mcp/add|remove|reload` live session mutation | — | Fully wired |
 | MCP server | `meerkat_mcp_add`, `meerkat_mcp_remove`, `meerkat_mcp_reload` live session mutation | — | Fully wired |
@@ -1352,4 +1475,5 @@ For complete method signatures and multi-surface examples, load:
 
 - `references/api_reference.md`
 - `references/mobs.md`
+- `references/migration_0_9.md` (when moving a 0.8 system to 0.9)
 - `references/migration_0_5.md` (only if migrating from 0.5)

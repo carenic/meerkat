@@ -49,6 +49,8 @@ Global flags (available on all commands):
 --state-root <path>       # override realm state root; default <project-root>/.rkat/realms, walking up to the nearest .rkat
 --context-root <path>     # realm identity + project files root; default CWD
 --user-config-root <path> # optional user-global convention root
+--as-agent <AGENT>        # governed realm: act as this agent (default rkat-agent)
+--default-model <MODEL>   # persist the default agent model into the scope-resolved config
 ```
 
 Core commands:
@@ -63,8 +65,11 @@ rkat session list [--limit N] [--offset N] [--label KEY=VALUE]
 rkat session show <ID>
 rkat session delete <ID>
 rkat session interrupt <ID>
+rkat session export-atif <ID> [--output <FILE>]   # ATIF trajectory; default realm trajectory dir
+rkat session repair-wholeblob <ID> [--apply [--accept-shorter]] [--runtime-store <FILE>] [--json]  # diagnose by default
 rkat blob get <BLOB-ID> [--output <FILE>] [--json]
 rkat realm current|list|show|create|delete|prune ...
+rkat realm govern|grant|revoke-grant <REALM> ...  # governed realms (see below)
 rkat mcp add|login|remove|list|get ...
 rkat skill add <PATH> [--name <NAME>]
 rkat skill remove|get <NAME_OR_SOURCE_UUID_OR_PATH> [--json for get]
@@ -73,11 +78,11 @@ rkat skill inspect <SKILL_NAME> --source-uuid <SOURCE_UUID> [--json]
 rkat workgraph list|show|ready|snapshot|events ...
 rkat models
 rkat help <QUESTION> [--prompt <PROMPT>] [--plan-execution] [--json] [--stream|--no-stream]
-rkat auth realms|profiles|profile|profile-delete|bindings|test|status|login|logout|refresh ...
+rkat auth realms|profiles|profile|profile-delete|bindings|test|status|login|logout|refresh|connector-client ...
 # (Scheduling has no top-level CLI subcommand. Schedules are managed
 # through the agent tools `meerkat_schedule_*` from `rkat run`,
 # the RPC `schedule/*` methods, REST schedule endpoints, or SDK helpers.)
-rkat mob spawn-helper|fork-helper|member-status|force-cancel|respawn|wait-kickoff|run|runs|status|logs|attach|run-flow|flow-status|pack|inspect|validate|deploy|web ...
+rkat mob spawn-helper|fork-helper|member-status|force-cancel|respawn|wait-kickoff|host|bind-host|revoke-host|hosts|grant|revoke-grant|grants|member-history|route-installs|live|run|runs|status|logs|attach|run-flow|flow-status|pack|inspect|validate|deploy|web ...
 rkat config get|set|patch ...
 rkat capabilities
 rkat doctor
@@ -113,12 +118,34 @@ Important `rkat run` options:
 --stream / --no-stream
 --stdin <auto|blob|lines|off>
 --line-format <text|json>
+--export-atif                          # write an ATIF trajectory when the turn completes
 ```
 
 Hard CLI negatives: no `rkat sessions`, no `rkat resume`, no `rkat rpc`, no
 `rkat live`, no `rkat image`, no `--tools all`, no `rkat blob get -o`, no
 `rkat session show --json`, no `rkat models --json`, no
 `rkat capabilities --json`.
+
+### Governed realms (CLI)
+
+Default `rkat` builds include the `local-authorization` feature:
+
+```bash
+rkat realm govern <REALM>
+rkat realm grant <REALM> [--agent <AGENT>] (--mcp <SERVER>=<OP>[,<OP>...] | --mcp <SERVER>=* | --catalog | --controller --route <ROUTE_KEY>...) [--expires-in-secs <N>]
+rkat realm revoke-grant <REALM> [--agent <AGENT>] (--mcp <SERVER> | --catalog | --controller | --worker)
+rkat --realm <REALM> --as-agent <AGENT> run "..."
+```
+
+`govern` durably selects governed posture for an existing realm and provisions
+its grant owner with the local user as operator; every later `rkat` process
+opens that realm governed (no flag selects it). `grant` issues one grant per
+target (an installed MCP server and its raw operations, the tool catalog, or
+the agent's controller routes) and supersedes only that target's previous
+grant; a controller grant takes no expiry. `--agent` defaults to `rkat-agent`.
+Review tiers above R1 come from the realm config's `[[governance.review.rules]]`;
+ordinary config writes never change the `governance` section (RPC and MCP
+refuse with invalid params and `data: {"type": "governance_administration_required"}`).
 
 ### WorkGraph host observability
 
@@ -157,15 +184,21 @@ read-only observability surface.
 
 ### MCP CLI config surface
 
-`rkat mcp` edits project/user MCP server config; it is not the live mutation surface for an already-running session.
+`rkat mcp` edits project, user, or realm MCP server config; it is not the live mutation surface for an already-running session.
 
 ```bash
-rkat mcp add <NAME> [--transport stdio|http|sse] [--scope project|user|local] [-H KEY:VALUE...] [-e KEY=VALUE...] [--url <URL> | <URL> | -- <CMD...>]
-rkat mcp login <NAME> [--scope project|user|local]
-rkat mcp remove <NAME> [--scope project|user|local]
-rkat mcp list [--scope project|user|local] [--json]
-rkat mcp get <NAME> [--scope project|user|local] [--json]
+rkat mcp add <NAME> [--transport stdio|http|sse] [--scope project|user|local|realm] [-H KEY:VALUE...] [-e KEY=VALUE...] [--oauth-account <ACCOUNT_ID>] [--allow-operation <OP>...] [--expected-generation <N>] [--url <URL> | <URL> | -- <CMD...>]
+rkat mcp login <NAME> [--scope project|user|local|realm] [--allow-headless]
+rkat mcp remove <NAME> [--scope project|user|local|realm] [--expected-generation <N>]
+rkat mcp list [--scope project|user|local|realm] [--json]
+rkat mcp get <NAME> [--scope project|user|local|realm] [--json]
 ```
+
+`add` defaults to `--scope project`; `local` is an alias for `project`.
+`--scope realm` writes the selected realm's own config (`[[tools.mcp_servers]]`,
+inherited by child realms), and `--expected-generation` guards that write.
+`--allow-operation` (repeatable) allows only the named raw MCP operations; every
+other operation is refused and not offered.
 
 Examples:
 
@@ -240,7 +273,9 @@ Core endpoints:
 - `GET /sessions/{id}/history` — get committed transcript history
 - `DELETE /sessions/{id}` — archive (remove) a session
 - `POST /sessions/{id}/interrupt` — interrupt an in-flight turn
+- `POST /sessions/{id}/runs/{run_id}/stop` - stop one exact run and terminalize every contributor bound to it
 - `POST /sessions/{id}/system_context` — append staged runtime system context
+- `POST /sessions/{id}/system_prompt` - replace one durable versioned system-prompt key
 - `POST /sessions/{id}/messages` — continue an existing session
 - `POST /sessions/{id}/external-events` — queue a runtime-backed external event
 - `POST /sessions/{id}/peer-response-terminal` — admit a correlated terminal peer response
@@ -268,6 +303,8 @@ Core endpoints:
 - `POST /mob/{id}/wire-members-batch`
 - `GET /mob/{id}/members/{agent_identity}/status`
 - `POST /mob/{id}/members/{agent_identity}/cancel`
+- `POST /mob/{id}/members/{agent_identity}/runs/{run_id}/stop`
+- `GET|PUT /mob/{id}/members/{agent_identity}/tool-declaration`, `POST /mob/{id}/members/{agent_identity}/identity-adoption`, `POST /mob/{id}/members/{agent_identity}/tool-convergence/resolve` - durable member tool/identity declarations
 - `POST /mob/{id}/members/{agent_identity}/respawn`
 - `GET /mob/{id}/members/{agent_identity}/history`
 - `GET /mob/{id}/hosts`
@@ -275,7 +312,7 @@ Core endpoints:
 - `GET|POST /auth/profiles`
 - `GET|DELETE /auth/bindings/{binding_id}`
 - `POST /auth/bindings/{binding_id}/test`
-- `POST /auth/login/start`, `POST /auth/login/complete`
+- `POST /auth/login/start`, `POST /auth/login/complete`, `POST /auth/login/cancel`
 - `POST /auth/login/device/start`, `POST /auth/login/device/complete`
 - `GET /auth/bindings/{binding_id}/status`
 - `POST /auth/bindings/{binding_id}/logout`
@@ -300,6 +337,9 @@ Config envelope shape (`GET/PUT/PATCH /config`):
 }
 ```
 
+`resolved_paths` is omitted unless `rkat-rest` (or `rkat-mcp`) runs with
+`--expose-paths`; JSON-RPC `config/*` includes it when available.
+
 CAS writes:
 
 ```json
@@ -319,6 +359,10 @@ rkat-rpc --realm team-alpha --tcp 127.0.0.1:9000
 rkat-rpc --realm team-alpha --tcp 127.0.0.1:9000 --live-ws 127.0.0.1:9001
 ```
 
+`--tcp` and `--live-ws` accept loopback binds by default; a non-loopback bind
+requires `--allow-remote`, which only opts in to network exposure (it adds no
+authentication or encryption).
+
 `rkat-rpc --tcp` is only the JSON-RPC host transport. It is not the signed
 Meerkat peer/comms channel used by remote agents or external mob members. For a
 remote peer, start `rkat run` with `--comms-listen-tcp` and usually
@@ -327,14 +371,19 @@ remote peer, start `rkat run` with `--comms-listen-tcp` and usually
 ### Sessions, turns, history
 
 - `initialize`
-- `session/create`, `session/list`, `session/read`, `session/history`, `session/archive`
+- `tools/register` - register client callback tools (`tools: [{name, description, input_schema}]`); during a turn the server sends `tool/execute` requests (`tool_use_id`, `name`, `arguments`) that the client answers with `{content, is_error}`
+- `session/create` (`initial_turn: "deferred"` returns a pending `session_id` without running the first turn), `session/list`, `session/read`, `session/history`, `session/archive`
 - `session/fork_at`, `session/fork_replace`
 - `session/rewrite_transcript`, `session/transcript_revision` (single read; `revision: "current"` reads the head), `session/transcript_revisions` (revision list), `session/restore_transcript_revision`
+- `session/update_system_prompt` (replace one durable versioned system-prompt key), `session/activate_instruction` (append one immutable instruction revision at an idle boundary), `session/instruction_activations`
+- `session/export_atif` - export the projected event log as an ATIF v1.7 trajectory (requires event replay)
 - `session/external_event`, `session/peer_response_terminal`, `session/inject_context`
+- `session/input_status` - read an input's stored runtime state by input id or idempotency key
 - `session/stream_open` / `session/stream_close` — event streaming
 - `events/latest_cursor`, `events/list_since`, `events/snapshot` — cursor-based event reads
 - `turn/start` — accepts `model`, `provider`, `provider_params`, `max_tokens` for mid-session hot-swap; optional `injected_context` (list of content inputs) delivers host-attached ambient context as separate typed messages before the user message (`session/create` accepts the same field)
 - `turn/interrupt`
+- `turn/stop_run` - stop one exact run (`session_id`, `run_id` from the `run_started` event, `reason`) and terminalize every input bound to it; receipt `outcome` is `stopped`, `not_current`, or `not_stoppable`
 - `blob/get` — fetch generated image / artifact payload bytes by blob id
 - `artifact/list`, `artifact/get`, `artifact/download`
 
@@ -357,8 +406,15 @@ result returns a blob id, fetch it with `rkat blob get <BLOB-ID>`.
 - `live/commit_input` — commit pending input on a live channel (turn boundary)
 - `live/interrupt` — interrupt the assistant turn on a live channel (barge-in)
 - `live/truncate` — truncate assistant output at a client-tracked playback cursor
+- `live/playback_complete` - report completed client playback for one generated assistant output
 - `live/refresh` — apply mutable session config (instructions/tools/audio) to an open live channel
 - `live/webrtc/answer` - exchange a browser offer for a server SDP answer using the single-use token returned by a WebRTC `live/open`
+- `live/media_health` - report decoded-audio counters for the output a `live/media_health_requested` notification named
+
+`live/webrtc/answer` and `live/media_health` are served only by `live-webrtc`
+builds, which also send the `live/assistant_output_available`,
+`live/media_health_requested`, and `live/assistant_playback_hint`
+notifications.
 
 Set `model: "gpt-realtime-2"` on `session/create` and call `live/open` to open a live channel; capability is gated on `ModelCapabilities.realtime`. Check the returned `capabilities.image_in` boolean before calling `live/send_input` with `{ "kind": "image", "idempotency_key": "turn-42-diagram", "mime": "image/png", "data": "<base64>" }`. Image input is staged context for the next text, audio, or explicitly committed response. `status: "sent"` is queue acceptance only; wait for `user_content_committed` with the matching key for durable success. An exact same-key replay returns the prior receipt without resending provider input; different MIME/bytes reject with `image_input_idempotency_conflict`. Commit staged text/audio before submitting an image (`image_input_requires_commit`). Canonical live image history is capped at 40 MiB decoded in aggregate; new input that would cross it rejects before provider send as `image_input_history_budget_exceeded`. Legacy/out-of-band overflow, missing blobs, and content-address mismatches fail `live/open`; reconnect never trims accepted image context.
 
@@ -380,11 +436,22 @@ single-use token, and `offer_sdp`, then applies the returned `answer_sdp`.
 ### Auth (realm/binding model)
 
 - `auth/profile/list`, `auth/profile/get`, `auth/profile/create`, `auth/profile/delete`
-- `auth/login/start`, `auth/login/complete`
+- `auth/login/start`, `auth/login/complete`, `auth/login/cancel`
 - `auth/login/device_start`, `auth/login/device_complete`
 - `auth/login/provision_api_key`
 - `auth/status/get`, `auth/logout`
 - `realm/list`, `realm/get`
+
+`auth/login/start` and `auth/login/complete` also accept an MCP server target
+(`{"mcp": {...}}`) or a connector slot (`{"connector": {...}}`).
+`auth/login/cancel` retires a pending MCP or connector attempt by its `state`,
+or an MCP attempt by the `attempt_ref` that `auth/status/get` reports.
+`auth/status/get` also reports MCP and connector targets, and `auth/logout`
+also clears an MCP target's stored credential. Auth errors carry a typed
+`error.data.reason` (`WireAuthErrorReason`, for example `slot_occupied`,
+`attempt_missing`, `reauth_required`; 0.9.0 adds `credential_access_denied`,
+`credential_interaction_required`, `credential_access_pending`, and
+`credential_store_unavailable`). Branch on the reason, not the message.
 
 CLI auth forms:
 
@@ -399,7 +466,14 @@ rkat auth status <PROFILE_ID>
 rkat auth login [PROVIDER] [--backend <BACKEND>] [--method <METHOD>] [--non-interactive --secret <SECRET>]
 rkat auth logout [<REALM>:]<BINDING_ID>
 rkat auth refresh <PROFILE_ID>
+rkat auth connector-client set <ID> --issuer <ISSUER> --client <CLIENT_ID> [--client-secret [--secret-stdin]] [--authorize-param NAME=VALUE...] [--no-resource-indicator] [--protocol <ID>] [--redirect-uri <URI>...]
+rkat auth connector-client rotate-secret|remove <ID>
+rkat auth connector-client list
 ```
+
+`connector-client` manages the connector OAuth clients of `--realm` (default
+`global`): writes go to that realm's own config, and a client secret is read
+from stdin and kept in the credential store, never in config.
 
 CLI `login` provisions the reserved `global` realm in the HOME-rooted doc
 (`~/.rkat/config.toml`), inherited by every workspace realm via the chain tail.
@@ -447,6 +521,13 @@ catalog in `docs/api/rpc.mdx` is authoritative.
 - `capabilities/get`
 - `runtime/host_info`, `runtime/capabilities`, `runtime/health`
 - `approval/request`, `approval/list`, `approval/get`, `approval/decide`
+- `approval/consent_decide` (`approval_id` and `decision` only; the connection names the approver) - listed by `initialize` only on a stock governed stdio pipe that serves R3 human consent; that pipe also sends `approval/consent_notice` notifications (`kind`: `requested`, `approved`, `denied`, `used`, `withdrawn`; a `requested` notice carries `presentation`)
+
+Approval records are audit data: creating or deciding one gates or executes
+nothing by itself. REST, MCP, and CLI expose no approval methods. Store
+failures return typed codes: `APPROVAL_STORE_UNAVAILABLE` (nothing committed),
+`APPROVAL_CONFLICT` (another owner changed it first), and
+`APPROVAL_COMMIT_UNKNOWN` (reconcile from the store before reuse).
 
 ### Config
 
@@ -465,8 +546,9 @@ Lifecycle and identity:
 - `mob/members`, `mob/list_members_matching`, `mob/member_status`
 - `mob/spawn`, `mob/spawn_many`, `mob/spawn_helper`, `mob/fork_helper`
 - `mob/ensure_member`, `mob/reconcile`
-- `mob/retire`, `mob/respawn`, `mob/force_cancel`
-- `mob/wire`, `mob/unwire`, `mob/rotate_supervisor`
+- `mob/retire`, `mob/respawn`, `mob/force_cancel`, `mob/stop_member_run` (stop one exact member run)
+- `mob/wire`, `mob/wire_members_batch`, `mob/unwire`, `mob/rotate_supervisor`
+- `mob/member_tool_declaration`, `mob/apply_member_tool_declaration` (revision-fenced), `mob/adopt_member_identity_declaration`, `mob/resolve_identity_convergence_block` - durable member tool/identity declarations
 
 Member interaction and context:
 
@@ -476,6 +558,7 @@ Member interaction and context:
 Work lanes (autonomous member work tracking):
 
 - `mob/submit_work`, `mob/cancel_work`, `mob/cancel_all_work`
+- `mob/conclude_objective` - explicitly conclude a durable kickoff objective
 
 Waits and observation:
 
@@ -514,6 +597,28 @@ an address string.
 
 `comms/send` accepts an optional tri-state `content_taint` override (`{"declare": "clean"|"tainted"}` or `"undeclared"`; absent = inherit the runtime-level outbound declaration). The declaration rides inside the signed envelope; receivers read it from the typed transcript comms notice (`sender_taint`).
 
+### Notifications
+
+Server to client: `session/event` (`AgentEvent` payload during turns),
+`session/stream_event` / `session/stream_end`, `mob/stream_event` /
+`mob/stream_end`, plus the conditional `approval/consent_notice` and WebRTC
+`live/*` notifications above. Client to server: `initialized` (acknowledged
+silently) and `cancel` (`{"request_id": <id>}`), which ends a still-uncommitted
+request with `REQUEST_CANCELLED` (-32005); committed success is never rewritten.
+
+### Error codes
+
+`meerkat_contracts::ErrorCode` JSON-RPC codes (besides the standard
+-32700/-32600/-32601):
+
+- Session and requests: `SESSION_NOT_FOUND` -32001, `SESSION_BUSY` -32002, `SESSION_NOT_RUNNING` -32003, `DUPLICATE_INPUT` -32004, `REQUEST_CANCELLED` -32005, `SESSION_RUNTIME_UNAVAILABLE` -32032
+- Agent: `PROVIDER_ERROR` -32010, `BUDGET_EXHAUSTED` -32011, `HOOK_DENIED` -32012, `AGENT_ERROR` -32013
+- Capabilities, skills, schedules: `CAPABILITY_UNAVAILABLE` -32020, `SKILL_NOT_FOUND` -32021, `SKILL_RESOLUTION_FAILED` -32022, `SCHEDULE_NOT_FOUND` -32023
+- Mob: `SUPERVISOR_ROTATION_INCOMPLETE` -32024, `SCOPE_DENIED` -32025, `HOST_UNAVAILABLE` -32026, `STALE_CURSOR` -32027, `STALE_FENCE` -32028, `MEMBER_RELOAD_REQUIRED` -32029, `STALE_DELIVERY_SCOPE` -32036 (new in 0.9.0: the member session moved under a current fence; re-capture the delivery scope)
+- Native input: `INPUT_REFUSED` -32030, `INPUT_NOT_READY` -32031
+- Approvals (new in 0.9.0): `APPROVAL_STORE_UNAVAILABLE` -32033, `APPROVAL_CONFLICT` -32034, `APPROVAL_COMMIT_UNKNOWN` -32035
+- Generic: `INVALID_PARAMS` -32602, `INTERNAL_ERROR` -32603
+
 ### CLI parity (config)
 
 ```bash
@@ -551,7 +656,7 @@ Core tools:
 - `meerkat_capabilities` — list runtime capabilities
 - `meerkat_models_catalog` — curated model catalog with provider profiles
 - `meerkat_skills` — list skills (`action: "list"`) or inspect one skill (`action: "inspect"`, typed `skill_key`, optional `source` UUID)
-- `meerkat_mcp_add` — stage live MCP server add
+- `meerkat_mcp_add` - stage live MCP server add (refuses `oauth_account`, `oauth_account_selection`, and `account`, which are host configuration; refused on a governed runtime)
 - `meerkat_mcp_remove` — stage live MCP server remove
 - `meerkat_mcp_reload` — stage live MCP server reload
 - `meerkat_event_stream_open` / `meerkat_event_stream_read` / `meerkat_event_stream_close` — session event streaming
@@ -560,9 +665,11 @@ Mob tools (feature-gated, public MCP names — distinct from the agent-internal 
 
 - Lifecycle: `meerkat_mob_create`, `meerkat_mob_list`, `meerkat_mob_status`, `meerkat_mob_lifecycle`
 - Membership: `meerkat_mob_spawn`, `meerkat_mob_spawn_many`, `meerkat_mob_retire`, `meerkat_mob_respawn`, `meerkat_mob_force_cancel`, `meerkat_mob_wait_kickoff`, `meerkat_mob_wait_ready`
-- Wiring: `meerkat_mob_wire`, `meerkat_mob_unwire`
+- Wiring: `meerkat_mob_wire`, `meerkat_mob_wire_members_batch`, `meerkat_mob_unwire`
 - Member interaction: `meerkat_mob_member_send`, `meerkat_mob_append_system_context`
 - Runs and flows: `meerkat_mob_events`, `meerkat_mob_flows`, `meerkat_mob_run`, `meerkat_mob_flow_run`, `meerkat_mob_flow_status`, `meerkat_mob_run_result`, `meerkat_mob_flow_cancel`
+- WorkGraph Flow bridge: `meerkat_workgraph_flow_launch`, `meerkat_workgraph_flow_reconcile`, `meerkat_workgraph_flow_binding_get`, `meerkat_workgraph_flow_binding_list`, `meerkat_workgraph_flow_abandon_uncertain`
+- Multi-host observation only: `meerkat_mob_member_history`, `meerkat_mob_hosts`, `meerkat_mob_route_installs` (host/grant admin, hard cancel, and member live channels are deliberately not MCP tools)
 - Profiles: `meerkat_mob_profile_create`, `meerkat_mob_profile_get`, `meerkat_mob_profile_list`, `meerkat_mob_profile_update`, `meerkat_mob_profile_delete`
 - Event streams: `meerkat_mob_event_stream_open` / `meerkat_mob_event_stream_read` / `meerkat_mob_event_stream_close`
 
@@ -571,6 +678,13 @@ Schedule tools:
 - `meerkat_schedule_create`, `meerkat_schedule_get`, `meerkat_schedule_list`, `meerkat_schedule_update`
 - `meerkat_schedule_pause`, `meerkat_schedule_resume`, `meerkat_schedule_delete`
 - `meerkat_schedule_occurrences`
+
+WorkGraph tools (no `meerkat_` prefix): `workgraph_create`, `workgraph_get`,
+`workgraph_list`, `workgraph_ready`, `workgraph_snapshot`, `workgraph_events`,
+`workgraph_claim`, `workgraph_release`, `workgraph_update`, `workgraph_block`,
+`workgraph_close`, `workgraph_link`, `workgraph_add_evidence`. The
+attention-scoped `workgraph_attention_reassign` and `workgraph_policy_escalate`
+are not on this unscoped surface.
 
 Comms tools (feature-gated):
 
@@ -584,11 +698,15 @@ Comms tools (feature-gated):
 {"action":"patch","patch":{...},"expected_generation":4}
 ```
 
-Response includes the same config envelope fields.
+Response includes the same config envelope fields (`resolved_paths` only with
+`rkat-mcp --expose-paths`).
 
 ---
 
 ## Python SDK
+
+Package: `meerkat-sdk` on PyPI (import `meerkat`); the client drives an
+`rkat-rpc` subprocess.
 
 Connect options:
 
@@ -601,6 +719,8 @@ await client.connect(
   state_root="/path",         # optional
   context_root="/path",       # optional
   user_config_root="/path",   # optional
+  live_ws=False,              # optional: spawn with --live-ws 127.0.0.1:0
+  live_webrtc=False,          # optional: spawn with --live-webrtc (live-webrtc builds)
 )
 ```
 
@@ -608,9 +728,13 @@ Client methods:
 
 - `create_session(prompt, *, model, auth_binding=None, ...)` → `Session` — `auth_binding` scopes credentials to a realm/binding
 - `create_session_streaming(prompt, ...)` → `EventStream`
+- `create_deferred_session(prompt, ...)` → `DeferredSession` (creates without running; `start_turn(...)` runs the first turn)
+- `ask_help(question, *, prompt=None, ...)` → `RunResult` (`help/ask`)
+- `@client.tool(name, description=..., input_schema=...)` decorator registers a callback tool (`tools/register`)
 - `list_sessions(*, labels=None, limit=None, offset=None)` → `list[SessionSummary]`
 - `read_session(session_id)` → `SessionDetails`
-- `read_session_history(session_id, offset=0, limit=None)` → `SessionHistory`
+- `read_session_history(session_id, *, offset=0, limit=None)` → `SessionHistory`
+- `export_session_atif(...)` / `input_state(...)` / `subscribe_session_events(session_id)`
 - `get_blob(blob_id)` → `BlobPayload`
 - `create_mob(*, definition)` → `Mob` — call `await client.create_mob(definition=definition)`
 - `list_mobs()` → `list[dict[str, Any]]`
@@ -619,8 +743,16 @@ Client methods:
 - `mcp_remove(session_id, server_name, *, persisted=False)`
 - `mcp_reload(session_id, *, server_name=None, persisted=False)`
 - `list_skills()`
-- `capabilities` (property, populated during `connect()`)
+- `capabilities` (property, populated during `connect()`) / `has_capability(id)` / `require_capability(id)`
 - `get_runtime_host_info()` / `get_runtime_host_capabilities()` / `get_runtime_host_health()`
+
+Durable jobs, approvals, artifacts, event replay, WorkGraph:
+
+- `jobs_get`, `jobs_list`, `jobs_cancel`, `jobs_progress`, `jobs_result`, `jobs_artifacts`, `jobs_retry`, `jobs_health()`, `jobs_subscribe`, `jobs_unsubscribe`, `monitors_start`
+- `meta_job_heartbeat`, `meta_job_progress`, `meta_job_checkpoint`, `meta_job_complete`, `meta_job_fail`, `meta_job_cancel_ack` (host-worker `meta/jobs/*`; renamed from `mobkit_job_*` in 0.9.0)
+- `request_approval`, `list_approvals`, `get_approval`, `decide_approval`; `on_consent_notice(callback)` delivers typed `approval/consent_notice` and returns an unsubscribe function
+- `list_artifacts`, `get_artifact`, `download_artifact`; `latest_event_cursor`, `list_events_since`, `event_snapshot`
+- `get_workgraph_item`, `list_workgraph_items`, `list_ready_workgraph_items`, `get_workgraph_snapshot`, `list_workgraph_events`, `get_workgraph_goal_status`, `list_workgraph_attention`
 
 Live channel helpers:
 
@@ -634,6 +766,10 @@ Live channel helpers:
 - `live_commit_input(channel_id, response_modality=None)` / `live_interrupt(channel_id)`
 - `live_truncate(channel_id, item_id, content_index, audio_played_ms)`
 - `live_refresh(channel_id)`
+- `live_playback_complete(channel_id, output_id)`
+- `live_media_health(channel_id, output_id, decoded_frames, audible_frames, max_rms)` (live-webrtc builds)
+- `on_live_notification(callback)` → unsubscribe function (`live/*` server notifications)
+- `LiveChannel.session(client, session_id, *, turning_mode=None, transport=None, seed_max_chars=None)` - session-bound wrapper (`open()`, `send_input_*`, `commit_input`, `playback_complete`, `close()`)
 
 Call `opened = await client.live_open(session_id, ...)`, then keep
 `channel_id = opened["channel_id"]`. All subsequent helpers above address that
@@ -646,31 +782,44 @@ Auth helpers:
 - `auth_provision_api_key(...)`
 - `auth_status(...)` / `auth_logout(...)`
 - `list_auth_profiles(realm_id)` / `get_auth_profile(...)` / `create_auth_profile(...)` / `delete_auth_profile(...)`
+- `auth_mcp_login_start(...)` / `auth_mcp_login_complete(...)` / `auth_mcp_login_cancel(...)` / `auth_mcp_login_cancel_by_attempt_ref(...)` / `auth_mcp_status(...)` / `auth_mcp_logout(...)`
+- `auth_connector_login_start(...)` / `auth_connector_login_complete(...)` / `auth_connector_login_cancel(...)` / `auth_connector_status(realm_id, slot_id)`
+- `list_realms()` / `get_realm(realm_id)`
 
 Schedule helpers:
 
 - `create_schedule(request)` / `get_schedule(id)` / `list_schedules(...)` / `update_schedule(request)`
 - `pause_schedule(id)` / `resume_schedule(id)` / `delete_schedule(id)`
-- `list_schedule_occurrences(id)`
+- `list_schedule_occurrences(id, *, include_terminal=None)`
+- `list_schedule_tools()` / `call_schedule_tool(request)`
 
 Session methods:
 
 - `Session.turn(prompt, ...)` → `RunResult`
 - `Session.stream(prompt, ...)` → `EventStream`
-- `Session.history(offset=0, limit=None)` → `SessionHistory`
+- `Session.history(*, offset=0, limit=None)` → `SessionHistory`
 - `Session.invoke_skill(skill_ref, prompt)` → `RunResult`
 - `Session.interrupt()`
+- `Session.stop_run(run_id, *, reason)` → `StopRunResult` (`turn/stop_run`; `run_id` from the `run_started` event)
 - `Session.archive()`
+- `Session.inject_context(text, *, source=None, idempotency_key=None)` / `send_external_event(...)` / `send_peer_response_terminal(...)`
+- `Session.transcript_revision(...)` / `transcript_revisions(...)` / `rewrite_transcript(...)` / `restore_transcript_revision(...)` / `fork_at(...)` / `fork_replace(...)`
+- `Session.update_system_prompt(key, content, ...)` / `activate_instruction(activation)` / `instruction_activations(...)`
 - `Session.send(**command)` / `Session.peers()`
 - `Session.subscribe_events()` → `EventSubscription`
+- `DeferredSession.start_turn(prompt, ...)` → `RunResult` (first turn of `create_deferred_session`)
 
 Mob methods:
 
-- `Mob.id` (property) / `Mob.status()` / `Mob.lifecycle(action)`
-- `Mob.spawn(...)` / `Mob.retire(agent_identity)` / `Mob.respawn(agent_identity)`
-- `Mob.wire(a, b)` / `Mob.unwire(a, b)`
-- `Mob.members()` / `Mob.member(agent_identity).send(content, handling_mode=...)`
-- `Mob.flows()` / `Mob.run_flow(flow_id, params)` / `Mob.flow_status(run_id)` / `Mob.run_result(run_id)` / `Mob.cancel_flow(run_id)`
+- `Mob.id` (attribute) / `Mob.status()` / `Mob.lifecycle(action)`
+- `Mob.spawn(...)` / `Mob.spawn_many(specs)` / `Mob.retire(agent_identity)` / `Mob.respawn(agent_identity)` / `Mob.force_cancel(agent_identity)` / `Mob.stop_member_run(agent_identity, run_id, *, reason)`
+- `Mob.wire(a, b)` / `Mob.wire_members_batch(edges)` / `Mob.unwire(a, b)`
+- `Mob.members()` / `Mob.member_status(agent_identity)` / `Mob.member(agent_identity).send(content, handling_mode=...)` / `Mob.append_system_context(agent_identity, text, ...)`
+- `Mob.spawn_helper(prompt, *, result_label, max_text_bytes, ...)` / `Mob.fork_helper(source_member_id, prompt, *, result_label, max_text_bytes, ...)` → `MobHelperResult`
+- `Mob.wait_for_kickoff_complete(*, member_ids=None, timeout_ms=None)` / `Mob.wait_for_ready(...)` / `Mob.read_events(*, after_cursor=0, limit=100)`
+- `Mob.flows()` / `Mob.run(params=None, *, prompt=None, flow_id=None)` / `Mob.run_flow(flow_id, params)` / `Mob.flow_status(run_id)` / `Mob.run_result(run_id)` / `Mob.cancel_flow(run_id)`
+- Multi-host: `Mob.grant_scopes(...)` / `revoke_scopes(...)` / `grants()` / `bind_host(...)` / `revoke_host(host_id)` / `hosts()` / `route_installs()` / `member_history(...)` / `hard_cancel(agent_identity, reason)` / `member_live_open|close|status|control(...)`
+- Declarations: `Mob.member_tool_declaration(...)` / `apply_member_tool_declaration(...)` / `adopt_member_identity_declaration(...)` / `resolve_identity_convergence_block(...)`
 - `Mob.subscribe_member_events(agent_identity)` → `EventSubscription`
 - `Mob.subscribe_events()` → `EventSubscription`
 
@@ -707,6 +856,9 @@ await client.connect({
   stateRoot: "/path",         // optional
   contextRoot: "/path",       // optional
   userConfigRoot: "/path",    // optional
+  liveWs: false,              // optional: spawn with --live-ws 127.0.0.1:0
+  liveWebrtc: false,          // optional: spawn with --live-webrtc (live-webrtc builds)
+  liveToolTimeoutMs: 60000,   // optional: --live-tool-timeout-ms
 });
 ```
 
@@ -717,35 +869,52 @@ Client methods:
 
 - `createSession(prompt, options?)` → `Session` — `options.authBinding` scopes credentials to a realm/binding
 - `createSessionStreaming(prompt, options?)` → `EventStream`
-- `listSessions()` → `SessionInfo[]`
-- `readSession(sessionId)` → object
+- `createDeferredSession(prompt, options?)` → `DeferredSession` (`startTurn(...)` or `stream(...)` runs the first turn)
+- `askHelp(question, options?)` → `RunResult` (`help/ask`)
+- `registerTool(name, description, inputSchema, handler)` registers a callback tool (`tools/register`)
+- `listSessions(options?)` → `SessionInfo[]` (`labels`, `limit`, `offset`)
+- `readSession(sessionId)` → `SessionInfo`
 - `readSessionHistory(sessionId, { offset, limit }?)` → `SessionHistory`
+- `exportSessionAtif(sessionId, options?)` / `inputState(sessionId, { inputId } | { idempotencyKey })` / `subscribeSessionEvents(sessionId)`
 - `getBlob(blobId)` → `BlobPayload`
 - `createMob({ definition })` → `Mob` — call `await client.createMob({ definition })`; neither mob creation nor a mob role `Profile` declares an initial auth binding. Configure host/realm credentials, or select a preconfigured realm binding through supported per-member spawn/helper auth options.
 - `listMobs()` → `MobSummary[]`
 - `getConfig()` / `setConfig(...)` / `patchConfig(...)`
 - `mcpAdd(params)` / `mcpRemove(params)` / `mcpReload(params)`
 - `listSkills()`
-- `capabilities` (property, populated during `connect()`)
+- `capabilities` (property, populated during `connect()`) / `hasCapability(id)` / `requireCapability(id)`
 - `getRuntimeHostInfo()` / `getRuntimeHostCapabilities()` / `getRuntimeHostHealth()`
+
+Durable jobs, approvals, artifacts, event replay, WorkGraph:
+
+- `jobsGet`, `jobsList`, `jobsCancel`, `jobsProgress`, `jobsResult`, `jobsArtifacts`, `jobsRetry`, `jobsHealth()`, `jobsSubscribe`, `jobsUnsubscribe`, `monitorsStart`
+- `metaJobHeartbeat`, `metaJobProgress`, `metaJobCheckpoint`, `metaJobComplete`, `metaJobFail`, `metaJobCancelAck` (host-worker `meta/jobs/*`; renamed from `mobkitJob*` in 0.9.0)
+- `requestApproval`, `listApprovals`, `getApproval`, `decideApproval`; `onConsentNotice(listener)` delivers typed `approval/consent_notice` (`ConsentNotice`) and returns an unsubscribe function
+- `listArtifacts`, `getArtifact`, `downloadArtifact`; `latestEventCursor`, `listEventsSince`, `eventSnapshot`
+- `getWorkGraphItem`, `listWorkGraphItems`, `listReadyWorkGraphItems`, `getWorkGraphSnapshot`, `listWorkGraphEvents`, `getWorkGraphGoalStatus`, `listWorkGraphAttention`
 
 Live channel helpers:
 
-- `liveOpen({ session_id, seed_max_chars? })` / `liveStatus(params)` / `liveClose(params)`
+- `liveOpen({ session_id, turning_mode?, transport?, seed_max_chars? })` / `liveStatus(params)` / `liveClose(params)`
 - `LiveChannel.session(client, sessionId, { seedMaxChars? })` — session-bound convenience wrapper
 - `liveSendInput(params)` — raw params-object API
 - `liveSendInputImage(channelId, idempotencyKey, mime, dataBase64)`
 - `liveSendInputVideoFrame(channelId, codec, dataBase64, timestampMs)`
 - `liveCommitInput(params)` / `liveInterrupt(params)` / `liveTruncate(params)`
 - `liveRefresh(params)`
+- `livePlaybackComplete(params)`
+- `liveWebrtcAnswer(params)` / `liveMediaHealth(params)` (live-webrtc builds)
+- `onLiveNotification(listener)` → unsubscribe function (`live/*` server notifications)
 
 Auth helpers:
 
-- `authLoginStart(...)` / `authLoginComplete(...)`
+- `authLoginStart(...)` / `authLoginComplete(...)` / `authLoginCancel(...)`
 - `authLoginDeviceStart(...)` / `authLoginDeviceComplete(...)`
 - `authLoginProvisionApiKey(...)`
 - `authStatusGet(...)` / `authLogout(...)`
 - `authProfileList(realmId)` / `authProfileGet(...)` / `authProfileCreate(...)` / `authProfileDelete(...)`
+- `authMcpStatus(...)` / `authMcpLogout(...)` / `authConnectorStatus(...)`
+- `realmList()` / `realmGet(realmId)`
 
 Schedule helpers:
 
@@ -761,20 +930,30 @@ Session methods:
 - `Session.history({ offset, limit }?)` → `SessionHistory`
 - `Session.invokeSkill(skillRef, prompt)` → `RunResult`
 - `Session.interrupt()`
+- `Session.stopRun(runId, reason)` → `StopRunResult` (`turn/stop_run`)
 - `Session.archive()`
+- `Session.injectContext(...)` / `sendExternalEvent(...)` / `sendPeerResponseTerminal(...)`
+- `Session.transcriptRevision(...)` / `transcriptRevisions(...)` / `rewriteTranscript(...)` / `restoreTranscriptRevision(...)` / `forkAt(...)` / `forkReplace(...)`
+- `Session.updateSystemPrompt(...)` / `activateInstruction(...)` / `instructionActivations(...)`
 - `Session.send(command)` / `Session.peers()`
 - `Session.subscribeEvents()` → `EventSubscription<AgentEventEnvelope>`
+- `DeferredSession.startTurn(prompt, options?)` / `DeferredSession.stream(prompt, options?)` (first turn of `createDeferredSession`)
 
 Mob methods:
 
 - `Mob.status()` / `Mob.lifecycle(action)`
-- `Mob.spawn(spec)` / `Mob.retire(agentIdentity)` / `Mob.respawn(agentIdentity)`
+- `Mob.spawn(spec)` / `Mob.spawnMany(specs)` / `Mob.retire(agentIdentity)` / `Mob.respawn(agentIdentity)` / `Mob.forceCancel(agentIdentity)` / `Mob.stopMemberRun(agentIdentity, runId, reason)`
 - `Mob.wire(a, b)` / `Mob.unwire(a, b)` — identity-keyed
 - `Mob.listMembers()` / `Mob.member(agentIdentity)` → `Member`
 - `Member.send(content, options?)` — call `mob.member(agentIdentity).send(content, options?)`
 - `Mob.listFlows()` / `Mob.run(params, options)` / `Mob.runFlow(flowId, params)` / `Mob.flowStatus(runId)` / `Mob.runResult(runId)` / `Mob.cancelFlow(runId)`
 - `Mob.subscribeMemberEvents(agentIdentity)` → `EventSubscription<AgentEventEnvelope>`
 - `Mob.subscribeEvents()` → `EventSubscription<AttributedMobEvent>`
+- `Mob.wireMembersBatch(edges)` / `Mob.memberStatus(agentIdentity)` / `Mob.appendSystemContext(...)` / `Mob.readEvents(options?)`
+- `Mob.spawnHelper(prompt, { resultLabel, maxTextBytes, ... })` / `Mob.forkHelper(sourceMemberId, prompt, { resultLabel, maxTextBytes, ... })` → `MobHelperResult`
+- `Mob.waitForKickoffComplete(options?)` / `Mob.waitForReady(options?)`
+- Multi-host: `Mob.grantScopes(...)` / `revokeScopes(...)` / `grants()` / `bindHost(...)` / `revokeHost(hostId)` / `hosts()` / `routeInstalls()` / `memberHistory(...)` / `hardCancel(agentIdentity, reason)` / `memberLiveOpen|Close|Status|Control(...)`
+- Declarations (client-level): `mobMemberToolDeclaration(...)` / `applyMobMemberToolDeclaration(...)` / `adoptMobMemberIdentityDeclaration(...)` / `resolveMobIdentityConvergenceBlock(...)`
 
 `getConfig()` / `patchConfig()` return the config envelope.
 
@@ -863,7 +1042,7 @@ use meerkat_runtime::MeerkatMachine;
 use meerkat_core::service::{CreateSessionRequest, SessionBuildOptions};
 
 // Runtime-backed surface: prepare bindings from the adapter
-let adapter = MeerkatMachine::persistent(store, blob_store);
+let adapter = MeerkatMachine::persistent(store, blob_store)?;
 let bindings = adapter.prepare_bindings(session_id.clone()).await?;
 let build = SessionBuildOptions {
     runtime_build_mode: RuntimeBuildMode::SessionOwned(bindings),
@@ -915,7 +1094,7 @@ the full canonical key; selecting an unrelated source does not rewrite it.
 
 - Inproc comms is namespace-scoped; realm namespace isolates peer discovery/sends.
 - **Peer lifecycle typing**: mob lifecycle routing is typed at ingress. `mob.peer_added`, `mob.peer_retired`, and `mob.peer_unwired` are silent lifecycle notices; the six `mob.kickoff_*` kinds (pending, starting, started, callback_pending, failed, cancelled) are visible lifecycle notices that open no inbound request and need no reply. Do not depend on mob defaults in `silent_comms_intents` for canonical behavior.
-- **Comms choice**: agents use `send_message` for ordinary collaboration, `send_request` for structured ask/reply, and `send_response` for replies. Public peer reservation streams were removed.
+- **Comms choice**: agents use `send_message` for ordinary collaboration, `send_request` for structured ask/reply, and `send_response` for replies; `reply_to_peer` answers the peer whose message was delivered in the turn without restating addressing (it fails with `no_reply_capability` otherwise). Public peer reservation streams were removed.
 - Hooks and skills resolve from runtime root. Workspace-default CLI realms preserve project ergonomics.
 - **Skill introspection**: `SkillRuntime::list_all_with_provenance()` returns active + shadowed skills. `load_from_source(key, None)` loads the canonical key; the factory composite accepts registered source UUID text for explicit source selection.
 - Multi-agent orchestration uses mobs exclusively. `MemberLaunchMode::Fork`
@@ -955,6 +1134,9 @@ Key step fields:
 - `condition` (optional)
 - `timeout_ms`
 - `expected_schema_ref` (optional)
+- `output_format = "json"|"text"` (optional; omitted resolves to `json` when `expected_schema_ref` is set, else `text`)
+- `failure_policy = "escalate"|"continue"` (default `escalate`; `continue` records the failure without deciding the frame's outcome; frame nodes accept it too)
+- `allowed_tools` / `blocked_tools` (optional per-step tool overlay)
 
 ### Explicit frame root
 
