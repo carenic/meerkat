@@ -6071,6 +6071,7 @@ class MeerkatClient:
         if refusal not in {
             "invalid_requirement", "invalid_launch", "unsupported_requirement",
             "backend_unavailable", "preparation_failed",
+            "untrusted_configuration_source",
         }:
             raise MeerkatError(
                 "INVALID_RESPONSE",

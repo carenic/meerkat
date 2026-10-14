@@ -5197,7 +5197,7 @@ export class MeerkatClient {
       raw,
       "confinement_refusal",
       ["invalid_requirement", "invalid_launch", "unsupported_requirement",
-        "backend_unavailable", "preparation_failed"],
+        "backend_unavailable", "preparation_failed", "untrusted_configuration_source"],
       context,
     );
   }
