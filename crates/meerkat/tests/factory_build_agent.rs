@@ -5402,7 +5402,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
 
 /// A declared MCP server without a tool list may provide any name once it
 /// connects, so a deny name in no vocabulary is deferred to the gate: the
-/// build logs the deferral, the tool stays listed, and a call is refused.
+/// build logs the deferral and a call is refused.
 #[tokio::test]
 async fn declared_deny_defers_unknown_names_while_a_declared_mcp_server_maps_no_tools() {
     let sink = LogSink::default();
