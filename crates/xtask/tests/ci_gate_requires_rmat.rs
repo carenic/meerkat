@@ -628,7 +628,12 @@ fn buildbuddy_workflow_is_called_only_by_nightly_and_release() {
             .unwrap_or_default()
             .to_owned()
     };
-    for job in ["control-plane-up", "executors-up", "executors-down"] {
+    for job in [
+        "control-plane-up",
+        "executors-up",
+        "executors-down",
+        "control-plane-down",
+    ] {
         let condition = job_if(&doc, job);
         assert!(
             condition.contains(GATE_ON) && !condition.contains("||"),

@@ -997,6 +997,28 @@ if [[ "${meerkat_bazel_backend}" != "gcp-local" && -n "${buildbuddy_remote_url}"
     --remote_cache="${buildbuddy_remote_url}"
     --remote_executor="${buildbuddy_remote_url}"
   )
+  # A plaintext endpoint is refused below, before the client starts.
+  if [[ "${meerkat_bazel_backend}" == "gcp-buildbuddy" && "${buildbuddy_remote_url}" == grpcs://* ]]; then
+    # The self-hosted control plane serves TLS with a certificate from its
+    # own per-boot CA; trust exactly that CA (the tunnel step writes it).
+    if [[ -z "${BUILDBUDDY_TLS_CERTIFICATE:-}" || ! -f "${BUILDBUDDY_TLS_CERTIFICATE}" ]]; then
+      echo "error: BUILDBUDDY_TLS_CERTIFICATE must name the control plane's CA certificate file for gcp-buildbuddy (got '${BUILDBUDDY_TLS_CERTIFICATE:-}')" >&2
+      exit 1
+    fi
+    # Actions run in the action image pinned by digest, on executors of the
+    # caller's own org (user-owned executors on the control plane).
+    gcp_action_image="${MEERKAT_BUILDBUDDY_CI_IMAGE:-}"
+    gcp_action_image="${gcp_action_image#docker://}"
+    if ! [[ "${gcp_action_image}" =~ ^[A-Za-z0-9._/:-]+@sha256:[0-9a-f]{64}$ ]]; then
+      echo "error: MEERKAT_BUILDBUDDY_CI_IMAGE must pin the action image by digest (<repository>[:tag]@sha256:<64 hex>) for gcp-buildbuddy; got '${MEERKAT_BUILDBUDDY_CI_IMAGE:-}'" >&2
+      exit 1
+    fi
+    bb_args+=(
+      --tls_certificate="${BUILDBUDDY_TLS_CERTIFICATE}"
+      "--remote_exec_header=x-buildbuddy-platform.container-image=docker://${gcp_action_image}"
+      --remote_exec_header=x-buildbuddy-platform.use-self-hosted-executors=true
+    )
+  fi
 fi
 if [[ "${#apple_platform_args[@]}" -gt 0 ]]; then
   bb_args+=("${apple_platform_args[@]}")
@@ -1130,6 +1152,87 @@ fi
 bb_args+=("$@")
 if [[ "${#enforced_args[@]}" -gt 0 ]]; then
   bb_args+=("${enforced_args[@]}")
+fi
+
+# --- The API key travels only over TLS ----------------------------------------
+# The x-buildbuddy-api-key header in the private bazelrc above goes to every
+# remote endpoint of the run (cache, executor, BES, downloader). While it is
+# set, each endpoint must be TLS: grpcs://, https://, no scheme (Bazel reads
+# that as grpcs) or a local unix: socket. Every endpoint token is checked: the
+# client argv (BUILDBUDDY_GRPC_URL/BUILDBUDDY_ENDPOINT and explicit flags, in
+# both `--flag=value` and `--flag value` form) and every line of the
+# repository .bazelrc. A .bazelrc shape this scan cannot read exactly (an
+# import, or a quoted endpoint flag) is refused rather than guessed at.
+remote_endpoint_is_tls() {
+  case "$1" in
+    "" | grpcs://* | https://* | unix:*) return 0 ;;
+    *://*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+# Prints every non-TLS endpoint value among the given tokens.
+non_tls_endpoint_tokens() {
+  local previous="" token value
+  for token in "$@"; do
+    value=""
+    case "${previous}" in
+      --remote_cache | --remote_executor | --bes_backend | --remote_downloader)
+        value="${token}"
+        ;;
+    esac
+    case "${token}" in
+      --remote_cache=* | --remote_executor=* | --bes_backend=* | --remote_downloader=*)
+        value="${token#*=}"
+        ;;
+    esac
+    if [[ -n "${value}" ]] && ! remote_endpoint_is_tls "${value}"; then
+      printf '%s\n' "${value}"
+    fi
+    previous="${token}"
+  done
+}
+# Prints every non-TLS endpoint and every unscannable line of a bazelrc.
+non_tls_rc_endpoints() {
+  local rc_file="$1" raw line="" stripped
+  local -a rc_tokens
+  [[ -f "${rc_file}" ]] || return 0
+  while IFS= read -r raw || [[ -n "${raw}" ]]; do
+    if [[ "${raw}" == *\\ ]]; then
+      line+="${raw%\\} "
+      continue
+    fi
+    line+="${raw}"
+    stripped="${line#"${line%%[![:space:]]*}"}"
+    line=""
+    case "${stripped}" in
+      "" | "#"*) ;;
+      import[[:space:]]* | try-import[[:space:]]*)
+        printf '%s\n' "${stripped} (imported rc files are not scanned)"
+        ;;
+      *)
+        if [[ "${stripped}" =~ --(remote_cache|remote_executor|bes_backend|remote_downloader) &&
+          "${stripped}" == *[\"\']* ]]; then
+          printf '%s\n' "${stripped} (quoted endpoint flags are not scanned)"
+        else
+          read -r -a rc_tokens <<<"${stripped}"
+          non_tls_endpoint_tokens ${rc_tokens[@]+"${rc_tokens[@]}"}
+        fi
+        ;;
+    esac
+  done <"${rc_file}"
+}
+if [[ -n "${secret_bazelrc}" ]]; then
+  plaintext_endpoints=()
+  while IFS= read -r plaintext_endpoint; do
+    plaintext_endpoints+=("${plaintext_endpoint}")
+  done < <(
+    non_tls_endpoint_tokens "${bb_args[@]}"
+    non_tls_rc_endpoints "${workspace_root}/.bazelrc"
+  )
+  if [[ "${#plaintext_endpoints[@]}" -gt 0 ]]; then
+    echo "error: refusing to send the BuildBuddy API key to non-TLS or unscannable endpoint configuration: ${plaintext_endpoints[*]}; use grpcs:// (or https://)" >&2
+    exit 1
+  fi
 fi
 
 # --- Corrupt external-repo state detection and auto-repair -------------------

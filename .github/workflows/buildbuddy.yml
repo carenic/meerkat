@@ -29,7 +29,10 @@ on:
         default: ""
         type: string
     secrets:
-      BUILDBUDDY_API_KEY:
+      # The self-hosted control plane's own org API key for the CI
+      # submitters. This workflow never reads the BuildBuddy Cloud key
+      # (BUILDBUDDY_API_KEY), which callers pass along with `secrets: inherit`.
+      MEERKAT_GCP_BUILDBUDDY_API_KEY:
         required: false
       BUILDBUDDY_ENDPOINT:
         required: false
@@ -73,7 +76,7 @@ env:
   RUSTUP_TOOLCHAIN: 1.94.1
   MEERKAT_BAZEL_BACKEND: gcp-buildbuddy
   BUILDBUDDY_BAZEL_CONFIG: buildbuddy-linux-gcp-ci-rbe
-  BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+  BUILDBUDDY_API_KEY: ${{ secrets.MEERKAT_GCP_BUILDBUDDY_API_KEY }}
   BUILDBUDDY_ENDPOINT: ${{ secrets.BUILDBUDDY_ENDPOINT }}
   BUILDBUDDY_GRPC_URL: ""
   BUILDBUDDY_HTTP_URL: ""
@@ -102,7 +105,15 @@ env:
   MEERKAT_GCP_BUILDBUDDY_CI_MAX_SECONDS: "3000"
   MEERKAT_GCP_BUILDBUDDY_SDK_CI_MAX_SECONDS: "3000"
   MEERKAT_BUILDBUDDY_EXECUTOR_POOL: ${{ vars.MEERKAT_BUILDBUDDY_EXECUTOR_POOL || 'meerkat-ci' }}
-  MEERKAT_BUILDBUDDY_CI_IMAGE: ${{ vars.MEERKAT_BUILDBUDDY_CI_IMAGE || 'europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0' }}
+  # Server, executor and action images, each pinned by digest
+  # (<repository>[:tag]@sha256:<digest>) in repository variables; the scripts
+  # and the Bazel wrapper refuse a reference without a digest.
+  MEERKAT_GCP_BUILDBUDDY_CONTROL_IMAGE: ${{ vars.MEERKAT_GCP_BUILDBUDDY_CONTROL_IMAGE }}
+  MEERKAT_BUILDBUDDY_EXECUTOR_IMAGE: ${{ vars.MEERKAT_BUILDBUDDY_EXECUTOR_IMAGE }}
+  MEERKAT_BUILDBUDDY_CI_IMAGE: ${{ vars.MEERKAT_BUILDBUDDY_CI_IMAGE }}
+  # Submitters authenticate with these to open their IAP tunnel.
+  MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+  MEERKAT_GCP_SERVICE_ACCOUNT: ${{ vars.MEERKAT_GCP_SERVICE_ACCOUNT }}
   MEERKAT_HOST_CARGO_HOME: /usr/local/cargo
   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
   RKAT_ANTHROPIC_API_KEY: ${{ secrets.RKAT_ANTHROPIC_API_KEY }}
@@ -125,10 +136,14 @@ jobs:
     name: Control plane up
     if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
+    # grpc_url is the submitters' local IAP tunnel, executor_grpc_url the
+    # VM's internal address; both are gRPCS with the per-boot CA tls_ca_b64.
     outputs:
       grpc_url: ${{ steps.endpoint.outputs.grpc_url }}
       http_url: ${{ steps.endpoint.outputs.http_url }}
+      executor_grpc_url: ${{ steps.endpoint.outputs.executor_grpc_url }}
+      tls_ca_b64: ${{ steps.endpoint.outputs.tls_ca_b64 }}
       started_at_epoch: ${{ steps.capture-start.outputs.started_at_epoch }}
     steps:
       - name: Capture start time
@@ -140,6 +155,20 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 1
+
+      # The scripts below must still refuse what the contract test feeds
+      # them before they touch GCP.
+      - name: Check the self-hosted BuildBuddy contract
+        shell: bash
+        run: scripts/test-gcp-buildbuddy-hardening.sh
+
+      - name: Require the self-hosted control-plane API key
+        shell: bash
+        run: |
+          if [[ -z "${BUILDBUDDY_API_KEY}" ]]; then
+            echo "::error::Secret MEERKAT_GCP_BUILDBUDDY_API_KEY (an org API key of the self-hosted control plane) is required."
+            exit 1
+          fi
 
       - name: Authenticate to GCP with Workload Identity
         if: ${{ vars.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER != '' && vars.MEERKAT_GCP_SERVICE_ACCOUNT != '' }}
@@ -169,28 +198,23 @@ jobs:
           gcloud auth activate-service-account --key-file "${key_file}"
           rm -f "${key_file}"
 
+      # Refuses (changing nothing) on any open, disabled, drifted or legacy
+      # firewall rule, a VM or data disk not made from this rendering, or an
+      # image not pinned by digest.
       - name: Ensure self-hosted BuildBuddy control plane
         shell: bash
         run: scripts/gcp-buildbuddy-control-plane ensure
+
+      # The VM reports the sha256 of the config it installed this boot; it
+      # must equal this checkout's rendering.
+      - name: Verify the installed control-plane config
+        shell: bash
+        run: scripts/gcp-buildbuddy-control-plane verify --wait 480
 
       - name: Resolve self-hosted BuildBuddy endpoint
         id: endpoint
         shell: bash
         run: scripts/gcp-buildbuddy-control-plane endpoint github-output
-
-      - name: Wait for BuildBuddy HTTP
-        shell: bash
-        env:
-          BUILDBUDDY_HTTP_URL: ${{ steps.endpoint.outputs.http_url }}
-        run: |
-          for _ in {1..60}; do
-            if curl -fsS "${BUILDBUDDY_HTTP_URL}/" >/dev/null; then
-              exit 0
-            fi
-            sleep 5
-          done
-          scripts/gcp-buildbuddy-control-plane logs
-          exit 1
 
   executors-up:
     name: Executors up
@@ -199,9 +223,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
-      BUILDBUDDY_GRPC_URL: ${{ needs.control-plane-up.outputs.grpc_url }}
-      BUILDBUDDY_HTTP_URL: ${{ needs.control-plane-up.outputs.http_url }}
-      BUILDBUDDY_ENDPOINT: ${{ needs.control-plane-up.outputs.grpc_url }}
+      BUILDBUDDY_GRPC_URL: ${{ needs.control-plane-up.outputs.executor_grpc_url }}
+      BUILDBUDDY_ENDPOINT: ${{ needs.control-plane-up.outputs.executor_grpc_url }}
+      BUILDBUDDY_TLS_CA_B64: ${{ needs.control-plane-up.outputs.tls_ca_b64 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -247,6 +271,7 @@ jobs:
   prebuild-submit:
     name: Prebuild submitter
     needs: [control-plane-up, executors-up]
+    if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}
     runs-on: ubuntu-24.04
     # Cold `//...` (3,447 actions) needs ~12-13 min of Bazel time plus setup;
     # a 12-minute timeout cancelled it at 97% on 2026-09-22.
@@ -256,6 +281,7 @@ jobs:
       BUILDBUDDY_HTTP_URL: ${{ needs.control-plane-up.outputs.http_url }}
       BUILDBUDDY_ENDPOINT: ${{ needs.control-plane-up.outputs.grpc_url }}
       CI_STARTED_AT_EPOCH: ${{ needs.control-plane-up.outputs.started_at_epoch }}
+      BUILDBUDDY_TLS_CA_B64: ${{ needs.control-plane-up.outputs.tls_ca_b64 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -273,6 +299,7 @@ jobs:
   static-submit:
     name: Static submitter
     needs: [control-plane-up, executors-up]
+    if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 12
     env:
@@ -280,6 +307,7 @@ jobs:
       BUILDBUDDY_HTTP_URL: ${{ needs.control-plane-up.outputs.http_url }}
       BUILDBUDDY_ENDPOINT: ${{ needs.control-plane-up.outputs.grpc_url }}
       CI_STARTED_AT_EPOCH: ${{ needs.control-plane-up.outputs.started_at_epoch }}
+      BUILDBUDDY_TLS_CA_B64: ${{ needs.control-plane-up.outputs.tls_ca_b64 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -297,6 +325,7 @@ jobs:
   native-submit:
     name: Native submitter
     needs: [control-plane-up, executors-up, prebuild-submit]
+    if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -304,6 +333,7 @@ jobs:
       BUILDBUDDY_HTTP_URL: ${{ needs.control-plane-up.outputs.http_url }}
       BUILDBUDDY_ENDPOINT: ${{ needs.control-plane-up.outputs.grpc_url }}
       CI_STARTED_AT_EPOCH: ${{ needs.control-plane-up.outputs.started_at_epoch }}
+      BUILDBUDDY_TLS_CA_B64: ${{ needs.control-plane-up.outputs.tls_ca_b64 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -343,6 +373,7 @@ jobs:
     # started ~28 min into the 50-min SLO and still ran at the deadline on
     # the v0.8.43 and v0.8.44 tag runs (it needs ~22-25 min cold).
     needs: [control-plane-up, executors-up]
+    if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}
     runs-on: ubuntu-24.04
     # Above the SLO left when it starts, so the SLO watchdog, not a GitHub
     # timeout, stops an overrunning batch.
@@ -352,6 +383,7 @@ jobs:
       BUILDBUDDY_HTTP_URL: ${{ needs.control-plane-up.outputs.http_url }}
       BUILDBUDDY_ENDPOINT: ${{ needs.control-plane-up.outputs.grpc_url }}
       CI_STARTED_AT_EPOCH: ${{ needs.control-plane-up.outputs.started_at_epoch }}
+      BUILDBUDDY_TLS_CA_B64: ${{ needs.control-plane-up.outputs.tls_ca_b64 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -371,6 +403,7 @@ jobs:
   governance-submit:
     name: Governance submitter
     needs: [control-plane-up, executors-up]
+    if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -378,6 +411,7 @@ jobs:
       BUILDBUDDY_HTTP_URL: ${{ needs.control-plane-up.outputs.http_url }}
       BUILDBUDDY_ENDPOINT: ${{ needs.control-plane-up.outputs.grpc_url }}
       CI_STARTED_AT_EPOCH: ${{ needs.control-plane-up.outputs.started_at_epoch }}
+      BUILDBUDDY_TLS_CA_B64: ${{ needs.control-plane-up.outputs.tls_ca_b64 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -463,7 +497,7 @@ jobs:
   wasm-sdk-submit:
     name: SDK suites submitter
     needs: [control-plane-up, executors-up, wasm-feature-changes]
-    if: ${{ needs.wasm-feature-changes.outputs.sdk_changed == 'true' }}
+    if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' && needs.wasm-feature-changes.outputs.sdk_changed == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -471,6 +505,7 @@ jobs:
       BUILDBUDDY_HTTP_URL: ${{ needs.control-plane-up.outputs.http_url }}
       BUILDBUDDY_ENDPOINT: ${{ needs.control-plane-up.outputs.grpc_url }}
       CI_STARTED_AT_EPOCH: ${{ needs.control-plane-up.outputs.started_at_epoch }}
+      BUILDBUDDY_TLS_CA_B64: ${{ needs.control-plane-up.outputs.tls_ca_b64 }}
       MEERKAT_GCP_BUILDBUDDY_CI_MAX_SECONDS: "3000"
     steps:
       - name: Checkout
@@ -489,7 +524,7 @@ jobs:
   wasm-check-submit:
     name: WASM check submitter
     needs: [control-plane-up, executors-up, wasm-feature-changes]
-    if: ${{ needs.wasm-feature-changes.outputs.wasm_changed == 'true' }}
+    if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' && needs.wasm-feature-changes.outputs.wasm_changed == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -497,6 +532,7 @@ jobs:
       BUILDBUDDY_HTTP_URL: ${{ needs.control-plane-up.outputs.http_url }}
       BUILDBUDDY_ENDPOINT: ${{ needs.control-plane-up.outputs.grpc_url }}
       CI_STARTED_AT_EPOCH: ${{ needs.control-plane-up.outputs.started_at_epoch }}
+      BUILDBUDDY_TLS_CA_B64: ${{ needs.control-plane-up.outputs.tls_ca_b64 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -514,7 +550,7 @@ jobs:
   minimal-feature-submit:
     name: Minimal feature submitter
     needs: [control-plane-up, executors-up, wasm-feature-changes]
-    if: ${{ needs.wasm-feature-changes.outputs.minimal_changed == 'true' }}
+    if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' && needs.wasm-feature-changes.outputs.minimal_changed == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -522,6 +558,7 @@ jobs:
       BUILDBUDDY_HTTP_URL: ${{ needs.control-plane-up.outputs.http_url }}
       BUILDBUDDY_ENDPOINT: ${{ needs.control-plane-up.outputs.grpc_url }}
       CI_STARTED_AT_EPOCH: ${{ needs.control-plane-up.outputs.started_at_epoch }}
+      BUILDBUDDY_TLS_CA_B64: ${{ needs.control-plane-up.outputs.tls_ca_b64 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -539,7 +576,7 @@ jobs:
   feature-submit:
     name: Feature matrix submitter
     needs: [control-plane-up, executors-up, wasm-feature-changes]
-    if: ${{ needs.wasm-feature-changes.outputs.feature_changed == 'true' }}
+    if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' && needs.wasm-feature-changes.outputs.feature_changed == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -547,6 +584,7 @@ jobs:
       BUILDBUDDY_HTTP_URL: ${{ needs.control-plane-up.outputs.http_url }}
       BUILDBUDDY_ENDPOINT: ${{ needs.control-plane-up.outputs.grpc_url }}
       CI_STARTED_AT_EPOCH: ${{ needs.control-plane-up.outputs.started_at_epoch }}
+      BUILDBUDDY_TLS_CA_B64: ${{ needs.control-plane-up.outputs.tls_ca_b64 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -570,7 +608,7 @@ jobs:
   audit-submit:
     name: Security audit submitter
     needs: [control-plane-up, executors-up, wasm-feature-changes]
-    if: ${{ needs.wasm-feature-changes.outputs.audit_changed == 'true' }}
+    if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' && needs.wasm-feature-changes.outputs.audit_changed == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -578,6 +616,7 @@ jobs:
       BUILDBUDDY_HTTP_URL: ${{ needs.control-plane-up.outputs.http_url }}
       BUILDBUDDY_ENDPOINT: ${{ needs.control-plane-up.outputs.grpc_url }}
       CI_STARTED_AT_EPOCH: ${{ needs.control-plane-up.outputs.started_at_epoch }}
+      BUILDBUDDY_TLS_CA_B64: ${{ needs.control-plane-up.outputs.tls_ca_b64 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -651,6 +690,54 @@ jobs:
           MEERKAT_GCP_BUILDBUDDY_WAIT_TIMEOUT: ${{ vars.MEERKAT_GCP_BUILDBUDDY_WAIT_TIMEOUT || '900' }}
         run: scripts/gcp-buildbuddy-executor-pool down
 
+  # The control plane runs only while a run uses it; the data disk keeps the
+  # cache. Stopped last, after the executors are parked.
+  control-plane-down:
+    name: Control plane down
+    if: ${{ always() && vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}
+    needs: [control-plane-up, executors-down]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Authenticate to GCP with Workload Identity
+        if: ${{ vars.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER != '' && vars.MEERKAT_GCP_SERVICE_ACCOUNT != '' }}
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.MEERKAT_GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ env.MEERKAT_GCP_PROJECT_ID }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Authenticate to GCP with JSON fallback
+        shell: bash
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
+        run: |
+          if gcloud auth list --filter=status:ACTIVE --format='value(account)' | grep -q .; then
+            exit 0
+          fi
+          if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" ]]; then
+            echo "GCP auth is required for GCP BuildBuddy CI." >&2
+            exit 1
+          fi
+          key_file="${RUNNER_TEMP}/gcp-key.json"
+          printf '%s' "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" > "${key_file}"
+          gcloud auth activate-service-account --key-file "${key_file}"
+          rm -f "${key_file}"
+
+      - name: Stop the control plane
+        shell: bash
+        env:
+          MEERKAT_GCP_BUILDBUDDY_WAIT_ON_DOWN: ${{ vars.MEERKAT_GCP_BUILDBUDDY_WAIT_ON_DOWN || '0' }}
+        run: scripts/gcp-buildbuddy-control-plane stop
+
   gate:
     name: GCP BuildBuddy gate
     if: ${{ always() }}
@@ -669,6 +756,7 @@ jobs:
       - feature-submit
       - audit-submit
       - executors-down
+      - control-plane-down
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
