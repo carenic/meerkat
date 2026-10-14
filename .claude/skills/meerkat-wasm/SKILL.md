@@ -118,9 +118,12 @@ browser bootstrap uses the catalog default of the highest-priority configured
 provider (Anthropic, then OpenAI, then Gemini) and reports it as
 `InitResult.model`. The OpenAI and global catalog default is `gpt-6-astra`.
 Confirm the proxy's API organization has access; otherwise select `gpt-5.5`
-explicitly. Existing configured models are unchanged. Anthropic and Gemini
-examples should use the current `claude-opus-5-5` and `gemini-3.8-flash`
-defaults unless a test deliberately pins another model. WASM mob flows use the
+explicitly. Existing configured models are unchanged. Anthropic examples should
+use the current `claude-opus-5-5` default; Gemini examples should pin
+`gemini-3.8-flash`, which every Gemini API tier serves, because the Gemini
+default `gemini-4-argon` needs a paid tier (a Gemini-only bootstrap without an
+explicit `model` reports `gemini-4-argon` as `InitResult.model`). Keep these
+unless a test deliberately pins another model. WASM mob flows use the
 same current identity-first mob runtime, including helper/fork/respawn
 controls, run-fenced stop, and runtime-committed session projection behavior.
 
