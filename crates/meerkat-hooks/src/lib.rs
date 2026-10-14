@@ -740,6 +740,9 @@ pub struct DefaultHookEngine {
     /// Durable custody for command-hook processes, when the host supplies it.
     #[cfg(not(target_arch = "wasm32"))]
     process_custody: Option<Arc<dyn CommandHookProcessCustody>>,
+    /// Entries the host refuses at every invocation, with the typed launch
+    /// refusal each returns before its runtime is reached.
+    refused_entries: Arc<HashMap<HookId, meerkat_core::confinement::ConfinementRefusal>>,
 }
 
 impl DefaultHookEngine {
@@ -777,6 +780,7 @@ impl DefaultHookEngine {
             revision: Arc::new(AtomicU64::new(1)),
             #[cfg(not(target_arch = "wasm32"))]
             process_custody: None,
+            refused_entries: Arc::new(HashMap::new()),
         }
     }
 
@@ -823,6 +827,20 @@ impl DefaultHookEngine {
         custody: Arc<dyn CommandHookProcessCustody>,
     ) -> Self {
         self.process_custody = Some(custody);
+        self
+    }
+
+    /// Refuse every invocation of each listed entry, before its runtime is
+    /// reached, with its typed launch refusal. The entry keeps its slot: a
+    /// mandatory guardrail withholds what it gates instead of disappearing,
+    /// and an observer reports its refusal. A host lists the entries whose
+    /// definition comes from a source its confined processes can write.
+    #[must_use]
+    pub fn with_refused_entries(
+        mut self,
+        refused: impl IntoIterator<Item = (HookId, meerkat_core::confinement::ConfinementRefusal)>,
+    ) -> Self {
+        self.refused_entries = Arc::new(refused.into_iter().collect());
         self
     }
 
@@ -1007,6 +1025,12 @@ impl DefaultHookEngine {
         registration_index: usize,
         invocation: HookInvocation,
     ) -> Result<HookOutcome, HookEngineError> {
+        if let Some(refusal) = self.refused_entries.get(&entry.id) {
+            return Err(HookEngineError::LaunchRefused {
+                hook_id: entry.id.clone(),
+                reason: HookFailureReason::ConfinementRefused { refusal: *refusal },
+            });
+        }
         let start = meerkat_core::time_compat::Instant::now();
         let timeout_ms = self.policy.timeout_ms_for(&entry);
 

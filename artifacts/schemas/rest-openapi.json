@@ -8525,7 +8525,8 @@
           "invalid_launch",
           "unsupported_requirement",
           "backend_unavailable",
-          "preparation_failed"
+          "preparation_failed",
+          "untrusted_configuration_source"
         ],
         "type": "string"
       },

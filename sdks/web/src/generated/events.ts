@@ -217,7 +217,7 @@ export interface CompactionRewriteRange {
   start: number;
 }
 
-export type ConfinementRefusal = "invalid_requirement" | "invalid_launch" | "unsupported_requirement" | "backend_unavailable" | "preparation_failed";
+export type ConfinementRefusal = "invalid_requirement" | "invalid_launch" | "unsupported_requirement" | "backend_unavailable" | "preparation_failed" | "untrusted_configuration_source";
 
 export type ContentBlock = {
   text: string;

@@ -3482,7 +3482,7 @@ export type ToolConfigChangeOperation = "add" | "remove" | "reload";
 
 export type ExternalToolDeltaPhase = "pending" | "applied" | "draining" | "forced" | "failed";
 
-export type ConfinementRefusal = "invalid_requirement" | "invalid_launch" | "unsupported_requirement" | "backend_unavailable" | "preparation_failed";
+export type ConfinementRefusal = "invalid_requirement" | "invalid_launch" | "unsupported_requirement" | "backend_unavailable" | "preparation_failed" | "untrusted_configuration_source";
 
 export type McpAttachmentRestoreWireOutcome = "suppressed" | "retired" | "rebound" | "account_changed" | "denied" | "unavailable" | "not_current" | "review_required" | "mismatch" | "stage_failed" | "renewal_required";
 

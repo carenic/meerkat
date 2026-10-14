@@ -1402,6 +1402,10 @@ mod tests {
                 "backend_unavailable",
             ),
             (ConfinementRefusal::PreparationFailed, "preparation_failed"),
+            (
+                ConfinementRefusal::UntrustedConfigurationSource,
+                "untrusted_configuration_source",
+            ),
         ] {
             let tool = RefusingLocalTool(refusal);
             let call = ToolCallView {

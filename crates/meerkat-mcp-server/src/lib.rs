@@ -1515,7 +1515,20 @@ impl MeerkatMcpState {
             &config.confinement,
             conventions_context_root.as_deref(),
         )?;
-        host_confinement.log_startup();
+        // A start whose confined processes could change the realm state or
+        // the user config document is refused before it serves.
+        let host_inputs = meerkat::HostConfinement::host_inputs(
+            &realms_root,
+            layout.global_config_path().as_deref(),
+        );
+        host_confinement.admit_host_inputs(&host_inputs)?;
+        host_confinement.log_startup(
+            &host_inputs,
+            &meerkat::HostConfinement::convention_sources(
+                conventions_context_root.as_deref(),
+                bootstrap.context.user_config_root.as_deref(),
+            ),
+        );
         let mcp_stdio_launch_profile = host_mcp_stdio_launch_profile(&host_confinement);
 
         // Create factory with max-permissive flags; per-request overrides
@@ -7281,6 +7294,44 @@ mode = "custom"
 working_directory = "/"
 requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths = [] }, write = { kind = "paths", paths = [] }, deny_read = [], deny_write = [], network = { kind = "denied" }, unix_connect = [], require_descendant_termination = true }
 "#;
+
+    /// A start whose confined processes could change the realm state is
+    /// refused before the server serves, naming the input and its remedy.
+    #[tokio::test]
+    async fn test_startup_refuses_confinement_that_could_change_the_realm_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().canonicalize().expect("canonical temp");
+        let state = base.join("realms");
+        std::fs::create_dir_all(&state).expect("state root");
+        let user_root = base.join("user");
+        std::fs::create_dir_all(user_root.join(".rkat")).expect("user root");
+        std::fs::write(user_root.join(".rkat").join("config.toml"), format!(
+            "[confinement.all]\nmode = \"custom\"\nworking_directory = \"{state}\"\nrequirement = {{ baseline = \"command_runtime_v1\", read = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{state}\" }}] }}, write = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{state}\" }}] }}, deny_read = [], deny_write = [], network = {{ kind = \"denied\" }}, unix_connect = [], require_descendant_termination = false }}\n",
+            state = state.display()
+        ))
+        .expect("user document");
+        let mut bootstrap = RuntimeBootstrap::default();
+        bootstrap.realm.selection = RealmSelection::Explicit {
+            realm_id: "state-writer".into(),
+        };
+        bootstrap.realm.state_root = Some(state);
+        bootstrap.context.context_root = Some(base.clone());
+        bootstrap.context.user_config_root = Some(user_root);
+        let refused = MeerkatMcpState::new_with_bootstrap_options_and_llm(
+            bootstrap,
+            false,
+            Some(Arc::new(TestClient::for_provider(Provider::Anthropic))),
+            None,
+        )
+        .await
+        .err()
+        .expect("a confined process could change the realm state");
+        let message = refused.to_string();
+        assert!(
+            message.contains("the realm state") && message.contains("--state-root"),
+            "{message}"
+        );
+    }
 
     /// The server's one MCP stdio launch profile comes from the composed
     /// `[confinement]`: a requirement in the user document applies without a

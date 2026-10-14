@@ -4,11 +4,21 @@
 //! [`crate::AgentFactory`] with [`crate::AgentFactory::with_host_confinement`].
 //!
 //! Resolution lowers each launch kind's selection into the mechanical
-//! [`ExecutionConfinement`]; it authorizes nothing. A launch the platform
-//! backend cannot confine is refused at that launch with its typed
-//! [`ConfinementRefusal`] and never runs unconfined.
+//! [`ExecutionConfinement`], compiles each distinct requirement once for the
+//! host's report, and retains each kind's write authority. It authorizes
+//! nothing. A launch the platform backend cannot confine is refused at that
+//! launch with its typed [`ConfinementRefusal`] and never runs unconfined.
+//!
+//! A host that confines every launch kind also keeps the inputs it reads its
+//! own administration from out of its confined processes' reach: a start
+//! whose realm state or user config document a confined process could
+//! change is refused ([`HostConfinement::admit_host_inputs`]), and a
+//! convention source (an `mcp.toml` or a project `config.toml` with hooks)
+//! that one could change is not trusted ([`HostConfinement::untrusted_source`]).
+//! A host that runs any launch kind as the trusted host claims none of this
+//! ([`HostAuthority::Withdrawn`]).
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use meerkat_core::confinement::{
     ConfinementRefusal, ConfinementSpec, ExecutionConfinement, FilesystemAccess, IpNetworkAccess,
@@ -18,10 +28,12 @@ use meerkat_core::{
     ConfinementConfig, ConfinementLaunchKind, LaunchConfinement, WorkspaceConfinement,
     WorkspaceNetwork,
 };
+use meerkat_sandbox::ConfinementBackend;
 
-/// A host confinement selection that cannot be installed. The host refuses
-/// to start rather than run a launch kind it was asked to confine as the
-/// trusted host.
+/// A host confinement selection that cannot be installed, or a start whose
+/// own administration inputs it cannot protect. The host refuses to start
+/// rather than run a launch kind it was asked to confine as the trusted
+/// host, or serve from inputs a confined process could change.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum HostConfinementError {
@@ -45,15 +57,305 @@ pub enum HostConfinementError {
         kind: ConfinementLaunchKind,
         refusal: ConfinementRefusal,
     },
+    /// A confined process of `kind` could change `input`, which the host
+    /// reads its own administration from (its confinement, governance,
+    /// bindings and the servers and hooks it runs).
+    #[error(
+        "{kind} confinement lets a confined process change {input} at '{}'; {}",
+        path.display(),
+        input.remedy()
+    )]
+    AdministrationInputWritable {
+        input: HostInput,
+        path: PathBuf,
+        kind: ConfinementLaunchKind,
+    },
 }
 
-/// One required launch kind: its requirement and the working directory of
-/// the processes that launch from a fixed directory (command hooks and MCP
-/// stdio servers; the shell keeps its own).
+/// An input a stock host reads its own administration from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HostInput {
+    /// The realm state root: every realm config document of the host (its
+    /// head realm's and its ancestors') and the head realm's stores.
+    RealmState,
+    /// The user config document (`<user config root>/.rkat/config.toml`),
+    /// the reserved global realm's document.
+    UserDocument,
+}
+
+impl HostInput {
+    /// What the operator does about an input a confined process could change.
+    #[must_use]
+    pub const fn remedy(self) -> &'static str {
+        match self {
+            Self::RealmState => {
+                "start the host with --state-root <dir> outside every confinement write grant"
+            }
+            Self::UserDocument => {
+                "keep the user config root outside every confinement write grant, or start the host with --user-config-root <dir> outside them"
+            }
+        }
+    }
+
+    /// Whether the host reads the whole subtree under the input's path.
+    const fn is_subtree(self) -> bool {
+        matches!(self, Self::RealmState)
+    }
+}
+
+impl std::fmt::Display for HostInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::RealmState => "the realm state",
+            Self::UserDocument => "the user config document",
+        })
+    }
+}
+
+/// What a host's confinement guarantees about the inputs it reads its own
+/// administration from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostAuthority {
+    /// No launch kind is confined: the host runs exactly as an unconfined
+    /// host does.
+    NotConfined,
+    /// These launch kinds run as the trusted host, so a process the agent
+    /// drives can still change every input: no guarantee is claimed.
+    Withdrawn {
+        trusted_host: Vec<ConfinementLaunchKind>,
+    },
+    /// Every launch kind is confined: an administration input a confined
+    /// process could change refuses the start, and a convention source one
+    /// could change is not trusted.
+    Guarded,
+}
+
+/// One line of a host's startup report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostConfinementNotice {
+    /// Whether the operator should act on it.
+    pub warning: bool,
+    pub text: String,
+}
+
+/// One granted or protected path of a write requirement, resolved to where
+/// it actually lives (its existing ancestors canonical).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WritePath {
+    path: PathBuf,
+    subtree: bool,
+}
+
+impl WritePath {
+    fn from_access(access: &PathAccess) -> Self {
+        Self {
+            path: resolve_existing(access.path()),
+            subtree: matches!(access, PathAccess::Subtree(_)),
+        }
+    }
+
+    fn covers(&self, path: &Path) -> bool {
+        if self.subtree {
+            path.starts_with(&self.path)
+        } else {
+            path == self.path
+        }
+    }
+}
+
+/// One confined launch kind's write authority, as its requirement states
+/// it: what its processes may write, and what they are kept from writing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KindWrites {
+    everything: bool,
+    grants: Vec<WritePath>,
+    protected: Vec<WritePath>,
+}
+
+impl KindWrites {
+    fn from_requirement(requirement: &ExecutionConfinement) -> Self {
+        let spec = requirement.specification();
+        let (everything, grants) = match &spec.write {
+            FilesystemAccess::Unrestricted => (true, Vec::new()),
+            FilesystemAccess::Paths(paths) => {
+                (false, paths.iter().map(WritePath::from_access).collect())
+            }
+        };
+        Self {
+            everything,
+            grants,
+            protected: spec.deny_write.iter().map(WritePath::from_access).collect(),
+        }
+    }
+
+    /// Whether a process of this kind may create, change, remove or rename
+    /// the directory entry at `path`.
+    fn writes(&self, path: &Path) -> bool {
+        (self.everything || self.grants.iter().any(|grant| grant.covers(path)))
+            && !self
+                .protected
+                .iter()
+                .any(|protection| protection.covers(path))
+    }
+
+    /// Whether a process of this kind may write anywhere outside
+    /// `directory`, where a directory it can rename could be moved to.
+    fn writes_outside(&self, directory: &Path) -> bool {
+        self.everything
+            || self
+                .grants
+                .iter()
+                .any(|grant| !grant.path.starts_with(directory))
+    }
+
+    /// Whether a process of this kind may write anywhere inside `directory`.
+    fn writes_inside(&self, directory: &Path) -> bool {
+        (self.everything && self.writes(directory))
+            || self.grants.iter().any(|grant| {
+                grant.path.starts_with(directory)
+                    && !self
+                        .protected
+                        .iter()
+                        .any(|protection| protection.covers(&grant.path))
+            })
+    }
+
+    /// Whether a process of this kind could change what the host reads at
+    /// `path` (`subtree`: everything under it): write the object itself,
+    /// create it where it is missing, or replace a directory entry on the
+    /// route the host's open follows. Each entry is judged where it
+    /// actually lives, and a symbolic link is followed to the rest of its
+    /// route; an entry this kind cannot create ends the route, since nothing
+    /// below a missing entry exists until it does.
+    fn controls(&self, path: &Path, subtree: bool) -> bool {
+        let absolute;
+        let path: &Path = if path.is_absolute() {
+            path
+        } else {
+            absolute = std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf());
+            &absolute
+        };
+        let normal: Vec<&std::ffi::OsStr> = path
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => Some(name),
+                _ => None,
+            })
+            .collect();
+        if path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+        {
+            // A route with `.` or `..` is judged at its resolved location.
+            return self.controls_resolved(&resolve_existing(path), subtree);
+        }
+        let mut parent = path
+            .ancestors()
+            .last()
+            .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+        for (index, name) in normal.iter().enumerate() {
+            let entry = parent.join(name);
+            let last = index + 1 == normal.len();
+            let Ok(metadata) = std::fs::symlink_metadata(&entry) else {
+                return self.writes(&entry);
+            };
+            if metadata.file_type().is_symlink() {
+                if self.writes(&entry) {
+                    return true;
+                }
+                // A link whose target cannot be resolved is unresolved
+                // ancestry: judged conservatively.
+                let Ok(target) = std::fs::canonicalize(&entry) else {
+                    return true;
+                };
+                if self.controls_canonical_route(&target, last) {
+                    return true;
+                }
+                parent = target;
+                continue;
+            }
+            if self.writes(&entry) && (last || self.writes_outside(&entry)) {
+                return true;
+            }
+            parent = entry;
+        }
+        subtree && self.writes_inside(&parent)
+    }
+
+    /// [`Self::controls`] for a route already resolved to where it lives.
+    fn controls_resolved(&self, path: &Path, subtree: bool) -> bool {
+        if self.controls_canonical_route(path, true) {
+            return true;
+        }
+        subtree && self.writes_inside(path)
+    }
+
+    /// Whether an entry on a route without symbolic links could be changed:
+    /// any directory on it this kind could rename away, or the final object
+    /// itself when `object` is set.
+    fn controls_canonical_route(&self, route: &Path, object: bool) -> bool {
+        let mut prefix = PathBuf::new();
+        for component in route.components() {
+            prefix.push(component);
+            if !matches!(component, Component::Normal(_)) {
+                continue;
+            }
+            let last = prefix.as_path() == route;
+            if !self.writes(&prefix) {
+                continue;
+            }
+            if (last && object) || self.writes_outside(&prefix) {
+                return true;
+            }
+            if std::fs::symlink_metadata(&prefix).is_err() {
+                // Missing and creatable.
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// `path` through its longest existing ancestor's canonical form, with the
+/// missing rest appended.
+fn resolve_existing(path: &Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(&existing) {
+            return missing.iter().rev().fold(canonical, |mut resolved, name| {
+                resolved.push(name);
+                resolved
+            });
+        }
+        match (
+            existing.file_name().map(ToOwned::to_owned),
+            existing.parent(),
+        ) {
+            (Some(name), Some(parent)) => {
+                missing.push(name);
+                existing = parent.to_path_buf();
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// One required launch kind: its requirement, the working directory of the
+/// processes that launch from a fixed directory (command hooks and MCP
+/// stdio servers; the shell keeps its own), the mode its selection
+/// requested, what this platform's backend made of it at resolution, and
+/// its write authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RequiredLaunch {
     requirement: ExecutionConfinement,
     working_directory: PathBuf,
+    requested: &'static str,
+    backend: Result<ConfinementBackend, ConfinementRefusal>,
+    writes: KindWrites,
 }
 
 /// The host's resolved OS process confinement, per launch kind. A kind
@@ -76,23 +378,48 @@ impl HostConfinement {
     /// flags applied) over `workspace_root`, the host's workspace: the shell's
     /// project root, which the `workspace` preset grants and command hooks and
     /// MCP stdio servers start in. A host without one refuses that preset.
+    /// Each distinct requirement is compiled once, for the host's report.
     pub fn resolve(
         selection: &ConfinementConfig,
         workspace_root: Option<&Path>,
     ) -> Result<Self, HostConfinementError> {
         let mut resolved = Self::default();
+        let mut compiled: Vec<(
+            ExecutionConfinement,
+            Result<ConfinementBackend, ConfinementRefusal>,
+        )> = Vec::new();
         for kind in ConfinementLaunchKind::ALL {
             let launch = match selection.statement(kind) {
                 None | Some(LaunchConfinement::TrustedHost) => None,
-                Some(LaunchConfinement::Workspace(workspace)) => {
-                    Some(lower_workspace(kind, workspace, workspace_root)?)
-                }
-                Some(LaunchConfinement::Custom(custom)) => Some(RequiredLaunch {
-                    requirement: custom.requirement.clone(),
-                    working_directory: custom.working_directory.clone(),
-                }),
+                Some(LaunchConfinement::Workspace(workspace)) => Some((
+                    "workspace",
+                    lower_workspace(kind, workspace, workspace_root)?,
+                )),
+                Some(LaunchConfinement::Custom(custom)) => Some((
+                    "custom",
+                    (custom.requirement.clone(), custom.working_directory.clone()),
+                )),
             };
-            *resolved.slot_mut(kind) = launch;
+            *resolved.slot_mut(kind) =
+                launch.map(|(requested, (requirement, working_directory))| {
+                    let backend = match compiled.iter().find(|(seen, _)| *seen == requirement) {
+                        Some((_, backend)) => *backend,
+                        None => {
+                            let backend =
+                                meerkat_sandbox::CompiledConfinement::compile(&requirement)
+                                    .map(|compiled| compiled.capabilities().backend());
+                            compiled.push((requirement.clone(), backend));
+                            backend
+                        }
+                    };
+                    RequiredLaunch {
+                        writes: KindWrites::from_requirement(&requirement),
+                        requirement,
+                        working_directory,
+                        requested,
+                        backend,
+                    }
+                });
         }
         Ok(resolved)
     }
@@ -133,48 +460,218 @@ impl HostConfinement {
             .map(|launch| launch.working_directory.as_path())
     }
 
-    /// Check now whether this platform's backend can enforce each required
-    /// launch kind, compiling each distinct requirement once. This is setup
-    /// support only, for the host's startup report: each launch is still
-    /// checked and refused on its own, and a refusal here changes nothing.
+    /// Each required launch kind this platform's backend cannot enforce, as
+    /// compiled once at resolution. This is setup support only, for the
+    /// host's startup report: each launch is still checked and refused on its
+    /// own, and a refusal here changes nothing.
     #[must_use]
     pub fn preflight(&self) -> Vec<(ConfinementLaunchKind, ConfinementRefusal)> {
-        let mut compiled: Vec<(&ExecutionConfinement, Option<ConfinementRefusal>)> = Vec::new();
-        let mut refusals = Vec::new();
-        for kind in ConfinementLaunchKind::ALL {
-            let Some(requirement) = self.requirement(kind) else {
-                continue;
-            };
-            let refusal = match compiled.iter().find(|(seen, _)| *seen == requirement) {
-                Some((_, refusal)) => *refusal,
-                None => {
-                    let refusal = meerkat_sandbox::CompiledConfinement::compile(requirement).err();
-                    compiled.push((requirement, refusal));
-                    refusal
-                }
-            };
-            if let Some(refusal) = refusal {
-                refusals.push((kind, refusal));
-            }
-        }
-        refusals
+        ConfinementLaunchKind::ALL
+            .into_iter()
+            .filter_map(|kind| {
+                let refusal = self.slot(kind)?.backend.err()?;
+                Some((kind, refusal))
+            })
+            .collect()
     }
 
-    /// Report this host's confinement at startup in its log: each launch
-    /// kind's mode, and a warning for each required kind this platform's
-    /// backend refuses, whose every launch is then refused.
-    pub fn log_startup(&self) {
-        if self.is_trusted_host() {
-            return;
+    /// What this host's confinement guarantees about its own inputs.
+    #[must_use]
+    pub fn authority(&self) -> HostAuthority {
+        let trusted_host: Vec<ConfinementLaunchKind> = ConfinementLaunchKind::ALL
+            .into_iter()
+            .filter(|kind| self.slot(*kind).is_none())
+            .collect();
+        if trusted_host.len() == ConfinementLaunchKind::ALL.len() {
+            HostAuthority::NotConfined
+        } else if trusted_host.is_empty() {
+            HostAuthority::Guarded
+        } else {
+            HostAuthority::Withdrawn { trusted_host }
         }
-        tracing::info!(confinement = %self, "OS process confinement installed");
-        for (kind, refusal) in self.preflight() {
-            tracing::warn!(
-                %kind,
-                %refusal,
-                "confinement cannot be enforced on this host; every launch of this kind will be refused"
-            );
+    }
+
+    /// The first confined launch kind whose processes could change what the
+    /// host reads at `path` (`subtree`: anything under it), when the host
+    /// claims the guarantee ([`HostAuthority::Guarded`]); `None` otherwise.
+    /// A kind writes what any of its grants allows and no protection of its
+    /// own denies, whatever other kinds protect.
+    #[must_use]
+    pub fn writer_of(&self, path: &Path, subtree: bool) -> Option<ConfinementLaunchKind> {
+        if self.authority() != HostAuthority::Guarded {
+            return None;
         }
+        ConfinementLaunchKind::ALL.into_iter().find(|kind| {
+            self.slot(*kind)
+                .is_some_and(|launch| launch.writes.controls(path, subtree))
+        })
+    }
+
+    /// Whether the convention source at `path` (an `mcp.toml`, or a project
+    /// `config.toml` with hooks) is untrusted: the host claims the guarantee
+    /// and a confined process could change it. Its MCP servers and hooks are
+    /// then refused before anything in them is expanded, resolved,
+    /// connected or launched.
+    #[must_use]
+    pub fn untrusted_source(&self, path: &Path) -> bool {
+        self.writer_of(path, false).is_some()
+    }
+
+    /// Refuse a new start whose administration inputs a confined process
+    /// could change, naming the input, its path and the kind. A host that
+    /// claims no guarantee admits every input.
+    pub fn admit_host_inputs(
+        &self,
+        inputs: &[(HostInput, PathBuf)],
+    ) -> Result<(), HostConfinementError> {
+        for (input, path) in inputs {
+            if let Some(kind) = self.writer_of(path, input.is_subtree()) {
+                return Err(HostConfinementError::AdministrationInputWritable {
+                    input: *input,
+                    path: path.clone(),
+                    kind,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The host's startup report: each launch kind's requested and effective
+    /// confinement, what keeps the host's own inputs from its confined
+    /// processes (or that nothing does), and each convention source it does
+    /// not trust. Empty for a host that confines nothing.
+    #[must_use]
+    pub fn startup_report(
+        &self,
+        inputs: &[(HostInput, PathBuf)],
+        convention_sources: &[PathBuf],
+    ) -> Vec<HostConfinementNotice> {
+        let authority = self.authority();
+        if authority == HostAuthority::NotConfined {
+            return Vec::new();
+        }
+        let mut notices = Vec::new();
+        for kind in ConfinementLaunchKind::ALL {
+            let (warning, effective) = match self.slot(kind) {
+                None => (false, "trusted host".to_owned()),
+                Some(launch) => match launch.backend {
+                    Ok(backend) => (
+                        false,
+                        format!(
+                            "requested {}, enforced by {}",
+                            launch.requested,
+                            backend_name(backend)
+                        ),
+                    ),
+                    Err(refusal) => (
+                        true,
+                        format!(
+                            "requested {}, cannot be enforced on this host ({refusal}): every launch of this kind is refused",
+                            launch.requested
+                        ),
+                    ),
+                },
+            };
+            notices.push(HostConfinementNotice {
+                warning,
+                text: format!("{kind} confinement: {effective}"),
+            });
+        }
+        match authority {
+            HostAuthority::Withdrawn { trusted_host } => notices.push(HostConfinementNotice {
+                warning: true,
+                text: format!(
+                    "no guarantee for the host's own inputs: {} {} as the trusted host, so a process the agent drives can still change them",
+                    trusted_host
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if trusted_host.len() == 1 { "runs" } else { "run" }
+                ),
+            }),
+            HostAuthority::Guarded => {
+                if !inputs.is_empty() {
+                    notices.push(HostConfinementNotice {
+                        warning: false,
+                        text: format!(
+                            "kept from every confined process: {}",
+                            inputs
+                                .iter()
+                                .map(|(input, path)| format!("{input} at '{}'", path.display()))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    });
+                }
+                for source in convention_sources {
+                    if self.untrusted_source(source) {
+                        notices.push(HostConfinementNotice {
+                            warning: true,
+                            text: format!(
+                                "untrusted configuration source '{}': a confined process can write it, so its MCP servers and hooks are refused",
+                                source.display()
+                            ),
+                        });
+                    }
+                }
+            }
+            HostAuthority::NotConfined => {}
+        }
+        notices
+    }
+
+    /// The administration inputs of a host whose realm state lives under
+    /// `state_root` and whose user config document is `user_document`.
+    #[must_use]
+    pub fn host_inputs(
+        state_root: &Path,
+        user_document: Option<&Path>,
+    ) -> Vec<(HostInput, PathBuf)> {
+        let mut inputs = vec![(HostInput::RealmState, state_root.to_path_buf())];
+        if let Some(document) = user_document {
+            inputs.push((HostInput::UserDocument, document.to_path_buf()));
+        }
+        inputs
+    }
+
+    /// The convention sources a host reads servers or hooks from: the
+    /// project and user `mcp.toml` files, and the project `config.toml`
+    /// whose hooks are layered in (the user `config.toml` is the user config
+    /// document, an administration input).
+    #[must_use]
+    pub fn convention_sources(
+        context_root: Option<&Path>,
+        user_config_root: Option<&Path>,
+    ) -> Vec<PathBuf> {
+        let mut sources = Vec::new();
+        if let Some(context) = context_root {
+            sources.push(context.join(".rkat").join("mcp.toml"));
+            sources.push(context.join(".rkat").join("config.toml"));
+        }
+        if let Some(user) = user_config_root {
+            sources.push(user.join(".rkat").join("mcp.toml"));
+        }
+        sources
+    }
+
+    /// Log [`Self::startup_report`] in the host's log.
+    pub fn log_startup(&self, inputs: &[(HostInput, PathBuf)], convention_sources: &[PathBuf]) {
+        for notice in self.startup_report(inputs, convention_sources) {
+            if notice.warning {
+                tracing::warn!("{}", notice.text);
+            } else {
+                tracing::info!("{}", notice.text);
+            }
+        }
+    }
+}
+
+fn backend_name(backend: ConfinementBackend) -> &'static str {
+    match backend {
+        ConfinementBackend::MacOsSeatbeltV1 => "macos_seatbelt_v1",
+        ConfinementBackend::LinuxNamespaceSeccompV1 => "linux_namespace_seccomp_v1",
+        _ => "the platform backend",
     }
 }
 
@@ -201,12 +698,16 @@ impl std::fmt::Display for HostConfinement {
 /// sockets only when the network is unrestricted. A subtree that another
 /// grant of the same or a stronger class already covers (the root, a
 /// writable subtree, or a listed subtree containing it) is not granted
-/// again, so the preset adds no nested grant of its own.
+/// again, so the preset adds no nested grant of its own. On macOS the
+/// project's Meerkat inputs (`<root>/.rkat`: the CLI's default realm state,
+/// its config documents and convention files) are protected from writes;
+/// the Linux backend has no deny lists, so there the host's own state must
+/// live outside the workspace.
 fn lower_workspace(
     kind: ConfinementLaunchKind,
     workspace: &WorkspaceConfinement,
     root: Option<&Path>,
-) -> Result<RequiredLaunch, HostConfinementError> {
+) -> Result<(ExecutionConfinement, PathBuf), HostConfinementError> {
     let root = root.ok_or(HostConfinementError::WorkspaceRootRequired { kind })?;
     if !root.is_absolute() {
         return Err(HostConfinementError::RelativeWorkspaceRoot {
@@ -231,7 +732,7 @@ fn lower_workspace(
         read: FilesystemAccess::Paths(subtrees(readable)),
         write: FilesystemAccess::Paths(subtrees(writable)),
         deny_read: Vec::new(),
-        deny_write: Vec::new(),
+        deny_write: workspace_protections(root),
         network: match workspace.network {
             WorkspaceNetwork::Denied => IpNetworkAccess::Denied,
             WorkspaceNetwork::Unrestricted => IpNetworkAccess::Unrestricted,
@@ -241,10 +742,19 @@ fn lower_workspace(
     }
     .try_into()
     .map_err(|refusal| HostConfinementError::InvalidRequirement { kind, refusal })?;
-    Ok(RequiredLaunch {
-        requirement,
-        working_directory: root.to_path_buf(),
-    })
+    Ok((requirement, root.to_path_buf()))
+}
+
+/// The paths the workspace preset keeps confined processes from writing.
+#[cfg(target_os = "macos")]
+fn workspace_protections(root: &Path) -> Vec<PathAccess> {
+    vec![PathAccess::Subtree(root.join(".rkat"))]
+}
+
+/// The paths the workspace preset keeps confined processes from writing.
+#[cfg(not(target_os = "macos"))]
+fn workspace_protections(_root: &Path) -> Vec<PathAccess> {
+    Vec::new()
 }
 
 /// `paths` once each, without a path that another listed path contains, in
@@ -279,7 +789,7 @@ mod tests {
             read: FilesystemAccess::Paths(subtrees(read)),
             write: FilesystemAccess::Paths(subtrees(write)),
             deny_read: vec![],
-            deny_write: vec![],
+            deny_write: workspace_protections(Path::new("/work")),
             network,
             unix_connect: vec![],
             require_descendant_termination: false,
@@ -444,5 +954,271 @@ mod tests {
                 .map(|kind| (kind, ConfinementRefusal::UnsupportedRequirement))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// A custom selection working in `root` whose requirement reads and
+    /// writes the `write` subtrees and protects the `protect` subtrees.
+    fn custom(root: &Path, write: &[&Path], protect: &[&Path]) -> LaunchConfinement {
+        let subtrees = |paths: &[&Path]| {
+            paths
+                .iter()
+                .map(|path| PathAccess::Subtree(path.to_path_buf()))
+                .collect::<Vec<_>>()
+        };
+        LaunchConfinement::Custom(CustomConfinement {
+            working_directory: root.to_path_buf(),
+            requirement: ConfinementSpec {
+                baseline: PlatformBaseline::CommandRuntimeV1,
+                read: FilesystemAccess::Paths(subtrees(write)),
+                write: FilesystemAccess::Paths(subtrees(write)),
+                deny_read: vec![],
+                deny_write: subtrees(protect),
+                network: IpNetworkAccess::Denied,
+                unix_connect: vec![],
+                require_descendant_termination: false,
+            }
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    /// A temporary tree: `work` (a workspace with `.rkat/realms`), and the
+    /// empty `state`, `home` and `scratch` directories.
+    fn tree() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        for directory in ["work/.rkat/realms", "state", "home", "scratch"] {
+            std::fs::create_dir_all(base.join(directory)).unwrap();
+        }
+        (temp, base)
+    }
+
+    fn confined(selection: &ConfinementConfig) -> HostConfinement {
+        HostConfinement::resolve(selection, None).unwrap()
+    }
+
+    /// Where nothing protects it, a realm state root inside a write grant
+    /// refuses the start, naming the input and its remedy (the Linux
+    /// workspace preset: there the host's state lives outside the
+    /// workspace). State outside every grant is admitted.
+    #[test]
+    fn a_writable_realm_state_refuses_the_start() {
+        let (_temp, base) = tree();
+        let work = base.join("work");
+        let host = confined(&ConfinementConfig::for_all(custom(&work, &[&work], &[])));
+        assert_eq!(host.authority(), HostAuthority::Guarded);
+        let state = work.join(".rkat").join("realms");
+        let refused = host
+            .admit_host_inputs(&HostConfinement::host_inputs(&state, None))
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            HostConfinementError::AdministrationInputWritable {
+                input: HostInput::RealmState,
+                path: state,
+                kind: ConfinementLaunchKind::Shell,
+            }
+        );
+        assert!(refused.to_string().contains("--state-root"), "{refused}");
+        assert!(
+            host.admit_host_inputs(&HostConfinement::host_inputs(&base.join("state"), None))
+                .is_ok()
+        );
+    }
+
+    /// A user config document that does not exist is judged by whether a
+    /// confined process could create it: outside every grant it is
+    /// admitted, under one the start is refused naming the document.
+    #[test]
+    fn a_missing_user_document_is_refused_only_where_it_could_be_created() {
+        let (_temp, base) = tree();
+        let work = base.join("work");
+        let home = base.join("home");
+        let state = base.join("state");
+        let document = home.join(".rkat").join("config.toml");
+        let host = confined(&ConfinementConfig::for_all(custom(&work, &[&work], &[])));
+        assert!(
+            host.admit_host_inputs(&HostConfinement::host_inputs(&state, Some(&document)))
+                .is_ok()
+        );
+
+        let home_writer = confined(&ConfinementConfig::for_all(custom(
+            &work,
+            &[&work, &home],
+            &[],
+        )));
+        let refused = home_writer
+            .admit_host_inputs(&HostConfinement::host_inputs(&state, Some(&document)))
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            HostConfinementError::AdministrationInputWritable {
+                input: HostInput::UserDocument,
+                path: document,
+                kind: ConfinementLaunchKind::Shell,
+            }
+        );
+        let message = refused.to_string();
+        assert!(
+            message.contains("--user-config-root") && !message.contains("--state-root"),
+            "{message}"
+        );
+    }
+
+    /// A protected subtree is kept from a kind that writes around it, unless
+    /// that kind could move the directory holding it away: a write grant
+    /// elsewhere gives it somewhere to move it to.
+    #[test]
+    fn a_protected_subtree_holds_unless_its_parent_can_be_moved_away() {
+        let (_temp, base) = tree();
+        let work = base.join("work");
+        let rkat = work.join(".rkat");
+        let state = rkat.join("realms");
+        let protected = confined(&ConfinementConfig::for_all(custom(
+            &work,
+            &[&work],
+            &[&rkat],
+        )));
+        assert!(
+            protected
+                .admit_host_inputs(&HostConfinement::host_inputs(&state, None))
+                .is_ok()
+        );
+        assert!(!protected.untrusted_source(&rkat.join("mcp.toml")));
+
+        let scratch = base.join("scratch");
+        let movable = confined(&ConfinementConfig::for_all(custom(
+            &work,
+            &[&work, &scratch],
+            &[&rkat],
+        )));
+        assert_eq!(
+            movable.writer_of(&state, true),
+            Some(ConfinementLaunchKind::Shell)
+        );
+        assert!(movable.untrusted_source(&rkat.join("mcp.toml")));
+    }
+
+    /// Writability is per kind: one kind's protection does not cover another
+    /// kind that writes the same place without it.
+    #[test]
+    fn one_kind_without_the_protection_is_enough_to_refuse() {
+        let (_temp, base) = tree();
+        let work = base.join("work");
+        let rkat = work.join(".rkat");
+        let selection = ConfinementConfig {
+            all: Some(custom(&work, &[&work], &[&rkat])),
+            mcp_stdio: Some(custom(&work, &[&work], &[])),
+            ..ConfinementConfig::default()
+        };
+        let state = rkat.join("realms");
+        assert_eq!(
+            confined(&selection).admit_host_inputs(&HostConfinement::host_inputs(&state, None)),
+            Err(HostConfinementError::AdministrationInputWritable {
+                input: HostInput::RealmState,
+                path: state,
+                kind: ConfinementLaunchKind::McpStdio,
+            })
+        );
+    }
+
+    /// The route the host's open follows is judged where each entry lives: a
+    /// state root reached through a link into a write grant is writable, and
+    /// so is any route through a link a confined process could replace.
+    #[cfg(unix)]
+    #[test]
+    fn a_route_through_links_is_judged_where_it_lives() {
+        let (_temp, base) = tree();
+        let work = base.join("work");
+        let host = confined(&ConfinementConfig::for_all(custom(&work, &[&work], &[])));
+        std::os::unix::fs::symlink(work.join(".rkat"), base.join("into-work")).unwrap();
+        assert!(
+            host.writer_of(&base.join("into-work").join("realms"), true)
+                .is_some()
+        );
+        std::os::unix::fs::symlink(base.join("state"), work.join("to-state")).unwrap();
+        assert!(host.writer_of(&work.join("to-state"), true).is_some());
+        assert_eq!(host.writer_of(&base.join("state"), true), None);
+    }
+
+    /// A host that runs any kind as the trusted host claims no guarantee: it
+    /// admits every input, trusts every source, and reports that it claims
+    /// none. A host that confines nothing reports nothing.
+    #[test]
+    fn partial_confinement_withdraws_the_guarantee() {
+        let (_temp, base) = tree();
+        let work = base.join("work");
+        let host = confined(&ConfinementConfig {
+            mcp_stdio: Some(custom(&work, &[&work], &[])),
+            ..ConfinementConfig::default()
+        });
+        assert_eq!(
+            host.authority(),
+            HostAuthority::Withdrawn {
+                trusted_host: vec![
+                    ConfinementLaunchKind::Shell,
+                    ConfinementLaunchKind::CommandHooks
+                ]
+            }
+        );
+        let inputs = HostConfinement::host_inputs(&work.join(".rkat").join("realms"), None);
+        assert!(host.admit_host_inputs(&inputs).is_ok());
+        assert!(!host.untrusted_source(&work.join(".rkat").join("mcp.toml")));
+        let report = host.startup_report(
+            &inputs,
+            &HostConfinement::convention_sources(Some(&work), None),
+        );
+        assert!(
+            report.iter().any(|notice| notice.warning
+                && notice.text.contains("no guarantee")
+                && notice.text.contains("shell, command_hooks")),
+            "{report:?}"
+        );
+        assert!(
+            HostConfinement::trusted_host()
+                .startup_report(&inputs, &[])
+                .is_empty()
+        );
+    }
+
+    /// The startup report names each kind's requested and effective
+    /// confinement, the inputs kept from confined processes, and each
+    /// convention source it does not trust.
+    #[test]
+    fn the_report_names_kinds_inputs_and_untrusted_sources() {
+        let (_temp, base) = tree();
+        let work = base.join("work");
+        let home = base.join("home");
+        let host = confined(&ConfinementConfig::for_all(custom(&work, &[&work], &[])));
+        let inputs = HostConfinement::host_inputs(&base.join("state"), None);
+        let sources = HostConfinement::convention_sources(Some(&work), Some(&home));
+        let report = host.startup_report(&inputs, &sources);
+        let texts: Vec<&str> = report.iter().map(|notice| notice.text.as_str()).collect();
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.starts_with("shell confinement: requested custom")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(
+                |text| text.starts_with("kept from every confined process: the realm state at")
+            ),
+            "{texts:?}"
+        );
+        for source in [
+            work.join(".rkat").join("mcp.toml"),
+            work.join(".rkat").join("config.toml"),
+        ] {
+            assert!(host.untrusted_source(&source), "{}", source.display());
+            assert!(
+                report
+                    .iter()
+                    .any(|notice| notice.warning
+                        && notice.text.contains(&source.display().to_string())),
+                "{texts:?}"
+            );
+        }
+        assert!(!host.untrusted_source(&home.join(".rkat").join("mcp.toml")));
     }
 }

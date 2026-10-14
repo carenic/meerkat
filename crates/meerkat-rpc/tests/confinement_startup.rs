@@ -30,8 +30,8 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
 
 /// The startup report of an installed requirement, and its warning for a
 /// launch kind this host cannot confine.
-const INSTALLED_REPORT: &str = "OS process confinement installed";
-const UNENFORCEABLE_REPORT: &str = "confinement cannot be enforced on this host";
+const INSTALLED_REPORT: &str = "confinement: requested custom";
+const UNENFORCEABLE_REPORT: &str = "cannot be enforced on this host";
 
 /// Last-resort bound for a server that neither exits nor answers, as in
 /// `realm_config_ingress.rs`: well above the observed startup latency under
@@ -172,6 +172,54 @@ fn workspace_confinement_without_a_context_root_refuses_rkat_rpc_startup() {
     assert!(
         run.stderr.contains("--context-root"),
         "the refusal names its remedy; stderr:\n{}",
+        run.stderr
+    );
+}
+
+/// A start whose confined processes could change the realm state is refused
+/// before the server serves, naming the input and its remedy.
+#[test]
+fn confinement_that_could_change_the_realm_state_refuses_rkat_rpc_startup() {
+    let Some(binary) = rkat_rpc_binary() else {
+        eprintln!(
+            "skipping: rkat-rpc binary not advertised (CARGO_BIN_EXE_rkat-rpc unset or missing)"
+        );
+        return;
+    };
+    let temp = TempDir::new().expect("temp dir");
+    let base = temp.path().canonicalize().expect("canonical temp");
+    let project = base.join("project");
+    let state = base.join("state");
+    let user_root = base.join("user");
+    std::fs::create_dir_all(&project).expect("project root should initialize");
+    std::fs::create_dir_all(&state).expect("state root should initialize");
+    std::fs::create_dir_all(user_root.join(".rkat")).expect("user root should initialize");
+    std::fs::write(
+        user_root.join(".rkat").join("config.toml"),
+        format!(
+            "[confinement.all]\nmode = \"custom\"\nworking_directory = \"{state}\"\nrequirement = {{ baseline = \"command_runtime_v1\", read = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{state}\" }}] }}, write = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{state}\" }}] }}, deny_read = [], deny_write = [], network = {{ kind = \"denied\" }}, unix_connect = [], require_descendant_termination = false }}\n",
+            state = state.display()
+        ),
+    )
+    .expect("user document should be written");
+
+    let mut args = scope_args("rpc-confinement-state-writer", &state, &user_root);
+    args.extend([
+        "--context-root",
+        project.to_str().expect("utf-8 project root"),
+    ]);
+    let run = run_rkat_rpc(&binary, &project, &args);
+
+    assert!(
+        !run.answered && !run.status.success(),
+        "rkat-rpc must refuse a start whose confined processes could change its state; \
+         exit={:?} stderr:\n{}",
+        run.status,
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("the realm state") && run.stderr.contains("--state-root"),
+        "the refusal names the input and its remedy; stderr:\n{}",
         run.stderr
     );
 }

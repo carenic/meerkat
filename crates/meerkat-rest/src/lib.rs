@@ -712,7 +712,20 @@ impl AppState {
             &config.confinement,
             conventions_context_root.as_deref(),
         )?;
-        host_confinement.log_startup();
+        // A start whose confined processes could change the realm state or
+        // the user config document is refused before it serves.
+        let host_inputs = meerkat::HostConfinement::host_inputs(
+            &realms_root,
+            layout.global_config_path().as_deref(),
+        );
+        host_confinement.admit_host_inputs(&host_inputs)?;
+        host_confinement.log_startup(
+            &host_inputs,
+            &meerkat::HostConfinement::convention_sources(
+                conventions_context_root.as_deref(),
+                bootstrap.context.user_config_root.as_deref(),
+            ),
+        );
         factory = factory.with_host_confinement(&host_confinement);
         if let Some(context_root) = conventions_context_root {
             factory = factory.context_root(context_root);
@@ -12828,6 +12841,41 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
         assert!(
             is_administration_refusal(&refused, "governance_administration_required"),
             "{refused:?}"
+        );
+    }
+
+    /// A start whose confined processes could change the realm state is
+    /// refused before the server serves, naming the input and its remedy.
+    #[tokio::test]
+    async fn test_startup_refuses_confinement_that_could_change_the_realm_state() {
+        let temp = TempDir::new().unwrap();
+        let instance_root = temp.path().canonicalize().unwrap();
+        let state = instance_root.join("realms");
+        std::fs::create_dir_all(&state).unwrap();
+        let user_document = instance_root.join("user").join(".rkat").join("config.toml");
+        std::fs::create_dir_all(user_document.parent().unwrap()).unwrap();
+        std::fs::write(&user_document, format!(
+            "[confinement.all]\nmode = \"custom\"\nworking_directory = \"{state}\"\nrequirement = {{ baseline = \"command_runtime_v1\", read = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{state}\" }}] }}, write = {{ kind = \"paths\", paths = [{{ kind = \"subtree\", path = \"{state}\" }}] }}, deny_read = [], deny_write = [], network = {{ kind = \"denied\" }}, unix_connect = [], require_descendant_termination = false }}\n",
+            state = state.display()
+        )).unwrap();
+        let mut bootstrap = RuntimeBootstrap::default();
+        bootstrap.realm.state_root = Some(state);
+        bootstrap.context.context_root = Some(instance_root.clone());
+        bootstrap.context.user_config_root = Some(instance_root.join("user"));
+        let refused = AppState::load_from_with_bootstrap_and_confinement(
+            instance_root.clone(),
+            bootstrap,
+            false,
+            test_credential_store(&instance_root),
+            None,
+        )
+        .await
+        .err()
+        .expect("a confined process could change the realm state");
+        let message = refused.to_string();
+        assert!(
+            message.contains("the realm state") && message.contains("--state-root"),
+            "{message}"
         );
     }
 

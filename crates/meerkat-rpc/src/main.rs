@@ -518,7 +518,20 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // preset never grants the realm's own directory.
     let host_confinement =
         meerkat::HostConfinement::resolve(&config.confinement, cli.context_root.as_deref())?;
-    host_confinement.log_startup();
+    // A start whose confined processes could change the realm state or the
+    // user config document is refused before it serves.
+    let host_inputs = meerkat::HostConfinement::host_inputs(
+        &locator.state_root,
+        layout.global_config_path().as_deref(),
+    );
+    host_confinement.admit_host_inputs(&host_inputs)?;
+    host_confinement.log_startup(
+        &host_inputs,
+        &meerkat::HostConfinement::convention_sources(
+            cli.context_root.as_deref(),
+            cli.user_config_root.as_deref(),
+        ),
+    );
     factory = factory.with_host_confinement(&host_confinement);
 
     let skill_runtime = factory.build_skill_runtime(&config).await?;
@@ -858,7 +871,20 @@ async fn serve_stock_governed_jsonl(
     });
     let host_confinement =
         meerkat::HostConfinement::resolve(&config.confinement, cli.context_root.as_deref())?;
-    host_confinement.log_startup();
+    // A start whose confined processes could change the realm state or the
+    // user config document is refused before it serves.
+    let host_inputs = meerkat::HostConfinement::host_inputs(
+        &locator.state_root,
+        layout.global_config_path().as_deref(),
+    );
+    host_confinement.admit_host_inputs(&host_inputs)?;
+    host_confinement.log_startup(
+        &host_inputs,
+        &meerkat::HostConfinement::convention_sources(
+            cli.context_root.as_deref(),
+            cli.user_config_root.as_deref(),
+        ),
+    );
     // The fixed governed profile: model, the named callback tools and live
     // MCP attachment only. Skills and schedules are not part of it; every
     // other unsupported setting is refused by the governed setup.

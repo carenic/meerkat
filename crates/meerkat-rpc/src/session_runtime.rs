@@ -13525,9 +13525,12 @@ impl SessionRuntime {
             }
         };
         let (context_root, user_root) = self.skill_identity_roots();
-        match meerkat_core::mcp_config::McpConfig::load_with_scopes_from_roots(
+        // An `mcp.toml` a confined process could write installs nothing.
+        let host_confinement = self.factory.host_confinement();
+        match meerkat_core::mcp_config::McpConfig::load_with_scopes_from_roots_trusting(
             context_root.as_deref(),
             user_root.as_deref(),
+            &|path| host_confinement.is_some_and(|host| host.untrusted_source(path)),
         )
         .await
         {

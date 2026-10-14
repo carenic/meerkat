@@ -186,14 +186,81 @@ fn confined_factory(root: &Path) -> AgentFactory {
 }
 
 fn assert_confinement_refused(text: &str) {
+    assert_refused_with(text, ConfinementRefusal::UnsupportedRequirement);
+}
+
+fn assert_refused_with(text: &str, refusal: ConfinementRefusal) {
     let body: serde_json::Value = serde_json::from_str(text)
         .unwrap_or_else(|error| panic!("typed refusal body ({error}): {text}"));
     assert_eq!(body["error"], "confinement_refused", "{text}");
-    assert_eq!(
-        body["data"]["refusal"],
-        json!(ConfinementRefusal::UnsupportedRequirement),
-        "{text}"
-    );
+    assert_eq!(body["data"]["refusal"], json!(refusal), "{text}");
+}
+
+/// A host whose every launch kind writes `writable` (and nothing protects
+/// any part of it): the convention files under it are not trusted.
+fn writing_host(writable: &Path) -> HostConfinement {
+    let requirement: ExecutionConfinement = ConfinementSpec {
+        baseline: PlatformBaseline::CommandRuntimeV1,
+        read: FilesystemAccess::Paths(vec![PathAccess::Subtree(writable.into())]),
+        write: FilesystemAccess::Paths(vec![PathAccess::Subtree(writable.into())]),
+        deny_read: vec![],
+        deny_write: vec![],
+        network: IpNetworkAccess::Denied,
+        unix_connect: vec![],
+        require_descendant_termination: false,
+    }
+    .try_into()
+    .unwrap();
+    HostConfinement::resolve(
+        &ConfinementConfig::for_all(LaunchConfinement::Custom(CustomConfinement {
+            working_directory: writable.to_path_buf(),
+            requirement,
+        })),
+        None,
+    )
+    .unwrap()
+}
+
+/// A project `config.toml` stating `entries` as its hooks.
+fn write_project_hooks(project: &Path, entries: Vec<HookEntryConfig>) {
+    #[derive(serde::Serialize)]
+    struct ProjectConfig {
+        hooks: meerkat_core::HooksConfig,
+    }
+    std::fs::create_dir_all(project.join(".rkat")).unwrap();
+    std::fs::write(
+        project.join(".rkat").join("config.toml"),
+        toml::to_string(&ProjectConfig {
+            hooks: meerkat_core::HooksConfig {
+                entries,
+                ..Default::default()
+            },
+        })
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// A PreTool command guardrail whose only effect, if it ever ran, is to
+/// create `marker`.
+fn marker_guardrail(id: &str, marker: &Path) -> HookEntryConfig {
+    HookEntryConfig {
+        id: HookId::new(id),
+        point: HookPoint::PreToolExecution,
+        capability: HookCapability::Guardrail,
+        timeout_ms: Some(5_000),
+        runtime: HookAdapterConfig::command(
+            "/bin/sh",
+            vec![
+                "-c".into(),
+                "printf entered > \"$1\"; cat >/dev/null; printf '{}'".into(),
+                "hook-probe".into(),
+                marker.display().to_string(),
+            ],
+            HashMap::new(),
+        ),
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -344,6 +411,83 @@ async fn a_refused_command_hook_launch_never_runs_unconfined() {
                 reason,
                 HookFailureReason::ConfinementRefused {
                     refusal: ConfinementRefusal::UnsupportedRequirement
+                }
+            );
+            refusals += 1;
+        }
+    }
+    assert_eq!(refusals, 1);
+    assert!(!marker.exists(), "the refused hook never ran");
+}
+
+/// A hook from a project `config.toml` that a confined process can write is
+/// not trusted: it keeps its slot and every invocation is refused with the
+/// typed untrusted-source refusal, so its guarded tool is blocked with model
+/// feedback, the hook never runs, and the same run continues.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_hook_from_an_untrusted_project_config_is_refused_at_every_invocation() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let project = base.join("project");
+    let marker = base.join("project-hook-entered");
+    write_project_hooks(&project, vec![marker_guardrail("project-guard", &marker)]);
+    let host = writing_host(&project);
+    assert!(host.untrusted_source(&project.join(".rkat").join("config.toml")));
+
+    let client = Arc::new(ScriptedClient::new("guarded_tool", json!({})));
+    let tool = Arc::new(GuardedTool::default());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+    let mut build = AgentBuildConfig::new("claude-sonnet-4-5");
+    build.llm_client_override = Some(client.clone());
+    build.external_tools = Some(tool.clone());
+    build.event_tx = Some(tx);
+    let factory = AgentFactory::new(base.join("sessions"))
+        .session_store(Arc::new(meerkat_store::MemoryStore::new()))
+        .runtime_root(base.join("runtime"))
+        .project_root(&project)
+        .builtins(false)
+        .shell(false)
+        .with_host_confinement(&host);
+    let mut agent = tokio::time::timeout(
+        Duration::from_secs(15),
+        factory.build_agent(build, &Config::default()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        agent.run("Attempt the guarded operation".to_string().into()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(result.text, "continued");
+    assert_eq!(
+        tool.0.load(Ordering::SeqCst),
+        0,
+        "the refused hook blocks its tool"
+    );
+    let results = client.returned_results();
+    assert_eq!(results.len(), 1);
+    assert!(results[0].0);
+    assert_refused_with(
+        &results[0].1,
+        ConfinementRefusal::UntrustedConfigurationSource,
+    );
+    let mut refusals = 0;
+    while let Ok(event) = rx.try_recv() {
+        if let AgentEvent::HookLaunchRefused {
+            hook_id, reason, ..
+        } = event
+        {
+            assert_eq!(hook_id, HookId::new("project-guard"));
+            assert_eq!(
+                reason,
+                HookFailureReason::ConfinementRefused {
+                    refusal: ConfinementRefusal::UntrustedConfigurationSource
                 }
             );
             refusals += 1;

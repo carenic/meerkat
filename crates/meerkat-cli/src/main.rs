@@ -855,6 +855,10 @@ fn is_root_flag_with_value(arg: &str) -> bool {
             | "--context-root"
             | "--user-config-root"
             | "--default-model"
+            | "--confinement"
+            | "--confinement-network"
+            | "--confinement-read"
+            | "--confinement-write"
     )
 }
 
@@ -5394,30 +5398,50 @@ async fn load_config(scope: &RuntimeScope) -> anyhow::Result<(Config, PathBuf)> 
 /// Install this process's OS process confinement on a CLI factory: the
 /// composed `[confinement]`, with the `--confinement*` flags already applied
 /// by [`load_config`], lowered over `workspace_root`, the factory's project
-/// root. A selection that cannot be lowered refuses the command; a launch the
-/// platform cannot confine is refused at that launch, never run unconfined.
+/// root. A selection that cannot be lowered refuses the command, and so does
+/// one whose confined processes could change the realm state or the user
+/// config document; a launch the platform cannot confine is refused at that
+/// launch, never run unconfined.
 pub(crate) fn with_cli_confinement(
     factory: AgentFactory,
     config: &Config,
+    scope: &RuntimeScope,
     workspace_root: &Path,
 ) -> anyhow::Result<AgentFactory> {
     let confinement = meerkat::HostConfinement::resolve(&config.confinement, Some(workspace_root))?;
-    report_cli_confinement_refusals(&confinement);
+    let user_document = cli_global_config_path(scope);
+    let inputs =
+        meerkat::HostConfinement::host_inputs(&scope.locator.state_root, Some(&user_document));
+    confinement.admit_host_inputs(&inputs)?;
+    report_cli_confinement(
+        &confinement,
+        &inputs,
+        &meerkat::HostConfinement::convention_sources(
+            Some(scope.context_root.as_deref().unwrap_or(workspace_root)),
+            scope.user_config_root.as_deref(),
+        ),
+    );
     Ok(factory.with_host_confinement(&confinement))
 }
 
-/// Warn once per process, on stderr, for each confined launch kind this
-/// host's platform backend cannot enforce: each such launch is refused.
-fn report_cli_confinement_refusals(confinement: &meerkat::HostConfinement) {
+/// Warn once per process, on stderr, for what the operator should act on in
+/// this host's confinement report: a confined launch kind the platform
+/// cannot enforce (each such launch is refused), a guarantee the host does
+/// not claim, and each untrusted convention source.
+fn report_cli_confinement(
+    confinement: &meerkat::HostConfinement,
+    inputs: &[(meerkat::HostInput, PathBuf)],
+    convention_sources: &[PathBuf],
+) {
     static REPORTED: std::sync::Once = std::sync::Once::new();
     if confinement.is_trusted_host() {
         return;
     }
     REPORTED.call_once(|| {
-        for (kind, refusal) in confinement.preflight() {
-            eprintln!(
-                "warning: {kind} confinement cannot be enforced on this host ({refusal}); every {kind} launch will be refused"
-            );
+        for notice in confinement.startup_report(inputs, convention_sources) {
+            if notice.warning {
+                eprintln!("warning: {}", notice.text);
+            }
         }
     });
 }
@@ -10985,23 +11009,33 @@ async fn create_mcp_tools(
     wait_for_mcp: bool,
     mcp_auth: CliMcpAuthMode,
     external_surface_handle: Option<Arc<dyn meerkat_core::ExternalToolSurfaceHandle>>,
-    stdio_profile: meerkat::McpStdioLaunchProfile,
+    stdio_profile: CliMcpStdioProfile,
 ) -> anyhow::Result<Option<McpRouterAdapter>> {
     use meerkat_core::mcp_config::{McpConfig, McpScope, McpServerSource};
     use meerkat_mcp::{McpConnection, McpRouter};
 
     // The realm's MCP set, with each server's source for security warnings.
-    let servers_with_scope = McpConfig::effective_servers_from_roots(
+    // An `mcp.toml` a confined process could write is never expanded: each
+    // of its servers is refused before it is authorized or launched.
+    let CliMcpStdioProfile {
+        profile: stdio_profile,
+        host_confinement,
+    } = stdio_profile;
+    let effective = McpConfig::effective_servers_from_roots_trusting(
         realm_servers,
         scope.context_root.as_deref(),
         scope.user_config_root.as_deref(),
+        &|path| host_confinement.untrusted_source(path),
     )
     .await
     .map_err(|e| anyhow::anyhow!("MCP config error: {e}"))?;
+    let servers_with_scope = effective.admitted;
+    let refused_servers = effective.refused;
 
-    if servers_with_scope.is_empty() {
+    if servers_with_scope.is_empty() && refused_servers.is_empty() {
         return Ok(None);
     }
+    report_refused_mcp_servers(&refused_servers);
 
     // Warn about project-scoped servers (potential security concern)
     let project_servers: Vec<_> = servers_with_scope
@@ -11056,6 +11090,14 @@ async fn create_mcp_tools(
             .stage_add(s.server.clone())
             .map_err(|e| anyhow::anyhow!("MCP config: {e}"))?;
     }
+    for refused in &refused_servers {
+        router
+            .stage_add_refused(
+                refused.server.clone(),
+                meerkat_core::confinement::ConfinementRefusal::UntrustedConfigurationSource,
+            )
+            .map_err(|e| anyhow::anyhow!("MCP config: {e}"))?;
+    }
 
     // Apply staged ops — spawns background connection tasks
     let result = router
@@ -11106,6 +11148,19 @@ async fn create_mcp_tools(
         .map_err(|e| anyhow::anyhow!("Failed to refresh MCP tools: {e}"))?;
 
     Ok(Some(adapter))
+}
+
+/// Tell the operator, on stderr, which `mcp.toml` servers are refused: their
+/// file is writable by a confined process. The model sees each refusal as a
+/// failed server.
+#[cfg(feature = "mcp")]
+fn report_refused_mcp_servers(refused: &[meerkat_core::mcp_config::RefusedMcpServer]) {
+    for server in refused {
+        eprintln!(
+            "warning: MCP server '{}' from the {} mcp.toml is refused: a confined process can write that file",
+            server.server.name, server.scope
+        );
+    }
 }
 
 fn resolve_keep_alive(requested: bool) -> anyhow::Result<bool> {
@@ -11183,18 +11238,27 @@ async fn load_mcp_external_tools(
 #[cfg(not(feature = "mcp"))]
 type McpRouterAdapter = ();
 
-/// The local MCP launch boundary of a CLI factory, for the routers the CLI
+/// The local MCP launch boundary of a CLI factory and the host confinement
+/// that decides which `mcp.toml` files it trusts, for the routers the CLI
 /// builds itself (the `rkat run` loader).
 #[cfg(feature = "mcp")]
-type CliMcpStdioProfile = meerkat::McpStdioLaunchProfile;
+#[derive(Clone)]
+struct CliMcpStdioProfile {
+    profile: meerkat::McpStdioLaunchProfile,
+    host_confinement: meerkat::HostConfinement,
+}
 #[cfg(not(feature = "mcp"))]
 type CliMcpStdioProfile = ();
 
 /// The factory's own local MCP launch boundary
-/// ([`AgentFactory::mcp_stdio_launch_profile`]), never one rebuilt per call.
+/// ([`AgentFactory::mcp_stdio_launch_profile`]) and host confinement, never
+/// rebuilt per call.
 #[cfg(feature = "mcp")]
 fn cli_mcp_stdio_profile(factory: &AgentFactory) -> CliMcpStdioProfile {
-    factory.mcp_stdio_launch_profile().clone()
+    CliMcpStdioProfile {
+        profile: factory.mcp_stdio_launch_profile().clone(),
+        host_confinement: factory.host_confinement().cloned().unwrap_or_default(),
+    }
 }
 
 #[cfg(not(feature = "mcp"))]
@@ -11219,26 +11283,34 @@ async fn governed_configured_mcp_servers(
     persistence: &PersistenceBundle,
     scope: &RuntimeScope,
     realm_servers: &[meerkat_core::McpServerConfig],
+    host_confinement: Option<&meerkat::HostConfinement>,
 ) -> anyhow::Result<Option<Vec<meerkat_core::McpServerConfig>>> {
     if !persistence_is_governed(persistence) {
         return Ok(None);
     }
     #[cfg(feature = "mcp")]
     {
-        let servers = meerkat_core::mcp_config::McpConfig::effective_servers_from_roots(
+        // An `mcp.toml` a confined process could write configures nothing.
+        let servers = meerkat_core::mcp_config::McpConfig::effective_servers_from_roots_trusting(
             realm_servers,
             scope.context_root.as_deref(),
             scope.user_config_root.as_deref(),
+            &|path| host_confinement.is_some_and(|host| host.untrusted_source(path)),
         )
         .await
         .map_err(|e| anyhow::anyhow!("MCP config error: {e}"))?;
+        report_refused_mcp_servers(&servers.refused);
         Ok(Some(
-            servers.into_iter().map(|entry| entry.server).collect(),
+            servers
+                .admitted
+                .into_iter()
+                .map(|entry| entry.server)
+                .collect(),
         ))
     }
     #[cfg(not(feature = "mcp"))]
     {
-        let _ = (scope, realm_servers);
+        let _ = (scope, realm_servers, host_confinement);
         Ok(Some(Vec::new()))
     }
 }
@@ -13492,12 +13564,17 @@ async fn run_agent(
         if let Some(user_root) = scope.user_config_root.clone() {
             factory = factory.user_config_root(user_root);
         }
-        let factory = with_cli_confinement(factory, &config, &project_root)?;
+        let factory = with_cli_confinement(factory, &config, scope, &project_root)?;
 
         #[cfg(feature = "comms")]
         let factory = factory.comms(!comms_overrides.disabled);
-        let governed_mcp =
-            governed_configured_mcp_servers(&persistence, scope, &config.tools.mcp_servers).await?;
+        let governed_mcp = governed_configured_mcp_servers(
+            &persistence,
+            scope,
+            &config.tools.mcp_servers,
+            factory.host_confinement(),
+        )
+        .await?;
         let factory = with_governed_mcp_auth(factory, scope, governed_mcp.as_deref(), mcp_auth)?;
         // The loader's router launches stdio servers inside the factory's
         // own launch boundary.
@@ -14293,7 +14370,7 @@ async fn resume_session_with_llm_override(
         if let Some(user_root) = scope.user_config_root.clone() {
             factory = factory.user_config_root(user_root);
         }
-        let factory = with_cli_confinement(factory, &config, &project_root)?;
+        let factory = with_cli_confinement(factory, &config, scope, &project_root)?;
 
         #[cfg(feature = "comms")]
         let factory = factory.comms(
@@ -14302,8 +14379,13 @@ async fn resume_session_with_llm_override(
                     || keep_alive
                     || comms_overrides.requires_runtime()),
         );
-        let governed_mcp =
-            governed_configured_mcp_servers(&persistence, scope, &config.tools.mcp_servers).await?;
+        let governed_mcp = governed_configured_mcp_servers(
+            &persistence,
+            scope,
+            &config.tools.mcp_servers,
+            factory.host_confinement(),
+        )
+        .await?;
         let factory = with_governed_mcp_auth(factory, scope, governed_mcp.as_deref(), mcp_auth)?;
         // The loader's router launches stdio servers inside the factory's
         // own launch boundary.
@@ -14821,7 +14903,7 @@ async fn get_or_create_cli_persistent_surface_from_bundle(
     if let Some(user_root) = scope.user_config_root.clone() {
         factory = factory.user_config_root(user_root);
     }
-    let factory = with_cli_confinement(factory, &config, &project_root)?;
+    let factory = with_cli_confinement(factory, &config, &scope, &project_root)?;
 
     let schedule_service = ScheduleService::new(persistence.schedule_store());
     let default_schedule_tools = Some(Arc::new(ScheduleToolDispatcher::new(
@@ -21059,7 +21141,7 @@ where
     if let Some(user_root) = scope.user_config_root.clone() {
         factory = factory.user_config_root(user_root);
     }
-    let factory = with_cli_confinement(factory, &config, &project_root)?;
+    let factory = with_cli_confinement(factory, &config, &scope, &project_root)?;
 
     let mcp_stdio_profile = cli_mcp_stdio_profile(&factory);
     let skill_runtime = factory.build_skill_runtime(&config).await?;
@@ -21879,7 +21961,7 @@ mod tests {
             std::collections::HashMap::new(),
         )];
         assert!(
-            governed_configured_mcp_servers(&ordinary, &scope, &servers)
+            governed_configured_mcp_servers(&ordinary, &scope, &servers, None)
                 .await
                 .expect("ordinary route")
                 .is_none()
@@ -21899,7 +21981,7 @@ mod tests {
         .expect("governed without owners");
         assert!(governed.stock_governance().is_none());
         assert!(persistence_is_governed(&governed));
-        let routed = governed_configured_mcp_servers(&governed, &scope, &servers)
+        let routed = governed_configured_mcp_servers(&governed, &scope, &servers, None)
             .await
             .expect("governed route")
             .expect("the governed route, never the ordinary preload");
@@ -26918,6 +27000,45 @@ default_model = "gemma"
         assert_eq!(default_trace_filter(&cli), DEFAULT_TRACE_FILTER);
     }
 
+    /// The `--confinement*` flags are root flags with a value: before an
+    /// explicit subcommand the arguments are left intact, and before a bare
+    /// prompt `run` is injected after them.
+    #[test]
+    fn test_normalize_cli_args_keeps_confinement_flags_ahead_of_the_subcommand() {
+        let explicit = [
+            "rkat",
+            "--confinement",
+            "workspace",
+            "--confinement-network",
+            "unrestricted",
+            "--confinement-read",
+            "/opt/tool",
+            "--confinement-write",
+            "/tmp/build",
+            "run",
+            "hello",
+        ];
+        let normalized = normalize_cli_args(explicit.map(Into::into));
+        assert_eq!(
+            normalized,
+            explicit.map(std::ffi::OsString::from).to_vec(),
+            "an explicit subcommand after the flags is left intact"
+        );
+        let cli = Cli::try_parse_from(normalized).expect("the explicit run parses");
+        assert_eq!(cli.confinement, Some(ConfinementModeArg::Workspace));
+
+        let prompt =
+            normalize_cli_args(["rkat", "--confinement", "trusted-host", "hello"].map(Into::into));
+        assert_eq!(
+            prompt,
+            ["rkat", "--confinement", "trusted-host", "run", "hello"]
+                .map(std::ffi::OsString::from)
+                .to_vec()
+        );
+        let cli = Cli::try_parse_from(prompt).expect("the prompt shortcut parses");
+        assert_eq!(cli.confinement, Some(ConfinementModeArg::TrustedHost));
+    }
+
     #[test]
     fn test_normalize_cli_args() {
         let args = normalize_cli_args(["rkat", "-h"].map(Into::into));
@@ -28489,6 +28610,103 @@ url = "https://user.example/mcp"
         adapter.shutdown().await;
     }
 
+    /// A project `mcp.toml` that a confined process can write is not trusted:
+    /// each of its servers is refused with the typed untrusted-source
+    /// refusal before anything in it is expanded (an unset variable would
+    /// otherwise fail the load), authorized, connected (no arrival) or
+    /// spawned (no marker), and the model sees each refusal.
+    #[cfg(all(feature = "mcp", unix))]
+    #[tokio::test]
+    async fn test_cli_mcp_loader_refuses_an_untrusted_project_mcp_toml() {
+        use meerkat_core::confinement::{
+            ConfinementRefusal, ConfinementSpec, FilesystemAccess, IpNetworkAccess, PathAccess,
+            PlatformBaseline,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let project = base.join("project");
+        std::fs::create_dir_all(project.join(".rkat")).unwrap();
+        let marker = base.join("untrusted-entered");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::fs::write(
+            project.join(".rkat").join("mcp.toml"),
+            format!(
+                "[[servers]]\nname = \"untrusted-remote\"\nurl = \"http://{}/mcp\"\nheaders = {{ Authorization = \"Bearer ${{CONFINEMENT_TEST_UNSET_SECRET}}\" }}\n\n[[servers]]\nname = \"untrusted-local\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"printf entered > {}\"]\n",
+                listener.local_addr().unwrap(),
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut scope = test_scope(base.join("realms"), "untrusted-project");
+        scope.context_root = Some(project.clone());
+        let requirement = ConfinementSpec {
+            baseline: PlatformBaseline::CommandRuntimeV1,
+            read: FilesystemAccess::Paths(vec![PathAccess::Subtree(project.clone())]),
+            write: FilesystemAccess::Paths(vec![PathAccess::Subtree(project.clone())]),
+            deny_read: vec![],
+            deny_write: vec![],
+            network: IpNetworkAccess::Denied,
+            unix_connect: vec![],
+            require_descendant_termination: false,
+        }
+        .try_into()
+        .unwrap();
+        let config = Config {
+            confinement: meerkat_core::ConfinementConfig::for_all(
+                meerkat_core::LaunchConfinement::Custom(meerkat_core::CustomConfinement {
+                    working_directory: project.clone(),
+                    requirement,
+                }),
+            ),
+            ..Config::default()
+        };
+        let factory = with_cli_confinement(
+            AgentFactory::new(base.join("sessions")),
+            &config,
+            &scope,
+            &project,
+        )
+        .expect("the realm state is outside every grant");
+
+        let adapter = create_mcp_tools(
+            &scope,
+            &[],
+            false,
+            CliMcpAuthMode::Stored,
+            Some(Arc::new(
+                meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral(),
+            )),
+            cli_mcp_stdio_profile(&factory),
+        )
+        .await
+        .expect("an untrusted file is refused, not an error")
+        .expect("its servers are staged as refusals");
+        let deltas = adapter
+            .wait_until_ready(std::time::Duration::from_secs(15))
+            .await
+            .unwrap();
+
+        for name in ["untrusted-remote", "untrusted-local"] {
+            assert!(
+                deltas.iter().any(|delta| {
+                    delta.target == name
+                        && delta.phase == meerkat_core::ExternalToolDeltaPhase::Failed
+                        && delta.confinement_refusal
+                            == Some(ConfinementRefusal::UntrustedConfigurationSource)
+                }),
+                "{name} is refused as untrusted: {deltas:?}"
+            );
+        }
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "no connection arrived"
+        );
+        assert!(!marker.exists(), "no server was spawned");
+        adapter.shutdown().await;
+    }
+
     #[cfg(feature = "mcp")]
     #[test]
     fn test_cli_mcp_interactive_wait_budget_includes_browser_login_timeout() {
@@ -28674,6 +28892,7 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
         let factory = with_cli_confinement(
             AgentFactory::new(temp.path().join("sessions")),
             &config,
+            &scope,
             temp.path(),
         )
         .expect("install confinement");
@@ -28683,7 +28902,7 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
         ));
         #[cfg(feature = "mcp")]
         assert_eq!(
-            cli_mcp_stdio_profile(&factory).capabilities().err(),
+            cli_mcp_stdio_profile(&factory).profile.capabilities().err(),
             Some(meerkat_core::confinement::ConfinementRefusal::UnsupportedRequirement)
         );
 
@@ -28696,6 +28915,7 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
         let factory = with_cli_confinement(
             AgentFactory::new(temp.path().join("sessions")),
             &config,
+            &scope,
             temp.path(),
         )
         .expect("install confinement");
@@ -28705,9 +28925,71 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
         );
         #[cfg(feature = "mcp")]
         assert!(matches!(
-            cli_mcp_stdio_profile(&factory).capabilities(),
+            cli_mcp_stdio_profile(&factory).profile.capabilities(),
             Ok(None)
         ));
+    }
+
+    /// A confined command whose processes could change the realm state is
+    /// refused before it starts, naming the input and its remedy; state
+    /// outside every write grant starts.
+    #[test]
+    fn test_cli_confinement_refuses_a_writable_realm_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let writable_state = test_scope(workspace.join(".rkat").join("realms"), "confined-state");
+        std::fs::create_dir_all(&writable_state.locator.state_root).unwrap();
+        let config = Config {
+            confinement: meerkat_core::ConfinementConfig::for_all(
+                meerkat_core::LaunchConfinement::Custom(meerkat_core::CustomConfinement {
+                    working_directory: workspace.clone(),
+                    requirement: meerkat_core::confinement::ConfinementSpec {
+                        baseline: meerkat_core::confinement::PlatformBaseline::CommandRuntimeV1,
+                        read: meerkat_core::confinement::FilesystemAccess::Paths(vec![
+                            meerkat_core::confinement::PathAccess::Subtree(workspace.clone()),
+                        ]),
+                        write: meerkat_core::confinement::FilesystemAccess::Paths(vec![
+                            meerkat_core::confinement::PathAccess::Subtree(workspace.clone()),
+                        ]),
+                        deny_read: vec![],
+                        deny_write: vec![],
+                        network: meerkat_core::confinement::IpNetworkAccess::Denied,
+                        unix_connect: vec![],
+                        require_descendant_termination: false,
+                    }
+                    .try_into()
+                    .unwrap(),
+                }),
+            ),
+            ..Config::default()
+        };
+        let refused = with_cli_confinement(
+            AgentFactory::new(base.join("sessions")),
+            &config,
+            &writable_state,
+            &workspace,
+        )
+        .err()
+        .expect("a confined process could change the realm state");
+        assert!(
+            refused.to_string().contains("the realm state")
+                && refused.to_string().contains("--state-root"),
+            "{refused}"
+        );
+
+        let outside = test_scope(base.join("state"), "confined-state");
+        std::fs::create_dir_all(&outside.locator.state_root).unwrap();
+        assert!(
+            with_cli_confinement(
+                AgentFactory::new(base.join("sessions")),
+                &config,
+                &outside,
+                &workspace,
+            )
+            .is_ok()
+        );
     }
 
     /// The workspace preset confines every launch kind to the factory's
@@ -28715,7 +28997,10 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
     #[test]
     fn test_cli_workspace_confinement_grants_the_project_root() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let root = base.join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let scope = test_scope(base.join("realms"), "workspace-root");
         let config = Config {
             confinement: meerkat_core::ConfinementConfig::for_all(
                 meerkat_core::LaunchConfinement::Workspace(
@@ -28724,9 +29009,13 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
             ),
             ..Config::default()
         };
-        let factory =
-            with_cli_confinement(AgentFactory::new(root.join("sessions")), &config, &root)
-                .expect("install confinement");
+        let factory = with_cli_confinement(
+            AgentFactory::new(base.join("sessions")),
+            &config,
+            &scope,
+            &root,
+        )
+        .expect("install confinement");
         let meerkat_tools::builtin::shell::ShellConfinement::Required { requirement } =
             factory.shell_confinement()
         else {
