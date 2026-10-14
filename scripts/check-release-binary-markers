@@ -30,6 +30,7 @@ MARKERS=(
   "forced mob event store|crates/meerkat-mob/src/store/in_memory.rs|feature test-support"
   "injected delivery input settle cancellation failure|crates/meerkat-mob/src/runtime/delivery_wait.rs|feature test-support"
   "deterministic TestClient replaces the provider client|crates/meerkat/src/factory.rs|debug_assertions"
+  "OAuth endpoints redirected to the local test fixture|crates/meerkat-auth-core/src/oauth_flow.rs|debug_assertions"
 )
 
 # The one allowed marker, until 0.9.2. tokio's test-util feature reaches the
