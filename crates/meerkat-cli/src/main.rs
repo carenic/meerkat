@@ -8,6 +8,7 @@
 )]
 
 mod cli_parse;
+mod exit_status;
 #[cfg(feature = "mcp")]
 mod mcp;
 #[cfg(all(
@@ -17,6 +18,7 @@ mod mcp;
     feature = "rpc-surface"
 ))]
 mod mob_host;
+mod resume_args;
 mod shutdown_signal;
 #[cfg(feature = "comms")]
 mod stdin_events;
@@ -96,10 +98,10 @@ use std::time::Duration;
 use tokio::process::Command as TokioCommand;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Exit codes as per DESIGN.md §12
+/// Exit codes as per DESIGN.md §12. A failed command with a typed error
+/// exits with its public code's `cli_exit_code()` (see [`exit_status`]).
 const EXIT_SUCCESS: u8 = 0;
 const EXIT_ERROR: u8 = 1;
-const EXIT_BUDGET_EXHAUSTED: u8 = 2;
 /// Usage errors mirror clap's argument-error exit code.
 const EXIT_USAGE: u8 = 2;
 
@@ -284,9 +286,9 @@ impl CliOutputPipeline {
 fn accumulate_anyhow_error(slot: &mut Option<anyhow::Error>, err: anyhow::Error) {
     match slot.take() {
         Some(existing) => {
-            *slot = Some(anyhow::anyhow!(
-                "{existing}; additionally failed during shutdown: {err}"
-            ));
+            // The first failure keeps its typed owner (and so its exit code).
+            let message = format!("{existing}; additionally failed during shutdown: {err}");
+            *slot = Some(existing.context(message));
         }
         None => {
             *slot = Some(err);
@@ -362,8 +364,12 @@ fn completion_outcome_to_cli_runtime_turn_result(
                 pending_tool_calls,
             }))
         }
+        // Typed as the shared completion projection types it, so a
+        // cancelled turn exits with the request-cancelled code.
         meerkat_runtime::completion::CompletionOutcome::Cancelled => {
-            Err(anyhow::anyhow!("request cancelled"))
+            Err(exit_status::typed_failure(AgentError::Cancelled, |_| {
+                "request cancelled".to_string()
+            }))
         }
         meerkat_runtime::completion::CompletionOutcome::Abandoned { reason, .. } => {
             Err(anyhow::anyhow!("turn abandoned: {reason}"))
@@ -629,9 +635,12 @@ where
         (Ok(result), Ok(())) => Ok(result),
         (Ok(_), Err(shutdown_err)) => Err(shutdown_err),
         (Err(turn_err), Ok(())) => Err(turn_err),
-        (Err(turn_err), Err(shutdown_err)) => Err(anyhow::anyhow!(
-            "{turn_err}; additionally failed during CLI shutdown: {shutdown_err}"
-        )),
+        (Err(turn_err), Err(shutdown_err)) => {
+            // The turn failure keeps its typed owner (and so its exit code).
+            let message =
+                format!("{turn_err}; additionally failed during CLI shutdown: {shutdown_err}");
+            Err(turn_err.context(message))
+        }
     }
 }
 
@@ -877,7 +886,8 @@ fn is_root_flag_with_attached_value(arg: &str) -> bool {
 }
 
 /// Inject `run` as the default subcommand when the first positional argument
-/// is not a known command, while preserving top-level help/version handling.
+/// is not a known command, while preserving top-level help/version handling,
+/// and give `run --resume` its documented `[SESSION] PROMPT` shape.
 fn normalize_cli_args(
     args: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> Vec<std::ffi::OsString> {
@@ -905,7 +915,7 @@ fn normalize_cli_args(
         "continue",
         "c",
     ];
-    let args: Vec<std::ffi::OsString> = args.into_iter().collect();
+    let mut args: Vec<std::ffi::OsString> = args.into_iter().collect();
     let mut i = 1; // skip binary name
     while i < args.len() {
         let arg_str = args[i].to_str().unwrap_or("");
@@ -921,12 +931,17 @@ fn normalize_cli_args(
                 break;
             }
         } else {
+            if arg_str == "run" {
+                imply_run_resume_last(&mut args, i);
+                return args;
+            }
             if SUBCOMMANDS.contains(&arg_str) {
                 return args;
             }
             let mut patched = args[..i].to_vec();
             patched.push("run".into());
             patched.extend_from_slice(&args[i..]);
+            imply_run_resume_last(&mut patched, i);
             return patched;
         }
     }
@@ -935,34 +950,28 @@ fn normalize_cli_args(
         let mut patched = args[..i].to_vec();
         patched.push("run".into());
         patched.extend_from_slice(&args[i..]);
-        if let Some(resume_index) = patched
-            .iter()
-            .position(|arg| arg.to_str() == Some("--resume"))
-        {
-            let remaining_positionals = patched
-                .iter()
-                .skip(resume_index + 1)
-                .filter(|arg| !arg.to_string_lossy().starts_with('-'))
-                .count();
-            let next_value = patched
-                .get(resume_index + 1)
-                .and_then(|arg| arg.to_str())
-                .filter(|arg| !arg.starts_with('-'));
-            let should_insert_last = match (next_value, remaining_positionals) {
-                (None, _) => true,
-                (Some(_), 0) => true,
-                (Some(value), 1) => !looks_like_resume_target(value),
-                (Some(_), _) => false,
-            };
-            if should_insert_last {
-                patched.insert(resume_index + 1, "last".into());
-            }
-        }
-
+        imply_run_resume_last(&mut patched, i);
         return patched;
     }
 
     args
+}
+
+/// The documented `run --resume [SESSION] PROMPT` shape for the `run` at
+/// `run_index`, explicit or implied (see [`resume_args::imply_resume_last`]).
+fn imply_run_resume_last(args: &mut Vec<std::ffi::OsString>, run_index: usize) {
+    if !args
+        .iter()
+        .skip(run_index + 1)
+        .any(|arg| arg.to_str() == Some("--resume"))
+    {
+        return;
+    }
+    let mut command = <Cli as clap::CommandFactory>::command();
+    command.build();
+    if let Some(run) = command.find_subcommand("run") {
+        resume_args::imply_resume_last(args, run_index, run, looks_like_resume_target);
+    }
 }
 
 /// Read piped stdin content and prepend it to the prompt as context.
@@ -3983,10 +3992,7 @@ async fn cli_main() -> anyhow::Result<ExitCode> {
         }
         return Ok(match handle_storage_command(command, &cli).await {
             Ok(()) => ExitCode::from(EXIT_SUCCESS),
-            Err(e) => {
-                eprintln!("Error: {e}");
-                ExitCode::from(EXIT_ERROR)
-            }
+            Err(e) => exit_status::report_failure(&e),
         });
     }
 
@@ -3999,8 +4005,7 @@ async fn cli_main() -> anyhow::Result<ExitCode> {
     if let Some(model) = cli.default_model.as_deref()
         && let Err(e) = handle_set_default_model(model, &cli_scope).await
     {
-        eprintln!("Error: {e}");
-        return Ok(ExitCode::from(EXIT_ERROR));
+        return Ok(exit_status::report_failure(&e));
     }
     let Some(command) = cli.command else {
         if cli.default_model.is_some() {
@@ -4248,34 +4253,11 @@ async fn cli_main() -> anyhow::Result<ExitCode> {
         }
     };
 
-    // Map result to exit code
+    // Map result to exit code: a typed failure exits with its public code's
+    // `cli_exit_code()` (§17.4 mob codes included), anything else with 1.
     Ok(match result {
         Ok(()) => ExitCode::from(EXIT_SUCCESS),
-        Err(e) => {
-            // Check if it's a budget exhaustion error
-            if let Some(agent_err) = e.downcast_ref::<AgentError>()
-                && agent_err.is_graceful()
-            {
-                // Budget exhausted - this is a graceful termination
-                eprintln!("Budget exhausted: {agent_err}");
-                return Ok(ExitCode::from(EXIT_BUDGET_EXHAUSTED));
-            }
-            // §17.4 typed exit path (mob verb family only): the four
-            // console codes exit 45-48 with one typed `detail:` line
-            // rendered from the typed fields, never a display string.
-            #[cfg(feature = "mob")]
-            if let Some(code) = mob_exit_code(&e) {
-                eprintln!("Error: {e}");
-                if let Some(detail) = mob_wire_detail(&e)
-                    && let Ok(json) = detail.detail_value()
-                {
-                    eprintln!("detail: {json}");
-                }
-                return Ok(ExitCode::from(code));
-            }
-            eprintln!("Error: {e}");
-            ExitCode::from(EXIT_ERROR)
-        }
+        Err(e) => exit_status::report_failure(&e),
     })
 }
 
@@ -4957,16 +4939,45 @@ impl CommsOverrides {
             || self.pairing_password.is_some()
             || self.peer_meta.is_some()
     }
+
+    /// Apply the `--comms-*` overrides to the loaded comms config. An
+    /// explicit `--comms-advertise-tcp` replaces the configured
+    /// `advertise_address`; without one the configured address stands.
+    #[cfg(feature = "comms")]
+    fn apply_to(&self, config: &mut Config) {
+        if let Some(addr) = &self.listen_tcp {
+            config.comms.mode = CommsRuntimeMode::Tcp;
+            config.comms.address = Some(addr.clone());
+        }
+        if let Some(advertise_address) = &self.advertise_address {
+            config.comms.advertise_address = Some(advertise_address.clone());
+        }
+        // A runtime-only secret: realm config never carries it (serde
+        // skips it), so the CLI flags are its only source.
+        config.comms.pairing_password = self.pairing_password.clone();
+    }
 }
 
+/// `--comms-advertise-tcp HOST:PORT` (or `tcp://HOST:PORT`) as the `tcp://`
+/// route the comms runtime advertises to signed peers. HOST is a DNS name,
+/// an IPv4 address or a bracketed IPv6 address. A name is not resolved here:
+/// the comms transport resolves it when a peer connects.
 fn resolve_comms_advertise_tcp(advertise_tcp: Option<String>) -> anyhow::Result<Option<String>> {
-    let Some(advertise_tcp) = advertise_tcp else {
+    let Some(raw) = advertise_tcp else {
         return Ok(None);
     };
-    let addr: std::net::SocketAddr = advertise_tcp
-        .parse()
-        .map_err(|err| anyhow::anyhow!("invalid --comms-advertise-tcp address: {err}"))?;
-    Ok(Some(format!("tcp://{addr}")))
+    let route = raw.strip_prefix("tcp://").unwrap_or(&raw);
+    let address = match route.parse::<std::net::SocketAddr>() {
+        Ok(socket) => format!("tcp://{socket}"),
+        Err(_) => format!("tcp://{route}"),
+    };
+    #[cfg(feature = "comms")]
+    meerkat_comms::validate_advertised_tcp_address(&address).map_err(|reason| {
+        anyhow::anyhow!(
+            "invalid --comms-advertise-tcp address '{raw}': {reason}; expected HOST:PORT with a DNS name, an IPv4 address or a bracketed IPv6 address, and a nonzero port"
+        )
+    })?;
+    Ok(Some(address))
 }
 
 fn resolve_comms_pairing_password(
@@ -10320,13 +10331,15 @@ fn runtime_accept_failure(
     error: meerkat_runtime::RuntimeDriverError,
     route_hint: &StockRouteHint,
 ) -> anyhow::Error {
-    match (route_hint, &error) {
-        (Some(hint), meerkat_runtime::RuntimeDriverError::InputRefused { .. }) => anyhow::anyhow!(
+    let message = match (route_hint, &error) {
+        (Some(hint), meerkat_runtime::RuntimeDriverError::InputRefused { .. }) => format!(
             "runtime accept failed: {error}\nInformation only: if this refusal is due to the \
              controller route, {hint}"
         ),
-        _ => anyhow::anyhow!("runtime accept failed: {error}"),
-    }
+        _ => format!("runtime accept failed: {error}"),
+    };
+    // Kept typed: a refused or not-ready input exits with its public code.
+    exit_status::typed_failure(error, |_| message)
 }
 
 /// Admit a governed prompt's original after the runtime accepted its input.
@@ -10568,6 +10581,19 @@ impl meerkat_mcp::McpAuthResolver for CliMcpHostAuthResolver {
                 },
             })?;
         self.authority.require_stored_bearer_token(target).await
+    }
+
+    /// The native authority's realm, as the RPC and REST resolvers report
+    /// it: the connection scopes its target to it, so the identity it
+    /// reports (sign-out, awaiting-authorization) is the realm's own.
+    fn credential_realm(&self) -> Option<meerkat_core::connection::RealmId> {
+        meerkat_mcp::McpAuthResolver::credential_realm(&self.authority)
+    }
+
+    /// The native authority's bound egress profile: under a required
+    /// profile a connection uses only a resolver bound to that same one.
+    fn http_egress(&self) -> Option<meerkat_mcp::HttpEgressProfile> {
+        meerkat_mcp::McpAuthResolver::http_egress(&self.authority)
     }
 
     fn selected_account(
@@ -13003,7 +13029,9 @@ async fn build_deploy_mob_session_service(
 fn session_err_to_anyhow(e: meerkat_core::service::SessionError) -> anyhow::Error {
     match e {
         meerkat_core::service::SessionError::Agent(agent_err) => anyhow::Error::from(agent_err),
-        other => anyhow::anyhow!("Session service error: {other}"),
+        other => {
+            exit_status::typed_failure(other, |other| format!("Session service error: {other}"))
+        }
     }
 }
 
@@ -13049,7 +13077,9 @@ async fn resolve_flexible_session_id(
                     labels: None,
                 })
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to list sessions: {e}"))?;
+                .map_err(|e| {
+                    exit_status::typed_failure(e, |e| format!("Failed to list sessions: {e}"))
+                })?;
             return sessions
                 .get(offset)
                 .map(|s| s.session_id.clone())
@@ -13097,7 +13127,9 @@ async fn resolve_flexible_session_id(
                 labels: None,
             })
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to list sessions: {e}"))?;
+            .map_err(|e| {
+                exit_status::typed_failure(e, |e| format!("Failed to list sessions: {e}"))
+            })?;
 
         let matches = find_session_matches_in_summaries(input, &sessions);
 
@@ -13383,19 +13415,11 @@ async fn run_agent(
         );
         tracing::info!("Using provider: {:?}, model: {}", provider, model);
 
-        // Apply --comms-listen-tcp override to the config
+        // Apply the --comms-* overrides to the config
         #[allow(unused_mut)]
         let mut config = config.clone();
         #[cfg(feature = "comms")]
-        if let Some(ref addr) = comms_overrides.listen_tcp {
-            config.comms.mode = CommsRuntimeMode::Tcp;
-            config.comms.address = Some(addr.clone());
-        }
-        #[cfg(feature = "comms")]
-        {
-            config.comms.advertise_address = comms_overrides.advertise_address.clone();
-            config.comms.pairing_password = comms_overrides.pairing_password.clone();
-        }
+        comms_overrides.apply_to(&mut config);
 
         // Build the parent session service on the runtime-backed persistent
         // surface. CLI one-shots must leave the runtime snapshot as durable
@@ -13689,7 +13713,9 @@ async fn run_agent(
                 .register_session_with_executor(session_id.clone(), executor)
                 .await
                 .map_err(|error| {
-                    anyhow::anyhow!("runtime executor registration failed: {error}")
+                    exit_status::typed_failure(error, |error| {
+                        format!("runtime executor registration failed: {error}")
+                    })
                 })?;
 
             #[cfg(feature = "comms")]
@@ -13749,7 +13775,9 @@ async fn run_agent(
                     .update_peer_ingress_context(&session_id, keep_alive, comms_rt)
                     .await
                     .map_err(|err| {
-                        anyhow::anyhow!("failed to update peer ingress context: {err}")
+                        exit_status::typed_failure(err, |err| {
+                            format!("failed to update peer ingress context: {err}")
+                        })
                     })?;
             }
 
@@ -14037,15 +14065,7 @@ async fn resume_session_with_llm_override(
         let (config, runtime_preload_skills) = resolve_runtime_skills(config, skills).await?;
         let mut config = config;
         #[cfg(feature = "comms")]
-        if let Some(ref addr) = comms_overrides.listen_tcp {
-            config.comms.mode = CommsRuntimeMode::Tcp;
-            config.comms.address = Some(addr.clone());
-        }
-        #[cfg(feature = "comms")]
-        {
-            config.comms.advertise_address = comms_overrides.advertise_address.clone();
-            config.comms.pairing_password = comms_overrides.pairing_password.clone();
-        }
+        comms_overrides.apply_to(&mut config);
         let has_max_duration = max_duration.is_some();
         let has_max_tool_calls = max_tool_calls.is_some();
         let duration = max_duration.map(|s| parse_duration(&s)).transpose()?;
@@ -14082,7 +14102,7 @@ async fn resume_session_with_llm_override(
             .load(&session_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to load session: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("Session not found: {session_id}"))?;
+            .ok_or_else(|| exit_status::session_not_found(&session_id))?;
         let message_count = session.messages().len();
         let stored_metadata = session
             .session_metadata()
@@ -14447,7 +14467,9 @@ async fn resume_session_with_llm_override(
                 .register_session_with_executor(session_id.clone(), executor)
                 .await
                 .map_err(|error| {
-                    anyhow::anyhow!("runtime executor registration failed: {error}")
+                    exit_status::typed_failure(error, |error| {
+                        format!("runtime executor registration failed: {error}")
+                    })
                 })?;
 
             #[cfg(feature = "comms")]
@@ -14518,7 +14540,9 @@ async fn resume_session_with_llm_override(
                     .update_peer_ingress_context(&session_id, keep_alive, comms_rt)
                     .await
                     .map_err(|err| {
-                        anyhow::anyhow!("failed to update peer ingress context: {err}")
+                        exit_status::typed_failure(err, |err| {
+                            format!("failed to update peer ingress context: {err}")
+                        })
                     })?;
             }
 
@@ -16467,10 +16491,9 @@ async fn list_sessions(
             },
         };
 
-        let sessions = service
-            .list(query)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to list sessions: {e}"))?;
+        let sessions = service.list(query).await.map_err(|e| {
+            exit_status::typed_failure(e, |e| format!("Failed to list sessions: {e}"))
+        })?;
 
         if sessions.is_empty() {
             println!("No sessions found.");
@@ -16773,8 +16796,8 @@ async fn show_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
         let session = service
             .load_authoritative_session(&session_id)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to load session: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("Session not found: {session_id}"))?;
+            .map_err(|e| exit_status::typed_failure(e, |e| format!("Failed to load session: {e}")))?
+            .ok_or_else(|| exit_status::session_not_found(&session_id))?;
 
         // Print session header
         println!("Session: {session_id}");
@@ -16901,7 +16924,9 @@ async fn delete_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
                     &session_id,
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to delete session: {e}"))?;
+                .map_err(|e| {
+                    exit_status::typed_failure(e, |e| format!("Failed to delete session: {e}"))
+                })?;
             } else {
                 service
                     .archive_with_machine_protocol(
@@ -16911,7 +16936,9 @@ async fn delete_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
                         ),
                     )
                     .await
-                    .map_err(|e| anyhow::anyhow!("Failed to delete session: {e}"))?;
+                    .map_err(|e| {
+                        exit_status::typed_failure(e, |e| format!("Failed to delete session: {e}"))
+                    })?;
             }
         }
         #[cfg(not(feature = "mob"))]
@@ -16925,7 +16952,9 @@ async fn delete_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
                     ),
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to delete session: {e}"))?;
+                .map_err(|e| {
+                    exit_status::typed_failure(e, |e| format!("Failed to delete session: {e}"))
+                })?;
         }
 
         println!("Deleted session: {session_id}");
@@ -16950,10 +16979,9 @@ async fn interrupt_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()>
 
         let (config, _) = load_config(scope).await?;
         let (service, runtime_adapter) = build_cli_persistent_service(scope, config).await?;
-        service
-            .read(&session_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to interrupt session: {e}"))?;
+        service.read(&session_id).await.map_err(|e| {
+            exit_status::typed_failure(e, |e| format!("Failed to interrupt session: {e}"))
+        })?;
 
         let (result, conflict_state) = match runtime_adapter
             .hard_cancel_current_run(&session_id, "CLI session interrupt")
@@ -17000,7 +17028,11 @@ async fn interrupt_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()>
                 ),
                 Some(state),
             ),
-            Err(e) => return Err(anyhow::anyhow!("Failed to interrupt session: {e}")),
+            Err(e) => {
+                return Err(exit_status::typed_failure(e, |e| {
+                    format!("Failed to interrupt session: {e}")
+                }));
+            }
         };
 
         match result.map_err(|e| anyhow::anyhow!("Failed to classify interrupt result: {e}"))? {
@@ -17022,12 +17054,26 @@ async fn interrupt_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()>
                 );
                 Ok(())
             }
-            meerkat_runtime::UserInterruptPublicResult::NotFound => Err(anyhow::anyhow!(
-                "Failed to interrupt session: session not found"
-            )),
-            meerkat_runtime::UserInterruptPublicResult::SessionBusy => Err(anyhow::anyhow!(
-                "Failed to interrupt session: session is still being materialized"
-            )),
+            // Typed as JSON-RPC types them: session not found, session busy.
+            meerkat_runtime::UserInterruptPublicResult::NotFound => {
+                Err(exit_status::typed_failure(
+                    meerkat_core::SessionError::NotFound {
+                        id: session_id.clone(),
+                    },
+                    |_| "Failed to interrupt session: session not found".to_string(),
+                ))
+            }
+            meerkat_runtime::UserInterruptPublicResult::SessionBusy => {
+                Err(exit_status::typed_failure(
+                    meerkat_core::SessionError::Busy {
+                        id: session_id.clone(),
+                    },
+                    |_| {
+                        "Failed to interrupt session: session is still being materialized"
+                            .to_string()
+                    },
+                ))
+            }
             meerkat_runtime::UserInterruptPublicResult::Conflict => {
                 let message = match conflict_state {
                     Some(state) => {
@@ -17986,35 +18032,6 @@ where
     anyhow::Error::new(err)
 }
 
-/// The four-code console projection carried by a mob verb failure, when the
-/// error chain bottoms out in a mob-family error (§17.4).
-#[cfg(feature = "mob")]
-fn mob_wire_detail(e: &anyhow::Error) -> Option<meerkat_contracts::wire::WireMobErrorDetail> {
-    e.downcast_ref::<meerkat_mob::MobError>()
-        .and_then(meerkat_mob::MobError::wire_detail)
-        .or_else(|| {
-            e.downcast_ref::<meerkat_mob::MobRespawnError>()
-                .and_then(meerkat_mob::MobRespawnError::wire_detail)
-        })
-        .or_else(|| {
-            e.downcast_ref::<meerkat_mob_mcp::MobMcpDestroyError>()
-                .and_then(meerkat_mob_mcp::MobMcpDestroyError::wire_detail)
-        })
-}
-
-/// §17.4 typed exit path (DEC-P7B-11, ADJ-P7-7): exit codes 45-48 for the
-/// mob verb family ONLY — scoping is by construction, since only mob
-/// handler arms put mob-family errors into the chain via [`mob_anyhow`].
-/// Unmapped mob errors keep `EXIT_ERROR`. The pre-existing
-/// `EXIT_BUDGET_EXHAUSTED=2` vs `cli_exit_code(BudgetExhausted)=21`
-/// inconsistency is recorded and deliberately NOT changed (plan-pinned).
-#[cfg(feature = "mob")]
-fn mob_exit_code(e: &anyhow::Error) -> Option<u8> {
-    let detail = mob_wire_detail(e)?;
-    // 45..=48 always fit; try_from is the no-panic guard.
-    u8::try_from(detail.code().cli_exit_code()).ok()
-}
-
 /// Human host-roster row (grants-verb rendering precedent): the wire enum
 /// owns the snake_case phase spelling — rendered via serde, never a
 /// CLI-local vocabulary copy.
@@ -18201,76 +18218,6 @@ async fn handle_mob_live_command(
 mod mob_typed_exit_tests {
     use super::*;
 
-    /// T-B11: `mob_exit_code` maps exactly the four console codes —
-    /// ScopeDenied→45, HostUnavailable→46, StaleCursor→47, StaleFence→48 —
-    /// and nothing else; the typed `detail:` line renders
-    /// `{required, presented}` from the typed fields.
-    #[test]
-    fn mob_exit_code_maps_four_codes_only() {
-        let denied = mob_anyhow(meerkat_mob::MobError::ScopeDenied(
-            meerkat_mob::ScopeDenial {
-                required: meerkat_mob::machines::mob_machine::ControlScope::AdminHost,
-                presented: std::collections::BTreeSet::from([
-                    meerkat_mob::machines::mob_machine::ControlScope::List,
-                ]),
-            },
-        ));
-        assert_eq!(mob_exit_code(&denied), Some(45));
-
-        let timed_out = mob_anyhow(meerkat_mob::MobError::BridgeRequestTimedOut {
-            request_envelope_id: "env".to_string(),
-            timeout_ms: 30_000,
-        });
-        assert_eq!(mob_exit_code(&timed_out), Some(46));
-
-        let stale_cursor = mob_anyhow(meerkat_mob::MobError::StaleEventCursor {
-            after_cursor: 9,
-            latest_cursor: 4,
-        });
-        assert_eq!(mob_exit_code(&stale_cursor), Some(47));
-
-        let stale_fence = mob_anyhow(meerkat_mob::MobError::StaleFenceToken {
-            runtime_id: meerkat_mob::AgentRuntimeId::initial(meerkat_mob::AgentIdentity::from(
-                "worker",
-            )),
-            expected: meerkat_mob::FenceToken::new(2),
-            actual: meerkat_mob::FenceToken::new(1),
-        });
-        assert_eq!(mob_exit_code(&stale_fence), Some(48));
-
-        // Unmapped mob errors keep EXIT_ERROR (None here ⇒ 1 at the mapper).
-        let not_found = mob_anyhow(meerkat_mob::MobError::MobNotFound(
-            meerkat_mob::MobId::from("missing"),
-        ));
-        assert_eq!(mob_exit_code(&not_found), None);
-
-        // PeerOffline ≠ HostUnavailable — pinned non-mapping (§17.4).
-        let peer_offline = mob_anyhow(meerkat_mob::MobError::CommsError(
-            meerkat_core::comms::SendError::PeerOffline,
-        ));
-        assert_eq!(mob_exit_code(&peer_offline), None);
-
-        // Non-mob chains (incl. the budget path's AgentError) never route
-        // through the mob exit path.
-        assert_eq!(mob_exit_code(&anyhow::anyhow!("boom")), None);
-
-        // The respawn wrapper delegates.
-        let respawn = mob_anyhow(meerkat_mob::MobRespawnError::Mob(
-            meerkat_mob::MobError::BridgeRequestTimedOut {
-                request_envelope_id: "env-2".to_string(),
-                timeout_ms: 15_000,
-            },
-        ));
-        assert_eq!(mob_exit_code(&respawn), Some(46));
-
-        // The `detail:` line renders the typed pair, not a display string.
-        let detail = mob_wire_detail(&denied).expect("scope denial detail");
-        assert_eq!(
-            detail.detail_value().expect("detail serializes"),
-            serde_json::json!({ "required": "admin_host", "presented": ["list"] })
-        );
-    }
-
     #[derive(Clone)]
     struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -18408,7 +18355,7 @@ async fn run_pack_flow_foreground(
     let run_id = state
         .mob_run_flow(mob_id, flow_id, params)
         .await
-        .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
+        .map_err(|err| exit_status::typed_failure(err, |err| format!("mob run failed: {err}")))?;
     match select_pack_flow_terminal_or_shutdown(
         wait_for_terminal_flow_run(state, mob_id.as_str(), &run_id),
         shutdown_signal::wait_for_shutdown_signal(),
@@ -20261,7 +20208,7 @@ async fn execute_mob_run_pack(
             source_identity,
         )
         .await
-        .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
+        .map_err(|err| exit_status::typed_failure(err, |err| format!("mob run failed: {err}")))?;
 
     if invocation.detach {
         let Some(flow_id) = flow_id else {
@@ -20272,7 +20219,9 @@ async fn execute_mob_run_pack(
         let run_id = state
             .mob_run_flow(&mob_id, flow_id.clone(), params)
             .await
-            .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
+            .map_err(|err| {
+                exit_status::typed_failure(err, |err| format!("mob run failed: {err}"))
+            })?;
         let rendered = if invocation.json {
             serde_json::to_string_pretty(&serde_json::json!({
                 "mob_id": mob_id.to_string(),
@@ -20330,7 +20279,9 @@ async fn execute_mob_run_pack(
                 &objective,
             )
             .await
-            .map_err(|err| anyhow::anyhow!("mob run failed: {err}"))?;
+            .map_err(|err| {
+                exit_status::typed_failure(err, |err| format!("mob run failed: {err}"))
+            })?;
             if invocation.json {
                 serde_json::to_string_pretty(&serde_json::json!({
                     "mob_id": archive.definition.id.to_string(),
@@ -33928,5 +33879,153 @@ mod no_cli_alias_tables {
         );
         assert!(parse_cli_principal_id("").is_err());
         assert!(parse_cli_principal_id("ok-principal").is_ok());
+    }
+}
+
+#[cfg(all(test, feature = "comms"))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod comms_override_tests {
+    use super::*;
+
+    /// `--comms-advertise-tcp` accepts a DNS name, as the comms docs show,
+    /// and passes it on unresolved: the transport resolves it when a peer
+    /// dials. IP literals keep their canonical form.
+    #[test]
+    fn comms_advertise_tcp_accepts_unresolved_dns_names() {
+        for (raw, advertised) in [
+            ("target.example.com:4200", "tcp://target.example.com:4200"),
+            (
+                "tcp://reviewer.example.com:4200",
+                "tcp://reviewer.example.com:4200",
+            ),
+            (
+                "unresolvable.invalid:4200",
+                "tcp://unresolvable.invalid:4200",
+            ),
+            ("203.0.113.10:4200", "tcp://203.0.113.10:4200"),
+            ("[2001:db8::1]:4200", "tcp://[2001:db8::1]:4200"),
+        ] {
+            assert_eq!(
+                resolve_comms_advertise_tcp(Some(raw.to_string())).unwrap(),
+                Some(advertised.to_string()),
+                "{raw}"
+            );
+        }
+        assert_eq!(resolve_comms_advertise_tcp(None).unwrap(), None);
+    }
+
+    /// A route peers cannot dial is refused with a clear error: no port, a
+    /// zero port, a wildcard host, an unbracketed IPv6 host, no host.
+    #[test]
+    fn comms_advertise_tcp_refuses_undialable_routes() {
+        for raw in [
+            "target.example.com",
+            "target.example.com:0",
+            "0.0.0.0:4200",
+            "[::]:4200",
+            "2001:db8::1:4200",
+            ":4200",
+        ] {
+            let error = resolve_comms_advertise_tcp(Some(raw.to_string()))
+                .expect_err(raw)
+                .to_string();
+            assert!(
+                error.starts_with(&format!("invalid --comms-advertise-tcp address '{raw}'")),
+                "{raw}: {error}"
+            );
+        }
+    }
+
+    /// An explicit `--comms-advertise-tcp` wins over the configured
+    /// `comms.advertise_address`; without the flag the configured address
+    /// stands, also when `--comms-listen-tcp` switches the listener.
+    #[test]
+    fn comms_overrides_keep_the_configured_advertise_address() {
+        const CONFIGURED: &str = "tcp://configured.example.com:4200";
+        let configured = || {
+            let mut config = Config::default();
+            config.comms.advertise_address = Some(CONFIGURED.to_string());
+            config
+        };
+
+        let mut config = configured();
+        CommsOverrides::default().apply_to(&mut config);
+        assert_eq!(config.comms.advertise_address.as_deref(), Some(CONFIGURED));
+
+        let mut config = configured();
+        CommsOverrides {
+            listen_tcp: Some("0.0.0.0:4200".to_string()),
+            ..CommsOverrides::default()
+        }
+        .apply_to(&mut config);
+        assert_eq!(config.comms.mode, CommsRuntimeMode::Tcp);
+        assert_eq!(config.comms.address.as_deref(), Some("0.0.0.0:4200"));
+        assert_eq!(config.comms.advertise_address.as_deref(), Some(CONFIGURED));
+
+        let mut config = configured();
+        CommsOverrides {
+            advertise_address: Some("tcp://explicit.example.com:4300".to_string()),
+            ..CommsOverrides::default()
+        }
+        .apply_to(&mut config);
+        assert_eq!(
+            config.comms.advertise_address.as_deref(),
+            Some("tcp://explicit.example.com:4300")
+        );
+    }
+}
+
+#[cfg(all(test, feature = "mcp"))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod cli_mcp_host_auth_resolver_tests {
+    use super::*;
+
+    /// The CLI host resolver reports its native authority's credential realm
+    /// and bound egress profile, as the RPC and REST resolvers (the
+    /// authority itself) do.
+    #[tokio::test]
+    async fn cli_resolver_forwards_credential_realm_and_http_egress() {
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let realm = meerkat_core::connection::RealmId::parse("team-alpha").unwrap();
+        let service = meerkat::HostAuthService::new(
+            meerkat_providers::auth_store::ProviderAuthPersistence::new(
+                Arc::new(meerkat_providers::auth_store::EphemeralTokenStore::new()),
+                Arc::new(meerkat_providers::auth_store::InMemoryCoordinator::new()),
+            ),
+            runtime.provider_auth_runtime_authority(),
+        )
+        .with_mcp_realm(realm.clone());
+        let profile =
+            meerkat_mcp::HttpEgressProfile::required(meerkat_mcp::HttpEgressPolicy::new());
+        let authority = service
+            .mcp_oauth_authority()
+            .unwrap()
+            .stored_only()
+            .with_http_egress(&profile);
+
+        // Positive control: the authority, as RPC and REST install it.
+        assert_eq!(
+            meerkat_mcp::McpAuthResolver::credential_realm(&authority),
+            Some(realm.clone())
+        );
+        assert!(
+            meerkat_mcp::McpAuthResolver::http_egress(&authority)
+                .is_some_and(|bound| bound.same_profile(&profile))
+        );
+
+        let resolver = CliMcpHostAuthResolver {
+            service,
+            authority,
+            mode: CliMcpAuthMode::Stored,
+        };
+        assert_eq!(
+            meerkat_mcp::McpAuthResolver::credential_realm(&resolver),
+            Some(realm)
+        );
+        assert!(
+            meerkat_mcp::McpAuthResolver::http_egress(&resolver)
+                .is_some_and(|bound| bound.same_profile(&profile)),
+            "the CLI resolver must report the authority's bound egress profile"
+        );
     }
 }

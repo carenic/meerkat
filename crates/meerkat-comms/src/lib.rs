@@ -41,6 +41,7 @@ pub use host_acceptor::{
     HostAcceptorBounds, HostAcceptorConfig, HostAcceptorError, HostAcceptorHandle,
     HostAcceptorIdentityRegistry, HostAcceptorIdentityReplacementReservation,
     HostAcceptorRegistrationMaterial, HostPairingConfig, PairingRateLimit, spawn_host_acceptor,
+    validate_advertised_tcp_address,
 };
 pub use identity::{IdentityError, Keypair, PubKey, Signature};
 pub use inbox::{AdmissionOutcome, DropReason, Inbox, InboxError, InboxSender};

@@ -14134,42 +14134,9 @@ pub(crate) fn session_error_to_rpc(err: SessionError) -> RpcError {
             data: meerkat_contracts::error::session_error_details(&err),
         };
     }
-    let code = match err.primary_error() {
-        SessionError::NotFound { .. } => error::SESSION_NOT_FOUND,
-        // Another runtime owner hosts the session (#1813): the busy class,
-        // with `kind = "session_served_elsewhere"` in the data.
-        SessionError::Busy { .. } | SessionError::ServedElsewhere { .. } => error::SESSION_BUSY,
-        SessionError::FailedWithData { .. } if err.is_runtime_teardown_in_progress() => {
-            error::SESSION_BUSY
-        }
-        SessionError::NotRunning { .. } => error::INTERNAL_ERROR,
-        // A durable resume hold is not a service fault: the session exists,
-        // its content is retained intact, and no runnable authority may be
-        // handed out until reconciliation promotes or repairs it. Classify it
-        // as "durably present, not runnable" and let the typed
-        // `durable_resume_hold` payload carry which hold applies.
-        SessionError::DurableTailHeldForRecovery { .. }
-        | SessionError::DurableTailRecoveryRefused { .. }
-        | SessionError::DurableEvidenceQuarantined { .. }
-        | SessionError::WholeBlobAuditedEndpointDivergence { .. } => error::SESSION_NOT_RUNNING,
-        SessionError::Agent(agent_err) => match agent_err.primary_error() {
-            meerkat_core::AgentError::TokenBudgetExceeded { .. }
-            | meerkat_core::AgentError::TimeBudgetExceeded { .. }
-            | meerkat_core::AgentError::ToolCallBudgetExceeded { .. } => error::BUDGET_EXHAUSTED,
-            meerkat_core::AgentError::ConfigError(_) => error::INVALID_PARAMS,
-            meerkat_core::AgentError::HookDenied { .. } => error::HOOK_DENIED,
-            meerkat_core::AgentError::Llm { .. } => error::PROVIDER_ERROR,
-            meerkat_core::AgentError::SessionNotFound(_) => error::SESSION_NOT_FOUND,
-            meerkat_core::AgentError::BuildError(_) => error::PROVIDER_ERROR,
-            meerkat_core::AgentError::Cancelled => error::REQUEST_CANCELLED,
-            meerkat_core::AgentError::SkillResolutionFailed { .. } => {
-                error::SKILL_RESOLUTION_FAILED
-            }
-            meerkat_core::AgentError::InternalError(_) => error::INTERNAL_ERROR,
-            _ => error::INTERNAL_ERROR,
-        },
-        _ => error::INTERNAL_ERROR,
-    };
+    // The session transport mapping is owned by the contracts crate and
+    // shared with the `rkat` exit status.
+    let code = meerkat_contracts::error::session_transport_error_code(&err).jsonrpc_code();
     let core_apply_failure_cause = match err.primary_error() {
         SessionError::Agent(agent_err) => {
             use meerkat_core::lifecycle::core_executor::{

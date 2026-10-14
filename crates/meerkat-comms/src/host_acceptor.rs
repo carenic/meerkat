@@ -40,6 +40,15 @@ use crate::runtime::comms_runtime::{
     read_pairing_message, validate_pairing_secret, write_pairing_json,
 };
 
+/// Validate an advertised signed-comms TCP route: `tcp://HOST:PORT`, where
+/// HOST is a DNS name, an IPv4 address or a bracketed IPv6 address that
+/// peers can dial (not a wildcard) and PORT is nonzero. A DNS name is not
+/// resolved here: the transport resolves it when a peer connects.
+pub fn validate_advertised_tcp_address(address: &str) -> Result<(), String> {
+    let endpoint = parse_peer_address(address)?;
+    validate_advertised_tcp_endpoint(&endpoint).map_err(str::to_string)
+}
+
 fn validate_advertised_tcp_endpoint(
     endpoint: &meerkat_core::comms::PeerAddress,
 ) -> Result<(), &'static str> {
@@ -788,20 +797,9 @@ pub async fn spawn_host_acceptor(
     // create a healthy-looking daemon whose signed binding descriptor cannot
     // route back to it.
     let advertise_address = advertise_address
-        .map(|address| {
-            let endpoint = parse_peer_address(&address).map_err(|reason| {
-                HostAcceptorError::InvalidAdvertiseAddress {
-                    address: address.clone(),
-                    reason,
-                }
-            })?;
-            if let Err(reason) = validate_advertised_tcp_endpoint(&endpoint) {
-                return Err(HostAcceptorError::InvalidAdvertiseAddress {
-                    address,
-                    reason: reason.to_string(),
-                });
-            }
-            Ok(address)
+        .map(|address| match validate_advertised_tcp_address(&address) {
+            Ok(()) => Ok(address),
+            Err(reason) => Err(HostAcceptorError::InvalidAdvertiseAddress { address, reason }),
         })
         .transpose()?;
     let listener = TcpListener::bind(listen_tcp).await?;
@@ -1639,6 +1637,40 @@ mod tests {
             .expect("valid advertised TCP route should not require DNS resolution at startup");
             assert_eq!(handle.advertised_address(), address);
             handle.shutdown().await;
+        }
+    }
+
+    /// The public route validator the CLI's `--comms-advertise-tcp` shares:
+    /// DNS names and IP literals pass unresolved; a wildcard host, a zero or
+    /// missing port, and a non-TCP scheme are refused.
+    #[test]
+    fn advertised_tcp_address_validator_accepts_names_and_refuses_unusable_routes() {
+        for address in [
+            "tcp://worker.example:7801",
+            "tcp://localhost:4200",
+            "tcp://203.0.113.10:4200",
+            "tcp://[2001:db8::1]:7801",
+        ] {
+            assert_eq!(
+                validate_advertised_tcp_address(address),
+                Ok(()),
+                "{address}"
+            );
+        }
+        for address in [
+            "worker.example:7801",
+            "uds:///tmp/host.sock",
+            "tcp://worker.example",
+            "tcp://worker.example:0",
+            "tcp://0.0.0.0:7801",
+            "tcp://[::]:7801",
+            "tcp://*:7801",
+            "tcp://2001:db8::1:7801",
+        ] {
+            assert!(
+                validate_advertised_tcp_address(address).is_err(),
+                "{address} must be refused"
+            );
         }
     }
 
