@@ -66,7 +66,9 @@ on:
         # Run only gcp-buildbuddy (the whole Bazel graph): the release
         # final gate dispatches it on the release branch tip before the tag,
         # where the full graph otherwise first runs (#1687), and the same
-        # dispatch warms the remote cache for the tag run.
+        # dispatch warms the remote cache for the tag run. While
+        # MEERKAT_GCP_BUILDBUDDY_ENABLED is not 'true' such a dispatch runs
+        # nothing, and the tag validates with Cargo instead (release.yml).
         description: Run only the full BuildBuddy graph (pre-tag check / cache warm-up).
         required: false
         default: false
@@ -374,8 +376,12 @@ jobs:
       - name: Python + TypeScript SDK tests
         run: make -j2 test-sdk-python test-sdk-typescript
 
+  # Default OFF: the self-hosted GCP graph runs only while the repository
+  # variable MEERKAT_GCP_BUILDBUDDY_ENABLED is 'true'. Otherwise this job is
+  # skipped (nothing starts, syncs or scales) and the chains below still run.
   gcp-buildbuddy:
     name: GCP BuildBuddy (full-fresh)
+    if: ${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}
     uses: ./.github/workflows/buildbuddy.yml
     with:
       mode: full-fresh

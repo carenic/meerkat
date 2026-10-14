@@ -510,9 +510,12 @@ fn nightly_holds_a_bounded_number_of_hosted_slots() {
         if name == ROOT {
             assert!(job.get("needs").is_none(), "{ROOT} runs first");
             // A graph-only dispatch (the pre-tag check) runs exactly this job.
-            assert!(
-                job.get("if").is_none(),
-                "{ROOT} runs on every nightly run, graph-only dispatches included"
+            // Only the self-hosted graph's default-off repository gate skips
+            // it, and the chains below still run when it is skipped.
+            assert_eq!(
+                job.get("if").and_then(serde_yaml::Value::as_str),
+                Some("${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}"),
+                "{ROOT} runs on every nightly run while the self-hosted graph is enabled, graph-only dispatches included"
             );
             continue;
         }
@@ -607,6 +610,37 @@ fn buildbuddy_workflow_is_called_only_by_nightly_and_release() {
     assert!(
         release.contains(".schema_version == 4") && release.contains("github-hosted-cargo"),
         "require_ci_green must accept the Cargo PR CI attestation"
+    );
+    // The self-hosted graph is default off behind one repository variable:
+    // every job in buildbuddy.yml that starts, syncs or scales GCP carries it,
+    // and a tag validates with Cargo whenever it is off
+    // (scripts/test-gcp-buildbuddy-workflow-gate.sh plans both routes).
+    const GATE_ON: &str = "vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true'";
+    const GATE_OFF: &str = "vars.MEERKAT_GCP_BUILDBUDDY_ENABLED != 'true'";
+    let job_if = |workflow: &serde_yaml::Value, job: &str| -> String {
+        workflow
+            .get("jobs")
+            .and_then(|jobs| jobs.get(job))
+            .and_then(|job| job.get("if"))
+            .and_then(serde_yaml::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    for job in ["control-plane-up", "executors-up", "executors-down"] {
+        let condition = job_if(&doc, job);
+        assert!(
+            condition.contains(GATE_ON) && !condition.contains("||"),
+            "buildbuddy.yml job {job} must run only while the self-hosted graph is enabled; if: {condition:?}"
+        );
+    }
+    let release_doc = read_workflow(&release_yml);
+    assert!(
+        job_if(&release_doc, "release_validate_buildbuddy_full").contains(GATE_ON),
+        "the tag runs the full BuildBuddy graph only while the self-hosted graph is enabled"
+    );
+    assert!(
+        job_if(&release_doc, "release_validate_cargo").contains(GATE_OFF),
+        "the tag validates with Cargo while the self-hosted graph is disabled"
     );
 }
 
