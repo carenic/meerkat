@@ -10854,6 +10854,7 @@ async fn create_mcp_tools(
     wait_for_mcp: bool,
     mcp_auth: CliMcpAuthMode,
     external_surface_handle: Option<Arc<dyn meerkat_core::ExternalToolSurfaceHandle>>,
+    stdio_profile: meerkat::McpStdioLaunchProfile,
 ) -> anyhow::Result<Option<McpRouterAdapter>> {
     use meerkat_core::mcp_config::{McpConfig, McpScope, McpServerSource};
     use meerkat_mcp::{McpConnection, McpRouter};
@@ -10913,8 +10914,11 @@ async fn create_mcp_tools(
     let Some(external_surface_handle) = external_surface_handle else {
         anyhow::bail!("MCP config requires generated external-tool surface authority");
     };
-    let mut router = McpRouter::new_with_surface_handle(external_surface_handle)
-        .with_mcp_auth(mcp_auth.into(), mcp_auth_resolver);
+    let mut router = McpRouter::new_with_surface_handle_and_stdio_profile(
+        external_surface_handle,
+        stdio_profile,
+    )
+    .with_mcp_auth(mcp_auth.into(), mcp_auth_resolver);
     for s in &servers_with_scope {
         tracing::info!("Staging MCP server: {}", s.server.name);
         router
@@ -11005,6 +11009,7 @@ async fn load_mcp_external_tools(
     wait_for_mcp: bool,
     mcp_auth: CliMcpAuthMode,
     external_surface_handle: Option<Arc<dyn meerkat_core::ExternalToolSurfaceHandle>>,
+    stdio_profile: CliMcpStdioProfile,
 ) -> anyhow::Result<(
     Option<Arc<dyn AgentToolDispatcher>>,
     Option<Arc<McpRouterAdapter>>,
@@ -11017,6 +11022,7 @@ async fn load_mcp_external_tools(
             wait_for_mcp,
             mcp_auth,
             external_surface_handle,
+            stdio_profile,
         )
         .await
         {
@@ -11038,12 +11044,30 @@ async fn load_mcp_external_tools(
         let _ = wait_for_mcp;
         let _ = mcp_auth;
         let _ = external_surface_handle;
+        let _ = stdio_profile;
         Ok((None, None))
     }
 }
 
 #[cfg(not(feature = "mcp"))]
 type McpRouterAdapter = ();
+
+/// The local MCP launch boundary of a CLI factory, for the routers the CLI
+/// builds itself (the `rkat run` loader).
+#[cfg(feature = "mcp")]
+type CliMcpStdioProfile = meerkat::McpStdioLaunchProfile;
+#[cfg(not(feature = "mcp"))]
+type CliMcpStdioProfile = ();
+
+/// The factory's own local MCP launch boundary
+/// ([`AgentFactory::mcp_stdio_launch_profile`]), never one rebuilt per call.
+#[cfg(feature = "mcp")]
+fn cli_mcp_stdio_profile(factory: &AgentFactory) -> CliMcpStdioProfile {
+    factory.mcp_stdio_launch_profile().clone()
+}
+
+#[cfg(not(feature = "mcp"))]
+fn cli_mcp_stdio_profile(_factory: &AgentFactory) -> CliMcpStdioProfile {}
 
 /// Whether `persistence` opened a governed realm: its machine has the
 /// governed host installed, with or without available stock owners. Without
@@ -13343,6 +13367,9 @@ async fn run_agent(
         let governed_mcp =
             governed_configured_mcp_servers(&persistence, scope, &config.tools.mcp_servers).await?;
         let factory = with_governed_mcp_auth(factory, scope, governed_mcp.as_deref(), mcp_auth)?;
+        // The loader's router launches stdio servers inside the factory's
+        // own launch boundary.
+        let mcp_stdio_profile = cli_mcp_stdio_profile(&factory);
 
         let context_root = scope
             .context_root
@@ -13457,6 +13484,7 @@ async fn run_agent(
                 wait_for_mcp,
                 mcp_auth,
                 Some(Arc::clone(bindings.external_tool_surface())),
+                mcp_stdio_profile,
             )
             .await?
         };
@@ -14144,6 +14172,9 @@ async fn resume_session_with_llm_override(
         let governed_mcp =
             governed_configured_mcp_servers(&persistence, scope, &config.tools.mcp_servers).await?;
         let factory = with_governed_mcp_auth(factory, scope, governed_mcp.as_deref(), mcp_auth)?;
+        // The loader's router launches stdio servers inside the factory's
+        // own launch boundary.
+        let mcp_stdio_profile = cli_mcp_stdio_profile(&factory);
 
         log_stage("build_cli_persistent_service");
         // Build persistent session service for resume — durable runtime
@@ -14224,6 +14255,7 @@ async fn resume_session_with_llm_override(
                 wait_for_mcp,
                 mcp_auth,
                 Some(Arc::clone(resume_bindings.external_tool_surface())),
+                mcp_stdio_profile,
             )
             .await?
         };
@@ -20893,6 +20925,7 @@ where
         factory = factory.user_config_root(user_root);
     }
 
+    let mcp_stdio_profile = cli_mcp_stdio_profile(&factory);
     let skill_runtime = factory.build_skill_runtime(&config).await?;
     let config_runtime = Arc::new(meerkat_core::ConfigRuntime::new(
         Arc::clone(&config_store),
@@ -20960,8 +20993,15 @@ where
     if let Some(warning) = mobpack_rpc_realm_mcp_warning(&config.tools.mcp_servers) {
         eprintln!("warning: {warning}");
     }
-    let (mcp_external_tools, _mcp_adapter_guard) =
-        load_mcp_external_tools(scope, &[], false, CliMcpAuthMode::Stored, None).await?;
+    let (mcp_external_tools, _mcp_adapter_guard) = load_mcp_external_tools(
+        scope,
+        &[],
+        false,
+        CliMcpAuthMode::Stored,
+        None,
+        mcp_stdio_profile,
+    )
+    .await?;
 
     let external_tools_provider: Option<meerkat_mob::ExternalToolsProvider> = Some(Arc::new({
         let runtime = runtime.clone();
@@ -28239,6 +28279,77 @@ url = "https://user.example/mcp"
 
         assert!(challenge.contains("resource_metadata"));
         handle.await.expect("preflight server finishes");
+    }
+
+    /// The `rkat run` loader launches the realm's stdio servers inside the
+    /// factory's own MCP stdio launch profile. Under a required profile the
+    /// backend refuses (`require_descendant_termination` is unsupported on
+    /// every backend): the server is refused typed and never starts.
+    #[cfg(all(feature = "mcp", unix))]
+    #[tokio::test]
+    async fn test_cli_mcp_loader_launches_inside_the_factory_stdio_launch_profile() {
+        use meerkat_core::confinement::{
+            ConfinementRefusal, ConfinementSpec, FilesystemAccess, IpNetworkAccess, PathAccess,
+            PlatformBaseline,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let marker = root.join("loader-launch-marker");
+        let scope = test_scope(root.join("realms"), "loader-realm");
+        let requirement = ConfinementSpec {
+            baseline: PlatformBaseline::CommandRuntimeV1,
+            read: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.clone())]),
+            write: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.clone())]),
+            deny_read: vec![],
+            deny_write: vec![],
+            network: IpNetworkAccess::Denied,
+            unix_connect: vec![],
+            require_descendant_termination: true,
+        }
+        .try_into()
+        .unwrap();
+        let factory = AgentFactory::new(root.join("sessions")).with_mcp_stdio_launch_profile(
+            meerkat::McpStdioLaunchProfile::required(requirement, root.clone()),
+        );
+        let server = meerkat_core::McpServerConfig::stdio(
+            "confined-realm-server",
+            "/bin/sh",
+            vec!["-c".into(), "printf entered > \"$MARKER\"".into()],
+            HashMap::from([("MARKER".into(), marker.display().to_string())]),
+        );
+
+        let adapter = create_mcp_tools(
+            &scope,
+            &[server],
+            false,
+            CliMcpAuthMode::Stored,
+            Some(Arc::new(
+                meerkat_runtime::handles::RuntimeExternalToolSurfaceHandle::ephemeral(),
+            )),
+            cli_mcp_stdio_profile(&factory),
+        )
+        .await
+        .expect("the loader stages the realm server")
+        .expect("one configured server");
+        let deltas = adapter
+            .wait_until_ready(std::time::Duration::from_secs(15))
+            .await
+            .unwrap();
+
+        assert!(
+            deltas.iter().any(|delta| {
+                delta.target == "confined-realm-server"
+                    && delta.phase == meerkat_core::ExternalToolDeltaPhase::Failed
+                    && delta.confinement_refusal == Some(ConfinementRefusal::UnsupportedRequirement)
+            }),
+            "the loader's launch is refused by the factory's boundary: {deltas:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "a refused server never starts its process"
+        );
+        adapter.shutdown().await;
     }
 
     #[cfg(feature = "mcp")]

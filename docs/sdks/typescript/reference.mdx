@@ -179,8 +179,10 @@ first turn later through `await deferred.startTurn(...)`, or streams it through
 immediate turn exists; pass it to the first turn instead. Both deferred turn
 methods accept `injectedContext`, `transientTurnContext`, `skillRefs`,
 `turnToolOverlay`, `additionalInstructions`, `keepAlive`, `model`, `provider`,
-`selfHostedServerId`, `maxTokens`, `systemPrompt`, `outputSchema`,
-`structuredOutputRetries`, `providerParams`, and `authBinding`.
+`selfHostedServerId`, `systemPrompt`, `providerParams`, and `authBinding`.
+Their `maxTokens`, `outputSchema`, and `structuredOutputRetries` options are
+refused by the server on a turn (`INVALID_PARAMS`): set those build settings
+at creation.
 
 ### LiveChannel
 

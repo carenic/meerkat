@@ -4553,7 +4553,8 @@ export class MeerkatClient {
   // server implements the write-side methods (auth/profile/create, delete,
   // login/start, login/complete, login/device_start, logout) itself; a
   // refusal arrives as a typed error whose `error.data.reason` is read with
-  // `authErrorReason`.
+  // `authErrorReason`. The wrappers surface whatever the server returns, so
+  // they stay honest about its state.
 
   async realmList(): Promise<unknown> {
     return this.request("realm/list", {});
@@ -4699,8 +4700,12 @@ export class MeerkatClient {
   }
 
   /**
-   * Remove an MCP server target's stored credential via `auth/logout`.
-   * Nothing is revoked at the provider; a pending attempt is unaffected.
+   * Disconnect an MCP server target via `auth/logout`. The target must name
+   * a server configured for this host. Logout retires the login attempt
+   * pending for the server, removes its stored credential, and stops
+   * offering the server to this runtime's sessions until a later login.
+   * Nothing is revoked at the provider; `cleared` is true even when no
+   * credential was stored.
    */
   async authMcpLogout(
     mcp: RpcWireMcpAuthTarget,

@@ -2,19 +2,60 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# The source scans below read this checkout through Git. A hook inherits
+# repository-local Git variables (GIT_DIR, GIT_INDEX_FILE, ...) that would
+# point them elsewhere, so drop them, as the pre-push dispatcher does.
+while IFS= read -r git_local_env; do
+  unset "$git_local_env"
+done < <(git rev-parse --local-env-vars)
+
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/meerkat-ci-nextest-archive.XXXXXX")"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
 LOG="${TEST_ROOT}/commands.log"
 FAKE_CARGO="${TEST_ROOT}/repo-cargo"
 FAKE_NEXTEST="${TEST_ROOT}/cargo-nextest"
+FAKE_METADATA="${TEST_ROOT}/metadata.json"
+FAKE_FIXTURE_BINARY="${TEST_ROOT}/mcp-test-server"
 
+# The archive build asks scripts/mcp-test-server-fixture whether a selected
+# package dev-depends on mcp-test-server, and builds the fixture first if so.
+# The fake answers that `cargo metadata` call and the fixture build, so the
+# fixture's real selection runs and any fixture error fails this test.
 cat >"$FAKE_CARGO" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'cargo' >>"$COMMAND_LOG"
 printf ' <%s>' "$@" >>"$COMMAND_LOG"
 printf '\n' >>"$COMMAND_LOG"
+case "${1:-}" in
+  metadata)
+    [[ "$*" == 'metadata --format-version=1 --no-deps' ]] || {
+      echo "fake cargo: unexpected metadata call: $*" >&2
+      exit 93
+    }
+    case "${FAKE_CARGO_METADATA:-ok}" in
+      ok) cat "$FAKE_METADATA" ;;
+      invalid) echo 'not cargo metadata' ;;
+      *)
+        echo "fake cargo: metadata failed" >&2
+        exit 94
+        ;;
+    esac
+    exit 0
+    ;;
+  build)
+    [[ "$*" == 'build -p mcp-test-server --bin mcp-test-server --locked --message-format=json-render-diagnostics' ]] || {
+      echo "fake cargo: unexpected build call: $*" >&2
+      exit 95
+    }
+    printf '{"reason":"compiler-artifact","target":{"name":"mcp-test-server","kind":["bin"]},"executable":"%s"}\n' \
+      "$FAKE_FIXTURE_BINARY"
+    printf '{"reason":"build-finished","success":true}\n'
+    exit 0
+    ;;
+esac
 archive_file=""
 while (($#)); do
   if [[ "$1" == "--archive-file" ]]; then
@@ -40,11 +81,28 @@ printf '\n' >>"$COMMAND_LOG"
 EOF
 
 chmod +x "$FAKE_CARGO" "$FAKE_NEXTEST"
+# The workspace's mcp-test-server dev-dependents (meerkat, meerkat-mcp,
+# meerkat-rpc, meerkat-integration-tests) and two packages without one.
+cat >"$FAKE_METADATA" <<'EOF'
+{"packages": [
+  {"name": "meerkat", "dependencies": [{"name": "mcp-test-server", "kind": "dev"}]},
+  {"name": "meerkat-mcp", "dependencies": [{"name": "mcp-test-server", "kind": "dev"}]},
+  {"name": "meerkat-rpc", "dependencies": [{"name": "mcp-test-server", "kind": "dev"}]},
+  {"name": "meerkat-integration-tests", "dependencies": [{"name": "mcp-test-server", "kind": "dev"}]},
+  {"name": "meerkat-mob", "dependencies": []},
+  {"name": "mcp-test-server", "dependencies": []}
+]}
+EOF
+printf '#!/bin/sh\nexit 0\n' >"$FAKE_FIXTURE_BINARY"
+chmod +x "$FAKE_FIXTURE_BINARY"
 export COMMAND_LOG="$LOG"
 export EXPECTED_WORKSPACE_ROOT="$ROOT"
 export ROOT
 export CARGO="$FAKE_CARGO"
 export NEXTEST_BIN="$FAKE_NEXTEST"
+export FAKE_METADATA FAKE_FIXTURE_BINARY
+# An exported fixture path would skip the fixture build this test observes.
+unset MEERKAT_MCP_TEST_SERVER FAKE_CARGO_METADATA
 
 families=(unit unit-mob int-heavy int-mob int-everything-else)
 for family in "${families[@]}"; do
@@ -72,6 +130,37 @@ assert_line_contains 'cargo <nextest> <archive> <--workspace> <--lib>'
 assert_line_contains 'cargo <nextest> <archive> <-p> <meerkat-integration-tests> <--tests> <--profile> <fast>'
 assert_line_contains '<-p> <meerkat-mob> <-p> <meerkat-mob-adaptive>'
 assert_line_contains '<--workspace> <--exclude> <meerkat-integration-tests> <--exclude> <meerkat-mob>'
+
+# Per family, in order: the fixture check, then the fixture build when a
+# selected package dev-depends on mcp-test-server (so the binary rides in the
+# archive), then the archive. unit-mob and int-mob select no such package.
+cargo_sequence="$(sed -n 's/^cargo <\([^>]*\)>.*/\1/p' "$LOG" | tr '\n' ' ')"
+expected_cargo_sequence='metadata build nextest metadata nextest metadata build nextest metadata nextest metadata build nextest '
+[[ "$cargo_sequence" == "$expected_cargo_sequence" ]] || {
+  echo "archive builds did not check and build the mcp-test-server fixture before archiving" >&2
+  echo "  expected cargo calls: ${expected_cargo_sequence}" >&2
+  echo "  actual cargo calls:   ${cargo_sequence}" >&2
+  exit 1
+}
+# A fixture check that cannot read the package graph stops the archive build;
+# it must never be taken for "no package needs the fixture".
+for metadata_mode in fail invalid; do
+  metadata_archive="${TEST_ROOT}/metadata-${metadata_mode}.tar.zst"
+  if COMMAND_LOG="${TEST_ROOT}/metadata-${metadata_mode}.log" \
+    FAKE_CARGO_METADATA="$metadata_mode" \
+    "$ROOT/scripts/ci-nextest-archive.sh" build unit "$metadata_archive" \
+    >"${TEST_ROOT}/metadata-${metadata_mode}.out" 2>&1; then
+    echo "archive build ignored a failed mcp-test-server fixture check (cargo metadata: ${metadata_mode})" >&2
+    cat "${TEST_ROOT}/metadata-${metadata_mode}.out" >&2
+    exit 1
+  fi
+  if ! grep -Fq 'mcp-test-server-fixture: ' "${TEST_ROOT}/metadata-${metadata_mode}.out" ||
+    [[ -e "$metadata_archive" ]]; then
+    echo "archive build did not stop at the failed fixture check (cargo metadata: ${metadata_mode})" >&2
+    cat "${TEST_ROOT}/metadata-${metadata_mode}.out" >&2
+    exit 1
+  fi
+done
 
 run_count="$(grep -c '^nextest ' "$LOG")"
 [[ "$run_count" == 6 ]] || {
@@ -291,26 +380,38 @@ assert_file_contains "$TOP_LEVEL_WORKFLOW" 'cargo-nextest nextest run --archive-
 WORKFLOW_PROBE_ROOT="${TEST_ROOT}/workflow-entrypoints"
 mkdir -p "${WORKFLOW_PROBE_ROOT}/.github/workflows"
 WORKFLOW_CHECK="${TEST_ROOT}/doctor-workflow-check.sh"
+WORKFLOW_BAD='GitHub workflow Rust entrypoints bypass scripts/repo-cargo'
 cat >"${WORKFLOW_CHECK}" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 pass() { :; }
 bad() { printf '%s\n' "$1" >&2; return 1; }
 EOF
-sed -n '/^raw_cargo_workflow_hits=/,/^rust_channel=/p' \
-  "$ROOT/scripts/rust-lane-doctor" | sed '$d' >>"${WORKFLOW_CHECK}"
-grep -Fq 'bad "GitHub workflow Rust entrypoints bypass scripts/repo-cargo"' "${WORKFLOW_CHECK}" || {
+# Exactly the workflow check: from its first scan through the `fi` that ends
+# its verdict. Later doctor checks (such as the env bash version) are not
+# this contract and must not decide the probes below.
+awk '
+  /^raw_cargo_workflow_hits=/ { selected = 1 }
+  selected { print }
+  selected && /^fi$/ { exit }
+' "$ROOT/scripts/rust-lane-doctor" >>"${WORKFLOW_CHECK}"
+if ! grep -Fq "bad \"${WORKFLOW_BAD}\"" "${WORKFLOW_CHECK}" ||
+  ! grep -Fq 'pass "GitHub workflow Rust entrypoints use the repo Cargo wrapper"' "${WORKFLOW_CHECK}" ||
+  [[ "$(tail -n 1 "${WORKFLOW_CHECK}")" != 'fi' ]]; then
   echo "doctor workflow check fixture no longer selects its actual owner" >&2
   exit 1
-}
+fi
 check_workflow_entrypoints() {
   local description="$1" expected="$2" source="$3" actual
   printf '%s\n' "${source}" >"${WORKFLOW_PROBE_ROOT}/.github/workflows/probe.yml"
   if (cd "${WORKFLOW_PROBE_ROOT}" && bash "${WORKFLOW_CHECK}") \
     >"${TEST_ROOT}/workflow-check.out" 2>&1; then
     actual=pass
-  else
+  elif grep -Fxq -- "${WORKFLOW_BAD}" "${TEST_ROOT}/workflow-check.out"; then
     actual=fail
+  else
+    # Exiting without the check's own verdict is a crash, not a detection.
+    actual=error
   fi
   if [[ "${actual}" != "${expected}" ]]; then
     echo "doctor workflow check ${description}: expected ${expected}, got ${actual}" >&2
@@ -334,6 +435,16 @@ check_workflow_entrypoints "lookalike flag" fail $'run: |\n  cargo-nextest nexte
 check_workflow_entrypoints "test-binary argument flag" fail $'run: |\n  cargo-nextest nextest run -p meerkat-core -- --archive-file fixture.tar.zst'
 check_workflow_entrypoints "comment cannot continue over next command" fail $'run: |\n  cargo-nextest nextest list --archive-file fixture.tar.zst # \\\n  cargo-nextest nextest run -p meerkat-core'
 check_workflow_entrypoints "raw Cargo archive consumer" fail 'run: cargo nextest list --archive-file fixture.tar.zst'
+# The raw Cargo scan: `run: cargo` anywhere, or a line of whitespace and then
+# `cargo <build or test subcommand>` as a whole word.
+check_workflow_entrypoints "inline raw Cargo command" fail '    run: cargo fmt --all -- --check'
+check_workflow_entrypoints "indented raw Cargo command" fail $'run: |\n  cargo build -p meerkat-core'
+check_workflow_entrypoints "tab-indented raw Cargo command" fail $'run: |\n\tcargo clippy --workspace'
+check_workflow_entrypoints "CRLF raw Cargo command" fail $'run: |\r\n  cargo test -p meerkat-core\r'
+check_workflow_entrypoints "raw Cargo subcommand at line end" fail $'run: |\n  cargo machete'
+check_workflow_entrypoints "Cargo subcommand prefix of a word" pass $'run: |\n  cargo testing --help'
+check_workflow_entrypoints "Cargo after another command" pass $'run: |\n  echo cargo build'
+check_workflow_entrypoints "unlisted Cargo subcommand" pass $'run: |\n  cargo metadata --format-version=1'
 check_workflow_entrypoints "quoted diagnostic" pass 'run: echo "cargo-nextest nextest run"'
 assert_file_contains "$RELEASE_WORKFLOW" '.schema_version == 4'
 assert_file_contains "$RELEASE_WORKFLOW" '.validation_backend == "github-hosted-cargo"'
@@ -345,9 +456,15 @@ assert_file_contains "$RELEASE_WORKFLOW" '.component_results.github_hosted_dense
 # The restore helper runs on the release scripts' Python >= 3.10 floor.
 restore_python="$("$ROOT/scripts/require-python" 3.10 "the nextest archive restore test")" || exit 1
 "$restore_python" "$ROOT/scripts/test_restore_ci_unit_mob_archive.py"
-# Also on the oldest supported interpreter, when one is installed.
+# Also on the oldest supported interpreter, when one is installed and runs: a
+# version manager's python3.10 shim (pyenv, asdf) without a selected 3.10
+# exits 127 instead of running Python.
 if oldest_python="$(command -v python3.10 2>/dev/null)"; then
-  "$oldest_python" "$ROOT/scripts/test_restore_ci_unit_mob_archive.py"
+  if "$oldest_python" -c 'import sys; raise SystemExit(sys.version_info[:2] != (3, 10))' >/dev/null 2>&1; then
+    "$oldest_python" "$ROOT/scripts/test_restore_ci_unit_mob_archive.py"
+  else
+    echo "note: ${oldest_python} does not run Python 3.10; skipped the restore test on the 3.10 floor" >&2
+  fi
 fi
 
 unit_job="$(sed -n '/^  unit:$/,/^  int-archives:$/p' "$WORKFLOW")"
@@ -385,14 +502,30 @@ else_job="$(sed -n '/^  int-else:$/,/^  int-rest:$/p' "$WORKFLOW")"
   exit 1
 }
 
-if rg -n 'env!\("CARGO_BIN_EXE_' "$ROOT" --glob '*.rs'; then
+# Prints every line of a tracked or untracked (not ignored) *.rs file that
+# contains the literal $1. Git, not ripgrep: Git is on every machine that runs
+# this hook, and a user ripgrep config cannot change the result.
+rust_source_lines() {
+  local matches status=0
+  matches="$(git -C "$ROOT" grep --untracked -n -F -e "$1" -- '*.rs')" || status=$?
+  case "$status" in
+    0) printf '%s\n' "$matches" ;;
+    1) ;;
+    *)
+      echo "error: git grep failed (exit ${status}) scanning Rust sources for $1" >&2
+      return 1
+      ;;
+  esac
+}
+
+bin_exe_matches="$(rust_source_lines 'env!("CARGO_BIN_EXE_')" || exit 1
+if [[ -n "$bin_exe_matches" ]]; then
+  printf '%s\n' "$bin_exe_matches"
   echo "archived tests must resolve Cargo binary paths from the runtime environment" >&2
   exit 1
 fi
 
-manifest_dir_env_matches="$(
-  rg -n 'env!\("CARGO_MANIFEST_DIR"\)' "$ROOT" --glob '*.rs' || true
-)"
+manifest_dir_env_matches="$(rust_source_lines 'env!("CARGO_MANIFEST_DIR")')" || exit 1
 manifest_dir_env_count="$(
   printf '%s\n' "$manifest_dir_env_matches" | sed '/^$/d' | wc -l | tr -d '[:space:]'
 )"

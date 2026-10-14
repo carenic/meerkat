@@ -188,8 +188,12 @@ Since 0.7.12 (PR #821, the Meta upstream asks):
   ENFORCED (previously admission-gated then dropped at the actor spawn
   sites): `ToolExecutionPolicy` (sealed resolved form) +
   `ExecutionPolicyGatedDispatcher`
-  (crates/meerkat-core/src/tool_execution_policy.rs) gate execution while leaving
-  `tools()`/`tool_catalog()` byte-identical (prompt-cache preserved). Deny
+  (crates/meerkat-core/src/tool_execution_policy.rs) gate execution; the gate
+  itself leaves `tools()`/`tool_catalog()` byte-identical. Since #1807 the
+  names a policy makes unreachable (a deny list, a profile `tools.deny`, the
+  complement of an allow list) also leave the visible scope through the
+  session's `policy_base_filter` (`ToolExecutionPolicy::static_visibility_filter`,
+  recomputed on every build); read-only intent hides nothing. Deny
   surfaces as an ordinary `access_denied` tool error (run continues); hook
   denials remain the run-fatal channel. The gate wraps OUTERMOST in the
   factory; the effective policy persists in session metadata

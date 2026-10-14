@@ -146,9 +146,32 @@ else
   pass "shell build/test entrypoints use the repo Cargo wrapper"
 fi
 
-raw_cargo_workflow_hits="$(
-  rg -n 'run: cargo|^\s+cargo (check|test|nextest|run|xtask|build|unit|int|e2e|clippy|machete)\b' \
-    .github/workflows 2>/dev/null || true
+raw_cargo_workflow_hits="$(python3 - <<'PYTHON'
+from pathlib import Path
+import re
+
+# The ripgrep scan this replaces, without needing ripgrep: the same pattern,
+# per "\n"-separated line, over every readable file below .github/workflows.
+# The ASCII lookahead is rg's `\b` after the subcommand; Python's Unicode `\s`
+# covers rg's. Where the two differ, this flags a line rg missed, never the
+# reverse.
+RAW_CARGO = re.compile(
+    r"run: cargo"
+    r"|^\s+cargo (?:check|test|nextest|run|xtask|build|unit|int|e2e|clippy|machete)"
+    r"(?![A-Za-z0-9_])"
+)
+
+root = Path(".github/workflows")
+if root.is_dir():
+    for path in sorted(entry for entry in root.rglob("*") if entry.is_file()):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line_number, line in enumerate(text.split("\n"), 1):
+            if RAW_CARGO.search(line):
+                print(f"{path}:{line_number}:{line}")
+PYTHON
 )"
 direct_nextest_workflow_hits="$(python3 - <<'PYTHON'
 from pathlib import Path

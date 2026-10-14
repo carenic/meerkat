@@ -430,8 +430,11 @@ interface SessionOptions {
 turn instead. `startTurn(...)` and `stream(...)` take `injectedContext`,
 `transientTurnContext`, `skillRefs`, `turnToolOverlay`,
 `additionalInstructions`, `keepAlive`, `model`, `provider`,
-`selfHostedServerId`, `maxTokens`, `systemPrompt`, `outputSchema`,
-`structuredOutputRetries`, `providerParams`, and `authBinding`.
+`selfHostedServerId`, `systemPrompt`, `providerParams`, and `authBinding`.
+The turn options also carry `maxTokens`, `outputSchema`, and
+`structuredOutputRetries`, but the server refuses them on a turn with
+`INVALID_PARAMS`: they are build settings, so set them on `createSession(...)`
+or `createDeferredSession(...)`.
 
 ---
 
@@ -496,7 +499,7 @@ async turn(
 ): Promise<RunResult>
 ```
 
-Sends another turn to the session and returns the `RunResult`. Also updates the session's last-result shortcuts.
+Sends another turn to the session and returns the `RunResult`. Also updates the session's last-result shortcuts. `maxTokens`, `outputSchema`, and `structuredOutputRetries` are build settings: the server refuses them on a turn with `INVALID_PARAMS`, so set them when you create the session.
 
 ```typescript
 const result = await session.turn("Now explain the second point in more detail");

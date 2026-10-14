@@ -610,3 +610,42 @@ mod factory_async {
         assert!(!root.join("private-launch-marker").exists());
     }
 }
+
+/// The supported standalone router constructor retains a host's launch
+/// boundary: a stdio server it adds is refused typed and never starts.
+#[tokio::test]
+async fn standalone_router_keeps_the_host_stdio_launch_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let requirement = ConfinementSpec {
+        baseline: PlatformBaseline::CommandRuntimeV1,
+        read: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.clone())]),
+        write: FilesystemAccess::Paths(vec![PathAccess::Subtree(root.clone())]),
+        deny_read: vec![],
+        deny_write: vec![],
+        network: IpNetworkAccess::Denied,
+        unix_connect: vec![],
+        require_descendant_termination: true,
+    }
+    .try_into()
+    .unwrap();
+    let factory = AgentFactory::minimal()
+        .with_mcp_stdio_launch_profile(McpStdioLaunchProfile::required(requirement, root.clone()));
+    let mut router = meerkat::mcp::standalone_router_with_stdio_profile(
+        factory.mcp_stdio_launch_profile().clone(),
+    );
+    let marker = root.join("standalone-launch-marker");
+    let config = meerkat_core::McpServerConfig::stdio(
+        "standalone-server",
+        "/bin/sh",
+        vec!["-c".into(), "printf entered > \"$MARKER\"".into()],
+        HashMap::from([("MARKER".into(), marker.display().to_string())]),
+    );
+    assert!(matches!(
+        router.add_server(config).await,
+        Err(McpError::Confinement(
+            ConfinementRefusal::UnsupportedRequirement
+        ))
+    ));
+    assert!(!marker.exists());
+}
