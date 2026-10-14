@@ -200,10 +200,11 @@ default_model = "my-deployment"     # the Azure deployment name
 `profile`, `profile-delete`, `test`, `status` and `refresh`, `--realm` picks a
 realm section of the already-loaded workspace and `global` config; it does
 not load that realm's own config file. It filters `bindings`. It does not
-retarget `login` or `logout`. `connector-client` is different: `set`,
-`rotate-secret` and `remove` write the named realm's own config document
+retarget `login` or `logout`. `connector-client` is different: `set` and
+`remove` write the named realm's own config document
 (`<state root>/<realm>/config.toml`; for `global`, `~/.rkat/config.toml`),
-and `list` reads that realm's effective chain.
+`rotate-secret` reads the client from that document and replaces only its
+stored secret, and `list` reads that realm's effective chain.
 
 | Command | What it does |
 |---|---|
@@ -353,8 +354,10 @@ switching: references/hooks_models_model_operations.md.
 - `auth/login/provision_api_key` exchanges an Anthropic Console OAuth access
   token for a stored API key (`oauth_to_api_key`).
 - Login, cancel and status also accept MCP server targets (`{"mcp": {...}}`)
-  and connector slots (`{"connector": {...}}`); see the MCP and connector
-  references. MCP and connector status are RPC-only.
+  and connector slots (`{"connector": {...}}`); MCP targets are described in
+  `references/mcp_tools_skills_mcp.md` ("MCP OAuth") and connector clients
+  under "Connector OAuth clients" below. MCP and connector status are
+  RPC-only.
 - Errors: RPC puts the typed reason in `error.data.reason`, REST in the body
   `reason`. Branch on it (Python `auth_error_reason(error)`, TypeScript
   `authErrorReason(error)`), never on text. Binding-login reasons include

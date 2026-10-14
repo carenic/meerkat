@@ -179,7 +179,8 @@ JSON definition is not inspected). The member prompt comes from `skills` and
 `[skills.<id>]` tables. For extra role text use `additional_instructions` on
 `mob/spawn`, or `mob/append_system_context` at run time; identity-first hosts
 (Meta) set `DurableAgentSpec.additional_instructions`. Other unknown keys
-only log a warning.
+only log a warning (diagnostic `unknown_profile_key` at
+`profiles.<profile>.<key>`).
 
 A member's tool restriction joins its role's current profile with the
 profile it was spawned on (deny lists joined; either `read_only` applies). A

@@ -444,7 +444,7 @@ Requests for exclusions return `CAPABILITY_UNAVAILABLE` with typed clearing
 actions; inspect the profile for the complete current capability set.
 
 **WASM API:**
-See the meerkat-wasm skill (`references/api_surface.md`) for the authoritative export list. Key mob-related exports:
+Key mob-related exports (a partial list; the full WASM export reference is not part of `rkat help`):
 ```
 mob_create(definition_json) → mob_id string  [async]
 mob_spawn(mob_id, specs_json) → result JSON  [async]

@@ -41,8 +41,9 @@ API changes, error codes, SDKs, prebuilt binaries and Rust embedding:
   turn completes. `SESSION_BUSY` (-32002) means the session cannot take the
   request now: it is still being materialized, served by another process, or
   tearing down.
-- A turn that keeps failing is retried back to back up to 3 times within one
-  wake (about three times the model spend), then its input ends abandoned:
+- A turn that keeps failing is attempted back to back at most 3 times in
+  total within one wake (about three times the model spend), then its input
+  ends abandoned:
   `session/input_status` shows `terminal_outcome: "abandoned"` (Rust
   `InputAbandonReason::MaxAttemptsExhausted {attempts}`). At the cap the whole
   refused batch ends this way, so other queued inputs can show it too.
@@ -274,6 +275,9 @@ job, monitor or command hook), process custody (Linux and macOS) stops that
 earlier incarnation's processes before the agent is rebuilt. The run's inputs are
 settled as interrupted and not replayed, and the transcript gets a
 `tool_process_recovery` notice with a `tool_process_interrupted` block (the
-tool's effects may be partial or complete). When custody cannot be proven,
+tool's effects may be partial or complete). Custody knows whether the tool
+process started: a spawn gate holds the command until the host has durably
+recorded it, and if the host dies first nothing runs. When custody cannot be
+proven,
 building the agent fails closed with `ProcessCustodyError`, whose message
 names the operator action (0.8.49).

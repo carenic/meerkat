@@ -260,3 +260,7 @@ RPC (the client answers inline):
   "resumable": true}` and runs nothing.
 - `rkat-mcp` sets no deadline on a suspended turn; the 120 s limit is the RPC
   `tool/execute` one.
+- REST: a turn that stops on a callback tool fails with HTTP 500 and
+  `code: "CALLBACK_PENDING"`; `details` carries `session_id`,
+  `session_ref`, `session_created`, `resumable: true`, `tool_name`, `args` and
+  `pending_tool_calls`.

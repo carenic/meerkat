@@ -203,7 +203,11 @@ committed from a live channel carry `realtime_origin` (its channel and
 model has no tools: work that needs tools, files or reasoning is delegated to
 the session's durable executor (up to 4 delegations per channel in parallel,
 tracked as WorkGraph items; serial without a WorkGraph store) and the result
-is spoken back. It is compiled only with the `openai-live` Cargo feature (off
+is spoken back. For a mob member's live channel the default execution policy
+is `DurableFork`: each delegation runs in a durable fork of the member (worker
+member `live-delegation-<operation>`); a Rust host can compose
+`ExistingMember` (`compose_experimental_live_delegation_coordinator_with_policy`),
+which runs delegations on the member itself, one at a time. It is compiled only with the `openai-live` Cargo feature (off
 by default, absent from released binaries), and the host must install the
 public authority (`ExperimentalGptLiveOpenAuthority::new_public`) with an
 OpenAI API-key binding; stock `rkat-rpc` never does this. Callers open with
