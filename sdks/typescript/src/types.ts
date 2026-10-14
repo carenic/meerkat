@@ -884,7 +884,7 @@ export interface MobTurnStartOptions {
    * (or an untagged binding ref, which the server admits as Set),
    * `{ action: "clear" }`, or omit the option to inherit.
    */
-  readonly authBinding?: Record<string, unknown>;
+  readonly authBinding?: TurnAuthBindingOverride;
 }
 
 export interface MobEventsOptions {

@@ -176,14 +176,11 @@ The `Session` methods are thin conveniences over canonical runtime calls:
 first turn later through `await deferred.startTurn(...)`, or streams it through
 `deferred.stream(...) -> EventStream`. Although deferred creation reuses
 `SessionOptions`, the server rejects `transientTurnContext` because no
-immediate turn exists. Current `DeferredTurnOptions` omits `injectedContext`,
-`transientTurnContext`, and `selfHostedServerId`. Set injected context during
-deferred creation; transient first-turn context and a self-hosted server route
-are not expressible through the current deferred TypeScript wrapper. Both
-deferred turn methods accept `skillRefs`, `turnToolOverlay`,
-`additionalInstructions`, `keepAlive`, `model`, `provider`, `maxTokens`,
-`systemPrompt`, `outputSchema`, `structuredOutputRetries`, `providerParams`,
-and `authBinding`.
+immediate turn exists; pass it to the first turn instead. Both deferred turn
+methods accept `injectedContext`, `transientTurnContext`, `skillRefs`,
+`turnToolOverlay`, `additionalInstructions`, `keepAlive`, `model`, `provider`,
+`selfHostedServerId`, `maxTokens`, `systemPrompt`, `outputSchema`,
+`structuredOutputRetries`, `providerParams`, and `authBinding`.
 
 ### LiveChannel
 

@@ -285,12 +285,15 @@ export class Session {
 
 /** Turn-time override options for deferred sessions. */
 export interface DeferredTurnOptions {
+  injectedContext?: TurnOptions["injectedContext"];
+  transientTurnContext?: TurnOptions["transientTurnContext"];
   skillRefs?: SkillRef[];
   turnToolOverlay?: TurnOptions["turnToolOverlay"];
   additionalInstructions?: TurnOptions["additionalInstructions"];
   keepAlive?: TurnOptions["keepAlive"];
   model?: TurnOptions["model"];
   provider?: TurnOptions["provider"];
+  selfHostedServerId?: TurnOptions["selfHostedServerId"];
   maxTokens?: TurnOptions["maxTokens"];
   systemPrompt?: TurnOptions["systemPrompt"];
   outputSchema?: TurnOptions["outputSchema"];

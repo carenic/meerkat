@@ -935,7 +935,11 @@ function mobTurnStartPayload(
   setIfDefined(payload, "output_schema", options?.outputSchema);
   setIfDefined(payload, "structured_output_retries", options?.structuredOutputRetries);
   setIfDefined(payload, "provider_params", options?.providerParams);
-  setIfDefined(payload, "auth_binding", options?.authBinding);
+  setIfDefined(
+    payload,
+    "auth_binding",
+    options?.authBinding as MobTurnStartParams["auth_binding"],
+  );
   return payload;
 }
 
