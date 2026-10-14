@@ -142,8 +142,70 @@ Do not execute commands, mutate state, or claim to have performed actions. If a 
 /// `skills.max_injection_bytes` (32 KiB by default).
 pub const HELP_MIN_INJECTION_BYTES: usize = 192 * 1024;
 
+/// Session metadata key that marks a help session. Every help entry point
+/// sets it, through [`help_session_metadata_entry`], in the build that
+/// creates the session, and it persists with the session. The `meerkat.`
+/// namespace is reserved for Meerkat: no caller-supplied label or app context
+/// can set or clear it.
+pub const HELP_SESSION_METADATA_KEY: &str = "meerkat.help_session";
+
+/// The initial session metadata entry that marks the session a build creates
+/// as a help session.
+pub fn help_session_metadata_entry() -> (String, serde_json::Value) {
+    (
+        HELP_SESSION_METADATA_KEY.to_string(),
+        serde_json::Value::Bool(true),
+    )
+}
+
+/// Refusal to rebuild a help session from storage.
+///
+/// A help session's reference tools exist only in the live session its help
+/// entry point built. Rebuilt from storage, after a restart or by a surface
+/// that rebuilds a session for a turn, it would get that surface's ordinary
+/// tools instead. Every rebuild of a help session therefore refuses it before
+/// any turn is admitted or any tool is composed, and the caller asks again.
+/// While its live session runs, a help session takes further turns as usual.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "help session {session_id} cannot be resumed: its help tools exist only in the live session that ended; ask the question again"
+)]
+pub struct HelpSessionNotResumable {
+    /// The refused help session.
+    pub session_id: meerkat_core::SessionId,
+}
+
+impl HelpSessionNotResumable {
+    /// The `kind` of the refusal's structured error data.
+    pub const KIND: &'static str = "help_session_not_resumable";
+
+    /// Refuse a rebuild of `session` from storage when it is a help session.
+    pub fn check(session: &meerkat_core::Session) -> Result<(), Self> {
+        match session.metadata().get(HELP_SESSION_METADATA_KEY) {
+            Some(serde_json::Value::Bool(true)) => Err(Self {
+                session_id: session.id().clone(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// The public error code: the session exists but cannot run.
+    pub fn error_code(&self) -> meerkat_contracts::ErrorCode {
+        meerkat_contracts::ErrorCode::SessionNotRunning
+    }
+
+    /// The refusal's structured error data.
+    pub fn data(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kind": Self::KIND,
+            "session_id": self.session_id.to_string(),
+        })
+    }
+}
+
 /// What every help entry point gives its session: CLI `rkat help`, JSON-RPC
-/// `help/ask`, REST `POST /help`, and the MCP `meerkat_help` tool.
+/// `help/ask`, REST `POST /help`, and the MCP `meerkat_help` tool. Each also
+/// marks the session with [`help_session_metadata_entry`].
 #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
 pub struct HelpSession {
     /// The help instructions followed by the embedded `meerkat-platform` and
@@ -153,12 +215,13 @@ pub struct HelpSession {
     /// `skill_read_resource` over the embedded skills, through which the model
     /// reads the platform skill's reference documents.
     pub tools: std::sync::Arc<dyn meerkat_core::AgentToolDispatcher>,
-    /// The session's launch tool access policy: an allow list of exactly the
-    /// two `tools`. Every help entry point launches its session with it, so
-    /// the session persists it and every resume restores it: when an ordinary
-    /// surface later resumes a saved help session with that surface's own
-    /// tools, the session's execution gate refuses each of them, and
-    /// provider-native tools stay off.
+    /// The session's launch tool access policy: an allow list of the two
+    /// `tools` by name, persisted with the session. It does not rebuild these
+    /// tools: a help session is never rebuilt from storage (see
+    /// [`HelpSessionNotResumable`]). Anything that still restores the
+    /// session's composition keeps the policy, which hides and refuses every
+    /// differently named tool and keeps provider-native tools off, but it
+    /// cannot tell a same-named tool from these two.
     pub tool_access_policy: meerkat_core::ops::ToolAccessPolicy,
 }
 
@@ -757,6 +820,41 @@ mod tests {
                 meerkat_core::ToolMutationClass::ReadOnly
             );
         }
+    }
+
+    #[test]
+    fn the_help_marker_refuses_a_rebuild_of_marked_sessions_only() {
+        let ordinary = meerkat_core::Session::new();
+        assert_eq!(HelpSessionNotResumable::check(&ordinary), Ok(()));
+
+        let mut help = meerkat_core::Session::new();
+        let (key, value) = help_session_metadata_entry();
+        help.try_set_metadata(&key, value)
+            .expect("the help marker is not a reserved authority key");
+        let refusal = HelpSessionNotResumable::check(&help).expect_err("a marked session");
+        assert_eq!(refusal.session_id, *help.id());
+        assert_eq!(
+            refusal.error_code(),
+            meerkat_contracts::ErrorCode::SessionNotRunning
+        );
+        assert_eq!(refusal.data()["kind"], HelpSessionNotResumable::KIND);
+        assert_eq!(
+            refusal.data()["session_id"],
+            serde_json::json!(help.id().to_string())
+        );
+    }
+
+    #[test]
+    fn callers_cannot_set_the_help_marker() {
+        let labels = std::collections::BTreeMap::from([(
+            HELP_SESSION_METADATA_KEY.to_string(),
+            "true".to_string(),
+        )]);
+        assert!(crate::surface::validate_public_surface_metadata(Some(&labels), None).is_err());
+        let app_context = serde_json::json!({ HELP_SESSION_METADATA_KEY: true });
+        assert!(
+            crate::surface::validate_public_surface_metadata(None, Some(&app_context)).is_err()
+        );
     }
 
     #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]

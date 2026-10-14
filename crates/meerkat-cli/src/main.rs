@@ -13771,8 +13771,8 @@ async fn run_agent(
         };
         // Mob tools now flow through mob_tools (factory pattern), not external_tools.
         // Only MCP tools (or a help run's help tools) remain as external_tools.
-        // A help run's launch policy admits only its help tools; the session
-        // persists it, so a later resume of the help session keeps it.
+        // A help run's launch policy admits only its help tools, and the
+        // session persists it.
         let (help_tools, help_tool_access_policy) = help_tools.unzip();
         let external_tools = help_tools.or(mcp_external_tools);
         #[cfg(feature = "mob")]
@@ -13876,7 +13876,12 @@ async fn run_agent(
             } else {
                 Some(instructions)
             },
-            initial_metadata_entries: std::collections::BTreeMap::new(),
+            // The help marker makes every rebuild of a help session from
+            // storage refuse it.
+            initial_metadata_entries: help_run
+                .then(meerkat::help::help_session_metadata_entry)
+                .into_iter()
+                .collect(),
             initial_tool_filter: None,
             initial_tool_visibility_state: None,
             shell_env: None,
@@ -14371,6 +14376,9 @@ async fn resume_session_with_llm_override(
             .await
             .map_err(|e| anyhow::anyhow!("Failed to load session: {e}"))?
             .ok_or_else(|| exit_status::session_not_found(&session_id))?;
+        // A help session continues only on the live session its help entry
+        // point built: refuse the rebuild before anything is composed.
+        meerkat::help::HelpSessionNotResumable::check(&session).map_err(anyhow::Error::new)?;
         let message_count = session.messages().len();
         let stored_metadata = session
             .session_metadata()

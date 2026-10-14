@@ -569,7 +569,8 @@ pub async fn create_session_with_params_on_route(
 /// session's build, where each connects through the governed configured
 /// entry, and `host_tools` (the help session's tools, with the launch tool
 /// access policy that admits only them) as the session's external tools in
-/// place of callback tools. Never taken from wire parameters.
+/// place of callback tools, marking the session as a help session. Never
+/// taken from wire parameters.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_session_with_params_on_route_and_configured_mcp(
     id: Option<RpcId>,
@@ -721,12 +722,14 @@ pub(crate) async fn create_session_with_params_on_route_and_configured_mcp(
         }
     }
     // Host tools are the session's whole tool set: it gets no live MCP
-    // adapter either. Their launch policy admits only them; the session
-    // persists it, so a later resume through any surface keeps it.
+    // adapter either. Their launch policy admits only them, and the help
+    // marker makes every rebuild of the session from storage refuse it.
     let live_mcp = host_tools.is_none();
     if let Some((host_tools, tool_access_policy)) = host_tools {
         build_config.external_tools = Some(host_tools);
         build_config.tool_access_policy = Some(tool_access_policy);
+        let (key, value) = meerkat::help::help_session_metadata_entry();
+        build_config.initial_metadata_entries.insert(key, value);
     }
 
     // Validate and canonicalize skill refs before creating a pending session.

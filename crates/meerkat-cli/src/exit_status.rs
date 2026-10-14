@@ -6,8 +6,9 @@
 //! owner in the error chain, never from display text. The first error in the
 //! chain whose type has a public code projection decides: a mob-family error
 //! answers with its owner's `wire_error_code()`, a runtime driver error with
-//! its native admission, teardown or hosting class, and a session or agent
-//! error with the session transport mapping. A typed error whose owner
+//! its native admission, teardown or hosting class, a session or agent
+//! error with the session transport mapping, and a refused help-session
+//! resume with its own code. A typed error whose owner
 //! assigns no public code, and a failure with no typed owner (an argument,
 //! configuration or lookup check made by the CLI itself), exits
 //! [`EXIT_ERROR`](crate::EXIT_ERROR).
@@ -99,6 +100,9 @@ fn owner_code(cause: &(dyn std::error::Error + 'static)) -> Option<OwnerCode> {
     }
     if let Some(error) = cause.downcast_ref::<meerkat_core::AgentError>() {
         return Some(OwnerCode::Public(agent_transport_error_code(error)));
+    }
+    if let Some(refusal) = cause.downcast_ref::<meerkat::help::HelpSessionNotResumable>() {
+        return Some(OwnerCode::Public(refusal.error_code()));
     }
     None
 }
@@ -246,6 +250,12 @@ mod tests {
             (
                 anyhow::Error::new(SessionError::DurableTailHeldForRecovery {
                     id: SessionId::new(),
+                }),
+                Some(ErrorCode::SessionNotRunning),
+            ),
+            (
+                anyhow::Error::new(meerkat::help::HelpSessionNotResumable {
+                    session_id: SessionId::new(),
                 }),
                 Some(ErrorCode::SessionNotRunning),
             ),

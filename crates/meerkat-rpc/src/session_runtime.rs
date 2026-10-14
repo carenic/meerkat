@@ -3318,10 +3318,13 @@ impl SessionRuntime {
                 .await?;
             return Ok(None);
         }
-        if stale {
-            return self.discard_stale_live_session(session_id).await;
-        }
-        Ok(None)
+        let rematerialization_hosting = if stale {
+            self.discard_stale_live_session(session_id).await?
+        } else {
+            None
+        };
+        self.refuse_cold_help_session(session_id).await?;
+        Ok(rematerialization_hosting)
     }
 
     fn session_not_found_rpc(session_id: &SessionId) -> RpcError {
@@ -5584,12 +5587,42 @@ impl SessionRuntime {
         }
     }
 
+    /// Refuse to rebuild `session` from storage when it is a help session:
+    /// its help tools exist only in the live session that ran it (see
+    /// [`meerkat::help::HelpSessionNotResumable`]).
+    fn refuse_help_session_rebuild(session: &Session) -> Result<(), RpcError> {
+        meerkat::help::HelpSessionNotResumable::check(session).map_err(|refusal| RpcError {
+            code: refusal.error_code().jsonrpc_code(),
+            message: refusal.to_string(),
+            data: Some(refusal.data()),
+        })
+    }
+
+    /// Refuse an input that would rebuild a help session from storage, before
+    /// the input is admitted: a session that is neither live nor staged is
+    /// rebuilt from its stored state.
+    async fn refuse_cold_help_session(&self, session_id: &SessionId) -> Result<(), RpcError> {
+        let live = self
+            .service
+            .has_live_session(session_id)
+            .await
+            .map_err(session_error_to_rpc)?;
+        if live || self.staged_sessions.contains(session_id).await {
+            return Ok(());
+        }
+        match self.load_persisted_session(session_id).await? {
+            Some(session) => Self::refuse_help_session_rebuild(&session),
+            None => Ok(()),
+        }
+    }
+
     async fn recovered_create_request(
         &self,
         session_id: &SessionId,
         session: Session,
         overrides: SurfaceSessionRecoveryOverrides,
     ) -> Result<RecoveredCreateRequest, RpcError> {
+        Self::refuse_help_session_rebuild(&session)?;
         let snapshot = self.realm_context_snapshot();
         self.recovery_context(&snapshot, Some(session_id))
             .recovered_create_request(session_id, session, overrides)
@@ -5604,6 +5637,7 @@ impl SessionRuntime {
         overrides: SurfaceSessionRecoveryOverrides,
         binding_mode: RecoveryRuntimeBindingMode,
     ) -> Result<RecoveredCreateRequest, RpcError> {
+        Self::refuse_help_session_rebuild(&session)?;
         let snapshot = self.realm_context_snapshot();
         self.recovery_context(&snapshot, Some(session_id))
             .recovered_create_request_with_runtime_binding_mode(
@@ -8020,6 +8054,9 @@ impl SessionRuntime {
         } else {
             None
         };
+        // A help session continues only on its live session: refuse to
+        // rebuild it from storage before the turn is admitted.
+        self.refuse_cold_help_session(session_id).await?;
 
         let runtime_registration_lock = self.runtime_registration_lock(session_id);
         let runtime_registration_guard = runtime_registration_lock.mutex().lock().await;
@@ -8470,6 +8507,7 @@ impl SessionRuntime {
         } else {
             None
         };
+        self.refuse_cold_help_session(session_id).await?;
         if let Err(primary) = self.ensure_runtime_executor(session_id).await {
             return Err(self
                 .unregister_new_runtime_registration_after_rpc_error(
@@ -9277,6 +9315,9 @@ impl SessionRuntime {
                 message: format!("session not found: {session_id}"),
                 data: None,
             })?;
+        // A help session continues only on its live session: refuse the
+        // rebuild before the turn is admitted or any tool is composed.
+        Self::refuse_help_session_rebuild(&stored_session)?;
         let recovery_overrides =
             self.recovery_overrides_from_turn(overrides.as_ref(), keep_alive)?;
         let active_turn = match pre_admission.as_mut() {
@@ -9687,6 +9728,7 @@ impl SessionRuntime {
     ) -> Result<meerkat::LiveSessionActorWitnessSlot, RpcError> {
         self.arm_schedule_host_for_agent_tools().await;
         let mut request = if recovering {
+            Self::refuse_help_session_rebuild(&session)?;
             let snapshot = self.realm_context_snapshot();
             let mut request = self
                 .recovery_context(&snapshot, Some(session.id()))
@@ -20795,18 +20837,8 @@ mod tests {
         .expect("the turn must not wait on a client tool")
     }
 
-    /// A saved help session keeps its help restriction when ordinary RPC
-    /// `turn/start` rebuilds it after a restart. The first help turn persists
-    /// the launch policy that admits only the help tools, and the cold
-    /// rebuild restores it: the client's callback tool on the connection's
-    /// route is neither offered to the model nor run when the model calls it,
-    /// and a model call to the catalog control plane, which the rebuilt MCP
-    /// adapter composes, is refused and loads nothing. An ordinary session on
-    /// the same path still offers the callback tool.
-    #[tokio::test]
-    async fn a_saved_help_session_resumed_cold_through_turn_start_keeps_its_help_restriction() {
-        let temp = tempfile::tempdir().unwrap();
-        let runtime = no_turn_disk_runtime(temp.path()).await;
+    /// Ask JSON-RPC `help/ask` a question; returns the help session.
+    async fn rpc_help_ask(runtime: &Arc<SessionRuntime>) -> SessionId {
         let params = serde_json::value::to_raw_value(&serde_json::json!({
             "question": "How do I add an MCP server?",
             "model": "claude-sonnet-4-5",
@@ -20816,7 +20848,7 @@ mod tests {
         let response = crate::handlers::help::handle_ask(
             None,
             Some(&params),
-            Arc::clone(&runtime),
+            Arc::clone(runtime),
             &crate::router::NotificationSink::noop(),
             &runtime.runtime_adapter(),
             None,
@@ -20825,16 +20857,42 @@ mod tests {
         assert!(response.error.is_none(), "help/ask failed: {response:?}");
         let result: serde_json::Value =
             serde_json::from_str(response.result.as_ref().expect("help result").get()).unwrap();
-        let help_session =
-            SessionId::parse(result["session_id"].as_str().expect("help session id")).unwrap();
-        let first_turn_tooling = runtime
+        SessionId::parse(result["session_id"].as_str().expect("help session id")).unwrap()
+    }
+
+    fn help_tool_names() -> std::collections::BTreeSet<String> {
+        ["skill_list_resources", "skill_read_resource"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    /// A help session continues only on the live session `help/ask` built.
+    /// While that runs, a further `turn/start` keeps the help tools. After a
+    /// restart, `turn/start` refuses to rebuild it from storage with a typed
+    /// error before the turn is admitted: no model call, no callback (neither
+    /// a client tool nor one named like a help tool), no MCP router. An
+    /// ordinary session resumed the same way gets the callback tools.
+    #[tokio::test]
+    async fn a_saved_help_session_runs_warm_and_is_refused_cold_through_turn_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = no_turn_disk_runtime(temp.path()).await;
+        let warm_llm = Arc::new(ToolCallScriptLlmClient::default());
+        runtime.set_default_llm_client(Some(Arc::clone(&warm_llm) as Arc<dyn LlmClient>));
+        let help_session = rpc_help_ask(&runtime).await;
+        let saved = runtime
             .load_persisted_session(&help_session)
             .await
             .unwrap()
-            .unwrap()
-            .session_metadata()
-            .unwrap()
-            .tooling;
+            .unwrap();
+        run_rpc_turn(&runtime, &help_session, "And how do I remove it?")
+            .await
+            .expect("the live help session takes a further turn");
+        assert_eq!(
+            warm_llm.last_offered(),
+            help_tool_names(),
+            "a live help session keeps its help tools"
+        );
         let ordinary = runtime
             .create_or_resume_session_without_turn(
                 mock_build_config(),
@@ -20848,7 +20906,88 @@ mod tests {
         drop(runtime);
 
         // A restarted runtime whose process-default callback route offers a
-        // client tool.
+        // client tool and a client tool named like a help tool.
+        let runtime = no_turn_disk_runtime(temp.path()).await;
+        let llm = Arc::new(ToolCallScriptLlmClient::default());
+        runtime.set_default_llm_client(Some(Arc::clone(&llm) as Arc<dyn LlmClient>));
+        let mut callback_requests = runtime.init_callback_channel();
+        runtime
+            .callback_tool_registry()
+            .replace_or_add(vec![
+                meerkat_core::ToolDef::new(
+                    "client_tool",
+                    "A tool the RPC client serves",
+                    serde_json::json!({"type": "object", "properties": {}}),
+                ),
+                meerkat_core::ToolDef::new(
+                    "skill_read_resource",
+                    "A client tool named like a help tool",
+                    serde_json::json!({"type": "object", "properties": {}}),
+                ),
+            ])
+            .unwrap();
+
+        let refusal = run_rpc_turn(&runtime, &help_session, "Read the MCP reference.")
+            .await
+            .expect_err("a help session is not rebuilt from storage");
+        assert_eq!(refusal.code, error::SESSION_NOT_RUNNING, "{refusal:?}");
+        assert_eq!(
+            refusal.data.as_ref().map(|data| data["kind"].clone()),
+            Some(serde_json::json!("help_session_not_resumable")),
+            "{refusal:?}"
+        );
+        assert!(llm.requests().is_empty(), "no model call");
+        assert!(
+            callback_requests.try_recv().is_err(),
+            "no callback tool ran for the help session"
+        );
+        #[cfg(feature = "mcp")]
+        assert!(
+            !runtime
+                .mcp_sessions
+                .read()
+                .await
+                .contains_key(&help_session),
+            "no MCP router was attached to the help session"
+        );
+        assert_eq!(
+            saved.metadata().get("meerkat.help_session"),
+            Some(&serde_json::json!(true)),
+            "help/ask marks its session as a help session"
+        );
+
+        // Control: an ordinary session resumed the same way gets the
+        // callback tools.
+        run_rpc_turn(&runtime, &ordinary, "hello again")
+            .await
+            .expect("the ordinary session resumes");
+        let offered = llm.last_offered();
+        assert!(
+            offered.contains("client_tool") && offered.contains("skill_read_resource"),
+            "an ordinary cold-resumed session offers the callback tools: {offered:?}"
+        );
+        runtime.try_shutdown().await.unwrap();
+    }
+
+    /// The help launch policy is the second line: a session that carries it
+    /// but no help marker, as a help session saved before the marker existed
+    /// would, is rebuilt under the restored policy. The model is offered no
+    /// composed tool but the catalog control plane; a call to the client's
+    /// tool is refused and never runs, and a catalog load is refused and
+    /// attaches nothing.
+    #[tokio::test]
+    async fn a_cold_rebuild_under_the_help_launch_policy_offers_and_runs_no_composed_tool() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = no_turn_disk_runtime(temp.path()).await;
+        let mut build = mock_build_config();
+        build.tool_access_policy = Some(help_launch_policy());
+        let session = runtime
+            .create_or_resume_session_without_turn(build, None, None, Default::default())
+            .await
+            .unwrap();
+        runtime.try_shutdown().await.unwrap();
+        drop(runtime);
+
         let runtime = no_turn_disk_runtime(temp.path()).await;
         let llm = Arc::new(ToolCallScriptLlmClient::default());
         runtime.set_default_llm_client(Some(Arc::clone(&llm) as Arc<dyn LlmClient>));
@@ -20867,70 +21006,37 @@ mod tests {
                 .map(String::from)
                 .collect();
 
-        // The cold rebuild restores the launch policy. Of the composed tools
-        // the model is offered only the catalog control plane, which tool
-        // visibility never filters.
-        run_rpc_turn(&runtime, &help_session, "And how do I remove it?")
+        run_rpc_turn(&runtime, &session, "hello again")
             .await
-            .expect("the saved help session resumes");
+            .expect("the session resumes");
         assert_eq!(
             llm.last_offered(),
             control_plane,
-            "a cold-resumed help session offers no composed tool but the control plane"
+            "the restored policy hides every composed tool but the control plane"
         );
-        assert_eq!(
-            first_turn_tooling.spawn_tool_access_policy,
-            Some(meerkat_core::ops::SpawnToolAccessPolicy::Restricted {
-                policy: help_launch_policy()
-            }),
-            "help/ask persists the launch policy that admits only the help tools"
-        );
-        assert_eq!(
-            first_turn_tooling.tool_access_policy,
-            Some(help_launch_policy())
-        );
-        let tooling = runtime
-            .load_persisted_session(&help_session)
-            .await
-            .unwrap()
-            .unwrap()
-            .session_metadata()
-            .unwrap()
-            .tooling;
-        assert_eq!(
-            tooling.tool_access_policy,
-            Some(help_launch_policy()),
-            "the resumed help session keeps the launch policy"
-        );
-
-        // The model's call to the client's tool is refused; the client is
-        // never asked to run it.
         llm.arm_call("client_tool", serde_json::json!({}));
-        run_rpc_turn(&runtime, &help_session, "Call the client tool.")
+        run_rpc_turn(&runtime, &session, "Call the client tool.")
             .await
-            .expect("the help turn completes");
-        let session = runtime
-            .load_persisted_session(&help_session)
+            .expect("the turn completes");
+        let saved = runtime
+            .load_persisted_session(&session)
             .await
             .unwrap()
             .unwrap();
-        assert_refused_as_access_denied(session.messages(), "call_client_tool");
-
-        // A model call to the catalog control plane is refused and attaches
-        // nothing: the next request offers the same tools.
+        assert_refused_as_access_denied(saved.messages(), "call_client_tool");
         llm.arm_call(
             "tool_catalog_load",
             serde_json::json!({"names": ["client_tool"]}),
         );
-        run_rpc_turn(&runtime, &help_session, "Load the client tool.")
+        run_rpc_turn(&runtime, &session, "Load the client tool.")
             .await
-            .expect("the help turn completes");
-        let session = runtime
-            .load_persisted_session(&help_session)
+            .expect("the turn completes");
+        let saved = runtime
+            .load_persisted_session(&session)
             .await
             .unwrap()
             .unwrap();
-        assert_refused_as_access_denied(session.messages(), "call_tool_catalog_load");
+        assert_refused_as_access_denied(saved.messages(), "call_tool_catalog_load");
         assert_eq!(
             llm.last_offered(),
             control_plane,
@@ -20938,16 +21044,7 @@ mod tests {
         );
         assert!(
             callback_requests.try_recv().is_err(),
-            "no callback tool ran for the help session"
-        );
-
-        // Control: an ordinary session resumed the same way is unchanged.
-        run_rpc_turn(&runtime, &ordinary, "hello again")
-            .await
-            .expect("the ordinary session resumes");
-        assert!(
-            llm.last_offered().contains("client_tool"),
-            "an ordinary cold-resumed session still offers the client's callback tool"
+            "no callback tool ran"
         );
         runtime.try_shutdown().await.unwrap();
     }

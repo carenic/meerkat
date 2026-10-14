@@ -2407,6 +2407,17 @@ fn format_agent_result_tool(
     }
 }
 
+/// The typed tool error of a refused help-session rebuild.
+fn help_session_not_resumable_tool_error(
+    refusal: &meerkat::help::HelpSessionNotResumable,
+) -> ToolCallError {
+    ToolCallError::new(
+        refusal.error_code().jsonrpc_code(),
+        refusal.to_string(),
+        Some(refusal.data()),
+    )
+}
+
 fn build_callback_dispatcher(tools: &[McpToolDef]) -> Option<Arc<dyn AgentToolDispatcher>> {
     if tools.is_empty() {
         None
@@ -4406,7 +4417,13 @@ async fn handle_meerkat_run_with_help_tools(
                 app_context: input.app_context.clone(),
                 fork_source: None,
                 additional_instructions: input.additional_instructions.clone(),
-                initial_metadata_entries: std::collections::BTreeMap::new(),
+                // The help marker makes every rebuild of a help session from
+                // storage refuse it.
+                initial_metadata_entries: help_tools_for_plan
+                    .as_ref()
+                    .map(|_| meerkat::help::help_session_metadata_entry())
+                    .into_iter()
+                    .collect(),
                 initial_tool_filter: None,
                 initial_tool_visibility_state: None,
                 shell_env: input.shell_env.clone(),
@@ -4589,6 +4606,16 @@ async fn handle_meerkat_resume(
         ));
     }
 
+    // A help session continues only on the live session its help entry
+    // point built, where its help tools are: any rebuild from storage is
+    // refused before a turn is admitted or a tool is composed.
+    let help_session = meerkat::help::HelpSessionNotResumable::check(&session).err();
+    if let Some(refusal) = help_session.as_ref()
+        && mcp_resume_requires_rebuild(&input)
+    {
+        return Err(help_session_not_resumable_tool_error(refusal));
+    }
+
     // Admit callback results through the session service's exact durable
     // callback-batch authority. Direct transcript append bypasses ID-set,
     // idempotency, and replay validation.
@@ -4720,11 +4747,18 @@ async fn handle_meerkat_resume(
     // Decide from one exact B-owned actor/config/attachment snapshot. Any
     // rebuild re-snapshots logical config after its own prepared transaction
     // acquires B, so no pre-boundary router can enter the replacement actor.
+    // A live help session has no router by design and takes its turn on the
+    // live session; any other help session would need a rebuild.
     let needs_rebuild = live_actor_lease.is_none()
-        || existing_adapter.is_none()
+        || (existing_adapter.is_none() && help_session.is_none())
         || !exact_live_attachment
         || mcp_resume_requires_rebuild(&input);
     drop(live_actor_lease);
+    if let Some(refusal) = help_session.as_ref()
+        && needs_rebuild
+    {
+        return Err(help_session_not_resumable_tool_error(refusal));
+    }
     let create_requires_materialization = needs_rebuild;
     let mut resume_admission = if create_requires_materialization {
         Some(
@@ -5091,6 +5125,11 @@ async fn handle_meerkat_resume(
         match turn_result {
             Ok(run_result) => Ok(run_result),
             Err((SessionError::NotFound { .. }, recovered_admission)) => {
+                // The live session ended under the turn: a help session is
+                // not rebuilt.
+                if let Some(refusal) = help_session.as_ref() {
+                    return Err(help_session_not_resumable_tool_error(refusal));
+                }
                 let admission = match recovered_admission.or_else(|| resume_admission.take()) {
                     Some(admission) => admission,
                     None => state
@@ -5173,7 +5212,7 @@ async fn handle_meerkat_resume(
             || runtime_materialization_committed
             || (!runtime_was_materialized && sidecar_existed));
     if should_configure_runtime_ingress && !runtime_materialization_committed {
-        let router = if existing_adapter.is_some() {
+        let router = if existing_adapter.is_some() || help_session.is_some() {
             None
         } else {
             let Some(mcp_adapter) = mcp_adapter.take() else {
@@ -6001,30 +6040,36 @@ mod tests {
             .expect("the session is saved")
     }
 
-    /// A help session and an ordinary session saved by one server, the help
-    /// session's tooling as its first help turn persisted it, and a restarted
-    /// server over the same stores whose model is `llm`.
-    async fn help_and_ordinary_sessions_on_a_restarted_server(
-        llm: Arc<ToolCallScriptLlmClient>,
-    ) -> (
-        MeerkatMcpState,
-        meerkat::SessionId,
-        meerkat::SessionId,
-        meerkat_core::SessionTooling,
-    ) {
-        let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
-        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
-            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
-        let state = MeerkatMcpState::new_with_store_options_and_llm(
-            Arc::clone(&store),
-            Arc::clone(&runtime_store),
+    fn help_tool_names() -> std::collections::BTreeSet<String> {
+        ["skill_list_resources", "skill_read_resource"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    /// A server over `store` and `runtime_store` whose model is `llm`.
+    async fn mcp_server_over(
+        store: &Arc<dyn SessionStore>,
+        runtime_store: &Arc<dyn meerkat_runtime::RuntimeStore>,
+        llm: &Arc<ToolCallScriptLlmClient>,
+    ) -> MeerkatMcpState {
+        MeerkatMcpState::new_with_store_options_and_llm(
+            Arc::clone(store),
+            Arc::clone(runtime_store),
             None,
-            Some(Arc::new(ToolCallScriptLlmClient::default())),
+            Some(Arc::clone(llm) as Arc<dyn meerkat::LlmClient>),
         )
-        .await;
+        .await
+    }
+
+    /// A help session asked through `meerkat_help` and an ordinary session
+    /// run through `meerkat_run` on `state`.
+    async fn help_and_ordinary_sessions(
+        state: &MeerkatMcpState,
+    ) -> (meerkat::SessionId, meerkat::SessionId) {
         let help_session = session_id_of(
             Box::pin(handle_meerkat_help(
-                &state,
+                state,
                 meerkat_contracts::HelpRequest {
                     question: "How do I add an MCP server?".to_string(),
                     prompt: None,
@@ -6039,12 +6084,7 @@ mod tests {
             .await
             .expect("meerkat_help succeeds"),
         );
-        let first_turn_tooling = load_saved_session(&state, &help_session)
-            .await
-            .session_metadata()
-            .expect("help session metadata")
-            .tooling;
-        // The restarted server below opens a fresh realm, and a WorkGraph
+        // A restarted test server opens a fresh realm, and a WorkGraph
         // namespace grant is bound to its realm, so the ordinary session
         // leaves WorkGraph off to stay resumable there.
         let run_input: MeerkatRunInput = serde_json::from_value(json!({
@@ -6055,21 +6095,25 @@ mod tests {
         }))
         .expect("run input");
         let ordinary = session_id_of(
-            Box::pin(handle_meerkat_run(&state, run_input, None, None))
+            Box::pin(handle_meerkat_run(state, run_input, None, None))
                 .await
                 .expect("meerkat_run succeeds"),
         );
+        (help_session, ordinary)
+    }
 
-        // Reconstruct the server against the same stores to model a restart.
-        drop(state);
-        let state = MeerkatMcpState::new_with_store_options_and_llm(
-            store,
-            runtime_store,
+    async fn resume_session(
+        state: &MeerkatMcpState,
+        session_id: &meerkat::SessionId,
+        tools: Vec<McpToolDef>,
+    ) -> Result<Value, ToolCallError> {
+        Box::pin(handle_meerkat_resume(
+            state,
+            bounded_resume_input(session_id.to_string(), tools),
             None,
-            Some(llm as Arc<dyn meerkat::LlmClient>),
-        )
-        .await;
-        (state, help_session, ordinary, first_turn_tooling)
+            None,
+        ))
+        .await
     }
 
     /// Resume `session_id` with the client's callback `tools` and no other
@@ -6080,14 +6124,7 @@ mod tests {
         session_id: &meerkat::SessionId,
         tools: Vec<McpToolDef>,
     ) -> Option<Value> {
-        match Box::pin(handle_meerkat_resume(
-            state,
-            bounded_resume_input(session_id.to_string(), tools),
-            None,
-            None,
-        ))
-        .await
-        {
+        match resume_session(state, session_id, tools).await {
             Ok(payload) => Some(unwrap_payload(payload)),
             Err(error)
                 if error
@@ -6100,26 +6137,139 @@ mod tests {
         }
     }
 
-    fn client_callback_tool() -> McpToolDef {
+    fn callback_tool(name: &str) -> McpToolDef {
         McpToolDef {
-            name: "client_callback".to_string(),
+            name: name.to_string(),
             description: "A tool the MCP client serves".to_string(),
             input_schema: meerkat_tools::empty_object_schema(),
             handler: Some("callback".to_string()),
         }
     }
 
-    /// A saved help session keeps its help restriction when `meerkat_resume`
-    /// rebuilds it on a restarted server with no override. The first help
-    /// turn persists the launch policy that admits only the help tools, and
-    /// the cold rebuild restores it: the model is offered only the catalog
-    /// control plane of the rebuilt router, which tool visibility never
-    /// filters, and a model call to it is refused and loads nothing.
+    /// Asserts that `meerkat_resume` refused to rebuild `help_session` from
+    /// storage with the typed help-session refusal, before any model call and
+    /// without publishing an MCP router for it.
+    async fn assert_help_rebuild_refused(
+        state: &MeerkatMcpState,
+        help_session: &meerkat::SessionId,
+        llm: &ToolCallScriptLlmClient,
+        result: Result<Value, ToolCallError>,
+    ) {
+        let refusal = result.expect_err("a help session is not rebuilt from storage");
+        assert_eq!(
+            refusal.code,
+            meerkat_contracts::ErrorCode::SessionNotRunning.jsonrpc_code(),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            refusal.data.as_ref().map(|data| data["kind"].clone()),
+            Some(json!("help_session_not_resumable")),
+            "{refusal:?}"
+        );
+        assert!(llm.requests().is_empty(), "no model call");
+        assert!(
+            state
+                .runtime_ingress_context()
+                .logical_router(help_session)
+                .await
+                .is_none(),
+            "no MCP router was published for the help session"
+        );
+    }
+
+    /// A help session continues only on the live session `meerkat_help`
+    /// built: while that runs, `meerkat_resume` takes the turn there with the
+    /// help tools. On a restarted server, `meerkat_resume` with no override
+    /// refuses to rebuild it from storage with a typed error before any model
+    /// call, and publishes no MCP router.
     #[tokio::test]
-    async fn test_a_saved_help_session_resumed_cold_keeps_its_launch_policy() {
+    async fn test_a_saved_help_session_runs_warm_and_is_refused_cold() {
+        let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let warm_llm = Arc::new(ToolCallScriptLlmClient::default());
+        let state = mcp_server_over(&store, &runtime_store, &warm_llm).await;
+        let (help_session, _ordinary) = help_and_ordinary_sessions(&state).await;
+        let saved = load_saved_session(&state, &help_session).await;
+
+        resume_with_client_tools(&state, &help_session, vec![]).await;
+        assert_eq!(
+            warm_llm.requests().last(),
+            Some(&help_tool_names()),
+            "a live help session keeps its help tools"
+        );
+        assert_eq!(
+            saved.metadata().get("meerkat.help_session"),
+            Some(&json!(true)),
+            "meerkat_help marks its session as a help session"
+        );
+
+        // Reconstruct the server against the same stores to model a restart.
+        drop(state);
         let llm = Arc::new(ToolCallScriptLlmClient::default());
-        let (state, help_session, _ordinary, first_turn_tooling) =
-            help_and_ordinary_sessions_on_a_restarted_server(Arc::clone(&llm)).await;
+        let state = mcp_server_over(&store, &runtime_store, &llm).await;
+        let result = resume_session(&state, &help_session, vec![]).await;
+        assert_help_rebuild_refused(&state, &help_session, &llm, result).await;
+    }
+
+    /// A client resuming a saved help session on a restarted server with its
+    /// callback tools, one of them named like a help tool, is refused before
+    /// any model call: no call is handed back to the client and no MCP router
+    /// is published. An ordinary session resumed the same way offers the
+    /// callback tools.
+    #[tokio::test]
+    async fn test_a_saved_help_session_resumed_cold_refuses_client_callback_tools() {
+        let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let first_llm = Arc::new(ToolCallScriptLlmClient::default());
+        let state = mcp_server_over(&store, &runtime_store, &first_llm).await;
+        let (help_session, ordinary) = help_and_ordinary_sessions(&state).await;
+        drop(state);
+        let llm = Arc::new(ToolCallScriptLlmClient::default());
+        let state = mcp_server_over(&store, &runtime_store, &llm).await;
+        let client_tools = || {
+            vec![
+                callback_tool("client_callback"),
+                callback_tool("skill_read_resource"),
+            ]
+        };
+
+        let result = resume_session(&state, &help_session, client_tools()).await;
+        assert_help_rebuild_refused(&state, &help_session, &llm, result).await;
+
+        // Control: an ordinary session resumed the same way offers them.
+        resume_with_client_tools(&state, &ordinary, client_tools()).await;
+        let offered = llm.requests().last().cloned().unwrap_or_default();
+        assert!(
+            offered.contains("client_callback") && offered.contains("skill_read_resource"),
+            "an ordinary resumed session offers the client's callback tools: {offered:?}"
+        );
+    }
+
+    /// The help launch policy is the second line: a saved help session that
+    /// carries no help marker, as one saved before the marker existed does,
+    /// is rebuilt by `meerkat_resume` under the policy `meerkat_help`
+    /// persisted. The model is offered only the catalog control plane of the
+    /// rebuilt router, and a call to it is refused and loads nothing.
+    #[tokio::test]
+    async fn test_a_saved_help_session_without_its_marker_keeps_its_launch_policy() {
+        let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let first_llm = Arc::new(ToolCallScriptLlmClient::default());
+        let state = mcp_server_over(&store, &runtime_store, &first_llm).await;
+        let (help_session, _ordinary) = help_and_ordinary_sessions(&state).await;
+        let mut unmarked = load_saved_session(&state, &help_session).await;
+        let first_turn_tooling = unmarked
+            .session_metadata()
+            .expect("help session metadata")
+            .tooling;
+        unmarked.remove_metadata("meerkat.help_session");
+        drop(state);
+        seed_runtime_authority_session(&runtime_store, &unmarked).await;
+        let llm = Arc::new(ToolCallScriptLlmClient::default());
+        let state = mcp_server_over(&store, &runtime_store, &llm).await;
 
         llm.arm_call(
             "tool_catalog_load",
@@ -6133,7 +6283,14 @@ mod tests {
         assert_eq!(
             offered,
             &catalog_control_plane(),
-            "a cold-resumed help session offers no composed tool but the control plane"
+            "the restored policy offers no composed tool but the control plane"
+        );
+        assert_eq!(
+            first_turn_tooling.spawn_tool_access_policy,
+            Some(meerkat_core::ops::SpawnToolAccessPolicy::Restricted {
+                policy: help_launch_policy()
+            }),
+            "meerkat_help persists the launch policy that admits only the help tools"
         );
         let resumed = load_saved_session(&state, &help_session).await;
         assert_eq!(
@@ -6143,61 +6300,10 @@ mod tests {
                 .tooling
                 .tool_access_policy,
             Some(help_launch_policy()),
-            "the cold rebuild restores the help session's launch policy"
-        );
-        assert_eq!(
-            first_turn_tooling.spawn_tool_access_policy,
-            Some(meerkat_core::ops::SpawnToolAccessPolicy::Restricted {
-                policy: help_launch_policy()
-            }),
-            "meerkat_help persists the launch policy that admits only the help tools"
-        );
-        assert_eq!(
-            first_turn_tooling.tool_access_policy,
-            Some(help_launch_policy())
+            "the rebuild restores the help session's launch policy"
         );
         assert_refused_as_access_denied(&resumed, "call_tool_catalog_load");
         assert_eq!(after_load, offered, "the refused load attaches no tool");
-    }
-
-    /// A callback tool the client supplies when it resumes a saved help
-    /// session on a restarted server is neither offered to the model nor
-    /// handed back to the client when the model calls it. An ordinary session
-    /// resumed the same way still offers it.
-    #[tokio::test]
-    async fn test_a_saved_help_session_resumed_cold_refuses_client_callback_tools() {
-        let llm = Arc::new(ToolCallScriptLlmClient::default());
-        let (state, help_session, ordinary, _first_turn_tooling) =
-            help_and_ordinary_sessions_on_a_restarted_server(Arc::clone(&llm)).await;
-
-        llm.arm_call("client_callback", json!({}));
-        let first_request = llm.requests().len();
-        let payload =
-            resume_with_client_tools(&state, &help_session, vec![client_callback_tool()]).await;
-        assert_eq!(
-            llm.requests()[first_request],
-            std::collections::BTreeSet::new(),
-            "the client's callback tool must not reach a help session's model"
-        );
-        assert_refused_as_access_denied(
-            &load_saved_session(&state, &help_session).await,
-            "call_client_callback",
-        );
-        if let Some(payload) = payload {
-            assert!(
-                payload.get("pending_tool_calls").is_none(),
-                "no call is handed back to the client: {payload}"
-            );
-        }
-
-        // Control: an ordinary session resumed the same way offers it.
-        resume_with_client_tools(&state, &ordinary, vec![client_callback_tool()]).await;
-        assert!(
-            llm.requests()
-                .last()
-                .is_some_and(|offered| offered.contains("client_callback")),
-            "an ordinary resumed session still offers the client's callback tool"
-        );
     }
 
     struct OwnershipCheckingLlmClient {
