@@ -307,6 +307,21 @@ class ReleaseFeatureGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("cannot evaluate select() branch", result.stderr)
 
+    def test_leading_non_literal_select_key_fails_closed(self) -> None:
+        # Only the default key is a literal: a variable naming the release
+        # setting must not drop its branch from the check.
+        self.edit(
+            "core/BUILD.bazel",
+            self.CORE_SELECT,
+            '        RELEASE_KEY: [\n'
+            '            "integration-real-tests",\n'
+            '        ],\n'
+            '        "//conditions:default": [],\n',
+        )
+        result = self.run_checker()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("//core:core: cannot evaluate select() key 'RELEASE_KEY:", result.stderr)
+
     def test_identifier_inside_a_release_feature_branch_fails_closed(self) -> None:
         self.edit(
             "app/BUILD.bazel",

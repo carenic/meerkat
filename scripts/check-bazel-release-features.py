@@ -96,14 +96,19 @@ def is_non_shipping(feature: str, features: set[str]) -> bool:
 
 
 def select_branches(select_body: str, where: str) -> list[tuple[str, str]]:
-    """Every (key, value) of one select(), each value consumed whole.
+    """Every (key, value) of one select(), each key and value consumed whole.
 
-    A value must be a literal string list or a sum of them; anything else
-    (a variable, a call, a nested select) cannot be evaluated and fails.
+    A key must be a string literal and a value a literal string list or a sum
+    of them; anything else (a variable, a call, a nested select) cannot be
+    evaluated and fails. The text before the first literal key must be empty:
+    a leading key that is not a literal would otherwise go unread.
     """
     marks = list(BRANCH_KEY.finditer(select_body))
     if not marks:
         raise GuardError(f"{where}: cannot evaluate a select() without branches")
+    leading = select_body[:marks[0].start()].strip()
+    if leading:
+        raise GuardError(f"{where}: cannot evaluate select() key {leading[:60]!r}")
     branches = []
     for index, mark in enumerate(marks):
         end = marks[index + 1].start() if index + 1 < len(marks) else len(select_body)
