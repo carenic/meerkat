@@ -1,6 +1,6 @@
 //! Agent state machine internals.
 
-use crate::budget::{BudgetDimension, BudgetExceeded};
+use crate::budget::{BudgetDimension, BudgetExceeded, BudgetThresholdCrossing};
 use crate::error::{AgentError, LlmFailureReason, ToolError};
 use crate::event::{
     AgentEvent, BackgroundJobTerminalStatus, BudgetType, DeferredCatalogDelta, ToolCallArguments,
@@ -538,17 +538,31 @@ fn validate_turn_input_failure_reason(input: &TurnExecutionInput) -> Result<(), 
     Ok(())
 }
 
-fn budget_warning_event(exceeded: BudgetExceeded) -> AgentEvent {
-    let budget_type = match exceeded.dimension {
+fn budget_type(dimension: BudgetDimension) -> BudgetType {
+    match dimension {
         BudgetDimension::Tokens => BudgetType::Tokens,
         BudgetDimension::Time => BudgetType::Time,
         BudgetDimension::ToolCalls => BudgetType::ToolCalls,
-    };
+    }
+}
+
+fn budget_warning_event(exceeded: BudgetExceeded) -> AgentEvent {
     AgentEvent::BudgetWarning {
-        budget_type,
+        budget_type: budget_type(exceeded.dimension),
         used: exceeded.used,
         limit: exceeded.limit,
         percent: 1.0,
+    }
+}
+
+/// The early warning for a dimension that reached the agent's
+/// `budget_warning_threshold` before its limit.
+fn budget_threshold_warning_event(crossing: BudgetThresholdCrossing) -> AgentEvent {
+    AgentEvent::BudgetWarning {
+        budget_type: budget_type(crossing.dimension),
+        used: crossing.used,
+        limit: crossing.limit,
+        percent: crossing.fraction,
     }
 }
 
@@ -5077,6 +5091,12 @@ where
                 return self.build_result(turn_count, tool_call_count).await;
             }
 
+            for crossing in self
+                .budget
+                .take_threshold_crossings(self.config.budget_warning_threshold)
+            {
+                emit_event!(budget_threshold_warning_event(crossing));
+            }
             if let Some(exceeded) = self.budget.observe().exceeded() {
                 emit_event!(budget_warning_event(exceeded));
                 if self.turn_in_extraction_flow()? {
@@ -7176,6 +7196,12 @@ where
                 self.extraction_state
                     .record_request_usage(turn_usage.clone());
             }
+        }
+        for crossing in self
+            .budget
+            .take_threshold_crossings(self.config.budget_warning_threshold)
+        {
+            emit_phase_event!(self, ctx, budget_threshold_warning_event(crossing));
         }
         if let Some(exceeded) = self.budget.observe().exceeded() {
             emit_phase_event!(self, ctx, budget_warning_event(exceeded));
