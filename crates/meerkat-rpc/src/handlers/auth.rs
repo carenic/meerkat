@@ -4325,20 +4325,31 @@ mod tests {
         let result: serde_json::Value =
             serde_json::from_str(resp.result.as_ref().expect("result").get()).unwrap();
         let state = result["state"].as_str().expect("state");
-        assert!(matches!(
-            unrelated_runtime.oauth_flow_authority().consume(
+        // A state another runtime admitted is an attempt this runtime does
+        // not hold: attempt_missing, never an authority fault.
+        let foreign = unrelated_runtime
+            .oauth_flow_authority()
+            .consume(
                 state,
                 &credential_identity(&openai_auth_binding()),
                 meerkat_providers::oauth_flow::OAuthBrowserFlowCompletion::from(
-                    meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt
+                    meerkat_providers::oauth_flow::OAuthProviderIdentity::OpenAiChatGpt,
                 ),
                 redirect_uri,
-            ),
-            Err(OAuthFlowError::LifecycleRejected {
-                operation: "verify_oauth_browser_flow",
-                ..
-            })
-        ));
+            )
+            .expect_err("an unrelated runtime holds no attempt with this state");
+        assert_eq!(foreign, OAuthFlowError::Missing);
+        let refusal = host_auth_error_response(
+            Some(RpcId::Num(2)),
+            meerkat::HostAuthError::OAuthFlow(foreign),
+        )
+        .error
+        .expect("error response");
+        assert_eq!(refusal.code, error::INVALID_PARAMS);
+        assert_eq!(
+            refusal.data.as_ref().and_then(|data| data.get("reason")),
+            Some(&serde_json::json!("attempt_missing"))
+        );
         let flow = runtime
             .oauth_flow_authority()
             .consume(
@@ -6158,7 +6169,7 @@ mod tests {
                 .message
                 .contains("oauth state terminal consume failed")
         );
-        assert!(error.message.contains("verify_oauth_browser_flow"));
+        assert!(error.message.contains("oauth state is missing or expired"));
         assert!(store.load(&key).await.unwrap().is_none());
         let snapshot = auth_lease.snapshot(&LeaseKey::from_auth_binding(&auth_binding));
         assert_eq!(snapshot.phase, None);
