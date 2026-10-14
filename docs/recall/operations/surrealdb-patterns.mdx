@@ -20,7 +20,7 @@ separately. Its conversion constructs the domain `BaseFields` and validates ID
 conversion before returning an `Entity`.
 
 Read the actual
-[entity storage proxy and conversion](https://github.com/lukacf/meerkat-recall/blob/main/crates/storage/src/entity_repository.rs)
+[entity storage proxy and conversion](https://github.com/lukacf/meerkat-recall/blob/d71722482183a802fcaeaaf41cb04ef7d16f4b85/crates/storage/src/entity_repository.rs)
 as the starting point for a new repository. Copying a partial domain struct
 into a proxy risks dropping security or provenance fields.
 
@@ -32,7 +32,7 @@ Use a Serde `Visitor` with the methods required for the type: string, map, or
 native enum access.
 
 A map visitor is not a replacement for `visit_enum`. The current
-[record ID deserializers](https://github.com/lukacf/meerkat-recall/blob/main/crates/types/src/ids.rs)
+[record ID deserializers](https://github.com/lukacf/meerkat-recall/blob/d71722482183a802fcaeaaf41cb04ef7d16f4b85/crates/types/src/ids.rs)
 show how Meerkat Recall handles the supported native and string representations.
 Reject unknown representations explicitly rather than guessing a value.
 

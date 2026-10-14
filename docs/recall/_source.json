@@ -3,17 +3,16 @@
   "source_repository": "https://github.com/lukacf/meerkat-recall",
   "source_branch": "codex/canonical-public-import-20261013",
   "source_ref": "codex/canonical-public-import-20261013",
-  "source_commit": "13be7b1a1c4a9bb5fcf8c46d1a7ce1c3137fdfd3",
-  "source_version": "0.1.0",
+  "source_commit": "d71722482183a802fcaeaaf41cb04ef7d16f4b85",
+  "source_version": "0.9.0",
   "source_docs_dirty": false,
   "public_pages": 45,
-  "content_sha256": "f0b3482723de2292d4dba3b17fe597294a8750f45ec793362af08f31c65ef716",
+  "content_sha256": "5cd87a76a0f05d9475cfaea057b88084cc4e3ac4f81ff0144fb1e31ee8490d20",
   "mirror_adjustments": [
     "Local routes namespaced under /recall.",
-    "Non-navigation technical Markdown links point to the exact canonical source commit.",
+    "Non-navigation technical Markdown and canonical main source links point to the exact canonical source commit.",
     "Missing Living Wiki page icon supplied.",
     "Pipeline Work Queue heading uses punctuation-free text for stable Mintlify/GitHub fragment.",
-    "Meerkat0.9 publication acknowledged; Recall0.9 remains upcoming while currentrelease0.1.0.",
-    "Quickstart paired-server recipe pinned to available canonical source13be untilmain integration."
+    "Recall0.9 source is pending; latest published Recall release remains v0.1.0."
   ]
 }

@@ -204,8 +204,8 @@ Erasure completion requires physical source-derived deletion. Apply a bounded
 retention policy to backups; hiding records from query results is insufficient.
 Keep the independent durable erasure journal and restore barrier outside replaced
 backup/data trees. Restore validates and replays that authority before reopening
-admission. See the [snapshot guide](https://github.com/lukacf/meerkat-recall/blob/13be7b1a1c4a9bb5fcf8c46d1a7ce1c3137fdfd3/docs/snapshot-durability.md) and
-[embedded commit guide](https://github.com/lukacf/meerkat-recall/blob/13be7b1a1c4a9bb5fcf8c46d1a7ce1c3137fdfd3/docs/embedded-durable-commits.md).
+admission. See the [snapshot guide](https://github.com/lukacf/meerkat-recall/blob/d71722482183a802fcaeaaf41cb04ef7d16f4b85/docs/snapshot-durability.md) and
+[embedded commit guide](https://github.com/lukacf/meerkat-recall/blob/d71722482183a802fcaeaaf41cb04ef7d16f4b85/docs/embedded-durable-commits.md).
 
 MCP retains the protocol handshake and `tools/call` envelope. Inspect `tools/list`
 for the selected profile (`/mcp`, `/mcp/agent`, `/mcp/maintenance`, `/mcp/full`).

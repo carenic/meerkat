@@ -185,7 +185,7 @@ worker-drain or snapshot-flush failure exits unsuccessfully. Managed embedded
 storage with a persistent destination synchronizes acknowledged mutations to its
 write-ahead log and replays it before admission; shutdown autosave is separate
 from that commit durability boundary. Explicitly ephemeral library/test stores
-remain volatile. See [managed embedded commit durability](https://github.com/lukacf/meerkat-recall/blob/13be7b1a1c4a9bb5fcf8c46d1a7ce1c3137fdfd3/docs/embedded-durable-commits.md).
+remain volatile. See [managed embedded commit durability](https://github.com/lukacf/meerkat-recall/blob/d71722482183a802fcaeaaf41cb04ef7d16f4b85/docs/embedded-durable-commits.md).
 
 ## Named backup, verification and restore
 
@@ -422,7 +422,7 @@ Embedded SurrealDB deadline changes require a process restart. SurrealDB 2.6.5
 does not enforce its transaction option independently, so Meerkat Recall applies the
 shorter configured limit as its engine query-batch deadline. Remote connections
 do not apply these client options to the server. See the
-[capacity and retention guide](https://github.com/lukacf/meerkat-recall/blob/main/docs/work-queue-capacity.md)
+[capacity and retention guide](https://github.com/lukacf/meerkat-recall/blob/d71722482183a802fcaeaaf41cb04ef7d16f4b85/docs/work-queue-capacity.md)
 for cancellation and archival details.
 
 ### MCP transport
