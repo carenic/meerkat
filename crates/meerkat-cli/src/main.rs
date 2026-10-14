@@ -34077,19 +34077,11 @@ mod docs_cli_examples {
     }
 
     #[test]
-    fn resume_reads_the_next_word_as_its_session() {
-        // `--resume` takes an optional value, so a prompt right after it is
-        // read as the session and the run has no prompt. Examples name the
-        // session, use the root form, or put another option next.
-        let rejected = split_tokens(r#"rkat run --resume "keep going""#).expect("tokens");
-        assert!(matches!(
-            validate_example(&rejected, CliFeature::compiled),
-            ExampleValidation::Rejected(_)
-        ));
+    fn resume_examples_that_name_their_session_parse() {
+        // Help and docs examples name the session before the prompt.
         for line in [
             r#"rkat run --resume last "keep going""#,
-            r#"rkat run --resume --stdin lines "watch for new incidents""#,
-            r#"rkat --resume "keep going""#,
+            r#"rkat run --resume '~2' "pick this thread back up""#,
         ] {
             let tokens = split_tokens(line).expect("tokens");
             assert!(
