@@ -562,11 +562,10 @@ Installed via `make install-hooks`. Two stages:
 - `scripts/pre-push-bridge-no-responsestatus.sh` (thin wrapper over `xtask bridge-classifier`)
 - `scripts/pre-push-bazel-locks.sh` (generated BUILD freshness, offline MODULE.bazel.lock recorded-input check, `bb mod deps --lockfile_mode=error` when the pinned CLI is present; `--require-bb` makes that last gate mandatory and the release preflight passes it)
 - `scripts/test-lock-consistency-gate.sh`, `scripts/test-bazel-module-lock-gate.sh`, `scripts/test-crate-enumeration-gate.sh`, `scripts/test-crate-license-files-gate.sh`, `scripts/test-release-doctor-workflow-contract.sh` (contract tests: each new release-infra gate must still fail on the defect it was written for; the last one also proves the release doctor's `release.yml` assertions survive rewording)
-- No Cargo test hook: `scripts/pre-push-unit.sh` (workspace unit, integration-fast, HeadCanonical cold-restart and `e2e-fast` lanes) no longer runs on push. The required CI `closure-tests` rows run its binaries for the change's test scope, checked against its selection on every plan; `scripts/test-pre-push-cargo-test-handoff.sh` pins the hand-off. The script stays for manual whole-workspace runs.
+- `scripts/pre-push-unit.sh` (deterministic Cargo/nextest gate: when fresh execution is needed, runs workspace unit, integration-fast, HeadCanonical cold-restart, and `e2e-fast` lanes; serializes identical source evidence and retries a timed-out lane once. `MEERKAT_BUILDBUDDY` does not switch this hook's backend)
 - `scripts/pre-push-prune-lanes.sh` (runs from the dispatcher only after a PASSED gate: keeps at most `MEERKAT_PRE_PUSH_KEEP_LANES` (default 2) `pre-push-<hash>` hook worktrees and Cargo target lanes per repo, never touching the current lane, a lane whose dispatcher lock is live, a lane referenced by any live process, a lane with any file activity inside `MEERKAT_PRE_PUSH_LANE_IDLE_SECS` (default 21600), or any non-lane name; logs one `kept:`/`pruned:` line per lane with its reason; `MEERKAT_PRE_PUSH_KEEP_LANES=all` disables it)
 
-When `scripts/pre-push-unit.sh` runs (by hand), its deterministic-test cache
-uses a source fingerprint that excludes
+The inner deterministic-test cache uses a source fingerprint that excludes
 root `Cargo.lock` and `MODULE.bazel.lock`. On a lock-only cache hit, the current
 lock graph is compiled by the required CI Clippy lanes but is not re-tested locally;
 the reused tests ran against the prior lock graph, and CI remains
@@ -579,7 +578,7 @@ with the skipped set, reusable only by a later push of that tree that skips the
 same hooks; a push without that `SKIP` re-runs them.
 
 After the gate, passed or failed, the dispatcher prints each hook's wall time
-(and the lane times of a deterministic gate run, if any), and appends them to
+and the deterministic gate's lane times, and appends them to
 `.git/meerkat-hook-cache/timings.tsv`.
 
 **Manual local preflight**:
@@ -590,9 +589,8 @@ After the gate, passed or failed, the dispatcher prints each hook's wall time
 
 Run the change-specific regression and required stress checks during development.
 For a candidate proceeding through normal commit hooks and one normal push, use
-that push and its required CI run for overlapping final lint, governance and
-deterministic tests instead of prepending another standalone `make test` or
-`make agent-gate`. If no normal
+that push for overlapping final lint, governance and deterministic tests instead
+of prepending another standalone `make test` or `make agent-gate`. If no normal
 push will run, retain an appropriate standalone gate before declaring the work
 qualified. This changes scheduling, not required coverage or hook behavior.
 
@@ -604,10 +602,9 @@ generated-contract, Web SDK and wasm ratchets; drift is left to
 `machine-codegen-drift`), and the required CI Clippy lanes lint every package
 it used to. Its path base is `CARGO_AGENT_BASE` or `origin/main` (then
 `main`/HEAD), which can differ from the dispatcher's remote-ref range. Check that
-the committed selection includes the intended delta. The push runs no Cargo
-tests: required CI's `closure-tests` rows cover the workspace-unified
-`kind(lib)` and `kind(test)` inventories, plus HeadCanonical `test-support` and
-`e2e-fast`, for the change's test scope. They do not prove package-only
+the committed selection includes the intended delta. The deterministic push
+lane covers workspace default-feature `kind(lib)` and `kind(test)` inventories,
+plus HeadCanonical `test-support` and `e2e-fast`. It does not prove package-only
 feature isolation, binary-target unit tests, required-feature targets absent
 from that inventory, doctests, ignored/live/system lanes, platform checks or the
 feature matrix. Retain each distinct requirement; all-feature Clippy is not an

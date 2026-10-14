@@ -355,6 +355,5 @@ fi
 "$REPO_ROOT/scripts/test-release-projection-pre-push.sh"
 "$REPO_ROOT/scripts/test-pre-push-harness-only.sh"
 "$REPO_ROOT/scripts/test-pre-push-ratchets.sh"
-"$REPO_ROOT/scripts/test-pre-push-cargo-test-handoff.sh"
 
 echo "pre-push deterministic gate status and source-fingerprint contracts hold"
