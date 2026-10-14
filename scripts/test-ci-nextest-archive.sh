@@ -2,6 +2,17 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# The source scans below and the doctor's workflow check run ripgrep. Without
+# it they find nothing, so refuse a false-green run (as the tombstone scans
+# do). A user ripgrep config (RIPGREP_CONFIG_PATH: --heading, --context, ...)
+# would change what they report, so none is read.
+if ! command -v rg >/dev/null 2>&1; then
+  echo "error: the CI nextest archive contract test requires ripgrep (rg); refusing a false-green scan. Install ripgrep (macOS: brew install ripgrep)." >&2
+  exit 1
+fi
+unset RIPGREP_CONFIG_PATH
+
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/meerkat-ci-nextest-archive.XXXXXX")"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 
@@ -426,9 +437,15 @@ assert_file_contains "$RELEASE_WORKFLOW" '.component_results.github_hosted_dense
 # The restore helper runs on the release scripts' Python >= 3.10 floor.
 restore_python="$("$ROOT/scripts/require-python" 3.10 "the nextest archive restore test")" || exit 1
 "$restore_python" "$ROOT/scripts/test_restore_ci_unit_mob_archive.py"
-# Also on the oldest supported interpreter, when one is installed.
+# Also on the oldest supported interpreter, when one is installed and runs: a
+# version manager's python3.10 shim (pyenv, asdf) without a selected 3.10
+# exits 127 instead of running Python.
 if oldest_python="$(command -v python3.10 2>/dev/null)"; then
-  "$oldest_python" "$ROOT/scripts/test_restore_ci_unit_mob_archive.py"
+  if "$oldest_python" -c 'import sys; raise SystemExit(sys.version_info[:2] != (3, 10))' >/dev/null 2>&1; then
+    "$oldest_python" "$ROOT/scripts/test_restore_ci_unit_mob_archive.py"
+  else
+    echo "note: ${oldest_python} does not run Python 3.10; skipped the restore test on the 3.10 floor" >&2
+  fi
 fi
 
 unit_job="$(sed -n '/^  unit:$/,/^  int-archives:$/p' "$WORKFLOW")"

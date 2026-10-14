@@ -21,10 +21,11 @@ SH
 }
 fake "${work}/old" python3 3.9.6 0
 fake "${work}/good" python3.12 3.12.4 1
+fake "${work}/floor" python3.10 3.10.14 1
 tools="${work}/tools"; mkdir -p "${tools}"
 for t in bash sed; do ln -s "$(command -v "$t")" "${tools}/$t"; done
 
-run() { env -i PATH="$1" ${2:+PYTHON="$2"} bash "${helper}" 3.11 probe; }
+run() { env -i PATH="$1" ${2:+PYTHON="$2"} bash "${helper}" "${3:-3.11}" probe; }
 
 if out="$(run "${work}/old:${tools}" "" 2>&1)"; then bad "an old python3 on PATH was accepted"
 elif [[ "${out}" == *"probe needs Python >= 3.11; found Python 3.9.6 (${work}/old/python3)"* ]]; then ok "old PATH python3 refused with the found version"
@@ -33,6 +34,10 @@ else bad "unexpected refusal text: ${out}"; fi
 if out="$(run "${work}/old:${work}/good:${tools}" "" 2>/dev/null)" && [[ "${out}" == "${work}/good/python3.12" ]]; then
   ok "a newer python3.x is preferred over an older PATH python3"
 else bad "did not prefer python3.12 over the old python3 (${out:-none})"; fi
+
+if out="$(run "${work}/old:${work}/floor:${tools}" "" 3.10 2>/dev/null)" && [[ "${out}" == "${work}/floor/python3.10" ]]; then
+  ok "python3.10 qualifies for MIN 3.10 over an older PATH python3"
+else bad "did not pick python3.10 for MIN 3.10 (${out:-none})"; fi
 
 if out="$(run "${work}/good:${tools}" "${work}/old/python3" 2>&1)"; then bad "an explicit old PYTHON was accepted"
 elif [[ "${out}" == *"found Python 3.9.6 (${work}/old/python3)"* ]]; then ok "an explicit PYTHON is the only candidate and is refused when old"
