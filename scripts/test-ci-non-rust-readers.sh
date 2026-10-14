@@ -5,10 +5,14 @@
 #
 # GREEN: the committed inventory matches the scan of this checkout.
 # RED:   an inventory with one reader row deleted fails, naming the reader's
-#        file and line; an inventory with an invented row fails as stale; a
-#        scratch copy of the checkout with a new, unlisted reader fails, naming
-#        the new file and line. The scratch copy is a throwaway clone; nothing
-#        synthetic touches this checkout.
+#        file and line; an inventory with an invented row fails as stale. In
+#        a scratch copy of the checkout, each from the clean tree: a new,
+#        unlisted reader target fails, naming its file and line; so does a
+#        reader in a support file a test target reaches only through
+#        include!(concat!(env!("CARGO_MANIFEST_DIR"), "...")); and an
+#        include!() or include_str!() the guard cannot resolve is refused.
+#        The scratch copy is a throwaway clone; nothing synthetic touches this
+#        checkout.
 
 set -euo pipefail
 
@@ -77,6 +81,13 @@ git -C "$SCRATCH" checkout --quiet --detach "$(git -C "$REPO_ROOT" rev-parse HEA
 for file in scripts/ci-non-rust-readers.json scripts/ci-non-rust-readers.mjs scripts/ci-non-rust-readers-guard.mjs scripts/rust-test-selector.mjs; do
   cp "${REPO_ROOT}/${file}" "${SCRATCH}/${file}"
 done
+SCRATCH_GUARD="${SCRATCH}/scripts/ci-non-rust-readers-guard.mjs"
+# Each control starts from the committed crates/ tree.
+reset_scratch_crates() {
+  git -C "$SCRATCH" checkout --quiet -- crates
+  git -C "$SCRATCH" clean -fdq -- crates
+}
+
 SYNTHETIC="crates/meerkat-machine-schema/tests/synthetic_non_rust_reader.rs"
 cat >"${SCRATCH}/${SYNTHETIC}" <<'RUST'
 #[test]
@@ -87,6 +98,40 @@ fn synthetic_reader_of_the_docs_navigation() {
 RUST
 expect_red "new unlisted reader in a scratch copy" "${TEST_ROOT}/synthetic.log" \
   "missing reader: ${SYNTHETIC}:3 reads docs/docs.json (meerkat-machine-schema test:synthetic_non_rust_reader" \
-  node "${SCRATCH}/scripts/ci-non-rust-readers-guard.mjs"
+  node "$SCRATCH_GUARD"
+
+# A reader in a support file that is no Cargo target of its own: the
+# hooks_contracts test target reaches it only through a manifest-relative
+# include!. The walk must follow it and name the reader.
+reset_scratch_crates
+HOOKS="crates/meerkat-core/tests/hooks_contracts.rs"
+H1_SUPPORT="crates/meerkat-core/tests/support/h1_reader.rs"
+mkdir -p "${SCRATCH}/crates/meerkat-core/tests/support"
+cat >"${SCRATCH}/${H1_SUPPORT}" <<'RUST'
+#[test]
+fn h1_reader_reads_the_docs_navigation() {
+    let navigation = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/docs.json"));
+    assert!(navigation.is_ok());
+}
+RUST
+printf '%s\n' 'include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/h1_reader.rs"));' >>"${SCRATCH}/${HOOKS}"
+expect_red "reader reached through include!(concat!(env!(CARGO_MANIFEST_DIR), ...))" "${TEST_ROOT}/include.log" \
+  "missing reader: ${H1_SUPPORT}:3 reads docs/docs.json (meerkat-core test:hooks_contracts" \
+  node "$SCRATCH_GUARD"
+
+# An include the guard cannot resolve is refused, not skipped: an include!
+# of generated source under OUT_DIR, and an include_str! of a path from the
+# environment.
+reset_scratch_crates
+UNRESOLVED_LINE=$(($(wc -l <"${SCRATCH}/${HOOKS}") + 1))
+printf '%s\n' \
+  'include!(concat!(env!("OUT_DIR"), "/h1_generated.rs"));' \
+  'const H1_DATA: &str = include_str!(env!("H1_DATA_PATH"));' >>"${SCRATCH}/${HOOKS}"
+expect_red "unresolvable include! refused" "${TEST_ROOT}/unresolved.log" \
+  "unresolved include: ${HOOKS}:${UNRESOLVED_LINE} include!(concat!(env!(\"OUT_DIR\"),\"/h1_generated.rs\")) (meerkat-core test:hooks_contracts)" \
+  node "$SCRATCH_GUARD"
+NEEDLE="unresolved include: ${HOOKS}:$((UNRESOLVED_LINE + 1)) include_str!(env!(\"H1_DATA_PATH\")) (meerkat-core test:hooks_contracts)"
+grep -qF -- "$NEEDLE" "${TEST_ROOT}/unresolved.log" || { cat "${TEST_ROOT}/unresolved.log" >&2; fail "unresolvable include_str! is not refused: ${NEEDLE}"; }
+printf 'RED   unresolvable include_str! refused: %s\n' "$(grep -F -- "$NEEDLE" "${TEST_ROOT}/unresolved.log" | head -1)"
 
 printf 'test-ci-non-rust-readers: OK\n'
