@@ -4477,6 +4477,52 @@ impl AgentFactory {
         self
     }
 
+    /// The native host confinement requirement of automatically composed
+    /// shell tools ([`Self::with_shell_confinement`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn shell_confinement(&self) -> &meerkat_tools::builtin::shell::ShellConfinement {
+        &self.shell_confinement
+    }
+
+    /// Install a stock host's resolved OS process confinement: each launch
+    /// kind it requires gets its requirement through the per-kind builder
+    /// (the shell, command hooks with their working directory, local MCP
+    /// stdio servers). A kind the host leaves as the trusted host keeps
+    /// this factory's current setting, so installing the trusted host never
+    /// downgrades a requirement already installed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_host_confinement(mut self, confinement: &crate::HostConfinement) -> Self {
+        use meerkat_core::ConfinementLaunchKind;
+        if let Some(requirement) = confinement.requirement(ConfinementLaunchKind::Shell) {
+            self = self.with_shell_confinement(
+                meerkat_tools::builtin::shell::ShellConfinement::Required {
+                    requirement: requirement.clone(),
+                },
+            );
+        }
+        if let (Some(requirement), Some(working_directory)) = (
+            confinement.requirement(ConfinementLaunchKind::CommandHooks),
+            confinement.working_directory(ConfinementLaunchKind::CommandHooks),
+        ) {
+            self = self.with_command_hook_confinement(
+                requirement.clone(),
+                working_directory.to_path_buf(),
+            );
+        }
+        #[cfg(feature = "mcp")]
+        if let (Some(requirement), Some(working_directory)) = (
+            confinement.requirement(ConfinementLaunchKind::McpStdio),
+            confinement.working_directory(ConfinementLaunchKind::McpStdio),
+        ) {
+            self =
+                self.with_mcp_stdio_launch_profile(meerkat_mcp::McpStdioLaunchProfile::required(
+                    requirement.clone(),
+                    working_directory.to_path_buf(),
+                ));
+        }
+        self
+    }
+
     /// Require the host's immutable confinement for automatically composed
     /// command hooks. The final command, argv, cwd and explicit environment
     /// are bound before launch; ambient environment is not inherited.

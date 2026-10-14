@@ -13870,6 +13870,25 @@ impl SessionRuntime {
             })
     }
 
+    /// Wait until the session's live MCP servers settle, returning the
+    /// deltas they reported.
+    #[cfg(all(test, feature = "mcp"))]
+    pub(crate) async fn mcp_wait_until_ready_for_test(
+        &self,
+        session_id: &SessionId,
+        timeout: Duration,
+    ) -> Result<Vec<meerkat_core::ExternalToolDelta>, RpcError> {
+        let adapter = self.mcp_adapter_for_session(session_id).await?;
+        adapter
+            .wait_until_ready(timeout)
+            .await
+            .map_err(|not_ready| RpcError {
+                code: error::INTERNAL_ERROR,
+                message: not_ready.to_string(),
+                data: None,
+            })
+    }
+
     #[cfg(feature = "mcp")]
     async fn mcp_adapter_for_session(
         &self,

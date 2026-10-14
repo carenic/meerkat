@@ -470,8 +470,9 @@ fn compose_reporting_chain_warnings(
     raw_docs: &std::collections::BTreeMap<crate::connection::RealmId, toml::Value>,
     head: &crate::connection::RealmId,
     mut warnings: Vec<RealmConfigWarning>,
-) -> Result<(Config, Vec<RealmConfigWarning>), crate::connection::RealmChainError> {
+) -> Result<(Config, Vec<RealmConfigWarning>), ConfigError> {
     let (config, chain) = crate::config::compose_effective_config_with_chain(docs, raw_docs, head)?;
+    crate::config::check_composed_confinement(docs, &chain)?;
     warnings.retain(|warning| chain.realms().contains(&warning.realm));
     Ok((config, warnings))
 }
@@ -503,6 +504,7 @@ impl ConfigStore for MemoryConfigStore {
     async fn set(&self, config: Config) -> Result<(), ConfigError> {
         let mut current = self.config.write().await;
         keep_governance(&current.governance, &config.governance)?;
+        keep_confinement(&current.confinement, &config.confinement)?;
         config.validate_for_write(self.catalog, &current.tools.mcp_servers)?;
         *current = config;
         Ok(())
@@ -514,6 +516,7 @@ impl ConfigStore for MemoryConfigStore {
         merge_patch(&mut value, delta.0);
         let updated: Config = serde_json::from_value(value).map_err(ConfigError::Json)?;
         keep_governance(&config.governance, &updated.governance)?;
+        keep_confinement(&config.confinement, &updated.confinement)?;
         updated.validate_for_write(self.catalog, &config.tools.mcp_servers)?;
         *config = updated.clone();
         Ok(updated)
@@ -723,6 +726,7 @@ impl ConfigStore for FileConfigStore {
         let persisted =
             PersistedConfigDocument::parse(&content).map(|document| document.into_loaded().0)?;
         keep_governance(&persisted.governance, &patched.config.governance)?;
+        keep_confinement(&persisted.confinement, &patched.config.confinement)?;
         patched
             .config
             .validate_for_write(self.catalog, &persisted.tools.mcp_servers)?;
@@ -734,10 +738,9 @@ impl ConfigStore for FileConfigStore {
     /// document each one then overrides the parent realm, so callers that
     /// change individual keys of a realm document patch it instead.
     async fn set(&self, config: Config) -> Result<(), ConfigError> {
-        keep_governance(
-            &persisted_governance(&self.read_content().await?)?,
-            &config.governance,
-        )?;
+        let content = self.read_content().await?;
+        keep_governance(&persisted_governance(&content)?, &config.governance)?;
+        keep_confinement(&persisted_confinement(&content)?, &config.confinement)?;
         config.validate_for_write(self.catalog, &self.persisted_mcp_servers_for_write().await)?;
         let content = toml::to_string_pretty(&config).map_err(ConfigError::TomlSerialize)?;
         self.write_content(&content).await
@@ -788,6 +791,39 @@ fn persisted_governance(content: &str) -> Result<Option<crate::GovernanceConfig>
             .try_into()
             .map(Some)
             .map_err(|_| ConfigError::GovernanceAdministration),
+    }
+}
+
+/// Refuse a write that would not keep `committed`, the document's
+/// `[confinement]` section, exactly ([`ConfigError::ConfinementAdministration`]):
+/// ordinary config write permission is not confinement administration. The
+/// host administers the section in the document itself, so a write can
+/// neither add, change nor remove it; it may restate it unchanged.
+fn keep_confinement(
+    committed: &crate::ConfinementConfig,
+    written: &crate::ConfinementConfig,
+) -> Result<(), ConfigError> {
+    if committed == written {
+        Ok(())
+    } else {
+        Err(ConfigError::ConfinementAdministration)
+    }
+}
+
+/// The `[confinement]` section a persisted document states (empty when it
+/// states none), for a full replace that does not otherwise parse the old
+/// document's sections. A document that is not TOML could state one, so no
+/// write may replace it.
+fn persisted_confinement(content: &str) -> Result<crate::ConfinementConfig, ConfigError> {
+    let document: toml::Table = content
+        .parse()
+        .map_err(|_| ConfigError::ConfinementAdministration)?;
+    match document.get("confinement") {
+        None => Ok(crate::ConfinementConfig::default()),
+        Some(section) => section
+            .clone()
+            .try_into()
+            .map_err(|_| ConfigError::ConfinementAdministration),
     }
 }
 
@@ -903,6 +939,291 @@ mod tests {
         assert_eq!(eff.models.openai, "g-openai", "inherited from global");
         assert_eq!(eff.models.anthropic, "c-anthropic", "child override");
         assert!(eff.realm.contains_key("global") && eff.realm.contains_key("child"));
+    }
+
+    fn workspace_confinement() -> crate::ConfinementConfig {
+        crate::ConfinementConfig::for_all(crate::LaunchConfinement::Workspace(
+            crate::WorkspaceConfinement::default(),
+        ))
+    }
+
+    fn confinement_document(text: &str) -> Config {
+        Config::from_persisted_toml(text).unwrap().0
+    }
+
+    async fn compose_head(docs: Vec<(&str, Config)>) -> Result<Config, ConfigError> {
+        let docs = docs
+            .into_iter()
+            .map(|(realm, doc)| (realm.to_string(), doc))
+            .collect();
+        EffectiveConfigReader::new(Arc::new(MapSource { docs }))
+            .effective_config(&crate::connection::RealmId::parse("head").unwrap())
+            .await
+    }
+
+    /// Across the documents a composition folds, a confinement requirement
+    /// only holds or is added. The user document decides it even when no
+    /// `[realm.global]` section puts it on the chain; a less trusted realm
+    /// that restates it or says nothing composes; one that states it
+    /// differently, `trusted_host` included, is refused naming both realms.
+    #[tokio::test]
+    async fn effective_reader_never_weakens_confinement_across_layers() {
+        const WORKSPACE: &str = "[confinement.all]\nmode = \"workspace\"\n";
+        const TRUSTED_HOST: &str = "[confinement.all]\nmode = \"trusted_host\"\n";
+        const WEAKER_MCP: &str = "[confinement.mcp_stdio]\nmode = \"trusted_host\"\n";
+
+        let required = compose_head(vec![
+            ("global", confinement_document(WORKSPACE)),
+            ("head", Config::default()),
+        ])
+        .await
+        .unwrap();
+        for kind in crate::ConfinementLaunchKind::ALL {
+            assert_eq!(
+                required.confinement.statement(kind),
+                workspace_confinement().statement(kind),
+                "the off-chain user document decides {kind}"
+            );
+        }
+        let restated = compose_head(vec![
+            ("global", confinement_document(WORKSPACE)),
+            ("head", confinement_document(WORKSPACE)),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(
+            restated
+                .confinement
+                .statement(crate::ConfinementLaunchKind::Shell),
+            workspace_confinement().statement(crate::ConfinementLaunchKind::Shell)
+        );
+        for weaker in [TRUSTED_HOST, WEAKER_MCP] {
+            let refused = compose_head(vec![
+                ("global", confinement_document(WORKSPACE)),
+                ("head", confinement_document(weaker)),
+            ])
+            .await
+            .expect_err("a less trusted document cannot weaken the requirement");
+            assert!(
+                matches!(
+                    &refused,
+                    ConfigError::ConfinementLayerConflict(conflict)
+                        if conflict.decided_by == "global" && conflict.conflicting == "head"
+                ),
+                "{weaker}: {refused:?}"
+            );
+        }
+        // A less trusted document can add confinement the user did not set.
+        for user in [None, Some(TRUSTED_HOST)] {
+            let mut docs = vec![("head", confinement_document(WORKSPACE))];
+            if let Some(user) = user {
+                docs.push(("global", confinement_document(user)));
+            }
+            let tightened = compose_head(docs).await.unwrap();
+            assert_eq!(
+                tightened
+                    .confinement
+                    .statement(crate::ConfinementLaunchKind::McpStdio),
+                workspace_confinement().statement(crate::ConfinementLaunchKind::McpStdio),
+                "{user:?}"
+            );
+        }
+    }
+
+    /// An ancestor realm decides confinement for its descendants: a child
+    /// realm that states it differently is refused.
+    #[tokio::test]
+    async fn effective_reader_refuses_a_child_realm_that_weakens_its_parent() {
+        use crate::connection::{RealmConfigSection, RealmId};
+
+        let mut org = confinement_document("[confinement.shell]\nmode = \"workspace\"\n");
+        org.realm
+            .insert("org".to_string(), RealmConfigSection::default());
+        let mut head = confinement_document(
+            "[confinement.shell]\nmode = \"workspace\"\nnetwork = \"unrestricted\"\n",
+        );
+        head.realm.insert(
+            "head".to_string(),
+            RealmConfigSection {
+                parent: Some(RealmId::parse("org").unwrap()),
+                ..Default::default()
+            },
+        );
+        let refused = compose_head(vec![("org", org.clone()), ("head", head)])
+            .await
+            .expect_err("a child cannot replace its parent's requirement");
+        assert!(
+            matches!(
+                &refused,
+                ConfigError::ConfinementLayerConflict(conflict)
+                    if conflict.kind == crate::ConfinementLaunchKind::Shell
+                        && conflict.decided_by == "org"
+                        && conflict.conflicting == "head"
+            ),
+            "{refused:?}"
+        );
+
+        // The supplied-head path of the network surfaces refuses it too.
+        let mut silent_head = Config::default();
+        silent_head.realm.insert(
+            "head".to_string(),
+            RealmConfigSection {
+                parent: Some(RealmId::parse("org").unwrap()),
+                ..Default::default()
+            },
+        );
+        let mut weaker = silent_head.clone();
+        weaker.confinement =
+            crate::ConfinementConfig::for_all(crate::LaunchConfinement::TrustedHost);
+        let docs = std::collections::BTreeMap::from([("org".to_string(), org)]);
+        let reader = EffectiveConfigReader::new(Arc::new(MapSource { docs }));
+        let head_id = RealmId::parse("head").unwrap();
+        assert!(matches!(
+            reader.effective_config_over_head(&head_id, weaker).await,
+            Err(ConfigError::ConfinementLayerConflict(_))
+        ));
+        let inherited = reader
+            .effective_config_over_head(&head_id, silent_head)
+            .await
+            .unwrap();
+        assert!(
+            inherited
+                .confinement
+                .statement(crate::ConfinementLaunchKind::Shell)
+                .is_some_and(crate::LaunchConfinement::requires_confinement)
+        );
+    }
+
+    /// `[confinement]` is administered by the host in the document itself:
+    /// an ordinary write can neither add, change nor remove it, and a write
+    /// that keeps it exactly commits.
+    #[tokio::test]
+    async fn config_writes_cannot_administer_confinement() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let store = FileConfigStore::new(
+            path.clone(),
+            *crate::model_profile::test_catalog::TEST_CATALOG,
+        );
+        let refused = |result: Result<(), ConfigError>| {
+            assert!(
+                matches!(result, Err(ConfigError::ConfinementAdministration)),
+                "{result:?}"
+            );
+        };
+
+        refused(
+            store
+                .patch(ConfigDelta(
+                    serde_json::json!({"confinement": {"all": {"mode": "workspace"}}}),
+                ))
+                .await
+                .map(|_| ()),
+        );
+        let mut added = Config::default();
+        added.confinement = workspace_confinement();
+        refused(store.set(added).await);
+
+        let stated = "[confinement.all]\nmode = \"workspace\"\n";
+        tokio::fs::write(&path, stated).await.unwrap();
+        for patch in [
+            serde_json::json!({"confinement": null}),
+            serde_json::json!({"confinement": {"all": {"mode": "trusted_host"}}}),
+            serde_json::json!({"confinement": {"shell": {"mode": "trusted_host"}}}),
+        ] {
+            refused(store.patch(ConfigDelta(patch)).await.map(|_| ()));
+        }
+        refused(store.set(Config::default()).await);
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), stated);
+
+        let patched = store
+            .patch(ConfigDelta(serde_json::json!({"max_tokens": 2048})))
+            .await
+            .unwrap();
+        assert_eq!(patched.confinement, workspace_confinement());
+        let mut restated = patched;
+        restated.max_tokens = Some(4096);
+        store.set(restated).await.unwrap();
+        let reloaded = store.get().await.unwrap();
+        assert_eq!(reloaded.confinement, workspace_confinement());
+        assert_eq!(reloaded.max_tokens, Some(4096));
+
+        let memory = MemoryConfigStore::new(
+            reloaded.clone(),
+            *crate::model_profile::test_catalog::TEST_CATALOG,
+        );
+        refused(memory.set(Config::default()).await);
+        refused(
+            memory
+                .patch(ConfigDelta(serde_json::json!({"confinement": null})))
+                .await
+                .map(|_| ()),
+        );
+        memory.set(reloaded).await.unwrap();
+    }
+
+    /// A realm document as 0.9.0 wrote it, with no `[confinement]`, loads,
+    /// composes and is written back without one: every launch stays the
+    /// trusted host, exactly as before.
+    #[tokio::test]
+    async fn a_document_written_by_090_is_unchanged_and_unconfined() {
+        const DOCUMENT_090: &str = r#"max_tokens = 4096
+
+[agent]
+model = "claude-opus-4-8"
+
+[tools]
+shell_enabled = true
+builtins_enabled = true
+
+[limits]
+budget = 200000
+max_turn_duration = "30m"
+
+[shell]
+security_mode = "allow_list"
+security_patterns = ["git *", "cargo test*"]
+
+[[tools.mcp_servers]]
+name = "search"
+command = "/usr/local/bin/search-mcp"
+
+[realm.ws-090]
+parent = "global"
+"#;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        tokio::fs::write(&path, DOCUMENT_090).await.unwrap();
+        let store = FileConfigStore::new(
+            path.clone(),
+            *crate::model_profile::test_catalog::TEST_CATALOG,
+        );
+
+        let (loaded, warnings) = store.get_with_warnings().await.unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(loaded.confinement.is_empty());
+        let composed = compose_head(vec![("head", loaded.clone())]).await.unwrap();
+        for kind in crate::ConfinementLaunchKind::ALL {
+            assert_eq!(composed.confinement.statement(kind), None, "{kind}");
+        }
+        assert!(
+            !toml::to_string_pretty(&loaded)
+                .unwrap()
+                .contains("confinement"),
+            "a typed write adds no section"
+        );
+
+        store
+            .patch(ConfigDelta(serde_json::json!({"max_tokens": 8192})))
+            .await
+            .unwrap();
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(!written.contains("confinement"), "{written}");
+        assert_eq!(
+            written.replace("max_tokens = 8192", "max_tokens = 4096"),
+            DOCUMENT_090,
+            "a patch rewrites only the key it names"
+        );
     }
 
     #[tokio::test]

@@ -67,6 +67,13 @@ pub struct Config {
     /// back as present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub governance: Option<crate::GovernanceConfig>,
+    /// OS process confinement of the processes launched for agents
+    /// (`[confinement]`). The host administers it in the document itself,
+    /// and across the documents a composition folds a requirement only holds
+    /// or is added ([`crate::ConfinementConfig::fold_less_trusted`]). Skipped
+    /// when it states nothing, so a document without it keeps its bytes.
+    #[serde(default, skip_serializing_if = "crate::ConfinementConfig::is_empty")]
+    pub confinement: crate::ConfinementConfig,
     /// Realm-scoped connection sets (backend profiles, auth profiles,
     /// bindings). TOML keys use the singular `[realm.<id>.*]` namespace
     /// even though the Rust field is plural-adjacent — `#[serde(rename)]`
@@ -104,6 +111,7 @@ impl Default for Config {
             model_fallback: ModelFallbackConfig::default(),
             presentation: PresentationConfig::default(),
             governance: None,
+            confinement: crate::ConfinementConfig::default(),
             realm: BTreeMap::new(),
         }
     }
@@ -489,6 +497,9 @@ impl Config {
         if other.governance.is_some() {
             self.governance = other.governance;
         }
+        // `other` is the less trusted layer: it can add confinement, never
+        // weaken or replace a requirement this layer already holds.
+        self.confinement.fold_less_trusted(&other.confinement);
 
         // Skills: scalar toggles and health policy are child-wins when
         // non-default. Identity-governance records are an append-only overlay:
@@ -905,6 +916,11 @@ impl Config {
                 *self = updated;
             }
         }
+        // The operator's `--confinement*` flags replace every document's
+        // `[confinement]` for every launch kind of this process.
+        if let Some(selection) = cli.confinement {
+            self.confinement = crate::ConfinementConfig::for_all(selection);
+        }
     }
 }
 
@@ -1086,6 +1102,9 @@ pub struct CliOverrides {
     pub max_tool_calls: Option<usize>,
     /// Arbitrary configuration overrides via JSON merge patch
     pub override_config: Option<ConfigDelta>,
+    /// The operator's process confinement selection (`--confinement*`
+    /// flags); replaces `[confinement]` for every launch kind.
+    pub confinement: Option<crate::LaunchConfinement>,
 }
 
 /// Canonical default for the structured-output validation retry budget.
@@ -2969,6 +2988,20 @@ pub enum ConfigError {
     )]
     GovernanceAdministration,
 
+    /// A write would add, change or remove the document's `[confinement]`
+    /// section ([`crate::ConfinementConfig`]). Ordinary config write
+    /// permission is not confinement administration: the host administers
+    /// the section in the document itself. Nothing is written.
+    #[error(
+        "the confinement section is administered by the host in the config document; a config write cannot add, change or remove it"
+    )]
+    ConfinementAdministration,
+
+    /// A less trusted config document states confinement for a launch kind
+    /// differently from the more trusted document that decided it.
+    #[error(transparent)]
+    ConfinementLayerConflict(#[from] crate::ConfinementLayerConflict),
+
     #[error("realm inheritance chain error: {0}")]
     RealmChain(#[from] crate::connection::RealmChainError),
 }
@@ -3292,6 +3325,13 @@ pub(crate) fn compose_effective_config_with_chain(
             }
         }
     }
+    // Confinement folds over its own layer order, from the most trusted
+    // document: the user document first even when it is not on the chain.
+    let mut confinement = crate::ConfinementConfig::default();
+    for (_, layer) in confinement_layers(docs, &chain) {
+        confinement.fold_less_trusted(layer);
+    }
+    effective.confinement = confinement;
     // NOTE (Finding D, non-blocking per adversarial review): `effective.realm`
     // is the outer-key union of every folded doc's sections (via Config::merge),
     // so a doc that hand-places a foreign `[realm.X]` (X != its owning realm)
@@ -3303,6 +3343,42 @@ pub(crate) fn compose_effective_config_with_chain(
     // `[realm.b]`, ... is how the CLI and surfaces resolve a `--realm`/section
     // that is not itself a chain member). Tracked, not gated.
     Ok((effective, chain))
+}
+
+/// The documents whose `[confinement]` a composition for `chain` folds, from
+/// the most trusted: the reserved `global` document (the home-rooted user
+/// document), whether or not a `[realm.global]` section puts it on the
+/// chain, then the chain's other realms from the root to the head.
+pub(crate) fn confinement_layers<'a>(
+    docs: &'a std::collections::BTreeMap<crate::connection::RealmId, Config>,
+    chain: &crate::connection::RealmChain,
+) -> Vec<(&'a crate::connection::RealmId, &'a crate::ConfinementConfig)> {
+    let mut layers = Vec::new();
+    if let Some((realm, doc)) = docs.get_key_value(&crate::connection::RealmId::global()) {
+        layers.push((realm, &doc.confinement));
+    }
+    for member in chain.realms().iter().rev() {
+        if member.is_global() {
+            continue;
+        }
+        if let Some((realm, doc)) = docs.get_key_value(member) {
+            layers.push((realm, &doc.confinement));
+        }
+    }
+    layers
+}
+
+/// Refuse a composition in which a less trusted document weakens or
+/// replaces a confinement requirement ([`crate::check_confinement_layers`]).
+pub(crate) fn check_composed_confinement(
+    docs: &std::collections::BTreeMap<crate::connection::RealmId, Config>,
+    chain: &crate::connection::RealmChain,
+) -> Result<(), crate::ConfinementLayerConflict> {
+    crate::check_confinement_layers(
+        confinement_layers(docs, chain)
+            .into_iter()
+            .map(|(realm, layer)| (realm.as_str(), layer)),
+    )
 }
 
 /// The chain [`compose_effective_config`] folds for `head`: the chain
@@ -3630,6 +3706,38 @@ max_sessions = 7
         // CLI should win over defaults
         assert_eq!(config.agent.model, "cli-model");
         assert_eq!(config.budget.max_tokens, Some(50000));
+    }
+
+    /// The operator's `--confinement*` selection replaces the composed
+    /// `[confinement]` for every launch kind; without it the configuration
+    /// decides.
+    #[test]
+    fn cli_confinement_override_replaces_the_composed_section() {
+        let composed = crate::ConfinementConfig {
+            shell: Some(crate::LaunchConfinement::Workspace(
+                crate::WorkspaceConfinement::default(),
+            )),
+            ..crate::ConfinementConfig::default()
+        };
+        let mut config = Config {
+            confinement: composed.clone(),
+            ..Config::default()
+        };
+        config.apply_cli_overrides(CliOverrides::default());
+        assert_eq!(
+            config.confinement, composed,
+            "without a flag the documents decide"
+        );
+
+        config.apply_cli_overrides(CliOverrides {
+            confinement: Some(crate::LaunchConfinement::TrustedHost),
+            ..CliOverrides::default()
+        });
+        assert_eq!(
+            config.confinement,
+            crate::ConfinementConfig::for_all(crate::LaunchConfinement::TrustedHost),
+            "the flag replaces every launch kind's statement"
+        );
     }
 
     #[test]

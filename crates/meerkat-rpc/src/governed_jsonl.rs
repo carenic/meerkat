@@ -403,6 +403,9 @@ pub struct GovernedJsonlSetup {
     pub operation_review: Option<Arc<meerkat_core::approval::review::BoundOperationReview>>,
     /// This pipe's consent surface, when the review routes R3 to it.
     pub consent: Option<Arc<stock_consent::StdioConsentSurface>>,
+    /// The host's OS process confinement, installed on the connection's
+    /// factory: its live MCP stdio servers launch inside it.
+    pub host_confinement: meerkat::HostConfinement,
 }
 
 /// Process-only receipt of what this connection's trusted ingress
@@ -578,6 +581,7 @@ where
         connector_authority,
         operation_review,
         consent,
+        host_confinement,
     } = setup;
     connection.binder = session_binder;
     connection.consent = consent;
@@ -655,6 +659,7 @@ where
         let _ = connector_authority;
         AgentFactory::minimal()
     };
+    let factory = factory.with_host_confinement(&host_confinement);
     // The realm owner's review is installed before the runtime clones the
     // factory, so the runtime installs its issuing consent owner.
     let factory = match operation_review {

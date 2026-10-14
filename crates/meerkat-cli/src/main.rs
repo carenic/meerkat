@@ -1424,8 +1424,91 @@ struct Cli {
     )]
     default_model: Option<String>,
 
+    /// OS process confinement for the shell, command hooks and MCP stdio
+    /// servers this process launches. `workspace` confines each launch to
+    /// the context root; `trusted-host` runs them unconfined. Replaces the
+    /// config's `[confinement]` for this process.
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        value_name = "MODE",
+        hide_short_help = true,
+        help_heading = "Confinement options"
+    )]
+    confinement: Option<ConfinementModeArg>,
+    /// IP network access of workspace-confined launches (default: denied).
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        value_name = "ACCESS",
+        requires = "confinement",
+        hide_short_help = true,
+        help_heading = "Confinement options"
+    )]
+    confinement_network: Option<ConfinementNetworkArg>,
+    /// An extra read-only directory for workspace-confined launches.
+    /// Repeatable.
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        requires = "confinement",
+        hide_short_help = true,
+        help_heading = "Confinement options"
+    )]
+    confinement_read: Vec<PathBuf>,
+    /// An extra writable directory for workspace-confined launches.
+    /// Repeatable.
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        requires = "confinement",
+        hide_short_help = true,
+        help_heading = "Confinement options"
+    )]
+    confinement_write: Vec<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+/// `--confinement`: how this process confines the processes it launches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ConfinementModeArg {
+    /// Launch as the trusted host, with no OS confinement.
+    TrustedHost,
+    /// Confine each launch to the context root and the extra directories.
+    Workspace,
+}
+
+impl From<ConfinementModeArg> for meerkat_core::ConfinementFlagMode {
+    fn from(value: ConfinementModeArg) -> Self {
+        match value {
+            ConfinementModeArg::TrustedHost => Self::TrustedHost,
+            ConfinementModeArg::Workspace => Self::Workspace,
+        }
+    }
+}
+
+/// `--confinement-network`: IP access of workspace-confined launches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ConfinementNetworkArg {
+    /// No IP sockets.
+    Denied,
+    /// IP sockets over the host's own network.
+    Unrestricted,
+}
+
+impl From<ConfinementNetworkArg> for meerkat_core::WorkspaceNetwork {
+    fn from(value: ConfinementNetworkArg) -> Self {
+        match value {
+            ConfinementNetworkArg::Denied => Self::Denied,
+            ConfinementNetworkArg::Unrestricted => Self::Unrestricted,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -5066,6 +5149,9 @@ struct RuntimeScope {
     origin_hint: RealmOrigin,
     context_root: Option<PathBuf>,
     user_config_root: Option<PathBuf>,
+    /// The process's `--confinement*` selection, applied over the composed
+    /// `[confinement]` by every config load (`None`: the config decides).
+    confinement: Option<meerkat_core::LaunchConfinement>,
     /// The governed-realm agent this process acts as (`--as-agent`).
     #[cfg(feature = "local-authorization")]
     stock_agent: Option<String>,
@@ -5166,6 +5252,15 @@ fn resolve_runtime_scope_with_realm(
         );
     }
     let user_config_root = cli.user_config_root.clone().or_else(dirs::home_dir);
+    // Relative confinement paths resolve against the working directory, as
+    // any other path argument does.
+    let confinement = meerkat_core::ConfinementFlags {
+        mode: cli.confinement.map(Into::into),
+        network: cli.confinement_network.map(Into::into),
+        read: cli.confinement_read.clone(),
+        write: cli.confinement_write.clone(),
+    }
+    .selection(&std::env::current_dir().unwrap_or_else(|_| context_root.clone()))?;
     #[cfg(any(
         all(feature = "anthropic", feature = "openai", feature = "gemini"),
         feature = "mcp"
@@ -5187,6 +5282,7 @@ fn resolve_runtime_scope_with_realm(
         origin_hint,
         context_root: Some(context_root),
         user_config_root,
+        confinement,
         #[cfg(feature = "local-authorization")]
         stock_agent: cli.as_agent.clone(),
         auth_lease,
@@ -5293,6 +5389,37 @@ async fn load_config(scope: &RuntimeScope) -> anyhow::Result<(Config, PathBuf)> 
     let (config, root, warnings) = load_config_with_warnings(scope).await?;
     report_config_load_warnings(scope, &warnings);
     Ok((config, root))
+}
+
+/// Install this process's OS process confinement on a CLI factory: the
+/// composed `[confinement]`, with the `--confinement*` flags already applied
+/// by [`load_config`], lowered over `workspace_root`, the factory's project
+/// root. A selection that cannot be lowered refuses the command; a launch the
+/// platform cannot confine is refused at that launch, never run unconfined.
+pub(crate) fn with_cli_confinement(
+    factory: AgentFactory,
+    config: &Config,
+    workspace_root: &Path,
+) -> anyhow::Result<AgentFactory> {
+    let confinement = meerkat::HostConfinement::resolve(&config.confinement, Some(workspace_root))?;
+    report_cli_confinement_refusals(&confinement);
+    Ok(factory.with_host_confinement(&confinement))
+}
+
+/// Warn once per process, on stderr, for each confined launch kind this
+/// host's platform backend cannot enforce: each such launch is refused.
+fn report_cli_confinement_refusals(confinement: &meerkat::HostConfinement) {
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    if confinement.is_trusted_host() {
+        return;
+    }
+    REPORTED.call_once(|| {
+        for (kind, refusal) in confinement.preflight() {
+            eprintln!(
+                "warning: {kind} confinement cannot be enforced on this host ({refusal}); every {kind} launch will be refused"
+            );
+        }
+    });
 }
 
 /// Operator-facing line for a typed config warning, naming the document to
@@ -5456,6 +5583,10 @@ async fn load_config_with_warnings(
     config
         .apply_env_overrides()
         .map_err(|e| anyhow::anyhow!("Failed to apply env overrides: {e}"))?;
+    config.apply_cli_overrides(CliOverrides {
+        confinement: scope.confinement.clone(),
+        ..CliOverrides::default()
+    });
     config
         .validate(meerkat_models::canonical())
         .map_err(|e| anyhow::anyhow!("Invalid runtime config: {e}"))?;
@@ -13350,7 +13481,7 @@ async fn run_agent(
                 )
                 .root,
             )
-            .project_root(project_root)
+            .project_root(project_root.clone())
             .builtins(enable_builtins)
             .shell(enable_shell)
             .workgraph(effective_workgraph)
@@ -13361,6 +13492,7 @@ async fn run_agent(
         if let Some(user_root) = scope.user_config_root.clone() {
             factory = factory.user_config_root(user_root);
         }
+        let factory = with_cli_confinement(factory, &config, &project_root)?;
 
         #[cfg(feature = "comms")]
         let factory = factory.comms(!comms_overrides.disabled);
@@ -14149,7 +14281,7 @@ async fn resume_session_with_llm_override(
                 )
                 .root,
             )
-            .project_root(project_root)
+            .project_root(project_root.clone())
             .builtins(tooling.builtins.resolve(config.tools.builtins_enabled))
             .shell(tooling.shell.resolve(config.tools.shell_enabled))
             .workgraph(tooling.workgraph.resolve(config.tools.workgraph_enabled))
@@ -14161,6 +14293,7 @@ async fn resume_session_with_llm_override(
         if let Some(user_root) = scope.user_config_root.clone() {
             factory = factory.user_config_root(user_root);
         }
+        let factory = with_cli_confinement(factory, &config, &project_root)?;
 
         #[cfg(feature = "comms")]
         let factory = factory.comms(
@@ -14677,7 +14810,7 @@ async fn get_or_create_cli_persistent_surface_from_bundle(
             meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
                 .root,
         )
-        .project_root(project_root)
+        .project_root(project_root.clone())
         .builtins(config.tools.builtins_enabled)
         .shell(config.tools.shell_enabled)
         .workgraph(config.tools.workgraph_enabled)
@@ -14688,6 +14821,7 @@ async fn get_or_create_cli_persistent_surface_from_bundle(
     if let Some(user_root) = scope.user_config_root.clone() {
         factory = factory.user_config_root(user_root);
     }
+    let factory = with_cli_confinement(factory, &config, &project_root)?;
 
     let schedule_service = ScheduleService::new(persistence.schedule_store());
     let default_schedule_tools = Some(Arc::new(ScheduleToolDispatcher::new(
@@ -19052,6 +19186,7 @@ async fn handle_mob_command(command: MobCommands, scope: &RuntimeScope) -> anyho
             max_duration: parsed_max_duration,
             max_tool_calls: *max_tool_calls,
             override_config: None,
+            confinement: scope.confinement.clone(),
         };
         println!(
             "{}",
@@ -20913,7 +21048,7 @@ where
     let mut factory = AgentFactory::new(realm_store_path(&manifest, scope))
         .session_store(session_store.clone())
         .runtime_root(paths.root.clone())
-        .project_root(project_root)
+        .project_root(project_root.clone())
         .builtins(config.tools.builtins_enabled)
         .shell(config.tools.shell_enabled)
         .workgraph(config.tools.workgraph_enabled)
@@ -20924,6 +21059,7 @@ where
     if let Some(user_root) = scope.user_config_root.clone() {
         factory = factory.user_config_root(user_root);
     }
+    let factory = with_cli_confinement(factory, &config, &project_root)?;
 
     let mcp_stdio_profile = cli_mcp_stdio_profile(&factory);
     let skill_runtime = factory.build_skill_runtime(&config).await?;
@@ -21608,6 +21744,7 @@ mod tests {
             // test's own state root so `load_config` composition never reads the
             // developer's real `~/.rkat/config.toml`.
             user_config_root: Some(state_root),
+            confinement: None,
             #[cfg(feature = "local-authorization")]
             stock_agent: None,
             auth_lease,
@@ -28418,6 +28555,191 @@ url = "https://user.example/mcp"
         }
     }
 
+    /// A requirement no platform backend enforces (descendant termination),
+    /// so a factory that installs it refuses every confined launch on any OS.
+    const UNENFORCEABLE_CONFINEMENT: &str = r#"[confinement.all]
+mode = "custom"
+working_directory = "/"
+requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths = [] }, write = { kind = "paths", paths = [] }, deny_read = [], deny_write = [], network = { kind = "denied" }, unix_connect = [], require_descendant_termination = true }
+"#;
+
+    /// The `--confinement*` flags are global, so they parse before or after
+    /// the subcommand; a workspace option without `--confinement` is a usage
+    /// error rather than an ignored flag.
+    #[test]
+    fn test_confinement_flags_parse_globally_and_need_a_mode() {
+        let cli = Cli::try_parse_from([
+            "rkat",
+            "--confinement",
+            "workspace",
+            "--confinement-network",
+            "unrestricted",
+            "--confinement-write",
+            "/tmp/build",
+            "--confinement-read",
+            "/opt/tool",
+            "run",
+            "hello",
+        ])
+        .expect("confinement flags parse");
+        assert_eq!(cli.confinement, Some(ConfinementModeArg::Workspace));
+        assert_eq!(
+            cli.confinement_network,
+            Some(ConfinementNetworkArg::Unrestricted)
+        );
+        assert_eq!(cli.confinement_write, vec![PathBuf::from("/tmp/build")]);
+        assert_eq!(cli.confinement_read, vec![PathBuf::from("/opt/tool")]);
+
+        let after = Cli::try_parse_from(["rkat", "run", "--confinement", "trusted-host", "hello"])
+            .expect("the global flag also follows the subcommand");
+        assert_eq!(after.confinement, Some(ConfinementModeArg::TrustedHost));
+
+        for orphan in [
+            ["rkat", "--confinement-network", "denied", "run", "hello"],
+            ["rkat", "--confinement-read", "/opt/tool", "run", "hello"],
+            ["rkat", "--confinement-write", "/tmp/build", "run", "hello"],
+        ] {
+            assert!(
+                Cli::try_parse_from(orphan).is_err(),
+                "{orphan:?} needs --confinement"
+            );
+        }
+    }
+
+    /// The scope carries the flags' selection, with relative paths resolved
+    /// against the working directory; trusted-host refuses workspace options.
+    #[test]
+    fn test_runtime_scope_resolves_the_confinement_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("realms");
+        let state_root = state_root.to_str().unwrap();
+        let cli = Cli::try_parse_from([
+            "rkat",
+            "--state-root",
+            state_root,
+            "--confinement",
+            "workspace",
+            "--confinement-write",
+            "target",
+            "run",
+            "hello",
+        ])
+        .unwrap();
+        let scope = resolve_runtime_scope(&cli).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            scope.confinement,
+            Some(meerkat_core::LaunchConfinement::Workspace(
+                meerkat_core::WorkspaceConfinement {
+                    network: meerkat_core::WorkspaceNetwork::Denied,
+                    read: Vec::new(),
+                    write: vec![cwd.join("target")],
+                }
+            ))
+        );
+
+        let unset =
+            Cli::try_parse_from(["rkat", "--state-root", state_root, "run", "hello"]).unwrap();
+        assert_eq!(resolve_runtime_scope(&unset).unwrap().confinement, None);
+
+        let contradictory = Cli::try_parse_from([
+            "rkat",
+            "--state-root",
+            state_root,
+            "--confinement",
+            "trusted-host",
+            "--confinement-write",
+            "/tmp/build",
+            "run",
+            "hello",
+        ])
+        .unwrap();
+        assert!(resolve_runtime_scope(&contradictory).is_err());
+    }
+
+    /// `rkat` installs the composed `[confinement]` on its factory and on the
+    /// MCP loader's launch boundary; a `--confinement` flag replaces the
+    /// realm's documents for the process.
+    #[tokio::test]
+    async fn test_cli_confinement_documents_and_flags_reach_the_factory() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut scope = test_scope(temp.path().join("realms"), "confined-realm");
+        let document =
+            meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
+                .config_path;
+        std::fs::create_dir_all(document.parent().unwrap()).unwrap();
+        std::fs::write(&document, UNENFORCEABLE_CONFINEMENT).unwrap();
+
+        let (config, _) = load_config(&scope).await.expect("load config");
+        let factory = with_cli_confinement(
+            AgentFactory::new(temp.path().join("sessions")),
+            &config,
+            temp.path(),
+        )
+        .expect("install confinement");
+        assert!(matches!(
+            factory.shell_confinement(),
+            meerkat_tools::builtin::shell::ShellConfinement::Required { .. }
+        ));
+        #[cfg(feature = "mcp")]
+        assert_eq!(
+            cli_mcp_stdio_profile(&factory).capabilities().err(),
+            Some(meerkat_core::confinement::ConfinementRefusal::UnsupportedRequirement)
+        );
+
+        scope.confinement = Some(meerkat_core::LaunchConfinement::TrustedHost);
+        let (config, _) = load_config(&scope).await.expect("load config");
+        assert_eq!(
+            config.confinement,
+            meerkat_core::ConfinementConfig::for_all(meerkat_core::LaunchConfinement::TrustedHost)
+        );
+        let factory = with_cli_confinement(
+            AgentFactory::new(temp.path().join("sessions")),
+            &config,
+            temp.path(),
+        )
+        .expect("install confinement");
+        assert_eq!(
+            factory.shell_confinement(),
+            &meerkat_tools::builtin::shell::ShellConfinement::TrustedHost
+        );
+        #[cfg(feature = "mcp")]
+        assert!(matches!(
+            cli_mcp_stdio_profile(&factory).capabilities(),
+            Ok(None)
+        ));
+    }
+
+    /// The workspace preset confines every launch kind to the factory's
+    /// project root.
+    #[test]
+    fn test_cli_workspace_confinement_grants_the_project_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config {
+            confinement: meerkat_core::ConfinementConfig::for_all(
+                meerkat_core::LaunchConfinement::Workspace(
+                    meerkat_core::WorkspaceConfinement::default(),
+                ),
+            ),
+            ..Config::default()
+        };
+        let factory =
+            with_cli_confinement(AgentFactory::new(root.join("sessions")), &config, &root)
+                .expect("install confinement");
+        let meerkat_tools::builtin::shell::ShellConfinement::Required { requirement } =
+            factory.shell_confinement()
+        else {
+            unreachable!("workspace confinement installs a shell requirement");
+        };
+        assert_eq!(
+            requirement.specification().write,
+            meerkat_core::confinement::FilesystemAccess::Paths(vec![
+                meerkat_core::confinement::PathAccess::Subtree(root.clone())
+            ])
+        );
+    }
+
     #[cfg(feature = "mob")]
     #[test]
     fn test_cli_mob_wait_kickoff_command_parses() {
@@ -29944,6 +30266,7 @@ capabilities = ["rpc"]
                     max_duration: None,
                     max_tool_calls: None,
                     override_config: None,
+                    confinement: None,
                 },
                 #[cfg(feature = "rpc-surface")]
                 rpc_io: None,
@@ -33289,6 +33612,7 @@ supports_reasoning = true
             origin_hint: RealmOrigin::Explicit,
             context_root: Some(root),
             user_config_root: None,
+            confinement: None,
             #[cfg(feature = "local-authorization")]
             stock_agent: None,
             auth_lease,

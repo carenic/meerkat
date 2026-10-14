@@ -143,11 +143,12 @@ fn runtime_error_to_response(id: Option<RpcId>, err: ConfigRuntimeError) -> RpcR
             error::INVALID_PARAMS,
             format!("Generation conflict: expected {expected}, current {current}"),
         ),
-        // An ordinary write is not governance administration; nothing was
-        // written.
+        // An ordinary write is not administration of a section the host
+        // administers in the document; nothing was written.
         ConfigRuntimeError::Config(
-            refused @ meerkat_core::ConfigError::GovernanceAdministration,
-        ) => governance_administration_response(id, &refused),
+            refused @ (meerkat_core::ConfigError::GovernanceAdministration
+            | meerkat_core::ConfigError::ConfinementAdministration),
+        ) => administration_response(id, &refused),
         // The store refused the caller's candidate config: its own new or
         // changed realm MCP server holds an environment reference, or the
         // written config is invalid (for example after a concurrent edit
@@ -166,12 +167,15 @@ fn runtime_error_to_response(id: Option<RpcId>, err: ConfigRuntimeError) -> RpcR
 }
 
 /// The typed refusal of a config write that would change, remove or restate
-/// the realm's governance section.
-fn governance_administration_response(
-    id: Option<RpcId>,
-    refused: &meerkat_core::ConfigError,
-) -> RpcResponse {
-    match serde_json::to_value(WireConfigWriteRefusal::GovernanceAdministrationRequired) {
+/// a host-administered section: the realm's governance or its confinement.
+fn administration_response(id: Option<RpcId>, refused: &meerkat_core::ConfigError) -> RpcResponse {
+    let refusal = match refused {
+        meerkat_core::ConfigError::ConfinementAdministration => {
+            WireConfigWriteRefusal::ConfinementAdministrationRequired
+        }
+        _ => WireConfigWriteRefusal::GovernanceAdministrationRequired,
+    };
+    match serde_json::to_value(refusal) {
         Ok(data) => {
             RpcResponse::error_with_data(id, error::INVALID_PARAMS, refused.to_string(), data)
         }
@@ -187,8 +191,9 @@ fn governance_administration_response(
 /// governance refusal stays typed, anything else is internal.
 fn store_write_error_response(id: Option<RpcId>, err: meerkat_core::ConfigError) -> RpcResponse {
     match err {
-        refused @ meerkat_core::ConfigError::GovernanceAdministration => {
-            governance_administration_response(id, &refused)
+        refused @ (meerkat_core::ConfigError::GovernanceAdministration
+        | meerkat_core::ConfigError::ConfinementAdministration) => {
+            administration_response(id, &refused)
         }
         other => RpcResponse::error(id, error::INTERNAL_ERROR, other.to_string()),
     }
