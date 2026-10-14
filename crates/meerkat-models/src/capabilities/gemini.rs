@@ -5,8 +5,24 @@
 //! and `ai.google.dev/gemini-api/docs/gemini-3`.
 
 use meerkat_core::Provider;
-use meerkat_core::model_profile::capabilities::{ModelCapabilities, ThinkingSupport};
+use meerkat_core::model_profile::capabilities::{EffortLevel, ModelCapabilities, ThinkingSupport};
 use meerkat_core::model_profile::catalog::{ModelReleaseStage, ModelTier};
+
+/// Thinking levels of models that refuse `minimal`: the API answers 400
+/// "Thinking level MINIMAL is not supported for this model" (live probe
+/// 2026-10-14 for gemini-4-argon, gemini-3.8-flash, gemini-3.7-flash and
+/// gemini-3.1-pro-preview; the thinking guide lists low/medium/high for them).
+const GEMINI_LOW_TO_HIGH: &[EffortLevel] =
+    &[EffortLevel::Low, EffortLevel::Medium, EffortLevel::High];
+
+/// Thinking levels of models that also accept `minimal` (thinking guide;
+/// live probe 2026-10-14 answered 200).
+const GEMINI_MINIMAL_TO_HIGH: &[EffortLevel] = &[
+    EffortLevel::Minimal,
+    EffortLevel::Low,
+    EffortLevel::Medium,
+    EffortLevel::High,
+];
 
 /// Capability rows for Gemini catalog models.
 pub const CAPABILITIES: &[ModelCapabilities] = &[
@@ -63,7 +79,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_k: false,
         thinking: ThinkingSupport::GeminiThinkingLevel,
         supports_reasoning: false,
-        effort_levels: &[],
+        effort_levels: GEMINI_LOW_TO_HIGH,
         openai_responses_params: None,
         supports_web_search: true,
         supports_mid_conversation_system_messages: false,
@@ -113,7 +129,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_k: false,
         thinking: ThinkingSupport::GeminiThinkingLevel,
         supports_reasoning: false,
-        effort_levels: &[],
+        effort_levels: GEMINI_LOW_TO_HIGH,
         openai_responses_params: None,
         supports_web_search: true,
         supports_mid_conversation_system_messages: false,
@@ -169,7 +185,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_k: false,
         thinking: ThinkingSupport::GeminiThinkingLevel,
         supports_reasoning: false,
-        effort_levels: &[],
+        effort_levels: GEMINI_LOW_TO_HIGH,
         openai_responses_params: None,
         supports_web_search: true,
         supports_mid_conversation_system_messages: false,
@@ -231,7 +247,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_k: false,
         thinking: ThinkingSupport::GeminiThinkingLevel,
         supports_reasoning: false,
-        effort_levels: &[],
+        effort_levels: GEMINI_MINIMAL_TO_HIGH,
         openai_responses_params: None,
         supports_web_search: true,
         supports_mid_conversation_system_messages: false,
@@ -290,7 +306,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_k: true,
         thinking: ThinkingSupport::GeminiThinkingLevel,
         supports_reasoning: false,
-        effort_levels: &[],
+        effort_levels: GEMINI_MINIMAL_TO_HIGH,
         openai_responses_params: None,
         supports_web_search: true,
         supports_mid_conversation_system_messages: false,
@@ -350,7 +366,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_k: false,
         thinking: ThinkingSupport::GeminiThinkingLevel,
         supports_reasoning: false,
-        effort_levels: &[],
+        effort_levels: GEMINI_MINIMAL_TO_HIGH,
         openai_responses_params: None,
         supports_web_search: true,
         supports_mid_conversation_system_messages: false,
@@ -401,7 +417,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_k: true,
         thinking: ThinkingSupport::GeminiThinkingLevel,
         supports_reasoning: false,
-        effort_levels: &[],
+        effort_levels: GEMINI_LOW_TO_HIGH,
         openai_responses_params: None,
         supports_web_search: true,
         supports_mid_conversation_system_messages: false,
@@ -463,7 +479,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_k: true,
         thinking: ThinkingSupport::GeminiThinkingLevel,
         supports_reasoning: false,
-        effort_levels: &[],
+        effort_levels: GEMINI_MINIMAL_TO_HIGH,
         openai_responses_params: None,
         supports_web_search: true,
         supports_mid_conversation_system_messages: false,
@@ -512,7 +528,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_k: true,
         thinking: ThinkingSupport::GeminiThinkingLevel,
         supports_reasoning: false,
-        effort_levels: &[],
+        effort_levels: GEMINI_MINIMAL_TO_HIGH,
         openai_responses_params: None,
         supports_web_search: true,
         supports_mid_conversation_system_messages: false,

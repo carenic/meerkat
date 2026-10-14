@@ -266,7 +266,10 @@ pub struct ModelCapabilities {
     /// Accepted values for effort control. Empty slice = unsupported.
     /// Applies to both Anthropic `output_config.effort` and OpenAI
     /// `reasoning.effort`; the two schemas live in different request shapes but
-    /// share the typed [`EffortLevel`] vocabulary.
+    /// share the typed [`EffortLevel`] vocabulary. On Gemini thinking-level
+    /// rows it lists the `thinkingConfig.thinkingLevel` values the model
+    /// accepts; an empty slice there records none, and the params schema then
+    /// advertises every Gemini level.
     pub effort_levels: &'static [EffortLevel],
     /// GPT-5.6-specific Responses parameter vocabularies. `None` means the row
     /// does not advertise these newer controls.

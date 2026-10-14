@@ -1585,6 +1585,53 @@ mod schema {
         assert_eq!(values, expected);
     }
 
+    /// Live probe 2026-10-14: `thinkingConfig.thinkingLevel: "minimal"`
+    /// answers 400 "Thinking level MINIMAL is not supported for this model"
+    /// on these models and 200 on every other Gemini row, so only the others
+    /// may advertise `minimal`.
+    #[test]
+    fn gemini_rows_advertise_only_the_thinking_levels_the_model_accepts() {
+        const REFUSES_MINIMAL: &[&str] = &[
+            "gemini-4-argon",
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.1-pro-preview",
+        ];
+        let gemini_rows: Vec<_> = all_capabilities()
+            .filter(|caps| caps.provider == Provider::Gemini)
+            .collect();
+        assert!(!gemini_rows.is_empty());
+        for caps in gemini_rows {
+            assert!(
+                caps.effort_levels.iter().all(|level| matches!(
+                    level,
+                    EffortLevel::Minimal
+                        | EffortLevel::Low
+                        | EffortLevel::Medium
+                        | EffortLevel::High
+                )),
+                "{} may only record Gemini thinking levels",
+                caps.id
+            );
+            let expected = if REFUSES_MINIMAL.contains(&caps.id) {
+                serde_json::json!(["low", "medium", "high"])
+            } else {
+                serde_json::json!(["minimal", "low", "medium", "high"])
+            };
+            let schema = build_params_schema(caps);
+            assert_eq!(
+                schema["properties"]["thinking_level"]["enum"], expected,
+                "{} thinking_level",
+                caps.id
+            );
+            assert_eq!(
+                schema["properties"]["thinking"]["properties"]["thinking_level"]["enum"], expected,
+                "{} thinking.thinking_level",
+                caps.id
+            );
+        }
+    }
+
     #[test]
     fn gemini_schema_has_no_include_thoughts() {
         for caps in all_capabilities().filter(|c| c.provider == Provider::Gemini) {

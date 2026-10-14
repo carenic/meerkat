@@ -91,8 +91,9 @@ fn apply(
             tag.effort = Some(effort);
             Ok(())
         }
-        // The catalog's Gemini thinking flag does not record which levels a
-        // given model accepts, so no level is validated for it yet.
+        // Gemini rows list their accepted thinking levels in `effort_levels`
+        // for the params schema, but a preference is not lowered onto
+        // `thinking_level` yet, so no level is validated for Gemini here.
         Provider::Gemini => Err(ReasoningNotAppliedReason::UnknownSupportedLevels),
         Provider::SelfHosted | Provider::Other => Err(ReasoningNotAppliedReason::NoCatalogFact),
     }
