@@ -947,6 +947,53 @@ fn gemini_38_and_37_capability_rows_match_the_current_flash_contract() {
 }
 
 #[test]
+fn gemini_36_flash_35_flash_lite_and_31_flash_lite_rows_match_their_model_pages() {
+    // (id, display name, sampling parameters accepted, legacy thinking_budget)
+    for (id, display_name, sampling, thinking_budget_legacy) in [
+        ("gemini-3.6-flash", "Gemini 3.6 Flash", false, false),
+        (
+            "gemini-3.5-flash-lite",
+            "Gemini 3.5 Flash Lite",
+            false,
+            false,
+        ),
+        ("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite", true, true),
+    ] {
+        let entry = entry_for(Provider::Gemini, id)
+            .unwrap_or_else(|| panic!("{id} must be in the Gemini catalog"));
+        assert_eq!(entry.display_name, display_name);
+        assert_eq!(entry.tier, ModelTier::Supported, "{id}");
+        assert_eq!(infer_provider(id), Some(Provider::Gemini), "{id}");
+        assert!(
+            allowed_models(Provider::Gemini).any(|allowed| allowed == id),
+            "{id} must be in the Gemini allowlist"
+        );
+
+        let caps = capabilities_for(Provider::Gemini, id)
+            .unwrap_or_else(|| panic!("{id} must have a capability row"));
+        assert_eq!(caps.model_family, "gemini-3", "{id}");
+        assert_eq!(caps.context_window, Some(1_048_576), "{id}");
+        assert_eq!(caps.max_output_tokens, Some(65_536), "{id}");
+        assert_eq!(caps.thinking, ThinkingSupport::GeminiThinkingLevel, "{id}");
+        assert_eq!(caps.supports_temperature, sampling, "{id}");
+        assert_eq!(caps.supports_top_p, sampling, "{id}");
+        assert_eq!(caps.supports_top_k, sampling, "{id}");
+        assert_eq!(
+            caps.supports_thinking_budget_legacy, thinking_budget_legacy,
+            "{id}"
+        );
+        assert!(
+            caps.vision && caps.image_tool_results && caps.inline_video,
+            "{id}"
+        );
+        assert!(!caps.realtime && !caps.image_generation, "{id}");
+        assert!(caps.supports_structured_output, "{id}");
+        assert!(caps.supports_web_search, "{id}");
+        assert_eq!(caps.call_timeout_secs, Some(120), "{id}");
+    }
+}
+
+#[test]
 fn gemini_4_argon_capability_row_matches_the_official_model_page() {
     let caps = capabilities_for(Provider::Gemini, "gemini-4-argon")
         .expect("gemini-4-argon must be in the Gemini catalog");
