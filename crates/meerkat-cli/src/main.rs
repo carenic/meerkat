@@ -6548,9 +6548,21 @@ impl LoginProvider {
         }
     }
 
+    /// Default model written into a freshly synthesized OAuth binding.
+    ///
+    /// Routes follow the catalog default for their provider, except the
+    /// Google login: it is the Code Assist route, which keeps its own
+    /// [`GOOGLE_CODE_ASSIST_SAMPLE_MODEL`] because the catalog's Gemini
+    /// default is chosen for the API-key route and is not verified on Code
+    /// Assist (notably its free tier).
     fn sample_model(self) -> &'static str {
-        meerkat_models::default_model(self.provider())
-            .expect("login provider must have a catalog default model")
+        match self {
+            Self::Google => GOOGLE_CODE_ASSIST_SAMPLE_MODEL,
+            Self::Anthropic | Self::OpenAi | Self::Copilot => {
+                meerkat_models::default_model(self.provider())
+                    .expect("login provider must have a catalog default model")
+            }
+        }
     }
 
     /// FROZEN historical snapshot of prior built-in OAuth binding sample
@@ -6559,8 +6571,9 @@ impl LoginProvider {
     /// This is intentionally NOT a mirror of the live model catalog. It exists
     /// only to detect a stale `default_model` that an *older* CLI build wrote
     /// into a synthesized OAuth binding and heal it by redirecting to the
-    /// catalog-derived current default (`sample_model` →
-    /// `catalog::default_model`; see `ensure_cli_interactive_oauth_config`).
+    /// current route default (`sample_model`: `catalog::default_model`, or
+    /// the Code Assist route default for Google; see
+    /// `ensure_cli_interactive_oauth_config`).
     /// Because it must match what prior builds persisted, it deliberately
     /// retains retired model IDs (e.g. `claude-opus-4-6`) that no longer exist
     /// in the catalog, so it cannot — and must not — be catalog-bound. Append a
@@ -6581,6 +6594,15 @@ impl LoginProvider {
         }
     }
 }
+
+/// Default model of a synthesized Google OAuth (Code Assist) binding.
+///
+/// Route-specific on purpose: the catalog's Gemini default serves the API-key
+/// route and may not be available through Code Assist, notably on its free
+/// tier, so a Google login keeps a model that route is known to serve. Must
+/// stay a catalog Gemini model (pinned by a test).
+#[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
+const GOOGLE_CODE_ASSIST_SAMPLE_MODEL: &str = "gemini-3.8-flash";
 
 #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
 const ALL_LOGIN_PROVIDERS: &[LoginProvider] = &[
@@ -22565,6 +22587,46 @@ mod tests {
                 .get("openai_oauth")
                 .and_then(|binding| binding.default_model.as_deref()),
             meerkat_models::default_model(meerkat_core::Provider::OpenAI)
+        );
+    }
+
+    #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
+    #[test]
+    fn test_cli_google_oauth_config_keeps_the_code_assist_route_default() {
+        assert_eq!(
+            meerkat_models::infer_provider(GOOGLE_CODE_ASSIST_SAMPLE_MODEL),
+            Some(meerkat_core::Provider::Gemini),
+            "the Code Assist login default must stay a catalog Gemini model"
+        );
+
+        let mut config = Config::default();
+        assert!(ensure_cli_interactive_oauth_config(LoginProvider::Google, &mut config).unwrap());
+        let default_model = |config: &Config| {
+            config
+                .realm
+                .get("global")
+                .and_then(|realm| realm.binding.get("google_oauth"))
+                .and_then(|binding| binding.default_model.clone())
+        };
+        assert_eq!(
+            default_model(&config).as_deref(),
+            Some(GOOGLE_CODE_ASSIST_SAMPLE_MODEL),
+            "a new Google login binds the Code Assist route default, not the \
+             API-key catalog default"
+        );
+
+        // A binding an older build synthesized with its sample model heals to
+        // the same route default.
+        config
+            .realm
+            .get_mut("global")
+            .and_then(|realm| realm.binding.get_mut("google_oauth"))
+            .expect("google oauth binding")
+            .default_model = Some("gemini-3.1-flash-lite".to_string());
+        assert!(ensure_cli_interactive_oauth_config(LoginProvider::Google, &mut config).unwrap());
+        assert_eq!(
+            default_model(&config).as_deref(),
+            Some(GOOGLE_CODE_ASSIST_SAMPLE_MODEL)
         );
     }
 
