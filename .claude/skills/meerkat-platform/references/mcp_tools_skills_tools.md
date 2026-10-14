@@ -60,9 +60,9 @@ Shell:
 - Arguments: `command`; `working_dir` (relative to the project root, must stay
   inside it); `timeout_secs` (at least 1); `background` (offered only where
   durable background jobs exist).
-- A call without `timeout_secs` gets 30 s. In 0.9.0 `[shell] timeout_secs` is
-  read but not applied to the tool, so longer commands need `timeout_secs` in
-  the call.
+- A call without `timeout_secs` gets `[shell] timeout_secs` (default 30 s; 0
+  keeps 30 s) since 0.9.1. In 0.9.0 `[shell] timeout_secs` was read but not
+  applied, so every such call got 30 s.
 - `[shell]`: `program` (default `nu`, falling back to `$SHELL`, `bash`, `zsh`,
   `sh`), `security_mode` (`unrestricted` default, `allow_list`, `deny_list`),
   `security_patterns` (globs matched against the whole command line;

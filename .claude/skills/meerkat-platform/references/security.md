@@ -434,7 +434,7 @@ secret_env = ["SEARCH_API_KEY"]
 | `access_denied` | tool result | tool policy or MCP access ceiling |
 | `policy_denied`, `policy_indeterminate` | tool result | host application tool policy |
 | `outcome_uncertain` | tool result | sent, effect unknown; never replayed |
-| `INPUT_REFUSED` -32030 / `INPUT_NOT_READY` -32031 | JSON-RPC | native input refused / not ready (HTTP 403/503, exit 50/51) |
+| `INPUT_REFUSED` -32030 / `INPUT_NOT_READY` -32031 | JSON-RPC | native input refused / not ready (HTTP 403/503; `rkat` exits 50/51 since 0.9.1, 1 before) |
 | `APPROVAL_*` -32033..-32035 | JSON-RPC | approval store unavailable, conflict, commit unknown |
 | `RESULT_DISCLOSURE_REFUSED` | REST 403; JSON-RPC -32025 `SCOPE_DENIED` with `data.reason` | result of a recovered governed input, until its scoped destination is bound again |
 | `governance_administration_required` | config write `data.type` | governance section is host-administered |

@@ -1,7 +1,7 @@
 Covers: Meerkat mob changes from 0.8.40 to 0.9.0: stop, shutdown, destroy,
 admission close, cancelling member work, member lifetime, helpers, fork_off,
 council, profile keys (tools.deny hides tools), flows and runs (run-flow
-waits, --detach), multi-host mobs, mobpacks and deploy (0.9.0 known issues),
+waits, --detach), multi-host mobs, mobpacks and deploy (budgets, known issues),
 error codes. Live: live_comms_mobs_live.md. Comms:
 live_comms_mobs_comms.md.
 
@@ -19,7 +19,8 @@ live_comms_mobs_live.md and comms in live_comms_mobs_comms.md.
   id. `rkat mob run --detach` does not keep executing after the CLI exits.
 - `rkat mob deploy` builds the mob in memory: it lives only as long as the
   command (`--surface cli`) or the JSON-RPC stream (`--surface rpc`). Its
-  budget flags are not enforced in 0.9.0 (see Mobpacks).
+  budget flags are enforced since 0.9.1, except with `--surface rpc` (see
+  Mobpacks).
 
 ## Stop, resume, shutdown, destroy
 
@@ -294,13 +295,15 @@ rkat mob web build ./dist/triage.mobpack -o ./dist/web --wasm <PKG_DIR|name_bg.w
   closes and does not start the realm's MCP servers (it warns), so members
   get no realm-configured MCP tools. Without an orchestrator, deploy warns
   that nothing was started.
-- Known issue in 0.9.0: `rkat mob deploy
+- Since 0.9.1 `rkat mob deploy
   --max-total-tokens/--max-duration/--max-tool-calls` and a pack's `[budget]`
-  are recorded but not enforced, because enforcement reads `[limits]`; a
-  correction is in progress for 0.9.1.
-- Known issue in 0.9.0: with `rkat mob deploy --surface rpc`, members are
-  built from the realm config store, so deploy flags and pack overlays
-  (budget, models, `max_tokens`, compaction, `--model`) do not apply.
+  set each member's `[limits]` (`budget`, `max_duration`, `max_tool_calls`)
+  on the default `--surface cli` and for `rkat mob run`; a flag wins over the
+  realm's `[limits]`, which wins over the pack default. 0.9.0 recorded them
+  but did not enforce them.
+- Known issue: with `rkat mob deploy --surface rpc`, members are built from
+  the realm config store, so deploy flags and pack overlays (budget, models,
+  `max_tokens`, compaction, `--model`) do not apply.
 - `rkat mob web build` needs prebuilt wasm-pack `--target web` output via
   `--wasm` and writes `index.html`, `meerkat-bootstrap.js` (`bootMobpack`),
   `mobpack.bin`, `manifest.web.toml` and the wasm files. Booting initializes
@@ -323,7 +326,13 @@ rkat mob web build ./dist/triage.mobpack -o ./dist/web --wasm <PKG_DIR|name_bg.w
 
 `rkat mob` commands exit 45 (`SCOPE_DENIED`), 46 (`HOST_UNAVAILABLE`), 47
 (`STALE_CURSOR`), 48 (`STALE_FENCE`) or 56 (`STALE_DELIVERY_SCOPE`) and print
-one `detail: {...}` JSON line on stderr; every other failure exits 1.
+one `detail: {...}` JSON line on stderr. Since 0.9.1 the other typed mob
+errors exit with their codes too: 49 (`MEMBER_RELOAD_REQUIRED`), 44
+(supervisor protocol upgrade required), 11 (retirement, lifecycle or admission
+pending, reload refused or timed out, actor command timeout), 40 (capability
+or delivery scope unavailable) and 52 (held before activation, runtime
+unavailable); `rkat mob run <pack>` follows the same codes. Other failures
+exit 1 (in 0.9.0, everything outside 45-48 and 56 exited 1).
 
 ## Removed or renamed
 

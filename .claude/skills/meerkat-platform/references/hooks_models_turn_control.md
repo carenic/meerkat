@@ -78,7 +78,8 @@ drain, then exits.
   concurrently, at most `[tools] max_concurrent` (default 10) at once; waiting
   for a slot counts toward a call's timeout. Results commit in call order after
   the whole batch. No setting makes calls sequential.
-- Tool-call limit: `--max-tool-calls` or `budget_limits.max_tool_calls`,
+- Tool-call limit: `--max-tool-calls`, `budget_limits.max_tool_calls` or
+  (since 0.9.1) `[limits] max_tool_calls`,
   unlimited by default; refused and failed calls count.
 - Tool choice: `turn_tool_overlay.tool_choice_plan` (RPC `turn/start` and
   `mob/turn_start`, REST continue, Python and TypeScript SDKs; Rust
@@ -112,7 +113,8 @@ timestamp_ms, payload}`; `payload.type` is the event type.
   per model call).
 - Tools: `tool_call_requested`, `tool_execution_started`,
   `tool_execution_completed`, `tool_result_received`,
-  `tool_execution_timed_out` (not emitted in 0.9.0), `tool_config_changed`.
+    `tool_execution_timed_out` (since 0.9.1; 0.9.0 never emitted it),
+  `tool_config_changed`.
 - Hooks: `hook_started`, `hook_completed`, `hook_failed`, `hook_denied`,
   `hook_launch_refused`.
 - Model operations: `compaction_started`, `compaction_completed`,

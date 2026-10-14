@@ -211,7 +211,7 @@ Local session-backed members use `RuntimeBinding::Session` and need no extra
 wiring. Members are addressed everywhere by stable `AgentIdentity`;
 runtime/binding identity rotates underneath.
 
-For a remote `rkat` process, use `rkat run --comms-listen-tcp <ip:port> --comms-advertise-tcp <ip:port> --comms-binding-out <path> --keep-alive ...` (the advertised address must be an IP literal; `rkat run` ignores a realm `[comms] advertise_address`). The generated binding JSON is the safest source for mob spawn/host tooling because hand-written address-only bindings and query-string-only bootstrap tokens are rejected.
+For a remote `rkat` process, use `rkat run --comms-listen-tcp <ip:port> --comms-advertise-tcp <host:port> --comms-binding-out <path> --keep-alive ...` (since 0.9.1 `--comms-advertise-tcp` takes `HOST:PORT` or `tcp://HOST:PORT`, where HOST is a DNS name, an IPv4 address or a bracketed IPv6 address, resolved when a peer connects; the flag wins over a realm `[comms] advertise_address`, which wins over the address derived from the listener, and a missing flag no longer erases the configured value; 0.9.0 accepted only IP literals and ignored the realm setting). The generated binding JSON is the safest source for mob spawn/host tooling because hand-written address-only bindings and query-string-only bootstrap tokens are rejected.
 
 `rkat-rpc --tcp` is not this channel. It exposes JSON-RPC to hosts and SDKs; signed Meerkat peer traffic uses the `rkat run --comms-*` comms listener.
 

@@ -361,8 +361,12 @@ rkat run \
   "You are a remote worker."
 ```
 `--comms-advertise-tcp`
-takes an IP literal and port (advertised as `tcp://IP:PORT`); a host name
-is rejected. A wildcard `--comms-listen-tcp 0.0.0.0:...` needs it.
+takes `HOST:PORT` or `tcp://HOST:PORT` (0.9.1); HOST is a DNS name, an IPv4
+address or a bracketed IPv6 address, resolved when a peer connects, and it is
+advertised as `tcp://HOST:PORT`. A wildcard host and a missing or zero port
+are refused (0.9.0 accepted only IP literals). A wildcard
+`--comms-listen-tcp 0.0.0.0:...` needs the flag or a realm `[comms]
+advertise_address`.
 
 Use `rkat run --comms-listen-tcp` for the signed Meerkat peer channel.
 `rkat-rpc --tcp` is only JSON-RPC host transport and does not make an agent

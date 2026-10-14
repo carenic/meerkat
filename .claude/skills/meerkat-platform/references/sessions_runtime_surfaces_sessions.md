@@ -72,8 +72,13 @@ rkat run --resume team-alpha:<uuid> "hi"  # realm-qualified; must match the acti
 rkat --resume "keep going"                # root shorthand, rewritten to `run --resume last`
 ```
 
-A bare `--resume` resumes `last`. When a prompt follows, name the target
-first (`rkat run --resume last "keep going"`), or use the root form above.
+A bare `--resume` resumes `last`. Since 0.9.1, when `--resume` is followed by
+the run's only positional argument, that argument is the prompt and the
+session is `last` (`rkat run --resume "keep going"`). A lone argument that
+names a session (a UUID, `<realm>:<uuid>`, a hexadecimal handle of 8 to 36
+characters, `last`, `~` or `~N`) is read as the session instead, and the
+prompt is still required. Option values, such as `gpt-5.5` in
+`-m gpt-5.5`, are not positional arguments.
 
 Accepted targets: a full UUID, a UUID prefix or tail handle,
 `<realm>:<uuid>`, `last`, `~`, `~0`, and `~N` (counted from the most
@@ -105,6 +110,11 @@ JSON-RPC `turn/start` (SDK `Session.turn`) accepts:
   ChatGPT-account backend refuse the request as a non-retryable invalid
   request (`InvalidInputShape`); history is not rewritten. On create, `system_prompt` is a policy: omit or `null` to inherit,
   a string to set, `{"action": "disable"}` to suppress every prompt source.
+  The same per-turn append is
+  `rkat run --resume <ID> --system <TEXT> <PROMPT>` (on a new run `--system`
+  sets the create-time prompt), REST `POST /sessions/{id}/messages`
+  `system_prompt`, MCP `meerkat_resume` `system_prompt` and RPC
+  `mob/turn_start` `system_prompt`.
 - `injected_context`: a list of content items stored as typed
   injected-context user rows immediately before the turn's user message;
   excluded from semantic-memory indexing.

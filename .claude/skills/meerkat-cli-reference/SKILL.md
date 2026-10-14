@@ -125,7 +125,7 @@ rkat run --resume[=<SESSION>] <PROMPT>
 Common options:
 
 ```bash
---resume [<SESSION>]            # resume SESSION (default last); before a prompt, name it: --resume last "<prompt>"
+--resume [<SESSION>]            # resume SESSION (default last); since 0.9.1 a lone positional after a bare --resume is the prompt for last, unless it names a session
 -m, --model <MODEL>
 -d, --max-duration <DURATION>
 -o, --output <text|json|html>
@@ -167,7 +167,7 @@ Advanced options (`rkat run --help` only):
 --line-format <text|json>       # how --stdin lines input is parsed (not output)
 --comms-name <NAME>                         # stable signed comms participant name
 --comms-listen-tcp <HOST:PORT>              # signed agent-to-agent TCP listener
---comms-advertise-tcp <IP:PORT>             # advertised signed comms address; IP literal, no host names
+--comms-advertise-tcp <HOST:PORT>           # advertised signed comms address; DNS name, IPv4 or [IPv6], optional tcp:// (0.9.1)
 --comms-binding-out <PATH>                  # write external mob/runtime binding JSON
 --comms-pairing-password <PASSWORD>         # one-time signed comms enrollment password
 --comms-pairing-password-env <ENV>          # read enrollment password from env
@@ -220,8 +220,8 @@ Defaults:
   `tools.builtins_enabled` or `tools.shell_enabled` differ; `full` adds
   WorkGraph, memory and mob tools. `--resume` keeps the stored choice unless
   `--tools`/`--yolo` is given
-- a shell call without `timeout_secs` gets 30 s; `[shell] timeout_secs` is not
-  applied in 0.9.0
+- a shell call without `timeout_secs` gets `[shell] timeout_secs` (default 30 s;
+  0 keeps 30 s) since 0.9.1; 0.9.0 always used 30 s
 - short session handles are UUID tails; resume accepts full UUID, prefix/tail, `<realm>:<uuid>`, `last`, `~`, or `~N`
 - `@path` in the prompt inlines that UTF-8 file, resolved from `--context-root` or the current directory; `@/...`, `@~/...`, `@./...`, and `@../...` must name an existing file, while a bare `@name` that is not a file stays plain text; at most 16 mentions, 64 KiB / 2,000 lines per file and 128 KiB / 4,000 lines in total (truncated beyond that)
 
@@ -437,13 +437,14 @@ rkat mob validate <pack> [--trust-policy permissive|strict]
 rkat mob deploy <pack> <prompt> [-m|--model <model>] [--max-total-tokens N] [-d|--max-duration D] [--max-tool-calls N] [--trust-policy permissive|strict] [--surface cli|rpc]
 rkat mob web build <pack> -o <dir> --wasm <PKG_DIR|name_bg.wasm> [--trust-policy permissive|strict]
 ```
-Known issue in 0.9.0: `rkat mob deploy
+Since 0.9.1 `rkat mob deploy
 --max-total-tokens/--max-duration/--max-tool-calls` and a pack's `[budget]`
-are recorded but not enforced, because enforcement reads `[limits]`; a
-correction is in progress for 0.9.1. Known issue in 0.9.0: with `rkat mob
-deploy --surface rpc`, members are built from the realm config store, so
-deploy flags and pack overlays (budget, models, `max_tokens`, compaction,
-`--model`) do not apply.
+set each member's `[limits]` (`budget`, `max_duration`, `max_tool_calls`) on
+the default `--surface cli` and for `rkat mob run`; a flag wins over the
+realm's `[limits]`, which wins over the pack default (0.9.0 recorded them but
+did not enforce them). Known issue: with `rkat mob deploy --surface rpc`,
+members are built from the realm config store, so deploy flags and pack
+overlays (budget, models, `max_tokens`, compaction, `--model`) do not apply.
 
 The parser accepts `--transport websocket|webrtc` on `rkat mob live open`, but
 the current member-live family rejects WebRTC for both local and placed
@@ -458,7 +459,10 @@ session through the controller.
 `--isolated`, and accepts pairing only on a loopback listener; pairing secrets
 must be at least 32 bytes. Typed mob errors exit with their own codes (scope
 denied 45, host unavailable 46, stale cursor 47, stale fence 48, stale delivery
-scope 56) and print one `detail: {...}` JSON line on stderr; other failures
+scope 56; since 0.9.1 also member reload required 49, supervisor protocol
+upgrade required 44, pending or timed-out lifecycle work 11, capability or
+delivery scope unavailable 40, runtime unavailable 52); an error with a typed
+console detail prints one `detail: {...}` JSON line on stderr; other failures
 exit 1.
 
 Packing with `--sign` embeds the signer identity and public key but does not

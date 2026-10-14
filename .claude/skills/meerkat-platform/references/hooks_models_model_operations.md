@@ -16,9 +16,10 @@ structured output, retries, timeouts, model fallback and model switching.
   total token budget (that is `[limits] budget` or `budget_limits.max_tokens`).
 - Token and tool-call budgets end a run successfully with
   `terminal_cause_kind: "budget_exhausted"`; a time budget is a hard failure.
-- Known issue in 0.9.0: the `[budget]` table, the `rkat mob deploy` budget
-  flags and a mobpack's `[budget]` are recorded but not enforced; a correction
-  is in progress for 0.9.1. Use `[limits]` or per-session `budget_limits`.
+- The legacy `[budget]` config table is recorded but not enforced; use
+  `[limits]` or per-session `budget_limits`. Since 0.9.1 the `rkat mob deploy`
+  budget flags and a mobpack's `[budget]` set the members' `[limits]` (not
+  with `--surface rpc`).
 - RPC `turn/start` refuses `max_tokens`, `output_schema` and
   `structured_output_retries` (-32602). Set them on `session/create`.
 - No surface has a manual "compact now" command.
@@ -46,7 +47,7 @@ structured output, retries, timeouts, model fallback and model switching.
 | Limit | Config | Per session | Scope | When reached |
 |---|---|---|---|---|
 | total tokens | `[limits] budget` | `budget_limits.max_tokens` | agent lifetime | run completes, `budget_exhausted` |
-| tool calls | none | `budget_limits.max_tool_calls`, `--max-tool-calls` | agent lifetime | run completes, `budget_exhausted` |
+| tool calls | `[limits] max_tool_calls` (0.9.1) | `budget_limits.max_tool_calls`, `--max-tool-calls` | agent lifetime | run completes, `budget_exhausted` |
 | wall clock | `[limits] max_duration` | `budget_limits.max_duration`, `-d/--max-duration` | agent lifetime | run fails, class `budget` |
 | per-run wall clock | `[limits] max_turn_duration` | `budget_limits.max_turn_duration` | each run | run fails, class `budget` |
 | model calls per run | `[agent] max_turns` (default 100) | none | each run | run fails, class `max_turns` |
@@ -93,13 +94,20 @@ Example JSON-RPC `session/create` params with limits and a schema:
   `terminal_cause_kind: "budget_exhausted"` on the result and on
   `run_completed`.
 - `budget_warning {budget_type, used, limit, percent}` (`budget_type`
-  `tokens`, `time` or `tool_calls`) is emitted only when a limit is reached,
-  with `percent` 1.0. `[agent] budget_warning_threshold` has no effect.
-- Known issue in 0.9.0: `[budget]` (`max_tokens`, `max_duration`,
-  `max_tool_calls`), the values `rkat mob deploy --max-total-tokens`,
-  `--max-duration` and `--max-tool-calls` write there, and a mobpack's
-  `[budget]` are recorded but not enforced, because enforcement reads
-  `[limits]` and `budget_limits`. A correction is in progress for 0.9.1.
+  `tokens`, `time` or `tool_calls`) fires once when usage reaches `[agent]
+  budget_warning_threshold` of a limit (0.8 by default), with `percent` the
+  fraction used; the per-turn time limit warns again each turn (0.9.1). A
+  value takes effect when it is greater than 0 and at most 1 (`1.0` keeps only
+  the warning at the limit); an out-of-range value loads with a warning and
+  keeps the inherited threshold. In 0.9.0 it fired only when a limit was
+  reached, with `percent` 1.0, and the threshold had no effect.
+- The legacy `[budget]` table (`max_tokens`, `max_duration`,
+  `max_tool_calls`) is recorded but not enforced, because enforcement reads
+  `[limits]` and `budget_limits`. Since 0.9.1 `rkat mob deploy
+  --max-total-tokens`, `--max-duration` and `--max-tool-calls` and a
+  mobpack's `[budget]` write the enforced `[limits]` instead (`budget`,
+  `max_duration` and the new `[limits] max_tool_calls`); with `--surface rpc`
+  they do not apply. In 0.9.0 they landed in `[budget]`.
 - Usage fields: `input_tokens`, `output_tokens`, `cache_creation_tokens`,
   `cache_read_tokens`, `reasoning_tokens`. Results carry `usage`
   (session-cumulative: take the latest value, never sum it), `run_usage` (this
@@ -178,8 +186,10 @@ history_retained_rewrites = 4      # older pre-compaction bodies are retired
 Schema: a raw JSON Schema object, or a wrapper `{"schema": {...}, "name":
 "...", "strict": false, "compat": "lossy" | "strict", "format": "meerkat_v1"}`.
 `structured_output_retries` defaults to 2 (`[agent] structured_output_retries`
-changes the default; `[agent] output_schema` and `extraction_prompt` are not
-applied).
+changes the default). Since 0.9.1 a realm's `[agent] extraction_prompt`
+replaces the built-in extraction prompt for every agent built from that
+config; `[agent] output_schema` applies to no session (the schema is set per
+run) and loads with a warning (`ConfigWarning::UnappliedAgentOutputSchema`).
 
 | Surface | How |
 |---|---|
@@ -260,9 +270,13 @@ multiplier = 2.0
   a retryable stall. The compaction summary call has none of these guards.
 - Tools: `[tools] default_timeout = "10m"`; per tool `[tools.tool_timeouts]
   shell = { secs = 120, nanos = 0 }` (not humantime). A timed-out tool returns
-  a `timeout` error result and the run goes on (`tool_execution_timed_out` is
-  never emitted in 0.9.0). The shell tool's `timeout_secs` comes from the
-  model (minimum 1, default 30); `[shell] timeout_secs` is not read.
+    a `timeout` error result and the run goes on. Since 0.9.1 a call that hits
+  its per-call or inactivity timeout first emits `tool_execution_timed_out`
+  (with the bound in `timeout_ms`), then its `tool_execution_completed`, and
+  ATIF exports record it as one observation marked `timed_out`; 0.9.0 never
+  emitted the event. The shell tool's `timeout_secs` comes from the model
+  (minimum 1); without it `[shell] timeout_secs` applies (default 30, and 0
+  keeps 30) since 0.9.1, where 0.9.0 always used 30.
 
 ## Model fallback and model switching
 

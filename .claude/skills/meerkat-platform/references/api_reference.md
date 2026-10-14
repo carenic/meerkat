@@ -241,7 +241,7 @@ Primary CLI mob usage is tool-driven from `run`/`run --resume` prompts using `mo
 | `pack <dir> -o <pack> [--sign <key> --signer-id <id>]` | Pack a mob directory into a `.mobpack` archive |
 | `inspect <pack>` | Inspect a `.mobpack` archive |
 | `validate <pack> [--trust-policy permissive\|strict]` | Validate a `.mobpack` archive |
-| `deploy <pack> <prompt> [--model] [--max-total-tokens] [--max-duration] [--max-tool-calls] [--trust-policy] [--surface cli\|rpc]` | Validate a `.mobpack`, build its mob in memory and queue the prompt to the orchestrator. `--surface cli` (default) returns at once and the mob ends with the command; `--surface rpc` serves JSON-RPC on stdin/stdout until EOF. Orchestrator-less packs warn that prompts are not delivered and flows are not started. Known issue in 0.9.0: the budget flags and a pack's `[budget]` are recorded but not enforced, because enforcement reads `[limits]` (a correction is in progress for 0.9.1), and with `--surface rpc` members are built from the realm config store, so deploy flags and pack overlays do not apply |
+| `deploy <pack> <prompt> [--model] [--max-total-tokens] [--max-duration] [--max-tool-calls] [--trust-policy] [--surface cli\|rpc]` | Validate a `.mobpack`, build its mob in memory and queue the prompt to the orchestrator. `--surface cli` (default) returns at once and the mob ends with the command; `--surface rpc` serves JSON-RPC on stdin/stdout until EOF. Orchestrator-less packs warn that prompts are not delivered and flows are not started. Since 0.9.1 the budget flags and a pack's `[budget]` set the members' `[limits]` (a flag wins over the realm's `[limits]`, which wins over the pack default). Known issue: with `--surface rpc` members are built from the realm config store, so deploy flags and pack overlays do not apply |
 | `web build <pack> -o <dir> --wasm <PKG_DIR\|name_bg.wasm> [--trust-policy]` | Build a browser-deployable WASM bundle from required prebuilt wasm-pack output |
 
 Lifecycle verbs that used to live on the CLI (`create`, `spawn`, `retire`, `wire`, `unwire`, `turn`, `stop`, `resume`, `complete`, `events`, `destroy`) are reached through the agent tools (`mob_create`, `mob_spawn_member`, `mob_wire`, ...) or through the RPC `mob/*` methods listed below.
@@ -623,7 +623,7 @@ request with `REQUEST_CANCELLED` (-32005); committed success is never rewritten.
 `meerkat_contracts::ErrorCode` JSON-RPC codes (besides the standard
 -32700/-32600/-32601). Each code also has a fixed HTTP status; see the error
 table in `references/sessions_runtime_surfaces_api_changes.md`, which also lists
-the exit codes `rkat` actually returns (1 for most failures).
+the exit codes `rkat` returns (since 0.9.1 the first typed error decides, with its own number).
 
 - Session and requests: `SESSION_NOT_FOUND` -32001, `SESSION_BUSY` -32002 (also a session served by another process, `data.kind = "session_served_elsewhere"`, and a teardown still finishing, `data.kind = "runtime_teardown_in_progress"`), `SESSION_NOT_RUNNING` -32003 (also every durable resume hold, `data.durable_resume_hold`), `DUPLICATE_INPUT` -32004, `REQUEST_CANCELLED` -32005, `SESSION_RUNTIME_UNAVAILABLE` -32032 (also `data.kind = "session_hosting_unavailable"`)
 - Agent: `PROVIDER_ERROR` -32010, `BUDGET_EXHAUSTED` -32011, `HOOK_DENIED` -32012, `AGENT_ERROR` -32013
@@ -819,7 +819,7 @@ Session methods:
 - `Session.inject_context(text, *, source=None, idempotency_key=None)` / `send_external_event(...)` / `send_peer_response_terminal(...)`
 - `Session.transcript_revision(...)` / `transcript_revisions(...)` / `rewrite_transcript(...)` / `restore_transcript_revision(...)` / `fork_at(...)` / `fork_replace(...)`
 - `Session.update_system_prompt(key, content, ...)` / `activate_instruction(activation)` / `instruction_activations(...)`
-- `Session.send(**command)` / `Session.peers()` Known issue in 0.9.0; a correction is in progress for 0.9.1. The SDK result validator predates delivery outcomes and raises `INVALID_RESPONSE` for `peer_request`, `peer_response` and `peer_lifecycle` sends, and for a `peer_message` whose `delivery` is `volatile_handed_off` or `durably_resolved`. The send has already happened: do not retry it. Workaround on 0.9.0: call `comms/send` over JSON-RPC directly, or use the Rust SDK.
+- `Session.send(**command)` / `Session.peers()`. Since 0.9.1 the result validator accepts the `delivery` outcome on every peer send kind (`acked`, `volatile_handed_off`, `queued`, or `{"durably_resolved": {"outcome": "accepted" | "deduplicated" | "rejected"}}`). A 0.9.0 SDK raised `INVALID_RESPONSE` for `peer_request`, `peer_response` and `peer_lifecycle` sends, and for a `peer_message` whose `delivery` was `volatile_handed_off` or `durably_resolved`, after the send had already happened: do not retry such a send.
 - `Session.subscribe_events()` → `EventSubscription`
 - `DeferredSession.start_turn(prompt, ...)` → `RunResult` (first turn of `create_deferred_session`)
 
@@ -949,7 +949,7 @@ Session methods:
 - `Session.injectContext(...)` / `sendExternalEvent(...)` / `sendPeerResponseTerminal(...)`
 - `Session.transcriptRevision(...)` / `transcriptRevisions(...)` / `rewriteTranscript(...)` / `restoreTranscriptRevision(...)` / `forkAt(...)` / `forkReplace(...)`
 - `Session.updateSystemPrompt(...)` / `activateInstruction(...)` / `instructionActivations(...)`
-- `Session.send(command)` / `Session.peers()` Known issue in 0.9.0; a correction is in progress for 0.9.1. The SDK result validator predates delivery outcomes and raises `INVALID_RESPONSE` for `peer_request`, `peer_response` and `peer_lifecycle` sends, and for a `peer_message` whose `delivery` is `volatile_handed_off` or `durably_resolved`. The send has already happened: do not retry it. Workaround on 0.9.0: call `comms/send` over JSON-RPC directly, or use the Rust SDK.
+- `Session.send(command)` / `Session.peers()`. Since 0.9.1 the result validator accepts the `delivery` outcome on every peer send kind (`acked`, `volatile_handed_off`, `queued`, or `{"durably_resolved": {"outcome": "accepted" | "deduplicated" | "rejected"}}`). A 0.9.0 SDK raised `INVALID_RESPONSE` for `peer_request`, `peer_response` and `peer_lifecycle` sends, and for a `peer_message` whose `delivery` was `volatile_handed_off` or `durably_resolved`, after the send had already happened: do not retry such a send.
 - `Session.subscribeEvents()` → `EventSubscription<AgentEventEnvelope>`
 - `DeferredSession.startTurn(prompt, options?)` / `DeferredSession.stream(prompt, options?)` (first turn of `createDeferredSession`)
 

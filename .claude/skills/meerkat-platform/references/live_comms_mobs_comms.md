@@ -1,8 +1,8 @@
 Covers: Meerkat 0.9 agent-to-agent comms: transports (inproc, tcp, uds), the
 [comms] config, enabling comms (comms_enabled, rkat run --comms-* flags, the
---comms-advertise-tcp IP rule, tools.comms), agent comms tools, comms/send on
-JSON-RPC, REST, MCP and SDKs, delivery outcomes, the 0.9.0 SDK send known
-issue, remote signed peers. Live: live_comms_mobs_live.md. Mobs:
+--comms-advertise-tcp address rules, tools.comms), agent comms tools,
+comms/send on JSON-RPC, REST, MCP and SDKs, delivery outcomes, the SDK send
+fix in 0.9.1, remote signed peers. Live: live_comms_mobs_live.md. Mobs:
 live_comms_mobs_mobs.md.
 
 # Agent-to-Agent Comms (0.9)
@@ -15,12 +15,14 @@ and mob changes in live_comms_mobs_mobs.md.
 
 - Comms defaults to the in-process transport, isolated per realm. Use `rkat
   run --comms-listen-tcp` for TCP, or `[comms] mode = "uds"` for a socket.
-- `rkat run --comms-advertise-tcp` takes an IP literal (`203.0.113.7:4200`);
-  host names are rejected.
+- `rkat run --comms-advertise-tcp` takes `HOST:PORT` or `tcp://HOST:PORT`
+  since 0.9.1, where HOST is a DNS name, an IPv4 address or a bracketed IPv6
+  address (`worker.example.com:4200`, `203.0.113.7:4200`,
+  `[2001:db8::7]:4200`); 0.9.0 rejected host names.
 - Every mob profile that spawns a member needs `tools.comms = true`.
-- Known issue in 0.9.0: the Python and TypeScript SDK `send` can raise
-  `INVALID_RESPONSE` after the message was sent. Do not retry; see Host
-  surfaces for the workaround.
+- Since 0.9.1 the Python and TypeScript SDK `send` accepts every delivery
+  outcome. A 0.9.0 SDK could raise `INVALID_RESPONSE` after the message was
+  sent; do not retry such a send (see Host surfaces).
 
 ## Transports and config
 
@@ -57,9 +59,17 @@ require_peer_auth = true                     # default true
   `--agent-description` or `--agent-label KEY=VALUE`. `--no-comms` disables
   it and cannot be combined with the listener, binding or pairing flags.
   Without `--comms-name`, a keep-alive run is named `cli/<session_id>`.
-- `--comms-advertise-tcp` must be an IP literal and port; it is advertised as
-  `tcp://IP:PORT`. A wildcard `--comms-listen-tcp` (`0.0.0.0`) needs it, and
-  `rkat run` ignores a realm `[comms] advertise_address`.
+- Since 0.9.1 `--comms-advertise-tcp` takes `HOST:PORT` or `tcp://HOST:PORT`;
+  HOST is a DNS name, an IPv4 address or a bracketed IPv6 address, and it is
+  advertised as `tcp://HOST:PORT`. Nothing is resolved at startup: the comms
+  transport resolves the name when a peer connects. A wildcard host and a
+  missing or zero port are refused with an error (the advertised-route rule
+  `rkat mob host --advertise-tcp` also uses). Precedence: the flag, then a
+  realm `[comms] advertise_address`, then the address derived from the
+  listener; a missing flag no longer erases the configured value, so a
+  wildcard `--comms-listen-tcp` (`0.0.0.0`) needs the flag or the realm
+  setting. In 0.9.0 only IP literals were accepted and `rkat run` ignored the
+  realm setting.
 - Mob profiles: `[profiles.<name>.tools] comms = true` is required for every
   member; the build fails otherwise with "mob meerkats require comms=true". To
   stop a member messaging peers, keep comms on and use `read_only = true` or
@@ -115,12 +125,14 @@ require_peer_auth = true                     # default true
   (`retry_safe: false`, `required_action: "reconcile"`) but `send_failed`
   ("peer delivery outcome is ambiguous") on JSON-RPC. The envelope may have
   been delivered: reconcile before resending.
-- Known issue in 0.9.0; a correction is in progress for 0.9.1. The Python
-  and TypeScript SDK `send` result validators predate delivery outcomes and
-  raise `INVALID_RESPONSE` for `peer_request_sent`, `peer_response_sent` and
-  `peer_lifecycle_sent`, and for a `peer_message_sent` whose `delivery` is
-  not `acked` or `queued`. The send has already happened: do not retry it.
-  Workaround on 0.9.0: call `comms/send` over JSON-RPC directly, or use the
+- Fixed in 0.9.1: the Python and TypeScript SDK `send` result validators
+  accept the `delivery` outcome on every peer send kind (`acked`,
+  `volatile_handed_off`, `queued`, or `{"durably_resolved": {"outcome":
+  "accepted" | "deduplicated" | "rejected"}}`). A 0.9.0 SDK raised
+  `INVALID_RESPONSE` for `peer_request_sent`, `peer_response_sent` and
+  `peer_lifecycle_sent`, and for a `peer_message_sent` whose `delivery` was
+  not `acked` or `queued`, after the send had already happened: do not retry
+  such a send. On 0.9.0, call `comms/send` over JSON-RPC directly or use the
   Rust SDK.
 
 ## Lifecycle notices

@@ -75,23 +75,49 @@ SDK call raises (Python) or rejects with (TypeScript) a `MeerkatError` that has
 `code`, `message` and `details`; `details` keeps the structured payload
 (0.8.35).
 
-`rkat` exit codes in 0.9.0:
+`rkat` exit codes (0.9.1). The first typed error in a failure's cause chain
+decides, with its `ErrorCode::cli_exit_code()` number (the code JSON-RPC
+reports); a failure with no typed owner exits 1.
 
-- 0: success.
+- 0: success, including a run stopped at its token or tool-call budget
+  (`terminal_cause_kind: "budget_exhausted"`) and a run left pending on a
+  callback tool.
+- 1: a turn hard failure (the `--max-duration` time budget, `max_turns`, a
+  provider, hook, tool or structured-output failure), a check the CLI makes
+  itself (arguments, config, storage, `--default-model`, scope, a `--resume`
+  handle that matches nothing or is ambiguous, no subcommand), a governed
+  realm's local refusal ("the governed realm refused this prompt"), and a
+  typed error whose owner has no public code.
 - 2: usage errors (argument parsing, storage verbs given `--isolated` or
-  `--default-model`, an invalid `RKAT_WORKER_STACK_BYTES`) and a run stopped
-  by a token, time or tool-call budget or the max-turns limit (stderr
-  "Budget exhausted: ...").
-- 45 `SCOPE_DENIED`, 46 `HOST_UNAVAILABLE`, 47 `STALE_CURSOR`, 48
-  `STALE_FENCE`, 56 `STALE_DELIVERY_SCOPE`: only for mob commands whose error
-  carries a wire detail; stderr adds a `detail: <json>` line.
-- 1: every other failure, including `MEMBER_RELOAD_REQUIRED` and all other
-  codes above; a bare `rkat` with no command prints help and exits 1.
+  `--default-model`, an invalid `RKAT_WORKER_STACK_BYTES`) and a typed
+  config error.
+- 10 `SESSION_NOT_FOUND`: `run --resume <exact id>` or `session show <id>`
+  for a session the realm does not hold.
+- 11 `SESSION_BUSY`: a busy session, one served by another process, or a
+  teardown in progress.
+- 12 `SESSION_NOT_RUNNING`: a durable resume hold.
+- 14 `REQUEST_CANCELLED`: a cancelled or interrupted turn.
+- 20 `PROVIDER_ERROR`: a provider or build failure while the session is
+  built.
+- 22 `HOOK_DENIED` and 42 `SKILL_RESOLUTION_FAILED`.
+- 50 `INPUT_REFUSED` and 51 `INPUT_NOT_READY`: the runtime refused the input
+  or its readiness is unavailable.
+- 52 `SESSION_RUNTIME_UNAVAILABLE`: hosting or the runtime is unavailable.
+- Mob commands (including `rkat mob run <pack>`): 45 `SCOPE_DENIED`, 46
+  `HOST_UNAVAILABLE`, 47 `STALE_CURSOR`, 48 `STALE_FENCE`, 56
+  `STALE_DELIVERY_SCOPE`, 49 `MEMBER_RELOAD_REQUIRED`, 44 (supervisor
+  protocol upgrade required), 11 (retirement, lifecycle or admission pending,
+  reload refused or timed out, actor command timeout), 40 (capability or
+  delivery scope unavailable) and 52 (held before activation, runtime
+  unavailable). An error with a typed console detail also prints one
+  `detail: <json>` line on stderr.
+- 21 `BUDGET_EXHAUSTED`: a typed budget error, printed as "Budget exhausted:
+  ..."; `rkat run` does not produce one, because a budget-stopped run
+  succeeds.
 
-`ErrorCode::cli_exit_code()` assigns every code a contract number (for
-example 49 for `MEMBER_RELOAD_REQUIRED`), but `rkat` 0.9.0 returns it only for
-the five mob codes above. `rkat-rpc`, `rkat-rest` and `rkat-mcp` exit 1 on a
-fatal error.
+`rkat` 0.9.0 used these numbers only for the mob codes 45-48 and 56 and
+exited 1 for nearly every other failure. `rkat-rpc`, `rkat-rest` and
+`rkat-mcp` exit 1 on a fatal error.
 
 ## SDK changes
 
