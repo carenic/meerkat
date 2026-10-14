@@ -1042,11 +1042,9 @@ mod tests {
                 .is_ok()
         );
 
-        let home_writer = confined(&ConfinementConfig::for_all(custom(
-            &work,
-            &[&work, &home],
-            &[],
-        )));
+        // A kind that writes only the home directory cannot move it away (it
+        // writes nowhere else), but it can create the missing `.rkat` there.
+        let home_writer = confined(&ConfinementConfig::for_all(custom(&home, &[&home], &[])));
         let refused = home_writer
             .admit_host_inputs(&HostConfinement::host_inputs(&state, Some(&document)))
             .unwrap_err();
