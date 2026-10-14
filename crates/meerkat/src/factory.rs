@@ -6989,10 +6989,6 @@ impl AgentFactory {
 
         // 4. Create LLM adapter (with optional provider_params, event channel, and shared event tap)
         let model = build_config.model.clone();
-        let model_profile = registry.profile_for_provider(provider, &model);
-        let capability_base_filter_override = model_profile.as_ref().map(|profile| {
-            meerkat_core::capability_base_filter_for_image_tool_results(profile.image_tool_results)
-        });
         let resolved_llm_identity = SessionLlmIdentity {
             model: model.clone(),
             provider,
@@ -7000,6 +6996,12 @@ impl AgentFactory {
             provider_params: build_config.provider_params.clone(),
             auth_binding: build_config.auth_binding.clone(),
         };
+        // The model's capabilities as the session's backend serves them: the
+        // session capability the machine is hydrated with below.
+        let model_profile = registry.profile_for_identity(config, &resolved_llm_identity);
+        let capability_base_filter_override = model_profile.as_ref().map(|profile| {
+            meerkat_core::capability_base_filter_for_image_tool_results(profile.image_tool_results)
+        });
         let provider_native_tool_policy = if governed_tool_inputs_disable_native
             || Self::llm_identity_uses_copilot(config, &resolved_llm_identity)
                 .map_err(BuildAgentError::LlmClient)?
@@ -8355,8 +8357,13 @@ impl AgentFactory {
         }
         // A bare resume authors nothing. An explicit prompt decision on resume
         // is different: it materializes a new ordinary System message at the
-        // current transcript boundary. Core performs the provider-wire
-        // capability check before appending it.
+        // current transcript boundary, whatever the binding. Nothing here
+        // checks the provider wire: a wire that cannot carry a System message
+        // at that position refuses the request that would carry it with a
+        // typed projection error, and the session's resolved
+        // `supports_mid_conversation_system_messages` (the model as its
+        // backend serves it, see `ModelRegistry::profile_for_identity`)
+        // states that in advance.
         let should_apply_system_prompt =
             resumed_session_metadata.is_none() || prompt_override.is_explicit();
         #[cfg(not(target_arch = "wasm32"))]
@@ -12346,6 +12353,49 @@ mod tests {
             .expect("valid ChatGPT backend binding");
         assert_eq!(target.backend.backend_kind, "chatgpt_backend");
         (config, auth_binding)
+    }
+
+    /// The ChatGPT backend serves the GPT catalog rows, but its wire carries
+    /// no ordered System message after the leading prefix. The session's
+    /// profile says so; the public API, and an identity that names no
+    /// binding, keep the row's capability.
+    #[test]
+    fn a_chatgpt_backend_identity_resolves_without_mid_conversation_system_messages() {
+        let (mut config, chatgpt_binding) = chatgpt_backend_cache_config();
+        config.realm.insert(
+            "public".to_string(),
+            inline_realm_section(&[("openai", "test-key")]),
+        );
+        let registry = config
+            .model_registry(meerkat_models::canonical())
+            .expect("model registry");
+        let supports = |auth_binding: Option<AuthBindingRef>| {
+            registry
+                .profile_for_identity(
+                    &config,
+                    &SessionLlmIdentity {
+                        model: "gpt-5.6-sol".to_string(),
+                        provider: Provider::OpenAI,
+                        self_hosted_server_id: None,
+                        provider_params: None,
+                        auth_binding,
+                    },
+                )
+                .expect("cataloged model")
+                .supports_mid_conversation_system_messages
+        };
+        assert!(
+            !supports(Some(chatgpt_binding)),
+            "the ChatGPT backend wire refuses a later System row"
+        );
+        assert!(
+            supports(Some(configured_auth_binding("public", "default_openai"))),
+            "the public API carries one"
+        );
+        assert!(
+            supports(None),
+            "an identity naming no binding keeps the row"
+        );
     }
 
     /// Lower `identity`'s request policy through a ChatGPT-backend client, as

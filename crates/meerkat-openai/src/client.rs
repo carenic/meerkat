@@ -6180,6 +6180,44 @@ mod tests {
         assert!(body.get("max_output_tokens").is_none());
     }
 
+    /// The wire refuses an ordered System message after the leading prefix
+    /// on exactly the backends the provider matrix says do not admit one, so
+    /// the session capability resolved from that rule is what the wire does.
+    #[test]
+    fn mid_conversation_system_messages_reach_exactly_the_backends_that_admit_them() {
+        use meerkat_core::provider_matrix::OpenAiBackendKind;
+        let request = LlmRequest::new(
+            "gpt-5.6-sol",
+            vec![
+                Message::System(meerkat_core::SystemMessage::new("leading")),
+                Message::User(UserMessage::text("first")),
+                Message::System(meerkat_core::SystemMessage::new("later")),
+                Message::User(UserMessage::text("second")),
+            ],
+        );
+        for kind in OpenAiBackendKind::ALL {
+            let client = OpenAiClient::new("test-key".to_string());
+            let client = match kind {
+                OpenAiBackendKind::OpenAiApi => client,
+                OpenAiBackendKind::ChatGptBackend => client.with_chatgpt_backend_wire(),
+                OpenAiBackendKind::AzureOpenAi => {
+                    client.with_azure_openai_wire(AzureOpenAiWireConfig::default())
+                }
+                OpenAiBackendKind::Copilot => client.with_copilot_backend_wire(),
+            };
+            let lowered = client.build_request_body(&request);
+            if kind.admits_mid_conversation_system_messages() {
+                assert!(lowered.is_ok(), "{}: {lowered:?}", kind.as_str());
+            } else {
+                assert!(
+                    matches!(lowered, Err(LlmError::InvalidInputShape { .. })),
+                    "{}: {lowered:?}",
+                    kind.as_str()
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_request_input_format_system_message() {
         let client = OpenAiClient::new("test-key".to_string());

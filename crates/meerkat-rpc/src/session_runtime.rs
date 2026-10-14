@@ -6070,8 +6070,9 @@ impl SessionRuntime {
         &self,
         identity: &SessionLlmIdentity,
     ) -> Option<meerkat_contracts::WireResolvedModelCapabilities> {
-        let registry = self.model_registry().await.ok()?;
-        let profile = registry.profile_for_provider(identity.provider, &identity.model)?;
+        let config = self.effective_config().await.ok()?;
+        let registry = config.model_registry(meerkat_models::canonical()).ok()?;
+        let profile = registry.profile_for_identity(&config, identity)?;
         Some(profile_to_capability_surface(&profile).to_wire_resolved())
     }
 
@@ -20653,6 +20654,51 @@ mod tests {
         config
     }
 
+    /// Realm `dev` whose `chatgpt` binding serves OpenAI models through the
+    /// private ChatGPT backend.
+    fn config_with_chatgpt_backend_binding() -> meerkat_core::Config {
+        let mut config = meerkat_core::Config::default();
+        let mut section = meerkat_core::RealmConfigSection::default();
+        section.backend.insert(
+            "chatgpt_backend".into(),
+            meerkat_core::BackendProfileConfig {
+                provider: "openai".into(),
+                backend_kind: meerkat_core::provider_matrix::OpenAiBackendKind::ChatGptBackend
+                    .as_str()
+                    .into(),
+                base_url: None,
+                options: serde_json::Value::Null,
+                server: None,
+            },
+        );
+        section.auth.insert(
+            "chatgpt_oauth".into(),
+            meerkat_core::AuthProfileConfig {
+                provider: "openai".into(),
+                auth_method: meerkat_core::provider_matrix::OpenAiAuthMethod::ManagedChatGptOauth
+                    .as_str()
+                    .into(),
+                source: meerkat_core::CredentialSourceSpec::ManagedStore,
+                constraints: Default::default(),
+                metadata_defaults: Default::default(),
+            },
+        );
+        section.binding.insert(
+            "chatgpt".into(),
+            meerkat_core::ProviderBindingConfig {
+                backend_profile: "chatgpt_backend".into(),
+                auth_profile: "chatgpt_oauth".into(),
+                credential_account: None,
+                default_model: None,
+                policy: Default::default(),
+                provider_default: false,
+            },
+        );
+        section.default_binding = Some("chatgpt".into());
+        config.realm.insert("dev".into(), section);
+        config
+    }
+
     fn slow_build_config(delay_ms: u64) -> AgentBuildConfig {
         AgentBuildConfig {
             llm_client_override: Some(Arc::new(SlowMockLlmClient::new(delay_ms))),
@@ -23511,6 +23557,135 @@ mod tests {
                 .model,
             "claude-opus-5"
         );
+    }
+
+    /// The ChatGPT backend serves the GPT catalog rows, which accept ordered
+    /// System messages after the leading prefix, but its Responses wire takes
+    /// one leading System row and refuses any later one. The session's
+    /// capability is the backend's, so an instruction activation (an ordered
+    /// mid-conversation System message) is refused at admission, before the
+    /// wire, and the session's next turn still reaches the wire.
+    #[tokio::test]
+    async fn a_chatgpt_backend_session_refuses_an_instruction_activation_before_the_wire() {
+        use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
+
+        const RESPONSES_SSE: &str = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",",
+            "\"usage\":{\"input_tokens\":4,\"output_tokens\":1}}}\n",
+            "data: [DONE]\n",
+        );
+        async fn capture(
+            State(bodies): State<Arc<std::sync::Mutex<Vec<serde_json::Value>>>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> impl IntoResponse {
+            bodies.lock().unwrap().push(body);
+            ([("content-type", "text/event-stream")], RESPONSES_SSE)
+        }
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/responses", post(capture))
+            .with_state(Arc::clone(&bodies));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let temp = tempfile::tempdir().unwrap();
+        // The session build reads the runtime's config; a hot swap reads the
+        // config runtime. Both see the ChatGPT-backend binding.
+        let runtime = make_runtime_with_config(
+            temp_factory(&temp),
+            10,
+            config_with_chatgpt_backend_binding(),
+        );
+        runtime.set_config_runtime(Arc::new(meerkat_core::ConfigRuntime::new(
+            Arc::new(meerkat_core::MemoryConfigStore::new(
+                config_with_chatgpt_backend_binding(),
+                meerkat_models::canonical(),
+            )),
+            temp.path().join("config_state.json"),
+        )));
+        let build_config = AgentBuildConfig {
+            llm_client_override: Some(Arc::new(
+                meerkat_client::OpenAiClient::new_with_base_url("test-token".to_string(), base_url)
+                    .with_chatgpt_backend_wire(),
+            )),
+            auth_binding: Some(test_auth_binding("dev", "chatgpt")),
+            ..AgentBuildConfig::new("gpt-5.6-sol")
+        };
+        let session_id = runtime
+            .create_session(build_config, None, None, Vec::new())
+            .await
+            .unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(100);
+        runtime
+            .start_turn(
+                &session_id,
+                "Hello".into(),
+                event_tx.clone(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let body = "Policy";
+        let refused = runtime
+            .activate_instruction(
+                &session_id,
+                InstructionActivationRequest {
+                    revision: meerkat_core::InstructionRevisionRef {
+                        namespace: meerkat_core::InstructionNamespace::new("app.example").unwrap(),
+                        key: meerkat_core::InstructionKey::new("primary").unwrap(),
+                        revision_id: meerkat_core::InstructionRevisionId::new("revision-1")
+                            .unwrap(),
+                        content_sha256: meerkat_core::InstructionContentDigest::for_body(body),
+                    },
+                    activation_id: meerkat_core::InstructionActivationId::new("activation-1")
+                        .unwrap(),
+                    expectation: meerkat_core::InstructionActivationExpectation::Absent,
+                    supersedes: None,
+                    body: body.to_string(),
+                },
+            )
+            .await
+            .expect_err("the ChatGPT backend wire carries no mid-conversation System message");
+        assert_eq!(refused.code, error::INVALID_PARAMS);
+        assert_eq!(
+            refused.data,
+            Some(serde_json::json!({
+                "instruction_activation_code":
+                    InstructionActivationAdmissionErrorCode::UnsupportedCurrentLowering,
+            }))
+        );
+
+        runtime
+            .start_turn(
+                &session_id,
+                "Again".into(),
+                event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("nothing the wire refuses was appended");
+        server.abort();
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "both turns reached the wire");
+        for body in bodies.iter() {
+            assert!(
+                body["input"]
+                    .as_array()
+                    .expect("Responses input")
+                    .iter()
+                    .all(|item| !matches!(item["role"].as_str(), Some("system" | "developer"))),
+                "only the leading System row is carried, as instructions: {body}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -831,16 +831,28 @@ impl SessionRuntimeLlmReconfigureHost {
         ),
         RuntimeDriverError,
     > {
-        let registry = self.model_registry().await?;
-        Ok(
-            match registry.profile_for_provider(identity.provider, &identity.model) {
-                Some(profile) => (
-                    Some(profile_to_capability_surface(&profile)),
-                    SessionLlmCapabilitySurfaceStatus::Resolved,
-                ),
-                None => (None, SessionLlmCapabilitySurfaceStatus::Unresolved),
-            },
-        )
+        Ok(match self.profile_for_identity(identity).await? {
+            Some(profile) => (
+                Some(profile_to_capability_surface(&profile)),
+                SessionLlmCapabilitySurfaceStatus::Resolved,
+            ),
+            None => (None, SessionLlmCapabilitySurfaceStatus::Unresolved),
+        })
+    }
+
+    /// The capability profile of `identity` as its backend serves it
+    /// ([`ModelRegistry::profile_for_identity`]).
+    async fn profile_for_identity(
+        &self,
+        identity: &SessionLlmIdentity,
+    ) -> Result<Option<meerkat_core::model_profile::ModelProfile>, RuntimeDriverError> {
+        let config = self.load_config_for_hot_swap().await?;
+        let registry = config
+            .model_registry(meerkat_models::canonical())
+            .map_err(|e| {
+                RuntimeDriverError::Internal(format!("Failed to resolve model registry: {e}"))
+            })?;
+        Ok(registry.profile_for_identity(&config, identity))
     }
 
     async fn hydrate_staged_session_llm_state(
@@ -1143,9 +1155,9 @@ impl SessionLlmReconfigureHost for SessionRuntimeLlmReconfigureHost {
         let target_identity = self
             .resolve_target_llm_identity(current_identity, request)
             .await?;
-        let registry = self.model_registry().await?;
-        let profile = registry
-            .profile_for_provider(target_identity.provider, &target_identity.model)
+        let profile = self
+            .profile_for_identity(&target_identity)
+            .await?
             .ok_or_else(|| RuntimeDriverError::ValidationFailed {
                 reason: format!(
                     "no capability profile is registered for provider '{}' and model '{}'",
