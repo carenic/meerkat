@@ -371,7 +371,12 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   TLC install for every lane: an immutable repository mirror of the tlaplus
   v1.8.0 jar pinned by sha256); the `CI gate` requires them on such a change. The `machine-verify --all` sweep is not in PR CI.
 - `clippy`: one lane per shard of every directly changed package
-  (`clippy --no-deps --all-targets --all-features -D warnings`).
+  (`clippy --no-deps --all-targets --all-features -D warnings`); a
+  whole-workspace plan gives the heads of the long check chains fixed
+  shards of their own (`CLIPPY_HEAD_SHARDS`) and packs the rest. Its
+  `RUSTC_WRAPPER` is `scripts/ci-clippy-sccache-wrapper`, which sends the
+  crates Clippy does not lint to sccache as plain rustc so they are cached;
+  the lane's own packages still go through clippy-driver.
 - `unit`: `nextest --lib --bins --profile ci-pr` (`fast` plus a 4-minute hung-test kill) for
   the changed packages outside the meerkat-mob compile chain; crates that
   compile `meerkat-mob` (mob, mob-adaptive, mob-mcp, mob-pack, rpc, rest,

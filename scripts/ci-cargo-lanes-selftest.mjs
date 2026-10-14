@@ -361,7 +361,28 @@ function assertArchivedLanes(plan, label) {
   assertLanes(plan, "Cargo.lock");
   assert.ok(plan.packages.length >= 45, `workspace mode lists every member (${plan.packages.length})`);
   assert.deepEqual(plan.closure, plan.packages);
-  assert.ok(plan.shards.length <= 8 && plan.shards.length >= 2, `bounded shard count (${plan.shards.length})`);
+  // The heads of the long check chains each get a fixed Clippy shard of
+  // their own (CLIPPY_HEAD_SHARDS), so the pole is one head and their
+  // dependencies' feature sets repeat between runs; the rest pack into five
+  // more shards.
+  const heads = [
+    ["rkat"],
+    ["meerkat-rpc"],
+    ["meerkat-mob"],
+    ["meerkat"],
+    ["meerkat-mob-adaptive", "meerkat-mob-mcp", "meerkat-mob-pack"],
+    ["meerkat-mcp-server", "meerkat-rest", "meerkat-web-runtime"],
+    ["meerkat-integration-tests", "surface-build-fixtures"],
+  ];
+  for (const group of heads) {
+    assert.ok(
+      plan.shards.some((shard) => JSON.stringify(shard.packages) === JSON.stringify(group)),
+      `the workspace plan lints ${group.join(" ")} in a shard of its own`,
+    );
+  }
+  assert.equal(plan.shards.length, heads.length + 5, `head shards plus five packed (${plan.shards.length})`);
+  // Feature checks keep the weight-packed shards (--workspace-shards).
+  assert.ok(new Set(plan.feature_check_jobs.map((job) => job.name.replace(/ (bazel set|matrix)$/, ""))).size <= 8);
   // Cost-balanced, not count-balanced: no shard carries more than a quarter
   // of the estimated workspace cost, so the heaviest crates spread out.
   const total = plan.shards.reduce((sum, shard) => sum + shard.estimated_cost, 0);
@@ -386,6 +407,7 @@ for (const path of [
   "scripts/ci-hook-coverage.mjs",
   "scripts/ci-verify-row-binaries.mjs",
   "scripts/ci-non-rust-readers.mjs",
+  "scripts/ci-clippy-sccache-wrapper",
   ".github/workflows/ci.yml",
   ".github/actions/setup-rust-ci/action.yml",
 ]) {
@@ -955,12 +977,18 @@ for (const path of [
   for (const row of rows(cli)) {
     assert.match(row, /^-p rkat /, `${row} belongs to the changed package`);
   }
-  // A workspace plan checks every package, shard by shard, and runs every
-  // Make feature-matrix check row with the shard that holds its package.
+  // A workspace plan checks every package, shard by shard (the weight-packed
+  // shards, not the Clippy head split), and runs every Make feature-matrix
+  // check row with the shard that holds its package.
   const workspace = planFor(["Cargo.toml"]);
-  assert.ok(workspace.feature_check_jobs.length <= 2 * workspace.shards.length);
+  assert.deepEqual(
+    workspace.feature_check_shards.flatMap((shard) => shard.packages).sort(),
+    workspace.packages,
+    "feature-check shards partition the workspace",
+  );
+  assert.ok(workspace.feature_check_jobs.length <= 2 * workspace.feature_check_shards.length);
   for (const job of workspace.feature_check_jobs) {
-    const shard = workspace.shards.find(
+    const shard = workspace.feature_check_shards.find(
       (candidate) => job.name === `${candidate.name} bazel set` || job.name === `${candidate.name} matrix`,
     );
     assert.ok(shard, `feature-check job ${job.name} follows a clippy shard`);

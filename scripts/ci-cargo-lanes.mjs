@@ -353,6 +353,31 @@ export const PR_UNIT_CHAIN_EXCEPTIONS = [
 // cargo metadata, so a renamed feature fails the plan.
 export const MAKE_FEATURE_MATRIX_TARGETS = ["test-minimal", "test-feature-matrix-lib"];
 
+// Whole-workspace Clippy shards. A Clippy lane checks the workspace chain
+// below its packages (from sccache since scripts/ci-clippy-sccache-wrapper)
+// and lints its own packages. The long chains end in a few heads: measured
+// on runs 38471093009, 38415750191 and 38020614570 and main push
+// 38473833907, tools -> meerkat-mob -> mob-mcp -> rpc -> rkat finished
+// 1169-1363 s into a lane. Packed by weight, those heads shared shards with
+// other crates, and the pole was a shard that linted meerkat-mob's lib and
+// its 55 test targets after the chain. In a whole-workspace plan each group
+// below gets a shard of its own, so the pole is one head, and a head's
+// dependencies are checked under the same feature set on every run (stable
+// sccache keys); the other packages pack into CLIPPY_PACKED_SHARDS more. A
+// changed-package plan keeps one shard per changed package up to
+// --max-shards. Names are checked against cargo metadata, so a renamed head
+// fails the plan instead of falling back to packing.
+export const CLIPPY_HEAD_SHARDS = [
+  ["rkat"],
+  ["meerkat-rpc"],
+  ["meerkat-mob"],
+  ["meerkat"],
+  ["meerkat-mob-mcp", "meerkat-mob-pack", "meerkat-mob-adaptive"],
+  ["meerkat-rest", "meerkat-mcp-server", "meerkat-web-runtime"],
+  ["meerkat-integration-tests", "surface-build-fixtures"],
+];
+export const CLIPPY_PACKED_SHARDS = 5;
+
 function parseBazelFeatureSets(pkg) {
   const buildPath = resolve(root, packageDir(pkg), "BUILD.bazel");
   if (!existsSync(buildPath)) {
@@ -708,6 +733,7 @@ function isGlobalPath(path) {
     path === "scripts/ci-non-rust-readers.mjs" ||
     path === "scripts/rust-test-selector.mjs" ||
     path === "scripts/ci-pin-rust-toolchain-env" ||
+    path === "scripts/ci-clippy-sccache-wrapper" ||
     path === ".github/workflows/ci.yml"
   ) {
     return true;
@@ -979,6 +1005,21 @@ function hookParityRows({ scope, byName, unified, weights, model, unitPackages, 
   return rows;
 }
 
+// Clippy shards: per changed package (packed past the cap) for a
+// changed-package plan, the fixed head groups plus packed shards for a
+// whole-workspace plan (see CLIPPY_HEAD_SHARDS).
+function clippyShards(pkgs, weights, mode, shardCap, byName) {
+  if (mode !== "workspace") return packShards(pkgs, weights, shardCap);
+  for (const name of CLIPPY_HEAD_SHARDS.flat()) {
+    if (!byName.has(name)) throw new Error(`Clippy head shard names unknown package ${name}`);
+  }
+  const heads = CLIPPY_HEAD_SHARDS.map((group) => group.filter((name) => pkgs.includes(name))).filter((group) => group.length > 0);
+  const inHeads = new Set(heads.flat());
+  const headShards = heads.map((group) => packShards(group, weights, 1)[0]);
+  const rest = packShards(pkgs.filter((name) => !inHeads.has(name)), weights, CLIPPY_PACKED_SHARDS);
+  return [...headShards, ...rest].sort((a, b) => b.estimated_cost - a.estimated_cost || a.name.localeCompare(b.name));
+}
+
 function plan(args) {
   const metadata = readMetadata();
   const packages = workspacePackages(metadata);
@@ -1224,7 +1265,7 @@ function plan(args) {
   if (result.rust_changed) {
     const shardCap = result.mode === "workspace" ? args.workspaceShards : args.maxShards;
     // Clippy lanes: every changed package.
-    result.shards = packShards(result.packages, weights, shardCap);
+    result.shards = clippyShards(result.packages, weights, result.mode, shardCap, byName);
     if (result.shards.length === 0) {
       throw new Error("internal error: Rust-relevant change produced no lanes");
     }
@@ -1281,7 +1322,11 @@ function plan(args) {
         );
       }
     }
-    result.feature_check_jobs = featureChecks(result.shards, byName);
+    // Feature checks keep the weight-packed shards: they compile one Bazel
+    // set and a few matrix rows per shard, and the head split would only
+    // multiply their jobs.
+    result.feature_check_shards = packShards(result.packages, weights, shardCap);
+    result.feature_check_jobs = featureChecks(result.feature_check_shards, byName);
   } else {
     result.unit_chain_exceptions = [];
     result.unit_deferred = [];
@@ -1292,6 +1337,7 @@ function plan(args) {
     result.unit_feature_shards = [];
     result.main_archive_builds = [];
     result.main_archive_runs = [];
+    result.feature_check_shards = [];
     result.feature_check_jobs = [];
   }
 

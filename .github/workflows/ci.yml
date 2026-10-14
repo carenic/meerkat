@@ -621,7 +621,13 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.changes.outputs.shard_matrix) }}
     env:
-      RUSTC_WRAPPER: sccache
+      # sccache could not cache a workspace crate behind clippy-driver, so
+      # every Clippy lane re-checked the whole workspace chain below its
+      # packages. This wrapper hands the crates Clippy does not lint (with
+      # --no-deps, every crate but the lane's own packages) to sccache as the
+      # plain rustc invocation clippy-driver would run; the lane's packages
+      # still go through clippy-driver.
+      RUSTC_WRAPPER: ${{ github.workspace }}/scripts/ci-clippy-sccache-wrapper
     steps:
       - name: Checkout
         uses: actions/checkout@v6
