@@ -10,8 +10,11 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import {
-  CI_COMMAND_PINS,
+  CI_ROW_STEPS,
+  HOOK_SCRIPT,
+  bindRowSteps,
   checkHookCoverage,
+  hookModel,
   featureClosure,
   parseFilter,
   profileFilter,
@@ -1147,9 +1150,121 @@ for (const path of [
   // A narrower scope than the closure is caught by the selftest's own
   // test-scope assertion (the checker trusts plan.test_scope).
   assert.throws(() => assertHookParity({ ...plan, test_scope: plan.packages }, "narrowed scope"));
-  // The workflow commands the checker reads the rows with are pinned.
-  const unpinned = checkHookCoverage(plan, { workflowText: "" });
-  assert.equal(unpinned.errors.length, CI_COMMAND_PINS.length, "every workflow command pin is checked");
+  // Every row-executing step is bound: with no workflow, each one is missing.
+  const unbound = checkHookCoverage(plan, { workflowText: "" });
+  assert.equal(unbound.errors.length, CI_ROW_STEPS.length, "every row-executing step is bound");
+}
+
+// The bound steps: what a closure-tests row lists is what it runs, and no
+// other nextest command, selection or missing binary check can hide in the
+// steps the coverage model reads. Each mutation edits the real ci.yml text.
+{
+  const workflow = readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8");
+  assert.deepEqual(bindRowSteps(workflow), [], "the real workflow binds");
+  const mutated = (from, to) => {
+    assert.equal(workflow.split(from).length, 2, `mutation anchor is unique: ${from}`);
+    return bindRowSteps(workflow.replace(from, to));
+  };
+  const run = '          ./scripts/repo-cargo nextest run "${selection[@]}" --no-tests="${NO_TESTS}" --no-fail-fast --status-level slow --final-status-level slow\n';
+  const runOnly = mutated(run, run.replace('"${selection[@]}"', `"\${selection[@]}" -E 'none()'`));
+  assert.ok(runOnly.some((error) => error.includes("job closure-tests: the step runs")), "a run-only selection change is refused");
+  const ownSelection = mutated(run, run.replace('"${selection[@]}"', '${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}"'));
+  assert.ok(ownSelection.some((error) => error.includes("job closure-tests: the step runs")), "a run that does not use the listed selection is refused");
+  const narrowed = mutated(
+    '          selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}")\n',
+    '          selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}")\n          [[ "${NO_TESTS}" == warn ]] && filter_args=(-E "none()")\n',
+  );
+  assert.ok(narrowed.some((error) => error.includes("job closure-tests: the step runs")), "a later selection change is refused");
+  const unchecked = mutated('          node scripts/ci-verify-row-binaries.mjs "${RUNNER_TEMP}/closure-test-list.json" ${BINARIES}\n', "");
+  assert.ok(unchecked.some((error) => error.includes("job closure-tests: the step runs")), "a step without the binary check is refused");
+  const moved = mutated("      - name: Unit tests (changed packages, lib and bin targets)\n", "      - name: Unit tests (moved)\n");
+  assert.ok(moved.some((error) => error.includes("job unit: step")), "the unit rows' step is bound by name");
+  const wrongMatrix = mutated(
+    "      matrix: ${{ fromJSON(needs.changes.outputs.closure_test_matrix) }}\n",
+    "      matrix: ${{ fromJSON(needs.changes.outputs.integration_matrix) }}\n",
+  );
+  assert.ok(wrongMatrix.some((error) => error.includes("its matrix is not")), "the closure-tests job runs the closure matrix");
+  const rewired = mutated(
+    "          TESTS: ${{ matrix.tests }}\n          PROFILE: ${{ matrix.profile }}\n",
+    "          TESTS: ${{ matrix.packages }}\n          PROFILE: ${{ matrix.profile }}\n",
+  );
+  assert.ok(rewired.some((error) => error.includes("step env TESTS")), "the step reads each selection input from its own matrix field");
+  const envSelection = mutated(
+    "          BINARIES: ${{ matrix.binaries }}\n",
+    "          BINARIES: ${{ matrix.binaries }}\n          NEXTEST_RUN_IGNORED: only\n",
+  );
+  assert.ok(envSelection.some((error) => error.includes("sets a NEXTEST_ variable")), "a NEXTEST_ variable in a bound job is refused");
+}
+
+// The hook's selection is read from the hook script, not copied: a changed
+// hook filter changes what CI must cover, and a shape the model cannot read
+// fails closed.
+{
+  const hookText = readFileSync(resolve(root, HOOK_SCRIPT), "utf8");
+  const hook = hookModel(hookText);
+  assert.equal(hook.buildFilter, "kind(lib) or kind(test)");
+  assert.deepEqual(hook.headCanonical, { package: "meerkat-mob", test: "cold_restart_mob_resume", features: ["test-support"], profile: "fast" });
+  assert.equal(hook.e2eFast.binary, "e2e_fast_lane");
+  assert.deepEqual(
+    hook.lanes.map((lane) => [lane.label, lane.profile, lane.filter]),
+    [
+      ["workspace unit lane", "default", "kind(lib)"],
+      ["workspace integration lane", "fast", "kind(test)"],
+      ["e2e-fast lane", "default", "binary(e2e_fast_lane)"],
+    ],
+  );
+  const plan = planFor(["Cargo.lock"]);
+  assert.deepEqual(checkHookCoverage(plan, { hookText }).missing, []);
+  const mutatedHook = (from, to) => {
+    assert.equal(hookText.split(from).length, 2, `hook mutation anchor is unique: ${from}`);
+    return hookText.replace(from, to);
+  };
+  // Widening only a lane's filter changes nothing (the build inventory lists
+  // lib and test binaries); widening both makes bin tests hook coverage.
+  const laneOnly = checkHookCoverage(plan, {
+    hookText: mutatedHook("    -E 'kind(lib)' --no-tests=fail --no-fail-fast \\\n", "    -E 'kind(lib) or kind(bin)' --no-tests=fail --no-fail-fast \\\n"),
+  });
+  assert.deepEqual(laneOnly.missing, [], "a lane cannot run binaries the hook's build does not list");
+  const widened = checkHookCoverage(plan, {
+    hookText: mutatedHook("    -E 'kind(lib)' --no-tests=fail --no-fail-fast \\\n", "    -E 'kind(lib) or kind(bin)' --no-tests=fail --no-fail-fast \\\n")
+      .replace("-E 'kind(lib) or kind(test)' >", "-E 'kind(lib) or kind(test) or kind(bin)' >"),
+  });
+  assert.ok(widened.missing.some((key) => key.includes("::bin::")), "a hook that also builds and runs bin tests needs rows for them");
+  const otherLane = checkHookCoverage(plan, {
+    hookText: mutatedHook("    -E 'binary(e2e_fast_lane)' --no-tests=fail --no-fail-fast \\\n", "    -E 'binary(e2e_system_lane)' --no-tests=fail --no-fail-fast \\\n"),
+  });
+  assert.ok(otherLane.missing.includes("meerkat-integration-tests::test::e2e_system_lane"), "a different e2e lane in the hook needs its row");
+  assert.throws(
+    () => checkHookCoverage(plan, { hookText: mutatedHook("    -E 'kind(lib)' --no-tests=fail --no-fail-fast \\\n", "    -E 'kind(lib) and not test(=slow)' --no-tests=fail --no-fail-fast \\\n") }),
+    /cannot be decided per binary/,
+    "a hook filter the model cannot decide per binary fails closed",
+  );
+  assert.throws(
+    () => hookModel(mutatedHook("    -E 'kind(lib)' --no-tests=fail --no-fail-fast \\\n", "    -E 'kind(lib)' --no-tests=fail --no-fail-fast --run-ignored all \\\n")),
+    /shape the coverage model does not read/,
+    "a hook lane with an extra selection flag fails closed",
+  );
+}
+
+// The matrix the closure-tests job runs is the plan's rows, field by field.
+{
+  const plan = planFor(["crates/meerkat-mob/src/lib.rs"]);
+  const github = run(["--format", "github", "--", "crates/meerkat-mob/src/lib.rs"]);
+  assert.equal(github.status, 0, github.stderr);
+  const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+  assert.deepEqual(
+    JSON.parse(lines.closure_test_matrix).include,
+    plan.closure_test_rows.map((row) => ({
+      name: row.name,
+      packages: row.package_flags,
+      tests: row.test_flags,
+      profile: row.profile,
+      filter: row.filter ?? "",
+      binaries: row.binaries.join(" "),
+      no_tests: row.no_tests,
+      rust_min_stack: String(row.rust_min_stack),
+    })),
+  );
 }
 
 // The filter subset and the profiles: ci-integration selects exactly fast's

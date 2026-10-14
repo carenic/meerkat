@@ -414,13 +414,15 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   `ci-integration` profile, the fast selection), HeadCanonical and
   `e2e-fast`, each package with the features whole-workspace unification
   gives it, on the hook's 32 MiB test-thread stack. The meerkat-mob compile
-  chain is included; nothing here is deferred to main. Each row first checks
-  that nextest lists exactly its planned binaries
-  (`scripts/ci-verify-row-binaries.mjs`), and the plan fails when
-  `scripts/ci-hook-coverage.mjs`, which re-derives the hook's selection
-  independently, finds a hook binary in scope without a row. Crates below a
-  row's packages get the features of the row's graph, which can be fewer
-  than the workspace's.
+  chain is included; nothing here is deferred to main. Each row lists and
+  runs one shared selection, and first checks that nextest lists exactly its
+  planned binaries (`scripts/ci-verify-row-binaries.mjs`). The plan fails
+  when `scripts/ci-hook-coverage.mjs` finds a hook binary in scope without a
+  row: it reads the hook's lanes from `scripts/pre-push-unit.sh` itself and
+  binds the exact list/run lines of the steps that execute rows. Crates below
+  a row's packages get the features of the row's graph, which can be fewer
+  than the workspace's, so these rows add coverage and do not replace the
+  hook.
 - `closure-check`: `cargo check --all-features` (lib and bin targets) over
   the reverse-dependency closure of the changed packages.
 - `feature-check` (two jobs per clippy shard, Bazel set and matrix): compile-only checks of the

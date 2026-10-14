@@ -9,30 +9,29 @@
 // it (cargo metadata's resolve graph; on 8e1f4f21, 18 of the 53 members get
 // more than their package-scoped build, meerkat-mcp's test-support among
 // them), and a test target whose required-features are outside that set is
-// not built at all. It then runs four lanes over those binaries:
-//   unit           -E 'kind(lib)'                      default profile
-//   integration    -E 'kind(test)' --profile fast      fast's default-filter
-//                                                      drops the e2e_*_lane
-//                                                      binaries
-//   e2e-fast       -E 'binary(e2e_fast_lane)'          default profile
-//   HeadCanonical  -p meerkat-mob --test cold_restart_mob_resume
-//                  --features test-support --profile fast
-//                  (its own, package-scoped build)
-// The required CI rows replace the hook for the plan's test scope: the
-// reverse-dependency closure of the changed packages, or every member when a
-// global input changed. This module derives the hook's selection for that
-// scope from cargo metadata and .config/nextest.toml by itself, reads each
-// planned CI row the way Cargo and nextest would (packages, features, target
-// flags, profile, filter), and reports every hook binary that no row runs
-// under the hook's feature set, and every row that could not build. The
-// planner calls it on its own result and fails the plan on any gap, so a row
-// construction change cannot silently narrow what CI runs.
+// not built at all. It then runs its lanes over those binaries, and
+// HeadCanonical from its own package-scoped build. The lanes are read from
+// the hook script itself (hookModel), not copied: every nextest command in it
+// must have one of the shapes below, or the check fails closed.
+//
+// The required CI rows run that selection for the plan's test scope: the
+// reverse-dependency closure of the changed packages (every member when a
+// global input changed) plus the readers of changed non-Rust inputs. This
+// module derives the hook's selection for that scope from cargo metadata,
+// .config/nextest.toml and the hook script, and reads each planned row the way
+// the workflow step that executes it does (CI_ROW_STEPS: the step's exact
+// list and run lines, its one selection array, its matrix and env). Any other
+// nextest line in such a step, a different selection, or a missing binary
+// check is an error. It then reports every hook binary that no row runs under
+// the hook's own feature set, and every row Cargo would refuse. The planner
+// calls it on its own result and fails the plan on any gap.
 //
 // What it does not see: the features Cargo unifies on a row's dependencies.
 // A row selects its own packages with the workspace's feature set, but the
 // crates below them get the features of the row's graph, which can be fewer
 // than the workspace's. Binary selection is exact; dependency configuration
-// is the stated residual.
+// is the stated residual, and it is why these rows add coverage but do not
+// replace the hook.
 //
 // usage: ci-hook-coverage.mjs [--plan <file>|-] [--map]
 //   Reads a plan (ci-cargo-lanes.mjs --format json) and prints the coverage
@@ -44,35 +43,169 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readMetadata, root, workspacePackages } from "./rust-test-selector.mjs";
 
-// How ci.yml executes each plan field. Every command fragment is pinned
-// against the workflow below, so a workflow edit that changes what a row runs
-// fails this check instead of drifting from it.
-export const CI_ROW_JOBS = [
-  { field: "unit_shards", job: "unit", targets: ["--lib", "--bins"], profile: "ci-pr" },
-  { field: "unit_feature_shards", job: "unit", targets: ["--lib", "--bins"], profile: "ci-pr" },
-  { field: "closure_unit_shards", job: "unit", targets: ["--lib", "--bins"], profile: "ci-pr" },
-  { field: "integration_suites", job: "integration", targets: null, profile: "ci-pr" },
-  { field: "closure_test_rows", job: "closure-tests", targets: null, profile: null },
-];
-export const CI_COMMAND_PINS = [
-  "./scripts/repo-cargo nextest run ${PACKAGES} --lib --bins --profile ci-pr",
-  "test_flags=(--test '*')",
-  "./scripts/repo-cargo nextest run ${PACKAGES} \"${test_flags[@]}\" --profile ci-pr",
-  "./scripts/repo-cargo nextest run ${PACKAGES} \"${test_flags[@]}\" --profile \"${PROFILE}\" \"${filter_args[@]}\"",
-];
+export const HOOK_SCRIPT = "scripts/pre-push-unit.sh";
+export const WORKFLOW = ".github/workflows/ci.yml";
 
-// The hook's lanes, as data (scripts/pre-push-unit.sh).
-export const HOOK_LANES = {
-  unit: { filter: "kind(lib)", profile: "default" },
-  integration: { filter: "kind(test)", profile: "fast" },
-  e2eFast: { package: "meerkat-integration-tests", binary: "e2e_fast_lane", profile: "default" },
-  headCanonical: {
-    package: "meerkat-mob",
-    test: "cold_restart_mob_resume",
-    features: ["test-support"],
-    profile: "fast",
+// The workflow steps that execute plan rows, with the exact lines each must
+// run (after joining backslash continuations, collapsing blanks and dropping
+// comments). In a bound step, every line that mentions nextest, the binary
+// check or a selection variable must be one of these, in this order, so the
+// listed selection is the run selection and nothing can narrow a run alone.
+export const CI_ROW_STEPS = [
+  {
+    field: "unit_shards",
+    job: "unit",
+    step: "Unit tests (changed packages, lib and bin targets)",
+    matrix: "unit_shard_matrix",
+    env: { PACKAGES: "${{ matrix.packages }}" },
+    lines: [
+      "./scripts/repo-cargo nextest run ${PACKAGES} --lib --bins --profile ci-pr --no-tests=pass --no-fail-fast --status-level fail --final-status-level fail",
+    ],
+    targets: ["--lib", "--bins"],
+    profile: "ci-pr",
   },
-};
+  {
+    field: "closure_test_rows",
+    job: "closure-tests",
+    step: "Closure tests (the row's targets, workspace feature set)",
+    matrix: "closure_test_matrix",
+    env: {
+      PACKAGES: "${{ matrix.packages }}",
+      TESTS: "${{ matrix.tests }}",
+      PROFILE: "${{ matrix.profile }}",
+      FILTER: "${{ matrix.filter }}",
+      BINARIES: "${{ matrix.binaries }}",
+      NO_TESTS: "${{ matrix.no_tests }}",
+    },
+    lines: [
+      "read -r -a test_flags <<<\"${TESTS}\"",
+      "filter_args=()",
+      "if [[ -n \"${FILTER}\" ]]; then filter_args=(-E \"${FILTER}\"); fi",
+      "selection=(${PACKAGES} \"${test_flags[@]}\" --profile \"${PROFILE}\" \"${filter_args[@]}\")",
+      "./scripts/repo-cargo nextest list \"${selection[@]}\" --message-format json >\"${RUNNER_TEMP}/closure-test-list.json\"",
+      "node scripts/ci-verify-row-binaries.mjs \"${RUNNER_TEMP}/closure-test-list.json\" ${BINARIES}",
+      "./scripts/repo-cargo nextest run \"${selection[@]}\" --no-tests=\"${NO_TESTS}\" --no-fail-fast --status-level slow --final-status-level slow",
+    ],
+    targets: null,
+    profile: null,
+  },
+];
+const BOUND_LINE = /nextest|ci-verify-row-binaries|\b(selection|test_flags|filter_args)\b/;
+
+// Shell text as logical lines: continuations joined, blanks collapsed,
+// comments and empty lines dropped. Not a shell parser: bound text must be
+// written in the plain form the pins name.
+export function logicalLines(text) {
+  const lines = [];
+  let pending = "";
+  for (const raw of text.split("\n")) {
+    const trimmed = raw.trim();
+    if (pending === "" && (trimmed === "" || trimmed.startsWith("#"))) continue;
+    if (trimmed.endsWith("\\")) {
+      pending += `${trimmed.slice(0, -1).trim()} `;
+      continue;
+    }
+    lines.push(`${pending}${trimmed}`.replace(/\s+/g, " ").trim());
+    pending = "";
+  }
+  if (pending !== "") lines.push(pending.trim());
+  return lines;
+}
+
+// The block of an indented YAML mapping entry or list item, by its exact
+// header line, up to the next sibling at the same indentation.
+function block(text, header, indent) {
+  const lines = text.split("\n");
+  const starts = lines.flatMap((line, index) => (line === header ? [index] : []));
+  if (starts.length !== 1) return { error: `${JSON.stringify(header.trim())} occurs ${starts.length} times` };
+  const sibling = new RegExp(`^ {${indent}}\\S`);
+  let end = starts[0] + 1;
+  while (end < lines.length && !(sibling.test(lines[end]) || /^\S/.test(lines[end]))) end += 1;
+  return { text: lines.slice(starts[0], end).join("\n") };
+}
+
+// Binds each CI_ROW_STEPS entry to its job and step in the workflow.
+export function bindRowSteps(workflowText) {
+  const errors = [];
+  for (const spec of CI_ROW_STEPS) {
+    const where = `${WORKFLOW} job ${spec.job}`;
+    const job = block(workflowText, `  ${spec.job}:`, 2);
+    if (job.error) {
+      errors.push(`${where}: ${job.error}`);
+      continue;
+    }
+    if (!job.text.includes(`      matrix: \${{ fromJSON(needs.changes.outputs.${spec.matrix}) }}\n`)) {
+      errors.push(`${where}: its matrix is not needs.changes.outputs.${spec.matrix}`);
+    }
+    if (/^\s+NEXTEST_[A-Z0-9_]*:/m.test(job.text)) errors.push(`${where}: sets a NEXTEST_ variable`);
+    const step = block(job.text, `      - name: ${spec.step}`, 6);
+    if (step.error) {
+      errors.push(`${where}: step ${step.error}`);
+      continue;
+    }
+    for (const [name, value] of Object.entries(spec.env)) {
+      if (!step.text.includes(`\n          ${name}: ${value}\n`)) errors.push(`${where}: step env ${name} is not ${value}`);
+    }
+    const run = step.text.split("\n        run: |\n");
+    if (run.length !== 2) {
+      errors.push(`${where}: step has no single run block`);
+      continue;
+    }
+    const bound = logicalLines(run[1]).filter((line) => BOUND_LINE.test(line));
+    if (JSON.stringify(bound) !== JSON.stringify(spec.lines)) {
+      errors.push(`${where}: the step runs ${JSON.stringify(bound)}, not the bound lines ${JSON.stringify(spec.lines)}`);
+    }
+  }
+  return errors;
+}
+
+// The hook's selection, read from scripts/pre-push-unit.sh: the workspace
+// build inventory, each lane run over it, and HeadCanonical's own build and
+// run. Every nextest command in the script must match one of these shapes.
+export function hookModel(text) {
+  const lines = logicalLines(text).filter((line) => /nextest (list|run)/.test(line));
+  const build = [];
+  const headBuild = [];
+  const lanes = [];
+  const unknown = [];
+  for (const line of lines) {
+    let match = line.match(/^"\$CARGO" nextest list --workspace --list-type binaries-only --message-format json -E '([^']+)' >"\$workspace_binaries_metadata"$/);
+    if (match) {
+      build.push(match[1]);
+      continue;
+    }
+    match = line.match(/^"\$CARGO" nextest list -p (\S+) --test (\S+) --features (\S+) --profile (\S+) --list-type binaries-only --message-format json >"\$headcanonical_binaries_metadata"$/);
+    if (match) {
+      headBuild.push({ package: match[1], test: match[2], features: match[3].split(","), profile: match[4] });
+      continue;
+    }
+    match = line.match(/^retry_lane "([^"]+)" "\$[A-Z_]+" "\$CARGO" nextest run --cargo-metadata "\$workspace_cargo_metadata" --binaries-metadata "\$(workspace|headcanonical)_binaries_metadata"(?: --profile (\S+))? -E '([^']+)' --no-tests=fail(?: --no-fail-fast)? --show-progress none --status-level none --final-status-level fail$/);
+    if (match) {
+      lanes.push({ label: match[1], inventory: match[2], profile: match[3] ?? "default", filter: match[4] });
+      continue;
+    }
+    unknown.push(line);
+  }
+  if (unknown.length > 0) throw new Error(`${HOOK_SCRIPT} runs nextest in a shape the coverage model does not read: ${unknown.join(" | ")}`);
+  if (build.length !== 1) throw new Error(`${HOOK_SCRIPT}: expected one workspace build inventory, found ${build.length}`);
+  if (headBuild.length !== 1) throw new Error(`${HOOK_SCRIPT}: expected one HeadCanonical build, found ${headBuild.length}`);
+  const headLanes = lanes.filter((lane) => lane.inventory === "headcanonical");
+  if (headLanes.length !== 1) throw new Error(`${HOOK_SCRIPT}: expected one HeadCanonical lane, found ${headLanes.length}`);
+  const [head] = headBuild;
+  if (headLanes[0].filter !== `binary(${head.test})` || headLanes[0].profile !== head.profile) {
+    throw new Error(`${HOOK_SCRIPT}: the HeadCanonical lane does not run exactly its build's ${head.test}`);
+  }
+  const workspaceLanes = lanes.filter((lane) => lane.inventory === "workspace");
+  // e2e-fast: the one workspace lane that runs a single named binary.
+  const named = workspaceLanes.filter((lane) => /^binary\([A-Za-z0-9_]+\)$/.test(lane.filter));
+  if (named.length !== 1) throw new Error(`${HOOK_SCRIPT}: expected one single-binary workspace lane (e2e-fast), found ${named.length}`);
+  return {
+    buildFilter: build[0],
+    lanes: workspaceLanes,
+    headCanonical: head,
+    e2eFast: { binary: named[0].filter.slice("binary(".length, -1), profile: named[0].profile, label: named[0].label },
+  };
+}
 
 const LIB_KINDS = new Set(["lib", "rlib", "dylib", "cdylib", "staticlib"]);
 
@@ -270,11 +403,11 @@ function parsePackageFlags(flags, byName) {
 
 // The binaries a row runs: Cargo's target selection (with its
 // required-features refusal for named targets), then the profile's
-// default-filter and the row's own filter.
-function rowBinaries(row, job, byName, nextestText) {
+// default-filter and the row's own filter, as its bound step runs them.
+function rowBinaries(row, spec, byName, nextestText) {
   const { packages, enabled } = parsePackageFlags(row.package_flags, byName);
-  const targetTokens = job.targets ?? (row.test_flags ? row.test_flags.split(/\s+/).filter(Boolean) : ["--test", "*"]);
-  const profile = job.profile ?? row.profile;
+  const targetTokens = spec.targets ?? (row.test_flags ?? "").split(/\s+/).filter(Boolean);
+  const profile = spec.profile ?? row.profile;
   if (!profile) throw new Error(`row ${row.name} names no nextest profile`);
   const profileFilterFn = parseFilter(profileFilter(nextestText, profile));
   const rowFilterFn = row.filter ? parseFilter(row.filter) : () => true;
@@ -299,8 +432,7 @@ function rowBinaries(row, job, byName, nextestText) {
       }
     } else if (token === "--test") {
       const wanted = targetTokens[++index];
-      const glob = wanted === "*";
-      if (!glob && !/^[A-Za-z0-9_-]+$/.test(wanted)) {
+      if (!/^[A-Za-z0-9_-]+$/.test(wanted ?? "")) {
         errors.push(`row ${row.name}: unsupported --test pattern ${wanted}`);
         continue;
       }
@@ -308,7 +440,7 @@ function rowBinaries(row, job, byName, nextestText) {
       for (const name of packages) {
         const pkg = byName.get(name);
         for (const target of pkg.targets) {
-          if (!target.kind.includes("test") || (!glob && target.name !== wanted)) continue;
+          if (!target.kind.includes("test") || target.name !== wanted) continue;
           matched += 1;
           const missing = (target["required-features"] ?? []).filter((feature) => !enabled.get(name).has(feature));
           if (missing.length > 0) {
@@ -330,14 +462,13 @@ function rowBinaries(row, job, byName, nextestText) {
   return { packages, enabled, runs, errors, profile };
 }
 
-// The hook's selection for `scope`, and the CI rows that cover it.
-export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText, workflowText } = {}) {
+// The hook's selection for the plan's test scope, and the CI rows that cover
+// it.
+export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText, workflowText, hookText } = {}) {
   const nextest = nextestText ?? readFileSync(resolve(root, ".config/nextest.toml"), "utf8");
-  const workflow = workflowText ?? readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8");
-  const errors = [];
-  for (const pin of CI_COMMAND_PINS) {
-    if (!workflow.includes(pin)) errors.push(`ci.yml no longer runs plan rows with: ${pin}`);
-  }
+  const workflow = workflowText ?? readFileSync(resolve(root, WORKFLOW), "utf8");
+  const errors = bindRowSteps(workflow);
+  const hook = hookModel(hookText ?? readFileSync(resolve(root, HOOK_SCRIPT), "utf8"));
   const packages = workspacePackages(metadata);
   const byName = new Map(packages.map((pkg) => [pkg.name, pkg]));
   const unified = workspaceFeatures(metadata, packages);
@@ -346,10 +477,14 @@ export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText
     if (!byName.has(name)) errors.push(`test scope names unknown package ${name}`);
   }
 
-  // The hook's binaries for the scope, keyed package::kind::binary.
-  const unitFilter = parseFilter(HOOK_LANES.unit.filter);
-  const integrationFilter = parseFilter(HOOK_LANES.integration.filter);
-  const fastFilter = parseFilter(profileFilter(nextest, HOOK_LANES.integration.profile));
+  // The hook's workspace binaries for the scope, keyed package::kind::binary:
+  // built by the workspace inventory, run by at least one of its lanes.
+  const builtFilter = parseFilter(hook.buildFilter);
+  const lanes = hook.lanes.map((lane) => ({
+    label: lane.label,
+    filter: parseFilter(lane.filter),
+    profileFilter: parseFilter(profileFilter(nextest, lane.profile)),
+  }));
   const expected = new Map();
   for (const name of scope.filter((candidate) => byName.has(candidate))) {
     const pkg = byName.get(name);
@@ -359,68 +494,63 @@ export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText
       if (target.test === false) continue;
       if (!(target["required-features"] ?? []).every((feature) => unified.get(name).has(feature))) continue;
       const binary = { kind: nextestKind(target), binary: target.name, package: name };
-      const key = `${name}::${binary.kind}::${target.name}`;
-      if (unitFilter(binary)) expected.set(key, { lane: "unit", package: name });
-      else if (integrationFilter(binary) && fastFilter(binary)) expected.set(key, { lane: "integration", package: name });
-      else if (name === HOOK_LANES.e2eFast.package && target.name === HOOK_LANES.e2eFast.binary) {
-        expected.set(key, { lane: "e2e-fast", package: name });
-      }
+      if (!builtFilter(binary)) continue;
+      const lane = lanes.find((candidate) => candidate.filter(binary) && candidate.profileFilter(binary));
+      if (lane) expected.set(`${name}::${binary.kind}::${target.name}`, { lane: lane.label, package: name });
     }
   }
-  const headCanonicalExpected = scope.includes(HOOK_LANES.headCanonical.package);
-  if (headCanonicalExpected) {
-    const pkg = byName.get(HOOK_LANES.headCanonical.package);
-    if (!pkg?.targets.some((target) => target.kind.includes("test") && target.name === HOOK_LANES.headCanonical.test)) {
-      errors.push(`HeadCanonical target ${HOOK_LANES.headCanonical.test} is missing from ${HOOK_LANES.headCanonical.package}`);
-    }
+  const hc = hook.headCanonical;
+  const headCanonicalExpected = scope.includes(hc.package);
+  if (headCanonicalExpected && !byName.get(hc.package)?.targets.some((target) => target.kind.includes("test") && target.name === hc.test)) {
+    errors.push(`HeadCanonical target ${hc.test} is missing from ${hc.package}`);
   }
 
   // What the planned rows run under the hook's feature set.
   const covered = new Map();
   let headCanonical = null;
-  for (const job of CI_ROW_JOBS) {
-    for (const row of plan[job.field] ?? []) {
+  for (const spec of CI_ROW_STEPS) {
+    for (const row of plan[spec.field] ?? []) {
       let read;
       try {
-        read = rowBinaries(row, job, byName, nextest);
+        read = rowBinaries(row, spec, byName, nextest);
       } catch (error) {
-        errors.push(`row ${row.name} (${job.job}): ${error.message}`);
+        errors.push(`row ${row.name} (${spec.job}): ${error.message}`);
         continue;
       }
       errors.push(...read.errors);
       for (const { pkg, target } of read.runs) {
         const key = `${pkg.name}::${nextestKind(target)}::${target.name}`;
         if (sameSet(read.enabled.get(pkg.name), unified.get(pkg.name)) && !covered.has(key)) {
-          covered.set(key, `${job.job}: ${row.name}`);
+          covered.set(key, `${spec.job}: ${row.name}`);
         }
       }
-      const hc = HOOK_LANES.headCanonical;
       const runsHeadCanonical = read.runs.some(({ pkg, target }) => pkg.name === hc.package && target.name === hc.test);
       if (runsHeadCanonical && read.packages.length === 1 && read.packages[0] === hc.package) {
-        const fast = parseFilter(profileFilter(nextest, hc.profile));
+        const hookProfile = parseFilter(profileFilter(nextest, hc.profile));
         const scoped = featureClosure(byName.get(hc.package), new Set(["default", ...hc.features]));
         const exact = sameSet(read.enabled.get(hc.package), scoped)
-          && fast({ kind: "test", binary: hc.test, package: hc.package })
+          && hookProfile({ kind: "test", binary: hc.test, package: hc.package })
           && read.runs.length === 1;
-        if (exact) headCanonical = `${job.job}: ${row.name}`;
+        if (exact) headCanonical = `${spec.job}: ${row.name}`;
       }
     }
   }
 
+  const headKey = `HeadCanonical::${hc.package}::${hc.test}`;
   const missing = [...expected.keys()].filter((key) => !covered.has(key)).sort();
-  if (headCanonicalExpected && !headCanonical) missing.push("HeadCanonical::meerkat-mob::cold_restart_mob_resume");
-  const lanes = {};
-  for (const { lane } of expected.values()) lanes[lane] = (lanes[lane] ?? 0) + 1;
-  if (headCanonicalExpected) lanes.headcanonical = 1;
+  if (headCanonicalExpected && !headCanonical) missing.push(headKey);
+  const byLane = {};
+  for (const { lane } of expected.values()) byLane[lane] = (byLane[lane] ?? 0) + 1;
+  if (headCanonicalExpected) byLane.HeadCanonical = 1;
   return {
     scope_packages: scope.length,
     hook_binaries: expected.size + (headCanonicalExpected ? 1 : 0),
-    by_lane: lanes,
+    by_lane: byLane,
     missing,
     errors,
     map: Object.fromEntries([
       ...[...expected.keys()].sort().map((key) => [key, covered.get(key) ?? null]),
-      ...(headCanonicalExpected ? [["HeadCanonical::meerkat-mob::cold_restart_mob_resume", headCanonical]] : []),
+      ...(headCanonicalExpected ? [[headKey, headCanonical]] : []),
     ]),
   };
 }

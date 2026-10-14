@@ -92,9 +92,10 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import {
-  HOOK_LANES,
+  HOOK_SCRIPT,
   checkHookCoverage,
   featureClosure,
+  hookModel,
   parseFilter,
   profileFilter,
   workspaceFeatures,
@@ -853,7 +854,7 @@ function sameFeatures(a, b) {
 }
 
 // The hook-parity rows for the test scope (see the header).
-function hookParityRows({ scope, byName, unified, weights, model, unitPackages, maxShards, maxTestRows, nextestText }) {
+function hookParityRows({ scope, byName, unified, weights, model, unitPackages, maxShards, maxTestRows, nextestText, hook }) {
   const rows = [];
 
   // Lib tests. A package that an existing pull-request unit row already
@@ -960,9 +961,10 @@ function hookParityRows({ scope, byName, unified, weights, model, unitPackages, 
     });
   }
 
-  // The hook's two named lanes, with its own flags.
+  // The hook's two named lanes, with its own flags (read from the hook
+  // script by hookModel).
   const hasTest = (name, test) => testTargets(name).some((target) => target.name === test);
-  const headCanonical = HOOK_LANES.headCanonical;
+  const headCanonical = hook.headCanonical;
   if (scope.includes(headCanonical.package)) {
     if (!hasTest(headCanonical.package, headCanonical.test)) {
       throw new Error(`HeadCanonical target ${headCanonical.test} is missing from ${headCanonical.package}`);
@@ -980,7 +982,11 @@ function hookParityRows({ scope, byName, unified, weights, model, unitPackages, 
       rust_min_stack: HOOK_TEST_STACK,
     });
   }
-  const e2eFast = HOOK_LANES.e2eFast;
+  const e2eOwners = [...byName.keys()].filter((name) => hasTest(name, hook.e2eFast.binary));
+  if (e2eOwners.length !== 1) {
+    throw new Error(`e2e-fast target ${hook.e2eFast.binary} belongs to ${e2eOwners.length} workspace packages`);
+  }
+  const e2eFast = { package: e2eOwners[0], binary: hook.e2eFast.binary };
   if (scope.includes(e2eFast.package)) {
     if (!hasTest(e2eFast.package, e2eFast.binary)) {
       throw new Error(`e2e-fast target ${e2eFast.binary} is missing from ${e2eFast.package}`);
@@ -1378,6 +1384,7 @@ function plan(args) {
   // Hook-parity rows for the test scope. scripts/ci-hook-coverage.mjs checks
   // them against the hook's own selection; a gap fails the plan.
   const nextestText = readFileSync(resolve(root, ".config/nextest.toml"), "utf8");
+  const hookText = readFileSync(resolve(root, HOOK_SCRIPT), "utf8");
   result.reader_packages = changed === null ? [] : readerPackagesFor(changed, loadNonRustReaders());
   for (const name of result.reader_packages) {
     if (!byName.has(name)) throw new Error(`the non-Rust reader inventory names unknown package ${name}`);
@@ -1394,9 +1401,10 @@ function plan(args) {
       maxShards: result.mode === "workspace" ? args.workspaceShards : args.maxShards,
       maxTestRows: args.closureTestRows,
       nextestText,
+      hook: hookModel(hookText),
     })
     : [];
-  const coverage = checkHookCoverage(result, { metadata, nextestText });
+  const coverage = checkHookCoverage(result, { metadata, nextestText, hookText });
   result.hook_coverage = {
     scope_packages: coverage.scope_packages,
     hook_binaries: coverage.hook_binaries,
