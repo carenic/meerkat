@@ -35,6 +35,30 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-core`: `LimitsConfig` gains `max_tool_calls: Option<usize>`, the
+  configuration twin of `BudgetLimits::max_tool_calls` (see Fixed).
+  Struct-literal constructors must add the field (`None` keeps the previous
+  unlimited behaviour). It is skipped when unset, so existing realm config
+  documents keep their bytes.
+- Behaviour-only (not measured by the gate): `Config::apply_cli_overrides`
+  writes the `CliOverrides` budget fields to the enforced `[limits]`
+  dimensions: `max_tokens` to `limits.budget`, `max_duration` to
+  `limits.max_duration` and `max_tool_calls` to `limits.max_tool_calls`.
+  They used to land in the legacy `[budget]` table (`Config::budget`), which
+  no runtime reads, and that table no longer receives them.
+- `meerkat-contracts`: `CommsSendErrorData` has a new variant,
+  `SendAmbiguous { envelope_id, message, retry_safe, required_action }`
+  (code `send_ambiguous`), for a `comms/send` whose delivery outcome is
+  unknown. Exhaustive matches over `CommsSendErrorData` need an arm for it.
+  `required_action` is the new `CommsSendRequiredAction` enum (`Reconcile`),
+  and the new `CommsSendErrorData::ambiguous_delivery` and
+  `CommsSendErrorData::peer_input_rejected` constructors build the shared
+  payloads. Rust clients that deserialize CommsSendErrorData with
+  meerkat-contracts 0.9.0 must upgrade to 0.9.1 to decode send_ambiguous; the
+  Python and TS SDKs pass unknown error data through.
+
 ### Fixed
 
 - Python and TypeScript SDK `comms/send` now accept the `delivery` outcome the
