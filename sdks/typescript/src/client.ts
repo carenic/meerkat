@@ -4545,11 +4545,11 @@ export class MeerkatClient {
 
   // -- Auth + realm (Phase 4d) --------------------------------------------
   //
-  // These wrappers cover the RPC catalog's auth/* and realm/* methods.
-  // Write-side methods (auth/profile/create, delete, login/start,
-  // login/complete, login/device_start, logout) are currently server-stubbed
-  // with typed INVALID_REQUEST pointing to the CLI; the wrappers surface
-  // whatever the server returns so they stay honest about the state.
+  // These wrappers cover the RPC catalog's auth/* and realm/* methods. The
+  // server implements the write-side methods (auth/profile/create, delete,
+  // login/start, login/complete, login/device_start, logout) itself; a
+  // refusal arrives as a typed error whose `error.data.reason` is read with
+  // `authErrorReason`.
 
   async realmList(): Promise<unknown> {
     return this.request("realm/list", {});
