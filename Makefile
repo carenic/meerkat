@@ -782,9 +782,10 @@ verify-bazel-release-features:
 	@echo "$(GREEN)Checking Bazel release builds exclude test-only features...$(NC)"
 	@$(PYTHON) scripts/check-bazel-release-features.py .
 
-# The release feature gate above and the packaged-binary marker scan
-# (scripts/check-release-binary-markers) must each still fail on the defects
-# they exist for.
+# The release feature gate above, the packaged-binary marker scan
+# (scripts/check-release-binary-markers) and the release tree's test-hook
+# check (scripts/check-release-source-test-hooks) must each still fail on the
+# defects they exist for.
 release-test-code-guards-selftest:
 	@echo "$(GREEN)Self-testing the release test-code guards...$(NC)"
 	@scripts/test-release-test-code-guards.sh

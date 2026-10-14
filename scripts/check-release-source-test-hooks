@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""Refuse to publish binaries compiled from a tree whose built-binary test
+hooks reach release builds.
+
+The RKAT_TEST_CLIENT shim (swaps in the deterministic TestClient) and the
+OAuth fixture endpoint override (points OAuth at a local fixture) read
+environment variables. Before 0.9.1 every release binary honoured both, and
+such a binary carries no string that only test code contains: the variable
+names alone also appear where documentation mentions them, so the packaged
+binary marker scan cannot tell. verify-release-asset-provenance binds every
+archive the publisher accepts to the release tag's tree; this script checks
+that tree compiles each hook only under debug assertions or tests, so
+archives built from an older tree (asset recovery of an old tag, or the
+reused archives of an earlier run) fail closed.
+
+Each string literal that is exactly a hook's variable name must sit in a
+statement or item that is itself, or inside a construct that is, attributed
+#[cfg(debug_assertions)], #[cfg(test)] or #[cfg(all(...))] with one of those
+as a conjunct. String literals and comments are found by lexing; enclosing
+constructs by rustfmt indentation. cfg(any(...)), a negation or a cfg_attr
+does not gate. A hook that no longer appears where it is listed fails too:
+move the entry with the code.
+
+Usage: check-release-source-test-hooks <commit-ish>
+Exit 0 = every hook is gated, 1 = a hook reaches release builds, 2 = usage.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+
+# (file, environment variable the hook reads)
+HOOKS = (
+    ("crates/meerkat/src/factory.rs", "RKAT_TEST_CLIENT"),
+    ("crates/meerkat-auth-core/src/oauth_flow.rs", "MEERKAT_TEST_OAUTH_ENDPOINT_OVERRIDE"),
+    ("crates/meerkat-auth-core/src/oauth_flow.rs", "MEERKAT_TEST_OAUTH_BASE_URL"),
+)
+GATE_NAMES = {"debug_assertions", "test"}
+# One not(...), with at most one level of parentheses inside.
+NEGATION = re.compile(r"not\((?:[^()]|\([^()]*\))*\)")
+RAW_STRING_START = re.compile(r'b?r(#*)"')
+IDENTIFIER_CHAR = re.compile(r"[A-Za-z0-9_]")
+
+
+def lex(text: str) -> tuple[list[bool], list[tuple[int, str]]]:
+    """Which lines begin in code rather than inside a string literal or block
+    comment, and every plain string literal as (line index, raw content)."""
+    in_code = [True]
+    strings: list[tuple[int, str]] = []
+    index, end = 0, len(text)
+
+    def skip_to(stop: int) -> None:
+        nonlocal index
+        in_code.extend([False] * text.count("\n", index, stop))
+        index = stop
+
+    while index < end:
+        char = text[index]
+        raw = None
+        if char in "br" and (index == 0 or not IDENTIFIER_CHAR.match(text[index - 1])):
+            raw = RAW_STRING_START.match(text, index)
+        if char == "\n":
+            in_code.append(True)
+            index += 1
+        elif text.startswith("//", index):
+            newline = text.find("\n", index)
+            index = end if newline < 0 else newline
+        elif text.startswith("/*", index):
+            depth, cursor = 1, index + 2
+            while cursor < end and depth:
+                if text.startswith("/*", cursor):
+                    depth, cursor = depth + 1, cursor + 2
+                elif text.startswith("*/", cursor):
+                    depth, cursor = depth - 1, cursor + 2
+                else:
+                    cursor += 1
+            skip_to(cursor)
+        elif raw:
+            closing = '"' + raw.group(1)
+            stop = text.find(closing, raw.end())
+            skip_to(end if stop < 0 else stop + len(closing))
+        elif char == '"':
+            cursor = index + 1
+            while cursor < end and text[cursor] != '"':
+                cursor += 2 if text[cursor] == "\\" else 1
+            strings.append((len(in_code) - 1, text[index + 1:cursor]))
+            skip_to(min(cursor + 1, end))
+        elif char == "'":
+            if text.startswith("\\", index + 1):
+                stop = text.find("'", index + 3)
+                index = end if stop < 0 else stop + 1
+            elif index + 2 < end and text[index + 2] == "'":
+                index += 3
+            else:
+                index += 1  # a lifetime or loop label
+        else:
+            index += 1
+    return in_code, strings
+
+
+def indentation(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def gates(attribute: str) -> bool:
+    """Whether one attribute compiles its target only in debug or test builds."""
+    text = re.sub(r"\s+", "", attribute)
+    match = re.fullmatch(r"#\[cfg\((.*)\)\]", text)
+    if not match:
+        return False
+    predicate = match.group(1)
+    if predicate in GATE_NAMES:
+        return True
+    if not (predicate.startswith("all(") and predicate.endswith(")")) or "any(" in predicate:
+        return False
+    conjuncts = NEGATION.sub("", predicate[len("all("):-1])
+    if "(" in conjuncts:
+        return False
+    return any(conjunct in GATE_NAMES for conjunct in conjuncts.split(","))
+
+
+def attached_attributes(lines: list[str], in_code: list[bool], start: int) -> list[str]:
+    """The attributes written directly above lines[start], each as one string."""
+    indent = indentation(lines[start])
+    attributes = []
+    pending: list[str] = []
+    index = start - 1
+    while index >= 0 and in_code[index]:
+        body = lines[index].strip()
+        if body.startswith("#["):
+            attributes.append(" ".join([body, *reversed(pending)]))
+            pending = []
+        elif body.startswith("//") and not pending:
+            pass
+        elif pending or (body.startswith((")", "]")) and body.endswith("]")):
+            # Inside a multi-line attribute, read from its last line upward.
+            if indentation(lines[index]) < indent or not body:
+                break
+            pending.append(body)
+        else:
+            break
+        index -= 1
+    return attributes
+
+
+def gated(lines: list[str], in_code: list[bool], number: int) -> bool:
+    """Whether the code on lines[number] compiles only in debug or test builds."""
+    indent = indentation(lines[number])
+    if any(gates(attribute) for attribute in attached_attributes(lines, in_code, number)):
+        return True
+    for index in range(number - 1, -1, -1):
+        if indent == 0:
+            break
+        line = lines[index]
+        body = line.strip()
+        if not in_code[index] or not body or body.startswith(("//", "#", "}", ")", "]")) or indentation(line) >= indent:
+            continue
+        # The start of a construct enclosing the line.
+        if any(gates(attribute) for attribute in attached_attributes(lines, in_code, index)):
+            return True
+        indent = indentation(line)
+    return False
+
+
+def git(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args], capture_output=True, encoding="utf-8", errors="replace", check=False
+    )
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: check-release-source-test-hooks <commit-ish>", file=sys.stderr)
+        return 2
+    resolved = git("rev-parse", "--verify", "--quiet", f"{sys.argv[1]}^{{commit}}")
+    if resolved.returncode != 0:
+        print(f"check-release-source-test-hooks: {sys.argv[1]} does not name a commit", file=sys.stderr)
+        return 2
+    commit = resolved.stdout.strip()
+
+    failed = False
+    for path, name in HOOKS:
+        literal = f'"{name}"'
+        shown = git("show", f"{commit}:{path}")
+        if shown.returncode != 0:
+            print(f"error: {path} does not exist at {commit}; the {literal} hook moved, update this check", file=sys.stderr)
+            failed = True
+            continue
+        lines = shown.stdout.split("\n")
+        in_code, strings = lex(shown.stdout)
+        found = sorted({number for number, content in strings if content == name})
+        if not found:
+            print(f"error: {path} at {commit} no longer reads {literal}; the hook moved, update this check", file=sys.stderr)
+            failed = True
+            continue
+        ungated = [number for number in found if not gated(lines, in_code, number)]
+        for number in ungated:
+            print(
+                f"error: {path}:{number + 1} at {commit} reads {literal} in release builds: "
+                "neither it nor an enclosing construct is gated on debug_assertions or test",
+                file=sys.stderr,
+            )
+        if ungated:
+            failed = True
+        else:
+            print(f"{path}: {literal} is compiled only for debug or test builds")
+    if failed:
+        print(f"Binaries built from {commit} honour a built-binary test hook; do not publish them.", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

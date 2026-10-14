@@ -1421,6 +1421,14 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: scripts/verify-release-asset-provenance release-artifacts "${RELEASE_TAG}"
 
+      # The archives just verified were compiled from the tag's tree. Its
+      # built-binary test hooks must reach debug builds only: an older tree's
+      # binaries honour them and carry no marker the packaging scan can see.
+      - name: Require the release tree to gate its test hooks
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: scripts/check-release-source-test-hooks "${RELEASE_TAG}"
+
       # Never churn already-published archives on a rerun. Missing archives
       # are still added, while the final publisher handles the cross-compiled
       # Windows archives later.
@@ -1731,6 +1739,15 @@ jobs:
           else
             scripts/verify-release-asset-provenance prepared-release-artifacts "${RELEASE_TAG}"
           fi
+
+      # Every archive above, reused or rebuilt, was compiled from the tag's
+      # tree. Its built-binary test hooks must reach debug builds only: an
+      # older tree's binaries honour them and carry no marker the packaging
+      # scan can see, so an old tag's archives fail closed here.
+      - name: Require the release tree to gate its test hooks
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+        run: scripts/check-release-source-test-hooks "${RELEASE_TAG}"
 
       - name: Publish release archives
         uses: softprops/action-gh-release@v2
