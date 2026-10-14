@@ -87,9 +87,21 @@ profile store is present it also exposes `mob_profile_create`,
 
 `mob_wire` / `mob_unwire` create and remove comms trust relationships between mob members (local or external peers). Reuses `MobMcpState::mob_wire()` / `mob_unwire()` state API.
 
-`owner_bridge_session_id` and `is_implicit` on `MobDefinition` are canonical for session-scoped access control, resume lookup, and cleanup.
+Bridge-session ownership is MobMachine state, not `MobDefinition` data:
+`owner_bridge_session_id`, `owner_bridge_destroy_on_archive`, and
+`implicit_delegation_mob` are bound by `BindOwnerBridgeSession` (restored by
+the `RecoverOwnerBridgeSession` signal) and read through
+`MobHandle::owner_bridge_session_lifecycle_authority()`. They are canonical
+for bridge-session-scoped lookup and owner-archive cleanup; legacy
+`owner_bridge_session_id` / `session_cleanup_policy` / `is_implicit`
+definition fields are ignored on decode.
 
-`destroy_session_mobs()` is the canonical archive cleanup seam. Tool building and cleanup must share the same hydrated `MobMcpState`; parallel shadow registries are a bug.
+`MobMcpState::destroy_bridge_session_mobs()` is the canonical archive cleanup
+seam (it destroys the owner's mobs whose authority has
+`destroy_on_owner_archive`; hydration-time
+`scavenge_orphaned_bridge_session_scoped_mobs()` destroys one only after the
+owner is confirmed archived). Tool building and cleanup must share the same
+hydrated `MobMcpState`; parallel shadow registries are a bug.
 
 Operator capabilities are runtime-injected through `MobToolAuthorityContext`. `can_create_mobs`, `can_mutate_profiles`, and `managed_mob_scope` are the authoritative checks; ambient mob enablement alone must not resurrect operator tools on resume.
 
@@ -102,7 +114,9 @@ Operator capabilities are runtime-injected through `MobToolAuthorityContext`. `c
   only in memory. Adopted host-owned sessions only
   release/unregister their member runtime and binding, not the host's durable
   document. The lower `MobProvisioner::retire_member` contract reports
-  `MemberSessionDisposal::Archived` or `RuntimeReleasedOnlyHostOwned`; the
+  `MemberSessionDisposal::Archived` or `RuntimeReleasedOnlyHostOwned` (a
+  member host serving a non-persistent realm reports
+  `RuntimeReleasedOnlyNoDurableSessions`); the
   handle returns `Result<(), MobError>`. This is not a drain guarantee for
   separate event-log projection tasks.
 - `force_cancel_member(id)` — cancel in-flight turn (distinct from retire)
@@ -110,16 +124,23 @@ Operator capabilities are runtime-injected through `MobToolAuthorityContext`. `c
 - `member_status(id)` returns `MobMemberSnapshot`. Its current public fields
   are `status`, `output_preview`, `error`, `tokens_used`, `is_final`,
   `current_session_id`, `peer_connectivity`, `kickoff`, `external_member`,
-  `resolved_capabilities`, `progress`, `placement`, `control_reachability`,
-  `comms_reachability`, `last_seen_ms`, `freshness_reason`,
+  `resolved_capabilities`, `progress`, `preview_unavailable`, `placement`,
+  `control_reachability`, `comms_reachability`, `last_seen_ms`,
+  `freshness_reason`,
   `lifecycle_capabilities`, and `non_portable_disabled`. Binding atoms
   (`agent_identity`, `agent_runtime_id`, `fence_token`, and
   `current_bridge_session_id`) are `pub(crate)` plus `#[serde(skip)]` -
   bridge-internal, not app-facing.
 - `wait_one(id)`, `wait_all(ids)`, `collect_completed()`
+- Admission close: once the last exported `MobHandle` clone drops and the
+  mob is idle, admission closes (`MobAdmissionCloseReason::LastOwnerReleased`);
+  `close_if_idle()` closes an idle mob and `close_admission(reason)` closes
+  unconditionally. Later mutating commands are refused with
+  `MobError::AdmissionClosed`. Closing tears nothing down, so keep a
+  `MobHandle` clone for as long as the mob must admit work.
 - `MobHandle::member(identity)` → `MemberHandle` — per-member handle. `MemberHandle::internal_turn(content)` is the in-process direct turn write (no peer comms, no handling-mode selection); it is distinct from `mob/turn_start` (RPC turn with overrides via the bridge session) and `mob/member_send` (peer delivery over comms into the member's inbox). Keep the three delivery paths separate.
 
-**Machine-authorized revival**: post-discard member revival is MobMachine-owned, not a shell retry loop. Live-session discard creates a `member_revival_pending: Set<AgentIdentity>` obligation; revival flows observe → classify → realize: the shell reports a `MemberLiveMaterializationClassified { observation, verdict, reason }` input, the machine issues the verdict (`MemberRevivalVerdictKind`), and the shell realizes only machine-authorized revivals (`ResolveMemberRevivalSucceeded` / `ResolveMemberRevivalFailed`). `Broken` is a terminal lifecycle classification: its `not_broken` guard refuses any further revival/retry, and `member()` access to a Broken member surfaces a typed `MobError::MemberRestoreFailed` instead of handing out a dead handle.
+**Machine-authorized revival**: post-discard member revival is MobMachine-owned, not a shell retry loop. Live-session discard creates a `member_revival_pending: Set<AgentIdentity>` obligation; revival flows observe → classify → realize: the shell reports the observation through the `ClassifyMemberLiveMaterialization { observation, reason }` signal, the machine issues the verdict (`MemberRevivalVerdictKind`) on its `MemberLiveMaterializationClassified` effect, and the shell realizes only machine-authorized revivals (`ResolveMemberRevivalSucceeded` / `ResolveMemberRevivalFailed` signals). `Broken` is a terminal lifecycle classification: its `not_broken` guard refuses any further revival/retry, and `member()` access to a Broken member surfaces a typed `MobError::MemberRestoreFailed` instead of handing out a dead handle.
 
 ## Provisioning
 
@@ -138,7 +159,7 @@ The provisioner dispatches on required `ProvisionMemberRequest.binding`.
 `resolve_binding()` translates `SpawnMemberSpec.binding` or legacy `backend`
 into that concrete binding and rejects bare `External` without details.
 
-**External member identity**: `BackendPeer.peer_id` is the real external process comms key, not the placeholder session's key. The bridge session still exists for lifecycle transport. `trusted_peer_spec()` uses the bridge key (from `comms.public_key()`, passed as `fallback_peer_id`) for transport trust, keeping identity and transport separate.
+**External member identity**: `MemberRef::BackendPeer.peer_id` (crate-private) is the real external process comms key, not the placeholder session's key. The bridge session still exists for lifecycle transport. `trusted_peer_spec()` uses the bridge key (from `comms.public_key()`, passed as `fallback_peer_id`) for transport trust, keeping identity and transport separate.
 
 Managed placement must not be described as External binding. The controlling
 host retains roster, placement, grant, and teardown authority while the bound
@@ -147,7 +168,7 @@ WebSocket-only for both local and placed members; controller-level `session/*`
 live methods do not proxy a placed member, and the placed-member surface does
 not currently offer WebRTC.
 
-**Member kickoff state** lives in MobMachine DSL as a multi-field decomposition keyed on `AgentIdentity`: `member_kickoff_pending` / `member_kickoff_starting` / `member_kickoff_callback_pending` / `member_kickoff_started` / `member_kickoff_failed` / `member_kickoff_cancelled` (Sets) plus `member_kickoff_error: Map<AgentIdentity, String>`. `MobActor` drives `KickoffMarkPending`/`KickoffMarkStarting`/`KickoffResolveStarted`/`KickoffCancelRequested` transitions directly via `self.dsl_authority.apply(mob_dsl::MobMachineInput::…)` (in-crate access; no cross-crate handle needed). Persistence flows through `MobEventKind::MemberKickoffUpdated` emitted from the DSL effect handler.
+**Member kickoff state** lives in MobMachine DSL as a multi-field decomposition keyed on `AgentIdentity`: `member_kickoff_pending` / `member_kickoff_starting` / `member_kickoff_callback_pending` / `member_kickoff_started` / `member_kickoff_failed` / `member_kickoff_cancelled` (Sets) plus `member_kickoff_error: Map<AgentIdentity, String>`. `MobActor` drives `KickoffMarkPending`/`KickoffMarkStarting`/`KickoffResolveStarted`/`KickoffCancelRequested` transitions directly through its `apply_dsl_input` seam (`MobMachineMutator::apply(&mut self.dsl_authority, mob_dsl::MobMachineInput::…)`; in-crate access, no cross-crate handle needed). Persistence flows through `MobEventKind::MemberKickoffUpdated` emitted from the DSL effect handler.
 
 ## Wiring
 
@@ -161,11 +182,11 @@ Recipient-side trust is a machine-owned obligation, not fire-and-forget: MobMach
 
 ## Flows
 
-- Flat DAG steps still exist, but `FlowSpec.root: FrameSpec` and `RepeatUntilSpec` enable frame-based execution.
+- Flat-authored `steps` are still accepted, but `FlowSpec::new` compiles them into the always-present canonical `FlowSpec.root: FrameSpec` (`FrameSpec::from_flat_steps`); `RepeatUntilSpec` adds repeat-until loop nodes.
 - Frame execution is owned by MobMachine DSL: frame-local state, loop iteration lifecycle, scheduler grants (`GrantNodeSlot`, `GrantBodyFrameStart`), frame-step projection, and terminalization all live in the MobMachine DSL as transitions. `FlowEngine` is the thin execution shell.
 - `flow_run`, `flow_frame`, and `loop_iteration` under `crates/meerkat-mob/src/run/` are MobMachine-owned fail-closed projection reducers. They define the persisted `MobRun` shape and reducer vocabulary, but every semantic reducer command must be authorized by a MobMachine input/effect path.
-- `FlowEngine::execute_step_with_all_guards()` is the single canonical step path used by both flat-step execution and the frame adapter. `FlowTurnExecutorAdapter` is intentionally thin.
-- Recovery lives in `crates/meerkat-mob/src/runtime/recovery.rs`: repairs ready-frame / pending-body-frame drift when possible and returns typed incompatibility for pre-v2 active runs when not.
+- `FlowEngine::execute_step_with_all_guards()` is the single canonical step path; the frame engine reaches it through the intentionally thin `FlowTurnExecutorAdapter`, so flat-authored and frame-authored flows share it.
+- Recovery lives in `crates/meerkat-mob/src/runtime/recovery.rs`: `reconcile_run_state` validates, and never rewrites, the ready-frame, pending-body-frame, active-count, and flow-authority projections against the frame/loop snapshots, returning typed `RestoreIncompatible` (for example `PreV3Schema` for active pre-v3 runs) instead of seeding machine-owned scheduler fields.
 - Gotcha: never append step/failure/event projections from a parallel executor path if the DSL already owns that projection.
 
 ## Actor Decomposition
@@ -197,7 +218,7 @@ machines. Canonical transition match tables live in MobMachine DSL.
 
 ## Key files
 
-- `crates/meerkat-mob/src/definition.rs` — `MobDefinition`, `FrameSpec`, `RepeatUntilSpec`, `owner_bridge_session_id`, `is_implicit`
+- `crates/meerkat-mob/src/definition.rs` - `MobDefinition`, `FlowSpec`, `FrameSpec`, `RepeatUntilSpec`
 - `crates/meerkat-mob/src/build.rs` — mob profile → `AgentBuildConfig`, operator capability gating
 - `crates/meerkat-mob/src/launch.rs` — `MemberLaunchMode`, `ForkContext`
 - `crates/meerkat-mob/src/storage.rs` — `MobStorage`, SQLite/custom storage seams
@@ -207,6 +228,7 @@ machines. Canonical transition match tables live in MobMachine DSL.
 - `crates/meerkat-mob/src/runtime/flow.rs` — canonical step execution path
 - `crates/meerkat-mob/src/runtime/flow_frame_engine.rs` — frame runtime executor
 - `crates/meerkat-mob/src/runtime/recovery.rs` — frame/loop recovery and incompatibility checks
+- `crates/meerkat-mob/src/runtime/delivery_scope.rs`, `crates/meerkat-mob/src/runtime/admission_close.rs` - scope-bound member delivery (`MemberDeliveryScope`) and mob admission close (`MobAdmissionCloseReason`)
 - `crates/meerkat-mob/src/runtime/tools.rs` — operator mob tool surface
 - `crates/meerkat-mob-mcp/src/agent_tools.rs` — agent-facing delegation/orchestration tool surface
 - `crates/meerkat-mob-pack/src/lib.rs` — mobpack archive format, signing, trust

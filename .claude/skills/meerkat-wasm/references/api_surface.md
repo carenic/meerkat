@@ -13,11 +13,11 @@ are the exact JS-visible identifiers in the Rust binding.
 
 | Export | Params | Returns | Notes |
 |--------|--------|---------|-------|
-| `init_runtime` | mobpack bytes, credentials JSON | `Promise<string>` | Trust-verified mobpack bootstrap; JSON result includes opaque `runtime_handle` |
+| `init_runtime` | mobpack bytes, credentials JSON | `Promise<string>` | Trust-verified mobpack bootstrap under the credentials' `mobpack_trust` (strict with an empty signer store by default); JSON result includes opaque `runtime_handle` |
 | `init_runtime_from_config` | config JSON | `Promise<string>` | Bootstrap without a mobpack; JSON result includes opaque `runtime_handle` |
 | `destroy_runtime` | optional expected runtime handle | `Promise<void>` | Await canonical teardown; a stale expected handle does not destroy a replacement runtime |
 | `runtime_version` | — | version string | Returns `CARGO_PKG_VERSION` for JS/WASM version validation |
-| `register_tool_callback` | name, description, schema JSON, callback | `()` | Register a promise-returning JS tool callback; requires initialized runtime state |
+| `register_tool_callback` | name, description, schema JSON, callback | `()` | Register a promise-returning JS tool callback; it receives the arguments JSON string and resolves to `{"content": string \| ContentBlock[], "is_error": bool}` JSON; requires initialized runtime state |
 | `register_js_tool` | name, description, schema JSON | `()` | Synchronous registration; dispatch reports pending detached host work, not completion; requires initialized runtime state |
 | `clear_tool_callbacks` | — | `()` | Clear all registered JS tool callbacks |
 | `register_external_auth_resolver` | callback (or `undefined` / `null` to clear) | `()` | Register a JS-side resolver that the agent factory calls to obtain a typed `ExternalAuthLease` for a given `authBinding`. Subsequent calls overwrite. Defined in `crates/meerkat-web-runtime/src/external_auth.rs`. |
@@ -38,9 +38,10 @@ completed.
 | `append_system_context` | handle, request JSON | `Promise<string>` | Canonical `InjectSystemContextResult` JSON containing `status` |
 | `get_session_state` | handle | `Promise<string>` | Canonical `WireSessionInfo` JSON, including `session_id`; no browser handle, mob identity, or usage fields |
 | `interrupt_session` | handle | `Promise<void>` | Interrupt through the shared machine authority |
+| `stop_session_run` | handle, run_id, reason | `Promise<string>` | Run-fenced Stop of one exact run; canonical `WireRunStopReceipt` JSON (`outcome` is `stopped`, `not_current`, or `not_stoppable`); a stale run id is `not_current`, not an error |
 | `session_wire_peer` | handle, peer handle | `Promise<void>` | Install directional in-process peer trust |
 | `destroy_session` | handle | `Promise<void>` | Retire the exact runtime registration; remove the handle only after cleanup succeeds |
-| `poll_events` | handle | AgentEvent[] JSON | Drain buffered canonical direct-session events |
+| `poll_events` | handle | AgentEvent[] JSON | Drain buffered canonical direct-session events; a lag gap arrives as `stream_truncated` |
 
 `config` for `create_session` / `create_session_simple` accepts an optional
 `auth_binding` that scopes credential resolution to a realm/binding through the
@@ -81,23 +82,24 @@ retry.
 | Export | Params | Returns | Notes |
 |--------|--------|---------|-------|
 | `mob_create` | definition JSON | mob_id string | async |
-| `mob_status` | mob_id | JSON | async |
+| `mob_status` | mob_id | MobStatusResult JSON: `{mob_id, status}` | async |
 | `mob_list` | — | MobListResult JSON: `{mobs: [...]}` | async |
-| `mob_lifecycle` | mob_id, action string | MobLifecycleResult JSON | async; stop/resume/complete/reset/destroy; includes `mob_id`, `action`, `ok`, and optional `destroy_report` |
+| `mob_lifecycle` | mob_id, action string | MobLifecycleResult JSON | async; stop/resume/complete/reset/destroy; includes `mob_id`, `action`, `ok`, and optional `destroy_report` (destroy) and `stop_report` (stop) |
 | `mob_events` | mob_id, after_cursor (string), limit (u32) | MobEvent[] JSON | async |
 | `mob_spawn` | mob_id, specs JSON | result JSON | async, batch spawn |
 | `mob_retire` | mob_id, agent_identity | `()` | async |
-| `mob_respawn` | mob_id, agent_identity, initial_message? | result JSON | async, retire + re-spawn same profile |
+| `mob_respawn` | mob_id, agent_identity, initial_message? (tagged prompt JSON, as for `start_turn`) | MobRespawnResult JSON | async, retire + re-spawn same profile; `status` is `completed` or `topology_restore_failed`, with `receipt` and `failed_peer_ids` |
 | `mob_force_cancel` | mob_id, agent_identity | `()` | async, force-cancel an in-flight turn |
-| `mob_member_status` | mob_id, agent_identity | JSON | async, execution status snapshot |
-| `mob_member_send` | mob_id, agent_identity, payload JSON | delivery receipt JSON | async; receipt keys: `mob_id`, `agent_identity`, `member_ref`, `handling_mode` (`queue` or `steer`) |
-| `mob_member_peer_target` | mob_id, member | peer target JSON | async, resolve a member name to its canonical comms peer target; wrapped by `Member.peerTarget()` in `@rkat/web` |
+| `mob_stop_member_run` | mob_id, agent_identity, run_id, reason | `WireRunStopReceipt` JSON | async, run-fenced Stop of one exact member run; a stale run id is `not_current` |
+| `mob_member_status` | mob_id, agent_identity | MobMemberStatusResult JSON | async, execution status snapshot with `member_ref` and tri-state `peer_connectivity` |
+| `mob_member_send` | mob_id, agent_identity, request JSON (`content`, optional `handling_mode`, `render_metadata`) | delivery receipt JSON | async; receipt keys: `mob_id`, `agent_identity`, `member_ref`, `handling_mode` (`queue` or `steer`) |
+| `mob_member_peer_target` | mob_id, member | peer target JSON | async, resolve a member to an external in-process `PeerTarget` (comms public key and address) for `mob_wire_peer` on another mob; wrapped by `Mob.crossMobPeerTarget(member)` and consumed by `Mob.wireToPeer(member, targetJson)` in `@rkat/web` |
 | `mob_list_members` | mob_id | RosterEntry[] JSON | async |
-| `mob_append_system_context` | mob_id, agent_identity, request JSON | result JSON | async, append context to a member's system prompt |
+| `mob_append_system_context` | mob_id, agent_identity, request JSON (`text`, optional `source`, `idempotency_key`) | `{mob_id, agent_identity, status}` JSON | async, append one ordinary durable System message to the member's session |
 | `mob_wire` / `mob_unwire` | mob_id, a, b | `()` | async, identity-keyed wiring |
 | `mob_wire_peer` / `mob_unwire_peer` | mob_id, member, peer JSON | `()` | async, canonical member/peer wiring (structured peer descriptor). There are no `mob_wire_target` / `wire_cross_mob` exports. |
-| `mob_spawn_helper` | mob_id, request JSON (requires `result_label`, `max_text_bytes`) | result JSON | async, helper spawn with auto-wait |
-| `mob_fork_helper` | mob_id, request JSON (requires `result_label`, `max_text_bytes`) | result JSON | async, fork-from-source helper spawn |
+| `mob_spawn_helper` | mob_id, request JSON (requires `prompt`, `agent_identity`, `result_label`, `max_text_bytes`) | result JSON | async, helper spawn with auto-wait |
+| `mob_fork_helper` | mob_id, request JSON (requires `source_member_id`, `prompt`, `agent_identity`, `result_label`, `max_text_bytes`) | result JSON | async, fork-from-source helper spawn |
 | `mob_run_flow` | mob_id, flow_id, params JSON | run_id string | async |
 | `mob_flow_status` | mob_id, run_id | MobFlowStatusResult JSON: `{run: MobRun \| null}` | async |
 | `mob_cancel_flow` | mob_id, run_id | `()` | async |
@@ -105,7 +107,7 @@ retry.
 These raw JSON results are JavaScript strings. The SDK's `runtime.listMobs()`
 unwraps `mobs`, and `mob.flowStatus()` unwraps `run` (or returns `null`).
 `mob.lifecycle()` retains the parsed lifecycle result; inspect its
-`destroy_report` rather than discarding the cleanup receipt.
+`destroy_report` or `stop_report` rather than discarding the cleanup receipt.
 
 ### Subscriptions
 
@@ -113,14 +115,14 @@ unwraps `mobs`, and `mob.flowStatus()` unwraps `run` (or returns `null`).
 |--------|--------|---------|-------|
 | `mob_member_subscribe` | mob_id, agent_identity | stream_id (string) | async, per-member broadcast subscription |
 | `mob_subscribe_events` | mob_id | stream_id (string) | async, mob-wide attributed event stream |
-| `poll_subscription` | stream_id (string) | JSON | Drain events from subscription |
+| `poll_subscription` | stream_id (string) | JSON | Drain buffered events as an array: per-member `EventEnvelope<AgentEvent>` (a lag gap arrives as `stream_truncated`) or mob-wide `AttributedEvent` (`source`, `source_fence_token`, `role`, `envelope`); unknown ids fail with `invalid_stream_id` |
 | `close_subscription` | stream_id (string) | `()` | Close subscription handle |
 
 ### Inspection
 
 | Export | Params | Returns | Notes |
 |--------|--------|---------|-------|
-| `inspect_mobpack` | bytes | manifest JSON | No init needed |
+| `inspect_mobpack` | bytes | manifest JSON | No init needed; read-only, so no trust verification (consuming ingress verifies) |
 
 ### Comms
 
@@ -191,6 +193,8 @@ Surface notes:
 
 - The resolver is **session-build-time**, not request-time — once a session is built, the resolved lease is pinned for that build.
 - `clearExternalAuthResolver(wasm)` clears the registration; the raw WASM export also clears on `undefined` / `null`.
+- Resolve to the structured lease object; a bare token string is refused. Reject with a typed `ExternalAuthFailure` (for example `{ kind: 'interactive_login_required' }` or `{ kind: 'refresh_failed', detail }`) to keep failure truth across the boundary.
+- `sdks/web/examples/oauth-host.html` is a registration-only demo that reports the slot through `has_external_auth_resolver`.
 - Helper spawn paths accept `authBinding`; plain `mob.spawn([...])` does not currently include that field in the `@rkat/web` `SpawnSpec`.
 
 ## Config JSON Formats
@@ -207,7 +211,11 @@ Surface notes:
   "anthropic_base_url": "https://proxy.example.com/anthropic",
   "openai_base_url": "https://proxy.example.com/openai",
   "gemini_base_url": "https://proxy.example.com/gemini",
-  "required_capabilities": ["in_memory_persistence", "keep_alive", "comms"]
+  "required_capabilities": ["in_memory_persistence", "keep_alive", "comms"],
+  "mobpack_trust": {
+    "policy": "strict",
+    "trusted_signers": { "signers": { "release@example.com": "<ed25519 public key hex>" } }
+  }
 }
 ```
 
@@ -218,6 +226,9 @@ calls a server-side provider proxy that injects the real credential.
 SDK field is `requiredCapabilities`. An excluded requirement rejects with
 `CAPABILITY_UNAVAILABLE` and typed `profile`, `capability`, and
 `clearing_action` data. Unknown bootstrap and session fields are rejected.
+`mobpack_trust` (SDK `mobpackTrust`, whose `trustedSigners` is the signer map)
+is the trust store for every pack ingress; omitted means strict with no
+signers. `max_sessions` defaults to 100000.
 
 ### SessionConfig
 
@@ -318,12 +329,20 @@ operation.
 ]
 ```
 
-`runtime_mode`: `"turn_driven"` or `"autonomous_host"`.
+`runtime_mode`: `"turn_driven"` or `"autonomous_host"` (the default). Specs may
+also carry `backend` (`"session"` or `"external"`; not exposed by the
+`@rkat/web` `SpawnSpec`) and `model_override`. `initial_message` is plain
+`ContentInput` (a string or a block array). Unknown fields are rejected, and a
+`placement` fails with `CAPABILITY_UNAVAILABLE` (`remote_member_placement`,
+clearing action `use_local_member_placement`).
 
 Helper spawn/fork request JSON (`mob_spawn_helper`, `mob_fork_helper`) requires
-`result_label` and `max_text_bytes` and may carry `auth_binding`; regular batch
-`mob_spawn` specs carry neither. The helper result JSON requires `output`,
-`tokens_used`, `agent_identity`, `member_ref`, `bounded_result`
+`prompt`, `agent_identity`, `result_label`, and `max_text_bytes` (fork also
+`source_member_id`) and may carry `role_name`, `model_override`,
+`auth_binding`, `runtime_mode`, and `backend` (fork also `fork_context`,
+default full history); regular batch `mob_spawn` specs carry no
+`result_label`, `max_text_bytes`, or `auth_binding`. The helper result JSON
+requires `output`, `tokens_used`, `agent_identity`, `member_ref`, `bounded_result`
 (`label`/`status`/`text`), `session_id`, `usage`, `turns`, and `tool_calls`,
 with optional `retirement_error`.
 
@@ -341,7 +360,7 @@ with optional `retirement_error`.
     },
     "operator": {
       "model": "claude-sonnet-4-6",
-      "tools": { "comms": true, "builtins": true, "mob": true },
+      "tools": { "comms": true, "builtins": true },
       "peer_description": "Executes tasks"
     }
   },
@@ -367,7 +386,10 @@ Profile has no `system_prompt` field. Profile `skills` names select inline
 content from the mob definition's `skills` table; verified mobpacks may also
 supply embedded prompt content. For per-turn embedded skill selection, use
 canonical `SkillKey` objects in `skillReferences`. These typed runtime skill
-identities are distinct from a mob definition's inline-content names.
+identities are distinct from a mob definition's inline-content names. A
+`"source": "path"` skill needs runtime skill discovery and is refused
+(`runtime_skills`). Browser mobs offer no agent mob-management tools, so
+browser definitions leave `tools.mob` unset.
 
 ## `@rkat/web` TypeScript API
 
@@ -397,6 +419,9 @@ sub.close();
 // Or via the member object: const memberSub = await mob.member('w1').subscribe();
 // Mob-wide attributed event stream (async, EventSubscription<AttributedEventItem>)
 const mobWide = await mob.subscribeEvents();
+// Member-directed work; run-fenced stop takes a run_started event's identity.run_id
+const receipt = await mob.member('w1').send('Summarize the plan.');
+const stopped = await mob.stopMemberRun('w1', runId, 'superseded');
 
 // Direct sessions
 const session = await runtime.createSession({ model: 'claude-sonnet-4-6' });
@@ -425,3 +450,6 @@ await runtime.destroy();
 - `MeerkatRuntime.createSession`, `MeerkatRuntime.destroy`, `Session.getState`, `Session.destroy`, and `Session.sessionId` return promises. `Session.interrupt` and `Session.wirePeer` also await runtime authority.
 - `SessionState` is generated from `WireSessionInfo`; `AppendSystemContextResult` exposes canonical `status` only. `TurnResult` is the generated `WireRunResult`, with no `response` alias or browser-only terminal status.
 - Direct `keepAlive` is supported with `commsName`. Browser exclusions carry `CAPABILITY_UNAVAILABLE` and a typed clearing action from the shared capability profile.
+- `Session.stopRun(runId, reason)` and `Mob.stopMemberRun(agentIdentity, runId, reason)` validate and return the `WireRunStopReceipt` union (`stopped`, `not_current`, `not_stoppable`).
+- `Session.pollEvents()` and `Session.subscribe()` drain the same buffer; use one of them.
+- `MeerkatError.fromWasm` wraps rejections from `createSession`, `runtime.destroy`, `Session.turn`/`getState`/`destroy`/`wirePeer`/`stopRun`/`interrupt`, and `Mob.spawn`/`respawn`/`stopMemberRun`/`spawnHelper`/`forkHelper`; other wrappers pass the raw WASM rejection through (normally a `{code, message}` JSON string). `Session.destroy()` treats `not_initialized` and `invalid_session_handle` as already gone.

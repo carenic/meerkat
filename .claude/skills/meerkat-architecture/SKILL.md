@@ -39,20 +39,23 @@ Architectural split:
   explicit `make buildbuddy-*` targets for local RBE lanes; avoid raw `bb`
   except when debugging the wrapper.
 - `scripts/buildbuddy-bazel-poc` is the lower-level Bazel launcher and
-  compatibility layer. It may temporarily rebase stale absolute local path
-  dependencies in `MODULE.bazel.lock`, runs local lanes with
-  `--lockfile_mode=error` against checked-in Bazel metadata, and restores the
-  checked-in lockfile plus vendored generated BUILD bytes after Bazel exits.
+  compatibility layer. It runs local lanes with `--lockfile_mode=error`
+  (overridable through `BUILDBUDDY_LOCKFILE_MODE`) against checked-in Bazel
+  metadata and restores the checked-in `MODULE.bazel.lock` after Bazel exits.
   Persistent BUILD regeneration and module-lock updates are explicit maintenance
-  steps, not normal local BuildBuddy lane behavior.
-- `.github/workflows/ci.yml` calls `buildbuddy.yml` in `changed-paths` mode
-  (`gcp-buildbuddy`) and `mob-dense-topology.yml`
-  (`github-hosted-dense-topology`). The aggregate `gate` requires both lanes
-  to succeed. This CI routing is separate from local backend selection.
-  Expensive low-churn lanes (feature matrices, minimal-feature,
-  surface modularity, e2e-system) run in `nightly.yml`.
-  BuildBuddy remains an OPTIONAL local backend (`MEERKAT_BUILDBUDDY=1`) and
-  the hosted RELEASE binary flow is unchanged.
+  steps (`make buildbuddy-generate`, `make buildbuddy-lock-update`), not normal
+  local BuildBuddy lane behavior.
+- `.github/workflows/ci.yml` is Cargo-only CI on GitHub-hosted runners:
+  `scripts/ci-cargo-lanes.mjs` selects fail-closed lanes from the changed
+  paths and the aggregate `gate` ("CI gate") checks them. PR CI never starts
+  the remote Bazel fleet; its `bazel-graph` job only loads and analyses the
+  graph. The whole BuildBuddy/Bazel graph (`buildbuddy.yml` in `full-fresh`
+  mode), the dense mob topology stress (`mob-dense-topology.yml`),
+  integration-fast, e2e-fast, bounded TLC, and the feature-matrix runs live in
+  `nightly.yml`; release tags run the full graph as
+  `release_validate_buildbuddy_full`. This CI routing is separate from local
+  backend selection: BuildBuddy remains an OPTIONAL local backend
+  (`MEERKAT_BUILDBUDDY=1`).
 
 Test lane authority belongs in Rust, not shell glue. The canonical e2e lane
 catalog is `tests/integration/src/e2e_lanes.rs`; scripts and Bazel targets
@@ -82,8 +85,9 @@ When updating architecture docs or reviewing current code, do not stop at the
 - Azure OpenAI auth/backend support, project-local CLI realm defaults, HTML
   artifact output, typed transcript notices, provider-native search/image
   improvements, structured skill identity, and model-aware compaction defaults.
-- `gemini-3.5-flash` as the recommended Gemini text model; the older Gemini 3
-  Flash preview row is not the featured/default model.
+- `gemini-3.8-flash` is the catalog default and `ModelTier::Recommended`
+  Gemini text model (`crates/meerkat-models/src/catalog.rs`); older Flash rows
+  such as `gemini-3.5-flash` are `ModelTier::Supported`.
 - Batch mob wiring (`wire_members_batch` / `MembersWiredBatch`), backpressured
   dense-mob delivery, autonomous member injector validation, spawn boundary
   customization, mob task-workflow guidance preloads, peer wake fixes, and safer
@@ -122,9 +126,10 @@ Since the PR #759 dogma campaign (and its follow-up lanes), additionally:
   seam-inventory) — old shell-script scanners deleted.
 - Net legacy elimination: migration shims, JSON codecs for machine payloads
   (`OpTerminalPayload` is a domain type), the comms-agent runtime, and the
-  `MemberState` mirror were deleted; fail-closed v3-only current Session
-  versions are enforced by the generated
-  `SessionPersistenceVersionAuthority`.
+  `MemberState` mirror were deleted; fail-closed current Session versions
+  are enforced by the generated `SessionPersistenceVersionAuthorityMachine`
+  (session envelope v4 since 0.8.51, released v3 restoring to v4 in memory;
+  stored input state v6 since 0.9.0).
 - Meerkat 0.8.11 sets the durable-state compatibility floor at 0.8.10. Store
   activation has one explicit importer for the exact released v2 envelope:
   historically stamped documents run the frozen 0.8.10 verifier once;
@@ -365,9 +370,10 @@ Since 0.8.11 (checkpoint-free session persistence):
   sequence. There is no host-injection ledger: materialization and resume do
   not compare host configuration with transcript content or synthesize a
   replacement System.
-- **Session is domain-only.** The v3 envelope carries conversation, metadata,
-  usage, and compact rewrite history. It carries no physical currentness,
-  migration authorization, or recovery authority.
+- **Session is domain-only.** The envelope (v3 at 0.8.11, v4 since 0.8.51)
+  carries conversation, metadata, usage, and compact rewrite history. It
+  carries no physical currentness, migration authorization, or recovery
+  authority.
 - **Stores issue the singular physical authority.** WholeBlob uses
   `{session_id, store_revision, blob_sha256}`. HeadCanonical uses
   `{session_id, store_revision, boundary_head, committed_head_token}`, with
@@ -383,7 +389,7 @@ Since 0.8.11 (checkpoint-free session persistence):
   interpret historical proof fields. It strips them before issuing a current
   Session, and no live write path can mint them again.
 
-Since 0.8.22 through current HEAD:
+Since 0.8.22 through 0.8.52:
 
 - **Durable event audit projection is separate derived state.**
   When a host installs it, a dedicated unbounded queue receives event
@@ -439,6 +445,64 @@ Since 0.8.22 through current HEAD:
   handwritten-wrapper exception is gone. `verify_rpc_signature_parity.py`
   requires Python and TypeScript request sites, generated method contracts,
   and the RPC documentation table to use the same catalog type references.
+
+Since 0.8.52 (the 0.9.0 release):
+
+- **Governed authorization (preview).** `meerkat-authorization-contracts`
+  holds portable, host-trusted data contracts (`GrantTarget`,
+  `WorkAuthorityBasis`, constraints, audit) with no producer or persistence;
+  `meerkat-authorization` owns the process-local generated grant authority
+  (`GrantAuthorityMachine`, bridged in `grants::dsl`; `LocalGrantAuthority`,
+  `GrantBackedWorkPolicy`). Core owns the per-work seam
+  (`meerkat_core::authorization::WorkAuthorization`), the runtime binds native
+  work through `NativeGrantWorkConfiguration`, and the facade's
+  `governed_realm` module (`local-authorization` feature) composes a governed
+  realm (`RealmGovernance`, stock `StockGovernance`) that refuses typed when
+  its owners are unavailable and never falls back to ungoverned behavior.
+  Public guide: `docs/guides/authorization-integration.mdx`.
+- **Review and human consent.** Approvals live in core (`ApprovalService`,
+  `ApprovalStore`) under the catalog `ApprovalLifecycleMachine`, which gains
+  consent inputs (`CreateConsentApproval`, `DecideConsent`,
+  `ConsumeConsentForEntry`, `WithdrawConsent`).
+  `ApprovalStore::put_if_current` is a conditional write whose
+  `ApprovalStoreError` states commitment (`NotCommitted`, `Conflict`,
+  `Contended`, `CommitUnknown`).
+- **OS confinement.** `meerkat_core::confinement::ExecutionConfinement` states
+  mechanical launch requirements; `meerkat-sandbox` lowers them to the OS
+  (Linux, macOS Seatbelt) for an exact native spawn (`ProcessLaunchSpec`) or
+  refuses (`ConfinementRefusal`). Shell tools, MCP stdio servers, and command
+  hooks spawn through it; authorization and process-group containment stay
+  with their existing owners.
+- **MCP host controls.** Per-server access ceilings (`McpServerAccess`),
+  checked MCP routes (`ToolOperationTarget::CheckedMcpServerOperation`,
+  `GrantTarget::CheckedMcpRoute`), realm service secrets for stdio servers
+  (`McpStdioConfig.secret_env`), typed HTTP egress refusals
+  (`HttpEgressRefusal`), bounded stdio close (`McpError::CloseTimedOut`), and
+  MCP Apps (`ToolDef.audience: ToolAudience`; the `AgentFactory` `mcp_apps`
+  flag defaults off).
+- **Mandatory model-request hooks are operation-local.**
+  `HookEngine::mandatory_topology` is required. A denying foreground Guardrail
+  at `pre_llm_request` or `post_llm_response` withholds only the dependent
+  operation (typed `mandatory_hook_prerequisite_failed` notice) and the run
+  continues; unsupported mandatory topologies are rejected at config
+  validation and run admission.
+- **Mob delivery and admission.** Host-persisted deliveries are scope-bound
+  (`MemberDeliveryScope` from `MobHandle::capture_member_delivery_scope`; a
+  moved scope refuses as `MobError::StaleDeliveryScope`). Admission closes
+  once the last exported `MobHandle` clone drops and the mob is idle, or on
+  `close_if_idle`; later mutating commands are refused with
+  `MobError::AdmissionClosed`. Held spawns go through
+  `MobHandle::spawn_held_within` / `MobProvisioner::provision_member_held`.
+  Destroy removes a mob's database files only after its actor ended and its
+  database observer drained; otherwise it answers the retryable
+  `MobMcpDestroyError::Incomplete` and keeps them.
+- **Copilot backend.** `meerkat-copilot` owns the GitHub OAuth and CAPI
+  token-exchange contracts, account model discovery, and the shared backend
+  runtime used by the OpenAI, Anthropic, and Gemini provider crates (no
+  Copilot SDK or CLI dependency).
+- **MobKit is renamed Meta in Core's public surface**, with no aliases:
+  `MetaJob*Params`, `ToolDeadlineOwner::MetaPublicCallback`, and JSON-RPC
+  `meta/jobs/*`.
 
 ## Runtime Dogma (first review lens)
 
@@ -626,12 +690,18 @@ DSL/machine domain. Key files: `crates/meerkat-core/src/connection.rs` (`RealmCh
 | `meerkat-sqlite` | Shared SQLite mechanics: named connection profiles (DDL-free opens), `meerkat_schema` migration ledger (pinned concurrent-open protocol, typed `SchemaFromTheFuture` refusal), `JsonColumnBytes`, per-operation maintenance-fence guards, error classification (rusqlite only, no meerkat deps) | — |
 | `meerkat-agent-build-authority` | Retired compatibility marker; no public minting path | None |
 | `meerkat-models` | Canonical provider model catalog/capabilities data; exposes `canonical()` `ModelCatalog` (core stays provider-free) | meerkat-core |
-| `meerkat-core` | Agent loop, domain-only `Session`, foundational session/store/tool/runtime contracts, exact released-state importer, DSL handle traits, `StorageLayout` path authority + realm-id-first dual-root resolution, `DurabilityClass` vocabulary, `StorageMigrator` diagnose seam | `AgentLlmClient`, `AgentToolDispatcher`, `AgentSessionStore`, `SessionStore`, `SessionCheckpointer`, `SessionService`, `CommsRuntime`, `HookEngine`, `OpsLifecycleRegistry`, `StorageMigrator`, and runtime handle traits |
+| `meerkat-core` | Agent loop, domain-only `Session`, foundational session/store/tool/runtime contracts, exact released-state importer, DSL handle traits, `StorageLayout` path authority + realm-id-first dual-root resolution, `DurabilityClass` vocabulary, `StorageMigrator` diagnose seam, approval/consent service, per-work authorization seam, confinement requirements | `AgentLlmClient`, `AgentToolDispatcher`, `AgentSessionStore`, `SessionStore`, `SessionCheckpointer`, `SessionService`, `CommsRuntime`, `HookEngine`, `OpsLifecycleRegistry`, `StorageMigrator`, `ApprovalStore`, `WorkAuthorization`, and runtime handle traits |
+| `meerkat-sandbox` | OS lowering of core `ExecutionConfinement` requirements and exact native spawn (Linux, macOS Seatbelt); authorization and process-group containment stay with their runtime owners | `ProcessLaunchSpec`, `ProcessChild` |
+| `meerkat-authorization-contracts` | Portable host-trusted authorization data contracts and restriction algebra (grants, constraints, evidence, work association, audit); confers no permission, no producer or persistence | `GrantTarget`, `WorkAuthorityBasis`, `AuthorizationAuditSink` |
+| `meerkat-authorization` | Process-local generated grant authority (`GrantAuthorityMachine` bridge in `grants::dsl`) composed with local operation authorization and work policy | `LocalGrantAuthority`, `GrantOwnerStore`, `GrantBackedWorkPolicy` |
 | `meerkat-atif` | ATIF-v1.7 trajectory model and canonical committed-event exporter | None |
+| `meerkat-capabilities` | Typed capability vocabulary, feature-owned declaration registry, and the browser runtime profile | `CapabilityId`, `BrowserRuntimeProfile` |
 | `meerkat-store-conformance` | Published storage conformance harness: per-trait capability profiles (baseline / incremental / guarded-projection), capability-discovery, append-only media, blob/artifact chapters | Consumes meerkat-core contracts |
 | `meerkat-contracts` | Wire types, catalogs, stable error codes, generated surface schemas, **supervisor bridge protocol (`BridgeCommand`, `BridgeReply`, `BridgePeerSpec`, `BridgeSupervisorPayload`)** | — |
+| `meerkat-llm-core` | Provider-neutral LLM wire-client trait, request/response/event types, streaming block assembly, realtime session traits, and the provider-runtime registry | `LlmClient`, `LlmClientAdapter`, `ProviderRuntimeRegistry` |
 | `meerkat-client` | Compatibility client shim that re-exports provider surfaces | Compatibility exports only |
 | `meerkat-auth-core` | Shared auth primitives, token stores, OAuth helpers, MCP OAuth discovery/DCR/PKCE/refresh, cloud authorizers | — |
+| `meerkat-copilot` | GitHub Copilot OAuth and CAPI token exchange, account model discovery, and the shared backend runtime for the OpenAI/Anthropic/Gemini Copilot backends | `CopilotRuntime`, `CopilotAuthorizer` |
 | `meerkat-providers` | Compatibility provider-runtime/auth shim surface | — |
 | `meerkat-anthropic` / `meerkat-openai` / `meerkat-gemini` | Provider-specific client/runtime implementations | Native clients implement `LlmClient`; `meerkat_llm_core::LlmClientAdapter` adapts them to `AgentLlmClient` |
 | `meerkat-store` | Session-store implementations and adapters (SQLite, Jsonl, Memory), HeadCanonical rows and exact activation import, realm manifest v2 pinning + cross-candidate first-start reservation, disk doctor/migrate (`doctor.rs`, `migrate.rs`) | Implements `SessionStore`, `StorageMigrator` |
@@ -655,7 +725,7 @@ DSL/machine domain. Key files: `crates/meerkat-core/src/connection.rs` (`RealmCh
 | `meerkat-machine-schema` | Rust-native machine/composition catalog DSL — the formal authority | — |
 | `meerkat-machine-kernels` | Typed generated kernel modules in `src/generated`; optional generic test oracle | `generated::*`; `test_oracle::GeneratedMachineKernel` only with `test-oracle` |
 | `meerkat-machine-codegen` | TLA+ model generation, TLC verification, drift detection | — |
-| `meerkat` (facade) | `AgentFactory`, `FactoryAgentBuilder`, persistence helpers, re-exports, `RealmStorageProvider` seam + `DiskStorageProvider` + fail-closed durability enforcement | Wires everything together |
+| `meerkat` (facade) | `AgentFactory`, `FactoryAgentBuilder`, persistence helpers, re-exports, `RealmStorageProvider` seam + `DiskStorageProvider` + fail-closed durability enforcement, `governed_realm` stock composition (`local-authorization` feature) | Wires everything together |
 
 **Rule: keep domain authority separate from backend implementations.**
 `meerkat-core` owns foundational contracts and also contains bounded native
@@ -690,7 +760,7 @@ For comprehensive file lists, see the matching reference. This is a minimal poin
 - `crates/meerkat-core/src/runtime_epoch.rs` — `SessionRuntimeBindings`, `RuntimeBuildMode`
 - `crates/meerkat-core/src/storage_layout.rs` — `StorageLayout` path authority (dual-root resolution lives in `runtime_bootstrap.rs`)
 - `crates/meerkat-core/src/storage_durability.rs`, `crates/meerkat-core/src/storage_diagnostics.rs` — `DurabilityClass`/`DurabilityDeclaration`, `StorageDiagnosis`/`StorageMigrator`
-- `crates/meerkat-sqlite/src/{profile,ledger,fence,json_column,error}.rs` — shared SQLite mechanics
+- `crates/meerkat-sqlite/src/{profile,ledger,fence,json_column,error,watch}.rs` - shared SQLite mechanics (`watch.rs`: cross-process `SqliteChangeWatch`)
 - `crates/meerkat/src/storage_provider.rs` — `RealmStorageProvider`, `DiskStorageProvider`, `enforce_fail_closed_durability`
 - `crates/meerkat-store/src/{doctor,migrate,realm}.rs` — disk diagnosis, offline migration mechanics, realm manifest v2 pinning
 - `crates/meerkat-cli/src/storage_migrate.rs` — `rkat storage migrate`/`prune` orchestration
@@ -700,6 +770,9 @@ For comprehensive file lists, see the matching reference. This is a minimal poin
 - `crates/meerkat-core/src/tool_execution_policy.rs` — `ToolExecutionPolicy`, `ExecutionPolicyGatedDispatcher` (list-preserving call-level tool gate)
 - `crates/meerkat-core/src/compact.rs` — `Compactor`, `CompactionCurator` (host-supplied summary producer)
 - `crates/meerkat-schedule/src/runnable.rs` — `ScheduleRunnableHost`, `HostRunnableRegistry` (host-runnable schedule targets)
+- `crates/meerkat-core/src/authorization.rs`, `crates/meerkat-core/src/approval.rs`, `crates/meerkat-core/src/confinement.rs` - `WorkAuthorization` seam, `ApprovalService`/`ApprovalStore`, `ExecutionConfinement`
+- `crates/meerkat-authorization/src/grants/`, `crates/meerkat/src/governed_realm.rs` - generated grant authority bridge and governed-realm composition
+- `crates/meerkat-sandbox/src/lib.rs` - `ProcessLaunchSpec` and OS confinement lowering
 - `crates/meerkat/src/factory.rs` — `AgentFactory::build_agent()` (pipeline)
 - `crates/meerkat-session/src/{ephemeral,persistent}.rs` — session services
 - `crates/meerkat-workgraph/src/{types,store,service,tools}.rs` — WorkGraph domain model, durable stores, service policy, and agent tools
