@@ -533,7 +533,7 @@ Installed via `make install-hooks`. Two stages:
 - Secret detection (gitleaks)
 - Trailing whitespace, end-of-file, YAML/TOML validation, merge conflict check, large file check
 - `repo-cargo fmt --all -- --check`
-- `scripts/pre-push-clippy.sh` (clippy on changed crates only with `--all-targets`; falls back to full workspace when root `Cargo.toml`/`Cargo.lock` changes)
+- `scripts/pre-push-ratchets.sh` (the agent gate's changed-path ratchets: formal/governance targets, generated contract freshness, Web SDK tests, wasm check; no Clippy, which is a required CI check: the CI planner gives every package the hook used to lint a Clippy lane with the same flags, pinned by `scripts/test-pre-push-ratchets.sh`)
 - `scripts/pre-push-machines.sh`, as two hooks behind the machine-authority classifier and the exact pushed refs: `machine-codegen-drift` (`--codegen-only`: machine and protocol codegen under the clean-tree contract, the only local drift check; the dispatcher refuses `SKIP=machine-codegen-drift`) and `machine-codegen-verify` (`--verify-only`: the canonical TLC lane)
 - `scripts/pre-push-audit-generated-headers.sh`
 - `scripts/pre-push-bridge-no-responsestatus.sh` (thin wrapper over `xtask bridge-classifier`)
@@ -544,7 +544,7 @@ Installed via `make install-hooks`. Two stages:
 
 The inner deterministic-test cache uses a source fingerprint that excludes
 root `Cargo.lock` and `MODULE.bazel.lock`. On a lock-only cache hit, the current
-lock graph has been compiled by pre-push Clippy but is not re-tested locally;
+lock graph is compiled by the required CI Clippy lanes but is not re-tested locally;
 the reused tests ran against the prior lock graph, and CI remains
 authoritative. Fail-closed `release-projection-only` and
 `pre-push-harness-only` classifiers can also reuse existing parent source-test
@@ -553,6 +553,10 @@ stamp, which is keyed to the entire pushed Git tree and written only when no
 hook was skipped. A push with `SKIP=<hook ids>` records partial evidence labeled
 with the skipped set, reusable only by a later push of that tree that skips the
 same hooks; a push without that `SKIP` re-runs them.
+
+After the gate, passed or failed, the dispatcher prints each hook's wall time
+and the deterministic gate's lane times, and appends them to
+`.git/meerkat-hook-cache/timings.tsv`.
 
 **Manual local preflight**:
 - `pre-commit run --hook-stage manual agent-check-changed` (runs `scripts/agent-gate --staged`)

@@ -452,6 +452,7 @@ function parseArgs(argv) {
     pathsFromStdin: false,
     paths: [],
     explicitPaths: false,
+    changedPathsOnly: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -474,6 +475,8 @@ function parseArgs(argv) {
       if (!["json", "github"].includes(args.format)) {
         throw new Error("--format must be json or github");
       }
+    } else if (arg === "--changed-paths-only") {
+      args.changedPathsOnly = true;
     } else if (arg === "--paths-from-stdin") {
       args.pathsFromStdin = true;
       args.explicitPaths = true;
@@ -483,7 +486,7 @@ function parseArgs(argv) {
       break;
     } else if (arg === "--help" || arg === "-h") {
       process.stdout.write(
-        "usage: ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N] [--workspace-shards N] [--format json|github] [--paths-from-stdin] [--] [changed-path ...]\n",
+        "usage: ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N] [--workspace-shards N] [--format json|github] [--paths-from-stdin] [--changed-paths-only] [--] [changed-path ...]\n",
       );
       process.exit(0);
     } else if (arg.startsWith("-")) {
@@ -532,7 +535,14 @@ function collectChangedPaths(args) {
   if (!revisionExists(args.head)) {
     return { paths: null, reason: `diff head ${args.head} is not available` };
   }
-  const output = git(["diff", "--name-only", "--diff-filter=ACMRD", args.base, args.head, "--"]);
+  // --no-renames lists both sides of a rename (its old side as a deletion),
+  // and T keeps type-only changes, such as a source file turned symlink.
+  // Either can be the only path that names a package: a test moved from
+  // crate A to crate B must still select A, and a source file renamed into
+  // docs/ must still select its crate. -z keeps every name exact.
+  const output = git([
+    "diff", "--no-renames", "--name-only", "-z", "--diff-filter=ACMRDT", args.base, args.head, "--",
+  ]);
   // Deleted paths and the old side of renames: a moved or removed source file
   // changes the generated Bazel data dependencies even when no BUILD file is
   // in the diff.
@@ -544,7 +554,7 @@ function collectChangedPaths(args) {
     if (fields.length >= 3 && fields[0].startsWith("R")) removed.push(fields[1].trim());
   }
   return {
-    paths: output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
+    paths: output.split("\0").filter(Boolean),
     removed,
     reason: `git diff ${args.base}..${args.head}`,
   };
@@ -1225,6 +1235,13 @@ function githubOutput(result) {
 
 function main() {
   const args = parseArgs(process.argv.slice(2));
+  if (args.changedPathsOnly) {
+    // The path collection alone, without Cargo metadata, for the actual-commit
+    // controls in scripts/test-release-projection-pre-push.sh.
+    const { paths, removed = [], reason } = collectChangedPaths(args);
+    process.stdout.write(`${JSON.stringify({ diff: reason, changed_paths: paths, removed_paths: removed })}\n`);
+    return;
+  }
   const result = plan(args);
   if (args.format === "github") {
     process.stdout.write(githubOutput(result));

@@ -8,11 +8,13 @@ dry_run=0
 scope="all"
 run_clippy=1
 run_tests=1
+ratchets_only=0
+selection_flags=0
 paths=()
 
 usage() {
   cat <<'EOF'
-usage: cargo-agent-gate [--base <rev>] [--staged|--committed|--working-tree] [--clippy-only|--tests-only] [--machine-drift-by-hook] [--dry-run] [path ...]
+usage: cargo-agent-gate [--base <rev>] [--staged|--committed|--working-tree] [--clippy-only|--tests-only|--ratchets-only] [--machine-drift-by-hook] [--dry-run] [path ...]
 
 Runs the default Cargo gate most useful for local agent edits. If paths are not
 provided, the script derives changed files from branch, staged, unstaged, and
@@ -20,6 +22,9 @@ untracked changes. Use --staged for pre-commit hooks, --committed for pre-push
 hooks, and --working-tree for unstaged/untracked local probes. Crate-local
 Rust/TOML edits run package-scoped clippy and nextest by default. Global
 Cargo/nextest lane changes escalate to workspace Cargo gates.
+--ratchets-only runs only the changed-path ratchets (formal/governance
+targets, generated contract freshness, Web SDK tests, wasm check), without
+Clippy or tests.
 EOF
 }
 
@@ -59,11 +64,22 @@ while [[ $# -gt 0 ]]; do
     --clippy-only)
       run_clippy=1
       run_tests=0
+      selection_flags=$((selection_flags + 1))
       shift
       ;;
     --tests-only)
       run_clippy=0
       run_tests=1
+      selection_flags=$((selection_flags + 1))
+      shift
+      ;;
+    --ratchets-only)
+      # The pre-push hook's mode: Clippy is a required CI check, so the hook
+      # keeps only the ratchets below.
+      run_clippy=0
+      run_tests=0
+      ratchets_only=1
+      selection_flags=$((selection_flags + 1))
       shift
       ;;
     --dry-run)
@@ -88,6 +104,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "${ratchets_only}" -eq 1 && "${selection_flags}" -gt 1 ]]; then
+  echo "error: --ratchets-only cannot be combined with --clippy-only or --tests-only" >&2
+  exit 2
+fi
 
 workspace_root="$(git rev-parse --show-toplevel)"
 cd "${workspace_root}"
@@ -371,6 +392,11 @@ if [[ "${#wasm_runtime[@]}" -gt 0 ]]; then
   else
     make wasm-check
   fi
+fi
+
+if [[ "${ratchets_only}" -eq 1 ]]; then
+  echo "Cargo agent gate: changed-path ratchets only (--ratchets-only); no Clippy or tests here."
+  exit 0
 fi
 
 if [[ "${#relevant[@]}" -eq 0 ]]; then
