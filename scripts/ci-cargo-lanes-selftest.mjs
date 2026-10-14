@@ -136,6 +136,9 @@ function assertHookParity(plan, label) {
     }
     if (row.lane === "lib") {
       assert.equal(row.test_flags, "--lib", `${label}: ${row.name} runs lib tests`);
+      // --workspace --lib also builds proc-macro crates' tests, which the
+      // hook's kind(lib) lane does not run and the row does not name.
+      assert.match(row.filter, /^kind\(lib\)( & \(.+\))?$/, `${label}: ${row.name} runs only kind(lib) binaries`);
       assert.deepEqual(row.binaries, row.packages, `${label}: ${row.name} lists one lib binary per package`);
     } else {
       // Every named target is one of the row's binaries, and the reverse (a
@@ -1154,6 +1157,17 @@ for (const path of [
     copy.closure_test_rows.find((candidate) => candidate.lane === "e2e-fast").profile = "ci-integration";
   });
   assert.ok(filtered.missing.includes("meerkat-integration-tests::test::e2e_fast_lane"), "ci-integration drops e2e_fast_lane");
+  // A row's binary list is what its job checks nextest against: it must be
+  // exactly what the row runs.
+  const overlisted = mutate((copy) => {
+    copy.closure_test_rows.find((row) => row.lane === "lib").binaries.push("meerkat-machine-derive");
+  });
+  assert.ok(overlisted.errors.some((error) => error.includes("lists binaries it does not run (meerkat-machine-derive)")), "a row cannot list a binary it does not run");
+  const underlisted = mutate((copy) => {
+    const row = copy.closure_test_rows.find((candidate) => candidate.lane === "lib");
+    delete row.filter;
+  });
+  assert.ok(underlisted.errors.some((error) => error.includes("runs binaries it does not list")), "a row cannot run binaries it does not list");
   // A narrower scope than the closure is caught by the selftest's own
   // test-scope assertion (the checker trusts plan.test_scope).
   assert.throws(() => assertHookParity({ ...plan, test_scope: plan.packages }, "narrowed scope"));

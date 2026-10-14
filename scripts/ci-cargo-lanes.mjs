@@ -860,13 +860,15 @@ function hookParityRows({ scope, byName, unified, model, maxTestRows, nextestTex
 
   // Lib tests: one row. `--workspace --lib` builds every member's lib test;
   // no stable selection builds fewer under the same resolution, so the scope
-  // narrows what runs (a package() filter), not what builds.
+  // narrows what runs, not what builds. The filter keeps the hook's own
+  // kind(lib) (proc-macro crates' tests are not in it) and the scope's
+  // packages.
   const libPackages = scope.filter(hasLib);
   if (libPackages.length > 0) {
     const everyLib = [...byName.keys()].filter(hasLib);
     const filter = libPackages.length === everyLib.length
-      ? null
-      : libPackages.map((name) => `package(${name})`).join(" | ");
+      ? "kind(lib)"
+      : `kind(lib) & (${libPackages.map((name) => `package(${name})`).join(" | ")})`;
     rows.push({
       name: "lib",
       lane: "lib",
@@ -874,7 +876,7 @@ function hookParityRows({ scope, byName, unified, model, maxTestRows, nextestTex
       package_flags: "--workspace",
       test_flags: "--lib",
       profile: CLOSURE_LIB_PROFILE,
-      ...(filter ? { filter } : {}),
+      filter,
       binaries: [...libPackages],
       no_tests: "warn",
       rust_min_stack: HOOK_TEST_STACK,

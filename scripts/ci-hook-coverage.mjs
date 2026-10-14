@@ -196,6 +196,16 @@ export function hookModel(text) {
 
 const LIB_KINDS = new Set(["lib", "rlib", "dylib", "cdylib", "staticlib"]);
 
+// nextest's binary id of a Cargo target: the package for a lib (or
+// proc-macro) test, package::name for an integration test, package::bin/name
+// for a bin.
+function binaryId(pkg, target) {
+  const kind = nextestKind(target);
+  if (kind === "lib" || kind === "proc-macro") return pkg.name;
+  if (kind === "bin") return `${pkg.name}::bin/${target.name}`;
+  return `${pkg.name}::${target.name}`;
+}
+
 // nextest binary kind of a Cargo target.
 function nextestKind(target) {
   if (target.kind.includes("proc-macro")) return "proc-macro";
@@ -511,6 +521,15 @@ export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText
         continue;
       }
       errors.push(...read.errors);
+      // The row's own list of binaries is what the job checks nextest
+      // against; it must be exactly what the row runs.
+      const runIds = [...new Set(read.runs.map(({ pkg, target }) => binaryId(pkg, target)))].sort();
+      const listed = [...new Set(row.binaries ?? [])].sort();
+      const unlisted = runIds.filter((id) => !listed.includes(id));
+      const unrun = listed.filter((id) => !runIds.includes(id));
+      if (unlisted.length > 0 || unrun.length > 0) {
+        errors.push(`row ${row.name}: runs binaries it does not list (${unlisted.join(", ") || "none"}) or lists binaries it does not run (${unrun.join(", ") || "none"})`);
+      }
       for (const { pkg, target } of read.runs) {
         const key = `${pkg.name}::${nextestKind(target)}::${target.name}`;
         if (read.workspace && !covered.has(key)) {
