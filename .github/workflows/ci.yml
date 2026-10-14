@@ -1160,7 +1160,9 @@ jobs:
           if [[ -n "${FILTER}" ]]; then filter_args=(-E "${FILTER}"); fi
           # One selection for the list and the run: the binaries nextest
           # lists, and the check below accepts, are the ones that run.
-          # scripts/ci-hook-coverage.mjs pins these lines.
+          # scripts/ci-hook-coverage.mjs pins every line of this step that
+          # names a row input (the env above), the selection, nextest or
+          # the binary check, so no line can reassign an input.
           # shellcheck disable=SC2206
           selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}")
           # The hook ran every lane on a 32 MiB test-thread stack.

@@ -1198,6 +1198,16 @@ for (const path of [
   assert.ok(narrowed.some((error) => error.includes("job closure-tests: the step runs")), "a later selection change is refused");
   const unchecked = mutated('          node scripts/ci-verify-row-binaries.mjs "${RUNNER_TEMP}/closure-test-list.json" ${BINARIES}\n', "");
   assert.ok(unchecked.some((error) => error.includes("job closure-tests: the step runs")), "a step without the binary check is refused");
+  // An input reassigned before it is read leaves every pinned line intact:
+  // the line that reassigns it names it, and is refused.
+  const selectionLine = '          selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}")\n';
+  const repackaged = mutated(selectionLine, `          PACKAGES='-p meerkat-integration-tests'\n${selectionLine}`);
+  assert.ok(repackaged.some((error) => error.includes("job closure-tests: the step runs")), "a PACKAGES reassignment is refused");
+  const reprofiled = mutated(selectionLine, `          export PROFILE=ci-pr\n${selectionLine}`);
+  assert.ok(reprofiled.some((error) => error.includes("job closure-tests: the step runs")), "a PROFILE export is refused");
+  const listLine = '          ./scripts/repo-cargo nextest list "${selection[@]}" --message-format json >"${RUNNER_TEMP}/closure-test-list.json"\n';
+  const reread = mutated(listLine, `          read -r NO_TESTS <<<"warn"\n${listLine}`);
+  assert.ok(reread.some((error) => error.includes("job closure-tests: the step runs")), "a NO_TESTS read is refused");
   const moved = mutated("      - name: Closure tests (the row's targets, workspace feature set)\n", "      - name: Closure tests (moved)\n");
   assert.ok(moved.some((error) => error.includes("job closure-tests: step")), "the rows' step is bound by name");
   const wrongMatrix = mutated(

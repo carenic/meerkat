@@ -48,8 +48,11 @@ export const WORKFLOW = ".github/workflows/ci.yml";
 // The workflow steps that execute plan rows, with the exact lines each must
 // run (after joining backslash continuations, collapsing blanks and dropping
 // comments). In a bound step, every line that mentions nextest, the binary
-// check or a selection variable must be one of these, in this order, so the
-// listed selection is the run selection and nothing can narrow a run alone.
+// check, a selection variable or one of the step's inputs (its env names)
+// must be one of these, in this order, so the listed selection is the run
+// selection, nothing can narrow a run alone, and no line can reassign an
+// input before it is read: an assignment, export, read or unset of an input
+// names it.
 export const CI_ROW_STEPS = [
   {
     field: "closure_test_rows",
@@ -65,10 +68,12 @@ export const CI_ROW_STEPS = [
       NO_TESTS: "${{ matrix.no_tests }}",
     },
     lines: [
+      "if [[ -z \"${PACKAGES}\" || -z \"${TESTS}\" || -z \"${PROFILE}\" || -z \"${BINARIES}\" || -z \"${NO_TESTS}\" ]]; then",
       "read -r -a test_flags <<<\"${TESTS}\"",
       "filter_args=()",
       "if [[ -n \"${FILTER}\" ]]; then filter_args=(-E \"${FILTER}\"); fi",
       "selection=(${PACKAGES} \"${test_flags[@]}\" --profile \"${PROFILE}\" \"${filter_args[@]}\")",
+      "fixture=\"$(scripts/mcp-test-server-fixture --if-needed ${PACKAGES})\"",
       "./scripts/repo-cargo nextest list \"${selection[@]}\" --message-format json >\"${RUNNER_TEMP}/closure-test-list.json\"",
       "node scripts/ci-verify-row-binaries.mjs \"${RUNNER_TEMP}/closure-test-list.json\" ${BINARIES}",
       "./scripts/repo-cargo nextest run \"${selection[@]}\" --no-tests=\"${NO_TESTS}\" --no-fail-fast --status-level slow --final-status-level slow",
@@ -77,7 +82,13 @@ export const CI_ROW_STEPS = [
     profile: null,
   },
 ];
-const BOUND_LINE = /nextest|ci-verify-row-binaries|\b(selection|test_flags|filter_args)\b/;
+
+// The lines of a bound step its pins govern: nextest, the binary check, the
+// selection variables and the step's inputs, each as a whole word.
+function boundLine(spec) {
+  const inputs = Object.keys(spec.env).join("|");
+  return new RegExp(`nextest|ci-verify-row-binaries|\\b(selection|test_flags|filter_args|${inputs})\\b`);
+}
 
 // Shell text as logical lines: continuations joined, blanks collapsed,
 // comments and empty lines dropped. Not a shell parser: bound text must be
@@ -138,7 +149,7 @@ export function bindRowSteps(workflowText) {
       errors.push(`${where}: step has no single run block`);
       continue;
     }
-    const bound = logicalLines(run[1]).filter((line) => BOUND_LINE.test(line));
+    const bound = logicalLines(run[1]).filter((line) => boundLine(spec).test(line));
     if (JSON.stringify(bound) !== JSON.stringify(spec.lines)) {
       errors.push(`${where}: the step runs ${JSON.stringify(bound)}, not the bound lines ${JSON.stringify(spec.lines)}`);
     }
