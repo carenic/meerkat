@@ -897,7 +897,8 @@ pub struct BuiltinConfigInput {
     /// Enable shell tools. Omit to inherit/default.
     #[serde(default)]
     pub enable_shell: Option<bool>,
-    /// Default timeout for shell commands in seconds (default: 30)
+    /// Accepted and ignored in 0.9.1. Set the shell's default command timeout
+    /// with `[shell] timeout_secs` in the realm config.
     #[serde(default)]
     pub shell_timeout_secs: Option<u64>,
 }

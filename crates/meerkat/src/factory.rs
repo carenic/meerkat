@@ -8624,7 +8624,15 @@ impl AgentFactory {
             // `ToolsConfig::default()`.
             .with_tools_config(config.tools.clone())
             .provider_native_tool_policy(provider_native_tool_policy)
-            .with_call_timeout_override(effective_call_timeout_override);
+            .with_call_timeout_override(effective_call_timeout_override)
+            // Config-owned budget warning threshold and extraction prompt reach
+            // the agent here; without this every factory-built agent ran on the
+            // template threshold and the built-in extraction prompt.
+            .budget_warning_threshold(config.agent.budget_warning_threshold);
+
+        if let Some(prompt) = config.agent.extraction_prompt.clone() {
+            builder = builder.extraction_prompt(prompt);
+        }
 
         if let Some(max_turns) = config.agent.max_turns {
             builder = builder.max_turns(max_turns);
@@ -12541,6 +12549,139 @@ mod tests {
             owner_state.filter_witnesses.get("parent_shell"),
             Some(&expected_witness),
             "the resumed owner holds the original identity"
+        );
+    }
+
+    /// A factory build for `session` with a test client, builtins disabled.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn config_probe_build(
+        session: Session,
+        client: meerkat_client::TestClient,
+    ) -> AgentBuildConfig {
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let bindings = runtime
+            .prepare_bindings(session.id().clone())
+            .await
+            .expect("session runtime bindings");
+        let mut build = AgentBuildConfig::new("claude-sonnet-4-5");
+        build.provider = Some(Provider::Anthropic);
+        build.llm_client_override = Some(Arc::new(client));
+        build.resume_session = Some(session);
+        build.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings);
+        build.override_builtins = ToolCategoryOverride::Disable;
+        build
+    }
+
+    /// The config's `[agent] extraction_prompt` is the prompt of a
+    /// factory-built agent's extraction turn.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn factory_applies_config_extraction_prompt_to_the_extraction_turn() {
+        const PROMPT: &str = "Reply with the configured extraction JSON only.";
+        let temp = tempfile::tempdir().expect("temp session store");
+        let factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
+        let mut build =
+            config_probe_build(Session::new(), meerkat_client::TestClient::default()).await;
+        build.output_schema = Some(
+            meerkat_core::OutputSchema::new(serde_json::json!({
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"]
+            }))
+            .expect("valid schema"),
+        );
+        let mut config = Config::default();
+        config.agent.extraction_prompt = Some(PROMPT.to_string());
+        let mut agent = factory
+            .build_agent(build, &config)
+            .await
+            .expect("agent with an output schema");
+        agent.set_runtime_execution_kind(Some(
+            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
+        ));
+        // The test client never answers with JSON, so the run enters the
+        // extraction turn; only the prompt that turn sends matters here.
+        let _outcome = agent
+            .run(meerkat_core::ContentInput::Text("one turn".into()))
+            .await;
+
+        let user_texts: Vec<String> = agent
+            .session()
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                meerkat_core::Message::User(user) => Some(user.text_content()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            user_texts.iter().any(|text| text == PROMPT),
+            "the extraction turn must send the configured prompt: {user_texts:?}"
+        );
+    }
+
+    /// The config's `[agent] budget_warning_threshold` reaches a
+    /// factory-built agent: a turn at 60% of its token budget warns under a
+    /// 0.5 threshold, which the template's 0.8 would not.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn factory_applies_config_budget_warning_threshold() {
+        let temp = tempfile::tempdir().expect("temp session store");
+        let factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
+        let client = meerkat_client::TestClient::new(vec![
+            LlmEvent::TextDelta {
+                delta: "ok".to_string(),
+                meta: None,
+            },
+            LlmEvent::UsageUpdate {
+                usage: meerkat_core::TurnUsage::host_declared(
+                    Provider::Anthropic,
+                    "claude-sonnet-4-5",
+                    meerkat_core::Usage {
+                        input_tokens: 60,
+                        ..meerkat_core::Usage::default()
+                    },
+                ),
+            },
+            LlmEvent::Done {
+                outcome: LlmDoneOutcome::Success {
+                    stop_reason: StopReason::EndTurn,
+                },
+            },
+        ]);
+        let mut build = config_probe_build(Session::new(), client).await;
+        build.budget_limits = Some(meerkat_core::BudgetLimits::unlimited().with_max_tokens(100));
+        let mut config = Config::default();
+        config.agent.budget_warning_threshold = 0.5;
+        let mut agent = factory
+            .build_agent(build, &config)
+            .await
+            .expect("agent with a token budget");
+        agent.set_runtime_execution_kind(Some(
+            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        agent
+            .run_with_events(meerkat_core::ContentInput::Text("one turn".into()), tx)
+            .await
+            .expect("one turn");
+
+        let mut warnings = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let meerkat_core::AgentEvent::BudgetWarning {
+                budget_type,
+                used,
+                limit,
+                ..
+            } = event
+            {
+                warnings.push((budget_type, used, limit));
+            }
+        }
+        assert_eq!(
+            warnings,
+            vec![(meerkat_core::BudgetType::Tokens, 60, 100)],
+            "the configured threshold must reach the agent"
         );
     }
 
@@ -20203,6 +20344,67 @@ mod tests {
         );
     }
 
+    /// The loaded config's `[shell] timeout_secs` is the composed shell tool's
+    /// default command timeout: a command that outlives it is terminated,
+    /// where the template default (30 s) would let it finish.
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn factory_shell_tool_honors_configured_shell_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("workspace");
+        tokio::fs::create_dir_all(&project_root).await.unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions")).project_root(&project_root);
+        let ops_lifecycle: Arc<dyn OpsLifecycleRegistry> =
+            Arc::new(RuntimeOpsLifecycleRegistry::new());
+
+        let mut effective_config = Config::default();
+        effective_config.shell.program = "sh".to_string();
+        effective_config.shell.timeout_secs = 1;
+
+        let dispatcher = factory
+            .build_tool_dispatcher_for_agent_with_overrides(
+                &effective_config,
+                None,
+                false,
+                true,
+                None,
+                None,
+                SessionId::new().to_string(),
+                ops_lifecycle,
+                None,
+                None,
+                None,
+                None,
+                ToolCategoryOverride::Inherit,
+                None,
+                ToolCategoryOverride::Inherit,
+                None,
+                Vec::new(),
+                false,
+                None,
+            )
+            .await
+            .expect("shell-only composition should succeed");
+
+        let call_json =
+            serde_json::value::RawValue::from_string(r#"{"command":"sleep 5"}"#.to_string())
+                .unwrap();
+        let call = ToolCallView {
+            id: "shell-timeout-probe",
+            name: "shell",
+            args: &call_json,
+        };
+        let outcome = dispatcher
+            .dispatch(call)
+            .await
+            .expect("shell dispatch should succeed");
+        let text = outcome.result.text_content();
+        assert!(
+            text.starts_with("timed out after "),
+            "the configured 1 s [shell] timeout must stop a 5 s command: {text}"
+        );
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[allow(clippy::panic)]
     mod prepared_controller;
@@ -20273,9 +20475,9 @@ impl AgentFactory {
         };
 
         // Create shell config if shell is enabled. The loaded config's
-        // `[shell]` vocabulary (program, security mode/patterns) is projected
-        // through `ShellConfig::from_defaults`; `ShellConfig::default` only
-        // ever sees the embedded template defaults.
+        // `[shell]` vocabulary (program, timeout, security mode/patterns) is
+        // projected through `ShellConfig::from_defaults`; `ShellConfig::default`
+        // only ever sees the embedded template defaults.
         let shell_config = if effective_shell {
             let project_root = self.shell_project_root();
             let mut shell_tool_config = ShellConfig::from_defaults(&config.shell, project_root);
