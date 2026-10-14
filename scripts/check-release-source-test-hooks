@@ -50,10 +50,12 @@ UNICODE_ESCAPE = re.compile(r"\{((?:[0-9A-Fa-f]_*){1,6})\}")
 IDENTIFIER_CHAR = re.compile(r"[A-Za-z0-9_]")
 
 
-def unescape(body: str, byte_string: bool = False) -> str | None:
-    """The value of an ordinary (or byte or C) string literal's body, or
-    None when it holds an escape this check cannot decode: such a literal
-    fails the check rather than drop out of the comparison."""
+def unescape(body: str, kind: str = "") -> str | None:
+    """The value of a string literal's body, or None when it holds an escape
+    this check cannot decode: such a literal fails the check rather than drop
+    out of the comparison. `kind` is the literal's prefix: "" (str), "b" (byte
+    string: \\x00-FF, no \\u) or "c" (C string: \\x00-FF and \\u, never NUL).
+    """
     value = []
     index = 0
     while index < len(body):
@@ -64,6 +66,8 @@ def unescape(body: str, byte_string: bool = False) -> str | None:
             continue
         escape = body[index + 1:index + 2]
         if escape in SIMPLE_ESCAPES:
+            if kind == "c" and escape == "0":
+                return None
             value.append(SIMPLE_ESCAPES[escape])
             index += 2
         elif escape == "\n" or body.startswith("\r\n", index + 1):
@@ -73,17 +77,17 @@ def unescape(body: str, byte_string: bool = False) -> str | None:
                 index += 1
         elif escape == "x":
             digits = body[index + 2:index + 4]
-            pattern = r"[0-9A-Fa-f]{2}" if byte_string else r"[0-7][0-9A-Fa-f]"
-            if not re.fullmatch(pattern, digits):
+            pattern = r"[0-9A-Fa-f]{2}" if kind in ("b", "c") else r"[0-7][0-9A-Fa-f]"
+            if not re.fullmatch(pattern, digits) or (kind == "c" and int(digits, 16) == 0):
                 return None
             value.append(chr(int(digits, 16)))
             index += 4
-        elif escape == "u" and not byte_string:
+        elif escape == "u" and kind != "b":
             match = UNICODE_ESCAPE.match(body, index + 2)
             if not match:
                 return None
             code = int(match.group(1).replace("_", ""), 16)
-            if code > 0x10FFFF or 0xD800 <= code <= 0xDFFF:
+            if code > 0x10FFFF or 0xD800 <= code <= 0xDFFF or (kind == "c" and code == 0):
                 return None
             value.append(chr(code))
             index = match.end()
@@ -136,12 +140,14 @@ def lex(text: str) -> tuple[list[bool], list[tuple[int, str | None]]]:
             cursor = index + 1
             while cursor < end and text[cursor] != '"':
                 cursor += 2 if text[cursor] == "\\" else 1
-            byte_string = (
-                index > 0
+            kind = (
+                text[index - 1]
+                if index > 0
                 and text[index - 1] in "bc"
                 and (index < 2 or not IDENTIFIER_CHAR.match(text[index - 2]))
+                else ""
             )
-            strings.append((len(in_code) - 1, unescape(text[index + 1:cursor], byte_string)))
+            strings.append((len(in_code) - 1, unescape(text[index + 1:cursor], kind)))
             skip_to(min(cursor + 1, end))
         elif char == "'":
             if text.startswith("\\", index + 1):

@@ -39,6 +39,11 @@ fn test_client_shim_requested() -> bool {
 const fn test_client_shim_requested() -> bool {
     false
 }
+
+/// An unrelated C string with a Unicode escape: valid Rust, so accepted.
+fn unrelated_c_string() -> &'static core::ffi::CStr {
+    c"\\u{41}"
+}
 """
 
 LEGACY_FACTORY = """
@@ -153,6 +158,13 @@ fn test_client_shim_requested() -> bool {
 #[cfg(test)]
 mod tests {
     const SHIM: &str = "RKAT_TEST_CLIENT";
+}
+"""
+
+# A C string may not hold NUL: the check cannot decode c"\\u{0}" either.
+NUL_C_STRING_FACTORY = GATED_FACTORY + """
+fn nul() -> &'static core::ffi::CStr {
+    c"\\u{0}"
 }
 """
 
@@ -282,7 +294,13 @@ class SourceTestHookCheckTests(unittest.TestCase):
         sha = self.commit({FACTORY: UNDECODABLE_LITERAL_FACTORY, OAUTH: GATED_OAUTH})
         result = self.check(sha)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn(f"{FACTORY}:16 at {sha} has a string literal whose escapes this check cannot decode", result.stderr)
+        self.assertIn(f"{FACTORY}:21 at {sha} has a string literal whose escapes this check cannot decode", result.stderr)
+
+    def test_nul_c_string_escape_fails_closed(self) -> None:
+        sha = self.commit({FACTORY: NUL_C_STRING_FACTORY, OAUTH: GATED_OAUTH})
+        result = self.check(sha)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"{FACTORY}:21 at {sha} has a string literal whose escapes this check cannot decode", result.stderr)
 
     def test_ungated_raw_oauth_reads_fail_beside_gated_plain_ones(self) -> None:
         sha = self.commit({FACTORY: GATED_FACTORY, OAUTH: RAW_UNGATED_OAUTH})
