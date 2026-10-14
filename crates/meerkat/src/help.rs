@@ -153,6 +153,13 @@ pub struct HelpSession {
     /// `skill_read_resource` over the embedded skills, through which the model
     /// reads the platform skill's reference documents.
     pub tools: std::sync::Arc<dyn meerkat_core::AgentToolDispatcher>,
+    /// The session's launch tool access policy: an allow list of exactly the
+    /// two `tools`. Every help entry point launches its session with it, so
+    /// the session persists it and every resume restores it: when an ordinary
+    /// surface later resumes a saved help session with that surface's own
+    /// tools, the session's execution gate refuses each of them, and
+    /// provider-native tools stay off.
+    pub tool_access_policy: meerkat_core::ops::ToolAccessPolicy,
 }
 
 /// Build the system prompt and tools of one help session.
@@ -185,6 +192,14 @@ pub fn help_session() -> HelpSession {
         system_prompt,
         tools: std::sync::Arc::new(
             meerkat_tools::builtin::CompositeDispatcher::skill_resources_only(runtime),
+        ),
+        tool_access_policy: meerkat_core::ops::ToolAccessPolicy::AllowList(
+            [
+                meerkat_tools::builtin::skills::SKILL_LIST_RESOURCES_TOOL_NAME,
+                meerkat_tools::builtin::skills::SKILL_READ_RESOURCE_TOOL_NAME,
+            ]
+            .into_iter()
+            .collect(),
         ),
     }
 }
@@ -742,6 +757,24 @@ mod tests {
                 meerkat_core::ToolMutationClass::ReadOnly
             );
         }
+    }
+
+    #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]
+    #[test]
+    fn help_session_launch_policy_admits_exactly_its_tools() {
+        let help = help_session();
+        let names: BTreeSet<String> = help
+            .tools
+            .tools()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(
+            help.tool_access_policy,
+            meerkat_core::ops::ToolAccessPolicy::AllowList(
+                names.iter().map(String::as_str).collect()
+            )
+        );
     }
 
     #[cfg(all(feature = "skills", not(target_arch = "wasm32")))]

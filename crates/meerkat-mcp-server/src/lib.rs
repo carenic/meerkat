@@ -4112,7 +4112,7 @@ async fn handle_meerkat_help(
         run_input,
         notifier,
         request_context,
-        Some(help.tools),
+        Some((help.tools, help.tool_access_policy)),
     ))
     .await
 }
@@ -4133,14 +4133,19 @@ async fn handle_meerkat_run(
     .await
 }
 
-/// `help_tools` are a help session's only tools: they take the place of the
-/// client's callback tools and of the session's live MCP router.
+/// `help_tools` are a help session's only tools, with the launch tool access
+/// policy that admits only them: the tools take the place of the client's
+/// callback tools and of the session's live MCP router, and the session
+/// persists the policy, so a later resume keeps it.
 async fn handle_meerkat_run_with_help_tools(
     state: &MeerkatMcpState,
     input: MeerkatRunInput,
     notifier: Option<EventNotifier>,
     request_context: Option<RequestContext>,
-    help_tools: Option<Arc<dyn AgentToolDispatcher>>,
+    help_tools: Option<(
+        Arc<dyn AgentToolDispatcher>,
+        meerkat_core::ops::ToolAccessPolicy,
+    )>,
 ) -> Result<Value, ToolCallError> {
     validate_public_peer_meta(input.peer_meta.as_ref()).map_err(ToolCallError::invalid_params)?;
     let ingress = state.runtime_ingress_context();
@@ -4266,8 +4271,8 @@ async fn handle_meerkat_run_with_help_tools(
                     )),
                 ))
             });
-            let external_tools = match help_tools_for_plan.clone() {
-                Some(help_tools) => Some(help_tools),
+            let external_tools = match help_tools_for_plan.as_ref() {
+                Some((help_tools, _)) => Some(Arc::clone(help_tools)),
                 None => compose_external_tool_dispatchers(
                     callback_tools_for_plan.clone(),
                     adapter
@@ -4278,7 +4283,9 @@ async fn handle_meerkat_run_with_help_tools(
             };
             let mut build = SessionBuildOptions {
                 model_fallback: None,
-                tool_access_policy: None,
+                tool_access_policy: help_tools_for_plan
+                    .as_ref()
+                    .map(|(_, tool_access_policy)| tool_access_policy.clone()),
                 declared_tool_restriction: None,
                 tool_dispatch_admission: None,
                 application_tool_policy: meerkat_core::ApplicationToolPolicyBinding::Unmanaged,
@@ -5770,6 +5777,358 @@ mod tests {
             .expect("meerkat_run succeeds");
         let session = session_id_of(run);
         assert!(ingress.logical_router(&session).await.is_some());
+    }
+
+    /// Records the tool names each model request offers. An armed tool call
+    /// is asked for by the next request only; every other request answers
+    /// `ok`.
+    #[derive(Default)]
+    struct ToolCallScriptLlmClient {
+        tool_names: std::sync::Mutex<Vec<Vec<String>>>,
+        armed_call: std::sync::Mutex<Option<(String, Value)>>,
+    }
+
+    impl ToolCallScriptLlmClient {
+        fn arm_call(&self, name: &str, args: Value) {
+            *self.armed_call.lock().expect("armed call lock") = Some((name.to_string(), args));
+        }
+
+        fn requests(&self) -> Vec<std::collections::BTreeSet<String>> {
+            self.tool_names
+                .lock()
+                .expect("recorded tool names lock")
+                .iter()
+                .map(|names| names.iter().cloned().collect())
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for ToolCallScriptLlmClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a LlmRequest,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>> {
+            self.tool_names
+                .lock()
+                .expect("recorded tool names lock")
+                .push(
+                    request
+                        .tools
+                        .iter()
+                        .map(|tool| tool.name.to_string())
+                        .collect(),
+                );
+            let usage = LlmEvent::UsageUpdate {
+                usage: meerkat_core::TurnUsage::host_declared(
+                    provider_for_successful_mcp_test_model(&request.model),
+                    &request.model,
+                    meerkat_core::Usage::default(),
+                ),
+            };
+            let armed = self.armed_call.lock().expect("armed call lock").take();
+            let events = match armed {
+                Some((name, args)) => vec![
+                    Ok(LlmEvent::ToolCallComplete {
+                        id: format!("call_{name}"),
+                        name,
+                        args,
+                        meta: None,
+                    }),
+                    Ok(usage),
+                    Ok(LlmEvent::Done {
+                        outcome: LlmDoneOutcome::Success {
+                            stop_reason: meerkat_core::StopReason::ToolUse,
+                        },
+                    }),
+                ],
+                None => vec![
+                    Ok(LlmEvent::TextDelta {
+                        delta: "ok".to_string(),
+                        meta: None,
+                    }),
+                    Ok(usage),
+                    Ok(LlmEvent::Done {
+                        outcome: LlmDoneOutcome::Success {
+                            stop_reason: meerkat_core::StopReason::EndTurn,
+                        },
+                    }),
+                ],
+            };
+            Box::pin(stream::iter(events))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Anthropic
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// The launch policy of a help session: only the two help tools.
+    fn help_launch_policy() -> meerkat_core::ops::ToolAccessPolicy {
+        meerkat_core::ops::ToolAccessPolicy::AllowList(
+            ["skill_list_resources", "skill_read_resource"]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// The tool names of the catalog control plane.
+    fn catalog_control_plane() -> std::collections::BTreeSet<String> {
+        ["tool_catalog_search", "tool_catalog_load"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    /// Asserts that the call `tool_use_id` was refused as `access_denied`.
+    fn assert_refused_as_access_denied(session: &Session, tool_use_id: &str) {
+        let result = session
+            .messages()
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                meerkat_core::types::Message::ToolResults { results, .. } => results
+                    .iter()
+                    .find(|result| result.tool_use_id == tool_use_id)
+                    .cloned(),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no tool result for {tool_use_id}"));
+        assert!(result.is_error, "{tool_use_id} must fail: {result:?}");
+        let payload: Value =
+            serde_json::from_str(&result.text_content()).expect("typed tool error payload");
+        assert_eq!(
+            payload["error"], "access_denied",
+            "{tool_use_id} must be refused by the session's policy: {payload}"
+        );
+    }
+
+    fn session_id_of(value: Value) -> meerkat::SessionId {
+        let payload = unwrap_payload(value);
+        meerkat::SessionId::parse(payload["session_id"].as_str().expect("session id"))
+            .expect("session id parses")
+    }
+
+    async fn load_saved_session(
+        state: &MeerkatMcpState,
+        session_id: &meerkat::SessionId,
+    ) -> Session {
+        state
+            .service
+            .load_authoritative_session(session_id)
+            .await
+            .expect("load the saved session")
+            .expect("the session is saved")
+    }
+
+    /// A help session and an ordinary session saved by one server, the help
+    /// session's tooling as its first help turn persisted it, and a restarted
+    /// server over the same stores whose model is `llm`.
+    async fn help_and_ordinary_sessions_on_a_restarted_server(
+        llm: Arc<ToolCallScriptLlmClient>,
+    ) -> (
+        MeerkatMcpState,
+        meerkat::SessionId,
+        meerkat::SessionId,
+        meerkat_core::SessionTooling,
+    ) {
+        let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let state = MeerkatMcpState::new_with_store_options_and_llm(
+            Arc::clone(&store),
+            Arc::clone(&runtime_store),
+            None,
+            Some(Arc::new(ToolCallScriptLlmClient::default())),
+        )
+        .await;
+        let help_session = session_id_of(
+            Box::pin(handle_meerkat_help(
+                &state,
+                meerkat_contracts::HelpRequest {
+                    question: "How do I add an MCP server?".to_string(),
+                    prompt: None,
+                    execution_mode: meerkat_contracts::HelpExecutionMode::ExplainOnly,
+                    model: Some("claude-sonnet-4-5".to_string()),
+                    provider: Some("anthropic".to_string()),
+                    max_tokens: None,
+                },
+                None,
+                None,
+            ))
+            .await
+            .expect("meerkat_help succeeds"),
+        );
+        let first_turn_tooling = load_saved_session(&state, &help_session)
+            .await
+            .session_metadata()
+            .expect("help session metadata")
+            .tooling;
+        // The restarted server below opens a fresh realm, and a WorkGraph
+        // namespace grant is bound to its realm, so the ordinary session
+        // leaves WorkGraph off to stay resumable there.
+        let run_input: MeerkatRunInput = serde_json::from_value(json!({
+            "prompt": "hello",
+            "model": "claude-sonnet-4-5",
+            "provider": "anthropic",
+            "enable_workgraph": false,
+        }))
+        .expect("run input");
+        let ordinary = session_id_of(
+            Box::pin(handle_meerkat_run(&state, run_input, None, None))
+                .await
+                .expect("meerkat_run succeeds"),
+        );
+
+        // Reconstruct the server against the same stores to model a restart.
+        drop(state);
+        let state = MeerkatMcpState::new_with_store_options_and_llm(
+            store,
+            runtime_store,
+            None,
+            Some(llm as Arc<dyn meerkat::LlmClient>),
+        )
+        .await;
+        (state, help_session, ordinary, first_turn_tooling)
+    }
+
+    /// Resume `session_id` with the client's callback `tools` and no other
+    /// override. Like the other cold-resume tests, accept the one post-turn
+    /// failure this harness can raise, the peer-ingress refresh.
+    async fn resume_with_client_tools(
+        state: &MeerkatMcpState,
+        session_id: &meerkat::SessionId,
+        tools: Vec<McpToolDef>,
+    ) -> Option<Value> {
+        match Box::pin(handle_meerkat_resume(
+            state,
+            bounded_resume_input(session_id.to_string(), tools),
+            None,
+            None,
+        ))
+        .await
+        {
+            Ok(payload) => Some(unwrap_payload(payload)),
+            Err(error)
+                if error
+                    .message
+                    .contains("failed to update peer ingress context") =>
+            {
+                None
+            }
+            Err(error) => panic!("meerkat_resume of {session_id} failed: {error:?}"),
+        }
+    }
+
+    fn client_callback_tool() -> McpToolDef {
+        McpToolDef {
+            name: "client_callback".to_string(),
+            description: "A tool the MCP client serves".to_string(),
+            input_schema: meerkat_tools::empty_object_schema(),
+            handler: Some("callback".to_string()),
+        }
+    }
+
+    /// A saved help session keeps its help restriction when `meerkat_resume`
+    /// rebuilds it on a restarted server with no override. The first help
+    /// turn persists the launch policy that admits only the help tools, and
+    /// the cold rebuild restores it: the model is offered only the catalog
+    /// control plane of the rebuilt router, which tool visibility never
+    /// filters, and a model call to it is refused and loads nothing.
+    #[tokio::test]
+    async fn test_a_saved_help_session_resumed_cold_keeps_its_launch_policy() {
+        let llm = Arc::new(ToolCallScriptLlmClient::default());
+        let (state, help_session, _ordinary, first_turn_tooling) =
+            help_and_ordinary_sessions_on_a_restarted_server(Arc::clone(&llm)).await;
+
+        llm.arm_call(
+            "tool_catalog_load",
+            json!({"names": ["skill_read_resource"]}),
+        );
+        resume_with_client_tools(&state, &help_session, vec![]).await;
+        let requests = llm.requests();
+        let [.., offered, after_load] = requests.as_slice() else {
+            panic!("the resumed turn asks the model twice: {requests:?}");
+        };
+        assert_eq!(
+            offered,
+            &catalog_control_plane(),
+            "a cold-resumed help session offers no composed tool but the control plane"
+        );
+        let resumed = load_saved_session(&state, &help_session).await;
+        assert_eq!(
+            resumed
+                .session_metadata()
+                .expect("help session metadata")
+                .tooling
+                .tool_access_policy,
+            Some(help_launch_policy()),
+            "the cold rebuild restores the help session's launch policy"
+        );
+        assert_eq!(
+            first_turn_tooling.spawn_tool_access_policy,
+            Some(meerkat_core::ops::SpawnToolAccessPolicy::Restricted {
+                policy: help_launch_policy()
+            }),
+            "meerkat_help persists the launch policy that admits only the help tools"
+        );
+        assert_eq!(
+            first_turn_tooling.tool_access_policy,
+            Some(help_launch_policy())
+        );
+        assert_refused_as_access_denied(&resumed, "call_tool_catalog_load");
+        assert_eq!(after_load, offered, "the refused load attaches no tool");
+    }
+
+    /// A callback tool the client supplies when it resumes a saved help
+    /// session on a restarted server is neither offered to the model nor
+    /// handed back to the client when the model calls it. An ordinary session
+    /// resumed the same way still offers it.
+    #[tokio::test]
+    async fn test_a_saved_help_session_resumed_cold_refuses_client_callback_tools() {
+        let llm = Arc::new(ToolCallScriptLlmClient::default());
+        let (state, help_session, ordinary, _first_turn_tooling) =
+            help_and_ordinary_sessions_on_a_restarted_server(Arc::clone(&llm)).await;
+
+        llm.arm_call("client_callback", json!({}));
+        let first_request = llm.requests().len();
+        let payload =
+            resume_with_client_tools(&state, &help_session, vec![client_callback_tool()]).await;
+        assert_eq!(
+            llm.requests()[first_request],
+            std::collections::BTreeSet::new(),
+            "the client's callback tool must not reach a help session's model"
+        );
+        assert_refused_as_access_denied(
+            &load_saved_session(&state, &help_session).await,
+            "call_client_callback",
+        );
+        if let Some(payload) = payload {
+            assert!(
+                payload.get("pending_tool_calls").is_none(),
+                "no call is handed back to the client: {payload}"
+            );
+        }
+
+        // Control: an ordinary session resumed the same way offers it.
+        resume_with_client_tools(&state, &ordinary, vec![client_callback_tool()]).await;
+        assert!(
+            llm.requests()
+                .last()
+                .is_some_and(|offered| offered.contains("client_callback")),
+            "an ordinary resumed session still offers the client's callback tool"
+        );
     }
 
     struct OwnershipCheckingLlmClient {

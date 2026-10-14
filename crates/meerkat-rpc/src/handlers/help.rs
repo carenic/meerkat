@@ -36,7 +36,8 @@ pub async fn handle_ask(
     let create_params = help_create_session_params(request, prompt, help.system_prompt);
 
     // K17: delegate the typed `session/create` params to the shared typed
-    // entrypoint, with no callback tools and no configured MCP servers.
+    // entrypoint, with no callback tools and no configured MCP servers. The
+    // help tools come with the launch policy that admits only them.
     super::session::create_session_with_params_on_route_and_configured_mcp(
         id,
         create_params,
@@ -46,7 +47,7 @@ pub async fn handle_ask(
         request_context,
         None,
         Vec::new(),
-        Some(help.tools),
+        Some((help.tools, help.tool_access_policy)),
     )
     .await
 }

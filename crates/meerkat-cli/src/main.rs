@@ -4538,18 +4538,20 @@ async fn handle_help_command(
         StdinMode::Off,
         LineFormat::Text,
         None,
-        Some(help.tools),
+        Some((help.tools, help.tool_access_policy)),
         scope,
     )
     .await
 }
 
 /// The session `rkat help` runs: the embedded skills whole in the system
-/// prompt, and the read-only reference tools as its only tools.
+/// prompt, the read-only reference tools as its only tools, and the launch
+/// tool access policy that admits only them.
 #[cfg_attr(not(feature = "skills"), allow(dead_code))]
 struct CliHelpSession {
     system_prompt: String,
     tools: Arc<dyn AgentToolDispatcher>,
+    tool_access_policy: meerkat_core::ops::ToolAccessPolicy,
 }
 
 #[cfg(feature = "skills")]
@@ -4558,6 +4560,7 @@ fn cli_help_session() -> anyhow::Result<CliHelpSession> {
     Ok(CliHelpSession {
         system_prompt: help.system_prompt,
         tools: help.tools,
+        tool_access_policy: help.tool_access_policy,
     })
 }
 
@@ -4623,7 +4626,10 @@ async fn handle_run_command(
     stdin: StdinMode,
     line_format: LineFormat,
     auth_binding: Option<AuthBindingRef>,
-    help_tools: Option<Arc<dyn AgentToolDispatcher>>,
+    help_tools: Option<(
+        Arc<dyn AgentToolDispatcher>,
+        meerkat_core::ops::ToolAccessPolicy,
+    )>,
     scope: &RuntimeScope,
 ) -> anyhow::Result<()> {
     // One-time, idempotent: carry any pre-`global` (`dev`) login credentials
@@ -13458,7 +13464,10 @@ async fn run_agent(
     manifest: meerkat_store::RealmManifest,
     persistence: PersistenceBundle,
     storage_scope: &RuntimeScope,
-    help_tools: Option<Arc<dyn AgentToolDispatcher>>,
+    help_tools: Option<(
+        Arc<dyn AgentToolDispatcher>,
+        meerkat_core::ops::ToolAccessPolicy,
+    )>,
     scope: &RuntimeScope,
 ) -> anyhow::Result<()> {
     #[cfg(not(feature = "session-store"))]
@@ -13711,6 +13720,9 @@ async fn run_agent(
         };
         // Mob tools now flow through mob_tools (factory pattern), not external_tools.
         // Only MCP tools (or a help run's help tools) remain as external_tools.
+        // A help run's launch policy admits only its help tools; the session
+        // persists it, so a later resume of the help session keeps it.
+        let (help_tools, help_tool_access_policy) = help_tools.unzip();
         let external_tools = help_tools.or(mcp_external_tools);
         #[cfg(feature = "mob")]
         let mob_tools_factory: Option<Arc<dyn meerkat_core::service::MobToolsFactory>> =
@@ -13738,7 +13750,7 @@ async fn run_agent(
 
         let mut build = SessionBuildOptions {
             model_fallback: None,
-            tool_access_policy: None,
+            tool_access_policy: help_tool_access_policy,
             declared_tool_restriction: None,
             tool_dispatch_admission: None,
             application_tool_policy: meerkat_core::ApplicationToolPolicyBinding::Unmanaged,

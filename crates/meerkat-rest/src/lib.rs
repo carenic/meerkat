@@ -5297,7 +5297,7 @@ async fn help(
         &state,
         create_req,
         req_ctx.clone(),
-        Some(help.tools),
+        Some((help.tools, help.tool_access_policy)),
     ))
     .await;
     with_request_lifecycle(&executor, req_ctx, outcome).await
@@ -5377,13 +5377,18 @@ fn create_session_error_to_api(err: SessionError) -> ApiError {
 }
 
 /// Create and run a new session (typed-terminal inner body).
-/// `help_tools` are a help session's only tools: they replace the per-session
-/// live MCP adapter every other session gets.
+/// `help_tools` are a help session's only tools, with the launch tool access
+/// policy that admits only them: the tools replace the per-session live MCP
+/// adapter every other session gets, and the session persists the policy, so
+/// a later resume keeps it.
 async fn create_session_inner(
     state: &AppState,
     req: CreateSessionRequest,
     req_ctx: Option<RequestContext>,
-    help_tools: Option<Arc<dyn meerkat_core::AgentToolDispatcher>>,
+    help_tools: Option<(
+        Arc<dyn meerkat_core::AgentToolDispatcher>,
+        meerkat_core::ops::ToolAccessPolicy,
+    )>,
 ) -> RequestTerminal<Result<Json<SessionResponse>, ApiError>> {
     // --- Validation (pre-stateful work) ---
     if let Err(e) = validate_public_peer_meta(req.peer_meta.as_ref()) {
@@ -5530,9 +5535,10 @@ async fn create_session_inner(
                 return RequestTerminal::RespondWithoutPublish(Err(error));
             }
         };
+    let (help_tools, help_tool_access_policy) = help_tools.unzip();
     let mut build = SessionBuildOptions {
         model_fallback: None,
-        tool_access_policy: None,
+        tool_access_policy: help_tool_access_policy,
         declared_tool_restriction: None,
         tool_dispatch_admission: None,
         application_tool_policy: meerkat_core::ApplicationToolPolicyBinding::Unmanaged,
@@ -14116,8 +14122,9 @@ mod tests {
     }
 
     /// `POST /help` runs with exactly the two read-only reference tools and
-    /// no live MCP adapter; an ordinary `POST /sessions` is unchanged and
-    /// keeps its adapter.
+    /// no live MCP adapter, and persists the launch policy that admits only
+    /// them, so a later resume restores it; an ordinary `POST /sessions` is
+    /// unchanged and keeps its adapter.
     #[cfg(feature = "mcp")]
     #[tokio::test]
     async fn test_help_route_runs_with_only_the_help_tools_and_no_live_mcp() {
@@ -14177,6 +14184,28 @@ mod tests {
         tools.sort();
         assert_eq!(tools, ["skill_list_resources", "skill_read_resource"]);
         assert!(!state.mcp_sessions.read().await.contains_key(&help_session));
+        let help_policy = meerkat_core::ops::ToolAccessPolicy::AllowList(
+            ["skill_list_resources", "skill_read_resource"]
+                .into_iter()
+                .collect(),
+        );
+        let tooling = state
+            .session_service
+            .load_authoritative_session(&help_session)
+            .await
+            .unwrap()
+            .unwrap()
+            .session_metadata()
+            .unwrap()
+            .tooling;
+        assert_eq!(
+            tooling.spawn_tool_access_policy,
+            Some(meerkat_core::ops::SpawnToolAccessPolicy::Restricted {
+                policy: help_policy.clone()
+            }),
+            "POST /help persists the launch policy that admits only the help tools"
+        );
+        assert_eq!(tooling.tool_access_policy, Some(help_policy));
 
         let created = post(&app, "/sessions", serde_json::json!({ "prompt": "hello" })).await;
         let session = SessionId::parse(created["session_id"].as_str().unwrap()).unwrap();

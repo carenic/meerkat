@@ -567,9 +567,9 @@ pub async fn create_session_with_params_on_route(
 /// [`create_session_with_params_on_route`] for a trusted host composition
 /// that carries `configured_mcp_servers` (full descriptors) into the
 /// session's build, where each connects through the governed configured
-/// entry, and `host_tools` (the help session's tools) as the session's
-/// external tools in place of callback tools. Never taken from wire
-/// parameters.
+/// entry, and `host_tools` (the help session's tools, with the launch tool
+/// access policy that admits only them) as the session's external tools in
+/// place of callback tools. Never taken from wire parameters.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_session_with_params_on_route_and_configured_mcp(
     id: Option<RpcId>,
@@ -580,7 +580,10 @@ pub(crate) async fn create_session_with_params_on_route_and_configured_mcp(
     request_context: Option<RequestContext>,
     callback_route: Option<crate::callback_dispatcher::CallbackRoute>,
     configured_mcp_servers: Vec<meerkat_core::McpServerConfig>,
-    host_tools: Option<Arc<dyn meerkat_core::AgentToolDispatcher>>,
+    host_tools: Option<(
+        Arc<dyn meerkat_core::AgentToolDispatcher>,
+        meerkat_core::ops::ToolAccessPolicy,
+    )>,
 ) -> RpcResponse {
     if let Err(err) = meerkat::surface::validate_public_peer_meta(params.peer_meta.as_ref()) {
         return RpcResponse::error(id, error::INVALID_PARAMS, err);
@@ -718,10 +721,12 @@ pub(crate) async fn create_session_with_params_on_route_and_configured_mcp(
         }
     }
     // Host tools are the session's whole tool set: it gets no live MCP
-    // adapter either.
+    // adapter either. Their launch policy admits only them; the session
+    // persists it, so a later resume through any surface keeps it.
     let live_mcp = host_tools.is_none();
-    if let Some(host_tools) = host_tools {
+    if let Some((host_tools, tool_access_policy)) = host_tools {
         build_config.external_tools = Some(host_tools);
+        build_config.tool_access_policy = Some(tool_access_policy);
     }
 
     // Validate and canonicalize skill refs before creating a pending session.
