@@ -20,25 +20,37 @@ spelling, singular/plural forms, flags, and enum values matter.
   Only the legacy names above are refused.
 - `rkat-rpc --tcp` is not a Meerkat signed peer/comms listener; use `rkat run --comms-listen-tcp ...` for remote peers and external mob members.
 - There is no root `rkat live` group. Use JSON-RPC `live/*` for ordinary
-  sessions; placed mob members also have the `rkat mob live` host-control
-  group.
+  sessions; mob members (local or placed) also have the `rkat mob live`
+  group, WebSocket only.
 - There is no `rkat image` command.
-- There is no `rkat schedule` command; schedules are managed through JSON-RPC
-  `schedule/*`.
+- There is no `rkat schedule` command; manage schedules through JSON-RPC
+  `schedule/*`, REST `/schedules`, the SDK schedule helpers, or the agent
+  `meerkat_schedule_*` tools inside `rkat run`.
 - There is no `rkat mcp reload` CLI command.
+- There is no `rkat mcp logout`; sign out with RPC `auth/logout` and an `mcp`
+  target (Python `auth_mcp_logout`, TypeScript `authMcpLogout`). There is no
+  CLI command to set MCP service secrets (`secret_env` values); a Rust host
+  uses `meerkat::set_mcp_service_secret`.
 - There is no `--tools all`; valid values are `safe`, `workspace`, `full`, `none`.
 - There is no sandbox or confinement flag, and no config key turns on OS
   sandboxing. Stock `rkat` runs shell commands, command hooks and stdio MCP
   servers as trusted host processes; `--tools none`, the shell's
   `restrict_to_project` check and `--isolated` are not OS sandboxes. OS
   confinement (macOS Seatbelt, Linux namespaces plus seccomp) is installed by a
-  Rust embedding host; see the meerkat-platform skill.
+  Rust embedding host; see `references/security.md` of the meerkat-platform
+  skill.
 - `rkat blob get` has no `-o` or `--out`; use `--output <FILE>`.
 - `rkat session show` has no `--json` flag.
 - `rkat models` and `rkat capabilities` take no arguments (no `--json`/`--format`, no `rkat models catalog`) and already print pretty JSON.
 - `rkat doctor` (setup checks, no flags) and `rkat storage doctor` (storage diagnosis, `--json`/`--root`) are different commands.
 - `rkat storage prune` deletes only registered maintenance backup artifacts; realm deletion is `rkat realm delete` / `rkat realm prune`.
 - `--isolated` and `--default-model` cannot be combined with `rkat storage`; both are usage errors (exit 2). `rkat mob host` also rejects `--isolated`.
+- `rkat run` has no hook flags; per-session hook overrides (`hooks_override`)
+  exist only on RPC, REST, MCP and the SDKs.
+- There is no manual compaction command on any surface.
+- `rkat` has no JSON-lines event output; `--output json` prints only the final
+  result.
+- `rkat session interrupt` cannot stop a turn running in another process.
 
 ## Root
 
@@ -113,7 +125,7 @@ rkat run --resume[=<SESSION>] <PROMPT>
 Common options:
 
 ```bash
---resume [<SESSION>]            # omit value to resume last
+--resume [<SESSION>]            # resume SESSION (default last); before a prompt, name it: --resume last "<prompt>"
 -m, --model <MODEL>
 -d, --max-duration <DURATION>
 -o, --output <text|json|html>
@@ -138,8 +150,8 @@ Advanced options (`rkat run --help` only):
 ```bash
 --system <SYSTEM_PROMPT>
 -p, --provider <anthropic|openai|gemini|self-hosted>
---max-tokens <N>
---max-tool-calls <N>
+--max-tokens <N>                # output cap per model call (not a total budget)
+--max-tool-calls <N>            # tool-call budget; run completes as budget_exhausted
 --yolo                          # alias for --tools full
 --param <KEY=VALUE>             # repeatable
 --params-json <JSON>
@@ -152,10 +164,10 @@ Advanced options (`rkat run --help` only):
 --app-context <JSON>
 --wait-for-mcp
 --mcp-auth <stored|interactive> # default stored
---line-format <text|json>
+--line-format <text|json>       # how --stdin lines input is parsed (not output)
 --comms-name <NAME>                         # stable signed comms participant name
 --comms-listen-tcp <HOST:PORT>              # signed agent-to-agent TCP listener
---comms-advertise-tcp <HOST:PORT>           # advertised signed comms address
+--comms-advertise-tcp <IP:PORT>             # advertised signed comms address; IP literal, no host names
 --comms-binding-out <PATH>                  # write external mob/runtime binding JSON
 --comms-pairing-password <PASSWORD>         # one-time signed comms enrollment password
 --comms-pairing-password-env <ENV>          # read enrollment password from env
@@ -173,7 +185,7 @@ Remote signed peer example:
 rkat run \
   --comms-name remote-worker \
   --comms-listen-tcp 0.0.0.0:4200 \
-  --comms-advertise-tcp worker.example.com:4200 \
+  --comms-advertise-tcp 203.0.113.7:4200 \
   --comms-binding-out ./remote-worker.binding.json \
   --keep-alive \
   "You are a remote worker."
@@ -197,13 +209,19 @@ active realm), `last`, `~`, `~0`, or `~N`.
 Defaults:
 
 - `--tools safe`
-- default model is OpenAI `gpt-6-astra` unless realm config/auth binding selects another model; catalog support does not imply access through Azure, Copilot, or custom backends
+- default model is OpenAI `gpt-6-astra` unless `-m`/`-p`, `--auth-binding` (the binding's `default_model`), `[agent] model` or `[models] <provider>` selects another; an Anthropic or Gemini env key alone does not change it. Catalog support does not imply access through Azure, Copilot, or custom backends
 - current default/recommended Gemini model is `gemini-3.8-flash`; `gemini-3.5-flash` remains a supported alternative
 - CLI realm state is project-local by default: `<project-root>/.rkat/realms/<ws-...>/`, where the project root is the nearest ancestor containing `.rkat` and falls back to the context root outside a project; that head realm's config composes over its parent chain and the HOME-rooted `global` doc (`~/.rkat/config.toml`)
 - `--verbose` also prints the active realm root
 - provider-native web search is on for models that support it; `--no-web-search` turns it off
 - text output streams by default when stdout is a TTY; JSON/HTML output and pipes/scripts do not
 - piped stdin is blob context unless `--stdin lines` (which implies `--keep-alive`)
+- for a new run, `--tools` decides builtins and shell even when
+  `tools.builtins_enabled` or `tools.shell_enabled` differ; `full` adds
+  WorkGraph, memory and mob tools. `--resume` keeps the stored choice unless
+  `--tools`/`--yolo` is given
+- a shell call without `timeout_secs` gets 30 s; `[shell] timeout_secs` is not
+  applied in 0.9.0
 - short session handles are UUID tails; resume accepts full UUID, prefix/tail, `<realm>:<uuid>`, `last`, `~`, or `~N`
 - `@path` in the prompt inlines that UTF-8 file, resolved from `--context-root` or the current directory; `@/...`, `@~/...`, `@./...`, and `@../...` must name an existing file, while a bare `@name` that is not a file stays plain text; at most 16 mentions, 64 KiB / 2,000 lines per file and 128 KiB / 4,000 lines in total (truncated beyond that)
 
@@ -286,9 +304,17 @@ Realm servers are literal: `${VAR}` expands only in `mcp.toml`, and
 Live mutation of an already-running session uses RPC/REST/MCP/SDK surfaces, not
 `rkat mcp reload`.
 
+`get` text output masks env and header values whose name contains key,
+secret, token or password; `--json` output is unmasked. Neither shows
+`access`, `tool_names` or `secret_env`.
+
 `--allow-operation <OPERATION>` (repeatable) writes the server's access ceiling
 (`access = { allowed_operations = [...] }`): every other raw MCP operation is
 refused and not offered. Sessions started after the write enforce it.
+`rkat mcp add` has no secret flag. A realm stdio server's `secret_env` names
+are written in the realm config; their values are set only by a Rust host
+(`meerkat::set_mcp_service_secret`). `rkat run` launches realm-defined servers
+with the stored values and refuses `secret_env` on `mcp.toml` servers.
 
 For streamable HTTP OAuth, endpoints are discovered when connecting; no auth
 schema is stored in MCP config. Interactive login needs an account selection on
@@ -299,7 +325,8 @@ the server entry: `oauth_account` (written by `rkat mcp add --oauth-account
 terminal unless `--allow-headless` is given (the authorize URL may then be
 printed to stderr). `rkat run` defaults to stored MCP OAuth tokens; use
 `--mcp-auth interactive` to allow first-use browser auth and reconnect in a TTY
-run. MCP OAuth credentials are per realm, so each realm needs its own login.
+run (only for servers with `oauth_account`; for `discover` or `unverified`
+servers run `rkat mcp login <name>` first). MCP OAuth credentials are per realm, so each realm needs its own login.
 
 ## Realm
 
@@ -329,6 +356,11 @@ supersedes only that target's previous one. `realm revoke-grant` revokes one
 target (`--worker` is an older selection's single worker grant). A governed
 prompt refused for its controller route names the exact
 `rkat realm grant <realm> --agent <agent> --controller --route <key>` to run.
+A prompt needs a controller grant. To learn the route key, grant a placeholder
+(`--controller --route model-route/v1/` plus 64 zeros) and run a prompt; the
+refusal names the real key. `realm govern` works only on Unix and only on an
+existing realm whose backend is not `memory`; governance cannot be removed.
+There is no CLI command that lists grants.
 
 A realm is a config + state namespace. The reserved realm slug `global` is an
 optional chain root whose config is the single HOME-rooted doc at
@@ -346,7 +378,9 @@ optional `global` tail (depth-capped, fail-closed; no flat sibling scan, no lite
 realm). CONFIG inherits down the chain: models, mcp servers, hooks, skills,
 limits, and auth bindings. STATE never inherits: sessions, SQLite/JSONL stores,
 and event stores are realm-LOCAL. Children may ADD or OVERRIDE inherited
-mcp/hook entries but cannot REMOVE them (no tombstones). `rkat config get`/`set`
+mcp entries and ADD hook entries, but cannot REMOVE either (no tombstones); a
+child hook entry reusing an inherited hook id is ignored (the first, most
+ancestral entry wins). `rkat config get`/`set`
 operate on the RAW head realm doc (read/write split), so an inherited entry is
 never flattened into a child doc (defaults can be; see Config); a host/RPC/REST
 credential write to an inherited binding is rejected as strict-owner.
@@ -360,14 +394,13 @@ There is no root `rkat live` CLI group. Ordinary session live channels are contr
 `live/webrtc/answer`. Start `rkat-rpc` with `--live-ws <ADDR>` for the
 WebSocket transport; WebRTC signaling needs an `rkat-rpc` built with the
 `live-webrtc` feature (not in the default build) and started with
-`--live-webrtc`. Placed
-mob members have a separate host-control surface under `rkat mob live`, listed
-below.
+`--live-webrtc`. Mob members, local or placed, have a separate identity-addressed
+surface under `rkat mob live` (WebSocket only), listed below.
 
 ## Mob
 
 Direct `rkat mob` covers helpers, artifacts, callable run resources,
-multi-host placement and grants, member history, and placed-member live control.
+multi-host placement and grants, member history, and member live control (local or placed).
 Lifecycle creation, full member CRUD, profile management, and ordinary wiring
 are available through agent `mob_*` tools or RPC `mob/*`.
 
@@ -382,7 +415,7 @@ rkat mob wait-kickoff <mob_id> [--member <agent_identity>...] [--timeout-ms N] [
 rkat mob grant <mob_id> <principal> --scope <scope>... [--expires-at-ms N | --expires-in DURATION]
 rkat mob revoke-grant <mob_id> <principal> [--scope <scope>...]
 rkat mob grants <mob_id> [--json]
-rkat mob host [--listen-tcp <ADDR>] [--advertise-tcp <ADDR>] [--live-ws <ADDR> --live-ws-advertise <URL>] [--identity-dir <DIR>] [--descriptor-out <FILE>] [--allow-remote] [--pairing-password <SECRET> | --pairing-password-env <ENV> | --pairing-password-file <FILE>]
+rkat mob host [--listen-tcp <ADDR>] [--advertise-tcp tcp://<HOST>:<PORT>] [--live-ws <ADDR> --live-ws-advertise <URL>] [--identity-dir <DIR>] [--descriptor-out <FILE>] [--allow-remote] [--pairing-password <SECRET> | --pairing-password-env <ENV> | --pairing-password-file <FILE>]
 rkat mob bind-host <mob_id> --descriptor <FILE>
 rkat mob revoke-host <mob_id> <host_id>
 rkat mob hosts <mob_id> [--json]
@@ -404,6 +437,13 @@ rkat mob validate <pack> [--trust-policy permissive|strict]
 rkat mob deploy <pack> <prompt> [-m|--model <model>] [--max-total-tokens N] [-d|--max-duration D] [--max-tool-calls N] [--trust-policy permissive|strict] [--surface cli|rpc]
 rkat mob web build <pack> -o <dir> --wasm <PKG_DIR|name_bg.wasm> [--trust-policy permissive|strict]
 ```
+Known issue in 0.9.0: `rkat mob deploy
+--max-total-tokens/--max-duration/--max-tool-calls` and a pack's `[budget]`
+are recorded but not enforced, because enforcement reads `[limits]`; a
+correction is in progress for 0.9.1. Known issue in 0.9.0: with `rkat mob
+deploy --surface rpc`, members are built from the realm config store, so
+deploy flags and pack overlays (budget, models, `max_tokens`, compaction,
+`--model`) do not apply.
 
 The parser accepts `--transport websocket|webrtc` on `rkat mob live open`, but
 the current member-live family rejects WebRTC for both local and placed

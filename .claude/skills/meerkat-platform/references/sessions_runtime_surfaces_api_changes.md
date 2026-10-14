@@ -1,0 +1,243 @@
+Covers: Meerkat 0.9 API surface changes: JSON-RPC methods and REST routes
+added or renamed since 0.8.40; the full `ErrorCode` table (-32001 to -32036)
+with HTTP status, and real `rkat` exit codes; Python, TypeScript and Web SDK changes
+(RunInput, CONNECTION_CLOSED stderr tail, wasm stack); prebuilt binaries,
+`cargo install` and low-memory builds; Rust embedding (`crates/<name>`
+layout, path dependencies, `[patch]`); removals.
+
+# API Changes, Error Codes, SDKs and Binaries (Meerkat 0.9)
+
+Names are exact and checked against the 0.9.0 source. Session operations:
+`references/sessions_runtime_surfaces_sessions.md`. Storage, runtime, WorkGraph,
+schedules and config: `references/sessions_runtime_surfaces_storage_config.md`.
+
+## JSON-RPC and REST changes since 0.8.40
+
+| Change | JSON-RPC | REST | Version |
+|---|---|---|---|
+| Run-fenced stop | `turn/stop_run`, `mob/stop_member_run` added | `POST /sessions/{id}/runs/{run_id}/stop`, `POST /mob/{id}/members/{agent_identity}/runs/{run_id}/stop` added | 0.8.49 |
+| Cancel a pending OAuth attempt | `auth/login/cancel` added | `POST /auth/login/cancel` added | 0.8.51 |
+| Live WebRTC media health | `live/media_health` added (`live-webrtc` builds) | none | 0.8.51 |
+| Host job leases | `mobkit/jobs/*` renamed `meta/jobs/{heartbeat,progress,checkpoint,complete,fail,cancel_ack}`, no aliases | none | 0.9.0 |
+| Human consent | `approval/consent_notice` notification; `approval/consent_decide` only on a stock governed stdio pipe | none | 0.9.0 |
+
+No other method or route was added or removed between 0.8.40 and 0.9.0.
+Earlier in the 0.8 line: `jobs/*` and `monitors/start` (0.8.8);
+`session/update_system_prompt`, REST `POST /sessions/{id}/system_prompt` and
+`session/export_atif` (0.8.22); the mob member declaration methods (0.8.26);
+`session/activate_instruction`, `session/instruction_activations` and
+`live/playback_complete` (0.8.30). A REST create whose first turn fails after
+the session was durably created returns `SESSION_CREATED_WITH_TURN_FAILURE`
+with the resumable session identity in `details`.
+
+## Error codes
+
+`meerkat_contracts::ErrorCode`, with JSON-RPC code and HTTP status:
+
+| Code | RPC | HTTP | Meaning |
+|---|---|---|---|
+| `SESSION_NOT_FOUND` | -32001 | 404 | No such session in this realm |
+| `SESSION_BUSY` | -32002 | 409 | Needs an idle session (fork, transcript edit), still materializing, served by another process, or tearing down |
+| `SESSION_NOT_RUNNING` | -32003 | 409 | Not runnable; durable resume holds use this code |
+| `DUPLICATE_INPUT` | -32004 | 409 | Same idempotency key already admitted |
+| `REQUEST_CANCELLED` | -32005 | 499 | Cancelled before commit |
+| `PROVIDER_ERROR` | -32010 | 502 | Upstream LLM failure |
+| `BUDGET_EXHAUSTED` | -32011 | 429 | Token, time or tool-call budget hit |
+| `HOOK_DENIED` | -32012 | 403 | A hook denied the operation |
+| `AGENT_ERROR` | -32013 | 500 | Agent loop failure |
+| `CAPABILITY_UNAVAILABLE` | -32020 | 501 | Feature not compiled, not composed, outside the runtime profile (browser), or persistence disabled |
+| `SKILL_NOT_FOUND` | -32021 | 404 | Unknown skill |
+| `SKILL_RESOLUTION_FAILED` | -32022 | 422 | Skill could not be resolved |
+| `SCHEDULE_NOT_FOUND` | -32023 | 404 | Unknown schedule |
+| `SUPERVISOR_ROTATION_INCOMPLETE` | -32024 | 409 | Mob supervisor rotation partially failed |
+| `SCOPE_DENIED` | -32025 | 403 | Mob control scope missing |
+| `HOST_UNAVAILABLE` | -32026 | 503 | Member host unreachable |
+| `STALE_CURSOR` | -32027 | 410 | Event cursor fell out of a host's buffer |
+| `STALE_FENCE` | -32028 | 409 | Superseded generation or write fence |
+| `MEMBER_RELOAD_REQUIRED` | -32029 | 409 | Member needs an explicit registration reload (0.8.35) |
+| `INPUT_REFUSED` | -32030 | 403 | Native owner declined the input (0.8.51) |
+| `INPUT_NOT_READY` | -32031 | 503 | Input readiness unavailable (0.8.51) |
+| `SESSION_RUNTIME_UNAVAILABLE` | -32032 | 503 | Runtime authority or hosting claim unavailable |
+| `APPROVAL_STORE_UNAVAILABLE` | -32033 | 503 | Approval store committed nothing (0.9.0) |
+| `APPROVAL_CONFLICT` | -32034 | 409 | Approval changed by another owner (0.9.0) |
+| `APPROVAL_COMMIT_UNKNOWN` | -32035 | 500 | Approval commit unknown; reconcile (0.9.0) |
+| `STALE_DELIVERY_SCOPE` | -32036 | 409 | Member session rotated; re-capture the delivery scope (0.9.0) |
+| `INVALID_PARAMS` | -32602 | 400 | Invalid request |
+| `INTERNAL_ERROR` | -32603 | 500 | Unexpected failure |
+
+Branch on `error.data` kinds, not message text: `session_served_elsewhere`,
+`session_hosting_unavailable`, `runtime_teardown_in_progress`,
+`durable_resume_hold`, and auth `reason` values. Ordinary REST errors use
+`{"error", "code", "details"?}` with route-specific codes (`BAD_REQUEST`,
+`NOT_FOUND`, `CONFLICT`, `DUPLICATE_REQUEST_ID`, `SERVICE_UNAVAILABLE`, ...);
+REST routes that project the canonical code use the HTTP status above. A failed
+SDK call raises (Python) or rejects with (TypeScript) a `MeerkatError` that has
+`code`, `message` and `details`; `details` keeps the structured payload
+(0.8.35).
+
+`rkat` exit codes in 0.9.0:
+
+- 0: success.
+- 2: usage errors (argument parsing, storage verbs given `--isolated` or
+  `--default-model`, an invalid `RKAT_WORKER_STACK_BYTES`) and a run stopped
+  by a token, time or tool-call budget or the max-turns limit (stderr
+  "Budget exhausted: ...").
+- 45 `SCOPE_DENIED`, 46 `HOST_UNAVAILABLE`, 47 `STALE_CURSOR`, 48
+  `STALE_FENCE`, 56 `STALE_DELIVERY_SCOPE`: only for mob commands whose error
+  carries a wire detail; stderr adds a `detail: <json>` line.
+- 1: every other failure, including `MEMBER_RELOAD_REQUIRED` and all other
+  codes above; a bare `rkat` with no command prints help and exits 1.
+
+`ErrorCode::cli_exit_code()` assigns every code a contract number (for
+example 49 for `MEMBER_RELOAD_REQUIRED`), but `rkat` 0.9.0 returns it only for
+the five mob codes above. `rkat-rpc`, `rkat-rest` and `rkat-mcp` exit 1 on a
+fatal error.
+
+## SDK changes
+
+Python (`meerkat-sdk`, import `meerkat`), TypeScript (`@rkat/sdk`) and
+`@rkat/web` are released with the binaries; pin all three to the same
+release as `rkat-rpc`. The handshake accepts a server with the same major and
+minor contract version (any 0.9.x).
+
+Added since 0.8.40:
+
+- Python `Session.stop_run`, `Mob.stop_member_run`,
+  `MeerkatClient.stop_mob_member_run`; TypeScript `Session.stopRun`,
+  `Mob.stopMemberRun`, `MeerkatClient.stopMobMemberRun`; Web
+  `Session.stopRun`, `Mob.stopMemberRun`.
+- `live_media_health` / `liveMediaHealth`; `on_live_notification` /
+  `onLiveNotification`; `on_consent_notice` / `onConsentNotice`.
+- Auth: Python `auth_mcp_login_start|complete|cancel|cancel_by_attempt_ref`,
+  `auth_mcp_status`, `auth_mcp_logout`, `auth_connector_login_start|complete|cancel`,
+  `auth_connector_status`; TypeScript `authLoginCancel`, `authMcpStatus`,
+  `authMcpLogout`, `authConnectorStatus`; Web `loginCancel`, `mcpStatus`,
+  `mcpLogout`.
+- Web `Session.interrupt()` and `Session.wirePeer(peer)`.
+
+Breaking:
+
+- 0.9.0: `mobkit_job_*` / `mobkitJob*` renamed `meta_job_*` /
+  `metaJob*` (no aliases).
+- 0.8.46 (`@rkat/web`): `MeerkatRuntime.createSession`,
+  `MeerkatRuntime.destroy`, `Session.getState`, `Session.destroy` and the
+  `Session.sessionId` getter return promises; `Session.isDestroyed` and
+  `TurnResult.response` were removed.
+- 0.8.44: Python `RunStarted` exposes `session_id` and a typed `input`;
+  TypeScript `RunStartedEvent.prompt` was replaced by `input`. `input` is a
+  `RunInput`: `kind` is `content` (with `content`) or `pending_tool_results`
+  (a continuation with no caller prompt). An event in the old prompt-only
+  shape is delivered as `malformed_event`, not as a typed event.
+
+`@rkat/web` 0.8.30 to 0.8.44 linked a 1 MiB wasm stack and failed the first
+turn with `RuntimeError: memory access out of bounds`; 0.8.45 and later link
+8 MiB, so upgrade. Wasm you build yourself for `rkat mob web build --wasm`
+needs the same stack (`-C link-arg=-zstack-size=8388608`, as
+`sdks/web/scripts/build-wasm.mjs` sets); the CLI does not compile wasm.
+
+Connect options: Python `connect(realm_id=, instance_id=, realm_backend=,
+isolated=, state_root=, context_root=, user_config_root=, live_ws=,
+live_webrtc=)` (`realm_id` with `isolated` raises `INVALID_ARGS`); TypeScript
+`connect({realmId, instanceId, realmBackend, isolated, stateRoot, contextRoot,
+userConfigRoot, liveWs, liveWebrtc, liveToolTimeoutMs})`. Both SDKs find
+`rkat-rpc` through `MEERKAT_BIN_PATH`, then `PATH`, then download the
+matching release binary.
+
+When `rkat-rpc` exits, the Python client fails pending and later calls with
+`CONNECTION_CLOSED` ("rkat-rpc process closed; stderr tail: ..."), keeping
+the last 16 KiB of the child's stderr in the message and in
+`details["stderr_tail"]`, so a startup refusal reaches the caller.
+`MeerkatClient.close()` is idempotent and does not raise for a child that
+already exited (0.8.34).
+
+## Prebuilt binaries and building from source
+
+Every release publishes `rkat`, `rkat-rpc`, `rkat-rest` and `rkat-mcp` as
+`<binary>-<version>-<target>.tar.gz` (`.zip` on Windows), with
+`checksums.sha256` and `index.json`, for `x86_64-unknown-linux-gnu`,
+`aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`
+and `x86_64-pc-windows-msvc`. Each archive carries a GitHub build provenance
+attestation (`gh attestation verify <archive> --repo lukacf/meerkat`). The
+Homebrew formula (`brew install lukacf/meerkat/rkat`, macOS and Linux)
+installs all four, and the SDKs download `rkat-rpc` from the same assets.
+
+- Linux binaries run on glibc 2.31 or newer (Debian 11, Ubuntu 20.04 and
+  later) and need no OpenSSL: the release fails if a binary references a newer
+  glibc symbol or links libssl/libcrypto. No musl (Alpine) build is published.
+  macOS binaries are not notarized; Windows is x86_64 only.
+- Every binary includes the Anthropic, OpenAI (with realtime models), Gemini
+  and Copilot providers, the sqlite, jsonl and memory session stores, memory
+  search and skills.
+  Package defaults on top (`cargo install` builds exactly these):
+  `rkat`: `openai-realtime`, `comms`, `mcp`, `schedule`, `workgraph`, `mob`,
+  `rpc-surface`, `local-authorization`; `rkat-rpc` (crate `meerkat-rpc`):
+  `comms`, `mcp`, `mob`, `schedule`, `workgraph`, `openai-realtime`,
+  `local-authorization`; `rkat-rest` (crate `meerkat-rest`): `comms`, `mcp`,
+  `mob`, `schedule`, `workgraph`; `rkat-mcp` (crate `meerkat-mcp-server`):
+  `comms`, `mob`, `schedule`, `workgraph`.
+- No package enables these by default, so do not rely on them in a prebuilt
+  binary; build from source with the feature: `live-webrtc` (WebRTC live
+  transport; `rkat-rpc --live-webrtc` exists only in such builds, which need
+  `cmake`), `openai-live`, `experimental-gpt-live`, and the cloud IAM auth
+  methods listed in `references/providers_and_auth_credentials.md`.
+
+```bash
+cargo install rkat --locked              # Rust 1.94 or newer
+cargo install meerkat-rpc --locked       # installs rkat-rpc; likewise meerkat-rest, meerkat-mcp-server
+CARGO_BUILD_JOBS=2 CARGO_PROFILE_RELEASE_OPT_LEVEL=1 cargo install rkat --locked \
+  --config 'profile.release.package.meerkat-machine-schema.opt-level=0'   # small hosts
+```
+
+- A default `cargo install rkat` compiles about 380 crates at Cargo's release
+  defaults; no workspace profile reaches `cargo install`, so you set the
+  profile (`.cargo/config.toml`, `CARGO_PROFILE_RELEASE_*` or `--config`).
+  The project's measured cold build peaked near 25 GiB with 18 parallel jobs,
+  and its largest single compiler process (`meerkat-mob`) near 11 GiB; only
+  `--config 'profile.release.package.meerkat-mob.opt-level=0'` lowers that
+  one (to about 6 GiB). Under 8 GiB, prefer a prebuilt binary.
+- Builds need a C compiler and libc headers (bundled SQLite), no OpenSSL.
+- Reduced builds are source-only. The repository keeps `rkat
+  --no-default-features --features session-store`, `session-store,mcp` and
+  `session-store,comms,mcp,workgraph` compiling; leaving out the mob graph
+  means omitting `mob`, `rpc-surface` and `openai-live`.
+- Host binaries run their workers on an 8 MiB stack; `RKAT_WORKER_STACK_BYTES`
+  overrides it for diagnosis only.
+
+## Embedding the Rust crates
+
+- Since 0.8.42 every workspace crate lives under `crates/<name>`, and test
+  crates and fixtures under `tests/`. Directory names equal package names
+  except `crates/meerkat-cli`, which publishes as `rkat`. `xtask`,
+  `meerkat-machine-codegen` and `meerkat-web-runtime` are not published.
+- Pin every `meerkat*` crate to the same exact version as your binaries and
+  SDKs (`meerkat = "=0.9.0"`); the family is released and tested as one set.
+- To build against a checkout, point path dependencies or `[patch.crates-io]`
+  entries at `<checkout>/crates/<crate>`, one for every `meerkat*` crate you
+  name, all from the same checkout. Inside the checkout the crates reach each
+  other by path, so an unpatched sibling you also name would come from
+  crates.io as a second, incompatible copy.
+
+```toml
+[dependencies]
+meerkat = "=0.9.0"
+meerkat-core = "=0.9.0"
+
+[patch.crates-io]
+meerkat = { path = "../meerkat/crates/meerkat" }
+meerkat-core = { path = "../meerkat/crates/meerkat-core" }
+```
+
+- A `[patch]` entry is used only when the checkout's version satisfies your
+  requirement: with `=0.9.0` pins the checkout must be at 0.9.0, otherwise
+  Cargo reports the patch as unused and keeps the crates.io copy.
+- Your own root `Cargo.toml` owns `[profile.*]`. Meerkat's workspace profile
+  (only an `opt-level = 1` pin for `meerkat-machine-schema`) applies to builds
+  run inside its checkout, never to `cargo install` or to your binary.
+
+## Removed or renamed
+
+- `rkat session migrate`: removed in 0.8.11; use `rkat storage migrate`.
+- `mobkit/jobs/*` and `mobkit_job_*` / `mobkitJob*`: renamed to `meta/jobs/*`,
+  `meta_job_*`, `metaJob*` in 0.9.0 (no aliases).
+- `[storage] directory`: deprecated since 0.8.4 and ignored; use
+  `--state-root`.

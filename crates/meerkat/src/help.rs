@@ -29,7 +29,81 @@ pub const MEERKAT_PLATFORM_SKILL_EXTENSIONS: &[(&str, &str)] = &[
         "references/api_reference.md",
         MEERKAT_PLATFORM_API_REFERENCE,
     ),
+    (
+        "references/sessions_runtime_surfaces_sessions.md",
+        include_str!(
+            "../embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_sessions.md"
+        ),
+    ),
+    (
+        "references/sessions_runtime_surfaces_storage_config.md",
+        include_str!(
+            "../embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_storage_config.md"
+        ),
+    ),
+    (
+        "references/sessions_runtime_surfaces_api_changes.md",
+        include_str!(
+            "../embedded_skills/meerkat-platform/references/sessions_runtime_surfaces_api_changes.md"
+        ),
+    ),
+    (
+        "references/providers_and_auth_models.md",
+        include_str!("../embedded_skills/meerkat-platform/references/providers_and_auth_models.md"),
+    ),
+    (
+        "references/providers_and_auth_credentials.md",
+        include_str!(
+            "../embedded_skills/meerkat-platform/references/providers_and_auth_credentials.md"
+        ),
+    ),
+    (
+        "references/security.md",
+        include_str!("../embedded_skills/meerkat-platform/references/security.md"),
+    ),
+    (
+        "references/security_governance.md",
+        include_str!("../embedded_skills/meerkat-platform/references/security_governance.md"),
+    ),
+    (
+        "references/mcp_tools_skills_mcp.md",
+        include_str!("../embedded_skills/meerkat-platform/references/mcp_tools_skills_mcp.md"),
+    ),
+    (
+        "references/mcp_tools_skills_tools.md",
+        include_str!("../embedded_skills/meerkat-platform/references/mcp_tools_skills_tools.md"),
+    ),
+    (
+        "references/mcp_tools_skills_skills.md",
+        include_str!("../embedded_skills/meerkat-platform/references/mcp_tools_skills_skills.md"),
+    ),
+    (
+        "references/hooks_models_hooks.md",
+        include_str!("../embedded_skills/meerkat-platform/references/hooks_models_hooks.md"),
+    ),
+    (
+        "references/hooks_models_model_operations.md",
+        include_str!(
+            "../embedded_skills/meerkat-platform/references/hooks_models_model_operations.md"
+        ),
+    ),
+    (
+        "references/hooks_models_turn_control.md",
+        include_str!("../embedded_skills/meerkat-platform/references/hooks_models_turn_control.md"),
+    ),
+    (
+        "references/live_comms_mobs_live.md",
+        include_str!("../embedded_skills/meerkat-platform/references/live_comms_mobs_live.md"),
+    ),
+    (
+        "references/live_comms_mobs_comms.md",
+        include_str!("../embedded_skills/meerkat-platform/references/live_comms_mobs_comms.md"),
+    ),
     ("references/mobs.md", MEERKAT_PLATFORM_MOBS_REFERENCE),
+    (
+        "references/live_comms_mobs_mobs.md",
+        include_str!("../embedded_skills/meerkat-platform/references/live_comms_mobs_mobs.md"),
+    ),
     (
         "references/migration_0_9.md",
         MEERKAT_PLATFORM_MIGRATION_0_9_REFERENCE,
@@ -280,6 +354,27 @@ mod tests {
             assert!(
                 section.contains(fact),
                 "the OS sandboxing section must state {fact}"
+            );
+        }
+        assert!(
+            section.contains("`references/security.md`"),
+            "the OS sandboxing summary must point at the security reference"
+        );
+        let security = MEERKAT_PLATFORM_SKILL_EXTENSIONS
+            .iter()
+            .find(|(path, _)| *path == "references/security.md")
+            .map(|(_, content)| *content)
+            .expect("the platform skill must embed the security reference");
+        for detail in [
+            "ConfinementSpec",
+            "deny_read",
+            "backend_unavailable",
+            "unsupported_requirement",
+            "restrict_to_project",
+        ] {
+            assert!(
+                security.contains(detail),
+                "the security reference must carry the sandboxing detail {detail}"
             );
         }
         assert!(
@@ -546,6 +641,30 @@ mod tests {
             indexed, embedded,
             "the Where to find details index must name exactly the embedded references"
         );
+    }
+
+    #[test]
+    fn platform_skill_reference_lists_name_every_embedded_reference() {
+        for intro in [
+            "For detailed surface schemas and examples, also load:",
+            "## Reference\n",
+        ] {
+            let start = MEERKAT_PLATFORM_SKILL_BODY
+                .find(intro)
+                .unwrap_or_else(|| panic!("the platform skill must keep the list after {intro:?}"));
+            let list = &MEERKAT_PLATFORM_SKILL_BODY[start + intro.len()..];
+            let list = list.find("\n## ").map_or(list, |end| &list[..end]);
+            for (path, _) in MEERKAT_PLATFORM_SKILL_EXTENSIONS {
+                // Only the closing list names the 0.5 upgrade guide.
+                if *path == "references/migration_0_5.md" && !intro.starts_with("## ") {
+                    continue;
+                }
+                assert!(
+                    list.contains(&format!("`{path}`")),
+                    "the list after {intro:?} must name {path}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -44,28 +44,34 @@ method-not-found.
 Mandatory model-request hooks are now operation-local: a denying foreground
 Guardrail at `pre_llm_request` / `post_llm_response` withholds only that model
 operation, sends `mandatory_hook_prerequisite_failed` to the retained
-controller, and the run continues. Configuration validation and run admission
-now reject, before anything runs:
+controller, and the run continues. Configuration validation (and run
+admission again) rejects:
 
-- a Guardrail at `pre_llm_request` or `post_llm_response` with the default
-  `model_operations = "all"`;
-- such a Guardrail on work without a retained authorized controller
-  (`AgentError::HookConfigInvalid`, no `RunStarted`, no user append);
-- any Guardrail at `run_started` or `turn_boundary`;
-- `model_operations` on a point that carries no model operation.
+- an enabled Guardrail at `pre_llm_request` or `post_llm_response` with the
+  default `model_operations = "all"`;
+- any enabled Guardrail at `run_started` or `turn_boundary`;
+- `model_operations` on a point that carries no model operation (even on a
+  disabled entry).
 
 A config file with such an entry fails to load, so the host does not start
 until it is migrated; a rejected config update keeps the previous valid
-config. To migrate:
+config. Run admission additionally rejects a model-request Guardrail on work
+without a retained authorized controller (`AgentError::HookConfigInvalid`, no
+`RunStarted`, no user append). That config loads, but every such run is
+refused; ordinary (ungoverned) sessions have no retained controller. To
+migrate:
 
 - For each model-request Guardrail, decide whether its prerequisite also
   governs the separate controller-feedback request. If not, set
   `model_operations = "ordinary_only"` (nothing sets it for you) and run that
-  work with a retained authorized controller.
+  work with a retained authorized controller. Without a controller, move the
+  policy to `pre_tool_execution` / `post_tool_execution`, or change it to an
+  `observe` hook that returns no decision (`{}`).
 - For a `run_started` or `turn_boundary` Guardrail there is no enforcing
   migration yet: remove the gate, move the policy to a supported point (for
-  example `pre_tool_execution`), or change it to `observe` and accept that
-  observation enforces nothing.
+  example `pre_tool_execution`), or change it to `observe` and make it return
+  no decision (`{}`). The engine still applies a `deny` returned by any
+  foreground entry, `observe` included, and such a deny fails the run.
 
 ## MCP
 

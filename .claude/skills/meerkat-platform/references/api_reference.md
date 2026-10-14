@@ -2,7 +2,8 @@
 
 For upgrade and terminology changes, also load:
 
-- `references/migration_0_5.md`
+- `references/migration_0_9.md` (moving a 0.8 system to 0.9)
+- `references/migration_0_5.md` (only when migrating from 0.4x/0.5)
 
 ## Realm scope (all surfaces)
 
@@ -46,7 +47,7 @@ Global flags (available on all commands):
 --isolated                # start in isolated mode (new generated realm)
 --instance <id>           # optional instance ID inside a realm
 --realm-backend <sqlite|jsonl|memory>
---state-root <path>       # override realm state root; default <project-root>/.rkat/realms, walking up to the nearest .rkat
+--state-root <path>       # explicit realm state root (no probing); otherwise the realm is used where it already exists (<project-root>/.rkat/realms or the user-global <data dir>/meerkat/realms), else <project-root>/.rkat/realms
 --context-root <path>     # realm identity + project files root; default CWD
 --user-config-root <path> # optional user-global convention root
 --as-agent <AGENT>        # governed realm: act as this agent (default rkat-agent)
@@ -81,7 +82,8 @@ rkat help <QUESTION> [--prompt <PROMPT>] [--plan-execution] [--json] [--stream|-
 rkat auth realms|profiles|profile|profile-delete|bindings|test|status|login|logout|refresh|connector-client ...
 # (Scheduling has no top-level CLI subcommand. Schedules are managed
 # through the agent tools `meerkat_schedule_*` from `rkat run`,
-# the RPC `schedule/*` methods, REST schedule endpoints, or SDK helpers.)
+# the RPC `schedule/*` methods, REST schedule endpoints, or SDK helpers.
+# Not available on JSONL-backed realms or in the browser runtime.)
 rkat mob spawn-helper|fork-helper|member-status|force-cancel|respawn|wait-kickoff|host|bind-host|revoke-host|hosts|grant|revoke-grant|grants|member-history|route-installs|live|run|runs|status|logs|attach|run-flow|flow-status|pack|inspect|validate|deploy|web ...
 rkat config get|set|patch ...
 rkat capabilities
@@ -89,7 +91,7 @@ rkat doctor
 rkat storage doctor [--json] [--root PATH]...       # read-only storage diagnosis
 rkat storage migrate [--apply] [--bridge-pre-0-8-10] [--adopt-root PATH]  # offline fenced migration (dry-run default)
 rkat storage prune [--apply] [--older-than-days N]  # registered backup-artifact lifecycle
-rkat run --comms-listen-tcp 0.0.0.0:4200 --comms-advertise-tcp host.example:4200 --comms-binding-out target.binding.json --keep-alive "..."
+rkat run --comms-listen-tcp 0.0.0.0:4200 --comms-advertise-tcp 203.0.113.7:4200 --comms-binding-out target.binding.json --keep-alive "..."
 rkat-rpc                                # JSON-RPC stdio
 rkat-rpc --tcp 127.0.0.1:9000           # JSON-RPC over TCP (stdio is default)
 rkat-rpc --tcp 127.0.0.1:9000 --live-ws 127.0.0.1:9001
@@ -134,7 +136,7 @@ Default `rkat` builds include the `local-authorization` feature:
 rkat realm govern <REALM>
 rkat realm grant <REALM> [--agent <AGENT>] (--mcp <SERVER>=<OP>[,<OP>...] | --mcp <SERVER>=* | --catalog | --controller --route <ROUTE_KEY>...) [--expires-in-secs <N>]
 rkat realm revoke-grant <REALM> [--agent <AGENT>] (--mcp <SERVER> | --catalog | --controller | --worker)
-rkat --realm <REALM> --as-agent <AGENT> run "..."
+rkat --realm <REALM> run --as-agent <AGENT> "..."
 ```
 
 `govern` durably selects governed posture for an existing realm and provisions
@@ -210,7 +212,7 @@ rkat mcp login remote-tools
 rkat mcp list
 ```
 
-HTTP OAuth is runtime-discovered. Keep `.rkat/mcp.toml` to name/url/transport/headers; `rkat mcp login <name>` performs explicit browser login. `rkat run` defaults to `--mcp-auth stored`; use `--mcp-auth interactive` to let a TTY run authenticate and retry when a streamable HTTP MCP server requires OAuth.
+HTTP OAuth endpoints are discovered at connect or login time; no auth schema is stored. An `mcp.toml` entry has `name`, then `command`/`args`/`env` (stdio) or `url`/`headers`/`transport` (HTTP), and optionally `connect_timeout_secs`, `tool_names`, `access`, `oauth_account` or `oauth_account_selection` ("discover" | "unverified"). `rkat mcp login <name>` performs explicit browser login and needs a streamable HTTP server without a static `Authorization` header and with an account selection; without one it refuses (`MCP OAuth interactive login requires an explicit expected account`). `rkat run` defaults to `--mcp-auth stored`; `--mcp-auth interactive` lets a TTY run authenticate and retry when the server has an `oauth_account`.
 
 ### Mob CLI surface
 
@@ -224,7 +226,7 @@ Primary CLI mob usage is tool-driven from `run`/`run --resume` prompts using `mo
 | `force-cancel <mob_id> <agent_identity>` | Force-cancel a member's in-flight turn |
 | `respawn <mob_id> <agent_identity> [--initial-message]` | Retire and respawn a member with the same profile |
 | `wait-kickoff <mob_id> [--member ...] [--timeout-ms] [--json]` | Wait for autonomous-host kickoff turns to complete |
-| `host [--listen-tcp ...] [--advertise-tcp ...] [--descriptor-out ...]` | Run the member-host daemon and write its single-use binding descriptor |
+| `host [--listen-tcp ...] [--advertise-tcp tcp://HOST:PORT] [--descriptor-out ...]` | Run the member-host daemon and write its single-use binding descriptor (a non-loopback bind needs `--allow-remote` and `--advertise-tcp`) |
 | `bind-host <mob_id> --descriptor <path>` / `revoke-host <mob_id> <host_id>` / `hosts <mob_id>` | Bind, revoke, and observe managed member hosts |
 | `grant <mob_id> <principal> --scope ...` / `revoke-grant ...` / `grants <mob_id>` | Manage remote-console control scopes |
 | `member-history <mob_id> <agent_identity>` / `route-installs <mob_id>` | Read placed-member history and route-install obligations |
@@ -234,12 +236,12 @@ Primary CLI mob usage is tool-driven from `run`/`run --resume` prompts using `mo
 | `status <mob_id> <run_id> [--json]` | Read one run resource status |
 | `logs <mob_id> [--after-cursor] [--limit] [--json]` | Read mob event history for run diagnostics |
 | `attach <mob_id> <run_id> [--json]` | Wait for a detached run and print its typed output envelope |
-| `run-flow <mob_id> --flow <flow_id> [--params <json>] [-s\|--stream] [--no-stream]` | Flow-specific compatibility entrypoint; use `run` for callable mobpack-style invocation |
+| `run-flow <mob_id> --flow <flow_id> [--params <json>] [-s\|--stream] [--no-stream]` | Start a flow, stream member output (default on a TTY), wait with no timeout until the run is terminal, then print only the run id; read the outcome with `flow-status` or `status`. `--params` must be a JSON object |
 | `flow-status <mob_id> <run_id>` | Print live or terminal `MobRun` JSON; status: `pending`/`running`/`completed`/`failed`/`canceled` |
 | `pack <dir> -o <pack> [--sign <key> --signer-id <id>]` | Pack a mob directory into a `.mobpack` archive |
 | `inspect <pack>` | Inspect a `.mobpack` archive |
 | `validate <pack> [--trust-policy permissive\|strict]` | Validate a `.mobpack` archive |
-| `deploy <pack> <prompt> [--model] [--max-total-tokens] [--max-duration] [--max-tool-calls] [--trust-policy] [--surface cli\|rpc]` | Validate/register/deploy a `.mobpack`; orchestrator-less packs warn that prompts are not delivered and flows are not started |
+| `deploy <pack> <prompt> [--model] [--max-total-tokens] [--max-duration] [--max-tool-calls] [--trust-policy] [--surface cli\|rpc]` | Validate a `.mobpack`, build its mob in memory and queue the prompt to the orchestrator. `--surface cli` (default) returns at once and the mob ends with the command; `--surface rpc` serves JSON-RPC on stdin/stdout until EOF. Orchestrator-less packs warn that prompts are not delivered and flows are not started. Known issue in 0.9.0: the budget flags and a pack's `[budget]` are recorded but not enforced, because enforcement reads `[limits]` (a correction is in progress for 0.9.1), and with `--surface rpc` members are built from the realm config store, so deploy flags and pack overlays do not apply |
 | `web build <pack> -o <dir> --wasm <PKG_DIR\|name_bg.wasm> [--trust-policy]` | Build a browser-deployable WASM bundle from required prebuilt wasm-pack output |
 
 Lifecycle verbs that used to live on the CLI (`create`, `spawn`, `retire`, `wire`, `unwire`, `turn`, `stop`, `resume`, `complete`, `events`, `destroy`) are reached through the agent tools (`mob_create`, `mob_spawn_member`, `mob_wire`, ...) or through the RPC `mob/*` methods listed below.
@@ -274,7 +276,7 @@ Core endpoints:
 - `DELETE /sessions/{id}` — archive (remove) a session
 - `POST /sessions/{id}/interrupt` — interrupt an in-flight turn
 - `POST /sessions/{id}/runs/{run_id}/stop` - stop one exact run and terminalize every contributor bound to it
-- `POST /sessions/{id}/system_context` — append staged runtime system context
+- `POST /sessions/{id}/system_context` - append one ordinary durable ordered System message (`content`, optional `source` and `idempotency_key`; RPC twin `session/inject_context`)
 - `POST /sessions/{id}/system_prompt` - replace one durable versioned system-prompt key
 - `POST /sessions/{id}/messages` — continue an existing session
 - `POST /sessions/{id}/external-events` — queue a runtime-backed external event
@@ -288,7 +290,7 @@ Core endpoints:
 - `GET /schedules/{id}/occurrences`
 - `GET /skills` — list skills with provenance
 - `GET /health`
-- `GET /models/catalog` — curated model catalog with provider profiles
+- `GET /models/catalog` — effective model catalog: built-in models plus `[models.<id>]` and self-hosted aliases, with provider defaults and per-model profiles
 - `GET /capabilities`
 - `GET /runtime/host_info`, `GET /runtime/capabilities`, `GET /runtime/health`
 - `GET|PUT|PATCH /config`
@@ -371,7 +373,7 @@ remote peer, start `rkat run` with `--comms-listen-tcp` and usually
 ### Sessions, turns, history
 
 - `initialize`
-- `tools/register` - register client callback tools (`tools: [{name, description, input_schema}]`); during a turn the server sends `tool/execute` requests (`tool_use_id`, `name`, `arguments`) that the client answers with `{content, is_error}`
+- `tools/register` - register client callback tools (`tools: [{name, description, input_schema, execution?}]`, result `{registered: N}`); registration is per connection and a session's callbacks go to the connection that created it. During a turn the server sends `tool/execute` requests (`tool_use_id`, `name`, `arguments`) that the client answers with `{content, is_error}` within 120 s (else the call fails `timeout`; a closed connection fails it `tool_unavailable`). `execution` is `{"mode": "fast"}` (default) or `{"mode": "detached", ...}`. Two or more registered callback tools are served through the deferred tool catalog.
 - `session/create` (`initial_turn: "deferred"` returns a pending `session_id` without running the first turn), `session/list`, `session/read`, `session/history`, `session/archive`
 - `session/fork_at`, `session/fork_replace`
 - `session/rewrite_transcript`, `session/transcript_revision` (single read; `revision: "current"` reads the head), `session/transcript_revisions` (revision list), `session/restore_transcript_revision`
@@ -381,7 +383,7 @@ remote peer, start `rkat run` with `--comms-listen-tcp` and usually
 - `session/input_status` - read an input's stored runtime state by input id or idempotency key
 - `session/stream_open` / `session/stream_close` — event streaming
 - `events/latest_cursor`, `events/list_since`, `events/snapshot` — cursor-based event reads
-- `turn/start` — accepts `model`, `provider`, `provider_params`, `max_tokens` for mid-session hot-swap; optional `injected_context` (list of content inputs) delivers host-attached ambient context as separate typed messages before the user message (`session/create` accepts the same field)
+- `turn/start` - accepts `model`, `provider`, `self_hosted_server_id`, `provider_params` and `auth_binding` for mid-session hot-swap (`provider_params`/`auth_binding`: a value or `{"action":"set","value":...}` sets, `{"action":"clear"}` removes); `max_tokens`, `output_schema` and `structured_output_retries` are parsed but refused with -32602 ("Cannot override ... on a runtime-routed turn") on every session, so set them on `session/create` (including a deferred create); the SDK `turn` arguments of those names are refused the same way; `system_prompt` appends one System message before the turn (it does not replace earlier ones; from the second turn on it needs a model that accepts mid-conversation System messages, so Gemini and older Anthropic models refuse it); optional `injected_context` (list of content inputs) delivers host-attached ambient context as separate typed messages before the user message (`session/create` accepts the same field); `transient_turn_context` is request-only, must be non-empty and is never written to the transcript; unknown fields are refused
 - `turn/interrupt`
 - `turn/stop_run` - stop one exact run (`session_id`, `run_id` from the `run_started` event, `reason`) and terminalize every input bound to it; receipt `outcome` is `stopped`, `not_current`, or `not_stoppable`
 - `blob/get` — fetch generated image / artifact payload bytes by blob id
@@ -411,8 +413,9 @@ result returns a blob id, fetch it with `rkat blob get <BLOB-ID>`.
 - `live/webrtc/answer` - exchange a browser offer for a server SDP answer using the single-use token returned by a WebRTC `live/open`
 - `live/media_health` - report decoded-audio counters for the output a `live/media_health_requested` notification named
 
-`live/webrtc/answer` and `live/media_health` are served only by `live-webrtc`
-builds, which also send the `live/assistant_output_available`,
+`live/webrtc/answer` and `live/media_health` are served only by an
+`rkat-rpc` built with `live-webrtc` and started with `--live-webrtc`, which
+also sends the `live/assistant_output_available`,
 `live/media_health_requested`, and `live/assistant_playback_hint`
 notifications.
 
@@ -463,7 +466,8 @@ rkat auth profile-delete <PROFILE_ID> [-y|--yes]
 rkat auth bindings
 rkat auth test <BINDING_ID>
 rkat auth status <PROFILE_ID>
-rkat auth login [PROVIDER] [--backend <BACKEND>] [--method <METHOD>] [--non-interactive --secret <SECRET>]
+rkat auth login [PROVIDER] [--backend <BACKEND>] [--method <METHOD>]
+rkat auth login <PROVIDER> --non-interactive [--secret <SECRET>] [--backend <BACKEND>] [--method <METHOD>]
 rkat auth logout [<REALM>:]<BINDING_ID>
 rkat auth refresh <PROFILE_ID>
 rkat auth connector-client set <ID> --issuer <ISSUER> --client <CLIENT_ID> [--client-secret [--secret-stdin]] [--authorize-param NAME=VALUE...] [--no-resource-indicator] [--protocol <ID>] [--redirect-uri <URI>...]
@@ -478,19 +482,22 @@ from stdin and kept in the credential store, never in config.
 CLI `login` provisions the reserved `global` realm in the HOME-rooted doc
 (`~/.rkat/config.toml`), inherited by every workspace realm via the chain tail.
 Direct-provider OAuth writes `global:anthropic_oauth`, `global:openai_oauth`, or
-`global:google_oauth`; non-interactive api-key login writes
-`global:default_<provider>`. With `copilot` compiled (default),
+`global:google_oauth`; non-interactive api-key login stores only a token
+under `global:default_<provider>` (no backend/auth/binding config; add a
+matching `managed_store` binding and select it with `--auth-binding`). With `copilot` compiled (default),
 `rkat auth login copilot` runs GitHub device OAuth (`github_copilot_oauth`) and
 provisions `global:copilot_openai`, `global:copilot_anthropic`, and
 `global:copilot_gemini`, all sharing the `github_copilot` credential account.
 These are provider-specific Copilot backends, not a fourth LLM provider family.
 Legacy `dev`-realm logins migrate to `global` on the
-run path (idempotent, no-clobber). Credential reads inherit down the chain;
+run path (idempotent, no-clobber). Credential reads inherit down the chain; RPC, REST and `HostAuthService`
 writes are strict-owner and must explicitly address the realm that defines the
-binding. A child-addressed inherited write is rejected with owner information;
-it is not forwarded automatically. Logout parses the positional
-`[<realm>:]<binding>` as the token owner; a bare binding means `global`, and
-`--realm` does not retarget it.
+binding (a child-addressed inherited write is rejected with
+`binding_inherited`, not forwarded). CLI logout resolves the positional
+`[<realm>:]<binding>` through the loaded config: a bare binding means
+`global`, `--realm` does not retarget it, and logging out `<child>:<binding>`
+for an inherited binding clears the owning realm's stored credential (possibly
+an account shared by other routes), so address the true owner.
 
 ### Scheduling
 
@@ -535,7 +542,7 @@ failures return typed codes: `APPROVAL_STORE_UNAVAILABLE` (nothing committed),
 
 ### MCP live mutation
 
-- `mcp/add`, `mcp/remove`, `mcp/reload`
+- `mcp/add {session_id, server_config, persisted?}`, `mcp/remove {session_id, server_name, persisted?}`, `mcp/reload {session_id, server_name?}`; response `{session_id, operation, server_name, status: "staged", persisted}`. Changes apply at the session's next turn boundary; `persisted: true` also writes the host's project `mcp.toml`.
 - These are JSON-RPC live session operations. CLI `rkat mcp add/remove/list/get` is the config surface.
 
 ### Mob (feature-gated)
@@ -596,6 +603,11 @@ display-only `name`, typed `address: { transport, endpoint }`, discovery
 an address string.
 
 `comms/send` accepts an optional tri-state `content_taint` override (`{"declare": "clean"|"tainted"}` or `"undeclared"`; absent = inherit the runtime-level outbound declaration). The declaration rides inside the signed envelope; receivers read it from the typed transcript comms notice (`sender_taint`).
+In 0.9.0, an ambiguous peer delivery (the envelope may
+have been delivered) is `send_ambiguous` on REST (`retry_safe: false`,
+`required_action: "reconcile"`) but plain `send_failed` with "peer delivery
+outcome is ambiguous" in the message on JSON-RPC `comms/send`. Reconcile
+before resending.
 
 ### Notifications
 
@@ -609,12 +621,14 @@ request with `REQUEST_CANCELLED` (-32005); committed success is never rewritten.
 ### Error codes
 
 `meerkat_contracts::ErrorCode` JSON-RPC codes (besides the standard
--32700/-32600/-32601):
+-32700/-32600/-32601). Each code also has a fixed HTTP status; see the error
+table in `references/sessions_runtime_surfaces_api_changes.md`, which also lists
+the exit codes `rkat` actually returns (1 for most failures).
 
-- Session and requests: `SESSION_NOT_FOUND` -32001, `SESSION_BUSY` -32002, `SESSION_NOT_RUNNING` -32003, `DUPLICATE_INPUT` -32004, `REQUEST_CANCELLED` -32005, `SESSION_RUNTIME_UNAVAILABLE` -32032
+- Session and requests: `SESSION_NOT_FOUND` -32001, `SESSION_BUSY` -32002 (also a session served by another process, `data.kind = "session_served_elsewhere"`, and a teardown still finishing, `data.kind = "runtime_teardown_in_progress"`), `SESSION_NOT_RUNNING` -32003 (also every durable resume hold, `data.durable_resume_hold`), `DUPLICATE_INPUT` -32004, `REQUEST_CANCELLED` -32005, `SESSION_RUNTIME_UNAVAILABLE` -32032 (also `data.kind = "session_hosting_unavailable"`)
 - Agent: `PROVIDER_ERROR` -32010, `BUDGET_EXHAUSTED` -32011, `HOOK_DENIED` -32012, `AGENT_ERROR` -32013
 - Capabilities, skills, schedules: `CAPABILITY_UNAVAILABLE` -32020, `SKILL_NOT_FOUND` -32021, `SKILL_RESOLUTION_FAILED` -32022, `SCHEDULE_NOT_FOUND` -32023
-- Mob: `SUPERVISOR_ROTATION_INCOMPLETE` -32024, `SCOPE_DENIED` -32025, `HOST_UNAVAILABLE` -32026, `STALE_CURSOR` -32027, `STALE_FENCE` -32028, `MEMBER_RELOAD_REQUIRED` -32029, `STALE_DELIVERY_SCOPE` -32036 (new in 0.9.0: the member session moved under a current fence; re-capture the delivery scope)
+- Mob: `SUPERVISOR_ROTATION_INCOMPLETE` -32024, `SCOPE_DENIED` -32025, `HOST_UNAVAILABLE` -32026, `STALE_CURSOR` -32027, `STALE_FENCE` -32028 (also session write-fence conflicts), `MEMBER_RELOAD_REQUIRED` -32029, `STALE_DELIVERY_SCOPE` -32036 (new in 0.9.0: the member session moved under a current fence; re-capture the delivery scope)
 - Native input: `INPUT_REFUSED` -32030, `INPUT_NOT_READY` -32031
 - Approvals (new in 0.9.0): `APPROVAL_STORE_UNAVAILABLE` -32033, `APPROVAL_CONFLICT` -32034, `APPROVAL_COMMIT_UNKNOWN` -32035
 - Generic: `INVALID_PARAMS` -32602, `INTERNAL_ERROR` -32603
@@ -654,7 +668,7 @@ Core tools:
 - `meerkat_archive` — archive (remove) a session
 - `meerkat_config` — get/set/patch config
 - `meerkat_capabilities` — list runtime capabilities
-- `meerkat_models_catalog` — curated model catalog with provider profiles
+- `meerkat_models_catalog` — effective model catalog (built-in plus config-defined models), same data as `rkat models`
 - `meerkat_skills` — list skills (`action: "list"`) or inspect one skill (`action: "inspect"`, typed `skill_key`, optional `source` UUID)
 - `meerkat_mcp_add` - stage live MCP server add (refuses `oauth_account`, `oauth_account_selection`, and `account`, which are host configuration; refused on a governed runtime)
 - `meerkat_mcp_remove` — stage live MCP server remove
@@ -805,7 +819,7 @@ Session methods:
 - `Session.inject_context(text, *, source=None, idempotency_key=None)` / `send_external_event(...)` / `send_peer_response_terminal(...)`
 - `Session.transcript_revision(...)` / `transcript_revisions(...)` / `rewrite_transcript(...)` / `restore_transcript_revision(...)` / `fork_at(...)` / `fork_replace(...)`
 - `Session.update_system_prompt(key, content, ...)` / `activate_instruction(activation)` / `instruction_activations(...)`
-- `Session.send(**command)` / `Session.peers()`
+- `Session.send(**command)` / `Session.peers()` Known issue in 0.9.0; a correction is in progress for 0.9.1. The SDK result validator predates delivery outcomes and raises `INVALID_RESPONSE` for `peer_request`, `peer_response` and `peer_lifecycle` sends, and for a `peer_message` whose `delivery` is `volatile_handed_off` or `durably_resolved`. The send has already happened: do not retry it. Workaround on 0.9.0: call `comms/send` over JSON-RPC directly, or use the Rust SDK.
 - `Session.subscribe_events()` → `EventSubscription`
 - `DeferredSession.start_turn(prompt, ...)` → `RunResult` (first turn of `create_deferred_session`)
 
@@ -935,7 +949,7 @@ Session methods:
 - `Session.injectContext(...)` / `sendExternalEvent(...)` / `sendPeerResponseTerminal(...)`
 - `Session.transcriptRevision(...)` / `transcriptRevisions(...)` / `rewriteTranscript(...)` / `restoreTranscriptRevision(...)` / `forkAt(...)` / `forkReplace(...)`
 - `Session.updateSystemPrompt(...)` / `activateInstruction(...)` / `instructionActivations(...)`
-- `Session.send(command)` / `Session.peers()`
+- `Session.send(command)` / `Session.peers()` Known issue in 0.9.0; a correction is in progress for 0.9.1. The SDK result validator predates delivery outcomes and raises `INVALID_RESPONSE` for `peer_request`, `peer_response` and `peer_lifecycle` sends, and for a `peer_message` whose `delivery` is `volatile_handed_off` or `durably_resolved`. The send has already happened: do not retry it. Workaround on 0.9.0: call `comms/send` over JSON-RPC directly, or use the Rust SDK.
 - `Session.subscribeEvents()` → `EventSubscription<AgentEventEnvelope>`
 - `DeferredSession.startTurn(prompt, options?)` / `DeferredSession.stream(prompt, options?)` (first turn of `createDeferredSession`)
 
@@ -995,7 +1009,6 @@ let reader = EffectiveConfigReader::new(Arc::new(FilesystemRealmConfigSource::ne
     meerkat_models::canonical(),
 )));
 let mut config = reader.effective_config(&realm_id).await?;
-config.apply_env_overrides()?;
 config.validate(meerkat_models::canonical())?;
 let factory = AgentFactory::new(realm.root.clone())
     .runtime_root(realm.root)
@@ -1095,7 +1108,7 @@ the full canonical key; selecting an unrelated source does not rewrite it.
 - Inproc comms is namespace-scoped; realm namespace isolates peer discovery/sends.
 - **Peer lifecycle typing**: mob lifecycle routing is typed at ingress. `mob.peer_added`, `mob.peer_retired`, and `mob.peer_unwired` are silent lifecycle notices; the six `mob.kickoff_*` kinds (pending, starting, started, callback_pending, failed, cancelled) are visible lifecycle notices that open no inbound request and need no reply. Do not depend on mob defaults in `silent_comms_intents` for canonical behavior.
 - **Comms choice**: agents use `send_message` for ordinary collaboration, `send_request` for structured ask/reply, and `send_response` for replies; `reply_to_peer` answers the peer whose message was delivered in the turn without restating addressing (it fails with `no_reply_capability` otherwise). Public peer reservation streams were removed.
-- Hooks and skills resolve from runtime root. Workspace-default CLI realms preserve project ergonomics.
+- Hook entries come from the effective realm config, then the project and user `.rkat/config.toml` files (the first entry per id wins). Skills resolve from the embedded built-ins, the realm's `[[skills.repositories]]` and `<context-root>/.rkat/skills`; the runtime root only holds the Git skill cache (and is the base for relative filesystem repository paths when there is no context root). Workspace-default CLI realms preserve project ergonomics.
 - **Skill introspection**: `SkillRuntime::list_all_with_provenance()` returns active + shadowed skills. `load_from_source(key, None)` loads the canonical key; the factory composite accepts registered source UUID text for explicit source selection.
 - Multi-agent orchestration uses mobs exclusively. `MemberLaunchMode::Fork`
   (including prompt-context `fork_helper`) creates a fresh member/session

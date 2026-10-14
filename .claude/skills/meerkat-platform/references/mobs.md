@@ -71,7 +71,7 @@ Primary crates:
 ### Core Rust types
 
 - `MobDefinition`
-- `MobStorage` (SQLite persistent via `SqliteMobStores`, in-memory for tests/WASM)
+- `MobStorage` (SQLite persistent via `SqliteMobStores`, in-memory for tests, WASM and `rkat mob deploy`)
 - `MobBuilder`
 - `MobHandle`
 - `MobSessionService`
@@ -355,11 +355,14 @@ For a remote `rkat` member, generate that binding from the target process:
 rkat run \
   --comms-name remote-worker \
   --comms-listen-tcp 0.0.0.0:4200 \
-  --comms-advertise-tcp worker.example.com:4200 \
+  --comms-advertise-tcp 203.0.113.7:4200 \
   --comms-binding-out ./remote-worker.binding.json \
   --keep-alive \
   "You are a remote worker."
 ```
+`--comms-advertise-tcp`
+takes an IP literal and port (advertised as `tcp://IP:PORT`); a host name
+is rejected. A wildcard `--comms-listen-tcp 0.0.0.0:...` needs it.
 
 Use `rkat run --comms-listen-tcp` for the signed Meerkat peer channel.
 `rkat-rpc --tcp` is only JSON-RPC host transport and does not make an agent
