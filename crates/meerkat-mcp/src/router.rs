@@ -4187,6 +4187,15 @@ impl McpRouter {
                 }
                 None => None,
             };
+            // A connector-bound server's reads need their connector
+            // preparation, as its calls do. Without one (no provider, or a
+            // provider that does not serve this destination) the read is
+            // refused locally, never sent unbound.
+            if preparation.is_none() && connection.config().connector.is_some() {
+                return Err(McpError::CallContext(
+                    crate::McpCallContextError::Unavailable,
+                ));
+            }
             let (metadata, _lease) = match preparation {
                 Some(prepared) => (Some(prepared.metadata), Some(prepared.guard)),
                 None => (None, None),
