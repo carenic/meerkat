@@ -198,12 +198,29 @@ fn claude_fable_51_is_recommended_without_changing_default_ladder() {
 }
 
 #[test]
-fn gemini_38_owns_the_default_and_recommendation_ladder() {
+fn gemini_4_argon_owns_the_gemini_default() {
+    assert_eq!(default_model(Provider::Gemini), Some("gemini-4-argon"));
+    let entry = entry_for(Provider::Gemini, "gemini-4-argon")
+        .expect("gemini-4-argon must be in the catalog");
+    assert_eq!(entry.provider, "gemini");
+    assert_eq!(entry.display_name, "Gemini 4 Argon");
+    assert_eq!(entry.tier, ModelTier::Recommended);
+    let defaults = provider_defaults()
+        .iter()
+        .find(|defaults| defaults.provider == "gemini")
+        .expect("gemini provider defaults");
+    assert_eq!(defaults.default_model_id, "gemini-4-argon");
+    // The platform-wide default stays OpenAI-owned.
+    assert_eq!(global_default_model(), "gpt-6-astra");
+}
+
+#[test]
+fn gemini_38_stays_recommended_without_owning_the_default() {
     let recommended = entry_for(Provider::Gemini, "gemini-3.8-flash")
         .expect("gemini-3.8-flash must be in the catalog");
     assert_eq!(recommended.display_name, "Gemini 3.8 Flash");
     assert_eq!(recommended.tier, ModelTier::Recommended);
-    assert_eq!(default_model(Provider::Gemini), Some("gemini-3.8-flash"));
+    assert_ne!(default_model(Provider::Gemini), Some("gemini-3.8-flash"));
 
     for supported_id in ["gemini-3.7-flash", "gemini-3.5-flash"] {
         let supported = entry_for(Provider::Gemini, supported_id)
@@ -1309,6 +1326,23 @@ fn image_generation_is_model_owned_not_provider_derived() {
     let claude = profile_for(Provider::Anthropic, "claude-opus-4-8")
         .expect("claude-opus-4-8 must have a profile");
     assert!(!claude.image_generation);
+}
+
+/// The fallback `web_search` executor runs on its provider's catalog default
+/// model and fails closed when that row lacks web search, so every provider
+/// default must keep it.
+#[test]
+fn every_provider_default_model_supports_web_search() {
+    for &provider in catalog_providers() {
+        let model = default_model(provider)
+            .unwrap_or_else(|| panic!("{provider:?} must have a default model"));
+        let profile = profile_for(provider, model)
+            .unwrap_or_else(|| panic!("{provider:?} default '{model}' must have a profile"));
+        assert!(
+            profile.supports_web_search,
+            "{provider:?} default '{model}' must support web search"
+        );
+    }
 }
 
 #[test]

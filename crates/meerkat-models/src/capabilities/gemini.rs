@@ -51,7 +51,9 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
     // the Interactions API, which Meerkat does not use, so max_output_tokens
     // is the synchronous cap. Thinking budgets are not documented for this
     // model (thinking_level only). call_timeout_secs follows Google's
-    // 15-minute client-timeout guidance.
+    // 15-minute client-timeout guidance. Default Gemini model since 0.9.1
+    // (paid Gemini API tier only; the Google OAuth login route keeps its own
+    // default).
     ModelCapabilities {
         id: "gemini-4-argon",
         provider: Provider::Gemini,
