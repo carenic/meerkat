@@ -2261,5 +2261,290 @@ mod observe_refusal_locality {
             )
             .await;
         }
+
+        /// The stock path: the host confinement installed on the factory and
+        /// mandatory hooks from the configuration or a convention file, never
+        /// an engine override.
+        async fn build_stock(
+            client: Arc<ControllerClient>,
+            tool: Arc<GuardedTool>,
+            host: &meerkat::HostConfinement,
+            project: &Path,
+            config: &Config,
+        ) -> Built {
+            let (stream_tx, stream_events) = tokio::sync::mpsc::channel(512);
+            let mut build = AgentBuildConfig::new(MODEL);
+            build.event_tx = Some(stream_tx);
+            build.llm_client_override = Some(client);
+            build.external_tools = Some(tool);
+            let factory = AgentFactory::minimal()
+                .session_store(Arc::new(meerkat_store::MemoryStore::new()))
+                .runtime_root(project.join("runtime"))
+                .project_root(project)
+                .with_host_confinement(host);
+            let (agent, controller) = tokio::time::timeout(
+                Duration::from_secs(15),
+                factory.build_agent_with_controller(build, config),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            Built {
+                agent,
+                controller,
+                stream_events,
+            }
+        }
+
+        /// A host confinement selected for `kind` (every kind with `None`)
+        /// whose requirement writes `writable` and, with `unenforceable`, asks
+        /// for descendant termination, which no backend enforces.
+        fn host(
+            writable: &Path,
+            unenforceable: bool,
+            kind: Option<meerkat_core::ConfinementLaunchKind>,
+        ) -> meerkat::HostConfinement {
+            let requirement: ExecutionConfinement = ConfinementSpec {
+                baseline: PlatformBaseline::CommandRuntimeV1,
+                read: FilesystemAccess::Paths(vec![PathAccess::Subtree(writable.into())]),
+                write: FilesystemAccess::Paths(vec![PathAccess::Subtree(writable.into())]),
+                deny_read: vec![],
+                deny_write: vec![],
+                network: IpNetworkAccess::Denied,
+                unix_connect: vec![],
+                require_descendant_termination: unenforceable,
+            }
+            .try_into()
+            .unwrap();
+            let selection =
+                meerkat_core::LaunchConfinement::Custom(meerkat_core::CustomConfinement {
+                    working_directory: writable.to_path_buf(),
+                    requirement,
+                });
+            let config = match kind {
+                None => meerkat_core::ConfinementConfig::for_all(selection),
+                Some(meerkat_core::ConfinementLaunchKind::CommandHooks) => {
+                    meerkat_core::ConfinementConfig {
+                        command_hooks: Some(selection),
+                        ..Default::default()
+                    }
+                }
+                Some(other) => unreachable!("no fixture selects {other}"),
+            };
+            meerkat::HostConfinement::resolve(&config, None).unwrap()
+        }
+
+        fn marker_runtime(marker: &Path) -> HookAdapterConfig {
+            HookAdapterConfig::command(
+                "/bin/sh",
+                vec![
+                    "-c".into(),
+                    "printf entered > \"$1\"; cat >/dev/null; printf '{}'".into(),
+                    "hook-probe".into(),
+                    marker.display().to_string(),
+                ],
+                HashMap::new(),
+            )
+        }
+
+        fn assert_withheld_with(
+            built: &Built,
+            hook_id: &str,
+            refusal: ConfinementRefusal,
+            run_id: &serde_json::Value,
+        ) {
+            let retained = notices(built.agent.session().messages());
+            assert_eq!(
+                retained.len(),
+                2,
+                "one bounded notice per withheld operation"
+            );
+            for (payload, sequence) in retained.iter().zip([1, 3]) {
+                assert_eq!(payload["requirement"], "mandatory");
+                assert_eq!(payload["disposition"], "launch_refused");
+                assert_eq!(
+                    payload["reason"],
+                    json!(HookFailureReason::ConfinementRefused { refusal })
+                );
+                assert_eq!(payload["attribution"]["hook_id"], hook_id);
+                assert_eq!(payload["attribution"]["point"], "pre_llm_request");
+                assert_eq!(payload["operation_sequence"], sequence);
+                assert_eq!(payload["withheld"], json!({"model_request": true}));
+                assert_eq!(payload["attribution"]["run_id"], *run_id);
+            }
+        }
+
+        /// On the stock path, a mandatory model-request gate whose launch the
+        /// host confinement refuses withholds each ordinary operation it
+        /// governs: the retained controller reads the typed feedback, the gate
+        /// never runs, the permitted tool still runs and the same run
+        /// completes.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[tokio::test]
+        async fn stock_confinement_refusal_of_a_mandatory_gate_feeds_the_controller() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let marker = root.join("gate-entered");
+            let mut config = Config::default();
+            config.hooks.entries.push(guardrail(
+                HookPoint::PreLlmRequest,
+                "confined-gate",
+                marker_runtime(&marker),
+            ));
+            let client = ControllerClient::new(vec![tool_call(), text("continued")]);
+            let tool = Arc::new(GuardedTool::default());
+            let mut built = build_stock(
+                client.clone(),
+                tool.clone(),
+                &host(
+                    &root,
+                    true,
+                    Some(meerkat_core::ConfinementLaunchKind::CommandHooks),
+                ),
+                &root,
+                &config,
+            )
+            .await;
+
+            let (result, events) = run(&mut built, true).await;
+            let result = result.expect("the refusal stays local to its operation");
+
+            assert_eq!(result.text, "continued");
+            assert_eq!(tool.0.load(Ordering::SeqCst), 1, "the permitted tool ran");
+            assert_eq!(
+                client.requests.lock().unwrap().len(),
+                2,
+                "no withheld request was sent"
+            );
+            assert_withheld_with(
+                &built,
+                "confined-gate",
+                ConfinementRefusal::UnsupportedRequirement,
+                &started_run_id(&events),
+            );
+            assert!(!marker.exists(), "the refused gate never ran");
+            assert_completed_in_place(&events);
+        }
+
+        /// A mandatory model-request gate from a project `config.toml` that a
+        /// confined process can write keeps its slot (its topology still needs
+        /// the retained controller) and is refused at every invocation with
+        /// the typed untrusted-source refusal: each ordinary operation it
+        /// governs is withheld with feedback to the controller, the gate never
+        /// runs, the permitted tool runs and the same run completes.
+        #[tokio::test]
+        async fn an_untrusted_project_gate_keeps_its_slot_and_is_refused() {
+            #[derive(serde::Serialize)]
+            struct ProjectConfig {
+                hooks: meerkat_core::HooksConfig,
+            }
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let project = root.join("project");
+            let marker = root.join("project-gate-entered");
+            std::fs::create_dir_all(project.join(".rkat")).unwrap();
+            std::fs::write(
+                project.join(".rkat").join("config.toml"),
+                toml::to_string(&ProjectConfig {
+                    hooks: meerkat_core::HooksConfig {
+                        entries: vec![guardrail(
+                            HookPoint::PreLlmRequest,
+                            "project-gate",
+                            marker_runtime(&marker),
+                        )],
+                        ..Default::default()
+                    },
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let host = host(&project, false, None);
+            assert!(host.untrusted_source(&project.join(".rkat").join("config.toml")));
+            let client = ControllerClient::new(vec![tool_call(), text("continued")]);
+            let tool = Arc::new(GuardedTool::default());
+            let mut built = build_stock(
+                client.clone(),
+                tool.clone(),
+                &host,
+                &project,
+                &Config::default(),
+            )
+            .await;
+
+            let (result, events) = run(&mut built, true).await;
+            let result = result.expect("the refusal stays local to its operation");
+
+            assert_eq!(result.text, "continued");
+            assert_eq!(tool.0.load(Ordering::SeqCst), 1, "the permitted tool ran");
+            assert_eq!(client.requests.lock().unwrap().len(), 2);
+            assert_withheld_with(
+                &built,
+                "project-gate",
+                ConfinementRefusal::UntrustedConfigurationSource,
+                &started_run_id(&events),
+            );
+            assert!(!marker.exists(), "the refused gate never ran");
+            assert_completed_in_place(&events);
+        }
+
+        /// On the stock path, with the host confinement installed, an invalid
+        /// mandatory topology is still rejected before admission: an
+        /// All-scoped model gate, or an ordinary gate without a retained
+        /// controller, is never narrowed or dropped, and nothing is published,
+        /// requested or launched.
+        #[tokio::test]
+        async fn stock_confinement_keeps_invalid_mandatory_topology_rejected() {
+            for (scope, with_controller, expected) in [
+                (
+                    HookModelOperationScope::All,
+                    true,
+                    "governs every model request",
+                ),
+                (
+                    HookModelOperationScope::OrdinaryOnly,
+                    false,
+                    "requires a retained authorized controller",
+                ),
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().canonicalize().unwrap();
+                let marker = root.join("invalid-gate-entered");
+                let mut config = Config::default();
+                config.hooks.entries.push(HookEntryConfig {
+                    model_operations: scope,
+                    ..guardrail(
+                        HookPoint::PreLlmRequest,
+                        "stock-gate",
+                        marker_runtime(&marker),
+                    )
+                });
+                let client = ControllerClient::new(vec![text("must not be requested")]);
+                let tool = Arc::new(GuardedTool::default());
+                let mut built = build_stock(
+                    client.clone(),
+                    tool.clone(),
+                    &host(
+                        &root,
+                        true,
+                        Some(meerkat_core::ConfinementLaunchKind::CommandHooks),
+                    ),
+                    &root,
+                    &config,
+                )
+                .await;
+
+                let (result, events) = run(&mut built, with_controller).await;
+
+                assert!(
+                    matches!(&result, Err(AgentError::HookConfigInvalid { reason })
+                        if reason.contains(expected)),
+                    "{expected}: {result:?}"
+                );
+                assert!(events.is_empty(), "nothing was published: {events:?}");
+                assert!(client.requests.lock().unwrap().is_empty());
+                assert_eq!(tool.0.load(Ordering::SeqCst), 0);
+                assert!(!marker.exists(), "nothing was launched");
+            }
+        }
     }
 }
