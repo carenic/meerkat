@@ -4939,16 +4939,45 @@ impl CommsOverrides {
             || self.pairing_password.is_some()
             || self.peer_meta.is_some()
     }
+
+    /// Apply the `--comms-*` overrides to the loaded comms config. An
+    /// explicit `--comms-advertise-tcp` replaces the configured
+    /// `advertise_address`; without one the configured address stands.
+    #[cfg(feature = "comms")]
+    fn apply_to(&self, config: &mut Config) {
+        if let Some(addr) = &self.listen_tcp {
+            config.comms.mode = CommsRuntimeMode::Tcp;
+            config.comms.address = Some(addr.clone());
+        }
+        if let Some(advertise_address) = &self.advertise_address {
+            config.comms.advertise_address = Some(advertise_address.clone());
+        }
+        // A runtime-only secret: realm config never carries it (serde
+        // skips it), so the CLI flags are its only source.
+        config.comms.pairing_password = self.pairing_password.clone();
+    }
 }
 
+/// `--comms-advertise-tcp HOST:PORT` (or `tcp://HOST:PORT`) as the `tcp://`
+/// route the comms runtime advertises to signed peers. HOST is a DNS name,
+/// an IPv4 address or a bracketed IPv6 address. A name is not resolved here:
+/// the comms transport resolves it when a peer connects.
 fn resolve_comms_advertise_tcp(advertise_tcp: Option<String>) -> anyhow::Result<Option<String>> {
-    let Some(advertise_tcp) = advertise_tcp else {
+    let Some(raw) = advertise_tcp else {
         return Ok(None);
     };
-    let addr: std::net::SocketAddr = advertise_tcp
-        .parse()
-        .map_err(|err| anyhow::anyhow!("invalid --comms-advertise-tcp address: {err}"))?;
-    Ok(Some(format!("tcp://{addr}")))
+    let route = raw.strip_prefix("tcp://").unwrap_or(&raw);
+    let address = match route.parse::<std::net::SocketAddr>() {
+        Ok(socket) => format!("tcp://{socket}"),
+        Err(_) => format!("tcp://{route}"),
+    };
+    #[cfg(feature = "comms")]
+    meerkat_comms::validate_advertised_tcp_address(&address).map_err(|reason| {
+        anyhow::anyhow!(
+            "invalid --comms-advertise-tcp address '{raw}': {reason}; expected HOST:PORT with a DNS name, an IPv4 address or a bracketed IPv6 address, and a nonzero port"
+        )
+    })?;
+    Ok(Some(address))
 }
 
 fn resolve_comms_pairing_password(
@@ -13346,19 +13375,11 @@ async fn run_agent(
         );
         tracing::info!("Using provider: {:?}, model: {}", provider, model);
 
-        // Apply --comms-listen-tcp override to the config
+        // Apply the --comms-* overrides to the config
         #[allow(unused_mut)]
         let mut config = config.clone();
         #[cfg(feature = "comms")]
-        if let Some(ref addr) = comms_overrides.listen_tcp {
-            config.comms.mode = CommsRuntimeMode::Tcp;
-            config.comms.address = Some(addr.clone());
-        }
-        #[cfg(feature = "comms")]
-        {
-            config.comms.advertise_address = comms_overrides.advertise_address.clone();
-            config.comms.pairing_password = comms_overrides.pairing_password.clone();
-        }
+        comms_overrides.apply_to(&mut config);
 
         // Build the parent session service on the runtime-backed persistent
         // surface. CLI one-shots must leave the runtime snapshot as durable
@@ -14003,15 +14024,7 @@ async fn resume_session_with_llm_override(
         let (config, runtime_preload_skills) = resolve_runtime_skills(config, skills).await?;
         let mut config = config;
         #[cfg(feature = "comms")]
-        if let Some(ref addr) = comms_overrides.listen_tcp {
-            config.comms.mode = CommsRuntimeMode::Tcp;
-            config.comms.address = Some(addr.clone());
-        }
-        #[cfg(feature = "comms")]
-        {
-            config.comms.advertise_address = comms_overrides.advertise_address.clone();
-            config.comms.pairing_password = comms_overrides.pairing_password.clone();
-        }
+        comms_overrides.apply_to(&mut config);
         let has_max_duration = max_duration.is_some();
         let has_max_tool_calls = max_tool_calls.is_some();
         let duration = max_duration.map(|s| parse_duration(&s)).transpose()?;
@@ -33742,5 +33755,98 @@ mod no_cli_alias_tables {
         );
         assert!(parse_cli_principal_id("").is_err());
         assert!(parse_cli_principal_id("ok-principal").is_ok());
+    }
+}
+
+#[cfg(all(test, feature = "comms"))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod comms_override_tests {
+    use super::*;
+
+    /// `--comms-advertise-tcp` accepts a DNS name, as the comms docs show,
+    /// and passes it on unresolved: the transport resolves it when a peer
+    /// dials. IP literals keep their canonical form.
+    #[test]
+    fn comms_advertise_tcp_accepts_unresolved_dns_names() {
+        for (raw, advertised) in [
+            ("target.example.com:4200", "tcp://target.example.com:4200"),
+            (
+                "tcp://reviewer.example.com:4200",
+                "tcp://reviewer.example.com:4200",
+            ),
+            (
+                "unresolvable.invalid:4200",
+                "tcp://unresolvable.invalid:4200",
+            ),
+            ("203.0.113.10:4200", "tcp://203.0.113.10:4200"),
+            ("[2001:db8::1]:4200", "tcp://[2001:db8::1]:4200"),
+        ] {
+            assert_eq!(
+                resolve_comms_advertise_tcp(Some(raw.to_string())).unwrap(),
+                Some(advertised.to_string()),
+                "{raw}"
+            );
+        }
+        assert_eq!(resolve_comms_advertise_tcp(None).unwrap(), None);
+    }
+
+    /// A route peers cannot dial is refused with a clear error: no port, a
+    /// zero port, a wildcard host, an unbracketed IPv6 host, no host.
+    #[test]
+    fn comms_advertise_tcp_refuses_undialable_routes() {
+        for raw in [
+            "target.example.com",
+            "target.example.com:0",
+            "0.0.0.0:4200",
+            "[::]:4200",
+            "2001:db8::1:4200",
+            ":4200",
+        ] {
+            let error = resolve_comms_advertise_tcp(Some(raw.to_string()))
+                .expect_err(raw)
+                .to_string();
+            assert!(
+                error.starts_with(&format!("invalid --comms-advertise-tcp address '{raw}'")),
+                "{raw}: {error}"
+            );
+        }
+    }
+
+    /// An explicit `--comms-advertise-tcp` wins over the configured
+    /// `comms.advertise_address`; without the flag the configured address
+    /// stands, also when `--comms-listen-tcp` switches the listener.
+    #[test]
+    fn comms_overrides_keep_the_configured_advertise_address() {
+        const CONFIGURED: &str = "tcp://configured.example.com:4200";
+        let configured = || {
+            let mut config = Config::default();
+            config.comms.advertise_address = Some(CONFIGURED.to_string());
+            config
+        };
+
+        let mut config = configured();
+        CommsOverrides::default().apply_to(&mut config);
+        assert_eq!(config.comms.advertise_address.as_deref(), Some(CONFIGURED));
+
+        let mut config = configured();
+        CommsOverrides {
+            listen_tcp: Some("0.0.0.0:4200".to_string()),
+            ..CommsOverrides::default()
+        }
+        .apply_to(&mut config);
+        assert_eq!(config.comms.mode, CommsRuntimeMode::Tcp);
+        assert_eq!(config.comms.address.as_deref(), Some("0.0.0.0:4200"));
+        assert_eq!(config.comms.advertise_address.as_deref(), Some(CONFIGURED));
+
+        let mut config = configured();
+        CommsOverrides {
+            advertise_address: Some("tcp://explicit.example.com:4300".to_string()),
+            ..CommsOverrides::default()
+        }
+        .apply_to(&mut config);
+        assert_eq!(
+            config.comms.advertise_address.as_deref(),
+            Some("tcp://explicit.example.com:4300")
+        );
     }
 }
