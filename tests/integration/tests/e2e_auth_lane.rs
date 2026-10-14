@@ -682,6 +682,45 @@ async fn rpc_error_message(harness: &AuthHarness, method: &str, params: Value) -
         .unwrap_or_else(|| panic!("RPC {method} succeeded unexpectedly"))
 }
 
+async fn rpc_error_reason(harness: &AuthHarness, method: &str, params: Value) -> (String, Value) {
+    let response = harness
+        .router
+        .dispatch(rpc_request(method, params))
+        .await
+        .expect("rpc response");
+    let error = response
+        .error
+        .unwrap_or_else(|| panic!("RPC {method} succeeded unexpectedly"));
+    let reason = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("reason"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    (error.message, reason)
+}
+
+/// The bearer a resolved OpenAI connection sends: managed ChatGPT OAuth
+/// resolves to a dynamic authorizer, not an inline secret.
+async fn resolved_bearer(resolved: &meerkat_providers::ResolvedConnection) -> Option<String> {
+    if let Some(secret) = resolved.resolved_secret() {
+        return Some(secret);
+    }
+    let authorizer = resolved.resolved_authorizer()?;
+    let mut headers = Vec::new();
+    let mut req = HttpAuthorizationRequest {
+        method: "POST",
+        url: "https://chatgpt.com/backend-api/codex/responses",
+        headers: &mut headers,
+    };
+    authorizer.authorize(&mut req).await.ok()?;
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .and_then(|(_, value)| value.strip_prefix("Bearer "))
+        .map(str::to_string)
+}
+
 fn rpc_request(method: &str, params: Value) -> RpcRequest {
     RpcRequest {
         jsonrpc: "2.0".to_string(),
@@ -841,7 +880,10 @@ async fn auth_mock_browser_oauth_login_round_trip() {
     let resolved = resolve_openai_binding(&harness, false, Arc::new(InMemoryCoordinator::new()))
         .await
         .expect("binding resolves after login");
-    assert_eq!(resolved.resolved_secret().as_deref(), Some("mock-access-1"));
+    assert_eq!(
+        resolved_bearer(&resolved).await.as_deref(),
+        Some("mock-access-1")
+    );
 }
 
 #[tokio::test]
@@ -927,7 +969,7 @@ async fn auth_mock_oauth_expired_token_refreshes_and_persists() {
         .await
         .expect("expired OAuth token refreshes during resolve");
     assert_eq!(
-        resolved.resolved_secret().as_deref(),
+        resolved_bearer(&resolved).await.as_deref(),
         Some("mock-refresh-access-1")
     );
     assert_eq!(fixture.refresh_count(), 1);
@@ -1000,11 +1042,11 @@ async fn auth_mock_oauth_restart_rehydrates_status_without_fabricating_from_raw_
         "restart test requires raw persisted token bytes"
     );
     let status = auth_status(&restarted).await;
-    assert_eq!(status.state, "unknown");
-    assert!(
-        !status.has_refresh_token,
-        "status must not expose refresh material when AuthMachine lifecycle is absent"
+    assert_eq!(
+        status.state, "valid",
+        "lifecycle-marked tokens from a real login rehydrate after restart"
     );
+    assert!(status.has_refresh_token);
 }
 
 #[tokio::test]
@@ -1030,7 +1072,7 @@ async fn auth_mock_oauth_logout_clears_token_and_releases_authmachine_lifecycle(
         "logout should clear token store material"
     );
     let status = auth_status(&harness).await;
-    assert_eq!(status.state, "unknown");
+    assert_eq!(status.state, "missing_credential");
     assert!(!status.has_refresh_token);
     let lease_key = LeaseKey::from_auth_binding(&openai_auth_binding());
     let snapshot = harness.runtime.auth_lease_handle().snapshot(&lease_key);
@@ -1064,10 +1106,10 @@ async fn auth_mock_concurrent_resolve_dedupes_refresh() {
             let env = ResolverEnvironment::testing()
                 .with_provider_auth_persistence(ProviderAuthPersistence::new(store, coordinator))
                 .with_auth_lease_handle(auth_lease);
-            registry
-                .resolve(&realm, &openai_auth_binding(), &env)
-                .await
-                .map(|connection| connection.resolved_secret())
+            match registry.resolve(&realm, &openai_auth_binding(), &env).await {
+                Ok(connection) => Ok(resolved_bearer(&connection).await),
+                Err(err) => Err(err),
+            }
         }));
     }
     let results = join_all(tasks).await;
@@ -1087,28 +1129,24 @@ async fn auth_mock_concurrent_resolve_dedupes_refresh() {
 #[tokio::test]
 #[ignore = "lane:e2e-auth"]
 async fn auth_mock_oauth_fixture_can_return_bad_code_and_malformed_token_errors() {
-    for (config, expected) in [
-        (
-            MockOAuthConfig {
-                token_mode: TokenMode::BadCode,
-                ..MockOAuthConfig::default()
-            },
-            "token endpoint returned",
-        ),
-        (
-            MockOAuthConfig {
-                token_mode: TokenMode::Malformed,
-                ..MockOAuthConfig::default()
-            },
-            "Token exchange failed",
-        ),
+    // Both failures surface as the same redacted upstream failure; the
+    // provider's token response stays in protected diagnostics.
+    for config in [
+        MockOAuthConfig {
+            token_mode: TokenMode::BadCode,
+            ..MockOAuthConfig::default()
+        },
+        MockOAuthConfig {
+            token_mode: TokenMode::Malformed,
+            ..MockOAuthConfig::default()
+        },
     ] {
         let fixture = MockOAuthProvider::start(config).await;
         let _env = FixtureEnvGuard::install(fixture.base_url()).await;
         let harness = AuthHarness::new();
         let start = start_login(&harness).await;
         let callback = follow_authorize_redirect(&start).await;
-        let message = rpc_error_message(
+        let (message, reason) = rpc_error_reason(
             &harness,
             "auth/login/complete",
             json!({
@@ -1121,10 +1159,13 @@ async fn auth_mock_oauth_fixture_can_return_bad_code_and_malformed_token_errors(
             }),
         )
         .await;
+        assert_eq!(message, "OAuth token exchange failed");
+        assert_eq!(reason, json!("upstream_failure"));
         assert!(
-            message.contains(expected),
-            "expected {expected:?} in {message:?}"
+            !message.contains("bad code") && !message.contains("token_type"),
+            "the provider's token response must not reach the caller: {message:?}"
         );
+        assert!(harness.stored_tokens().await.is_none());
     }
 }
 
