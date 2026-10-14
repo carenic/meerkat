@@ -3,15 +3,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# The source scans below and the doctor's workflow check run ripgrep. Without
-# it they find nothing, so refuse a false-green run (as the tombstone scans
-# do). A user ripgrep config (RIPGREP_CONFIG_PATH: --heading, --context, ...)
-# would change what they report, so none is read.
-if ! command -v rg >/dev/null 2>&1; then
-  echo "error: the CI nextest archive contract test requires ripgrep (rg); refusing a false-green scan. Install ripgrep (macOS: brew install ripgrep)." >&2
-  exit 1
-fi
-unset RIPGREP_CONFIG_PATH
+# The source scans below read this checkout through Git. A hook inherits
+# repository-local Git variables (GIT_DIR, GIT_INDEX_FILE, ...) that would
+# point them elsewhere, so drop them, as the pre-push dispatcher does.
+while IFS= read -r git_local_env; do
+  unset "$git_local_env"
+done < <(git rev-parse --local-env-vars)
 
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/meerkat-ci-nextest-archive.XXXXXX")"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
@@ -438,6 +435,16 @@ check_workflow_entrypoints "lookalike flag" fail $'run: |\n  cargo-nextest nexte
 check_workflow_entrypoints "test-binary argument flag" fail $'run: |\n  cargo-nextest nextest run -p meerkat-core -- --archive-file fixture.tar.zst'
 check_workflow_entrypoints "comment cannot continue over next command" fail $'run: |\n  cargo-nextest nextest list --archive-file fixture.tar.zst # \\\n  cargo-nextest nextest run -p meerkat-core'
 check_workflow_entrypoints "raw Cargo archive consumer" fail 'run: cargo nextest list --archive-file fixture.tar.zst'
+# The raw Cargo scan: `run: cargo` anywhere, or a line of whitespace and then
+# `cargo <build or test subcommand>` as a whole word.
+check_workflow_entrypoints "inline raw Cargo command" fail '    run: cargo fmt --all -- --check'
+check_workflow_entrypoints "indented raw Cargo command" fail $'run: |\n  cargo build -p meerkat-core'
+check_workflow_entrypoints "tab-indented raw Cargo command" fail $'run: |\n\tcargo clippy --workspace'
+check_workflow_entrypoints "CRLF raw Cargo command" fail $'run: |\r\n  cargo test -p meerkat-core\r'
+check_workflow_entrypoints "raw Cargo subcommand at line end" fail $'run: |\n  cargo machete'
+check_workflow_entrypoints "Cargo subcommand prefix of a word" pass $'run: |\n  cargo testing --help'
+check_workflow_entrypoints "Cargo after another command" pass $'run: |\n  echo cargo build'
+check_workflow_entrypoints "unlisted Cargo subcommand" pass $'run: |\n  cargo metadata --format-version=1'
 check_workflow_entrypoints "quoted diagnostic" pass 'run: echo "cargo-nextest nextest run"'
 assert_file_contains "$RELEASE_WORKFLOW" '.schema_version == 4'
 assert_file_contains "$RELEASE_WORKFLOW" '.validation_backend == "github-hosted-cargo"'
@@ -495,14 +502,30 @@ else_job="$(sed -n '/^  int-else:$/,/^  int-rest:$/p' "$WORKFLOW")"
   exit 1
 }
 
-if rg -n 'env!\("CARGO_BIN_EXE_' "$ROOT" --glob '*.rs'; then
+# Prints every line of a tracked or untracked (not ignored) *.rs file that
+# contains the literal $1. Git, not ripgrep: Git is on every machine that runs
+# this hook, and a user ripgrep config cannot change the result.
+rust_source_lines() {
+  local matches status=0
+  matches="$(git -C "$ROOT" grep --untracked -n -F -e "$1" -- '*.rs')" || status=$?
+  case "$status" in
+    0) printf '%s\n' "$matches" ;;
+    1) ;;
+    *)
+      echo "error: git grep failed (exit ${status}) scanning Rust sources for $1" >&2
+      return 1
+      ;;
+  esac
+}
+
+bin_exe_matches="$(rust_source_lines 'env!("CARGO_BIN_EXE_')" || exit 1
+if [[ -n "$bin_exe_matches" ]]; then
+  printf '%s\n' "$bin_exe_matches"
   echo "archived tests must resolve Cargo binary paths from the runtime environment" >&2
   exit 1
 fi
 
-manifest_dir_env_matches="$(
-  rg -n 'env!\("CARGO_MANIFEST_DIR"\)' "$ROOT" --glob '*.rs' || true
-)"
+manifest_dir_env_matches="$(rust_source_lines 'env!("CARGO_MANIFEST_DIR")')" || exit 1
 manifest_dir_env_count="$(
   printf '%s\n' "$manifest_dir_env_matches" | sed '/^$/d' | wc -l | tr -d '[:space:]'
 )"
