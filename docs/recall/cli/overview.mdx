@@ -115,12 +115,12 @@ receipt. It creates a new immutable directory containing `manifest.json` and
 Restore replaces the store under a durable recovery barrier. Keep the original
 independent erasure journal outside replaceable data and backup trees; missing,
 foreign or interrupted recovery keeps readiness closed. `import` remains a
-compatibility alias for restore. See [snapshot durability](https://github.com/lukacf/meerkat-recall/blob/13be7b1a1c4a9bb5fcf8c46d1a7ce1c3137fdfd3/docs/snapshot-durability.md).
+compatibility alias for restore. See [snapshot durability](https://github.com/lukacf/meerkat-recall/blob/d71722482183a802fcaeaaf41cb04ef7d16f4b85/docs/snapshot-durability.md).
 
 Managed embedded storage with a persistent destination synchronizes acknowledged
 mutations to its WAL. Shutdown snapshots are separate from that commit boundary;
 explicitly ephemeral library/test stores remain volatile. See
-[embedded durability](https://github.com/lukacf/meerkat-recall/blob/13be7b1a1c4a9bb5fcf8c46d1a7ce1c3137fdfd3/docs/embedded-durable-commits.md).
+[embedded durability](https://github.com/lukacf/meerkat-recall/blob/d71722482183a802fcaeaaf41cb04ef7d16f4b85/docs/embedded-durable-commits.md).
 
 ## Migrate a snapshot to SurrealDB
 
