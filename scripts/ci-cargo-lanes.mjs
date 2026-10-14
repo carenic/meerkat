@@ -63,23 +63,27 @@
 // binaries, HeadCanonical and e2e-fast before every push. CI runs that
 // coverage as required rows (closure_test_rows, the closure-tests job) for
 // the test scope: the reverse-dependency closure of the changed packages,
-// every member when a global input changed. A scoped package runs with the
-// features the hook's whole-workspace build gives it (cargo metadata's
-// resolve graph), not its smaller package-scoped set, so a test behind a
-// feature that only workspace unification enables still runs; on 8e1f4f21
-// that is 18 of 53 members (meerkat-mcp's test-support targets among them).
-// The rows are
-//   lib        `--lib` per package, the heavy chain included (no main-only
-//              deferral for this coverage); a package whose existing unit
-//              row already builds it with that feature set is not repeated
-//   tests      every tests/*.rs target the hook built, by name, with the
-//              hook's fast selection (ci-integration), split by
-//              CLOSURE_TESTS_PER_ROW and packed so no row selects two
-//              packages that share a target name
-//   HeadCanonical and e2e-fast, the hook's own commands
-// Each row lists the binaries it must run; the job checks nextest's list
-// against them before it runs. scripts/ci-hook-coverage.mjs re-derives the
-// hook's selection independently, and the plan fails when any hook binary in
+// every member when a global input changed. Every row but HeadCanonical
+// selects the whole workspace (`--workspace`) and names only its targets, so
+// Cargo resolves every crate's features exactly as the hook's single
+// workspace build does and builds only those targets' graphs: the row
+// compiles the hook's own units (cargo's unit graph: identical for
+// `--workspace --test ...` and `--workspace --lib`; a package-scoped row
+// compiled 31-39 dependency units with fewer features, and so does
+// `--workspace --exclude`). The rows are
+//   lib        one `--workspace --lib` row: it builds every member's lib
+//              test (nothing narrower keeps the resolution) and runs the
+//              scope's through a package() filter
+//   tests      every tests/*.rs target name the hook built, with every
+//              member's target of that name, `--test NAME` by name, with
+//              the hook's fast selection (ci-integration), split by
+//              CLOSURE_TESTS_PER_ROW names
+//   HeadCanonical and e2e-fast, from the hook's own lane commands
+// Each row lists and runs one shared selection, and checks that nextest
+// selects exactly the binaries the plan names before it runs.
+// scripts/ci-hook-coverage.mjs reads the hook's lanes from the hook script
+// and the executing step from ci.yml, credits only whole-workspace rows (and
+// HeadCanonical's own command), and the plan fails when any hook binary in
 // scope has no row.
 // The test scope also holds the readers of changed non-Rust inputs
 // (scripts/ci-non-rust-readers.json, kept complete by its guard): a test
@@ -94,7 +98,6 @@ import { join, relative, resolve } from "node:path";
 import {
   HOOK_SCRIPT,
   checkHookCoverage,
-  featureClosure,
   hookModel,
   parseFilter,
   profileFilter,
@@ -838,68 +841,72 @@ function packShards(pkgs, weights, maxShards, model = null) {
     .sort((a, b) => b.estimated_cost - a.estimated_cost || a.name.localeCompare(b.name));
 }
 
-// `--features` for a row's packages: each one's whole-workspace set, by name.
-function workspaceFeatureFlags(names, unified) {
-  const features = names.flatMap((name) =>
-    [...unified.get(name)]
-      .filter((feature) => feature !== "default")
-      .sort()
-      .map((feature) => `${name}/${feature}`),
-  );
-  return features.length > 0 ? ` --features ${features.join(",")}` : "";
-}
-
-function sameFeatures(a, b) {
-  return a.size === b.size && [...a].every((feature) => b.has(feature));
-}
-
-// The hook-parity rows for the test scope (see the header).
-function hookParityRows({ scope, byName, unified, weights, model, unitPackages, maxShards, maxTestRows, nextestText, hook }) {
+// The hook-parity rows for the test scope (see the header). Every row but
+// HeadCanonical selects the whole workspace (`--workspace`) and names only
+// its own targets: Cargo then resolves features exactly as the hook's single
+// workspace build does, and builds only those targets' graphs, so a row's
+// compilation units are the hook's own. Measured with cargo's unit graph on
+// b45c8e60: `--workspace --test ...` rows 472/472 and 380/380 units identical
+// to the hook's, `--workspace --lib` 572/572; package-scoped rows differed in
+// 31-39 units (dependency features), and so does `--workspace --exclude`.
+function hookParityRows({ scope, byName, unified, model, maxTestRows, nextestText, hook }) {
   const rows = [];
+  const testTargets = (name) =>
+    byName.get(name).targets.filter((target) => target.kind.length === 1 && target.kind[0] === "test");
+  const hookBuilt = (name, target) =>
+    target.test !== false && (target["required-features"] ?? []).every((feature) => unified.get(name).has(feature));
+  const hasLib = (name) =>
+    byName.get(name).targets.some((target) => target.test !== false && target.kind.some((kind) => LIB_TARGET_KINDS.has(kind)));
 
-  // Lib tests. A package that an existing pull-request unit row already
-  // compiles with exactly the workspace set (its default features imply the
-  // whole set) runs this binary there.
-  const libPackages = scope.filter((name) => {
-    const pkg = byName.get(name);
-    if (!pkg.targets.some((target) => target.test !== false && target.kind.some((kind) => LIB_TARGET_KINDS.has(kind)))) {
-      return false;
-    }
-    if (!unitPackages.includes(name)) return true;
-    const defaults = Object.hasOwn(pkg.features ?? {}, "default") ? ["default"] : [];
-    return !sameFeatures(featureClosure(pkg, new Set(defaults)), unified.get(name));
-  });
-  for (const shard of packWithinBudget(libPackages, weights, maxShards, model)) {
+  // Lib tests: one row. `--workspace --lib` builds every member's lib test;
+  // no stable selection builds fewer under the same resolution, so the scope
+  // narrows what runs (a package() filter), not what builds.
+  const libPackages = scope.filter(hasLib);
+  if (libPackages.length > 0) {
+    const everyLib = [...byName.keys()].filter(hasLib);
+    const filter = libPackages.length === everyLib.length
+      ? null
+      : libPackages.map((name) => `package(${name})`).join(" | ");
     rows.push({
-      name: `lib ${shard.name}`,
+      name: "lib",
       lane: "lib",
-      packages: shard.packages,
-      package_flags: `${shard.package_flags}${workspaceFeatureFlags(shard.packages, unified)}`,
+      packages: libPackages,
+      package_flags: "--workspace",
       test_flags: "--lib",
       profile: CLOSURE_LIB_PROFILE,
-      binaries: [...shard.packages],
+      ...(filter ? { filter } : {}),
+      binaries: [...libPackages],
       no_tests: "warn",
       rust_min_stack: HOOK_TEST_STACK,
-      estimated_minutes: shard.estimated_minutes,
     });
   }
 
-  // Integration tests: every tests/*.rs target the hook's workspace build
-  // compiles (its required-features within the workspace set) that the fast
-  // selection keeps, named one by one, so Cargo builds no other target and
-  // refuses a renamed one. Large packages are split into parts.
+  // Integration tests: every hook-built tests/*.rs target name in scope that
+  // the fast selection keeps. Under --workspace, `--test NAME` selects that
+  // name in every member, so a name is one unit with all of its binaries;
+  // a name a member cannot build would make Cargo refuse the row.
   const keep = parseFilter(profileFilter(nextestText, CLOSURE_TEST_PROFILE));
-  const testTargets = (name) =>
-    byName.get(name).targets.filter((target) => target.kind.length === 1 && target.kind[0] === "test");
-  const units = [];
+  const allNames = [...byName.keys()].sort();
+  const home = new Map();
   for (const name of scope) {
-    const enabled = unified.get(name);
-    const tests = testTargets(name)
-      .filter((target) => target.test !== false)
-      .filter((target) => (target["required-features"] ?? []).every((feature) => enabled.has(feature)))
-      .filter((target) => keep({ kind: "test", binary: target.name, package: name }))
-      .map((target) => target.name)
-      .sort();
+    for (const target of testTargets(name)) {
+      if (!hookBuilt(name, target) || !keep({ kind: "test", binary: target.name, package: name })) continue;
+      if (!home.has(target.name)) home.set(target.name, name);
+    }
+  }
+  const binariesOf = (test) => allNames.filter((name) => {
+    const target = testTargets(name).find((candidate) => candidate.name === test);
+    if (!target) return false;
+    if (!hookBuilt(name, target)) {
+      throw new Error(`test target name ${test} is hook-built in ${home.get(test)} but not in ${name}; --test ${test} would make Cargo refuse the row`);
+    }
+    return true;
+  }).map((name) => `${name}::${test}`);
+  const byHome = new Map();
+  for (const [test, name] of home) byHome.set(name, [...(byHome.get(name) ?? []), test]);
+  const units = [];
+  for (const [name, tests] of [...byHome].sort(([a], [b]) => a.localeCompare(b))) {
+    tests.sort();
     const parts = Math.ceil(tests.length / CLOSURE_TESTS_PER_ROW);
     for (let index = 0; index < parts; index += 1) {
       const slice = tests.slice(
@@ -914,16 +921,12 @@ function hookParityRows({ scope, byName, unified, weights, model, unitPackages, 
       });
     }
   }
-  // Two packages that share a test target name never share a row: `--test
-  // NAME` would select both, and Cargo refuses a selected target whose
-  // required-features the row lacks. Two parts of one package do not share
-  // one either, or the split would not parallelize.
-  const names = new Map(scope.map((name) => [name, new Set(testTargets(name).map((target) => target.name))]));
-  const conflicts = (a, b) => a === b || [...names.get(a)].some((test) => names.get(b).has(test));
+  // Two parts of one package never share a row, or the split would not
+  // parallelize; a target name lives in exactly one unit.
   units.sort((a, b) => b.weight - a.weight || a.package.localeCompare(b.package) || a.part.localeCompare(b.part));
   const bins = [];
   for (const unit of units) {
-    const open = bins.filter((bin) => !bin.units.some((other) => conflicts(other.package, unit.package)));
+    const open = bins.filter((bin) => !bin.units.some((other) => other.package === unit.package));
     let bin;
     if (bins.length < maxTestRows || open.length === 0) {
       bin = { units: [], weight: 0 };
@@ -935,10 +938,9 @@ function hookParityRows({ scope, byName, unified, weights, model, unitPackages, 
     bin.weight += unit.weight;
   }
   for (const bin of bins) {
-    const packages = [...new Set(bin.units.map((unit) => unit.package))].sort();
-    const tests = bin.units
-      .flatMap((unit) => unit.tests.map((test) => ({ name: unit.package, test })))
-      .sort((a, b) => a.name.localeCompare(b.name) || a.test.localeCompare(b.test));
+    const tests = bin.units.flatMap((unit) => unit.tests).sort();
+    const binaries = tests.flatMap(binariesOf);
+    const packages = [...new Set(binaries.map((binary) => binary.split("::")[0]))].sort();
     const union = new Set();
     let lines = 0;
     for (const name of packages) {
@@ -951,22 +953,22 @@ function hookParityRows({ scope, byName, unified, weights, model, unitPackages, 
       name: `tests ${shortName(heaviest.package)}${heaviest.part}${bin.units.length > 1 ? `+${bin.units.length - 1}` : ""}`,
       lane: "tests",
       packages,
-      package_flags: `${packages.map((name) => `-p ${name}`).join(" ")}${workspaceFeatureFlags(packages, unified)}`,
-      test_flags: tests.map(({ test }) => `--test ${test}`).join(" "),
+      package_flags: "--workspace",
+      test_flags: tests.map((test) => `--test ${test}`).join(" "),
       profile: CLOSURE_TEST_PROFILE,
-      binaries: tests.map(({ name, test }) => `${name}::${test}`),
+      binaries,
       no_tests: "warn",
       rust_min_stack: HOOK_TEST_STACK,
-      estimated_minutes: estimatedMinutes(lines + LINK_COST_PER_DEP * union.size + TEST_TARGET_COST * tests.length),
+      estimated_minutes: estimatedMinutes(lines + LINK_COST_PER_DEP * union.size + TEST_TARGET_COST * binaries.length),
     });
   }
 
-  // The hook's two named lanes, with its own flags (read from the hook
-  // script by hookModel).
-  const hasTest = (name, test) => testTargets(name).some((target) => target.name === test);
+  // The hook's two named lanes: HeadCanonical with the hook's own
+  // package-scoped flags, e2e-fast from the workspace build (both read from
+  // the hook script by hookModel).
   const headCanonical = hook.headCanonical;
   if (scope.includes(headCanonical.package)) {
-    if (!hasTest(headCanonical.package, headCanonical.test)) {
+    if (!testTargets(headCanonical.package).some((target) => target.name === headCanonical.test)) {
       throw new Error(`HeadCanonical target ${headCanonical.test} is missing from ${headCanonical.package}`);
     }
     rows.push({
@@ -982,24 +984,20 @@ function hookParityRows({ scope, byName, unified, weights, model, unitPackages, 
       rust_min_stack: HOOK_TEST_STACK,
     });
   }
-  const e2eOwners = [...byName.keys()].filter((name) => hasTest(name, hook.e2eFast.binary));
+  const e2eOwners = allNames.filter((name) => testTargets(name).some((target) => target.name === hook.e2eFast.binary));
   if (e2eOwners.length !== 1) {
     throw new Error(`e2e-fast target ${hook.e2eFast.binary} belongs to ${e2eOwners.length} workspace packages`);
   }
-  const e2eFast = { package: e2eOwners[0], binary: hook.e2eFast.binary };
-  if (scope.includes(e2eFast.package)) {
-    if (!hasTest(e2eFast.package, e2eFast.binary)) {
-      throw new Error(`e2e-fast target ${e2eFast.binary} is missing from ${e2eFast.package}`);
-    }
+  if (scope.includes(e2eOwners[0])) {
     rows.push({
       name: "e2e-fast",
       lane: "e2e-fast",
-      packages: [e2eFast.package],
-      package_flags: `-p ${e2eFast.package}${workspaceFeatureFlags([e2eFast.package], unified)}`,
-      test_flags: `--test ${e2eFast.binary}`,
+      packages: [e2eOwners[0]],
+      package_flags: "--workspace",
+      test_flags: `--test ${hook.e2eFast.binary}`,
       profile: CLOSURE_LIB_PROFILE,
-      filter: `binary(${e2eFast.binary})`,
-      binaries: [`${e2eFast.package}::${e2eFast.binary}`],
+      filter: `binary(${hook.e2eFast.binary})`,
+      binaries: [`${e2eOwners[0]}::${hook.e2eFast.binary}`],
       no_tests: "fail",
       rust_min_stack: HOOK_TEST_STACK,
     });
@@ -1395,10 +1393,7 @@ function plan(args) {
       scope: result.test_scope,
       byName,
       unified: workspaceFeatures(metadata, packages),
-      weights,
       model,
-      unitPackages: result.unit_packages,
-      maxShards: result.mode === "workspace" ? args.workspaceShards : args.maxShards,
       maxTestRows: args.closureTestRows,
       nextestText,
       hook: hookModel(hookText),

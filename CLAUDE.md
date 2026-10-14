@@ -409,20 +409,19 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   (every member on a global change) plus the packages whose tests read a
   changed non-Rust input (`scripts/ci-non-rust-readers.json`, kept complete
   by `scripts/ci-non-rust-readers-guard.mjs` in `make ci-lanes-selftest`).
-  Rows (`closure_test_rows` in `scripts/ci-cargo-lanes.mjs`): lib tests,
-  every `tests/*.rs` target the hook's workspace build compiles (by name,
-  `ci-integration` profile, the fast selection), HeadCanonical and
-  `e2e-fast`, each package with the features whole-workspace unification
-  gives it, on the hook's 32 MiB test-thread stack. The meerkat-mob compile
-  chain is included; nothing here is deferred to main. Each row lists and
-  runs one shared selection, and first checks that nextest lists exactly its
-  planned binaries (`scripts/ci-verify-row-binaries.mjs`). The plan fails
-  when `scripts/ci-hook-coverage.mjs` finds a hook binary in scope without a
-  row: it reads the hook's lanes from `scripts/pre-push-unit.sh` itself and
-  binds the exact list/run lines of the steps that execute rows. Crates below
-  a row's packages get the features of the row's graph, which can be fewer
-  than the workspace's, so these rows add coverage and do not replace the
-  hook.
+  Rows (`closure_test_rows` in `scripts/ci-cargo-lanes.mjs`) select the whole
+  workspace and name only their targets, so they compile the hook's own
+  units: one `--workspace --lib` row (filtered to the scope's packages),
+  every `tests/*.rs` target the hook builds (by name, `ci-integration`
+  profile, the fast selection), `e2e-fast`, and HeadCanonical with the
+  hook's own package-scoped command, all on the hook's 32 MiB test-thread
+  stack. Each row lists and runs one shared selection and first checks that
+  nextest selects exactly its planned binaries
+  (`scripts/ci-verify-row-binaries.mjs`). The plan fails when
+  `scripts/ci-hook-coverage.mjs` finds a hook binary in scope without a row:
+  it reads the hook's lanes from `scripts/pre-push-unit.sh`, binds the exact
+  list/run lines of the executing step, and credits only whole-workspace
+  rows.
 - `closure-check`: `cargo check --all-features` (lib and bin targets) over
   the reverse-dependency closure of the changed packages.
 - `feature-check` (two jobs per clippy shard, Bazel set and matrix): compile-only checks of the

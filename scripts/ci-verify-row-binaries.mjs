@@ -1,8 +1,10 @@
 #!/usr/bin/env node
-// Checks one closure-tests row before it runs: nextest must list exactly the
-// test binaries the plan names for the row (scripts/ci-cargo-lanes.mjs,
-// closure_test_rows), and no test of those binaries may be dropped by a
-// profile's default-filter. The plan's static coverage check
+// Checks one closure-tests row before it runs: the binaries whose tests the
+// row selects must be exactly the ones the plan names for it
+// (scripts/ci-cargo-lanes.mjs, closure_test_rows), and no test of those
+// binaries may be dropped by a filter. A row that selects the whole workspace
+// lists other members' binaries too (a `--workspace --lib` row lists every
+// lib); those may be listed, but none of their tests may be selected. The plan's static coverage check
 // (scripts/ci-hook-coverage.mjs) proves the rows cover the pre-push hook's
 // binaries; this proves the job built and selected what the row says, so a
 // row cannot pass by running fewer binaries than planned.
@@ -27,7 +29,10 @@ function main() {
   let ignored = 0;
   for (const [id, suite] of Object.entries(suites)) {
     if (!wanted.has(id)) {
-      problems.push(`nextest listed ${id}, which the row does not name`);
+      const selected = Object.entries(suite.testcases ?? {}).filter(([, testCase]) => testCase["filter-match"]?.status === "matches");
+      if (selected.length > 0) {
+        problems.push(`nextest selects ${selected.length} test(s) of ${id}, which the row does not name`);
+      }
       continue;
     }
     if (suite.status !== "listed") {

@@ -1093,11 +1093,12 @@ jobs:
     # The pre-push hook's cargo-test coverage (scripts/pre-push-unit.sh), run
     # here for the test scope: the reverse-dependency closure of the changed
     # packages, or every member on a global change. Rows are closure_test_rows
-    # in scripts/ci-cargo-lanes.mjs: lib tests, every tests/*.rs target the
-    # hook built (by name, fast selection), HeadCanonical and e2e-fast, each
-    # package with the whole workspace's feature set, as the hook's single
-    # workspace build compiled it. scripts/ci-hook-coverage.mjs fails the plan
-    # when a hook binary in scope has no row. Selected by the row count alone.
+    # in scripts/ci-cargo-lanes.mjs: one --workspace --lib row, every
+    # tests/*.rs target the hook built (by name, fast selection), e2e-fast,
+    # all selecting the whole workspace so they compile the hook's own units,
+    # and HeadCanonical with the hook's own command. scripts/ci-hook-coverage.mjs
+    # fails the plan when a hook binary in scope has no row. Selected by the
+    # row count alone.
     if: ${{ needs.changes.result == 'success' && needs.changes.outputs.closure_test_count != '0' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40

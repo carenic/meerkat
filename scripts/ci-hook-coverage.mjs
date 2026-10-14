@@ -26,12 +26,11 @@
 // the hook's own feature set, and every row Cargo would refuse. The planner
 // calls it on its own result and fails the plan on any gap.
 //
-// What it does not see: the features Cargo unifies on a row's dependencies.
-// A row selects its own packages with the workspace's feature set, but the
-// crates below them get the features of the row's graph, which can be fewer
-// than the workspace's. Binary selection is exact; dependency configuration
-// is the stated residual, and it is why these rows add coverage but do not
-// replace the hook.
+// Only a row that selects the whole workspace (`--workspace`) is credited:
+// Cargo then resolves every crate's features exactly as the hook's workspace
+// build does, so the row compiles the hook's own units (a package-scoped row
+// compiles its dependencies with fewer features and is not the hook's
+// build). HeadCanonical is credited for its own, package-scoped command.
 //
 // usage: ci-hook-coverage.mjs [--plan <file>|-] [--map]
 //   Reads a plan (ci-cargo-lanes.mjs --format json) and prints the coverage
@@ -52,18 +51,6 @@ export const WORKFLOW = ".github/workflows/ci.yml";
 // check or a selection variable must be one of these, in this order, so the
 // listed selection is the run selection and nothing can narrow a run alone.
 export const CI_ROW_STEPS = [
-  {
-    field: "unit_shards",
-    job: "unit",
-    step: "Unit tests (changed packages, lib and bin targets)",
-    matrix: "unit_shard_matrix",
-    env: { PACKAGES: "${{ matrix.packages }}" },
-    lines: [
-      "./scripts/repo-cargo nextest run ${PACKAGES} --lib --bins --profile ci-pr --no-tests=pass --no-fail-fast --status-level fail --final-status-level fail",
-    ],
-    targets: ["--lib", "--bins"],
-    profile: "ci-pr",
-  },
   {
     field: "closure_test_rows",
     job: "closure-tests",
@@ -361,14 +348,20 @@ function sameSet(a, b) {
 // Reads `-p NAME`, `--features LIST` and `--no-default-features` the way
 // Cargo does for a multi-package invocation: a feature must name its package
 // unless exactly one package is selected.
-function parsePackageFlags(flags, byName) {
+function parsePackageFlags(flags, byName, unified) {
   const tokens = flags.split(/\s+/).filter(Boolean);
+  if (tokens.length === 1 && tokens[0] === "--workspace") {
+    // Every member, each with the features the workspace build resolves.
+    return { packages: [...byName.keys()].sort(), enabled: new Map(unified), workspace: true };
+  }
   const packages = [];
   const requested = [];
   let defaults = true;
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
-    if (token === "-p" || token === "--package") {
+    if (token === "--workspace") {
+      throw new Error(`--workspace cannot be combined with other package flags in ${JSON.stringify(flags)}`);
+    } else if (token === "-p" || token === "--package") {
       packages.push(tokens[++index]);
     } else if (token === "--features" || token === "-F") {
       requested.push(...tokens[++index].split(",").filter(Boolean));
@@ -398,14 +391,14 @@ function parsePackageFlags(flags, byName) {
     if (!Object.hasOwn(pkg.features ?? {}, "default")) features.delete("default");
     enabled.set(name, featureClosure(pkg, features));
   }
-  return { packages, enabled };
+  return { packages, enabled, workspace: false };
 }
 
 // The binaries a row runs: Cargo's target selection (with its
 // required-features refusal for named targets), then the profile's
 // default-filter and the row's own filter, as its bound step runs them.
-function rowBinaries(row, spec, byName, nextestText) {
-  const { packages, enabled } = parsePackageFlags(row.package_flags, byName);
+function rowBinaries(row, spec, byName, nextestText, unified) {
+  const { packages, enabled, workspace } = parsePackageFlags(row.package_flags, byName, unified);
   const targetTokens = spec.targets ?? (row.test_flags ?? "").split(/\s+/).filter(Boolean);
   const profile = spec.profile ?? row.profile;
   if (!profile) throw new Error(`row ${row.name} names no nextest profile`);
@@ -459,7 +452,7 @@ function rowBinaries(row, spec, byName, nextestText) {
     const binary = { kind: nextestKind(target), binary: target.name, package: pkg.name };
     return profileFilterFn(binary) && rowFilterFn(binary);
   });
-  return { packages, enabled, runs, errors, profile };
+  return { packages, enabled, workspace, runs, errors, profile };
 }
 
 // The hook's selection for the plan's test scope, and the CI rows that cover
@@ -512,7 +505,7 @@ export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText
     for (const row of plan[spec.field] ?? []) {
       let read;
       try {
-        read = rowBinaries(row, spec, byName, nextest);
+        read = rowBinaries(row, spec, byName, nextest, unified);
       } catch (error) {
         errors.push(`row ${row.name} (${spec.job}): ${error.message}`);
         continue;
@@ -520,7 +513,7 @@ export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText
       errors.push(...read.errors);
       for (const { pkg, target } of read.runs) {
         const key = `${pkg.name}::${nextestKind(target)}::${target.name}`;
-        if (sameSet(read.enabled.get(pkg.name), unified.get(pkg.name)) && !covered.has(key)) {
+        if (read.workspace && !covered.has(key)) {
           covered.set(key, `${spec.job}: ${row.name}`);
         }
       }

@@ -129,13 +129,19 @@ function assertHookParity(plan, label) {
     for (const feature of row.package_flags.match(/--features (\S+)/)?.[1]?.split(",") ?? []) {
       assert.match(feature, /^[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/, `${label}: ${row.name} names each feature's package`);
     }
+    // Every row but HeadCanonical selects the whole workspace, so Cargo
+    // resolves features exactly as the hook's workspace build does.
+    if (row.lane !== "headcanonical") {
+      assert.equal(row.package_flags, "--workspace", `${label}: ${row.name} selects the whole workspace`);
+    }
     if (row.lane === "lib") {
       assert.equal(row.test_flags, "--lib", `${label}: ${row.name} runs lib tests`);
       assert.deepEqual(row.binaries, row.packages, `${label}: ${row.name} lists one lib binary per package`);
     } else {
-      // Every named target is one of the row's binaries, and the reverse.
-      const named = [...row.test_flags.matchAll(/--test (\S+)/g)].map((match) => match[1]).sort();
-      assert.deepEqual(named, row.binaries.map((binary) => binary.split("::")[1]).sort(), `${label}: ${row.name} names exactly its binaries`);
+      // Every named target is one of the row's binaries, and the reverse (a
+      // name shared by several members names all of their binaries).
+      const named = [...new Set([...row.test_flags.matchAll(/--test (\S+)/g)].map((match) => match[1]))].sort();
+      assert.deepEqual(named, [...new Set(row.binaries.map((binary) => binary.split("::")[1]))].sort(), `${label}: ${row.name} names exactly its binaries`);
       for (const binary of row.binaries) {
         assert.ok(row.packages.includes(binary.split("::")[0]), `${label}: ${row.name} selects the package of ${binary}`);
       }
@@ -1054,7 +1060,7 @@ for (const path of [
   const row = plan.closure_test_rows.find((candidate) => candidate.binaries.includes("meerkat-mcp::form_elicitation"));
   assert.ok(row, "a row runs meerkat-mcp's form_elicitation");
   assert.ok(row.binaries.includes("meerkat-mcp::lifecycle_contract"), "and lifecycle_contract");
-  assert.match(row.package_flags, /meerkat-mcp\/test-support/, "with the workspace's test-support");
+  assert.equal(row.package_flags, "--workspace", "under the workspace's resolution, which enables test-support");
   assert.ok(
     plan.closure_test_rows.some((candidate) => candidate.lane === "lib" && candidate.packages.includes("meerkat-mob")),
     "meerkat-mob's lib tests run in the pull request, not only on main",
@@ -1078,7 +1084,7 @@ for (const path of [
     no_tests: "fail",
   });
   assert.deepEqual(pick("e2e-fast"), {
-    packages: "-p meerkat-integration-tests",
+    packages: "--workspace",
     tests: "--test e2e_fast_lane",
     profile: "ci-unit",
     filter: "binary(e2e_fast_lane)",
@@ -1122,18 +1128,19 @@ for (const path of [
     copy.closure_test_rows = copy.closure_test_rows.filter((row) => row !== mcpRow(copy));
   });
   assert.ok(dropped.missing.includes("meerkat-mcp::test::form_elicitation"), "a dropped row is a gap");
-  // The package-scoped feature set is not the hook's: Cargo refuses the
-  // required-features targets, and the rest of the row no longer counts.
+  // A package-scoped row is not the hook's build: Cargo refuses the
+  // required-features targets, and nothing in the row counts.
   const scoped = mutate((copy) => {
-    const row = mcpRow(copy);
-    row.package_flags = row.package_flags.replace(/ --features \S+/, "");
+    mcpRow(copy).package_flags = "-p meerkat-mcp";
   });
   assert.ok(scoped.errors.some((error) => error.includes("form_elicitation requires test-support")), "Cargo would refuse the row");
   assert.ok(scoped.missing.includes("meerkat-mcp::test::account_selection"), "the scoped set does not cover the hook");
-  // A lib row without the workspace set is a gap for that lib.
+  // A package-scoped lib row is a gap even with the workspace's own
+  // features: its dependencies are not the hook's.
   const libScoped = mutate((copy) => {
-    const row = copy.closure_test_rows.find((candidate) => candidate.lane === "lib" && candidate.packages.includes("meerkat-mob"));
-    row.package_flags = row.package_flags.replace(/ --features \S+/, "");
+    const row = copy.closure_test_rows.find((candidate) => candidate.lane === "lib");
+    row.package_flags = "-p meerkat-mob --features meerkat-mob/runtime-adapter,meerkat-mob/schema,meerkat-mob/test-support";
+    delete row.filter;
   });
   assert.ok(libScoped.missing.includes("meerkat-mob::lib::meerkat_mob"), "meerkat-mob's lib under its scoped set is a gap");
   // HeadCanonical under the workspace set is not the hook's HeadCanonical.
@@ -1177,8 +1184,8 @@ for (const path of [
   assert.ok(narrowed.some((error) => error.includes("job closure-tests: the step runs")), "a later selection change is refused");
   const unchecked = mutated('          node scripts/ci-verify-row-binaries.mjs "${RUNNER_TEMP}/closure-test-list.json" ${BINARIES}\n', "");
   assert.ok(unchecked.some((error) => error.includes("job closure-tests: the step runs")), "a step without the binary check is refused");
-  const moved = mutated("      - name: Unit tests (changed packages, lib and bin targets)\n", "      - name: Unit tests (moved)\n");
-  assert.ok(moved.some((error) => error.includes("job unit: step")), "the unit rows' step is bound by name");
+  const moved = mutated("      - name: Closure tests (the row's targets, workspace feature set)\n", "      - name: Closure tests (moved)\n");
+  assert.ok(moved.some((error) => error.includes("job closure-tests: step")), "the rows' step is bound by name");
   const wrongMatrix = mutated(
     "      matrix: ${{ fromJSON(needs.changes.outputs.closure_test_matrix) }}\n",
     "      matrix: ${{ fromJSON(needs.changes.outputs.integration_matrix) }}\n",
@@ -1332,6 +1339,11 @@ for (const path of [
     assert.equal(verify({ "p::a": suite({ t1: match, t2: ignored }), p: suite({ t3: match }) }, ["p::a", "p"]).status, 0);
     assert.equal(verify({ "p::a": suite({ t1: match }) }, ["p::a", "p::b"]).status, 1, "a missing binary fails");
     assert.equal(verify({ "p::a": suite({ t1: match }), "q::a": suite({ t1: match }) }, ["p::a"]).status, 1, "an extra binary fails");
+    assert.equal(
+      verify({ "p::a": suite({ t1: match }), q: suite({ t1: { "filter-match": { status: "mismatch", reason: "expression" } } }), r: suite({}, "skipped") }, ["p::a"]).status,
+      0,
+      "a listed binary none of whose tests are selected (another member's lib under --workspace) passes",
+    );
     assert.equal(verify({ "p::a": suite({ t1: defaultFiltered }) }, ["p::a"]).status, 1, "a profile-filtered test fails");
     assert.equal(verify({ "p::a": suite({}, "skipped") }, ["p::a"]).status, 1, "a skipped binary fails");
   } finally {
