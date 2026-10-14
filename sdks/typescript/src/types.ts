@@ -971,16 +971,7 @@ export interface CommsPeerMessageCommand {
 export interface CommsPeerLifecycleCommand {
   kind: "peer_lifecycle";
   to: string;
-  lifecycle_kind:
-    | "mob.peer_added"
-    | "mob.peer_retired"
-    | "mob.peer_unwired"
-    | "mob.kickoff_pending"
-    | "mob.kickoff_starting"
-    | "mob.kickoff_started"
-    | "mob.kickoff_callback_pending"
-    | "mob.kickoff_failed"
-    | "mob.kickoff_cancelled";
+  lifecycle_kind: Generated.CommsSendParamsPeerLifecycle["lifecycle_kind"];
   params: Generated.CommsPeerLifecycleParams;
 }
 

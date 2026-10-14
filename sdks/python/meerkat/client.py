@@ -4576,6 +4576,7 @@ class MeerkatClient:
         "mob.peer_added",
         "mob.peer_retired",
         "mob.peer_unwired",
+        "mob.dismiss",
         "mob.kickoff_pending",
         "mob.kickoff_starting",
         "mob.kickoff_started",
