@@ -62,10 +62,10 @@ Global/realm options:
 ```
 
 `-h` prints the basic view and `--help` every option; realm options and
-advanced flags appear only under `--help`. Write `--as-agent` after the
-command name (`rkat run --as-agent <AGENT> ...`): the prompt-first rewrite does
-not skip it as a root flag, so in front of a command name it turns that command
-into a prompt.
+advanced flags appear only under `--help`. `--as-agent` is a root option
+like `--realm` and works before or after the command name
+(`rkat --as-agent <AGENT> run ...` or `rkat run --as-agent <AGENT> ...`);
+0.9.0 accepted it only after the command name.
 
 `--default-model <MODEL>` persists the default agent model into the
 scope-resolved config (same project/user/realm resolution as every other

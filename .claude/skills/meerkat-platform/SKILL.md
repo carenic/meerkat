@@ -1104,7 +1104,8 @@ rkat realm revoke-grant team-alpha --mcp github
   operations, the session tool catalog, or the agent's controller routes) and
   supersedes only that target's previous grant. A prompt refused for its
   controller route names the exact `rkat realm grant ... --controller --route
-  <key>` to run. Pass `--as-agent` after the command name.
+  <key>` to run. `--as-agent` works before or after the command name
+  (0.9.0 accepted it only after).
 - Review above R1 comes from the realm config's `[[governance.review.rules]]`
   (an exact MCP server, raw operation or tool bundle operation with tier `r2`
   or `r3`; `r3` also states `consent_assurance`, `device_trusted` or

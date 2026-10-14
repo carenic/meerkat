@@ -49,6 +49,17 @@ them.
   root command list keeps one-line summaries and names every command group,
   and `rkat help` without a question prints its usage instead of a bare
   missing-argument error.
+- `rkat help` knows about OS sandboxing. The embedded meerkat-platform skill
+  gains a section on execution confinement: the host-installed `Required`
+  profiles for shell tools, command hooks and stdio MCP servers, the
+  `meerkat-sandbox` backends (macOS Seatbelt, Linux namespaces with seccomp),
+  refusal semantics, backend limits and the trusted-host default of the stock
+  surfaces. Before, the help corpus did not mention it, so `rkat help` answered
+  that Meerkat has no OS-level sandboxing. The 0.9 migration notes are now
+  embedded with the skill as well.
+- `--as-agent` works before the command name, like the other root options.
+  `rkat --as-agent <AGENT> realm list` was rewritten into a prompt-first run
+  whose prompt was the command name.
 
 ## [0.9.0] - 2026-10-13
 
@@ -2459,7 +2470,7 @@ them.
   names no binding is likewise switched to with the binding and credential its
   client resolved.
 
-- `rkat run` and `rkat resume` work in a governed realm: the CLI's runtime
+- `rkat run` and `rkat run --resume` work in a governed realm: the CLI's runtime
   executor declares and forwards the native work context of each governed
   turn, as the shared runtime-backed executor does, instead of every
   governed prompt being refused as "governed executor support is
@@ -2467,7 +2478,7 @@ them.
 
 - The CLI launches a realm-defined MCP stdio server with the service secrets
   its realm stored for the server's declared `secret_env` slots. It refused
-  every declared slot before: the MCP loader of `rkat run` and `rkat resume`
+  every declared slot before: the MCP loader of `rkat run` and `rkat run --resume`
   on an ordinary realm held no service-secret custody, and the servers
   launched through the CLI's runtime-backed composition (such as a governed
   realm's configured servers) were refused as ownerless, because that
@@ -2485,7 +2496,7 @@ them.
   reviewed operation on such a server. A source that states no account
   still states none through the custody.
 
-- The MCP credential source of `rkat run` and `rkat resume` states the
+- The MCP credential source of `rkat run` and `rkat run --resume` states the
   account the native MCP OAuth owner selected for a server
   (`oauth_account`). It stated none, so in a governed realm the stock policy
   refused each reviewed operation on such a server.

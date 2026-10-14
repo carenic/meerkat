@@ -849,6 +849,7 @@ fn is_root_flag_with_value(arg: &str) -> bool {
     matches!(
         arg,
         "-r" | "--realm"
+            | "--as-agent"
             | "--instance"
             | "--realm-backend"
             | "--state-root"
@@ -4428,9 +4429,10 @@ async fn cli_main() -> anyhow::Result<ExitCode> {
                 eprintln!("Budget exhausted: {agent_err}");
                 return Ok(ExitCode::from(EXIT_BUDGET_EXHAUSTED));
             }
-            // §17.4 typed exit path (mob verb family only): the four
-            // console codes exit 45-48 with one typed `detail:` line
-            // rendered from the typed fields, never a display string.
+            // §17.4 typed exit path (mob verb family only): the typed mob
+            // codes (45-48, and 56 for a stale delivery scope) exit with one
+            // typed `detail:` line rendered from the typed fields, never a
+            // display string.
             #[cfg(feature = "mob")]
             if let Some(code) = mob_exit_code(&e) {
                 eprintln!("Error: {e}");
@@ -18138,8 +18140,8 @@ fn mob_wire_detail(e: &anyhow::Error) -> Option<meerkat_contracts::wire::WireMob
         })
 }
 
-/// §17.4 typed exit path (DEC-P7B-11, ADJ-P7-7): exit codes 45-48 for the
-/// mob verb family ONLY — scoping is by construction, since only mob
+/// §17.4 typed exit path (DEC-P7B-11, ADJ-P7-7): exit codes 45-48 and 56
+/// for the mob verb family ONLY — scoping is by construction, since only mob
 /// handler arms put mob-family errors into the chain via [`mob_anyhow`].
 /// Unmapped mob errors keep `EXIT_ERROR`. The pre-existing
 /// `EXIT_BUDGET_EXHAUSTED=2` vs `cli_exit_code(BudgetExhausted)=21`
@@ -18147,7 +18149,7 @@ fn mob_wire_detail(e: &anyhow::Error) -> Option<meerkat_contracts::wire::WireMob
 #[cfg(feature = "mob")]
 fn mob_exit_code(e: &anyhow::Error) -> Option<u8> {
     let detail = mob_wire_detail(e)?;
-    // 45..=48 always fit; try_from is the no-panic guard.
+    // The mob codes (45..=48, 56) always fit; try_from is the no-panic guard.
     u8::try_from(detail.code().cli_exit_code()).ok()
 }
 
@@ -18373,6 +18375,13 @@ mod mob_typed_exit_tests {
             actual: meerkat_mob::FenceToken::new(1),
         });
         assert_eq!(mob_exit_code(&stale_fence), Some(48));
+
+        let stale_delivery_scope = mob_anyhow(meerkat_mob::MobError::StaleDeliveryScope {
+            agent_identity: meerkat_mob::AgentIdentity::from("worker"),
+            expected_session: meerkat_core::types::SessionId::new(),
+            actual_session: None,
+        });
+        assert_eq!(mob_exit_code(&stale_delivery_scope), Some(56));
 
         // Unmapped mob errors keep EXIT_ERROR (None here ⇒ 1 at the mapper).
         let not_found = mob_anyhow(meerkat_mob::MobError::MobNotFound(
@@ -27098,6 +27107,80 @@ default_model = "gemma"
                 .map(std::ffi::OsString::from)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_normalize_cli_args_as_agent_before_the_command() {
+        // `--as-agent` is a root option with a value: in front of a command
+        // name it must not turn that command into the prompt.
+        let cases: [(&[&str], &[&str]); 4] = [
+            (
+                &["rkat", "--as-agent", "agent-a", "realm", "list"],
+                &["rkat", "--as-agent", "agent-a", "realm", "list"],
+            ),
+            (
+                &["rkat", "--as-agent=agent-a", "realm", "list"],
+                &["rkat", "--as-agent=agent-a", "realm", "list"],
+            ),
+            (
+                &[
+                    "rkat",
+                    "--realm",
+                    "team",
+                    "--as-agent",
+                    "agent-a",
+                    "run",
+                    "hi",
+                ],
+                &[
+                    "rkat",
+                    "--realm",
+                    "team",
+                    "--as-agent",
+                    "agent-a",
+                    "run",
+                    "hi",
+                ],
+            ),
+            (
+                &["rkat", "--as-agent", "agent-a", "hi"],
+                &["rkat", "--as-agent", "agent-a", "run", "hi"],
+            ),
+        ];
+        for (argv, expected) in cases {
+            let args = normalize_cli_args(argv.iter().copied().map(Into::into));
+            assert_eq!(
+                args,
+                expected
+                    .iter()
+                    .copied()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>(),
+                "{argv:?}"
+            );
+        }
+
+        #[cfg(feature = "local-authorization")]
+        {
+            let cli = Cli::try_parse_from(normalize_cli_args(
+                [
+                    "rkat",
+                    "--realm",
+                    "team",
+                    "--as-agent",
+                    "agent-a",
+                    "run",
+                    "hi",
+                ]
+                .map(Into::into),
+            ))
+            .expect("root-position --as-agent parses");
+            assert_eq!(cli.as_agent.as_deref(), Some("agent-a"));
+            match cli.command.expect("test invocation parses a subcommand") {
+                Commands::Run { prompt, .. } => assert_eq!(prompt, "hi"),
+                _ => unreachable!("expected run command"),
+            }
+        }
     }
 
     #[test]

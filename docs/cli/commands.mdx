@@ -732,10 +732,11 @@ Multi-host notes:
   `live/webrtc/answer` supports WebRTC only when the caller can address the
   owning session directly. Controller `session/*` methods do not proxy a
   placed member's host-local session in multi-host v1.
-- Mob verbs exit with typed codes for the four multi-host error classes:
-  scope denied `45`, host unavailable `46`, stale cursor `47`, stale fence
-  `48`, each with a one-line `detail: {...}` JSON rendering on stderr.
-  Everything else keeps the generic exit `1`.
+- Mob verbs exit with typed codes: scope denied `45`, host unavailable
+  `46`, stale cursor `47`, stale fence `48`, and stale delivery scope `56`
+  (the member's session rotated under a still-current fence; capture the
+  delivery scope again), each with a one-line `detail: {...}` JSON rendering
+  on stderr. Everything else keeps the generic exit `1`.
 - Durable member role migration is not a CLI spawn option. The one-shot
   `resume_from_role` declaration is restricted to trusted in-process
   `SpawnMemberSpec` construction and the private member-host materialization
