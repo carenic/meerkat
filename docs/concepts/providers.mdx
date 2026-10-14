@@ -48,7 +48,8 @@ exists, the CLI can replace a built-in OAuth binding's `default_model` with
 the login route's current default: the provider's catalog default, except
 `google_oauth` (the Google Code Assist route), which uses `gemini-3.8-flash`
 because the catalog's Gemini default is not verified on Code Assist. A new
-`rkat login google` binding also starts on `gemini-3.8-flash`. This applies
+`rkat login google` binding also starts on `gemini-3.8-flash`, as does the
+`copilot_gemini` route binding that `rkat login copilot` creates. This applies
 only to the following reserved `global` binding/backend/auth profile IDs and
 frozen legacy values:
 
