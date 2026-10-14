@@ -141,9 +141,25 @@ fn test_client_shim_requested() -> bool {
 """
 
 # An ungated read spelled with an escape is still the hook's name.
+# Ungated reads spelled with escapes are still the hook's name, beside a
+# test-gated plain occurrence; a Unicode escape may put any number of
+# underscores after each of its hex digits.
 ESCAPED_UNGATED_READ_FACTORY = """
 fn test_client_shim_requested() -> bool {
     std::env::var("RKAT\\x5fTEST_CLIENT").ok().as_deref() == Some("1")
+        || std::env::var("RKAT\\u{5_______f}TEST_CLIENT").is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    const SHIM: &str = "RKAT_TEST_CLIENT";
+}
+"""
+
+# A literal whose escape the check cannot decode might spell the hook's name.
+UNDECODABLE_LITERAL_FACTORY = GATED_FACTORY + """
+fn other() -> &'static str {
+    "RKAT\\u{_5f}TEST_CLIENT"
 }
 """
 
@@ -259,6 +275,14 @@ class SourceTestHookCheckTests(unittest.TestCase):
         result = self.check(sha)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn(f'{FACTORY}:3 at {sha} reads "RKAT_TEST_CLIENT" in release builds', result.stderr)
+        self.assertIn(f'{FACTORY}:4 at {sha} reads "RKAT_TEST_CLIENT" in release builds', result.stderr)
+        self.assertNotIn(f"{FACTORY}:9 ", result.stderr)
+
+    def test_undecodable_literal_fails_closed(self) -> None:
+        sha = self.commit({FACTORY: UNDECODABLE_LITERAL_FACTORY, OAUTH: GATED_OAUTH})
+        result = self.check(sha)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"{FACTORY}:16 at {sha} has a string literal whose escapes this check cannot decode", result.stderr)
 
     def test_ungated_raw_oauth_reads_fail_beside_gated_plain_ones(self) -> None:
         sha = self.commit({FACTORY: GATED_FACTORY, OAUTH: RAW_UNGATED_OAUTH})

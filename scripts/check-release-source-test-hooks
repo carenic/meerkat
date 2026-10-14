@@ -44,47 +44,60 @@ GATE_NAMES = {"debug_assertions", "test"}
 NEGATION = re.compile(r"not\((?:[^()]|\([^()]*\))*\)")
 RAW_STRING_START = re.compile(r'[bc]?r(#*)"')
 SIMPLE_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "0": "\0", "\\": "\\", '"': '"', "'": "'"}
+# Rust's Unicode escape body: 1 to 6 hex digits, each followed by any
+# number of underscores (Rust Reference, tokens).
+UNICODE_ESCAPE = re.compile(r"\{((?:[0-9A-Fa-f]_*){1,6})\}")
 IDENTIFIER_CHAR = re.compile(r"[A-Za-z0-9_]")
 
 
-def unescape(body: str) -> str:
-    """The value of an ordinary string literal's body; an escape it cannot
-    decode stays as written."""
+def unescape(body: str, byte_string: bool = False) -> str | None:
+    """The value of an ordinary (or byte or C) string literal's body, or
+    None when it holds an escape this check cannot decode: such a literal
+    fails the check rather than drop out of the comparison."""
     value = []
     index = 0
     while index < len(body):
         char = body[index]
-        if char != "\\" or index + 1 >= len(body):
+        if char != "\\":
             value.append(char)
             index += 1
             continue
-        escape = body[index + 1]
+        escape = body[index + 1:index + 2]
         if escape in SIMPLE_ESCAPES:
             value.append(SIMPLE_ESCAPES[escape])
             index += 2
-        elif escape == "\n":
+        elif escape == "\n" or body.startswith("\r\n", index + 1):
             # A line continuation skips the newline and leading whitespace.
             index += 2
             while index < len(body) and body[index] in " \t\r\n":
                 index += 1
-        elif escape == "x" and re.fullmatch(r"[0-7][0-9A-Fa-f]", body[index + 2:index + 4]):
-            value.append(chr(int(body[index + 2:index + 4], 16)))
+        elif escape == "x":
+            digits = body[index + 2:index + 4]
+            pattern = r"[0-9A-Fa-f]{2}" if byte_string else r"[0-7][0-9A-Fa-f]"
+            if not re.fullmatch(pattern, digits):
+                return None
+            value.append(chr(int(digits, 16)))
             index += 4
-        elif escape == "u" and (match := re.match(r"\{([0-9A-Fa-f_]{1,8})\}", body[index + 2:])):
-            value.append(chr(int(match.group(1).replace("_", ""), 16)))
-            index += 2 + match.end()
+        elif escape == "u" and not byte_string:
+            match = UNICODE_ESCAPE.match(body, index + 2)
+            if not match:
+                return None
+            code = int(match.group(1).replace("_", ""), 16)
+            if code > 0x10FFFF or 0xD800 <= code <= 0xDFFF:
+                return None
+            value.append(chr(code))
+            index = match.end()
         else:
-            value.append(char)
-            index += 1
+            return None
     return "".join(value)
 
 
-def lex(text: str) -> tuple[list[bool], list[tuple[int, str]]]:
+def lex(text: str) -> tuple[list[bool], list[tuple[int, str | None]]]:
     """Which lines begin in code rather than inside a string literal or block
     comment, and the value of every string literal, plain or raw, as (line
-    index, value)."""
+    index, value); the value is None when an escape cannot be decoded."""
     in_code = [True]
-    strings: list[tuple[int, str]] = []
+    strings: list[tuple[int, str | None]] = []
     index, end = 0, len(text)
 
     def skip_to(stop: int) -> None:
@@ -123,7 +136,12 @@ def lex(text: str) -> tuple[list[bool], list[tuple[int, str]]]:
             cursor = index + 1
             while cursor < end and text[cursor] != '"':
                 cursor += 2 if text[cursor] == "\\" else 1
-            strings.append((len(in_code) - 1, unescape(text[index + 1:cursor])))
+            byte_string = (
+                index > 0
+                and text[index - 1] in "bc"
+                and (index < 2 or not IDENTIFIER_CHAR.match(text[index - 2]))
+            )
+            strings.append((len(in_code) - 1, unescape(text[index + 1:cursor], byte_string)))
             skip_to(min(cursor + 1, end))
         elif char == "'":
             if text.startswith("\\", index + 1):
@@ -228,6 +246,15 @@ def main() -> int:
             continue
         lines = shown.stdout.split("\n")
         in_code, strings = lex(shown.stdout)
+        undecodable = sorted({number for number, content in strings if content is None})
+        for number in undecodable:
+            print(
+                f"error: {path}:{number + 1} at {commit} has a string literal whose escapes this check "
+                f"cannot decode, so it cannot tell whether it reads {literal}",
+                file=sys.stderr,
+            )
+        if undecodable:
+            failed = True
         found = sorted({number for number, content in strings if content == name})
         if not found:
             print(f"error: {path} at {commit} no longer reads {literal}; the hook moved, update this check", file=sys.stderr)
