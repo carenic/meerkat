@@ -4,9 +4,17 @@ import asyncio
 
 import base64
 import json
+import sys
 from dataclasses import MISSING, replace
 from pathlib import Path
-from typing import Literal, get_args, get_origin, get_type_hints
+from typing import Literal, get_args, get_origin
+
+# Python 3.10's get_type_hints keeps the typing_extensions Required/NotRequired
+# qualifiers that 3.11+ strips.
+if sys.version_info >= (3, 11):
+    from typing import get_type_hints
+else:
+    from typing_extensions import get_type_hints
 
 import pytest
 
@@ -6608,7 +6616,7 @@ def test_generated_wire_live_continuity_mode_is_tagged_union():
     can narrow on the discriminator. The `provider_native_resume` variant
     additionally carries `provider_session_id: str`.
     """
-    from typing import Literal, get_args, get_type_hints
+    from typing import Literal, get_args
 
     from meerkat.types import (
         WireLiveContinuityModeDegraded,
@@ -6640,8 +6648,6 @@ def test_generated_live_open_result_references_typed_capabilities_and_continuity
     access to image_in / video_in (via `WireLiveChannelCapabilities`) and
     can route on `result.continuity["mode"]` without parsing raw JSON.
     """
-    from typing import get_type_hints
-
     from meerkat.types import (
         LiveOpenResult,
         WireLiveChannelCapabilities,
@@ -6665,7 +6671,6 @@ def test_generated_live_send_input_params_chunk_is_typed_union():
     the `LiveSendInputParams` dataclass references the typed union by name.
     """
     from dataclasses import fields
-    from typing import get_type_hints
 
     from meerkat.types import (
         LiveInputChunkWire,
@@ -6743,7 +6748,7 @@ def test_generated_wire_live_adapter_observation_is_typed_union():
     `observation` discriminator and read the typed payload fields with
     static-checker support.
     """
-    from typing import get_args, get_type_hints
+    from typing import get_args
 
     from meerkat.types import (
         WireLiveAdapterErrorCode,
@@ -6924,8 +6929,6 @@ def test_generated_wire_assistant_block_variant_data_is_typed_typeddict():
       ``meta`` is ``NotRequired`` (matches the JSON-schema `required`
       list and prevents regression to the pre-R7-1 opaque-dict shape).
     """
-    from typing import get_type_hints
-
     from meerkat.generated.types import (
         WireAssistantBlockImage,
         WireAssistantBlockImageData,
@@ -8236,7 +8239,6 @@ def test_operation_observation_diagnostic_is_known_and_retains_exact_payload():
 def test_wire_tool_result_retains_typed_observation_settlement_companions():
     from dataclasses import asdict
     import json
-    from typing import get_type_hints
     from meerkat.generated import types as generated
 
     hints = get_type_hints(generated.WireToolResult)

@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, NotRequired, Optional, Required, TypeGuard, TypedDict
+import sys
+from typing import Any, Literal, Optional, TypeGuard
+
+if sys.version_info >= (3, 11):
+    from typing import NotRequired, Required, TypedDict
+else:
+    from typing_extensions import NotRequired, Required, TypedDict
 
 
 class WireScopeDeniedDetail(TypedDict, total=False):

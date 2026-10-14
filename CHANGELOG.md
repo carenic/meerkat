@@ -35,6 +35,17 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- Python and TypeScript SDK `comms/send` now accept the `delivery` outcome the
+  server returns on every peer send kind; previously `peer_request`,
+  `peer_response` and `peer_lifecycle` sends, and non-acked `peer_message`
+  deliveries, raised `INVALID_RESPONSE` after the send had already happened.
+- Python SDK: `import meerkat` works on Python 3.10, the declared minimum. It
+  imported `NotRequired` and `Required` from `typing`, which has them only from
+  3.11; on 3.10 they now come from `typing_extensions>=4.1`, a new dependency
+  there only.
+
 ## [0.9.0] - 2026-10-13
 
 ### Breaking

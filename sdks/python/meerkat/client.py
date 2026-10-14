@@ -25,6 +25,7 @@ import logging
 import os
 import platform
 import shutil
+import sys
 import tarfile
 import tempfile
 import urllib.request
@@ -32,8 +33,14 @@ import warnings
 import zipfile
 from dataclasses import fields, is_dataclass
 from pathlib import Path
-from typing import Any, Callable, Literal, NotRequired, TypedDict, cast, get_args, get_origin
+from typing import Any, Callable, Literal, cast, get_args, get_origin
 from urllib.error import URLError
+
+# Python 3.10 has no typing.NotRequired, and its TypedDict ignores it.
+if sys.version_info >= (3, 11):
+    from typing import NotRequired, TypedDict
+else:
+    from typing_extensions import NotRequired, TypedDict
 
 from .errors import CapabilityUnavailableError, MeerkatError
 from .event_envelope import parse_agent_event_envelope
@@ -424,6 +431,13 @@ _MOB_CONTROL_SCOPES = frozenset(
         "admin_grants",
     }
 )
+
+# `delivery` on every peer `comms/send` receipt is the server's
+# `PeerDeliveryOutcome` (crates/meerkat-core/src/comms.rs): a unit variant is
+# its snake_case name, and `durably_resolved` carries the receiver's
+# `PeerIngressTerminalOutcomeKind` (crates/meerkat-core/src/interaction.rs).
+_PEER_DELIVERY_UNIT_OUTCOMES = frozenset({"acked", "volatile_handed_off", "queued"})
+_PEER_INGRESS_TERMINAL_OUTCOMES = frozenset({"accepted", "deduplicated", "rejected"})
 
 RenderClass = Literal[
     "user_prompt",
@@ -7539,6 +7553,42 @@ class MeerkatClient:
         return value
 
     @staticmethod
+    def _require_peer_delivery_outcome(raw: dict[str, Any], context: str) -> None:
+        """Validate ``delivery`` on a peer ``comms/send`` receipt.
+
+        Accepts exactly one ``PeerDeliveryOutcome`` form: a unit variant name
+        or ``{"durably_resolved": {"outcome": <terminal outcome>}}``. Mirrors
+        the TypeScript SDK ``requirePeerDeliveryOutcome``.
+        """
+        if "delivery" not in raw:
+            raise MeerkatError("INVALID_RESPONSE", f"{context}: missing delivery")
+        delivery = raw["delivery"]
+        if isinstance(delivery, str):
+            if delivery not in _PEER_DELIVERY_UNIT_OUTCOMES:
+                raise MeerkatError("INVALID_RESPONSE", f"{context}: invalid delivery")
+            return
+        if not isinstance(delivery, dict) or set(delivery) != {"durably_resolved"}:
+            raise MeerkatError("INVALID_RESPONSE", f"{context}: invalid delivery")
+        resolved = delivery["durably_resolved"]
+        if not isinstance(resolved, dict):
+            raise MeerkatError(
+                "INVALID_RESPONSE", f"{context}: invalid delivery.durably_resolved"
+            )
+        unknown = set(resolved) - {"outcome"}
+        if unknown:
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                f"{context}: unknown field delivery.durably_resolved."
+                f"{sorted(unknown)[0]}",
+            )
+        outcome = resolved.get("outcome")
+        if not isinstance(outcome, str) or outcome not in _PEER_INGRESS_TERMINAL_OUTCOMES:
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                f"{context}: invalid delivery.durably_resolved.outcome",
+            )
+
+    @staticmethod
     def _parse_comms_send_result(raw: Any) -> CommsSendResult:
         context = "Invalid comms/send response"
         result = MeerkatClient._require_dict(raw, "result", context)
@@ -7548,15 +7598,10 @@ class MeerkatClient:
             allowed = {"kind", "interaction_id", "stream_reserved"}
             MeerkatClient._require_string_field(result, "interaction_id", context)
             MeerkatClient._require_bool_field(result, "stream_reserved", context)
-        elif kind == "peer_message_sent":
+        elif kind in {"peer_message_sent", "peer_lifecycle_sent"}:
             allowed = {"kind", "envelope_id", "delivery"}
             MeerkatClient._require_string_field(result, "envelope_id", context)
-            delivery = MeerkatClient._require_string_field(result, "delivery", context)
-            if delivery not in {"acked", "handed_off", "queued"}:
-                raise MeerkatError("INVALID_RESPONSE", f"{context}: invalid delivery")
-        elif kind == "peer_lifecycle_sent":
-            allowed = {"kind", "envelope_id"}
-            MeerkatClient._require_string_field(result, "envelope_id", context)
+            MeerkatClient._require_peer_delivery_outcome(result, context)
         elif kind == "peer_request_sent":
             allowed = {
                 "kind",
@@ -7564,15 +7609,18 @@ class MeerkatClient:
                 "interaction_id",
                 "request_id",
                 "stream_reserved",
+                "delivery",
             }
             MeerkatClient._require_string_field(result, "envelope_id", context)
             MeerkatClient._require_string_field(result, "interaction_id", context)
             MeerkatClient._require_string_field(result, "request_id", context)
             MeerkatClient._require_bool_field(result, "stream_reserved", context)
+            MeerkatClient._require_peer_delivery_outcome(result, context)
         elif kind == "peer_response_sent":
-            allowed = {"kind", "envelope_id", "in_reply_to"}
+            allowed = {"kind", "envelope_id", "in_reply_to", "delivery"}
             MeerkatClient._require_string_field(result, "envelope_id", context)
             MeerkatClient._require_string_field(result, "in_reply_to", context)
+            MeerkatClient._require_peer_delivery_outcome(result, context)
         else:
             raise MeerkatError("INVALID_RESPONSE", f"{context}: invalid kind")
         unknown = set(result) - allowed
