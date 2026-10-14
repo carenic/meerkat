@@ -10,6 +10,72 @@ use meerkat_core::model_profile::catalog::{ModelReleaseStage, ModelTier};
 
 /// Capability rows for Gemini catalog models.
 pub const CAPABILITIES: &[ModelCapabilities] = &[
+    // Gemini 4 Argon
+    //
+    // Sources:
+    //   - Model page:
+    //     https://ai.google.dev/gemini-api/docs/models/gemini-4-argon
+    //     (stable; text, image, video, audio and PDF input, text output;
+    //      1,048,576-token context window shared by input, thinking and
+    //      output; max output 65,536 synchronous, up to 1,048,576 only with
+    //      long decode; implicit caching only, explicit caching is not
+    //      supported; function calling, structured outputs and Search
+    //      grounding supported; Live API and image generation not supported)
+    //   - Latest model guide:
+    //     https://ai.google.dev/gemini-api/docs/latest-model
+    //     (GA 2026-10-13, paid tier only; thinking_level low/medium/high with
+    //      default "medium" and no way to disable thinking; temperature,
+    //      top_p and top_k are ignored if sent; raise max_output_tokens to at
+    //      least 32,768; set HTTP client timeouts to at least 15 minutes)
+    //   - Thinking:
+    //     https://ai.google.dev/gemini-api/docs/thinking
+    //     (levels low/medium/high; synchronous max_output_tokens cap 65,536)
+    //
+    // Long decode beyond 65,536 output tokens needs background execution on
+    // the Interactions API, which Meerkat does not use, so max_output_tokens
+    // is the synchronous cap. Thinking budgets are not documented for this
+    // model (thinking_level only). call_timeout_secs follows Google's
+    // 15-minute client-timeout guidance.
+    ModelCapabilities {
+        id: "gemini-4-argon",
+        provider: Provider::Gemini,
+        display_name: "Gemini 4 Argon",
+        tier: ModelTier::Recommended,
+        release_stage: ModelReleaseStage::Stable,
+        model_family: "gemini-4",
+        context_window: Some(1_048_576),
+        max_input_tokens: None,
+        max_output_tokens: Some(65_536),
+        context_window_beta: None,
+        max_output_tokens_beta: None,
+        vision: true,
+        image_tool_results: true,
+        inline_video: true,
+        realtime: false,
+        realtime_supports_provider_managed_turns: false,
+        realtime_supports_explicit_commit: false,
+        realtime_interrupt_supported: false,
+        realtime_transcript_supported: false,
+        transcription_companion_model: None,
+        image_generation: false,
+        supports_temperature: false,
+        supports_top_p: false,
+        supports_top_k: false,
+        thinking: ThinkingSupport::GeminiThinkingLevel,
+        supports_reasoning: false,
+        effort_levels: &[],
+        openai_responses_params: None,
+        supports_web_search: true,
+        supports_mid_conversation_system_messages: false,
+        supports_inference_geo: false,
+        supports_compaction: false,
+        supports_structured_output: true,
+        supports_legacy_penalties: false,
+        supports_thinking_budget_legacy: false,
+        beta_headers: &[],
+        call_timeout_secs: Some(900),
+        supports_forced_tool_choice: true,
+    },
     // Gemini 3.8 Flash
     //
     // Sources:

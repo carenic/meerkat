@@ -881,6 +881,54 @@ fn gemini_38_and_37_capability_rows_match_the_current_flash_contract() {
 }
 
 #[test]
+fn gemini_4_argon_capability_row_matches_the_official_model_page() {
+    let caps = capabilities_for(Provider::Gemini, "gemini-4-argon")
+        .expect("gemini-4-argon must be in the Gemini catalog");
+    assert_eq!(caps.provider, Provider::Gemini);
+    assert_eq!(caps.display_name, "Gemini 4 Argon");
+    assert_eq!(caps.tier, ModelTier::Recommended);
+    assert_eq!(caps.model_family, "gemini-4");
+    assert_eq!(
+        caps.context_window,
+        Some(1_048_576),
+        "input, thinking and output share one 1,048,576-token window"
+    );
+    assert_eq!(caps.max_input_tokens, None);
+    assert_eq!(
+        caps.max_output_tokens,
+        Some(65_536),
+        "synchronous output cap; longer output needs Interactions background mode"
+    );
+    assert_eq!(caps.thinking, ThinkingSupport::GeminiThinkingLevel);
+    assert!(
+        !caps.supports_temperature && !caps.supports_top_p && !caps.supports_top_k,
+        "Gemini 4 Argon ignores sampling parameters"
+    );
+    assert!(
+        !caps.supports_thinking_budget_legacy,
+        "Gemini 4 Argon documents thinking_level only"
+    );
+    assert!(caps.vision);
+    assert!(caps.image_tool_results);
+    assert!(caps.inline_video);
+    assert!(!caps.realtime, "the Live API does not serve Gemini 4 Argon");
+    assert!(!caps.image_generation);
+    assert!(caps.supports_structured_output);
+    assert!(caps.supports_web_search);
+    assert!(caps.supports_forced_tool_choice);
+    assert_eq!(
+        caps.call_timeout_secs,
+        Some(900),
+        "Google asks for client timeouts of at least 15 minutes"
+    );
+    assert_eq!(infer_provider("gemini-4-argon"), Some(Provider::Gemini));
+    assert!(
+        allowed_models(Provider::Gemini).any(|id| id == "gemini-4-argon"),
+        "gemini-4-argon must be in the Gemini allowlist"
+    );
+}
+
+#[test]
 fn claude_opus_5_capability_row_mirrors_the_claude_5_generation() {
     let caps = capabilities_for(Provider::Anthropic, "claude-opus-5")
         .expect("claude-opus-5 must be in the Anthropic catalog");

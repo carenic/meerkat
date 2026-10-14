@@ -3945,6 +3945,34 @@ mod tests {
         Ok(())
     }
 
+    /// Gemini 4 Argon ignores sampling parameters, does not support explicit
+    /// context caching, and thinks at its default level (`medium`) unless the
+    /// caller picks one: a default request carries none of those fields and
+    /// keeps the caller's output budget.
+    #[test]
+    fn test_gemini_4_argon_default_request_sends_no_sampling_caching_or_thinking_override()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let client = GeminiClient::new("test-key".to_string());
+        let mut request = LlmRequest::new(
+            "gemini-4-argon",
+            vec![Message::User(UserMessage::text("test".to_string()))],
+        );
+        request.max_tokens = 65_536;
+
+        let body = client.build_request_body(&request)?;
+        let generation_config = body.get("generationConfig").ok_or("missing config")?;
+
+        assert_eq!(generation_config["maxOutputTokens"], 65_536);
+        for field in ["temperature", "topP", "topK", "thinkingConfig"] {
+            assert!(
+                generation_config.get(field).is_none(),
+                "{field} must not be sent by default: {body}"
+            );
+        }
+        assert!(body.get("cachedContent").is_none(), "{body}");
+        Ok(())
+    }
+
     #[test]
     fn test_build_request_body_with_cached_content_name() -> Result<(), Box<dyn std::error::Error>>
     {
