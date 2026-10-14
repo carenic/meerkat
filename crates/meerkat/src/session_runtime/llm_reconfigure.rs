@@ -855,6 +855,27 @@ impl SessionRuntimeLlmReconfigureHost {
         Ok(registry.profile_for_identity(&config, identity))
     }
 
+    /// `target_identity` with the capability surface its backend serves.
+    async fn resolved_reconfigure_target(
+        &self,
+        target_identity: SessionLlmIdentity,
+    ) -> Result<ResolvedSessionLlmReconfigure, RuntimeDriverError> {
+        let profile = self
+            .profile_for_identity(&target_identity)
+            .await?
+            .ok_or_else(|| RuntimeDriverError::ValidationFailed {
+                reason: format!(
+                    "no capability profile is registered for provider '{}' and model '{}'",
+                    target_identity.provider.as_str(),
+                    target_identity.model
+                ),
+            })?;
+        Ok(ResolvedSessionLlmReconfigure {
+            target_identity,
+            target_capability_surface: profile_to_capability_surface(&profile),
+        })
+    }
+
     async fn hydrate_staged_session_llm_state(
         &self,
         session_id: &SessionId,
@@ -1155,21 +1176,40 @@ impl SessionLlmReconfigureHost for SessionRuntimeLlmReconfigureHost {
         let target_identity = self
             .resolve_target_llm_identity(current_identity, request)
             .await?;
-        let profile = self
-            .profile_for_identity(&target_identity)
-            .await?
-            .ok_or_else(|| RuntimeDriverError::ValidationFailed {
-                reason: format!(
-                    "no capability profile is registered for provider '{}' and model '{}'",
-                    target_identity.provider.as_str(),
-                    target_identity.model
-                ),
-            })?;
+        self.resolved_reconfigure_target(target_identity).await
+    }
 
-        Ok(ResolvedSessionLlmReconfigure {
-            target_identity,
-            target_capability_surface: profile_to_capability_surface(&profile),
-        })
+    async fn resolve_target_session_llm_identity_for_session(
+        &self,
+        session_id: &SessionId,
+        request: &SessionLlmReconfigureRequest,
+        current_identity: &SessionLlmIdentity,
+    ) -> Result<ResolvedSessionLlmReconfigure, RuntimeDriverError> {
+        let mut target_identity = self
+            .resolve_target_llm_identity(current_identity, request)
+            .await?;
+        // A target that names no binding is served by the candidate the
+        // session's client resolution selects: the resolution the apply runs.
+        // That backend can only narrow the model's row, and only its
+        // `supports_mid_conversation_system_messages`
+        // (`ModelRegistry::profile_for_identity`). When the row admits it,
+        // name the selected binding here, as the apply would, so the
+        // capability planned and admitted is that backend's (the ChatGPT
+        // backend refuses the later System row a public binding carried).
+        // When the row refuses it, every binding plans the same surface and
+        // the apply names the binding as before.
+        if target_identity.auth_binding.is_none()
+            && self
+                .profile_for_identity(&target_identity)
+                .await?
+                .is_some_and(|profile| profile.supports_mid_conversation_system_messages)
+        {
+            let (_adapter, selection) = self
+                .build_adapter_for_session_llm_identity(session_id, &target_identity)
+                .await?;
+            LlmCredentialSelection::bind_unselected(selection, &mut target_identity);
+        }
+        self.resolved_reconfigure_target(target_identity).await
     }
 
     async fn preflight_target_session_llm_identity(

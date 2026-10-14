@@ -23688,6 +23688,232 @@ mod tests {
         }
     }
 
+    /// The `global` realm (the head an identity naming no binding resolves
+    /// on) with a public OpenAI API binding (`public`) beside the
+    /// ChatGPT-backend one (`chatgpt`); `default_binding` names the one such
+    /// an identity selects.
+    fn config_with_public_and_chatgpt_bindings(default_binding: &str) -> meerkat_core::Config {
+        let mut config = config_with_chatgpt_backend_binding();
+        let mut section = config.realm.remove("dev").expect("dev realm");
+        section.backend.insert(
+            "openai_api".into(),
+            meerkat_core::BackendProfileConfig {
+                provider: "openai".into(),
+                backend_kind: meerkat_core::provider_matrix::OpenAiBackendKind::OpenAiApi
+                    .as_str()
+                    .into(),
+                base_url: None,
+                options: serde_json::Value::Null,
+                server: None,
+            },
+        );
+        section.auth.insert(
+            "openai_key".into(),
+            meerkat_core::AuthProfileConfig {
+                provider: "openai".into(),
+                auth_method: meerkat_core::provider_matrix::OpenAiAuthMethod::ApiKey
+                    .as_str()
+                    .into(),
+                source: meerkat_core::CredentialSourceSpec::InlineSecret {
+                    secret: "sk-public-test".into(),
+                },
+                constraints: Default::default(),
+                metadata_defaults: Default::default(),
+            },
+        );
+        section.binding.insert(
+            "public".into(),
+            meerkat_core::ProviderBindingConfig {
+                backend_profile: "openai_api".into(),
+                auth_profile: "openai_key".into(),
+                credential_account: None,
+                default_model: None,
+                policy: Default::default(),
+                provider_default: false,
+            },
+        );
+        section.default_binding = Some(default_binding.into());
+        config.realm.insert("global".into(), section);
+        config
+    }
+
+    /// A public-API OpenAI session that holds an instruction activation, then
+    /// a hot swap that clears its binding, so the binding the session's client
+    /// resolution selects (the realm's `default_binding`) serves it. Returns
+    /// the hot swap's result, the identity before it and the identity after.
+    async fn clear_binding_hot_swap_with_a_recorded_activation(
+        default_binding: &str,
+    ) -> (Result<(), RpcError>, SessionLlmIdentity, SessionLlmIdentity) {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config_with_public_and_chatgpt_bindings(default_binding);
+        let token_store = Arc::new(meerkat_providers::auth_store::EphemeralTokenStore::new());
+        let factory = temp_factory(&temp).with_provider_auth_persistence(
+            meerkat_providers::auth_store::ProviderAuthPersistence::new(
+                token_store.clone(),
+                Arc::new(meerkat_providers::auth_store::InMemoryCoordinator::new()),
+            ),
+        );
+        let runtime = make_runtime_with_config(factory, 10, config.clone());
+        runtime.set_config_runtime(Arc::new(meerkat_core::ConfigRuntime::new(
+            Arc::new(meerkat_core::MemoryConfigStore::new(
+                config,
+                meerkat_models::canonical(),
+            )),
+            temp.path().join("config_state.json"),
+        )));
+        // The ChatGPT binding holds a current login, so the resolution can
+        // select it.
+        let chatgpt = test_auth_binding("global", "chatgpt");
+        // Whole seconds: the store keeps token timestamps at that precision.
+        let now = chrono::Utc::now().timestamp();
+        let tokens = meerkat_providers::auth_store::PersistedTokens {
+            auth_mode: meerkat_providers::auth_store::PersistedAuthMode::ChatgptOauth,
+            primary_secret: Some("chatgpt-access".into()),
+            refresh_token: Some("chatgpt-refresh".into()),
+            id_token: None,
+            expires_at: chrono::DateTime::from_timestamp(now + 3600, 0),
+            last_refresh: chrono::DateTime::from_timestamp(now, 0),
+            scopes: Vec::new(),
+            account_id: Some("acct-1".into()),
+            metadata: serde_json::Value::Null,
+        };
+        // As a login does: acquire the lease, then persist the tokens marked
+        // with that acquisition.
+        let transition = meerkat_core::publish_token_lifecycle_acquired(
+            &runtime.generated_auth_lease_handle(),
+            &chatgpt,
+            &tokens,
+        )
+        .expect("the ChatGPT login is acquired");
+        let key = meerkat_providers::auth_store::TokenKey::from_auth_binding(&chatgpt);
+        let marked = meerkat_core::mark_tokens_lifecycle_published_for_transition(
+            &key,
+            &tokens,
+            &transition,
+        )
+        .expect("the login's tokens are marked");
+        token_store.save(&key, &marked).await.unwrap();
+        // What the scenario relies on: the ChatGPT binding resolves, so a
+        // target naming no binding can be served by it.
+        runtime
+            .llm_reconfigure_host()
+            .build_adapter_for_llm_identity(&SessionLlmIdentity {
+                model: "gpt-5.6-sol".to_string(),
+                provider: meerkat_core::Provider::OpenAI,
+                self_hosted_server_id: None,
+                provider_params: None,
+                auth_binding: Some(chatgpt.clone()),
+            })
+            .await
+            .expect("the ChatGPT binding resolves");
+
+        let build_config = AgentBuildConfig {
+            llm_client_override: Some(Arc::new(MockLlmClient)),
+            auth_binding: Some(test_auth_binding("global", "public")),
+            ..AgentBuildConfig::new("gpt-5.6-sol")
+        };
+        let session_id = runtime
+            .create_session(build_config, None, None, Vec::new())
+            .await
+            .unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(100);
+        runtime
+            .start_turn(
+                &session_id,
+                "Hello".into(),
+                event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let body = "Policy";
+        runtime
+            .activate_instruction(
+                &session_id,
+                InstructionActivationRequest {
+                    revision: meerkat_core::InstructionRevisionRef {
+                        namespace: meerkat_core::InstructionNamespace::new("app.example").unwrap(),
+                        key: meerkat_core::InstructionKey::new("primary").unwrap(),
+                        revision_id: meerkat_core::InstructionRevisionId::new("revision-1")
+                            .unwrap(),
+                        content_sha256: meerkat_core::InstructionContentDigest::for_body(body),
+                    },
+                    activation_id: meerkat_core::InstructionActivationId::new("activation-1")
+                        .unwrap(),
+                    expectation: meerkat_core::InstructionActivationExpectation::Absent,
+                    supersedes: None,
+                    body: body.to_string(),
+                },
+            )
+            .await
+            .expect("the public API carries the activation");
+
+        let before = runtime
+            .current_materialized_llm_identity(&session_id)
+            .await
+            .unwrap();
+        let swapped = runtime
+            .hot_swap_llm_client(
+                &session_id,
+                &crate::handlers::turn::TurnOverrides {
+                    auth_binding: Some(
+                        meerkat_core::lifecycle::run_primitive::TurnMetadataOverride::Clear,
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let after = runtime
+            .current_materialized_llm_identity(&session_id)
+            .await
+            .unwrap();
+        (swapped, before, after)
+    }
+
+    /// Clearing the binding of a session that holds an activation, when the
+    /// binding the resolution selects is the ChatGPT backend: the capability
+    /// of the backend that would serve the session refuses the swap before
+    /// anything changes.
+    #[tokio::test]
+    async fn a_binding_clear_onto_the_chatgpt_backend_is_refused_while_activations_are_recorded() {
+        let (swapped, before, after) =
+            clear_binding_hot_swap_with_a_recorded_activation("chatgpt").await;
+        let Err(error) = swapped else {
+            panic!(
+                "the swap was admitted onto {:?}, a backend that cannot carry the recorded activation",
+                after.auth_binding
+            );
+        };
+        assert!(
+            error
+                .message
+                .contains("cannot represent the ordered instruction activations"),
+            "unexpected reconfigure error: {error:?}"
+        );
+        assert_eq!(after, before, "a refused swap changes nothing");
+        assert_eq!(
+            after.auth_binding,
+            Some(test_auth_binding("global", "public"))
+        );
+    }
+
+    /// The control: clearing the binding onto a backend that carries the
+    /// activation is admitted, and the applied identity names that binding.
+    #[tokio::test]
+    async fn a_binding_clear_onto_a_backend_that_carries_activations_is_admitted() {
+        let (swapped, _before, after) =
+            clear_binding_hot_swap_with_a_recorded_activation("public").await;
+        swapped.expect("the public API carries the recorded activation");
+        assert_eq!(after.model, "gpt-5.6-sol");
+        assert_eq!(
+            after.auth_binding,
+            Some(test_auth_binding("global", "public"))
+        );
+    }
+
     #[tokio::test]
     async fn reconfigure_build_threads_auth_lease_for_managed_store_resolution() {
         let temp = tempfile::tempdir().unwrap();
