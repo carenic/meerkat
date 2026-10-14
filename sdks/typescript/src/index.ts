@@ -253,6 +253,7 @@ export type {
   TranscriptRewriteSelection,
   TranscriptToolResultContentBlockReplacement,
   TranscriptUserContentBlockReplacement,
+  TurnAuthBindingOverride,
   TurnOptions,
   TurnToolOverlay,
   UpdateSchedulePatch,

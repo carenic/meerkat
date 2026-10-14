@@ -665,7 +665,22 @@ export interface TurnOptions {
   readonly outputSchema?: Record<string, unknown>;
   readonly structuredOutputRetries?: number;
   readonly providerParams?: Record<string, unknown>;
+  /**
+   * Switch the session's credential binding from this turn on; omit it to
+   * keep the current one. See {@link TurnAuthBindingOverride}.
+   */
+  readonly authBinding?: TurnAuthBindingOverride;
 }
+
+/**
+ * Per-turn auth-binding override, the `turn/start` wire's Set/Clear
+ * tri-state: a binding ref (or `{ action: "set", value }`) switches the
+ * session to that binding, `{ action: "clear" }` drops the session's binding.
+ */
+export type TurnAuthBindingOverride =
+  | WireAuthBindingRef
+  | { readonly action: "set"; readonly value: WireAuthBindingRef }
+  | { readonly action: "clear" };
 
 export type EventSourceIdentity =
   | { readonly type: "session"; readonly sessionId: string }

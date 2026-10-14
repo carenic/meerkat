@@ -395,6 +395,33 @@ sources, pass any string (including ``""``) to set an explicit prompt, or pass
 ``{"action": "disable"}`` to suppress inherited prompt sources.
 """
 
+
+class AuthBindingOverrideSet(TypedDict):
+    """Switch the session to the binding in ``value``."""
+
+    action: Literal["set"]
+    value: WireAuthBindingRef | dict[str, str]
+
+
+class AuthBindingOverrideClear(TypedDict):
+    """Drop the session's binding."""
+
+    action: Literal["clear"]
+
+
+TurnAuthBindingOverride = (
+    WireAuthBindingRef
+    | dict[str, str]
+    | AuthBindingOverrideSet
+    | AuthBindingOverrideClear
+)
+"""Per-turn auth-binding override, the ``turn/start`` wire's Set/Clear tri-state.
+
+A binding ref (or :class:`AuthBindingOverrideSet`) switches the session to that
+binding from this turn on, :class:`AuthBindingOverrideClear` drops the
+session's binding, and omitting the argument keeps the current one.
+"""
+
 # Transcript history uses the generated wire projection rather than the
 # input-bearing block union above. History may carry structured/unknown blocks
 # and server-owned provenance that an input constructor does not expose.

@@ -431,8 +431,8 @@ interface SessionOptions {
 `injectedContext`, or `selfHostedServerId`: set injected context on deferred
 creation, and use `startTurn(...)` or `stream(...)` only with `skillRefs`,
 `turnToolOverlay`, `additionalInstructions`, `keepAlive`, `model`, `provider`,
-`maxTokens`, `systemPrompt`, `outputSchema`, `structuredOutputRetries`, and
-`providerParams`. Transient first-turn context and a self-hosted server route
+`maxTokens`, `systemPrompt`, `outputSchema`, `structuredOutputRetries`,
+`providerParams`, and `authBinding`. Transient first-turn context and a self-hosted server route
 are not expressible through the current deferred TypeScript wrapper.
 
 ---
@@ -493,6 +493,7 @@ async turn(
     outputSchema?: Record<string, unknown>;
     structuredOutputRetries?: number;
     providerParams?: Record<string, unknown>;
+    authBinding?: TurnAuthBindingOverride;
   },
 ): Promise<RunResult>
 ```
@@ -524,6 +525,7 @@ stream(
     outputSchema?: Record<string, unknown>;
     structuredOutputRetries?: number;
     providerParams?: Record<string, unknown>;
+    authBinding?: TurnAuthBindingOverride;
   },
 ): EventStream
 ```

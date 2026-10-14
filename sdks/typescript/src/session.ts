@@ -296,6 +296,7 @@ export interface DeferredTurnOptions {
   outputSchema?: TurnOptions["outputSchema"];
   structuredOutputRetries?: TurnOptions["structuredOutputRetries"];
   providerParams?: TurnOptions["providerParams"];
+  authBinding?: TurnOptions["authBinding"];
 }
 
 /**

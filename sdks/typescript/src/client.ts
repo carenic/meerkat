@@ -3993,6 +3993,7 @@ export class MeerkatClient {
       params.structured_output_retries = options.structuredOutputRetries;
     }
     if (options?.providerParams) params.provider_params = options.providerParams;
+    if (options?.authBinding != null) params.auth_binding = options.authBinding;
     const raw = await this.request("turn/start", params);
     return MeerkatClient.parseRunResult(raw);
   }
@@ -4047,6 +4048,7 @@ export class MeerkatClient {
       params.structured_output_retries = options.structuredOutputRetries;
     }
     if (options?.providerParams) params.provider_params = options.providerParams;
+    if (options?.authBinding != null) params.auth_binding = options.authBinding;
 
     const rpcRequest = { jsonrpc: "2.0", id: requestId, method: "turn/start", params };
     this.process.stdin!.write(JSON.stringify(rpcRequest) + "\n");
