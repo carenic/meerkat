@@ -576,6 +576,13 @@ mod tests {
         let prompt = help_session().system_prompt;
         assert!(prompt.starts_with(HELP_SYSTEM_PROMPT));
         assert!(!prompt.contains("[truncated]"));
+        // The whole help prompt stays within the help limit, so corpus growth
+        // fails here instead of truncating on a help surface.
+        assert!(
+            prompt.len() <= HELP_MIN_INJECTION_BYTES,
+            "the help prompt is {} bytes, over the {HELP_MIN_INJECTION_BYTES}-byte help limit",
+            prompt.len()
+        );
         for (key, body) in [
             (platform_skill_key(), MEERKAT_PLATFORM_SKILL_BODY),
             (cli_reference_skill_key(), MEERKAT_CLI_REFERENCE_SKILL_BODY),

@@ -14115,6 +14115,74 @@ mod tests {
         );
     }
 
+    /// `POST /help` runs with exactly the two read-only reference tools and
+    /// no live MCP adapter; an ordinary `POST /sessions` is unchanged and
+    /// keeps its adapter.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn test_help_route_runs_with_only_the_help_tools_and_no_live_mcp() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        async fn post(app: &axum::Router, uri: &str, body: serde_json::Value) -> serde_json::Value {
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                app.clone().oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                ),
+            )
+            .await
+            .expect("route timed out")
+            .unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{uri} failed: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        let temp = TempDir::new().unwrap();
+        let mut state = AppState::load_from(temp.path().to_path_buf())
+            .await
+            .unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        state.llm_client_override = Some(Arc::new(ScriptedStructuredOutputClient {
+            replies: vec!["ok", "ok"],
+            requests: Arc::clone(&requests),
+        }));
+        let app = router(state.clone());
+
+        let help = post(
+            &app,
+            "/help",
+            serde_json::json!({ "question": "How do I add an MCP server?" }),
+        )
+        .await;
+        let help_session = SessionId::parse(help["session_id"].as_str().unwrap()).unwrap();
+        let mut tools: Vec<String> = requests.lock().unwrap()[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        tools.sort();
+        assert_eq!(tools, ["skill_list_resources", "skill_read_resource"]);
+        assert!(!state.mcp_sessions.read().await.contains_key(&help_session));
+
+        let created = post(&app, "/sessions", serde_json::json!({ "prompt": "hello" })).await;
+        let session = SessionId::parse(created["session_id"].as_str().unwrap()).unwrap();
+        assert!(state.mcp_sessions.read().await.contains_key(&session));
+    }
+
     #[tokio::test]
     async fn test_create_session_route_completes_in_runtime_backed_mode() {
         use axum::body::Body;

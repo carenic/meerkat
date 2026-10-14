@@ -8033,27 +8033,29 @@ mod tests {
 
         assert!(response.error.is_none(), "help/ask failed: {response:?}");
         assert_eq!(result_value(&response)["text"], "Hello from mock");
-        let requests = recorded_requests
-            .lock()
-            .expect("recorded requests lock poisoned");
-        let system_prompt = system_prompt_from_request(
-            requests
-                .first()
-                .expect("help session should reach the LLM request"),
-        )
-        .expect("help session should include a system prompt");
-        assert!(system_prompt.contains("dedicated help surface"));
-        assert!(system_prompt.contains("meerkat-platform"));
-        assert!(system_prompt.contains("Meerkat Platform Guide"));
-        // Both help skills reach the model whole, past the 32 KiB that a
-        // preload is cut at.
-        for body in [
-            meerkat::help::MEERKAT_PLATFORM_SKILL_BODY,
-            meerkat::help::MEERKAT_CLI_REFERENCE_SKILL_BODY,
-        ] {
-            assert!(system_prompt.contains(body));
+        {
+            let requests = recorded_requests
+                .lock()
+                .expect("recorded requests lock poisoned");
+            let system_prompt = system_prompt_from_request(
+                requests
+                    .first()
+                    .expect("help session should reach the LLM request"),
+            )
+            .expect("help session should include a system prompt");
+            assert!(system_prompt.contains("dedicated help surface"));
+            assert!(system_prompt.contains("meerkat-platform"));
+            assert!(system_prompt.contains("Meerkat Platform Guide"));
+            // Both help skills reach the model whole, past the 32 KiB that a
+            // preload is cut at.
+            for body in [
+                meerkat::help::MEERKAT_PLATFORM_SKILL_BODY,
+                meerkat::help::MEERKAT_CLI_REFERENCE_SKILL_BODY,
+            ] {
+                assert!(system_prompt.contains(body));
+            }
+            assert!(!system_prompt.contains("[truncated]"));
         }
-        assert!(!system_prompt.contains("[truncated]"));
         // The session's only tools read the platform skill's references.
         let mut tools = recorded_tools
             .lock()
@@ -8063,6 +8065,47 @@ mod tests {
             .expect("help session should reach the LLM request");
         tools.sort();
         assert_eq!(tools, ["skill_list_resources", "skill_read_resource"]);
+
+        // The help session starts no live MCP router; an ordinary session on
+        // the same runtime is unchanged and still gets one.
+        #[cfg(feature = "mcp")]
+        {
+            let help_session = meerkat_core::SessionId::parse(
+                result_value(&response)["session_id"]
+                    .as_str()
+                    .expect("help/ask returns a session id"),
+            )
+            .expect("session id parses");
+            assert!(
+                !router
+                    .runtime()
+                    .has_live_mcp_session_for_testing(&help_session)
+                    .await
+            );
+            let created = router
+                .dispatch(make_request(
+                    "session/create",
+                    serde_json::json!({ "prompt": "hello" }),
+                ))
+                .await
+                .expect("session/create response");
+            assert!(
+                created.error.is_none(),
+                "session/create failed: {created:?}"
+            );
+            let session = meerkat_core::SessionId::parse(
+                result_value(&created)["session_id"]
+                    .as_str()
+                    .expect("session/create returns a session id"),
+            )
+            .expect("session id parses");
+            assert!(
+                router
+                    .runtime()
+                    .has_live_mcp_session_for_testing(&session)
+                    .await
+            );
+        }
     }
 
     #[cfg(feature = "mob")]

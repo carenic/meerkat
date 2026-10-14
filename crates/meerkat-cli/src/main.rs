@@ -108,7 +108,7 @@ const CLI_ABOUT: &str = "Run agent tasks and manage local Meerkat surfaces from 
 const ROOT_AFTER_HELP: &str = "Command groups:\n  Runtime:      run, help\n  Realm config: init, config, realm, auth\n  Utility:      session, blob, workgraph, models, capabilities, doctor, storage\n  Integrations: mcp, mob, skill (when compiled in)\n\nRealm defaults:\n  - context root: current directory, unless --context-root is supplied\n  - state root: <project-root>/.rkat/realms, where project root is the nearest ancestor containing .rkat (or the context root when none exists), unless --state-root is supplied\n  - realm id: workspace-derived ws-... unless --realm or --isolated is supplied\n\nExamples:\n  rkat \"summarize this repository\"\n  rkat help \"How do I add an mcp server?\"\n  cat story.txt | rkat \"summarize the story\"\n  git diff | rkat run \"review these changes\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nUse `rkat <command> -h` for the basic view and `rkat <command> --help` for all options. `rkat help <QUESTION>` answers usage questions with a model.";
 const HELP_AFTER_HELP: &str = "Examples:\n  rkat help \"How do I add an mcp server and schedule to remove it in 30 minutes\"\n  rkat help \"Use gemini with my vertex auth, load ~/codex/skills\" --prompt \"Write a match-3 game in Erlang\"\n\nFor the command reference, run `rkat --help` or `rkat <command> --help`.";
 
-const RUN_AFTER_HELP: &str = "Examples:\n  rkat run \"summarize this repository\"\n  cat story.txt | rkat run \"summarize the story\"\n  git diff | rkat run --json \"review these changes\"\n  rkat run --html \"make a visual explainer\"\n  rkat run --browser \"create an implementation plan\"\n  rkat run --resume \"keep going\"\n  rkat run --resume ~2 \"pick this thread back up\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nDefaults:\n  - realm state under <project-root>/.rkat/realms, using the nearest ancestor containing .rkat or the context root when none exists; use --verbose to print the active realm root\n  - `--tools safe`\n  - provider-native web search on for supporting models; use `--no-web-search` to disable\n  - stream on in a TTY, off in pipes/scripts\n  - piped stdin is read as blob context unless `--stdin lines` is set";
+const RUN_AFTER_HELP: &str = "Examples:\n  rkat run \"summarize this repository\"\n  cat story.txt | rkat run \"summarize the story\"\n  git diff | rkat run --json \"review these changes\"\n  rkat run --html \"make a visual explainer\"\n  rkat run --browser \"create an implementation plan\"\n  rkat run --resume last \"keep going\"\n  rkat run --resume ~2 \"pick this thread back up\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nDefaults:\n  - realm state under <project-root>/.rkat/realms, using the nearest ancestor containing .rkat or the context root when none exists; use --verbose to print the active realm root\n  - `--tools safe`\n  - provider-native web search on for supporting models; use `--no-web-search` to disable\n  - stream on in a TTY, off in pipes/scripts\n  - piped stdin is read as blob context unless `--stdin lines` is set";
 
 const DEFAULT_TRACE_FILTER: &str = "off";
 const VERBOSE_TRACE_FILTER: &str = "info";
@@ -2425,9 +2425,12 @@ enum AuthCommands {
     /// `global:default_<provider>`, for CI and scripted provisioning; it
     /// writes no binding config, so a matching binding must already exist.
     Login {
-        /// Provider: `anthropic`, `openai`, `gemini`, or `copilot` (GitHub
-        /// Copilot, interactive only). Prompted for when omitted; required
-        /// with --non-interactive.
+        /// Provider. Interactive login accepts `anthropic` (or `claude`,
+        /// `claude.ai`), `openai` (or `chatgpt`), `gemini` (or `google`,
+        /// `code_assist`) and `copilot` (or `github_copilot`, GitHub
+        /// Copilot). --non-interactive accepts `anthropic`, `openai` or
+        /// `gemini`. Prompted for when omitted; required with
+        /// --non-interactive.
         provider: Option<String>,
 
         /// With --non-interactive: the backend kind recorded with the stored
@@ -8228,13 +8231,13 @@ async fn interactive_login(
         eprintln!();
         print_warn(&format!("{env_var} is set in your environment."));
         print_hint(&format!(
-            "The env-var auth path will continue to handle `{cli_cmd} run` without"
+            "After this login, `{cli_cmd} run` without `--auth-binding` tries this provider's"
         ));
         print_hint(&format!(
-            "`--auth-binding`. OAuth tokens are used when you invoke `{cli_cmd}` with"
+            "stored bindings, this login included, before {env_var}."
         ));
         print_hint(&format!(
-            "`--auth-binding global:{}`.",
+            "`--auth-binding global:{}` selects this login explicitly.",
             provider.binding_id(),
         ));
     }
@@ -13361,6 +13364,38 @@ fn build_turn_tool_overlay(
     })
 }
 
+/// Tool families a run composes from its flags and the realm configuration.
+/// A help run composes none of them: its help tools are its only tools.
+#[cfg(feature = "session-store")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunToolFamilies {
+    workgraph: bool,
+    mob: bool,
+    schedule: bool,
+    /// The realm's configured MCP servers.
+    realm_mcp: bool,
+}
+
+#[cfg(feature = "session-store")]
+impl RunToolFamilies {
+    fn resolve(help_run: bool, enable_workgraph: bool, enable_mob: bool, config: &Config) -> Self {
+        if help_run {
+            return Self {
+                workgraph: false,
+                mob: false,
+                schedule: false,
+                realm_mcp: false,
+            };
+        }
+        Self {
+            workgraph: enable_workgraph || config.tools.workgraph_enabled,
+            mob: cfg!(feature = "mob") && (enable_mob || config.tools.mob_enabled),
+            schedule: config.tools.schedule_enabled,
+            realm_mcp: true,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_agent(
     prompt: &str,
@@ -13459,12 +13494,10 @@ async fn run_agent(
     #[cfg(feature = "session-store")]
     {
         let keep_alive = resolve_keep_alive(keep_alive)?;
-        // A help run's only tools are its help tools: none of the realm's
-        // configured tool families, MCP servers or schedule tools join them.
         let help_run = help_tools.is_some();
-        let effective_workgraph = !help_run && (enable_workgraph || config.tools.workgraph_enabled);
-        let effective_mob =
-            !help_run && cfg!(feature = "mob") && (enable_mob || config.tools.mob_enabled);
+        let families = RunToolFamilies::resolve(help_run, enable_workgraph, enable_mob, config);
+        let effective_workgraph = families.workgraph;
+        let effective_mob = families.mob;
         let turn_tool_overlay = build_turn_tool_overlay(allow_tools, block_tools);
         // Wave-c C-12: the canonical runtime identity for a skill is
         // `SkillKey { source_uuid, skill_name }` (C-1 / C-4 upstream retype).
@@ -13524,7 +13557,7 @@ async fn run_agent(
             .builtins(enable_builtins)
             .shell(enable_shell)
             .workgraph(effective_workgraph)
-            .schedule(!help_run && config.tools.schedule_enabled);
+            .schedule(families.schedule);
         if let Some(context_root) = scope.context_root.clone() {
             factory = factory.context_root(context_root);
         }
@@ -13534,10 +13567,10 @@ async fn run_agent(
 
         #[cfg(feature = "comms")]
         let factory = factory.comms(!comms_overrides.disabled);
-        let governed_mcp = if help_run {
-            None
-        } else {
+        let governed_mcp = if families.realm_mcp {
             governed_configured_mcp_servers(&persistence, scope, &config.tools.mcp_servers).await?
+        } else {
+            None
         };
         let factory = with_governed_mcp_auth(factory, scope, governed_mcp.as_deref(), mcp_auth)?;
 
@@ -13645,7 +13678,7 @@ async fn run_agent(
 
         // Load optional MCP tools immediately before external tool composition so
         // later early-return windows cannot skip adapter shutdown.
-        let (mcp_external_tools, mcp_adapter) = if governed_mcp.is_some() || help_run {
+        let (mcp_external_tools, mcp_adapter) = if governed_mcp.is_some() || !families.realm_mcp {
             (None, None)
         } else {
             load_mcp_external_tools(
@@ -18374,12 +18407,12 @@ async fn handle_mob_live_command(
 mod mob_typed_exit_tests {
     use super::*;
 
-    /// T-B11: `mob_exit_code` maps exactly the four console codes —
-    /// ScopeDenied→45, HostUnavailable→46, StaleCursor→47, StaleFence→48 —
-    /// and nothing else; the typed `detail:` line renders
-    /// `{required, presented}` from the typed fields.
+    /// T-B11: `mob_exit_code` maps exactly the typed console codes
+    /// (ScopeDenied 45, HostUnavailable 46, StaleCursor 47, StaleFence 48,
+    /// StaleDeliveryScope 56) and nothing else; the typed `detail:` line
+    /// renders `{required, presented}` from the typed fields.
     #[test]
-    fn mob_exit_code_maps_four_codes_only() {
+    fn mob_exit_code_maps_the_typed_console_codes_only() {
         let denied = mob_anyhow(meerkat_mob::MobError::ScopeDenied(
             meerkat_mob::ScopeDenial {
                 required: meerkat_mob::machines::mob_machine::ControlScope::AdminHost,
@@ -27169,6 +27202,48 @@ default_model = "gemma"
         assert_eq!(config.skills.max_injection_bytes, 48 * 1024);
     }
 
+    #[cfg(feature = "session-store")]
+    #[test]
+    fn test_help_run_composes_none_of_the_realm_tool_families() {
+        let mut config = Config::default();
+        config.tools.workgraph_enabled = true;
+        config.tools.mob_enabled = true;
+        config.tools.schedule_enabled = true;
+
+        // `rkat help` passes its help tools: nothing the realm configures,
+        // and none of its MCP servers, joins them.
+        assert_eq!(
+            RunToolFamilies::resolve(true, true, true, &config),
+            RunToolFamilies {
+                workgraph: false,
+                mob: false,
+                schedule: false,
+                realm_mcp: false,
+            }
+        );
+        // A normal run is unchanged: it composes what its flags and the
+        // realm configure, and loads the realm's MCP servers.
+        assert_eq!(
+            RunToolFamilies::resolve(false, false, false, &config),
+            RunToolFamilies {
+                workgraph: true,
+                mob: cfg!(feature = "mob"),
+                schedule: true,
+                realm_mcp: true,
+            }
+        );
+        let defaults = Config::default();
+        assert_eq!(
+            RunToolFamilies::resolve(false, true, false, &defaults),
+            RunToolFamilies {
+                workgraph: true,
+                mob: cfg!(feature = "mob") && defaults.tools.mob_enabled,
+                schedule: defaults.tools.schedule_enabled,
+                realm_mcp: true,
+            }
+        );
+    }
+
     #[test]
     fn test_normalize_cli_args_as_agent_before_the_command() {
         // `--as-agent` is a root option with a value: in front of a command
@@ -33942,6 +34017,89 @@ mod docs_cli_examples {
             lines.push(line);
         }
         lines
+    }
+
+    /// The `rkat` examples of every command's after-help text, a piped
+    /// example reduced to its `rkat` stage.
+    fn after_help_examples() -> Vec<String> {
+        fn walk(command: &clap::Command, examples: &mut Vec<String>) {
+            if let Some(text) = command.get_after_help() {
+                for line in text.to_string().lines() {
+                    let line = line.trim();
+                    let stage = line
+                        .rsplit_once(" | ")
+                        .map_or(line, |(_, last)| last.trim());
+                    if stage.starts_with("rkat ") {
+                        examples.push(stage.to_string());
+                    }
+                }
+            }
+            for subcommand in command.get_subcommands() {
+                walk(subcommand, examples);
+            }
+        }
+        let mut examples = Vec::new();
+        walk(
+            &<super::Cli as clap::CommandFactory>::command(),
+            &mut examples,
+        );
+        examples
+    }
+
+    #[test]
+    fn after_help_examples_parse_against_clap() {
+        let mut checked = 0usize;
+        let mut failures = Vec::new();
+        for example in after_help_examples() {
+            // Placeholders such as `<PKG_DIR>` are shapes, not invocations.
+            if example.contains('<') {
+                continue;
+            }
+            let Some(tokens) = split_tokens(&example) else {
+                failures.push(format!("`{example}`: unbalanced quotes"));
+                continue;
+            };
+            match validate_example(&tokens, CliFeature::compiled) {
+                ExampleValidation::Accepted => checked += 1,
+                ExampleValidation::UnsupportedFeature => {}
+                ExampleValidation::Rejected(err) => {
+                    checked += 1;
+                    failures.push(format!("`{example}`: {err}"));
+                }
+            }
+        }
+        assert!(checked > 0, "no after-help examples were checked");
+        assert!(
+            failures.is_empty(),
+            "after-help examples the CLI rejects:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn resume_reads_the_next_word_as_its_session() {
+        // `--resume` takes an optional value, so a prompt right after it is
+        // read as the session and the run has no prompt. Examples name the
+        // session, use the root form, or put another option next.
+        let rejected = split_tokens(r#"rkat run --resume "keep going""#).expect("tokens");
+        assert!(matches!(
+            validate_example(&rejected, CliFeature::compiled),
+            ExampleValidation::Rejected(_)
+        ));
+        for line in [
+            r#"rkat run --resume last "keep going""#,
+            r#"rkat run --resume --stdin lines "watch for new incidents""#,
+            r#"rkat --resume "keep going""#,
+        ] {
+            let tokens = split_tokens(line).expect("tokens");
+            assert!(
+                matches!(
+                    validate_example(&tokens, CliFeature::compiled),
+                    ExampleValidation::Accepted
+                ),
+                "{line}"
+            );
+        }
     }
 
     #[test]

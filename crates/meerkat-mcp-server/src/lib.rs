@@ -5656,6 +5656,122 @@ mod tests {
         }
     }
 
+    /// Answers `ok` and records the tool names each request offers.
+    struct ToolNameRecordingLlmClient {
+        tool_names: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for ToolNameRecordingLlmClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(
+            &'a self,
+            request: &'a LlmRequest,
+        ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>> {
+            self.tool_names
+                .lock()
+                .expect("recorded tool names lock")
+                .push(
+                    request
+                        .tools
+                        .iter()
+                        .map(|tool| tool.name.to_string())
+                        .collect(),
+                );
+            Box::pin(stream::iter(vec![
+                Ok(LlmEvent::TextDelta {
+                    delta: "ok".to_string(),
+                    meta: None,
+                }),
+                Ok(LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        provider_for_successful_mcp_test_model(&request.model),
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
+                }),
+                Ok(LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Success {
+                        stop_reason: meerkat_core::StopReason::EndTurn,
+                    },
+                }),
+            ]))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Anthropic
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// `meerkat_help` runs with exactly the two read-only reference tools and
+    /// no live MCP router; an ordinary `meerkat_run` is unchanged and keeps
+    /// its router.
+    #[tokio::test]
+    async fn test_meerkat_help_runs_with_only_the_help_tools_and_no_live_mcp() {
+        let tool_names = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let state = MeerkatMcpState::new_with_store_options_and_llm(
+            store,
+            runtime_store,
+            None,
+            Some(Arc::new(ToolNameRecordingLlmClient {
+                tool_names: Arc::clone(&tool_names),
+            })),
+        )
+        .await;
+        let session_id_of = |value: Value| {
+            let payload = unwrap_payload(value);
+            meerkat::SessionId::parse(payload["session_id"].as_str().expect("session id"))
+                .expect("session id parses")
+        };
+
+        let help = Box::pin(handle_meerkat_help(
+            &state,
+            meerkat_contracts::HelpRequest {
+                question: "How do I add an MCP server?".to_string(),
+                prompt: None,
+                execution_mode: meerkat_contracts::HelpExecutionMode::ExplainOnly,
+                model: Some("claude-sonnet-4-5".to_string()),
+                provider: Some("anthropic".to_string()),
+                max_tokens: None,
+            },
+            None,
+            None,
+        ))
+        .await
+        .expect("meerkat_help succeeds");
+        let help_session = session_id_of(help);
+        let mut tools = tool_names.lock().expect("recorded tool names lock")[0].clone();
+        tools.sort();
+        assert_eq!(tools, ["skill_list_resources", "skill_read_resource"]);
+        let ingress = state.runtime_ingress_context();
+        assert!(ingress.logical_router(&help_session).await.is_none());
+
+        let run_input: MeerkatRunInput = serde_json::from_value(json!({
+            "prompt": "hello",
+            "model": "claude-sonnet-4-5",
+            "provider": "anthropic",
+        }))
+        .expect("run input");
+        let run = Box::pin(handle_meerkat_run(&state, run_input, None, None))
+            .await
+            .expect("meerkat_run succeeds");
+        let session = session_id_of(run);
+        assert!(ingress.logical_router(&session).await.is_some());
+    }
+
     struct OwnershipCheckingLlmClient {
         old_executor_stopped: Arc<AtomicBool>,
         turn_started: Arc<AtomicBool>,

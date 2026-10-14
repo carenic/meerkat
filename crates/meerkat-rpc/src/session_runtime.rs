@@ -12488,6 +12488,12 @@ impl SessionRuntime {
         *self.mcp_attempt_admission.read().await
     }
 
+    /// Whether `session_id` has a live MCP router.
+    #[cfg(all(test, feature = "mcp"))]
+    pub(crate) async fn has_live_mcp_session_for_testing(&self, session_id: &SessionId) -> bool {
+        self.mcp_sessions.read().await.contains_key(session_id)
+    }
+
     #[cfg(test)]
     pub(crate) fn mcp_wire_attempt_count_for_testing(&self) -> usize {
         self.mcp_wire_attempts
