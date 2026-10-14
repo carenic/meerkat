@@ -310,6 +310,7 @@ impl SessionRuntime {
             Some(create.labels.clone()),
             None,
             Vec::new(),
+            true,
         )
         .await
         .map_err(|error| ScheduleDomainError::Internal(error.message))

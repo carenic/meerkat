@@ -23,6 +23,10 @@ authority (generated into
 enforces fail-closed acceptance of persisted session schema versions. It is
 registered for production-schema parity but intentionally not part of
 `canonical_machine_schemas()` — do not count it as a canonical machine.
+`mob_host_binding_authority.rs` (`MobHostBindingAuthority`, the member host's
+mob-keyed admission and dedup authority, bridged in
+`crates/meerkat-mob/src/machines/mob_host_binding_authority.rs`) is likewise
+catalog-owned but outside `canonical_machine_schemas()`.
 
 Previously-standalone machines absorbed into MeerkatMachine/MobMachine state become fields, inputs, and transitions inside the host machine. Post-absorption, remaining helper modules are projection/reducer support or shell mechanics; shell code routes semantic decisions through the host machine's DSL via handle traits or in-crate MobMachine authority access (see "Cross-crate DSL access" below).
 
@@ -112,7 +116,7 @@ Governance gates are typed syn-AST/fact gates in `xtask`, not source-text scanne
 
 - `xtask effect-authority` (`crates/xtask/src/effect_authority.rs`) — effect realization must trace to machine authority.
 - `xtask ownership-ledger --check-drift` (`crates/xtask/src/ownership_ledger.rs`) — semantic-fact ownership ledger with mechanically-resolved anchors; drift fails the gate.
-- `xtask bridge-classifier` (`crates/xtask/src/bridge_classifier.rs`) - bridge wire types must not re-interpret `ResponseStatus`; terminality is the machine-classified `TerminalityClass` (`response_terminality` on `PeerIngressClassification`/`PeerInputCandidate`, `PeerInteractionHandle::classify_response_reply` for outbound replies) (Makefile entry: `bridge-no-responsestatus-gate`).
+- `xtask bridge-classifier` (`crates/xtask/src/bridge_classifier.rs`) - bridge wire types must not re-interpret `ResponseStatus`; terminality is the typed, machine-classified `TerminalityClass` (`meerkat_core::interaction`), carried as `response_terminality` on `PeerIngressClassification`/`PeerInputCandidate`; outbound replies use `PeerInteractionHandle::classify_response_reply` (Makefile entry: `bridge-no-responsestatus-gate`).
 - `xtask rmat-audit --strict` (`crates/xtask/src/rmat_audit.rs`) — syn-AST read/write seam enforcement.
 - `xtask seam-inventory` (`crates/xtask/src/seam_inventory.rs`) — every Local/External effect needs an explicit classification (`EffectTeardownClass` coherence lives here) and routed effects must resolve via the typed Route table.
 
@@ -159,18 +163,16 @@ enum to infer or duplicate.
 
 ## Signals vs Inputs
 
-The DSL distinguishes two transition triggers:
+The DSL declares two trigger alphabets, each generated as its own enum:
 
-- **Inputs** — parameterized variants carrying data (`MeerkatMachineInput::QueueAccepted { input_id }`). Drive state mutations; usually called from runtime shell code via `dsl_apply(input)`.
-- **Signals** — parameterless variants (`MeerkatMachineSignal::CallStarted`). Used at composition seams for cross-machine handoffs; typically fired via `apply_signal(signal)`. The machine may transition on a signal without any data payload.
+- **Inputs** - `input <Name>` variants such as `MeerkatMachineInput::QueueAccepted { input_id }`, `Prepare { session_id, run_id }`, and `StartConversationRun { run_id, .. }`. They drive most state mutations and are usually applied from runtime shell code via `dsl_apply(input)`.
+- **Signals** - a separate `signal <Name>` alphabet (`MeerkatMachineSignal`, `MobMachineSignal`) applied via `apply_signal(signal)`. Signal variants may be unit (`Initialize`, `EnsureDrainRunning`) or carry typed fields (`BoundaryApplied { revision }`, `DrainQueuedRun { run_id }`, `ClassifyExternalEnvelope { .. }`); transitions bind signal fields exactly like input fields (`TriggerMatch::Signal { variant, bindings }`).
 
-Signals exist because compositions route traffic across machine boundaries at owner handoffs. The receiver doesn't need payload — the payload was stored in an upstream Input on the sending side. Example: `Prepare { session_id, run_id }` (Input with params) populates `current_run_id` field. Later, `StartConversationRun` signal fires parameterless — the run_id is already in state.
+Composition routes may target either alphabet (`RouteTargetKind::Input` or `RouteTargetKind::Signal`), so "signal" does not mean payload-free or seam-only. State written by an earlier input stays available to later transitions: `Prepare { session_id, run_id }` writes `current_run_id`.
 
-When writing a trait or handle method for a domain, match the DSL shape:
-- If the domain uses Inputs with params, the trait method takes those params.
-- If the domain uses Signals, the trait method is parameterless.
+When writing a trait or handle method for a domain, match the DSL variant: the method takes exactly the fields its input or signal variant carries.
 
-Mapping an old phase-driven authority's input onto a parameterless DSL signal loses the parameters. Either (a) an upstream DSL Input is responsible for storing the params into state fields, OR (b) the DSL needs to be extended with a new Input variant carrying those params.
+Mapping an old phase-driven authority's input onto a unit (fieldless) DSL signal loses the parameters. Either (a) an upstream DSL Input is responsible for storing the params into state fields, OR (b) the DSL needs to be extended with a variant carrying those params.
 
 ## Concrete trace — user sends "Hello"
 
@@ -214,11 +216,12 @@ Every semantic state change is one `dsl_apply`. Shell code does not decide what 
 ## Cross-crate DSL access (handle trait pattern)
 
 `meerkat-runtime` holds the MeerkatMachine DSL authority per session. Other
-crates (meerkat-core, meerkat-mcp, meerkat-comms, and meerkat-session) need to
-route MeerkatMachine-owned transitions through it without importing
-meerkat-runtime (dependency direction forbids). Auth lease transitions are a
-separate case: `RuntimeAuthLeaseHandle` routes them to per-binding
-`AuthMachineAuthority` instances.
+crates (meerkat-core, meerkat-mcp, and meerkat-comms) do not depend on
+meerkat-runtime and route MeerkatMachine-owned transitions through handle
+traits instead; meerkat-session takes meerkat-runtime only through its
+optional `runtime-machine` feature (implied by `session-store`). Auth lease
+transitions are a separate case: `RuntimeAuthLeaseHandle` routes them to
+per-binding `AuthMachineAuthority` instances.
 
 Pattern: trait in meerkat-core, impl in meerkat-runtime, `Arc<dyn Trait>` on `SessionRuntimeBindings` (also in meerkat-core).
 

@@ -6557,6 +6557,14 @@ impl AgentFactory {
                     .into(),
             ));
         }
+        // A build that carries an already marked help session rebuilds it
+        // from storage, where its help tools do not exist: refuse it before
+        // anything is composed. The surfaces refuse earlier on their own
+        // resume paths; this covers every other path.
+        if let Some(session) = build_config.resume_session.as_ref() {
+            crate::help::HelpSessionNotResumable::check(session)
+                .map_err(|refusal| BuildAgentError::Config(refusal.to_string()))?;
+        }
         self.validate_runtime_profile(&build_config, config)?;
         let mut effective_config;
         let config = if let Some(fallback) = &build_config.model_fallback {

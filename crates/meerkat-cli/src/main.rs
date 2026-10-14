@@ -107,10 +107,10 @@ const EXIT_USAGE: u8 = 2;
 
 const CLI_ABOUT: &str = "Run agent tasks and manage local Meerkat surfaces from the terminal";
 
-const ROOT_AFTER_HELP: &str = "Command groups:\n  Runtime:      run, help\n  Realm config: init, config, realm\n  Utility:      session, blob, models, capabilities, doctor, storage\n\nAdditional commands appear when their supporting capabilities are compiled in.\n\nRealm defaults:\n  - context root: current directory, unless --context-root is supplied\n  - state root: <project-root>/.rkat/realms, where project root is the nearest ancestor containing .rkat (or the context root when none exists), unless --state-root is supplied\n  - realm id: workspace-derived ws-... unless --realm or --isolated is supplied\n\nExamples:\n  rkat \"summarize this repository\"\n  rkat help \"How do I add an mcp server?\"\n  cat story.txt | rkat \"summarize the story\"\n  git diff | rkat run \"review these changes\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nUse `<binary> <command> -h` for the basic view and `<binary> <command> --help` for all options.";
-const HELP_AFTER_HELP: &str = "Examples:\n  rkat help \"How do I add an mcp server and schedule to remove it in 30 minutes\"\n  rkat help \"Use gemini with my vertex auth, load ~/codex/skills\" --prompt \"Write a match-3 game in Erlang\"";
+const ROOT_AFTER_HELP: &str = "Command groups:\n  Runtime:      run, help\n  Realm config: init, config, realm, auth\n  Utility:      session, blob, workgraph, models, capabilities, doctor, storage\n  Integrations: mcp, mob, skill (when compiled in)\n\nRealm defaults:\n  - context root: current directory, unless --context-root is supplied\n  - state root: <project-root>/.rkat/realms, where project root is the nearest ancestor containing .rkat (or the context root when none exists), unless --state-root is supplied\n  - realm id: workspace-derived ws-... unless --realm or --isolated is supplied\n\nExamples:\n  rkat \"summarize this repository\"\n  rkat help \"How do I add an mcp server?\"\n  cat story.txt | rkat \"summarize the story\"\n  git diff | rkat run \"review these changes\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nUse `rkat <command> -h` for the basic view and `rkat <command> --help` for all options. `rkat help <QUESTION>` answers usage questions with a model.";
+const HELP_AFTER_HELP: &str = "Examples:\n  rkat help \"How do I add an mcp server and schedule to remove it in 30 minutes\"\n  rkat help \"Use gemini with my vertex auth, load ~/codex/skills\" --prompt \"Write a match-3 game in Erlang\"\n\nFor the command reference, run `rkat --help` or `rkat <command> --help`.";
 
-const RUN_AFTER_HELP: &str = "Examples:\n  rkat run \"summarize this repository\"\n  cat story.txt | rkat run \"summarize the story\"\n  git diff | rkat run --json \"review these changes\"\n  rkat run --html \"make a visual explainer\"\n  rkat run --browser \"create an implementation plan\"\n  rkat run --resume \"keep going\"\n  rkat run --resume ~2 \"pick this thread back up\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nDefaults:\n  - realm state under <project-root>/.rkat/realms, using the nearest ancestor containing .rkat or the context root when none exists; use --verbose to print the active realm root\n  - `--tools safe`\n  - provider-native web search on for supporting models; use `--no-web-search` to disable\n  - stream on in a TTY, off in pipes/scripts\n  - piped stdin is read as blob context unless `--stdin lines` is set";
+const RUN_AFTER_HELP: &str = "Examples:\n  rkat run \"summarize this repository\"\n  cat story.txt | rkat run \"summarize the story\"\n  git diff | rkat run --json \"review these changes\"\n  rkat run --html \"make a visual explainer\"\n  rkat run --browser \"create an implementation plan\"\n  rkat run --resume last \"keep going\"\n  rkat run --resume ~2 \"pick this thread back up\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nDefaults:\n  - realm state under <project-root>/.rkat/realms, using the nearest ancestor containing .rkat or the context root when none exists; use --verbose to print the active realm root\n  - `--tools safe`\n  - provider-native web search on for supporting models; use `--no-web-search` to disable\n  - stream on in a TTY, off in pipes/scripts\n  - piped stdin is read as blob context unless `--stdin lines` is set";
 
 const DEFAULT_TRACE_FILTER: &str = "off";
 const VERBOSE_TRACE_FILTER: &str = "info";
@@ -858,6 +858,7 @@ fn is_root_flag_with_value(arg: &str) -> bool {
     matches!(
         arg,
         "-r" | "--realm"
+            | "--as-agent"
             | "--instance"
             | "--realm-backend"
             | "--state-root"
@@ -1729,7 +1730,7 @@ enum Commands {
         #[arg(long, short = 'm', help_heading = "Common options")]
         model: Option<String>,
 
-        /// LLM provider (anthropic, openai, gemini). Inferred from the model registry when omitted.
+        /// LLM provider. Inferred from the model registry when omitted.
         #[arg(
             long,
             short = 'p',
@@ -2035,14 +2036,17 @@ enum Commands {
         )]
         line_format: LineFormat,
 
-        /// Typed auth binding reference `realm:binding[:profile]`.
+        /// Auth binding for this run, as `realm:binding[:profile]`.
         ///
-        /// Parsed at the CLI boundary by
-        /// `cli_parse::parse_auth_binding_user_input`; a typed
-        /// [`meerkat_core::AuthBindingRef`] is threaded through
-        /// `SessionBuildOptions.auth_binding`. Opaque-string
-        /// ferry through the runtime is prohibited by the
-        /// wave-b deletion of `AuthBindingRef::parse` / `Display`.
+        /// Uses that binding's backend and credential (and the named auth
+        /// profile, when given) instead of the default credential
+        /// resolution. `rkat auth bindings` lists the configured bindings.
+        // Parsed at the CLI boundary by
+        // `cli_parse::parse_auth_binding_user_input`; a typed
+        // `meerkat_core::AuthBindingRef` is threaded through
+        // `SessionBuildOptions.auth_binding`. Opaque-string ferry through
+        // the runtime is prohibited by the wave-b deletion of
+        // `AuthBindingRef::parse` / `Display`.
         #[arg(
             long = "auth-binding",
             value_name = "REALM:BINDING[:PROFILE]",
@@ -2051,13 +2055,18 @@ enum Commands {
         auth_binding: Option<String>,
     },
 
-    #[command(after_help = HELP_AFTER_HELP)]
+    #[command(after_help = HELP_AFTER_HELP, arg_required_else_help = true)]
     /// Ask how to use Meerkat
+    ///
+    /// A model answers the question from the embedded Meerkat platform and
+    /// CLI reference, so it needs a configured provider, like `rkat run`.
+    /// For the command reference, use `rkat --help`.
     Help {
         /// The Meerkat usage question to answer
         question: String,
 
-        /// Inert prompt payload for future execution-oriented help
+        /// A task you intend to run later. Help explains it, or plans it
+        /// with --plan-execution, and treats it as input only
         #[arg(
             long,
             value_name = "PROMPT",
@@ -2066,7 +2075,8 @@ enum Commands {
         )]
         prompt: Option<String>,
 
-        /// Plan future execution without executing anything
+        /// Ask for a plan with the exact commands or API calls to run later,
+        /// instead of an explanation
         #[arg(
             long = "plan-execution",
             hide_short_help = true,
@@ -2222,14 +2232,15 @@ enum Commands {
         command: StorageCommands,
     },
 
-    /// Auth profile management — list, inspect, test, log in, log out,
-    /// delete, and check status of realm-scoped auth profiles.
-    /// `login` runs the interactive OAuth flow by default, or writes an
-    /// inline api_key when `--non-interactive --secret <S>` is passed.
-    /// Env-var auth (`RKAT_*` provider keys, ANTHROPIC_API_KEY,
-    /// OPENAI_API_KEY, AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT,
-    /// GEMINI_API_KEY / GOOGLE_API_KEY) continues to work as a fallback for
-    /// callers that haven't migrated.
+    /// Sign in to providers and manage realm-scoped auth profiles
+    ///
+    /// List, inspect, test, refresh, log in, log out, and delete realm-scoped
+    /// auth profiles and bindings. `login` runs the provider's interactive
+    /// OAuth or device flow by default; `--non-interactive` stores an API key
+    /// from `--secret` or stdin instead. Provider API keys in environment
+    /// variables (`RKAT_*` provider keys, ANTHROPIC_API_KEY, OPENAI_API_KEY,
+    /// AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT, GEMINI_API_KEY /
+    /// GOOGLE_API_KEY) work without any auth profile.
     Auth {
         #[command(subcommand)]
         command: AuthCommands,
@@ -2384,9 +2395,11 @@ enum AuthCommands {
         profile_id: String,
     },
 
-    /// Delete an auth profile's persisted credentials from the TokenStore.
-    /// The realm config entry itself is declarative — this removes the
-    /// secret/token material bound to the profile's owning `<realm>:<binding_id>`.
+    /// Delete an auth profile's stored credentials
+    ///
+    /// Removes the secret or token material stored for the binding that owns
+    /// the profile (`<realm>:<binding_id>`). The profile's declaration in the
+    /// realm config is left unchanged.
     ProfileDelete {
         /// Auth profile id.
         profile_id: String,
@@ -2406,42 +2419,49 @@ enum AuthCommands {
         binding_id: String,
     },
 
-    /// Print auth profile status — reports realm config shape and the
-    /// observed AuthMachine lease lifecycle state.
+    /// Show an auth profile's realm config and credential lease state.
     Status {
         /// Auth profile id.
         profile_id: String,
     },
 
-    /// Sign in to a provider and persist the resolved credential into the
-    /// TokenStore. Interactive (OAuth) when `--secret` is omitted; scripted
-    /// (inline api key) with `--non-interactive --secret`.
+    /// Sign in to a provider and store the credential
+    ///
+    /// By default this runs the provider's interactive OAuth or device flow
+    /// and records the sign-in in the reserved `global` realm, which every
+    /// workspace realm inherits. `--non-interactive` instead stores an API key
+    /// from `--secret` (or one line of stdin) under
+    /// `global:default_<provider>`, for CI and scripted provisioning; it
+    /// writes no binding config, so a matching binding must already exist.
     Login {
-        /// Provider — `anthropic` / `openai` / `gemini` (positional or
-        /// selected interactively when absent).
+        /// Provider. Interactive login accepts `anthropic` (or `claude`,
+        /// `claude.ai`), `openai` (or `chatgpt`), `gemini` (or `google`,
+        /// `code_assist`) and `copilot` (or `github_copilot`, GitHub
+        /// Copilot). --non-interactive accepts `anthropic`, `openai` or
+        /// `gemini`. Prompted for when omitted; required with
+        /// --non-interactive.
         provider: Option<String>,
 
-        /// Target backend kind (e.g. `anthropic_api`, `openai_api`,
-        /// `chatgpt_backend`, `google_genai`). Defaults to the
-        /// provider's primary backend.
+        /// With --non-interactive: the backend kind recorded with the stored
+        /// key (e.g. `anthropic_api`, `openai_api`, `google_genai`). Defaults
+        /// to the provider's default backend. Interactive login ignores it.
         #[arg(long)]
         backend: Option<String>,
 
-        /// Auth method (e.g. `api_key`, `azure_api_key`,
-        /// `managed_chatgpt_oauth`, `claude_ai_oauth`, `google_oauth`).
-        /// Defaults to the primary interactive flow for the provider.
+        /// With --non-interactive: the auth method of the stored secret, such
+        /// as `api_key` (default), `azure_api_key`, or `static_bearer`. OAuth
+        /// methods need interactive login, which ignores this flag.
         #[arg(long)]
         method: Option<String>,
 
-        /// Skip interactive prompts — resolve the secret from
-        /// `--secret` (or stdin if not given) and write directly to
-        /// TokenStore. Intended for CI / scripted provisioning.
+        /// Store an API key without a browser or prompts. The secret comes
+        /// from --secret, or from one line of stdin. Intended for CI and
+        /// scripted provisioning.
         #[arg(long, requires = "provider")]
         non_interactive: bool,
 
-        /// Inline secret for `--non-interactive` flows. For
-        /// interactive flows the secret is captured via OAuth and
-        /// this flag is ignored.
+        /// The secret to store with --non-interactive. Omit it to read the
+        /// secret from stdin, which keeps it out of the process list.
         #[arg(long, requires = "non_interactive")]
         secret: Option<String>,
     },
@@ -2468,9 +2488,11 @@ enum AuthCommands {
         profile_id: String,
     },
 
-    /// Manage the realm's connector OAuth clients (used for connector login
-    /// and refresh). Writes go to the realm's own config; client secrets go
-    /// to the credential store, never to the config.
+    /// Manage the realm's connector OAuth clients
+    ///
+    /// Connector clients are used for connector login and refresh. Writes go
+    /// to the realm's own config; client secrets go to the credential store,
+    /// never to the config.
     ConnectorClient {
         #[command(subcommand)]
         command: ConnectorClientCommands,
@@ -2481,9 +2503,10 @@ enum AuthCommands {
 /// hosts use for connector login and refresh.
 #[derive(Subcommand)]
 enum ConnectorClientCommands {
-    /// Create or replace a connector client in the realm's own config. A
-    /// client secret is read from stdin (piped, or typed without echo), never
-    /// from the command line.
+    /// Create or replace a connector client in the realm's own config.
+    ///
+    /// A client secret is read from stdin (piped, or typed without echo),
+    /// never from the command line.
     Set {
         /// Profile id a connector login names.
         id: String,
@@ -2513,8 +2536,10 @@ enum ConnectorClientCommands {
         #[arg(long = "redirect-uri")]
         registered_redirect_uris: Vec<String>,
     },
-    /// Replace a client's stored secret, read from stdin. The next code
-    /// exchange or refresh uses it; existing sign-ins stay valid.
+    /// Replace a client's stored secret, read from stdin.
+    ///
+    /// The next code exchange or refresh uses it; existing sign-ins stay
+    /// valid.
     RotateSecret {
         /// Profile id.
         id: String,
@@ -2691,6 +2716,7 @@ async fn handle_connector_client_command(
 enum ConfigCommands {
     /// Print the current config
     Get {
+        /// Output format
         #[arg(long, default_value = "toml")]
         format: ConfigFormat,
         /// Include the monotonic config generation in the output envelope/header
@@ -2769,8 +2795,10 @@ enum StreamView {
 enum SessionCommands {
     /// List sessions
     List {
+        /// Maximum number of sessions to list
         #[arg(long, default_value = "20")]
         limit: usize,
+        /// Number of sessions to skip before listing
         #[arg(long)]
         offset: Option<usize>,
         /// Filter by label (key=value, repeatable). Only sessions matching ALL labels are shown.
@@ -2783,10 +2811,13 @@ enum SessionCommands {
         /// Session ID
         id: String,
     },
-    /// Diagnose, and with --apply repair, a WholeBlob session whose committed
-    /// document is refused because its live rows no longer preserve the
-    /// graph-proved audited endpoint (every send reports reload_required).
-    /// The repair keeps every message and re-anchors the audit graph.
+    /// Diagnose, and with --apply repair, a WholeBlob session stuck on reload_required
+    ///
+    /// Diagnoses, and with --apply repairs, a WholeBlob session whose
+    /// committed document is refused because its live rows no longer
+    /// preserve the graph-proved audited endpoint (every send reports
+    /// reload_required). The repair keeps every message and re-anchors the
+    /// audit graph.
     RepairWholeblob {
         /// Session ID
         id: String,
@@ -2867,16 +2898,20 @@ enum RealmCommands {
         #[arg(long, value_enum)]
         backend: Option<RealmBackendArg>,
     },
-    /// Govern an existing realm: select governed posture durably and
-    /// provision its grant owner with the local user as operator. Every later
-    /// rkat process opens the realm governed; it is never selected by a flag.
+    /// Make an existing realm governed, with the local user as operator.
+    ///
+    /// Selects governed posture durably and provisions the realm's grant
+    /// owner with the local user as operator. Every later rkat process opens
+    /// the realm governed; it is never selected by a flag.
     #[cfg(feature = "local-authorization")]
     Govern {
         /// Realm ID
         realm_id: String,
     },
-    /// Issue one grant of a governed realm to a named agent, as the local
-    /// operator, and select it for one target: an installed MCP server
+    /// Issue an agent of a governed realm the grant for one target.
+    ///
+    /// Issues one grant of a governed realm to a named agent, as the local
+    /// operator, and selects it for one target: an installed MCP server
     /// (`--mcp`), the tool catalog (`--catalog`) or the agent's controller
     /// (`--controller`). Each target has its own grant and lifetime; a new
     /// grant supersedes only its target's previous one, which is recorded
@@ -2915,8 +2950,10 @@ enum RealmCommands {
         #[arg(long)]
         expires_in_secs: Option<u64>,
     },
-    /// Revoke an agent's grant selected for one target now, as the local
-    /// operator, and unselect it once revoked: `--mcp <server>`,
+    /// Revoke an agent's grant for one target of a governed realm.
+    ///
+    /// Revokes the agent's grant selected for one target now, as the local
+    /// operator, and unselects it once revoked: `--mcp <server>`,
     /// `--catalog`, `--controller`, or `--worker` (an older selection's single
     /// worker grant). Exits successfully only when it is revoked; otherwise
     /// it reports what the attempt did.
@@ -3063,67 +3100,103 @@ impl From<WorkAttentionStatusArg> for meerkat::WorkAttentionStatus {
 enum WorkGraphCommands {
     /// List WorkGraph items
     List {
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// Read every namespace. Refused: the CLI's WorkGraph grant covers one
+        /// namespace
         #[arg(long)]
         all_namespaces: bool,
+        /// Only items in this status (repeatable). Completed, cancelled, and
+        /// failed items also need --include-terminal
         #[arg(long = "status", value_enum)]
         statuses: Vec<WorkGraphStatusArg>,
+        /// Only items with this label (repeatable; all must match)
         #[arg(long = "label")]
         labels: Vec<String>,
+        /// Include completed, cancelled, and failed items
         #[arg(long)]
         include_terminal: bool,
+        /// Maximum number of items (default 100, at most 1000)
         #[arg(long)]
         limit: Option<usize>,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Show one WorkGraph item
     Show {
+        /// WorkGraph item ID
         id: String,
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// List ready WorkGraph items
     Ready {
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// Only items with this label (repeatable; all must match)
         #[arg(long = "label")]
         labels: Vec<String>,
+        /// Maximum number of items (default 100, at most 1000)
         #[arg(long)]
         limit: Option<usize>,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Show a graph snapshot
     Snapshot {
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// Read every namespace. Refused: the CLI's WorkGraph grant covers one
+        /// namespace
         #[arg(long)]
         all_namespaces: bool,
+        /// Only items in this status (repeatable). Completed, cancelled, and
+        /// failed items also need --include-terminal
         #[arg(long = "status", value_enum)]
         statuses: Vec<WorkGraphStatusArg>,
+        /// Only items with this label (repeatable; all must match)
         #[arg(long = "label")]
         labels: Vec<String>,
+        /// Include completed, cancelled, and failed items
         #[arg(long)]
         include_terminal: bool,
+        /// Maximum number of items (default 100, at most 1000)
         #[arg(long)]
         limit: Option<usize>,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// List WorkGraph events
     Events {
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// Read every namespace. Refused: the CLI's WorkGraph grant covers one
+        /// namespace
         #[arg(long)]
         all_namespaces: bool,
+        /// Only events after this sequence number
         #[arg(long)]
         after_seq: Option<i64>,
+        /// Maximum number of events (default 100, at most 1000)
         #[arg(long)]
         limit: Option<usize>,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
@@ -3133,81 +3206,125 @@ enum WorkGraphCommands {
         session_id: String,
         /// Goal title
         title: String,
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// Goal description
         #[arg(long, allow_hyphen_values = true)]
         description: Option<String>,
+        /// Attention mode of the session binding
         #[arg(long, value_enum, default_value = "pursue")]
         mode: WorkAttentionModeArg,
+        /// Who may close the goal: the bound session itself (self-attest), or
+        /// only with host confirmation evidence (host-confirmed)
         #[arg(long, value_enum, default_value = "self-attest")]
         completion_policy: WorkCompletionPolicyArg,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Show a goal item and its attention binding
     GoalStatus {
+        /// Attention binding ID of the goal
         binding_id: String,
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Attach confirmation evidence to a goal
     GoalConfirm {
+        /// Attention binding ID of the goal
         binding_id: String,
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// The goal item's current revision (see goal-status); the write is
+        /// refused if it changed
         #[arg(long)]
         expected_revision: u64,
+        /// Evidence kind, for example `notification`
         #[arg(long)]
         kind: String,
+        /// ID of the evidence artifact (WorkGraph stores the reference only)
         #[arg(long)]
         id: String,
+        /// Short evidence label
         #[arg(long)]
         label: Option<String>,
+        /// Evidence summary
         #[arg(long)]
         summary: Option<String>,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Request policy-gated goal closure
     GoalClose {
+        /// Attention binding ID of the goal
         binding_id: String,
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// The goal item's current revision (see goal-status); the close is
+        /// refused if it changed
         #[arg(long)]
         expected_revision: u64,
+        /// Terminal status to close the goal with
         #[arg(long = "status", value_enum, default_value = "completed")]
         status: WorkGraphTerminalStatusArg,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// List attention bindings
     AttentionList {
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// Only bindings in this status
         #[arg(long = "status", value_enum)]
         status: Option<WorkAttentionStatusArg>,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Pause an attention binding
     AttentionPause {
+        /// Attention binding ID
         binding_id: String,
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// The binding's current revision (`machine_state.revision` in
+        /// attention-list --json); the pause is refused if it changed
         #[arg(long)]
         expected_revision: u64,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
     /// Resume an attention binding
     AttentionResume {
+        /// Attention binding ID
         binding_id: String,
+        /// WorkGraph namespace. Defaults to `default`, the only namespace the
+        /// CLI is granted
         #[arg(long)]
         namespace: Option<String>,
+        /// The binding's current revision (`machine_state.revision` in
+        /// attention-list --json); the resume is refused if it changed
         #[arg(long)]
         expected_revision: u64,
+        /// Output as JSON
         #[arg(long)]
         json: bool,
     },
@@ -3379,7 +3496,9 @@ enum McpCommands {
 enum MobCommands {
     /// Pack a mob directory into a .mobpack archive.
     Pack {
+        /// Mob directory to pack
         dir: PathBuf,
+        /// Path of the .mobpack archive to write
         #[arg(short = 'o', long)]
         output: PathBuf,
         /// Path to an Ed25519 signing key (hex-encoded).
@@ -3392,16 +3511,28 @@ enum MobCommands {
         signer_id: Option<String>,
     },
     /// Inspect a .mobpack archive.
-    Inspect { pack: PathBuf },
+    Inspect {
+        /// Path to a .mobpack archive
+        pack: PathBuf,
+    },
     /// Validate a .mobpack archive.
     Validate {
+        /// Path to a .mobpack archive
         pack: PathBuf,
+        /// Signature trust policy (default: RKAT_TRUST_POLICY, then the
+        /// realm's trust.policy, then strict)
+        ///
+        /// strict rejects unsigned packs and unknown signers; permissive
+        /// allows them with a warning. Invalid signatures are always rejected.
         #[arg(long, value_enum)]
         trust_policy: Option<TrustPolicyArg>,
     },
     /// Deploy a .mobpack archive with a prompt.
     Deploy {
+        /// Path to a .mobpack archive
         pack: PathBuf,
+        /// Prompt for the mob's orchestrator member (not delivered when the
+        /// pack defines no orchestrator)
         prompt: String,
         /// Override model at deploy time.
         #[arg(long, short = 'm')]
@@ -3415,13 +3546,21 @@ enum MobCommands {
         /// Override maximum tool calls at deploy time.
         #[arg(long)]
         max_tool_calls: Option<usize>,
+        /// Signature trust policy (default: RKAT_TRUST_POLICY, then the
+        /// realm's trust.policy, then strict)
+        ///
+        /// strict rejects unsigned packs and unknown signers; permissive
+        /// allows them with a warning. Invalid signatures are always rejected.
         #[arg(long, value_enum)]
         trust_policy: Option<TrustPolicyArg>,
+        /// Deploy surface: `cli` runs the mob in this process; `rpc` also
+        /// serves it as JSON-RPC on stdin/stdout
         #[arg(long, value_enum, default_value = "cli")]
         surface: DeploySurfaceArg,
     },
     /// Invoke a mobpack or installed mob as a typed callable run.
     Run {
+        /// Path to a .mobpack archive, or the ID of an installed mob
         target: String,
         /// Flow id to invoke. Defaults to `main`, or the only declared flow.
         #[arg(long = "flow")]
@@ -3438,14 +3577,23 @@ enum MobCommands {
         /// Output a machine-readable result envelope.
         #[arg(long)]
         json: bool,
+        /// Signature trust policy for a .mobpack TARGET (default:
+        /// RKAT_TRUST_POLICY, then the realm's trust.policy, then strict)
+        ///
+        /// strict rejects unsigned packs and unknown signers; permissive
+        /// allows them with a warning. Invalid signatures are always rejected.
+        /// An installed mob ID ignores it.
         #[arg(long, value_enum)]
         trust_policy: Option<TrustPolicyArg>,
     },
-    /// Start a flow run and print the run_id.
+    /// Run a flow on an installed mob, wait for it to finish, and print the run_id.
     RunFlow {
+        /// Installed mob ID
         mob_id: String,
+        /// Flow ID to run
         #[arg(long = "flow")]
         flow: String,
+        /// Flow parameters as a JSON object
         #[arg(long = "params")]
         params: Option<String>,
         /// Stream flow member outputs while the run is executing
@@ -3456,9 +3604,15 @@ enum MobCommands {
         no_stream: bool,
     },
     /// Show JSON status for a flow run.
-    FlowStatus { mob_id: String, run_id: String },
+    FlowStatus {
+        /// Mob ID
+        mob_id: String,
+        /// Run ID
+        run_id: String,
+    },
     /// List run resources for an installed mob.
     Runs {
+        /// Installed mob ID
         mob_id: String,
         /// Filter to one flow id.
         #[arg(long = "flow")]
@@ -3469,7 +3623,9 @@ enum MobCommands {
     },
     /// Show status for one run resource.
     Status {
+        /// Mob ID
         mob_id: String,
+        /// Run ID
         run_id: String,
         /// Output only the typed status projection.
         #[arg(long)]
@@ -3477,6 +3633,7 @@ enum MobCommands {
     },
     /// Read mob event history for run diagnostics.
     Logs {
+        /// Mob ID
         mob_id: String,
         /// First cursor to read after.
         #[arg(long, default_value_t = 0)]
@@ -3490,7 +3647,9 @@ enum MobCommands {
     },
     /// Wait for a detached run and print its typed result envelope.
     Attach {
+        /// Mob ID
         mob_id: String,
+        /// Run ID of the detached run
         run_id: String,
         /// Output a machine-readable result envelope.
         #[arg(long)]
@@ -3502,8 +3661,8 @@ enum MobCommands {
         mob_id: String,
         /// Task prompt for the helper
         prompt: String,
-        /// Agent identity for the helper. Required: the surface does not
-        /// allocate member identity (#115).
+        /// Agent identity for the helper. Required: the CLI does not
+        /// generate member identities.
         #[arg(long)]
         agent_identity: String,
         /// Profile to use
@@ -3533,8 +3692,8 @@ enum MobCommands {
         source_member: String,
         /// Task prompt for the forked helper
         prompt: String,
-        /// Agent identity for the helper. Required: the surface does not
-        /// allocate member identity (#115).
+        /// Agent identity for the helper. Required: the CLI does not
+        /// generate member identities.
         #[arg(long)]
         agent_identity: String,
         /// Profile to use
@@ -3593,9 +3752,8 @@ enum MobCommands {
         /// Absolute expiry (UNIX epoch milliseconds); stored verbatim
         #[arg(long, conflicts_with = "expires_in")]
         expires_at_ms: Option<u64>,
-        /// Relative expiry sugar (e.g. "30m", "2h"); the CLI reads the
-        /// clock ONCE and sends the absolute timestamp — expiry is data by
-        /// the time it reaches the machine
+        /// Relative expiry (e.g. "30m", "2h"), converted once to an
+        /// absolute timestamp when the command runs
         #[arg(long, conflicts_with = "expires_at_ms")]
         expires_in: Option<String>,
     },
@@ -3610,8 +3768,10 @@ enum MobCommands {
         #[arg(long = "scope")]
         scopes: Vec<String>,
     },
-    /// List raw control-scope grant records (expired rows appear verbatim
-    /// with their expires_at_ms; the enforcement seam evaluates expiry).
+    /// List a mob's stored control-scope grant records.
+    ///
+    /// Expired grants are still listed, with their expires_at_ms; expiry is
+    /// checked when a grant is used.
     Grants {
         /// Mob ID
         mob_id: String,
@@ -3643,8 +3803,7 @@ enum MobCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Bind a member-host daemon to a mob using its binding descriptor
-    /// (multi-host mobs §7.2 step 2).
+    /// Bind a member-host daemon to a mob using its binding descriptor.
     BindHost {
         /// Mob ID
         mob_id: String,
@@ -3687,7 +3846,7 @@ enum MobCommands {
         /// Mob ID
         mob_id: String,
     },
-    /// Member live-channel console verbs (§16.9).
+    /// Open, inspect, control, and close member live channels.
     Live {
         #[command(subcommand)]
         command: MobLiveCommands,
@@ -3701,8 +3860,8 @@ enum MobCommands {
     ///
     /// Binds the host acceptor, writes the host binding descriptor (0600),
     /// and serves supervisor bind/rebind ceremonies until interrupted.
-    /// Realm selection is workspace-derived by default; `--isolated` is a
-    /// typed startup rejection for the daemon.
+    /// Realm selection is workspace-derived by default; the daemon refuses
+    /// to start with `--isolated`.
     #[cfg(all(feature = "comms", feature = "schedule", feature = "rpc-surface"))]
     Host {
         /// Host acceptor TCP bind address (default: 127.0.0.1:0).
@@ -3758,10 +3917,12 @@ enum MobCommands {
 #[cfg(feature = "mob")]
 #[derive(Subcommand)]
 enum MobLiveCommands {
-    /// Open a live realtime channel on a member. Prints the wire
-    /// LiveOpenResult JSON (URL + single-use token) to stdout VERBATIM —
-    /// stdout is the delivery channel, not a log; stderr stays token-free
-    /// (DEC-P6B-C7/C8).
+    /// Open a live realtime channel on a member.
+    ///
+    /// Prints the LiveOpenResult JSON (live URL and single-use token) to
+    /// stdout, unmodified: stdout is the delivery channel, not a log, and
+    /// stderr stays token-free. The returned WebSocket is the input plane;
+    /// there is no `live send` verb.
     Open {
         /// Mob ID
         mob_id: String,
@@ -3770,11 +3931,13 @@ enum MobLiveCommands {
         /// Turning mode (omitted = the owning host's provider-managed default)
         #[arg(long, value_enum)]
         turning_mode: Option<CliRealtimeTurningMode>,
-        /// Requested live transport
+        /// Requested live transport. Member live channels support only
+        /// websocket; webrtc is refused (use the session-scoped JSON-RPC
+        /// live/open for WebRTC)
         #[arg(long, value_enum)]
         transport: Option<CliLiveOpenTransport>,
     },
-    /// Close one NAMED live channel (close-what-you-name, DEC-P6B-C9).
+    /// Close one live channel, named by its id.
     Close {
         /// Mob ID
         mob_id: String,
@@ -3783,8 +3946,10 @@ enum MobLiveCommands {
         /// Channel id to close
         channel_id: String,
     },
-    /// Read live channel status. Omit --channel-id for the reply-loss
-    /// discovery read of the member's active channel (ADJ-P6B-2).
+    /// Read live channel status.
+    ///
+    /// Without --channel-id, reads the member's active channel, so the id of
+    /// an open whose reply was lost can be found and closed.
     Status {
         /// Mob ID
         mob_id: String,
@@ -3802,7 +3967,7 @@ enum MobLiveCommands {
         agent_identity: String,
         /// Channel id to control
         channel_id: String,
-        /// Control verb (closed DL10 vocabulary)
+        /// Control verb
         #[arg(value_enum)]
         verb: CliMobLiveControlVerb,
         /// Truncate only: provider item id
@@ -3872,7 +4037,9 @@ enum CliMobLiveControlVerb {
 enum MobWebCommands {
     /// Build a browser-deployable WASM bundle from a .mobpack archive.
     Build {
+        /// Path to a .mobpack archive
         pack: PathBuf,
+        /// Output directory for the bundle
         #[arg(short = 'o', long)]
         output: PathBuf,
         /// Prebuilt meerkat-web-runtime artifacts: either the wasm-pack `--target web` output
@@ -3880,6 +4047,11 @@ enum MobWebCommands {
         /// `<name>.js` glue is copied alongside). Required: the CLI does not compile wasm32 itself.
         #[arg(long)]
         wasm: PathBuf,
+        /// Signature trust policy (default: RKAT_TRUST_POLICY, then the
+        /// realm's trust.policy, then strict)
+        ///
+        /// strict rejects unsigned packs and unknown signers; permissive
+        /// allows them with a warning. Invalid signatures are always rejected.
         #[arg(long, value_enum)]
         trust_policy: Option<TrustPolicyArg>,
     },
@@ -4139,6 +4311,7 @@ async fn cli_main() -> anyhow::Result<ExitCode> {
                 stdin,
                 line_format,
                 auth_binding,
+                None,
                 &cli_scope,
             ))
             .await
@@ -4293,11 +4466,15 @@ async fn handle_help_command(
         max_tokens,
     };
     let help_prompt = meerkat::help::render_help_prompt(&request)?;
+    // Like every help entry point, the CLI builds its session from the one
+    // shared help session: the embedded skills whole in the system prompt and
+    // the read-only reference tools as the session's only tools.
+    let help = cli_help_session()?;
 
     handle_run_command(
         help_prompt,
         None,
-        Some(meerkat::help::help_system_prompt().to_string()),
+        Some(help.system_prompt),
         model,
         provider,
         max_tokens,
@@ -4312,12 +4489,12 @@ async fn handle_help_command(
         html_template_file,
         stream,
         no_stream,
-        false,
+        true,
         false,
         Vec::new(),
         None,
         None,
-        meerkat::help::platform_preload_skill_names(),
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -4336,15 +4513,48 @@ async fn handle_help_command(
         None,
         None,
         None,
-        false,
+        true,
         None,
         Vec::new(),
         StdinMode::Off,
         LineFormat::Text,
         None,
+        Some((help.tools, help.tool_access_policy)),
         scope,
     )
     .await
+}
+
+/// The session `rkat help` runs: the embedded skills whole in the system
+/// prompt, the read-only reference tools as its only tools, and the launch
+/// tool access policy that admits only them.
+#[cfg_attr(not(feature = "skills"), allow(dead_code))]
+struct CliHelpSession {
+    system_prompt: String,
+    tools: Arc<dyn AgentToolDispatcher>,
+    tool_access_policy: meerkat_core::ops::ToolAccessPolicy,
+}
+
+#[cfg(feature = "skills")]
+fn cli_help_session() -> anyhow::Result<CliHelpSession> {
+    let help = meerkat::help::help_session();
+    Ok(CliHelpSession {
+        system_prompt: help.system_prompt,
+        tools: help.tools,
+        tool_access_policy: help.tool_access_policy,
+    })
+}
+
+/// Model help answers from the embedded skills and reads their references
+/// through the help session's resource tools. A build without the `skills`
+/// feature has neither, so `rkat help` is refused here, before any session or
+/// tool is composed, instead of running as an ordinary run.
+#[cfg(not(feature = "skills"))]
+fn cli_help_session() -> anyhow::Result<CliHelpSession> {
+    anyhow::bail!(
+        "rkat help needs the `skills` feature, which this rkat was built without: \
+         help answers from the embedded skills and their reference documents"
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4397,6 +4607,10 @@ async fn handle_run_command(
     stdin: StdinMode,
     line_format: LineFormat,
     auth_binding: Option<AuthBindingRef>,
+    help_tools: Option<(
+        Arc<dyn AgentToolDispatcher>,
+        meerkat_core::ops::ToolAccessPolicy,
+    )>,
     scope: &RuntimeScope,
 ) -> anyhow::Result<()> {
     // One-time, idempotent: carry any pre-`global` (`dev`) login credentials
@@ -4600,6 +4814,7 @@ async fn handle_run_command(
                 manifest,
                 persistence,
                 &storage_scope,
+                help_tools,
                 scope,
             )
             .await
@@ -8094,13 +8309,13 @@ async fn interactive_login(
         eprintln!();
         print_warn(&format!("{env_var} is set in your environment."));
         print_hint(&format!(
-            "The env-var auth path will continue to handle `{cli_cmd} run` without"
+            "After this login, `{cli_cmd} run` without `--auth-binding` tries this provider's"
         ));
         print_hint(&format!(
-            "`--auth-binding`. OAuth tokens are used when you invoke `{cli_cmd}` with"
+            "stored bindings, this login included, before {env_var}."
         ));
         print_hint(&format!(
-            "`--auth-binding global:{}`.",
+            "`--auth-binding global:{}` selects this login explicitly.",
             provider.binding_id(),
         ));
     }
@@ -13272,6 +13487,38 @@ fn build_turn_tool_overlay(
     })
 }
 
+/// Tool families a run composes from its flags and the realm configuration.
+/// A help run composes none of them: its help tools are its only tools.
+#[cfg(feature = "session-store")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunToolFamilies {
+    workgraph: bool,
+    mob: bool,
+    schedule: bool,
+    /// The realm's configured MCP servers.
+    realm_mcp: bool,
+}
+
+#[cfg(feature = "session-store")]
+impl RunToolFamilies {
+    fn resolve(help_run: bool, enable_workgraph: bool, enable_mob: bool, config: &Config) -> Self {
+        if help_run {
+            return Self {
+                workgraph: false,
+                mob: false,
+                schedule: false,
+                realm_mcp: false,
+            };
+        }
+        Self {
+            workgraph: enable_workgraph || config.tools.workgraph_enabled,
+            mob: cfg!(feature = "mob") && (enable_mob || config.tools.mob_enabled),
+            schedule: config.tools.schedule_enabled,
+            realm_mcp: true,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_agent(
     prompt: &str,
@@ -13315,6 +13562,10 @@ async fn run_agent(
     manifest: meerkat_store::RealmManifest,
     persistence: PersistenceBundle,
     storage_scope: &RuntimeScope,
+    help_tools: Option<(
+        Arc<dyn AgentToolDispatcher>,
+        meerkat_core::ops::ToolAccessPolicy,
+    )>,
     scope: &RuntimeScope,
 ) -> anyhow::Result<()> {
     #[cfg(not(feature = "session-store"))]
@@ -13361,6 +13612,7 @@ async fn run_agent(
             manifest,
             persistence,
             storage_scope,
+            help_tools,
             scope,
         );
         anyhow::bail!("rkat built without session-store support");
@@ -13368,8 +13620,10 @@ async fn run_agent(
     #[cfg(feature = "session-store")]
     {
         let keep_alive = resolve_keep_alive(keep_alive)?;
-        let effective_workgraph = enable_workgraph || config.tools.workgraph_enabled;
-        let effective_mob = cfg!(feature = "mob") && (enable_mob || config.tools.mob_enabled);
+        let help_run = help_tools.is_some();
+        let families = RunToolFamilies::resolve(help_run, enable_workgraph, enable_mob, config);
+        let effective_workgraph = families.workgraph;
+        let effective_mob = families.mob;
         let turn_tool_overlay = build_turn_tool_overlay(allow_tools, block_tools);
         // Wave-c C-12: the canonical runtime identity for a skill is
         // `SkillKey { source_uuid, skill_name }` (C-1 / C-4 upstream retype).
@@ -13429,7 +13683,7 @@ async fn run_agent(
             .builtins(enable_builtins)
             .shell(enable_shell)
             .workgraph(effective_workgraph)
-            .schedule(config.tools.schedule_enabled);
+            .schedule(families.schedule);
         if let Some(context_root) = scope.context_root.clone() {
             factory = factory.context_root(context_root);
         }
@@ -13439,8 +13693,11 @@ async fn run_agent(
 
         #[cfg(feature = "comms")]
         let factory = factory.comms(!comms_overrides.disabled);
-        let governed_mcp =
-            governed_configured_mcp_servers(&persistence, scope, &config.tools.mcp_servers).await?;
+        let governed_mcp = if families.realm_mcp {
+            governed_configured_mcp_servers(&persistence, scope, &config.tools.mcp_servers).await?
+        } else {
+            None
+        };
         let factory = with_governed_mcp_auth(factory, scope, governed_mcp.as_deref(), mcp_auth)?;
         // The loader's router launches stdio servers inside the factory's
         // own launch boundary.
@@ -13542,7 +13799,7 @@ async fn run_agent(
 
         // Load optional MCP tools immediately before external tool composition so
         // later early-return windows cannot skip adapter shutdown.
-        let (mcp_external_tools, mcp_adapter) = if governed_mcp.is_some() {
+        let (mcp_external_tools, mcp_adapter) = if governed_mcp.is_some() || !families.realm_mcp {
             (None, None)
         } else {
             load_mcp_external_tools(
@@ -13556,8 +13813,11 @@ async fn run_agent(
             .await?
         };
         // Mob tools now flow through mob_tools (factory pattern), not external_tools.
-        // Only MCP tools remain as external_tools.
-        let external_tools = mcp_external_tools;
+        // Only MCP tools (or a help run's help tools) remain as external_tools.
+        // A help run's launch policy admits only its help tools, and the
+        // session persists it.
+        let (help_tools, help_tool_access_policy) = help_tools.unzip();
+        let external_tools = help_tools.or(mcp_external_tools);
         #[cfg(feature = "mob")]
         let mob_tools_factory: Option<Arc<dyn meerkat_core::service::MobToolsFactory>> =
             run_mob_tools.as_ref().map(|ctx| {
@@ -13584,7 +13844,7 @@ async fn run_agent(
 
         let mut build = SessionBuildOptions {
             model_fallback: None,
-            tool_access_policy: None,
+            tool_access_policy: help_tool_access_policy,
             declared_tool_restriction: None,
             tool_dispatch_admission: None,
             application_tool_policy: meerkat_core::ApplicationToolPolicyBinding::Unmanaged,
@@ -13619,12 +13879,20 @@ async fn run_agent(
             override_builtins: meerkat_core::ToolCategoryOverride::from_effective(enable_builtins),
             override_shell: meerkat_core::ToolCategoryOverride::from_effective(enable_shell),
             override_memory: meerkat_core::ToolCategoryOverride::from_effective(enable_memory),
-            override_schedule: meerkat_core::ToolCategoryOverride::Inherit,
+            override_schedule: if help_run {
+                meerkat_core::ToolCategoryOverride::Disable
+            } else {
+                meerkat_core::ToolCategoryOverride::Inherit
+            },
             override_workgraph: meerkat_core::ToolCategoryOverride::from_effective(
                 effective_workgraph,
             ),
             override_mob: meerkat_core::ToolCategoryOverride::Inherit,
-            override_image_generation: meerkat_core::ToolCategoryOverride::Inherit,
+            override_image_generation: if help_run {
+                meerkat_core::ToolCategoryOverride::Disable
+            } else {
+                meerkat_core::ToolCategoryOverride::Inherit
+            },
             override_web_search: if no_web_search {
                 meerkat_core::ToolCategoryOverride::Disable
             } else {
@@ -13651,7 +13919,12 @@ async fn run_agent(
             } else {
                 Some(instructions)
             },
-            initial_metadata_entries: std::collections::BTreeMap::new(),
+            // The help marker makes every rebuild of a help session from
+            // storage refuse it.
+            initial_metadata_entries: help_run
+                .then(meerkat::help::help_session_metadata_entry)
+                .into_iter()
+                .collect(),
             initial_tool_filter: None,
             initial_tool_visibility_state: None,
             shell_env: None,
@@ -14146,6 +14419,9 @@ async fn resume_session_with_llm_override(
             .await
             .map_err(|e| anyhow::anyhow!("Failed to load session: {e}"))?
             .ok_or_else(|| exit_status::session_not_found(&session_id))?;
+        // A help session continues only on the live session its help entry
+        // point built: refuse the rebuild before anything is composed.
+        meerkat::help::HelpSessionNotResumable::check(&session).map_err(anyhow::Error::new)?;
         let message_count = session.messages().len();
         let stored_metadata = session
             .session_metadata()
@@ -25745,6 +26021,7 @@ default_model = "gemma"
             stdin,
             line_format,
             auth_binding,
+            None,
             &scope,
         )
         .await
@@ -27045,6 +27322,146 @@ default_model = "gemma"
                 .map(std::ffi::OsString::from)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn test_run_preloading_the_platform_skill_keeps_the_configured_injection_limit() {
+        // Only the help entry points carry the help skills whole (through
+        // `meerkat::help::help_session`); a normal run that preloads them
+        // keeps the configured per-skill limit for every skill it injects.
+        let default_limit = Config::default().skills.max_injection_bytes;
+        let (config, preload) = resolve_runtime_skills(
+            Config::default(),
+            meerkat::help::platform_preload_skill_names(),
+        )
+        .await
+        .expect("builtin help skills resolve");
+        assert_eq!(preload, meerkat::help::platform_preload_skill_names());
+        assert_eq!(config.skills.max_injection_bytes, default_limit);
+
+        let mut configured = Config::default();
+        configured.skills.max_injection_bytes = 48 * 1024;
+        let (config, _) =
+            resolve_runtime_skills(configured, meerkat::help::platform_preload_skill_names())
+                .await
+                .expect("builtin help skills resolve");
+        assert_eq!(config.skills.max_injection_bytes, 48 * 1024);
+    }
+
+    #[cfg(feature = "session-store")]
+    #[test]
+    fn test_help_run_composes_none_of_the_realm_tool_families() {
+        let mut config = Config::default();
+        config.tools.workgraph_enabled = true;
+        config.tools.mob_enabled = true;
+        config.tools.schedule_enabled = true;
+
+        // `rkat help` passes its help tools: nothing the realm configures,
+        // and none of its MCP servers, joins them.
+        assert_eq!(
+            RunToolFamilies::resolve(true, true, true, &config),
+            RunToolFamilies {
+                workgraph: false,
+                mob: false,
+                schedule: false,
+                realm_mcp: false,
+            }
+        );
+        // A normal run is unchanged: it composes what its flags and the
+        // realm configure, and loads the realm's MCP servers.
+        assert_eq!(
+            RunToolFamilies::resolve(false, false, false, &config),
+            RunToolFamilies {
+                workgraph: true,
+                mob: cfg!(feature = "mob"),
+                schedule: true,
+                realm_mcp: true,
+            }
+        );
+        let defaults = Config::default();
+        assert_eq!(
+            RunToolFamilies::resolve(false, true, false, &defaults),
+            RunToolFamilies {
+                workgraph: true,
+                mob: cfg!(feature = "mob") && defaults.tools.mob_enabled,
+                schedule: defaults.tools.schedule_enabled,
+                realm_mcp: true,
+            }
+        );
+    }
+
+    #[test]
+    fn test_normalize_cli_args_as_agent_before_the_command() {
+        // `--as-agent` is a root option with a value: in front of a command
+        // name it must not turn that command into the prompt.
+        let cases: [(&[&str], &[&str]); 4] = [
+            (
+                &["rkat", "--as-agent", "agent-a", "realm", "list"],
+                &["rkat", "--as-agent", "agent-a", "realm", "list"],
+            ),
+            (
+                &["rkat", "--as-agent=agent-a", "realm", "list"],
+                &["rkat", "--as-agent=agent-a", "realm", "list"],
+            ),
+            (
+                &[
+                    "rkat",
+                    "--realm",
+                    "team",
+                    "--as-agent",
+                    "agent-a",
+                    "run",
+                    "hi",
+                ],
+                &[
+                    "rkat",
+                    "--realm",
+                    "team",
+                    "--as-agent",
+                    "agent-a",
+                    "run",
+                    "hi",
+                ],
+            ),
+            (
+                &["rkat", "--as-agent", "agent-a", "hi"],
+                &["rkat", "--as-agent", "agent-a", "run", "hi"],
+            ),
+        ];
+        for (argv, expected) in cases {
+            let args = normalize_cli_args(argv.iter().copied().map(Into::into));
+            assert_eq!(
+                args,
+                expected
+                    .iter()
+                    .copied()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>(),
+                "{argv:?}"
+            );
+        }
+
+        #[cfg(feature = "local-authorization")]
+        {
+            let cli = Cli::try_parse_from(normalize_cli_args(
+                [
+                    "rkat",
+                    "--realm",
+                    "team",
+                    "--as-agent",
+                    "agent-a",
+                    "run",
+                    "hi",
+                ]
+                .map(Into::into),
+            ))
+            .expect("root-position --as-agent parses");
+            assert_eq!(cli.as_agent.as_deref(), Some("agent-a"));
+            match cli.command.expect("test invocation parses a subcommand") {
+                Commands::Run { prompt, .. } => assert_eq!(prompt, "hi"),
+                _ => unreachable!("expected run command"),
+            }
+        }
     }
 
     #[test]
@@ -28462,6 +28879,10 @@ url = "https://user.example/mcp"
         assert!(top.contains("rkat help \"How do I add an mcp server?\""));
         assert!(top.contains("tail -f app.log | rkat run --stdin lines"));
         assert!(top.contains("help"));
+        assert!(top.contains("Realm config: init, config, realm, auth"));
+        assert!(top.contains("Utility:      session, blob, workgraph,"));
+        assert!(top.contains("Integrations: mcp, mob, skill"));
+        assert!(top.contains("Use `rkat <command> -h`"));
 
         let run = render_help(Cli::command().find_subcommand("run").unwrap().clone());
         assert!(run.contains("--tools <TOOLS>"));
@@ -28473,6 +28894,18 @@ url = "https://user.example/mcp"
         assert!(help.contains("--prompt <PROMPT>"));
         assert!(help.contains("--plan-execution"));
         assert!(help.contains("How do I add an mcp server"));
+        assert!(help.contains("For the command reference, run `rkat --help`"));
+
+        let login = render_help(
+            Cli::command()
+                .find_subcommand("auth")
+                .unwrap()
+                .find_subcommand("login")
+                .unwrap()
+                .clone(),
+        );
+        assert!(login.contains("`copilot`"), "{login}");
+        assert!(login.contains("Interactive login ignores it"), "{login}");
 
         #[cfg(feature = "mob")]
         {
@@ -28491,6 +28924,76 @@ url = "https://user.example/mcp"
             assert!(mob.contains("respawn"));
             assert!(mob.contains("wait-kickoff"));
         }
+    }
+
+    #[test]
+    fn test_help_tree_carries_no_internal_references() {
+        use clap::CommandFactory;
+
+        fn collect_long_help(
+            command: &clap::Command,
+            path: &str,
+            pages: &mut Vec<(String, String)>,
+        ) {
+            let mut out = Vec::new();
+            command
+                .clone()
+                .write_long_help(&mut out)
+                .expect("help should render");
+            pages.push((
+                path.to_string(),
+                String::from_utf8(out).expect("utf-8 help"),
+            ));
+            for sub in command.get_subcommands() {
+                collect_long_help(sub, &format!("{path} {}", sub.get_name()), pages);
+            }
+        }
+
+        let mut pages = Vec::new();
+        collect_long_help(&Cli::command(), "rkat", &mut pages);
+        assert!(pages.len() > 20, "the help walk must reach nested commands");
+        for (path, page) in &pages {
+            for marker in [
+                "\u{a7}",
+                "DEC-",
+                "ADJ-",
+                "DL10",
+                "wave-b",
+                "cli_parse::",
+                "SessionBuildOptions",
+                "enforcement seam",
+                "<binary>",
+            ] {
+                assert!(
+                    !page.contains(marker),
+                    "`{path} --help` leaks internal reference {marker:?}:\n{page}"
+                );
+            }
+            assert!(
+                !page
+                    .match_indices("(#")
+                    .any(|(at, _)| page[at + 2..].starts_with(|c: char| c.is_ascii_digit())),
+                "`{path} --help` cites an issue number:\n{page}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bare_help_command_prints_its_usage() {
+        let error = match Cli::try_parse_from(["rkat", "help"]) {
+            Err(error) => error,
+            Ok(_) => panic!("bare `rkat help` has no question to answer"),
+        };
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("rkat help [OPTIONS] <QUESTION>"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("run `rkat --help`"), "{rendered}");
     }
 
     #[cfg(feature = "mob")]
@@ -33873,6 +34376,81 @@ mod docs_cli_examples {
             lines.push(line);
         }
         lines
+    }
+
+    /// The `rkat` examples of every command's after-help text, a piped
+    /// example reduced to its `rkat` stage.
+    fn after_help_examples() -> Vec<String> {
+        fn walk(command: &clap::Command, examples: &mut Vec<String>) {
+            if let Some(text) = command.get_after_help() {
+                for line in text.to_string().lines() {
+                    let line = line.trim();
+                    let stage = line
+                        .rsplit_once(" | ")
+                        .map_or(line, |(_, last)| last.trim());
+                    if stage.starts_with("rkat ") {
+                        examples.push(stage.to_string());
+                    }
+                }
+            }
+            for subcommand in command.get_subcommands() {
+                walk(subcommand, examples);
+            }
+        }
+        let mut examples = Vec::new();
+        walk(
+            &<super::Cli as clap::CommandFactory>::command(),
+            &mut examples,
+        );
+        examples
+    }
+
+    #[test]
+    fn after_help_examples_parse_against_clap() {
+        let mut checked = 0usize;
+        let mut failures = Vec::new();
+        for example in after_help_examples() {
+            // Placeholders such as `<PKG_DIR>` are shapes, not invocations.
+            if example.contains('<') {
+                continue;
+            }
+            let Some(tokens) = split_tokens(&example) else {
+                failures.push(format!("`{example}`: unbalanced quotes"));
+                continue;
+            };
+            match validate_example(&tokens, CliFeature::compiled) {
+                ExampleValidation::Accepted => checked += 1,
+                ExampleValidation::UnsupportedFeature => {}
+                ExampleValidation::Rejected(err) => {
+                    checked += 1;
+                    failures.push(format!("`{example}`: {err}"));
+                }
+            }
+        }
+        assert!(checked > 0, "no after-help examples were checked");
+        assert!(
+            failures.is_empty(),
+            "after-help examples the CLI rejects:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn resume_examples_that_name_their_session_parse() {
+        // Help and docs examples name the session before the prompt.
+        for line in [
+            r#"rkat run --resume last "keep going""#,
+            r#"rkat run --resume '~2' "pick this thread back up""#,
+        ] {
+            let tokens = split_tokens(line).expect("tokens");
+            assert!(
+                matches!(
+                    validate_example(&tokens, CliFeature::compiled),
+                    ExampleValidation::Accepted
+                ),
+                "{line}"
+            );
+        }
     }
 
     #[test]

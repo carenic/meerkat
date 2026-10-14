@@ -62,13 +62,13 @@ impl SkillReadResourceTool {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl BuiltinTool for SkillListResourcesTool {
     fn name(&self) -> &'static str {
-        "skill_list_resources"
+        super::SKILL_LIST_RESOURCES_TOOL_NAME
     }
 
     fn def(&self) -> ToolDef {
         ToolDef {
             audience: Default::default(),
-            name: "skill_list_resources".into(),
+            name: super::SKILL_LIST_RESOURCES_TOOL_NAME.into(),
             description:
                 "List resources exposed by a skill identified by (source_uuid, skill_name).".into(),
             input_schema: crate::schema::schema_for::<SkillListResourcesArgs>(),
@@ -116,13 +116,13 @@ impl BuiltinTool for SkillListResourcesTool {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl BuiltinTool for SkillReadResourceTool {
     fn name(&self) -> &'static str {
-        "skill_read_resource"
+        super::SKILL_READ_RESOURCE_TOOL_NAME
     }
 
     fn def(&self) -> ToolDef {
         ToolDef {
             audience: Default::default(),
-            name: "skill_read_resource".into(),
+            name: super::SKILL_READ_RESOURCE_TOOL_NAME.into(),
             description:
                 "Read a resource at `path` from a skill identified by (source_uuid, skill_name)."
                     .into(),

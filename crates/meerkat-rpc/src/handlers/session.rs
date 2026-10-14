@@ -559,6 +559,7 @@ pub async fn create_session_with_params_on_route(
         request_context,
         callback_route,
         Vec::new(),
+        None,
     )
     .await
 }
@@ -566,7 +567,10 @@ pub async fn create_session_with_params_on_route(
 /// [`create_session_with_params_on_route`] for a trusted host composition
 /// that carries `configured_mcp_servers` (full descriptors) into the
 /// session's build, where each connects through the governed configured
-/// entry. Never taken from wire parameters.
+/// entry, and `host_tools` (the help session's tools, with the launch tool
+/// access policy that admits only them) as the session's external tools in
+/// place of callback tools, marking the session as a help session. Never
+/// taken from wire parameters.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_session_with_params_on_route_and_configured_mcp(
     id: Option<RpcId>,
@@ -577,6 +581,10 @@ pub(crate) async fn create_session_with_params_on_route_and_configured_mcp(
     request_context: Option<RequestContext>,
     callback_route: Option<crate::callback_dispatcher::CallbackRoute>,
     configured_mcp_servers: Vec<meerkat_core::McpServerConfig>,
+    host_tools: Option<(
+        Arc<dyn meerkat_core::AgentToolDispatcher>,
+        meerkat_core::ops::ToolAccessPolicy,
+    )>,
 ) -> RpcResponse {
     if let Err(err) = meerkat::surface::validate_public_peer_meta(params.peer_meta.as_ref()) {
         return RpcResponse::error(id, error::INVALID_PARAMS, err);
@@ -713,6 +721,16 @@ pub(crate) async fn create_session_with_params_on_route_and_configured_mcp(
             build_config.external_tools = Some(dispatcher);
         }
     }
+    // Host tools are the session's whole tool set: it gets no live MCP
+    // adapter either. Their launch policy admits only them, and the help
+    // marker makes every rebuild of the session from storage refuse it.
+    let live_mcp = host_tools.is_none();
+    if let Some((host_tools, tool_access_policy)) = host_tools {
+        build_config.external_tools = Some(host_tools);
+        build_config.tool_access_policy = Some(tool_access_policy);
+        let (key, value) = meerkat::help::help_session_metadata_entry();
+        build_config.initial_metadata_entries.insert(key, value);
+    }
 
     // Validate and canonicalize skill refs before creating a pending session.
     // This prevents invalid requests from consuming session slots.
@@ -754,15 +772,26 @@ pub(crate) async fn create_session_with_params_on_route_and_configured_mcp(
         } else {
             (None, Vec::new(), injected_context)
         };
-    let session_id = match runtime
-        .create_session(
-            build_config,
-            params.labels,
-            deferred_prompt,
-            deferred_injected_context,
-        )
-        .await
-    {
+    let created = if live_mcp {
+        runtime
+            .create_session(
+                build_config,
+                params.labels,
+                deferred_prompt,
+                deferred_injected_context,
+            )
+            .await
+    } else {
+        runtime
+            .create_session_without_live_mcp(
+                build_config,
+                params.labels,
+                deferred_prompt,
+                deferred_injected_context,
+            )
+            .await
+    };
+    let session_id = match created {
         Ok(sid) => sid,
         Err(rpc_err) => {
             return RpcResponse::error(id, rpc_err.code, rpc_err.message);

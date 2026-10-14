@@ -19,10 +19,21 @@ meerkat-core              (types, foundational traits, agent loop, domain-only S
                               depends on core and contracts)
   ├── meerkat-auth-core      (cross-target credential resolver plus native token stores, OAuth,
                               keyring, lockfile, and cloud authorizers; depends on core + llm-core)
+  ├── meerkat-copilot        (GitHub Copilot OAuth/CAPI token exchange, account model discovery,
+                              shared backend runtime for the OpenAI/Anthropic/Gemini Copilot
+                              backends; depends on core + llm-core + auth-core)
   ├── meerkat-providers      (compatibility shim re-exporting llm-core provider runtime and
                               auth-core primitives)
   ├── meerkat-capabilities    (typed capability vocabulary, feature-owned declaration collection)
   ├── meerkat-atif            (ATIF-v1.7 trajectory model and committed-event exporter)
+  ├── meerkat-sandbox         (OS lowering of core ExecutionConfinement requirements + exact native
+                                spawn: Linux, macOS Seatbelt; used by shell tools, MCP stdio servers,
+                                and command hooks)
+  ├── meerkat-authorization-contracts (portable host-trusted grant, constraint, evidence, audit,
+                                and work-association contracts; no producer or persistence)
+  ├── meerkat-authorization   (process-local generated grant authority: GrantAuthorityMachine
+                                bridge, LocalGrantAuthority, grant-backed work policy; depends on
+                                core, machine-schema/dsl, authorization-contracts)
   ├── meerkat-contracts       (wire types, error codes, generated surface schema projections)
   ├── meerkat-store-conformance (published storage conformance harness: per-trait capability
                                 profiles, capability-discovery, append-only media, blob/artifact
@@ -73,6 +84,10 @@ Surface binaries:
   ├── meerkat-rpc           → rkat-rpc                   (JSON-RPC; stdio default, --tcp opt-in)
   ├── meerkat-rest          → rkat-rest                   (REST + SSE)
   └── meerkat-mcp-server    → rkat-mcp                    (MCP server)
+
+Unpublished workspace tooling:
+  ├── xtask                       (typed governance gates; machine codegen/drift/verify commands)
+  └── meerkat-integration-tests   (tests/integration; e2e lane catalog in src/e2e_lanes.rs)
 ```
 
 There are no separate public reduced-surface binaries. Reduced-surface distributions are source builds of the same surface crates with a narrower Cargo feature set.
@@ -141,6 +156,15 @@ profiles; the in-repo stores run the same suite in
 | `OpsLifecycleRegistry` | Async operation tracking (wait_all, collect_completed, bounded retention, timestamps, concurrency, detached wake) | `RuntimeOpsLifecycleRegistry` (meerkat-runtime) |
 | `MobToolsFactory` | Late-binding session-scoped mob tool construction | `AgentMobToolSurfaceFactory` (meerkat-mob-mcp) |
 | `StorageMigrator` | Shape-stable storage diagnose seam (`diagnose(&DiagnoseScope) → StorageDiagnosis`; mutation verbs arrive as defaulted methods) | `DiskStorageMigrator` (crates/meerkat-store/src/doctor.rs) |
+| `WorkAuthorization` | Feature-owned per-work authorization context consulted at existing operation boundaries; core defines no turn, run, or session disposition for a refusal (crates/meerkat-core/src/authorization.rs) | `LocalWorkAuthorization` (meerkat-authorization) |
+| `ApprovalStore` | Review/consent approval persistence: conditional `put_if_current` with commitment-typed `ApprovalStoreError` (`NotCommitted`, `Conflict`, `Contended`, `CommitUnknown`) | `InMemoryApprovalStore` (meerkat-core), `FileApprovalStore` (meerkat-store) |
+
+### Authorization traits (defined in meerkat-authorization)
+
+| Trait | Purpose | Implementors |
+|-------|---------|-------------|
+| `GrantOwnerStore` | Optional restart custody for the process-local grant owner (`LocalGrantAuthority`); prepared decisions are never persisted | `InMemoryGrantOwnerStore`, `FileGrantOwnerStore` |
+| `AdmittedWorkPolicyOwner` / `OperationPolicyOwner` | Host policy owners for the accepted work and for each actual operation; `GrantBackedWorkPolicy` conjoins them with one selected grant authority | Host-provided |
 
 ### WorkGraph traits (defined in meerkat-workgraph)
 
@@ -153,7 +177,7 @@ profiles; the in-repo stores run the same suite in
 | Trait | Purpose | Implementors |
 |-------|---------|-------------|
 | `RuntimeControlPlane` | Multi-session runtime control (ingest, publish event, retire, recycle, reset, recover, inspect state, destroy, load boundary receipt) | `MeerkatMachine` |
-| `RuntimeDriver` | Per-session input lifecycle (accept, run events, control, recover, retire, destroy) | `EphemeralRuntimeDriver`, `PersistentRuntimeDriver` |
+| `RuntimeDriver` | Per-session input lifecycle (accept input, handle runtime events, recover) plus DSL-backed input/runtime state reads | `EphemeralRuntimeDriver`, `PersistentRuntimeDriver` |
 
 ### Durable job traits (defined in meerkat-jobs)
 
@@ -199,9 +223,9 @@ profiles; the in-repo stores run the same suite in
 |------|---------|
 | `MemberLaunchMode` | Fresh / Resume / Fork; Resume is strict same-role unless one exact cold request declares `resume_from_role` |
 | `ForkContext` | FullHistory / LastMessages(n); selected source history is rendered into fresh child context rather than using `Session::fork()` CoW state |
-| `MobMemberSnapshot` | Public status/output fields plus progress, placement, control/comms reachability, freshness, lifecycle capabilities, and disabled non-portable resources. Binding atoms (`agent_identity`, `agent_runtime_id`, `fence_token`, `current_bridge_session_id`) are `pub(crate)` plus `#[serde(skip)]` - bridge-internal, never app-facing |
+| `MobMemberSnapshot` | Public status/output fields plus progress, preview availability, placement, control/comms reachability, freshness, lifecycle capabilities, and disabled non-portable resources. Binding atoms (`agent_identity`, `agent_runtime_id`, `fence_token`, `current_bridge_session_id`) are `pub(crate)` plus `#[serde(skip)]` - bridge-internal, never app-facing |
 | `FrameSpec` / `FlowNodeSpec` / `RepeatUntilSpec` | Frame-based flow graphs and repeat-until loop nodes |
-| `MobDefinition.owner_bridge_session_id` / `MobDefinition.is_implicit` | Session-scoped mob ownership, access control, implicit cleanup |
+| MobMachine `owner_bridge_session_id` / `owner_bridge_destroy_on_archive` / `implicit_delegation_mob` | Machine-owned bridge-session ownership, destroy-on-owner-archive cleanup truth, and implicit-delegation marker (bound by `BindOwnerBridgeSession`, read via `MobHandle::owner_bridge_session_lifecycle_authority()`); `MobDefinition` no longer carries them and ignores the legacy fields on decode |
 
 ### Multimodal types (defined in meerkat-core)
 
@@ -281,7 +305,7 @@ re-paired.
 | `WholeBlobStoreAuthority` / `HeadCanonicalStoreAuthority` | Committed profile-specific physical authority: row revision+SHA or store revision+boundary head+head token — crates/meerkat-runtime/src/store/mod.rs |
 | `RuntimeSessionCatalogEntry` | Transcript-free, graph-free catalog projection committed atomically with body authority — crates/meerkat-runtime/src/store/mod.rs |
 
-### 0.8.23-HEAD additions
+### 0.8.23-0.8.52 additions
 
 | Type | Purpose |
 |------|---------|
@@ -291,6 +315,20 @@ re-paired.
 | `JobHealthCoverage` / `JobHealthReading` / `JobHealthSummary` | Separate job outbox and runtime inbox backlog, declare census coverage, and preserve unreadable as a third state |
 | `LiveOpenTransport::Webrtc` / `LiveWebrtcAnswerParams` / `LiveWebrtcAnswerResult` | Feature-gated WebRTC selection and single-use SDP offer/answer signaling over `live/webrtc/answer` |
 | `MemberLaunchMode::Resume.resume_from_role` / `MaterializeLaunchMode::Resume.resume_from_role` | One-request, exact-cold, forward-only durable member role migration for trusted host paths |
+
+### 0.9.0 additions
+
+| Type | Purpose |
+|------|---------|
+| `ExecutionConfinement` / `ConfinementRefusal` | Core-owned mechanical launch requirements (crates/meerkat-core/src/confinement.rs); `meerkat-sandbox` enforces them for an exact native spawn or refuses |
+| `LocalGrantAuthority` / `GrantRefusal` | Process-local generated grant owner (`GrantAuthorityMachine` bridged in `meerkat_authorization::grants::dsl`); `GrantRefusal` gains `Duplicate` |
+| `GrantTarget` / `WorkAuthorityBasis::TargetedGrantLineages` | Portable typed grant targets (`McpServer`, `RegisteredToolBundleOperation`, `CheckedMcpRoute`) and per-target lineage selection - meerkat-authorization-contracts |
+| `ApprovalService` / `ApprovalStore::put_if_current` / `ApprovalStoreError` | Review and human-consent approvals with conditional writes and commitment-typed outcomes - crates/meerkat-core/src/approval.rs |
+| `RealmGovernance` / `StockGovernance` | Facade governed-realm posture and stock composition (`local-authorization` feature); unavailable owners leave the realm governed and refusing typed - crates/meerkat/src/governed_realm.rs |
+| `McpServerAccess` / `McpStdioConfig.secret_env` / `HttpEgressRefusal` | MCP server access ceilings, realm service secrets for stdio servers, and typed HTTP egress refusals |
+| `ToolAudience` (`ToolDef.audience`) | Model and/or app tool visibility for MCP Apps hosts (`AgentFactory` `mcp_apps` flag, default off) |
+| `HookEngine::mandatory_topology` / `HookModelOperationScope` | Required attested mandatory-hook topology; model-request Guardrails withhold only the dependent operation |
+| `MemberDeliveryScope` / `MobError::{StaleDeliveryScope, AdmissionClosed}` / `MobAdmissionCloseReason` | Scope-bound mob delivery and mob admission close (`IdleClose`, `LastOwnerReleased`, `StandDown`) |
 
 ## Agent Loop And Turn Phases
 
@@ -355,7 +393,7 @@ MobHandle::spawn_spec(spec)
   ├── build AgentBuildConfig from profile
   ├── provisioner.provision_member() → session_service.create_session()
   ├── add to roster, compute wiring targets
-  └── do_wire() for each target pair
+  └── handle_wire() for each target pair
 
 MobHandle::respawn(identity: AgentIdentity)
   ├── retire existing member and remove its roster/runtime binding
@@ -365,13 +403,13 @@ MobHandle::respawn(identity: AgentIdentity)
 
 MobHandle::run_flow(flow_id, params)
   ├── create MobRun record
-  ├── topological sort steps OR dispatch to frame runtime when `flow_spec.root` exists
+  ├── run the canonical root frame (`FlowSpec.root`; flat `steps` compile into it via `FrameSpec::from_flat_steps`)
   ├── canonical step execution via `execute_step_with_all_guards()`
   └── emit FlowCompleted/FlowFailed
 ```
 
 - `mob/create` is definition-only; prefabs are gone.
-- `delegate` / implicit mobs are tracked by canonical `owner_bridge_session_id` + `is_implicit` fields and cleaned up by `destroy_session_mobs()`.
+- `delegate` / implicit mobs are tracked by MobMachine-owned owner-bridge state (`owner_bridge_session_id`, `owner_bridge_destroy_on_archive`, `implicit_delegation_mob`) and cleaned up by `MobMcpState::destroy_bridge_session_mobs()`.
 - Successful retirement is the disposal barrier for this mob incarnation's
   owned work. The provisioner's `MemberSessionDisposal` distinguishes
   `Archived` from `RuntimeReleasedOnlyHostOwned`; the latter does not archive
@@ -381,10 +419,10 @@ MobHandle::run_flow(flow_id, params)
 ## Post-0.5.0 Deltas
 
 - `SessionStore` moved into `meerkat-core`; `meerkat-store` now re-exports and implements it.
-- Agent delegation tools are mob-backed and session-scoped via `owner_bridge_session_id` / `is_implicit`; operator authority is injected, not ambient.
+- Agent delegation tools are mob-backed and session-scoped via MobMachine-owned owner-bridge state (`owner_bridge_session_id`, `implicit_delegation_mob`); operator authority is injected, not ambient.
 - Tooling persistence is tri-state via `ToolCategoryOverride`; resume paths must preserve `Inherit`.
 - Mob persistence switched to SQLite/WAL; the previous exclusive-handle mob store is gone.
 - Flow and loop state is owned by `MobMachine`. `FlowFrameEngine` is the
   scheduler-backed execution shell, while `FlowFrameKernel` is its
   authority-validating store mutation adapter rather than a separate machine.
-- `FlowEngine::execute_step_with_all_guards()` is the single canonical step path for both flat and frame execution.
+- `FlowEngine::execute_step_with_all_guards()` is the single canonical step path; flat-authored flows compile into the root frame and reach it through the same frame adapter.

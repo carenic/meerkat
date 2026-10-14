@@ -6,7 +6,7 @@ Load this reference when working on peer trust, inter-agent messaging, comms dra
 
 - **InprocRegistry** — process-global peer discovery
 - **CommsRuntime** — per-session, created by `AgentFactory::build_agent()` when `comms_name` is set
-- **Wiring** — bidirectional trust. Each peer has `TrustedPeerSpec`
+- **Wiring** - bidirectional trust. Each peer is described by a `TrustedPeerDescriptor` (crates/meerkat-core/src/comms.rs: typed `PeerId`, `PeerName`, `PeerAddress`, and Ed25519 `pubkey`)
 - **Unified trust state** — single `Arc<parking_lot::RwLock<TrustStore>>`. `TrustStore` (crates/meerkat-comms/src/trust.rs) is `PeerId`-keyed (`BTreeMap<PeerId, TrustEntry>`); duplicate `PeerId` inserts are rejected with a typed `DuplicatePeerId` error, so name-keyed trust folklore is structurally impossible
 - **Not all mob members are peers** — wiring rules control which members can communicate
 
