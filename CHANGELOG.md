@@ -35,6 +35,21 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- `rkat` help now matches 0.9 behaviour. `rkat auth login` lists the
+  `copilot` provider, and says that `--backend` and `--method` apply only
+  with `--non-interactive` and that `--secret` requires it. `rkat run
+  --auth-binding` no longer prints internal implementation notes, and the
+  `rkat mob` live, host and helper verbs no longer cite internal design
+  references. `rkat mob live open --transport` states that member channels
+  accept only websocket. The WorkGraph, mob, session and config arguments
+  that had no help are described, including that the CLI's WorkGraph grant
+  covers only the `default` namespace, so `--all-namespaces` is refused. The
+  root command list keeps one-line summaries and names every command group,
+  and `rkat help` without a question prints its usage instead of a bare
+  missing-argument error.
+
 ## [0.9.0] - 2026-10-13
 
 ### Breaking
