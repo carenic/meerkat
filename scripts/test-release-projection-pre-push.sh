@@ -330,6 +330,83 @@ git -C "$TEST_ROOT" commit -qm rust-file-became-symlink
 type_head="$(git -C "$TEST_ROOT" rev-parse HEAD)"
 assert_range_gate rust-file-type-change runtime-only "$range_head" "$type_head" direct
 git -C "$TEST_ROOT" checkout -q --detach "$range_head"
+
+# The same actual commits feed CI planning: the planner's own path collection
+# (run in the fixture repository) must name every path a change touches, both
+# sides of a rename and type-only changes included, and the real workspace
+# plan for those paths must give the touched crates Clippy lanes. The hook no
+# longer runs Clippy, so a path the planner drops is unlinted code. The
+# planner resolves the repository from its working directory, so it runs from
+# this checkout against the fixture's commits.
+ci_plan_failures=0
+assert_ci_plan() {
+  local label="$1" from="$2" to="$3" expected_paths="$4" expected_packages="$5"
+  local collected
+  collected="$(cd "$TEST_ROOT" && node "$REPO_ROOT/scripts/ci-cargo-lanes.mjs" --changed-paths-only --base "$from" --head "$to")" || {
+    printf 'FAIL ci plan: %s: path collection failed\n' "$label" >&2
+    ci_plan_failures=$((ci_plan_failures + 1))
+    return
+  }
+  if ! python3 - "$collected" "$expected_paths" "$expected_packages" "$REPO_ROOT" <<'PY'
+import json
+import subprocess
+import sys
+
+collected, expected_paths, expected_packages, repo_root = sys.argv[1:]
+paths = json.loads(collected)["changed_paths"]
+missing = [path for path in expected_paths.split(",") if path not in paths]
+if missing:
+    sys.exit(f"collection {paths} misses {missing}")
+plan = json.loads(subprocess.run(
+    ["node", "scripts/ci-cargo-lanes.mjs", "--format", "json", "--", *paths],
+    cwd=repo_root, check=True, capture_output=True, text=True,
+).stdout)
+linted = {name for shard in plan["shards"] for name in shard["packages"]}
+unlinted = [name for name in expected_packages.split(",") if name not in linted and plan["mode"] != "workspace"]
+if not plan["rust_changed"] or unlinted:
+    sys.exit(f"plan for {paths}: rust_changed={plan['rust_changed']}, Clippy lanes {sorted(linted)} miss {unlinted}")
+PY
+  then
+    printf 'FAIL ci plan: %s\n' "$label" >&2
+    ci_plan_failures=$((ci_plan_failures + 1))
+  else
+    printf 'PASS ci plan: %s\n' "$label"
+  fi
+}
+git -C "$TEST_ROOT" checkout -q --detach "$range_head"
+git -C "$TEST_ROOT" rm -q crates/meerkat-runtime/src/lib.rs
+git -C "$TEST_ROOT" commit -qm ci-deleted-runtime-source
+assert_ci_plan deleted-runtime-source "$range_head" "$(git -C "$TEST_ROOT" rev-parse HEAD)" \
+  crates/meerkat-runtime/src/lib.rs meerkat-runtime
+git -C "$TEST_ROOT" checkout -q --detach "$range_head"
+git -C "$TEST_ROOT" mv crates/meerkat-runtime/src/lib.rs crates/meerkat-runtime/src/notes.txt
+git -C "$TEST_ROOT" commit -qm ci-rust-renamed-to-text
+assert_ci_plan rust-renamed-to-text "$range_head" "$(git -C "$TEST_ROOT" rev-parse HEAD)" \
+  crates/meerkat-runtime/src/lib.rs,crates/meerkat-runtime/src/notes.txt meerkat-runtime
+git -C "$TEST_ROOT" checkout -q --detach "$range_head"
+mkdir -p "$TEST_ROOT/docs"
+git -C "$TEST_ROOT" mv crates/meerkat-runtime/src/lib.rs docs/retired-test.md
+git -C "$TEST_ROOT" commit -qm ci-rust-renamed-into-docs
+assert_ci_plan rust-renamed-into-docs "$range_head" "$(git -C "$TEST_ROOT" rev-parse HEAD)" \
+  crates/meerkat-runtime/src/lib.rs,docs/retired-test.md meerkat-runtime
+git -C "$TEST_ROOT" checkout -q --detach "$range_head"
+mkdir -p "$TEST_ROOT/crates/meerkat-core/src"
+git -C "$TEST_ROOT" mv crates/meerkat-runtime/src/lib.rs crates/meerkat-core/src/moved_from_runtime.rs
+git -C "$TEST_ROOT" commit -qm ci-test-moved-between-crates
+assert_ci_plan test-moved-between-crates "$range_head" "$(git -C "$TEST_ROOT" rev-parse HEAD)" \
+  crates/meerkat-runtime/src/lib.rs,crates/meerkat-core/src/moved_from_runtime.rs meerkat-runtime,meerkat-core
+git -C "$TEST_ROOT" checkout -q --detach "$range_head"
+rm "$TEST_ROOT/crates/meerkat-runtime/src/lib.rs"
+ln -s ../../../README.md "$TEST_ROOT/crates/meerkat-runtime/src/lib.rs"
+git -C "$TEST_ROOT" add .
+git -C "$TEST_ROOT" commit -qm ci-rust-file-became-symlink
+assert_ci_plan rust-file-type-change "$range_head" "$(git -C "$TEST_ROOT" rev-parse HEAD)" \
+  crates/meerkat-runtime/src/lib.rs meerkat-runtime
+git -C "$TEST_ROOT" checkout -q --detach "$range_head"
+if [[ "$ci_plan_failures" -ne 0 ]]; then
+  echo "$ci_plan_failures CI planning contract failures" >&2
+  exit 1
+fi
 REAL_GIT="$(command -v git)"
 cat > "$HARNESS_ROOT/git" <<'EOF_GIT'
 #!/usr/bin/env bash
