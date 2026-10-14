@@ -20687,20 +20687,26 @@ fn apply_pack_deploy_policy(
     {
         config.models.gemini = model.as_str().to_string();
     }
+    // The pack's `[budget]` fills the enforced `[limits]` dimensions that
+    // `Config::budget_limits` gives every member built from this config. The
+    // legacy `[budget]` table is not enforced, so it neither receives these
+    // values nor blocks them. Precedence per dimension: a
+    // `rkat mob deploy --max-*` flag (applied by `load_deploy_runtime_config`)
+    // > the operator's realm `[limits]` chain > the pack default.
     if let Some(max_tokens) = policy.budget.max_tokens
-        && config.budget.max_tokens.is_none()
+        && config.limits.budget.is_none()
     {
-        config.budget.max_tokens = Some(max_tokens);
+        config.limits.budget = Some(max_tokens);
     }
     if let Some(secs) = policy.budget.max_duration_secs
-        && config.budget.max_duration.is_none()
+        && config.limits.max_duration.is_none()
     {
-        config.budget.max_duration = Some(std::time::Duration::from_secs(secs));
+        config.limits.max_duration = Some(std::time::Duration::from_secs(secs));
     }
     if let Some(calls) = policy.budget.max_tool_calls
-        && config.budget.max_tool_calls.is_none()
+        && config.limits.max_tool_calls.is_none()
     {
-        config.budget.max_tool_calls = Some(calls);
+        config.limits.max_tool_calls = Some(calls);
     }
     if let Some(threshold) = policy.compaction.auto_compact_threshold
         && config.compaction.auto_compact_threshold == baseline.compaction.auto_compact_threshold
@@ -28952,6 +28958,77 @@ capabilities = ["core", "skills", "hooks", "adaptive_flow"]
 
     #[cfg(feature = "mob")]
     #[test]
+    fn test_pack_deploy_policy_budget_reaches_effective_budget_limits() {
+        // A pack's `[budget]` must reach the limits every deployed member is
+        // built with (`Config::budget_limits`), not the legacy `[budget]`
+        // table that nothing enforces.
+        let mut config = Config::default();
+        let policy = meerkat_mob_pack::deploy_policy::MobpackDeployPolicy::parse(Some(
+            b"[budget]\nmax_tokens = 200000\nmax_duration_secs = 900\nmax_tool_calls = 50\n",
+        ))
+        .expect("valid policy");
+
+        apply_pack_deploy_policy(
+            &mut config,
+            &empty_deploy_manifest(),
+            &policy,
+            DeploySurfaceArg::Cli,
+        )
+        .expect("ungated budget knobs apply");
+
+        assert_eq!(
+            config.budget_limits(),
+            BudgetLimits {
+                max_tokens: Some(200_000),
+                max_duration: Some(Duration::from_secs(900)),
+                max_turn_duration: None,
+                max_tool_calls: Some(50),
+            }
+        );
+    }
+
+    #[cfg(feature = "mob")]
+    #[test]
+    fn test_pack_deploy_policy_budget_never_overrides_explicit_limits() {
+        // The operator's realm `[limits]` pins the token budget and a deploy
+        // flag pins the tool-call cap, so the pack only fills the duration
+        // both left unset. The legacy realm `[budget]` value is not enforced:
+        // it neither applies nor blocks the pack default.
+        let mut config = Config::default();
+        config
+            .merge_toml_str("[limits]\nbudget = 1000\n\n[budget]\nmax_duration = \"30m\"\n")
+            .expect("realm config merge");
+        config.apply_cli_overrides(CliOverrides {
+            max_tool_calls: Some(7),
+            ..CliOverrides::default()
+        });
+        let policy = meerkat_mob_pack::deploy_policy::MobpackDeployPolicy::parse(Some(
+            b"[budget]\nmax_tokens = 200000\nmax_duration_secs = 900\nmax_tool_calls = 50\n",
+        ))
+        .expect("valid policy");
+
+        apply_pack_deploy_policy(
+            &mut config,
+            &empty_deploy_manifest(),
+            &policy,
+            DeploySurfaceArg::Cli,
+        )
+        .expect("ungated budget knobs apply");
+
+        assert_eq!(
+            config.budget_limits(),
+            BudgetLimits {
+                max_tokens: Some(1000),
+                max_duration: Some(Duration::from_secs(900)),
+                max_turn_duration: None,
+                max_tool_calls: Some(7),
+            },
+            "realm [limits] and the deploy flag win; the pack fills only the unset duration"
+        );
+    }
+
+    #[cfg(feature = "mob")]
+    #[test]
     fn test_pack_deploy_policy_rejects_out_of_allow_list_section() {
         // A pack must not be able to set self-hosted provider endpoints,
         // provider-tool keys, comms credentials, or hook commands through its
@@ -29852,6 +29929,77 @@ capabilities = ["rpc"]
             "operator realm [tools] config is untouched by the pack (mob_enabled=false), the pack's \
              allow-listed max_tokens default fills (4321), and the CLI model override still wins at \
              the deploy boundary"
+        );
+    }
+
+    /// The deploy budget reaches the limits the deployed members are built
+    /// with: a `--max-*` flag wins over the operator's realm `[limits]`, which
+    /// wins over the pack's `[budget]` default.
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn test_mob_deploy_budget_flags_and_pack_budget_reach_member_limits() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut scope = test_scope_with_context(temp.path().to_path_buf());
+        scope.user_config_root = Some(temp.path().to_path_buf());
+        let config_path =
+            meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str())
+                .config_path;
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("mkdir config");
+        std::fs::write(&config_path, "[limits]\nbudget = 1000\n").expect("write config");
+
+        let mob_dir = create_mobpack_fixture_dir(temp.path());
+        std::fs::create_dir_all(mob_dir.join("config")).expect("config dir");
+        std::fs::write(
+            mob_dir.join("config").join("defaults.toml"),
+            "[budget]\nmax_tokens = 200000\nmax_duration_secs = 900\nmax_tool_calls = 50\n",
+        )
+        .expect("write pack defaults");
+        let pack_out = temp.path().join("budget-proof.mobpack");
+        execute_mob_pack(&mob_dir, &pack_out, None)
+            .await
+            .expect("pack succeeds");
+
+        let observed = Arc::new(Mutex::new(None::<BudgetLimits>));
+        let observer: Arc<dyn Fn(&Config) + Send + Sync> = Arc::new({
+            let observed = Arc::clone(&observed);
+            move |config: &Config| {
+                *observed.lock().expect("lock observed") = Some(config.budget_limits());
+            }
+        });
+        let output = Box::pin(execute_mob_deploy_internal(
+            &scope,
+            &pack_out,
+            "hello",
+            DeployInvocation {
+                cli_trust_policy: Some(TrustPolicyArg::Permissive),
+                surface: DeploySurfaceArg::Cli,
+                cli_overrides: CliOverrides {
+                    max_tool_calls: Some(7),
+                    ..CliOverrides::default()
+                },
+                #[cfg(feature = "rpc-surface")]
+                rpc_io: None,
+                config_observer: Some(observer),
+            },
+        ))
+        .await
+        .expect("deploy succeeds");
+
+        assert!(
+            output.contains("deployed\tmob="),
+            "unexpected output: {output}"
+        );
+        assert_eq!(
+            *observed.lock().expect("lock observed"),
+            Some(BudgetLimits {
+                max_tokens: Some(1000),
+                max_duration: Some(Duration::from_secs(900)),
+                max_turn_duration: None,
+                max_tool_calls: Some(7),
+            }),
+            "the --max-tool-calls flag wins, the realm [limits] budget wins over the pack, and \
+             the pack fills the duration both left unset"
         );
     }
 

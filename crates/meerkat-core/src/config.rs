@@ -465,6 +465,9 @@ impl Config {
         if other.limits.max_turn_duration.is_some() {
             self.limits.max_turn_duration = other.limits.max_turn_duration;
         }
+        if other.limits.max_tool_calls.is_some() {
+            self.limits.max_tool_calls = other.limits.max_tool_calls;
+        }
         if other.rest != RestServerConfig::default() {
             self.rest = other.rest;
         }
@@ -881,7 +884,10 @@ impl Config {
 
     /// Apply CLI argument overrides.
     ///
-    /// - Explicit CLI flags override scalar runtime knobs.
+    /// - Explicit CLI flags override scalar runtime knobs. The budget flags
+    ///   override the enforced `[limits]` dimensions read by
+    ///   [`Config::budget_limits`], never the legacy `[budget]` table, which
+    ///   no runtime enforces.
     /// - `override_config` applies RFC 7396 JSON merge-patch semantics.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn apply_cli_overrides(&mut self, cli: CliOverrides) {
@@ -889,13 +895,13 @@ impl Config {
             self.agent.model = model;
         }
         if let Some(tokens) = cli.max_tokens {
-            self.budget.max_tokens = Some(tokens);
+            self.limits.budget = Some(tokens);
         }
         if let Some(duration) = cli.max_duration {
-            self.budget.max_duration = Some(duration);
+            self.limits.max_duration = Some(duration);
         }
         if let Some(calls) = cli.max_tool_calls {
-            self.budget.max_tool_calls = Some(calls);
+            self.limits.max_tool_calls = Some(calls);
         }
         // Apply JSON merge patch override if present
         if let Some(delta) = cli.override_config {
@@ -1081,8 +1087,11 @@ impl Config {
 #[derive(Debug, Clone, Default)]
 pub struct CliOverrides {
     pub model: Option<String>,
+    /// Agent-lifetime token budget; overrides `limits.budget`.
     pub max_tokens: Option<u64>,
+    /// Agent-lifetime wall-clock ceiling; overrides `limits.max_duration`.
     pub max_duration: Option<Duration>,
+    /// Agent-lifetime tool-call ceiling; overrides `limits.max_tool_calls`.
     pub max_tool_calls: Option<usize>,
     /// Arbitrary configuration overrides via JSON merge patch
     pub override_config: Option<ConfigDelta>,
@@ -1823,6 +1832,14 @@ pub struct LimitsConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_turn_duration: Option<Duration>,
+    /// Agent-lifetime tool-call ceiling, the configuration twin of
+    /// [`BudgetLimits::max_tool_calls`]. Counted from agent construction like
+    /// `budget`, not per turn.
+    ///
+    /// Skipped when unset so an existing realm config document keeps its
+    /// exact bytes rather than gaining a null key on the next rewrite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<usize>,
 }
 
 impl LimitsConfig {
@@ -1831,7 +1848,7 @@ impl LimitsConfig {
             max_tokens: self.budget,
             max_duration: self.max_duration,
             max_turn_duration: self.max_turn_duration,
-            max_tool_calls: None,
+            max_tool_calls: self.max_tool_calls,
         }
     }
 }
@@ -3585,6 +3602,27 @@ max_sessions = 7
     }
 
     #[test]
+    fn test_limits_max_tool_calls_reaches_budget_limits() {
+        let mut config = Config::default();
+        config
+            .merge_toml_str(
+                r"
+[limits]
+max_tool_calls = 12
+",
+            )
+            .expect("merge max_tool_calls");
+        assert_eq!(config.budget_limits().max_tool_calls, Some(12));
+
+        // An explicit CLI override wins over the configured value.
+        config.apply_cli_overrides(CliOverrides {
+            max_tool_calls: Some(3),
+            ..Default::default()
+        });
+        assert_eq!(config.budget_limits().max_tool_calls, Some(3));
+    }
+
+    #[test]
     fn test_config_layering() {
         // 1. Test defaults
         let config = Config::default();
@@ -3627,9 +3665,11 @@ max_sessions = 7
             max_tokens: Some(50000),
             ..Default::default()
         });
-        // CLI should win over defaults
+        // CLI should win over defaults. The token budget lands in the
+        // enforced `[limits]` table, not the legacy `[budget]` table.
         assert_eq!(config.agent.model, "cli-model");
-        assert_eq!(config.budget.max_tokens, Some(50000));
+        assert_eq!(config.budget_limits().max_tokens, Some(50000));
+        assert_eq!(config.budget.max_tokens, None);
     }
 
     #[test]

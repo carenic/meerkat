@@ -35,6 +35,33 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-core`: `LimitsConfig` gains `max_tool_calls: Option<usize>`, the
+  configuration twin of `BudgetLimits::max_tool_calls` (see Fixed).
+  Struct-literal constructors must add the field (`None` keeps the previous
+  unlimited behaviour). It is skipped when unset, so existing realm config
+  documents keep their bytes.
+- Behaviour-only (not measured by the gate): `Config::apply_cli_overrides`
+  writes the `CliOverrides` budget fields to the enforced `[limits]`
+  dimensions: `max_tokens` to `limits.budget`, `max_duration` to
+  `limits.max_duration` and `max_tool_calls` to `limits.max_tool_calls`.
+  They used to land in the legacy `[budget]` table (`Config::budget`), which
+  no runtime reads, and that table no longer receives them.
+
+### Fixed
+
+- `rkat mob deploy` budget limits now limit the deployed members.
+  `--max-total-tokens`, `--max-duration`, `--max-tool-calls` and a mobpack's
+  `[budget]` deploy default were recorded in the legacy `[budget]` config
+  table, which nothing enforces, so the members ran without them. They now
+  set each member's agent-lifetime `[limits]` (`budget`, `max_duration` and
+  `max_tool_calls`) on the default `cli` deploy surface and for
+  `rkat mob run <pack>`. A deploy flag wins over the operator's realm
+  `[limits]`, and the realm wins over the pack's default. The new
+  `[limits] max_tool_calls` key also caps tool calls for any agent built
+  from a realm config that sets it.
+
 ## [0.9.0] - 2026-10-13
 
 ### Breaking
