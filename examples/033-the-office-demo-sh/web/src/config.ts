@@ -5,6 +5,7 @@
 export type Provider = "anthropic" | "openai" | "gemini";
 
 export const MODEL_PROVIDER: Record<string, Provider> = {
+  "claude-sonnet-5-5": "anthropic",
   "claude-sonnet-4-6": "anthropic",
   "claude-opus-4-8": "anthropic",
   "gpt-5.5": "openai",
@@ -59,7 +60,7 @@ export function getApiKeys(): Record<Provider, string> {
 
 export function getSelectedModel(): string {
   if (proxyConfig?.model) return proxyConfig.model;
-  return $<HTMLSelectElement>("modelSelect").value || "claude-sonnet-4-6";
+  return $<HTMLSelectElement>("modelSelect").value || "claude-sonnet-5-5";
 }
 
 export function availableModels(): string[] {

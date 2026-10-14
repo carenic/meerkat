@@ -141,14 +141,17 @@ body {
   border: 2px solid var(--border);
   border-radius: 10px;
   overflow: hidden;
-  background: var(--cream-dark);
+  background:
+    radial-gradient(ellipse at center, #2c2532 0%, #1c1820 70%);
   box-shadow: 3px 3px 0 var(--copper);
-  display: flex; align-items: center; justify-content: center;
   position: relative;
 }
+/* Absolutely centred so the canvas size never feeds back into the layout. */
 .canvas-wrap canvas {
-  image-rendering: pixelated;
-  image-rendering: crisp-edges;
+  position: absolute;
+  left: 50%; top: 50%;
+  transform: translate(-50%, -50%);
+  display: block;
 }
 
 /* Bottom panel — warm toned controls + log */
@@ -434,11 +437,29 @@ body {
 .start-overlay {
   position: fixed; inset: 0; z-index: 25;
   display: grid; place-items: center;
-  background: var(--cream);
+  background: rgba(28, 24, 32, 0.55);
+  backdrop-filter: blur(3px);
   transition: opacity 0.4s ease;
 }
 .start-overlay.hidden { opacity: 0; pointer-events: none; }
-.start-content { text-align: center; max-width: 500px; padding: 24px; }
+.start-content {
+  text-align: center; max-width: 560px; padding: 28px 32px 24px;
+  background: var(--cream-light);
+  border: 2px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 4px 4px 0 var(--copper), 0 18px 60px rgba(0, 0, 0, 0.45);
+}
+.start-cast {
+  display: block;
+  width: min(100%, 488px);
+  margin: -4px auto 14px;
+  image-rendering: pixelated;
+  animation: cast-in 0.6s cubic-bezier(0.2, 1.4, 0.4, 1) both;
+}
+@keyframes cast-in {
+  from { transform: translateY(10px); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
 .start-content h1 {
   font-family: var(--title-font);
   font-size: clamp(28px, 5vw, 44px); font-weight: 700;
@@ -578,10 +599,10 @@ body {
 .settings-close:hover { border-color: var(--border); color: var(--ink); }
 
 /* ═══ Approval Floating Panel ═══ */
+/* Bottom-right, over the lounge, so the Compliance desk stays visible. */
 .approval-float {
   position: absolute;
-  bottom: 12px; left: 50%;
-  transform: translateX(-50%);
+  bottom: 12px; right: 12px;
   z-index: 10;
   width: min(280px, 90%);
   background: var(--cream-light);

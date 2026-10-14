@@ -17,17 +17,18 @@ import {
 } from "./config";
 import type { Provider } from "./config";
 import { setupBridge } from "./llm-bridge";
-import { initCanvas, setOnSelectAgent, loadBackground, setOnFilingCabinetClick } from "./office/canvas";
+import { initCanvas, setOnSelectAgent, setOnFilingCabinetClick, highlightAgent } from "./office/canvas";
 import { initCharacters, setAgentState } from "./office/characters";
 import { loadSprites } from "./office/sprites";
 import { initBubbles, showSpeechBubble, hideSpeechBubble, showThinkBubble, hideThinkBubble } from "./office/bubbles";
-import { initPhoneLines, startCall, endCall, endCallsForAgent, triggerEnvelopeArrival } from "./office/phonelines";
-import { buildOfficeDefinition, WIRING_PAIRS, PROFILE_NAMES } from "./agents";
+import { initPhoneLines, startCall, endCall, endCallsForAgent, triggerEnvelopeArrival, triggerFileRecord } from "./office/phonelines";
+import { initDecor } from "./office/decor";
+import { buildOfficeDefinition, WIRING_PAIRS, PROFILE_NAMES, KICKOFF_MESSAGE } from "./agents";
 import { SCENARIOS } from "./scenarios";
-import { drainAllEvents, resetEventState, resolvePeerAgents, setOnMessage, setOnApprovalNeeded, setOnAccessControl, setOnUpsertRecord } from "./events";
+import { drainAllEvents, resetEventState, resolvePeerAgents, setOnMessage, setOnApprovalNeeded, expectKickoff, pendingKickoffs, noteHostMessage } from "./events";
 import { OfficeTopology } from "./topology";
 import { createIncident, addMessage, renderIncidentPanel, setRenderCallback } from "./incidents";
-import { upsertRecord, showCaseFiles, showGraph, hideKnowledgeBase } from "./knowledge";
+import { upsertRecord, getRecordCount, showCaseFiles, showGraph, hideKnowledgeBase } from "./knowledge";
 
 // =====================================================================
 // HTML Shell
@@ -137,6 +138,7 @@ app.innerHTML = `
 <!-- Start Overlay (Title Screen) -->
 <div class="start-overlay" id="startOverlay">
   <div class="start-content">
+    <img class="start-cast" src="./office/cast.png" alt="The ten office agents seated at their desks" />
     <h1>The Office</h1>
     <p class="start-subtitle">A MEERKAT WASM DEMO -- 10 AUTONOMOUS AI AGENTS</p>
     <div class="start-desc">
@@ -262,8 +264,8 @@ initCanvas(canvasEl);
 initCharacters();
 initBubbles();
 initPhoneLines();
-loadBackground("./office-bg.png").catch(() => console.warn("Office background not found, using placeholder"));
-loadSprites().catch(() => console.warn("Sprites not found, using fallback"));
+initDecor();
+loadSprites().catch((error) => console.warn("Office art failed to load:", error));
 
 // Filing cabinet click -> switch to records tab
 setOnFilingCabinetClick(() => switchTab("cases"));
@@ -311,10 +313,61 @@ setOnMessage((from, to, content, headline, category) => {
   addMessage(null, from, to, content, headline, category);
 });
 
-// Wire upsert_record tool calls -> knowledge base
-setOnUpsertRecord((data) => {
+// ── Host tool callbacks ──
+// upsert_record, revoke_access and restore_access run synchronously from the
+// agent's point of view: each returns the real outcome, so an agent never
+// guesses whether its record was stored or its topology change applied.
+
+interface ToolResult { content: string; is_error: boolean }
+const toolResult = (content: string, is_error = false): string => JSON.stringify({ content, is_error } satisfies ToolResult);
+
+function parseToolArgs(argsJson: string): Record<string, unknown> | null {
+  try {
+    const value = JSON.parse(argsJson);
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+async function upsertRecordTool(argsJson: string): Promise<string> {
+  const data = parseToolArgs(argsJson);
+  if (!data) return toolResult("Arguments must be a JSON object.", true);
+  const problems: string[] = [];
+  if (typeof data.id !== "string" || !data.id.trim()) problems.push("id must be a non-empty string");
+  if (!Array.isArray(data.entities) || data.entities.length < 2) problems.push("entities needs at least 2 items");
+  if (!Array.isArray(data.relationships) || data.relationships.length < 1) problems.push("relationships needs at least 1 item");
+  if (problems.length) return toolResult(`Record not stored: ${problems.join("; ")}.`, true);
+  const before = getRecordCount();
   upsertRecord(data);
-});
+  triggerFileRecord("archivist");
+  const verb = getRecordCount() > before ? "Created" : "Updated";
+  return toolResult(`${verb} record "${data.id}" with ${(data.entities as unknown[]).length} entities and ${(data.relationships as unknown[]).length} relationships.`);
+}
+
+function accessTool(action: "revoke" | "restore"): (argsJson: string) => Promise<string> {
+  return async (argsJson) => {
+    const data = parseToolArgs(argsJson);
+    const target = data?.target;
+    const reason = typeof data?.reason === "string" ? data.reason : "";
+    if (typeof target !== "string" || !AGENT_IDS.includes(target as AgentId)) {
+      return toolResult(`Unknown target. Valid targets: ${AGENT_IDS.join(", ")}.`, true);
+    }
+    if (!topology) {
+      addMessage(null, "system", null, "Topology is unavailable.", "Topology request not applied", "error");
+      return toolResult("The office topology is unavailable; nothing was changed.", true);
+    }
+    const targetId = target as AgentId;
+    const result = await topology.change(action, targetId);
+    const message = `${AGENTS[targetId].name} topology ${action}: ${result.state}. ${reason}` +
+      (result.blocked.length ? ` Disconnected endpoints requested: ${result.blocked.join(", ")}.` : "") +
+      (result.errors.length ? ` Retry the request. ${result.errors.join("; ")}` : "");
+    showSpeechBubble("it-dept", `${action}: ${result.state}`, 5000);
+    addMessage(null, "it-dept", targetId, message, message, "action");
+    setStatus(message);
+    return toolResult(message, result.state === "failed");
+  };
+}
 
 // Wire gate approval
 setOnApprovalNeeded((data) => {
@@ -329,27 +382,6 @@ setOnApprovalNeeded((data) => {
     state: "pending",
   });
   renderApprovalFloat();
-});
-
-// Wire IT access control
-setOnAccessControl(async (action, target, reason) => {
-  if (!topology) {
-    addMessage(null, "system", null, "Topology is unavailable.", "Topology request not applied", "error");
-    return;
-  }
-  const targetId = target as AgentId;
-  if (!AGENT_IDS.includes(targetId)) {
-    console.warn("[ACCESS CONTROL] Unknown target:", target);
-    return;
-  }
-
-  const result = await topology.change(action, targetId);
-  const message = `${AGENTS[targetId].name} topology ${action}: ${result.state}. ${reason}` +
-    (result.blocked.length ? ` Disconnected endpoints requested: ${result.blocked.join(", ")}.` : "") +
-    (result.errors.length ? ` Retry the request. ${result.errors.join("; ")}` : "");
-  showSpeechBubble("it-dept", `${action}: ${result.state}`, 5000);
-  addMessage(null, "it-dept", targetId, message, message, "action");
-  setStatus(message);
 });
 
 // Agent selection from canvas
@@ -383,7 +415,7 @@ if (isServerMode()) {
 // Expose demo functions for console testing
 (window as any).demo = {
   showSpeechBubble, showThinkBubble, hideThinkBubble,
-  setAgentState, startCall, endCall, triggerEnvelopeArrival,
+  setAgentState, startCall, endCall, triggerEnvelopeArrival, triggerFileRecord,
 };
 
 // =====================================================================
@@ -408,6 +440,7 @@ document.getElementById("agentPicker")!.addEventListener("click", (e) => {
   if (card) {
     selectedChatAgent = card.dataset.agent as AgentId;
     updateAgentLabel();
+    highlightAgent(selectedChatAgent);
     $<HTMLDivElement>("agentPicker").classList.add("hidden");
     $<HTMLTextAreaElement>("chatInput").focus();
   } else if (!(e.target as HTMLElement).closest(".picker-frame")) {
@@ -594,10 +627,13 @@ async function startOffice(): Promise<void> {
     // Init runtime before registering JS tools.
     await mod.init_runtime_from_config(JSON.stringify(initConfig));
 
-    // Register fire-and-forget JS tools after init, before creating the mob.
+    // Register host tools after init, before creating the mob.
+    // request_human_approval is fire-and-forget: the human decides later and
+    // the decision reaches gate as a message. The others are callbacks that
+    // return their real outcome to the calling agent.
     setStatus("Registering tools...");
     mod.register_js_tool("request_human_approval",
-      "Escalate a high-risk action for human sign-off. Use when an action needs human approval before proceeding.",
+      "Escalate a high-risk action for human sign-off. Returns at once; the human's decision arrives later as a HUMAN DECISION message.",
       JSON.stringify({
         type: "object",
         properties: {
@@ -608,8 +644,8 @@ async function startOffice(): Promise<void> {
         },
         required: ["short_summary", "action_description", "risk_level", "proposed_by"],
       }));
-    mod.register_js_tool("upsert_record",
-      "Create or update a knowledge record. MUST include entities AND relationships between them.",
+    mod.register_tool_callback("upsert_record",
+      "Create or update a knowledge record. MUST include entities AND relationships between them. Returns what was stored, or why it was rejected.",
       JSON.stringify({
         type: "object",
         properties: {
@@ -623,9 +659,9 @@ async function startOffice(): Promise<void> {
           status: { type: "string", enum: ["open", "resolved", "monitoring"] },
         },
         required: ["id", "title", "type", "summary", "entities", "relationships"],
-      }));
-    mod.register_js_tool("revoke_access",
-      "Request disconnection of an agent's in-memory office comms edges. Not credential revocation; acknowledgement is not completion.",
+      }), upsertRecordTool);
+    mod.register_tool_callback("revoke_access",
+      "Disconnect an agent's in-memory office comms edges. Not credential revocation. Returns the actual outcome: complete, partial or failed.",
       JSON.stringify({
         type: "object",
         properties: {
@@ -633,9 +669,9 @@ async function startOffice(): Promise<void> {
           reason: { type: "string", description: "Why access is being revoked" },
         },
         required: ["target", "reason"],
-      }));
-    mod.register_js_tool("restore_access",
-      "Request reconnection of an agent's office comms edges, only where both endpoints permit it. Not credential restoration.",
+      }), accessTool("revoke"));
+    mod.register_tool_callback("restore_access",
+      "Reconnect an agent's office comms edges, only where both endpoints permit it. Not credential restoration. Returns the actual outcome.",
       JSON.stringify({
         type: "object",
         properties: {
@@ -643,7 +679,7 @@ async function startOffice(): Promise<void> {
           reason: { type: "string", description: "Why access is being restored" },
         },
         required: ["target", "reason"],
-      }));
+      }), accessTool("restore"));
 
     setStatus("Creating office mob (10 agents)...");
     const def = buildOfficeDefinition(model);
@@ -654,6 +690,7 @@ async function startOffice(): Promise<void> {
       profile: PROFILE_NAMES[id],
       agent_identity: id,
       runtime_mode: "autonomous_host",
+      initial_message: KICKOFF_MESSAGE,
     }));
     const spawned = JSON.parse(parseJsResult(await mod.mob_spawn(mobId, JSON.stringify(specs))));
     if (!Array.isArray(spawned) || spawned.length !== AGENT_IDS.length) {
@@ -665,15 +702,22 @@ async function startOffice(): Promise<void> {
     if (failures.length) throw new Error(`Spawn failed: ${failures.join("; ")}`);
     await resolvePeerAgents(mod, mobId);
 
+    // Wire only after every kickoff turn has resolved: the runtime tells each
+    // wired peer when a member's kickoff ends, and that notice wakes the peer
+    // for a turn with nothing to do.
+    setStatus("Subscribing to agent events...");
+    await subscribeOffice(mod, mobId);
+    expectKickoff(AGENT_IDS);
+    await waitForKickoffs(mod, mobId);
+    drainAllEvents(mod, subs);
+    expectKickoff([]);
+
     setStatus("Wiring comms topology...");
     for (const [a, b] of WIRING_PAIRS) {
       try { await mod.mob_wire(mobId, a, b); }
       catch (e) { throw new Error(`Wire ${a} ↔ ${b}: ${String(e)}`); }
     }
     topology = new OfficeTopology(mod, mobId);
-
-    setStatus("Subscribing to agent events...");
-    await subscribeOffice(mod, mobId);
 
     running = true;
     pollTimer = setInterval(() => {
@@ -682,32 +726,13 @@ async function startOffice(): Promise<void> {
       if (errors.length > 0) {
         setStatus(errors.join("; "));
         if (!providerIssuePromptShown) {
-          const missingKeyError = errors.find((err) => {
-            const lower = err.toLowerCase();
-            return lower.includes("api key")
-              && (lower.includes("missing")
-                || lower.includes("not configured")
-                || lower.includes("no provider api key")
-                || lower.includes("must be provided"));
-          });
-          const authError = errors.find((err) => {
-            const lower = err.toLowerCase();
-            return lower.includes(" 401")
-              || lower.includes("authentication")
-              || lower.includes("unauthorized")
-              || lower.includes("invalid x-api-key")
-              || lower.includes("invalid api key");
-          });
-          const keyIssue = missingKeyError ?? authError;
+          const keyIssue = findKeyIssue(errors);
           if (keyIssue) {
             providerIssuePromptShown = true;
-            const provider = extractProviderFromError(keyIssue);
-            const providerText = provider ? `${providerLabel(provider)} ` : "";
-            const looksAuth = keyIssue === authError;
             void (async () => {
               if (running) await pauseOffice();
               if (stopped) setBadge("CONFIG");
-              showKeyDialog(`${providerText}API key ${looksAuth ? "appears invalid" : "is missing"}. Update key and press Save & Start (restarts the office).`);
+              showKeyDialog(`${keyIssueText(keyIssue)} Update key and press Save & Start (restarts the office).`);
             })();
           }
         }
@@ -723,13 +748,76 @@ async function startOffice(): Promise<void> {
   } catch (e) {
     let cleanup = "";
     try { await teardownOffice(); } catch (error) { cleanup = ` ${String(error)}`; }
+    const message = e instanceof Error ? e.message : String(e);
     setBadge("ERROR");
-    setStatus(`FAILED: ${e instanceof Error ? e.message : String(e)}${cleanup}. Press Retry.`);
+    setStatus(`FAILED: ${message}${cleanup}. Press Retry.`);
     $<HTMLButtonElement>("startBtn").textContent = "Retry";
     console.error("Start failed:", e);
+    // A kickoff that failed on the provider key gets the key dialog, as a
+    // running office does.
+    const keyIssue = findKeyIssue([message]);
+    if (keyIssue) showKeyDialog(`${keyIssueText(keyIssue)} Update key and press Save & Start.`);
   } finally {
     starting = false;
     updateControls();
+  }
+}
+
+interface KeyIssue { error: string; looksAuth: boolean }
+
+function findKeyIssue(errors: string[]): KeyIssue | null {
+  const missing = errors.find((err) => {
+    const lower = err.toLowerCase();
+    return lower.includes("api key")
+      && (lower.includes("missing")
+        || lower.includes("not configured")
+        || lower.includes("no provider api key")
+        || lower.includes("must be provided"));
+  });
+  if (missing) return { error: missing, looksAuth: false };
+  const auth = errors.find((err) => {
+    const lower = err.toLowerCase();
+    return lower.includes(" 401")
+      || lower.includes("authentication")
+      || lower.includes("unauthorized")
+      || lower.includes("invalid x-api-key")
+      || lower.includes("invalid api key");
+  });
+  return auth ? { error: auth, looksAuth: true } : null;
+}
+
+function keyIssueText(issue: KeyIssue): string {
+  const provider = extractProviderFromError(issue.error);
+  const providerText = provider ? `${providerLabel(provider)} ` : "";
+  return `${providerText}API key ${issue.looksAuth ? "appears invalid" : "is missing"}.`;
+}
+
+const KICKOFF_TIMEOUT_MS = 90_000;
+const KICKOFF_TERMINAL = new Set(["started", "failed", "cancelled"]);
+
+/**
+ * Wait until every member's kickoff turn has resolved, reading the runtime's
+ * roster rather than inferring it from events. Events are drained meanwhile
+ * so the kickoff turns animate.
+ */
+async function waitForKickoffs(mod: RuntimeModule, id: string): Promise<void> {
+  const deadline = performance.now() + KICKOFF_TIMEOUT_MS;
+  for (;;) {
+    const { errors } = drainAllEvents(mod, subs);
+    if (errors.length) throw new Error(`Kickoff: ${errors.join("; ")}`);
+    const members = JSON.parse(parseJsResult(await mod.mob_list_members(id))) as
+      { agent_identity: string; kickoff?: { phase: string; error?: string } | null }[];
+    const failed = members.filter((m) => m.kickoff?.phase === "failed");
+    if (failed.length) {
+      throw new Error(`Kickoff failed: ${failed.map((m) => `${m.agent_identity}: ${m.kickoff?.error ?? "no reason given"}`).join("; ")}`);
+    }
+    const waiting = members.filter((m) => m.kickoff && !KICKOFF_TERMINAL.has(m.kickoff.phase));
+    if (!waiting.length) return;
+    if (performance.now() > deadline) {
+      throw new Error(`Kickoff timed out waiting for ${waiting.map((m) => m.agent_identity).join(", ")}`);
+    }
+    setStatus(`Agents arriving at their desks (${members.length - waiting.length}/${members.length})...`);
+    await new Promise((resolve) => setTimeout(resolve, 400));
   }
 }
 
@@ -754,6 +842,7 @@ async function injectEvent(scenarioId: string): Promise<void> {
 
   try {
     const taggedScenario = `[INTERNAL SYSTEM EVENT — This event was generated by the office's internal monitoring/mail system.]\n${scenario.text}`;
+    noteHostMessage("triage");
     await runtime.mob_member_send(
       mobId,
       "triage",
@@ -785,6 +874,7 @@ async function chatWithAgent(agentId: AgentId, message: string): Promise<void> {
   addMessage(incident, "user", agentId, message, message.slice(0, 50), "response");
 
   showSpeechBubble(agentId, "Incoming call...", 2000);
+  noteHostMessage(agentId);
 
   try {
     await runtime.mob_member_send(
@@ -979,6 +1069,7 @@ async function resolveApproval(id: number, approved: boolean): Promise<void> {
     const sentEpoch = epoch;
     const sentMob = mobId;
     const decision = approved ? "APPROVED" : "DENIED";
+    noteHostMessage("gate");
     const receipt = JSON.parse(await runtime.mob_member_send(
       sentMob,
       "gate",
