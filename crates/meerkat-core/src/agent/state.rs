@@ -552,6 +552,15 @@ fn budget_warning_event(exceeded: BudgetExceeded) -> AgentEvent {
     }
 }
 
+/// The bound a tool call ran into, when its error is a timeout.
+fn tool_timeout_ms(error: &ToolError) -> Option<u64> {
+    match error {
+        ToolError::Timeout { timeout_ms, .. } => Some(*timeout_ms),
+        ToolError::InactivityTimeout { inactivity_ms, .. } => Some(*inactivity_ms),
+        _ => None,
+    }
+}
+
 fn synthetic_notice_block_message(
     kind: SystemNoticeKind,
     body: impl Into<String>,
@@ -7736,13 +7745,16 @@ where
         let mut deferred_failure = None;
         for (_, tc, dispatch_result, duration_ms) in dispatch_results {
             let mut tool_session_effects = Vec::new();
+            let mut timed_out_ms = None;
             let mut tool_result = match dispatch_result {
                 Ok(mut outcome) => {
                     if let Some(crate::ops::ToolDispatchTerminalCause::RuntimeToolError { error }) =
                         outcome.terminal_cause()
-                        && let Some(approval_id) = requested_consent(error)
                     {
-                        self.run_consent_attempts.requested(approval_id);
+                        timed_out_ms = tool_timeout_ms(error.primary_error());
+                        if let Some(approval_id) = requested_consent(error) {
+                            self.run_consent_attempts.requested(approval_id);
+                        }
                     }
                     if outcome.terminal_cause().is_some_and(|cause| {
                         cause.kind() == crate::ToolDispatchTerminalErrorKind::OperationObservationUnavailable
@@ -7775,6 +7787,7 @@ where
                 }
                 Err(error) => {
                     let (error, settlement_failures) = error.into_primary_and_settlement_failures();
+                    timed_out_ms = tool_timeout_ms(&error);
                     if matches!(error, ToolError::OperationObservationUnavailable) {
                         deferred_failure.get_or_insert(crate::session::DeferredToolBatchFailureKind::OperationObservationUnavailable);
                     }
@@ -7900,6 +7913,20 @@ where
                         crate::ops::SessionEffect::AppendAssistantBlocks { .. }
                     )
                 });
+            }
+
+            // A timed-out call still completes with its timeout result; the
+            // timeout is the additional execution fact.
+            if let Some(timeout_ms) = timed_out_ms {
+                emit_phase_event!(
+                    self,
+                    ctx,
+                    AgentEvent::ToolExecutionTimedOut {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        timeout_ms,
+                    }
+                );
             }
 
             // Emit execution complete
@@ -17006,6 +17033,81 @@ mod tests {
         assert!(
             saw_timeout_completion,
             "normal dispatch loop must emit a timeout tool completion for the hanging tool"
+        );
+    }
+
+    /// A call the per-call timeout ends publishes the documented
+    /// `ToolExecutionTimedOut` execution fact with the bound it ran into,
+    /// and still completes with its timeout result after it.
+    #[tokio::test]
+    async fn normal_loop_tool_timeout_emits_tool_execution_timed_out() {
+        struct HangingTurnDispatcher {
+            tools: Arc<[Arc<ToolDef>]>,
+        }
+
+        #[async_trait]
+        impl AgentToolDispatcher for HangingTurnDispatcher {
+            fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+                Arc::clone(&self.tools)
+            }
+
+            async fn dispatch(
+                &self,
+                _call: ToolCallView<'_>,
+            ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
+                std::future::pending().await
+            }
+        }
+
+        let client = Arc::new(BoundaryContextRecordingClient::new());
+        let tools = Arc::new(HangingTurnDispatcher {
+            tools: Arc::from([Arc::new(ToolDef::new(
+                "slow_tool",
+                "hangs until the per-call timeout fires",
+                serde_json::json!({ "type": "object" }),
+            ))]),
+        });
+        let tools_config = crate::config::ToolsConfig {
+            default_timeout: std::time::Duration::from_millis(20),
+            ..crate::config::ToolsConfig::default()
+        };
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .with_tools_config(tools_config)
+            .build_standalone(client, tools, Arc::new(NoopStore))
+            .await;
+
+        let (tx, mut rx) = mpsc::channel(64);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent.run_with_events("start with a tool".to_string().into(), tx),
+        )
+        .await
+        .expect("run must complete promptly once the per-call timeout fires")
+        .expect("agent run should succeed after timeout terminalization");
+
+        let mut timed_out = Vec::new();
+        let mut completed_after_timeout = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                crate::event::AgentEvent::ToolExecutionTimedOut {
+                    name, timeout_ms, ..
+                } => timed_out.push((name, timeout_ms)),
+                crate::event::AgentEvent::ToolExecutionCompleted { name, is_error, .. }
+                    if name == "slow_tool" =>
+                {
+                    completed_after_timeout = is_error && !timed_out.is_empty();
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            timed_out,
+            vec![("slow_tool".to_string(), 20)],
+            "the timed-out call must publish ToolExecutionTimedOut with its bound"
+        );
+        assert!(
+            completed_after_timeout,
+            "the timed-out call still completes with its timeout result, after the timeout event"
         );
     }
 
