@@ -314,6 +314,72 @@ fn claude_sonnet_5_5_capability_row_matches_the_official_model_page() {
 }
 
 #[test]
+fn claude_haiku_5_5_is_cataloged_without_changing_the_anthropic_default() {
+    let entry = entry_for(Provider::Anthropic, "claude-haiku-5-5")
+        .expect("claude-haiku-5-5 must be in catalog");
+    assert_eq!(entry.provider, "anthropic");
+    assert_eq!(entry.display_name, "Claude Haiku 5.5");
+    assert_eq!(entry.tier, ModelTier::Recommended);
+    assert_eq!(entry.context_window, Some(1_000_000));
+    assert_eq!(entry.max_output_tokens, Some(128_000));
+    assert!(
+        allowed_models(Provider::Anthropic).any(|id| id == "claude-haiku-5-5"),
+        "claude-haiku-5-5 must be in the Anthropic allowlist"
+    );
+    assert_eq!(
+        infer_provider("claude-haiku-5-5"),
+        Some(Provider::Anthropic)
+    );
+    assert_eq!(default_model(Provider::Anthropic), Some("claude-opus-5-5"));
+}
+
+#[test]
+fn claude_haiku_5_5_capability_row_matches_the_official_model_page() {
+    let caps = capabilities_for(Provider::Anthropic, "claude-haiku-5-5")
+        .expect("claude-haiku-5-5 must be in the Anthropic catalog");
+    assert_eq!(caps.provider, Provider::Anthropic);
+    assert_eq!(caps.model_family, "claude-haiku-5");
+    assert_eq!(caps.context_window, Some(1_000_000));
+    assert_eq!(caps.max_output_tokens, Some(128_000));
+    assert_eq!(
+        caps.max_output_tokens_beta.map(|beta| beta.value),
+        Some(300_000),
+        "Haiku 5.5 is listed for the output-300k batch beta"
+    );
+    assert_eq!(caps.thinking, ThinkingSupport::AnthropicAdaptiveOnly);
+    assert!(
+        !caps.supports_temperature && !caps.supports_top_p && !caps.supports_top_k,
+        "non-default sampling parameters return 400 on Haiku 5.5"
+    );
+    assert!(
+        !caps.supports_thinking_budget_legacy,
+        "budget_tokens returns 400 on Haiku 5.5"
+    );
+    assert!(caps.vision);
+    assert!(!caps.inline_video);
+    assert!(caps.supports_mid_conversation_system_messages);
+    assert!(caps.supports_inference_geo);
+    assert!(caps.supports_compaction);
+    assert!(caps.supports_structured_output);
+    assert!(caps.supports_web_search);
+    assert!(
+        caps.supports_forced_tool_choice,
+        "Haiku 5.5 accepts a forced tool_choice (the call then skips thinking)"
+    );
+    assert_eq!(
+        caps.effort_levels,
+        &[
+            EffortLevel::Low,
+            EffortLevel::Medium,
+            EffortLevel::High,
+            EffortLevel::Xhigh,
+            EffortLevel::Max,
+        ]
+    );
+    assert_eq!(caps.call_timeout_secs, Some(120));
+}
+
+#[test]
 fn claude_sonnet_5_is_cataloged_as_a_supported_legacy_model() {
     let entry = entry_for(Provider::Anthropic, "claude-sonnet-5")
         .expect("claude-sonnet-5 is still available upstream and must be in the catalog");
