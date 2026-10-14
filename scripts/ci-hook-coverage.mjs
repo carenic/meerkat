@@ -48,11 +48,11 @@ export const WORKFLOW = ".github/workflows/ci.yml";
 // The workflow steps that execute plan rows, with the exact lines each must
 // run (after joining backslash continuations, collapsing blanks and dropping
 // comments). In a bound step, every line that mentions nextest, the binary
-// check, a selection variable or one of the step's inputs (its env names)
-// must be one of these, in this order, so the listed selection is the run
-// selection, nothing can narrow a run alone, and no line can reassign an
-// input before it is read: an assignment, export, read or unset of an input
-// names it.
+// check, a selection variable, one of the step's inputs (its env names) or a
+// variable it exports from them (exports: the test-thread stack) must be one
+// of these, in this order, so the listed selection is the run selection,
+// nothing can narrow a run alone, and no line can reassign an input or
+// override an export: an assignment, export, read or unset of one names it.
 export const CI_ROW_STEPS = [
   {
     field: "closure_test_rows",
@@ -66,13 +66,16 @@ export const CI_ROW_STEPS = [
       FILTER: "${{ matrix.filter }}",
       BINARIES: "${{ matrix.binaries }}",
       NO_TESTS: "${{ matrix.no_tests }}",
+      MIN_STACK: "${{ matrix.rust_min_stack }}",
     },
+    exports: ["RUST_MIN_STACK"],
     lines: [
       "if [[ -z \"${PACKAGES}\" || -z \"${TESTS}\" || -z \"${PROFILE}\" || -z \"${BINARIES}\" || -z \"${NO_TESTS}\" ]]; then",
       "read -r -a test_flags <<<\"${TESTS}\"",
       "filter_args=()",
       "if [[ -n \"${FILTER}\" ]]; then filter_args=(-E \"${FILTER}\"); fi",
       "selection=(${PACKAGES} \"${test_flags[@]}\" --profile \"${PROFILE}\" \"${filter_args[@]}\")",
+      "if [[ -n \"${MIN_STACK}\" ]]; then export RUST_MIN_STACK=\"${MIN_STACK}\"; fi",
       "fixture=\"$(scripts/mcp-test-server-fixture --if-needed ${PACKAGES})\"",
       "./scripts/repo-cargo nextest list \"${selection[@]}\" --message-format json >\"${RUNNER_TEMP}/closure-test-list.json\"",
       "node scripts/ci-verify-row-binaries.mjs \"${RUNNER_TEMP}/closure-test-list.json\" ${BINARIES}",
@@ -84,10 +87,11 @@ export const CI_ROW_STEPS = [
 ];
 
 // The lines of a bound step its pins govern: nextest, the binary check, the
-// selection variables and the step's inputs, each as a whole word.
+// selection variables, the step's inputs and its exports, each as a whole
+// word.
 function boundLine(spec) {
-  const inputs = Object.keys(spec.env).join("|");
-  return new RegExp(`nextest|ci-verify-row-binaries|\\b(selection|test_flags|filter_args|${inputs})\\b`);
+  const names = [...Object.keys(spec.env), ...spec.exports].join("|");
+  return new RegExp(`nextest|ci-verify-row-binaries|\\b(selection|test_flags|filter_args|${names})\\b`);
 }
 
 // Shell text as logical lines: continuations joined, blanks collapsed,

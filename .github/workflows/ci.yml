@@ -1161,8 +1161,9 @@ jobs:
           # One selection for the list and the run: the binaries nextest
           # lists, and the check below accepts, are the ones that run.
           # scripts/ci-hook-coverage.mjs pins every line of this step that
-          # names a row input (the env above), the selection, nextest or
-          # the binary check, so no line can reassign an input.
+          # names a row input (the env above), RUST_MIN_STACK, the selection,
+          # nextest or the binary check, so no line can reassign an input or
+          # the test-thread stack.
           # shellcheck disable=SC2206
           selection=(${PACKAGES} "${test_flags[@]}" --profile "${PROFILE}" "${filter_args[@]}")
           # The hook ran every lane on a 32 MiB test-thread stack.

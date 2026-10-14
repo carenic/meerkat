@@ -420,9 +420,9 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   (`scripts/ci-verify-row-binaries.mjs`). The plan fails when
   `scripts/ci-hook-coverage.mjs` finds a hook binary in scope without a row:
   it reads the hook's lanes from `scripts/pre-push-unit.sh`, binds every line
-  of the executing step that names a row input, the selection, nextest or
-  the binary check (so none can reassign an input), and credits only
-  whole-workspace rows.
+  of the executing step that names a row input, the exported test-thread
+  stack, the selection, nextest or the binary check (so none can reassign
+  an input or the stack), and credits only whole-workspace rows.
 - `closure-check`: `cargo check --all-features` (lib and bin targets) over
   the reverse-dependency closure of the changed packages.
 - `feature-check` (two jobs per clippy shard, Bazel set and matrix): compile-only checks of the
