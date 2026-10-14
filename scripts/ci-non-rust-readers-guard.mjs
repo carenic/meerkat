@@ -14,7 +14,14 @@
 // examples/*-rs files that meerkat and meerkat-mob compile as [[example]]
 // targets, and #[path] modules shared across crates, are scanned under the
 // package that compiles them), lexes each file (comments are not code), and
-// collects references to repository paths outside the referencing crate:
+// collects references to repository paths outside the referencing crate.
+// The walk follows `mod`, #[path] modules and include!() of a literal or of
+// concat!(env!("CARGO_MANIFEST_DIR"), "<literal>"). Any other include!()
+// form, an include!() whose file does not exist, and an
+// include_str!/include_bytes! argument it cannot resolve (other than a
+// concat! under OUT_DIR, which reads its own build script's output; build
+// scripts are scanned) are refused: the guard cannot claim a complete
+// inventory over source it did not read. References:
 //   - include_str!/include_bytes! of a literal or of
 //     concat!(env!("CARGO_MANIFEST_DIR"), "...") (symlinks resolved, so an
 //     in-crate link to .claude/skills counts as .claude/skills);
@@ -345,11 +352,32 @@ export function testRegions(tokens) {
 // ---------------------------------------------------------------------------
 // Workspace model: every Rust file of every workspace target, by module walk.
 
+// The argument of `include!(...)`, `include_str!(...)` or `include_bytes!(...)`
+// whose `(` is at `open`: { kind: "literal", value } for a string literal,
+// { kind: "manifest", value } for concat!(env!("CARGO_MANIFEST_DIR"),
+// "<literal>"), { kind: "out-dir" } for a concat! under env!("OUT_DIR"),
+// else { kind: "unresolved" }. `form` is the argument's source text.
+export function includeArgument(tokens, open, match) {
+  const close = match[open] > open ? match[open] : tokens.length - 1;
+  const args = tokens.slice(open + 1, close);
+  const form = args.map((tok) => (tok.t === "str" ? JSON.stringify(tok.v) : tok.v)).join("");
+  if (args.length === 1 && args[0].t === "str") return { kind: "literal", value: args[0].v, form, close };
+  const shape = args.map((tok) => (tok.t === "str" ? "S" : tok.v)).join(" ");
+  if (shape === "concat ! ( env ! ( S ) , S )" || shape === "concat ! ( env ! ( S ) , S , )") {
+    if (args[6].v === "CARGO_MANIFEST_DIR") return { kind: "manifest", value: args[9].v, form, close };
+  }
+  if (/^concat ! \( env ! \( S \)( , S)+ ,? \)$/.test(shape) && args[6].v === "OUT_DIR") return { kind: "out-dir", form, close };
+  return { kind: "unresolved", form, close };
+}
+
 // The `mod` declarations, #[path] modules and include!() files of one file,
 // each with the candidate paths it may resolve to and whether the
-// declaration is test-only. Inline `mod name { ... }` blocks nest the
-// directory.
-function moduleChildren(file, tokens, regions, isRoot) {
+// declaration is test-only; an include!() the walk cannot follow is a child
+// with `unresolved` set. Inline `mod name { ... }` blocks nest the
+// directory. A file reached through include!() gets `modDir`, the
+// directory the including file's `mod` items resolve against at the
+// include site; its own `mod` items may resolve against either.
+function moduleChildren(file, tokens, regions, index, isRoot, crateDir, modDir = null) {
   const base = dirname(file);
   const stem = file.endsWith("/mod.rs") || isRoot ? base : file.replace(/\.rs$/, "");
   const children = [];
@@ -385,7 +413,9 @@ function moduleChildren(file, tokens, regions, isRoot) {
         if (pendingPath) {
           children.push({ candidates: [resolve(inline.length ? dir : base, pendingPath.value)], testOnly, pathLiteral: pendingPath.index });
         } else {
-          children.push({ candidates: [resolve(dir, `${name}.rs`), resolve(dir, name, "mod.rs")], testOnly });
+          const dirs = modDir ? [resolve(modDir, ...inline), resolve(base, ...inline), dir] : [dir];
+          const candidates = [...new Set(dirs.flatMap((candidate) => [resolve(candidate, `${name}.rs`), resolve(candidate, name, "mod.rs")]))];
+          children.push({ candidates, testOnly });
         }
         pendingPath = null;
       } else if (after?.v === "{") {
@@ -397,8 +427,18 @@ function moduleChildren(file, tokens, regions, isRoot) {
       }
       continue;
     }
-    if (tok.t === "id" && tok.v === "include" && tokens[k + 1]?.v === "!" && tokens[k + 2]?.v === "(" && tokens[k + 3]?.t === "str") {
-      children.push({ candidates: [resolve(base, tokens[k + 3].v)], testOnly: regions.inTest[k] === 1 });
+    if (tok.t === "id" && tok.v === "include" && tokens[k + 1]?.v === "!" && tokens[k + 2]?.v === "(" && tokens[k - 1]?.v !== "fn") {
+      const arg = includeArgument(tokens, k + 2, index.match);
+      const testOnly = regions.inTest[k] === 1;
+      const includeDir = resolve(stem, ...inline);
+      if (arg.kind === "literal") {
+        children.push({ candidates: [resolve(base, arg.value)], testOnly, include: { line: tok.line, form: arg.form, modDir: includeDir } });
+      } else if (arg.kind === "manifest") {
+        children.push({ candidates: [resolve(crateDir, arg.value.replace(/^\//, ""))], testOnly, include: { line: tok.line, form: arg.form, modDir: includeDir } });
+      } else {
+        children.push({ unresolved: { line: tok.line, form: `include!(${arg.form})`, why: "the walk follows include!() of a literal or of concat!(env!(\"CARGO_MANIFEST_DIR\"), \"<literal>\") only" } });
+      }
+      k = arg.close;
     }
   }
   return children;
@@ -427,14 +467,24 @@ export function workspaceModel() {
     }
     return cache.get(file);
   };
+  // Source the walk could not follow, keyed by file and line.
+  const unresolved = new Map();
+  const refuse = (file, site, pkg, id) => {
+    const source = normalizePath(relative(root, file));
+    const key = `${source}:${site.line}`;
+    const entry = unresolved.get(key) ?? { source, line: site.line, form: site.form, why: site.why, readers: new Set() };
+    entry.readers.add(`${pkg.name} ${id}`);
+    unresolved.set(key, entry);
+  };
   for (const pkg of packages) {
+    const crateDir = resolve(root, packageDir(pkg));
     for (const target of pkg.targets) {
       const id = targetId(target);
       const rootTestOnly = id.startsWith("test:") || id.startsWith("bench:");
       const visited = new Map(); // file -> testOnly
-      const queue = [[target.src_path, true, rootTestOnly]];
+      const queue = [[target.src_path, true, rootTestOnly, null]];
       while (queue.length) {
-        const [file, isRoot, testOnly] = queue.pop();
+        const [file, isRoot, testOnly, modDir] = queue.pop();
         if (!existsSync(file)) continue;
         // Re-walk a file first reached through test-only code when a
         // non-test path reaches it too.
@@ -445,15 +495,23 @@ export function workspaceModel() {
         entry.targets.set(id, entry.targets.has(id) ? entry.targets.get(id) && testOnly : testOnly);
         byPkg.set(pkg.name, entry);
         files.set(file, byPkg);
-        const { tokens, regions } = parse(file);
-        for (const child of moduleChildren(file, tokens, regions, isRoot)) {
+        const { tokens, regions, index } = parse(file);
+        for (const child of moduleChildren(file, tokens, regions, index, isRoot, crateDir, modDir)) {
+          if (child.unresolved) {
+            refuse(file, child.unresolved, pkg, id);
+            continue;
+          }
           const found = child.candidates.find((candidate) => existsSync(candidate));
-          if (found) queue.push([found, false, testOnly || child.testOnly]);
+          if (found) {
+            queue.push([found, false, testOnly || child.testOnly, child.include ? child.include.modDir : null]);
+          } else if (child.include) {
+            refuse(file, { ...child.include, why: `its file ${normalizePath(relative(root, child.candidates[0]))} does not exist` }, pkg, id);
+          }
         }
       }
     }
   }
-  return { packages, files, parse };
+  return { packages, files, parse, unresolved };
 }
 
 // ---------------------------------------------------------------------------
@@ -848,23 +906,29 @@ export function scanReferences(model, index) {
       };
       for (let k = 0; k < tokens.length; k += 1) {
         const tok = tokens[k];
-        // include_str!/include_bytes!
-        if (tok.t === "id" && (tok.v === "include_str" || tok.v === "include_bytes") && tokens[k + 1]?.v === "!" && tokens[k + 2]?.v === "(") {
-          const arg = tokens[k + 3];
-          if (arg?.t === "str") {
-            consumed.add(k + 3);
-            push(k + 3, tok.v, resolve(dirname(file), arg.v), arg.v);
-          } else if (arg?.v === "concat") {
-            const close = matching(ctx, k + 5);
-            let manifest = false;
-            let pieces = "";
-            for (let j = k + 5; j < close; j += 1) {
-              if (tokens[j].t !== "str") continue;
-              consumed.add(j);
-              if (tokens[j].v === "CARGO_MANIFEST_DIR") manifest = true;
-              else pieces += tokens[j].v;
-            }
-            if (manifest) push(k + 3, tok.v, resolve(crateDir, pieces.replace(/^\//, "")), pieces);
+        // include_str!/include_bytes!, and include!() of source outside the
+        // crate (the walk scans the included file itself).
+        if (tok.t === "id" && ["include_str", "include_bytes", "include"].includes(tok.v) && tokens[k + 1]?.v === "!" && tokens[k + 2]?.v === "(" && tokens[k - 1]?.v !== "fn") {
+          const arg = includeArgument(tokens, k + 2, fileIndex.match);
+          for (let j = k + 3; j < arg.close; j += 1) {
+            if (tokens[j].t === "str") consumed.add(j);
+          }
+          if (arg.kind === "literal") {
+            push(k + 3, tok.v, resolve(dirname(file), arg.value), arg.value);
+          } else if (arg.kind === "manifest") {
+            push(k + 3, tok.v, resolve(crateDir, arg.value.replace(/^\//, "")), arg.value);
+          } else if (arg.kind === "unresolved" && tok.v !== "include") {
+            // The walk refuses an unresolved include!() itself.
+            const key = `${source}:${tok.line}`;
+            const entry = model.unresolved.get(key) ?? {
+              source,
+              line: tok.line,
+              form: `${tok.v}!(${arg.form})`,
+              why: "the scan resolves a literal, concat!(env!(\"CARGO_MANIFEST_DIR\"), ...) or an OUT_DIR concat! only",
+              readers: new Set(),
+            };
+            for (const target of targets.keys()) entry.readers.add(`${pkg.name} ${target}`);
+            model.unresolved.set(key, entry);
           }
           continue;
         }
@@ -1019,6 +1083,11 @@ export function groupReferences(refs) {
 
 export function checkInventory(refs, inventory, model) {
   const problems = [];
+  for (const site of [...model.unresolved.values()].sort((a, b) => a.source.localeCompare(b.source) || a.line - b.line)) {
+    problems.push(
+      `unresolved include: ${site.source}:${site.line} ${site.form} (${[...site.readers].sort().join(", ")}): ${site.why}; the guard did not read that source, so the inventory cannot be complete`,
+    );
+  }
   const live = [];
   for (const ref of refs) {
     const ignored = inventory.notReaders.some((row) => row.source === ref.source && row.literal === ref.literal);
@@ -1112,6 +1181,11 @@ function main() {
   const model = workspaceModel();
   const index = trackedIndex();
   const refs = scanReferences(model, index);
+  if (mode !== "check") {
+    for (const site of model.unresolved.values()) {
+      process.stderr.write(`ci-non-rust-readers: unresolved include: ${site.source}:${site.line} ${site.form}: ${site.why}\n`);
+    }
+  }
   if (mode === "json") {
     process.stdout.write(`${JSON.stringify(refs, null, 2)}\n`);
     return;
