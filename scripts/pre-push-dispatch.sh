@@ -450,27 +450,52 @@ export MEERKAT_PRE_PUSH_LANE_TIMINGS="$lane_timings"
 # so consecutive result lines give each hook's wall time. perl relays whatever
 # it reads at once, partial lines included, so the terminal stays live; without
 # perl the transcript is captured untimed.
+#
+# Neither log may stop the relay. pre-commit is still writing while this runs,
+# and a reader that exits early kills it with a broken pipe, so the push would
+# take the pipe's status instead of the hooks'. Like tee, a gate log that
+# cannot be written is reported by a nonzero exit after every byte is relayed;
+# the timing log is optional and only warns.
 capture_transcript() {
   if command -v perl >/dev/null 2>&1; then
     perl -e '
       $| = 1;
-      open(my $log, ">", $ARGV[0]) or die "gate log: $!\n";
-      open(my $times, ">", $ARGV[1]) or die "timing log: $!\n";
+      my $status = 0;
+      my ($log, $times);
+      unless (open($log, ">", $ARGV[0])) {
+        warn "gate log: $!\n";
+        undef $log;
+        $status = 1;
+      }
+      unless (open($times, ">", $ARGV[1])) {
+        warn "timing log unavailable ($!); hook timings are not recorded\n";
+        undef $times;
+      }
       my $pending = "";
       while (1) {
         my $read = sysread(STDIN, my $chunk, 65536);
-        die "transcript read: $!\n" unless defined $read;
+        unless (defined $read) {
+          next if $!{EINTR};
+          warn "transcript read: $!\n";
+          $status = 1;
+          last;
+        }
         last if $read == 0;
         print STDOUT $chunk;
-        print {$log} $chunk;
+        print {$log} $chunk if $log;
+        next unless $times;
         $pending .= $chunk;
         while ($pending =~ s/^([^\n]*)\n//) {
           print {$times} time(), " ", $1, "\n";
         }
       }
-      print {$times} time(), " ", $pending, "\n" if length $pending;
-      close($log) or die "gate log: $!\n";
-      close($times) or die "timing log: $!\n";
+      print {$times} time(), " ", $pending, "\n" if $times && length $pending;
+      if ($log && !close($log)) {
+        warn "gate log: $!\n";
+        $status = 1;
+      }
+      close($times) if $times;
+      exit $status;
     ' "$gate_log" "$timing_log"
   else
     tee "$gate_log"
