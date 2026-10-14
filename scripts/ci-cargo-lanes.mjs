@@ -313,25 +313,36 @@ function parseBazelFeatureSets(pkg) {
   const testSets = new Set();
   const variants = new Map();
   for (const [, rule, body] of text.matchAll(/^(rust_test|rust_library|rust_binary)\(\n([\s\S]*?)^\)/gm)) {
-    const list = body.match(/^ {4}crate_features = \[([\s\S]*?)\]/m);
-    // Weak dependency features (`dep?/feature`) are rustc cfgs the generator
-    // passes through; Cargo enables them from the package's own features.
-    const features = list
-      ? [...list[1].matchAll(/"([^"]+)"/g)].map((match) => match[1]).filter((name) => !name.includes("/"))
-      : [];
-    for (const feature of features) {
-      if (!known.has(feature)) {
-        throw new Error(`${relative(root, buildPath)} enables ${feature}, which ${pkg.name} does not declare`);
-      }
+    // A production target selects its release feature set (no test-only
+    // features) under //tools/bazel:release_build; each select branch is a
+    // feature set the Bazel graph builds, so each is checked.
+    const value = body.match(/^ {4}crate_features = (\[[\s\S]*?\]|select\(\{[\s\S]*?\}\)),?$/m)?.[1];
+    const lists = !value
+      ? [[]]
+      : value.startsWith("select(")
+      ? [...value.matchAll(/"[^"]+":\s*\[([\s\S]*?)\]/g)].map((branch) => branch[1])
+      : [value.slice(1, -1)];
+    if (value?.startsWith("select(") && lists.length < 2) {
+      throw new Error(`${relative(root, buildPath)} has a crate_features select() without two feature sets`);
     }
-    const key = [...new Set(features)].sort().join(",");
-    if (rule === "rust_test") {
-      testSets.add(key);
-    } else {
-      const variant = variants.get(key) ?? { lib: false, bins: false };
-      if (rule === "rust_library") variant.lib = true;
-      if (rule === "rust_binary") variant.bins = true;
-      variants.set(key, variant);
+    for (const list of lists) {
+      // Weak dependency features (`dep?/feature`) are rustc cfgs the generator
+      // passes through; Cargo enables them from the package's own features.
+      const features = [...list.matchAll(/"([^"]+)"/g)].map((match) => match[1]).filter((name) => !name.includes("/"));
+      for (const feature of features) {
+        if (!known.has(feature)) {
+          throw new Error(`${relative(root, buildPath)} enables ${feature}, which ${pkg.name} does not declare`);
+        }
+      }
+      const key = [...new Set(features)].sort().join(",");
+      if (rule === "rust_test") {
+        testSets.add(key);
+      } else {
+        const variant = variants.get(key) ?? { lib: false, bins: false };
+        if (rule === "rust_library") variant.lib = true;
+        if (rule === "rust_binary") variant.bins = true;
+        variants.set(key, variant);
+      }
     }
   }
   if (testSets.size > 1) {

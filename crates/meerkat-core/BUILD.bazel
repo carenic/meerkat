@@ -67,13 +67,21 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-core"),
     crate_name = "meerkat_core",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "__meerkat-generated-authority-bridge",
-        "__meerkat-live-authority-bridge",
-        "jsonschema",
-        "schema",
-        "test-support",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [
+            "__meerkat-generated-authority-bridge",
+            "__meerkat-live-authority-bridge",
+            "jsonschema",
+            "schema",
+        ],
+        "//conditions:default": [
+            "__meerkat-generated-authority-bridge",
+            "__meerkat-live-authority-bridge",
+            "jsonschema",
+            "schema",
+            "test-support",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS + [
         "--cfg=meerkat_internal_generated_authority_bridge",
@@ -105,13 +113,21 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-core"),
     crate_name = "meerkat_core",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "__meerkat-generated-authority-bridge",
-        "__meerkat-live-authority-bridge",
-        "jsonschema",
-        "schema",
-        "test-support",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [
+            "__meerkat-generated-authority-bridge",
+            "__meerkat-live-authority-bridge",
+            "jsonschema",
+            "schema",
+        ],
+        "//conditions:default": [
+            "__meerkat-generated-authority-bridge",
+            "__meerkat-live-authority-bridge",
+            "jsonschema",
+            "schema",
+            "test-support",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS + [
         "--cfg=meerkat_internal_agent_factory_build",

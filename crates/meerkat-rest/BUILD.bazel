@@ -49,14 +49,23 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-rest"),
     crate_name = "meerkat_rest",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "comms",
-        "integration-real-tests",
-        "mcp",
-        "mob",
-        "schedule",
-        "workgraph",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [
+            "comms",
+            "mcp",
+            "mob",
+            "schedule",
+            "workgraph",
+        ],
+        "//conditions:default": [
+            "comms",
+            "integration-real-tests",
+            "mcp",
+            "mob",
+            "schedule",
+            "workgraph",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
@@ -219,14 +228,23 @@ rust_binary(
     aliases = aliases(package_name = "crates/meerkat-rest"),
     crate_name = "rkat_rest",
     crate_root = "src/main.rs",
-    crate_features = [
-        "comms",
-        "integration-real-tests",
-        "mcp",
-        "mob",
-        "schedule",
-        "workgraph",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [
+            "comms",
+            "mcp",
+            "mob",
+            "schedule",
+            "workgraph",
+        ],
+        "//conditions:default": [
+            "comms",
+            "integration-real-tests",
+            "mcp",
+            "mob",
+            "schedule",
+            "workgraph",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [

@@ -482,29 +482,33 @@ case "${command}" in
       --curses=no
     )
     ;;
+  # Release builds of the shipped binaries. --define=meerkat_release_build=1
+  # selects //tools/bazel:release_build, under which every generated
+  # production target drops its non-shipping (test-only) features;
+  # scripts/check-bazel-release-features.py fails a release build without it.
   release-build-macos-arm64)
     command="build"
     config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
     default_target="//crates/meerkat-cli:rkat //crates/meerkat-rpc:rkat_rpc_bin //crates/meerkat-rest:rkat_rest_bin //crates/meerkat-mcp-server:rkat_mcp_bin"
-    extra_args+=(--compilation_mode=opt --remote_download_outputs=toplevel)
+    extra_args+=(--compilation_mode=opt --define=meerkat_release_build=1 --remote_download_outputs=toplevel)
     ;;
   release-build-macos-x86)
     command="build"
     config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
     default_target="//crates/meerkat-cli:rkat //crates/meerkat-rpc:rkat_rpc_bin //crates/meerkat-rest:rkat_rest_bin //crates/meerkat-mcp-server:rkat_mcp_bin"
-    extra_args+=(--compilation_mode=opt --remote_download_outputs=toplevel --platforms=//tools/bazel/platforms:macos_x86_64)
+    extra_args+=(--compilation_mode=opt --define=meerkat_release_build=1 --remote_download_outputs=toplevel --platforms=//tools/bazel/platforms:macos_x86_64)
     ;;
   release-build-linux-x86)
     command="build"
     config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-linux-rbe}"
     default_target="//crates/meerkat-cli:rkat //crates/meerkat-rpc:rkat_rpc_bin //crates/meerkat-rest:rkat_rest_bin //crates/meerkat-mcp-server:rkat_mcp_bin"
-    extra_args+=(--compilation_mode=opt --remote_download_outputs=toplevel)
+    extra_args+=(--compilation_mode=opt --define=meerkat_release_build=1 --remote_download_outputs=toplevel)
     ;;
   release-build-linux-arm64)
     command="build"
     config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-linux-arm64-rbe}"
     default_target="//crates/meerkat-cli:rkat //crates/meerkat-rpc:rkat_rpc_bin //crates/meerkat-rest:rkat_rest_bin //crates/meerkat-mcp-server:rkat_mcp_bin"
-    extra_args+=(--compilation_mode=opt --remote_download_outputs=toplevel --linkopt=-fuse-ld=bfd)
+    extra_args+=(--compilation_mode=opt --define=meerkat_release_build=1 --remote_download_outputs=toplevel --linkopt=-fuse-ld=bfd)
     ;;
   release-build-windows-x86)
     command="build"
@@ -517,6 +521,7 @@ case "${command}" in
     winsdk_root="C:/Program Files (x86)/Windows Kits/10"
     extra_args+=(
       --compilation_mode=opt
+      --define=meerkat_release_build=1
       --remote_download_outputs=toplevel
       "--action_env=PATH=${msvc_root}/VC/Tools/MSVC/${msvc_ver}/bin/HostX64/x64;${winsdk_root}/bin/${winsdk_ver}/x64;C:/Windows/System32"
       "--action_env=LIB=${msvc_root}/VC/Tools/MSVC/${msvc_ver}/lib/x64;${winsdk_root}/Lib/${winsdk_ver}/um/x64;${winsdk_root}/Lib/${winsdk_ver}/ucrt/x64"

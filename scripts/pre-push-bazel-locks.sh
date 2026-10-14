@@ -3,7 +3,7 @@
 # module lockfile are stale, so CI doesn't reject the push for the same
 # reason after a long round-trip.
 #
-# Four gates:
+# Five gates:
 #   1. node scripts/generate-bazel-rust-builds.mjs --check
 #      Verifies the generated Bazel BUILD files match the workspace's
 #      Cargo metadata. Always runs (no `bb` CLI dependency).
@@ -16,14 +16,18 @@
 #      member manifest). Offline and always runs: this is the class that
 #      broke every BuildBuddy release-binary lane in 0.8.22, when a
 #      one-line Cargo.lock heal landed without a module-lock refresh.
-#   4. bb mod deps --lockfile_mode=error
+#   4. scripts/check-bazel-release-features.py
+#      Verifies every release build of the shipped binaries passes
+#      --define=meerkat_release_build=1 and that, under it, no target the
+#      binaries link enables a non-shipping (test-only) feature. Offline.
+#   5. bb mod deps --lockfile_mode=error
 #      Full authority over MODULE.bazel.lock vs MODULE.bazel, including
 #      registry inputs gate 3 cannot see. Requires the pinned `bb` CLI.
 #      Skipped (with a clear note) when `bb` is not available, unless
 #      --require-bb is passed (the release preflight does).
 #
 # Usage: pre-push-bazel-locks.sh [--require-bb]
-# Exit 0 = locks fresh (or gate 4 skipped honestly), exit 1 = stale locks.
+# Exit 0 = all gates pass (or gate 5 skipped honestly), exit 1 = a gate failed.
 
 set -euo pipefail
 
@@ -89,7 +93,18 @@ else
   failed=1
 fi
 
-# ---- Gate 4: MODULE.bazel.lock freshness ------------------------------------
+# ---- Gate 4: release builds exclude test-only features ----------------------
+
+if "${PYTHON}" scripts/check-bazel-release-features.py "${ROOT}"; then
+  printf '%bBazel release builds exclude non-shipping features%b\n' "${GREEN}" "${NC}"
+else
+  printf '%bA Bazel release binary can compile test-only code.%b\n' "${RED}" "${NC}"
+  printf '%bRegenerate with:%b  make buildbuddy-generate\n' "${YELLOW}" "${NC}"
+  printf '%bNon-shipping features: scripts/non-shipping-features.json%b\n\n' "${YELLOW}" "${NC}"
+  failed=1
+fi
+
+# ---- Gate 5: MODULE.bazel.lock freshness ------------------------------------
 
 # Locate the pinned `bb` CLI the same way scripts/buildbuddy-doctor does.
 bb_bin=""

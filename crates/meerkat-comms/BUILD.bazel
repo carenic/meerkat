@@ -49,10 +49,15 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-comms"),
     crate_name = "meerkat_comms",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "capability",
-        "integration-real-tests",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [
+            "capability",
+        ],
+        "//conditions:default": [
+            "capability",
+            "integration-real-tests",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [
@@ -86,10 +91,15 @@ rust_library(
     aliases = aliases(package_name = "crates/meerkat-comms"),
     crate_name = "meerkat_comms",
     crate_root = "src/lib.rs",
-    crate_features = [
-        "capability",
-        "integration-real-tests",
-    ],
+    crate_features = select({
+        "//tools/bazel:release_build": [
+            "capability",
+        ],
+        "//conditions:default": [
+            "capability",
+            "integration-real-tests",
+        ],
+    }),
     edition = "2024",
     rustc_flags = WORKSPACE_LINT_RUSTC_FLAGS,
     compile_data = [

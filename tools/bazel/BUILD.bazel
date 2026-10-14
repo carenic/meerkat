@@ -2,3 +2,15 @@ exports_files(
     ["workspace_lints.bzl"],
     visibility = ["//visibility:public"],
 )
+
+# Release builds of the shipped binaries pass --define=meerkat_release_build=1
+# (scripts/buildbuddy-bazel-poc release-build-*). Under it every generated
+# production rust_library and rust_binary selects its feature set without the
+# non-shipping features listed in scripts/non-shipping-features.json; the
+# default configuration, which the test lanes build, keeps them.
+# scripts/check-bazel-release-features.py enforces both halves.
+config_setting(
+    name = "release_build",
+    define_values = {"meerkat_release_build": "1"},
+    visibility = ["//visibility:public"],
+)

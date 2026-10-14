@@ -897,6 +897,19 @@ jobs:
           set -euo pipefail
           codesign --force --sign - "target/${{ matrix.platform.target }}/release/${{ matrix.surface.bin }}"
 
+      # The test-code marker guard comes from the workflow ref: an asset
+      # recovery of an older tag builds a tree that predates it. Sparse, so
+      # the checkout adds no Cargo or Bazel package to the build.
+      - name: Checkout release binary guard
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tooling
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/check-release-binary-markers
+          sparse-checkout-cone-mode: false
+
       - name: Package artifacts
         shell: bash
         env:
@@ -926,6 +939,8 @@ jobs:
             if [[ "${TARGET}" == *-unknown-linux-gnu ]]; then
               ./scripts/check-linux-release-binary-portability.sh "$src"
             fi
+            # No release binary may carry compiled-in test code.
+            .release-tooling/scripts/check-release-binary-markers "$src"
 
             tar -czf "dist/${artifact_name}" -C "$(dirname "$src")" "$(basename "$src")"
             echo "packaged=${bin} -> dist/${artifact_name}"
@@ -1219,6 +1234,19 @@ jobs:
 
           exit "${status}"
 
+      # The test-code marker guard comes from the workflow ref: an asset
+      # recovery of an older tag builds a tree that predates it. Sparse, so
+      # the checkout adds no Cargo or Bazel package to the build.
+      - name: Checkout release binary guard
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tooling
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/check-release-binary-markers
+          sparse-checkout-cone-mode: false
+
       - name: Package artifacts
         shell: bash
         env:
@@ -1272,6 +1300,9 @@ jobs:
             if [[ "${TARGET}" == *-unknown-linux-gnu ]]; then
               ./scripts/check-linux-release-binary-portability.sh "${stage_dir}/${payload_name}"
             fi
+            # No release binary may carry compiled-in test code (the guard
+            # names its one documented exception, tokio's test-util).
+            .release-tooling/scripts/check-release-binary-markers "${stage_dir}/${payload_name}"
             archive_path="${PWD}/dist/${artifact_name}"
 
             if [[ "$ARCHIVE_EXT" == "zip" ]]; then
@@ -1406,6 +1437,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: scripts/verify-release-asset-provenance release-artifacts "${RELEASE_TAG}"
+
+      # The archives just verified were compiled from the tag's tree. Its
+      # built-binary test hooks must reach debug builds only: an older tree's
+      # binaries honour them and carry no marker the packaging scan can see.
+      - name: Require the release tree to gate its test hooks
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: scripts/check-release-source-test-hooks "${RELEASE_TAG}"
 
       # Never churn already-published archives on a rerun. Missing archives
       # are still added, while the final publisher handles the cross-compiled
@@ -1672,13 +1711,15 @@ jobs:
                 echo "$(basename "${archive}"): $(basename "${binary}") does not embed release version ${version}" >&2
                 exit 1
               }
+              # Nor may it carry compiled-in test code.
+              scripts/check-release-binary-markers "${binary}"
             done < <(find "${unpacked}" -type f -print0)
             [[ "${binaries}" -gt 0 ]] || { echo "$(basename "${archive}") is empty" >&2; exit 1; }
             rm -rf "${unpacked}"
             checked=$((checked + 1))
           done
           [[ "${checked}" -gt 0 ]] || { echo "no release archives to check" >&2; exit 1; }
-          echo "Every binary in ${checked} archives embeds ${version}"
+          echo "Every binary in ${checked} archives embeds ${version} and passes the test-code marker guard"
 
       # Tag push, or a dispatch on the tag ref: every archive is attested
       # from exactly the tag commit. An asset recovery dispatched from main
@@ -1715,6 +1756,15 @@ jobs:
           else
             scripts/verify-release-asset-provenance prepared-release-artifacts "${RELEASE_TAG}"
           fi
+
+      # Every archive above, reused or rebuilt, was compiled from the tag's
+      # tree. Its built-binary test hooks must reach debug builds only: an
+      # older tree's binaries honour them and carry no marker the packaging
+      # scan can see, so an old tag's archives fail closed here.
+      - name: Require the release tree to gate its test hooks
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+        run: scripts/check-release-source-test-hooks "${RELEASE_TAG}"
 
       - name: Publish release archives
         uses: softprops/action-gh-release@v2
