@@ -268,6 +268,7 @@ jobs:
       integration_matrix: ${{ steps.plan.outputs.integration_matrix }}
       test_scope_count: ${{ steps.plan.outputs.test_scope_count }}
       hook_binary_count: ${{ steps.plan.outputs.hook_binary_count }}
+      hook_retained_count: ${{ steps.plan.outputs.hook_retained_count }}
       closure_test_count: ${{ steps.plan.outputs.closure_test_count }}
       closure_test_matrix: ${{ steps.plan.outputs.closure_test_matrix }}
       feature_check_count: ${{ steps.plan.outputs.feature_check_count }}
@@ -1093,12 +1094,15 @@ jobs:
     # The pre-push hook's cargo-test coverage (scripts/pre-push-unit.sh), run
     # here for the test scope: the reverse-dependency closure of the changed
     # packages, or every member on a global change. Rows are closure_test_rows
-    # in scripts/ci-cargo-lanes.mjs: one --workspace --lib row, every
-    # tests/*.rs target the hook built (by name, fast selection), e2e-fast,
-    # all selecting the whole workspace so they compile the hook's own units,
-    # and HeadCanonical with the hook's own command. scripts/ci-hook-coverage.mjs
-    # fails the plan when a hook binary in scope has no row. Selected by the
-    # row count alone.
+    # in scripts/ci-cargo-lanes.mjs: every tests/*.rs target the hook built
+    # (by name, fast selection) and e2e-fast, selecting the whole workspace
+    # so they compile the hook's own units, and HeadCanonical with the hook's
+    # own command. The hook keeps its kind(lib) lane: a --workspace --lib row
+    # is planned only with --lib-row-runner, for a runner that builds it in
+    # time (a hosted 4-vCPU runner needs about 64 min).
+    # scripts/ci-hook-coverage.mjs fails the plan when a hook binary in scope
+    # has no row and is not a lib binary the plan leaves to the hook.
+    # Selected by the row count alone.
     if: ${{ needs.changes.result == 'success' && needs.changes.outputs.closure_test_count != '0' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -2001,6 +2005,7 @@ jobs:
           CLOSURE_TEST_COUNT: ${{ needs.changes.outputs.closure_test_count }}
           TEST_SCOPE_COUNT: ${{ needs.changes.outputs.test_scope_count }}
           HOOK_BINARY_COUNT: ${{ needs.changes.outputs.hook_binary_count }}
+          HOOK_RETAINED_COUNT: ${{ needs.changes.outputs.hook_retained_count }}
           MAIN_UNIT_PACKED_RESULT: ${{ needs.main-unit.result }}
           MAIN_UNIT_ARCHIVE_BUILD_RESULT: ${{ needs.main-unit-archive-build.result }}
           MAIN_UNIT_ARCHIVE_RUN_RESULT: ${{ needs.main-unit-archive-run.result }}
@@ -2048,7 +2053,7 @@ jobs:
             echo "::notice::unit tests deferred to the push-to-main run (meerkat-mob compile chain): ${UNIT_DEFERRED}"
           fi
           echo "changes=${CHANGES_RESULT} fmt-governance=${FMT_GOVERNANCE_RESULT} ratchets=${RATCHETS_RESULT} tlc-audits=${TLC_AUDITS_RESULT}"
-          echo "clippy=${CLIPPY_RESULT} unit=${UNIT_RESULT} governed-jsonl=${GOVERNED_JSONL_RESULT} mcp-confinement-positive=${MCP_CONFINEMENT_POSITIVE_RESULT} integration=${INTEGRATION_RESULT} (${INTEGRATION_COUNT} suites) closure-tests=${CLOSURE_TESTS_RESULT} (${CLOSURE_TEST_COUNT} rows, ${HOOK_BINARY_COUNT} hook binaries, ${TEST_SCOPE_COUNT}-package scope) main-unit=${MAIN_UNIT_RESULT} closure-check=${CLOSURE_CHECK_RESULT} feature-check=${FEATURE_CHECK_RESULT} wasm-check=${WASM_CHECK_RESULT} sdk-host=${SDK_HOST_RESULT} example-web=${EXAMPLE_WEB_RESULT} wasm-timers=${WASM_TIMERS_RESULT} bazel-graph=${BAZEL_GRAPH_RESULT}"
+          echo "clippy=${CLIPPY_RESULT} unit=${UNIT_RESULT} governed-jsonl=${GOVERNED_JSONL_RESULT} mcp-confinement-positive=${MCP_CONFINEMENT_POSITIVE_RESULT} integration=${INTEGRATION_RESULT} (${INTEGRATION_COUNT} suites) closure-tests=${CLOSURE_TESTS_RESULT} (${CLOSURE_TEST_COUNT} rows, ${HOOK_BINARY_COUNT} hook binaries, ${HOOK_RETAINED_COUNT} of them left to the hook, ${TEST_SCOPE_COUNT}-package scope) main-unit=${MAIN_UNIT_RESULT} closure-check=${CLOSURE_CHECK_RESULT} feature-check=${FEATURE_CHECK_RESULT} wasm-check=${WASM_CHECK_RESULT} sdk-host=${SDK_HOST_RESULT} example-web=${EXAMPLE_WEB_RESULT} wasm-timers=${WASM_TIMERS_RESULT} bazel-graph=${BAZEL_GRAPH_RESULT}"
           failed=0
           require_success() {
             local lane="$1" result="$2"

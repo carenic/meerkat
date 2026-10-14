@@ -19,6 +19,7 @@
 // usage:
 //   ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N]
 //                      [--workspace-shards N] [--closure-test-rows N]
+//                      [--lib-row-runner LABEL]
 //                      [--format json|github] [--] [changed-path ...]
 //   ci-cargo-lanes.mjs --paths-from-stdin [...]
 //
@@ -73,7 +74,13 @@
 // `--workspace --exclude`). The rows are
 //   lib        one `--workspace --lib` row: it builds every member's lib
 //              test (nothing narrower keeps the resolution) and runs the
-//              scope's through a package() filter
+//              scope's through a package() filter. Only with
+//              --lib-row-runner, on that runner: a hosted 4-vCPU runner
+//              needs about 64 min to build it (nightly's workspace unit
+//              lane: 4940 s, 1071 s of it running the tests). Without one
+//              the plan leaves the hook's kind(lib) lane to the hook
+//              (hook_retained_lanes), which runs those tests before the
+//              push.
 //   tests      every tests/*.rs target name the hook built, with every
 //              member's target of that name, `--test NAME` by name, with
 //              the hook's fast selection (ci-integration), split by
@@ -84,7 +91,8 @@
 // scripts/ci-hook-coverage.mjs reads the hook's lanes from the hook script
 // and the executing step from ci.yml, credits only whole-workspace rows (and
 // HeadCanonical's own command), and the plan fails when any hook binary in
-// scope has no row.
+// scope has no row and is not a lib binary of a lane the plan leaves to the
+// hook.
 // The test scope also holds the readers of changed non-Rust inputs
 // (scripts/ci-non-rust-readers.json, kept complete by its guard): a test
 // that reads docs/, specs/, sdks/, a fixture outside its crate or the whole
@@ -528,6 +536,7 @@ function parseArgs(argv) {
     maxShards: 6,
     workspaceShards: 8,
     closureTestRows: 12,
+    libRowRunner: "",
     format: "json",
     pathsFromStdin: false,
     paths: [],
@@ -555,6 +564,11 @@ function parseArgs(argv) {
       if (!Number.isInteger(args.closureTestRows) || args.closureTestRows < 1) {
         throw new Error("--closure-test-rows requires a positive integer");
       }
+    } else if (arg === "--lib-row-runner") {
+      args.libRowRunner = argv[++i] ?? "";
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(args.libRowRunner)) {
+        throw new Error("--lib-row-runner requires a runner label");
+      }
     } else if (arg === "--format") {
       args.format = argv[++i] ?? "";
       if (!["json", "github"].includes(args.format)) {
@@ -571,7 +585,7 @@ function parseArgs(argv) {
       break;
     } else if (arg === "--help" || arg === "-h") {
       process.stdout.write(
-        "usage: ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N] [--workspace-shards N] [--closure-test-rows N] [--format json|github] [--paths-from-stdin] [--changed-paths-only] [--] [changed-path ...]\n",
+        "usage: ci-cargo-lanes.mjs [--base <rev> --head <rev>] [--max-shards N] [--workspace-shards N] [--closure-test-rows N] [--lib-row-runner LABEL] [--format json|github] [--paths-from-stdin] [--changed-paths-only] [--] [changed-path ...]\n",
       );
       process.exit(0);
     } else if (arg.startsWith("-")) {
@@ -841,6 +855,16 @@ function packShards(pkgs, weights, maxShards, model = null) {
     .sort((a, b) => b.estimated_cost - a.estimated_cost || a.name.localeCompare(b.name));
 }
 
+// The hook's kind(lib) lane: the one a plan without a lib row leaves to the
+// hook.
+function hookLibLane(hook) {
+  const lanes = hook.lanes.filter((lane) => lane.filter === "kind(lib)");
+  if (lanes.length !== 1) {
+    throw new Error(`${HOOK_SCRIPT}: expected one kind(lib) lane to leave the lib tests to, found ${lanes.length}`);
+  }
+  return lanes[0];
+}
+
 // The hook-parity rows for the test scope (see the header). Every row but
 // HeadCanonical selects the whole workspace (`--workspace`) and names only
 // its own targets: Cargo then resolves features exactly as the hook's single
@@ -849,7 +873,7 @@ function packShards(pkgs, weights, maxShards, model = null) {
 // b45c8e60: `--workspace --test ...` rows 472/472 and 380/380 units identical
 // to the hook's, `--workspace --lib` 572/572; package-scoped rows differed in
 // 31-39 units (dependency features), and so does `--workspace --exclude`.
-function hookParityRows({ scope, byName, unified, model, maxTestRows, nextestText, hook }) {
+function hookParityRows({ scope, byName, unified, model, maxTestRows, nextestText, hook, libRowRunner }) {
   const rows = [];
   const testTargets = (name) =>
     byName.get(name).targets.filter((target) => target.kind.length === 1 && target.kind[0] === "test");
@@ -858,12 +882,13 @@ function hookParityRows({ scope, byName, unified, model, maxTestRows, nextestTex
   const hasLib = (name) =>
     byName.get(name).targets.some((target) => target.test !== false && target.kind.some((kind) => LIB_TARGET_KINDS.has(kind)));
 
-  // Lib tests: one row. `--workspace --lib` builds every member's lib test;
-  // no stable selection builds fewer under the same resolution, so the scope
-  // narrows what runs, not what builds. The filter keeps the hook's own
-  // kind(lib) (proc-macro crates' tests are not in it) and the scope's
-  // packages.
-  const libPackages = scope.filter(hasLib);
+  // Lib tests: one row, on the runner that can build it in time (none
+  // given: the hook keeps its kind(lib) lane). `--workspace --lib` builds
+  // every member's lib test; no stable selection builds fewer under the
+  // same resolution, so the scope narrows what runs, not what builds. The
+  // filter keeps the hook's own kind(lib) (proc-macro crates' tests are not
+  // in it) and the scope's packages.
+  const libPackages = libRowRunner ? scope.filter(hasLib) : [];
   if (libPackages.length > 0) {
     const everyLib = [...byName.keys()].filter(hasLib);
     const filter = libPackages.length === everyLib.length
@@ -872,6 +897,7 @@ function hookParityRows({ scope, byName, unified, model, maxTestRows, nextestTex
     rows.push({
       name: "lib",
       lane: "lib",
+      runner: libRowRunner,
       packages: libPackages,
       package_flags: "--workspace",
       test_flags: "--lib",
@@ -1390,6 +1416,11 @@ function plan(args) {
     if (!byName.has(name)) throw new Error(`the non-Rust reader inventory names unknown package ${name}`);
   }
   result.test_scope = [...new Set([...result.closure, ...result.reader_packages])].sort();
+  const hook = hookModel(hookText);
+  // The `--workspace --lib` row runs only on a runner that can build it in
+  // time; without one the plan leaves the hook's kind(lib) lane to the hook.
+  result.lib_row_runner = args.libRowRunner || null;
+  result.hook_retained_lanes = result.lib_row_runner ? [] : [hookLibLane(hook).label];
   result.closure_test_rows = result.test_scope.length > 0
     ? hookParityRows({
       scope: result.test_scope,
@@ -1398,13 +1429,15 @@ function plan(args) {
       model,
       maxTestRows: args.closureTestRows,
       nextestText,
-      hook: hookModel(hookText),
+      hook,
+      libRowRunner: result.lib_row_runner,
     })
     : [];
   const coverage = checkHookCoverage(result, { metadata, nextestText, hookText });
   result.hook_coverage = {
     scope_packages: coverage.scope_packages,
     hook_binaries: coverage.hook_binaries,
+    hook_retained: coverage.hook_retained,
     by_lane: coverage.by_lane,
     missing: coverage.missing,
     errors: coverage.errors,
@@ -1557,6 +1590,8 @@ function githubOutput(result) {
   scalar("integration_matrix", matrixOf(result.integration_suites));
   scalar("test_scope_count", String(result.test_scope.length));
   scalar("hook_binary_count", String(result.hook_coverage.hook_binaries));
+  scalar("hook_retained_count", String(result.hook_coverage.hook_retained));
+  scalar("hook_retained_lanes", result.hook_retained_lanes.join(","));
   scalar("closure_test_count", String(result.closure_test_rows.length));
   scalar("closure_test_matrix", closureMatrixOf(result.closure_test_rows));
   scalar("feature_check_count", String(result.feature_check_jobs.length));
@@ -1587,7 +1622,7 @@ function main() {
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   }
   process.stderr.write(
-    `ci-cargo-lanes: mode=${result.mode} packages=${result.packages.length} closure=${result.closure.length} clippy_shards=${result.shards.length} unit_shards=${result.unit_shards.length} feature_suites=${result.unit_feature_shards.length}/${result.main_feature_unit_shards.length} unit_deferred=${result.unit_deferred.length} unit_chain_exceptions=${result.unit_chain_exceptions.length} integration=${result.integration_suites.length} feature_check_jobs=${result.feature_check_jobs.length} test_scope=${result.test_scope.length} closure_tests=${result.closure_test_rows.length} hook_binaries=${result.hook_coverage.hook_binaries} (${result.reason})\n`,
+    `ci-cargo-lanes: mode=${result.mode} packages=${result.packages.length} closure=${result.closure.length} clippy_shards=${result.shards.length} unit_shards=${result.unit_shards.length} feature_suites=${result.unit_feature_shards.length}/${result.main_feature_unit_shards.length} unit_deferred=${result.unit_deferred.length} unit_chain_exceptions=${result.unit_chain_exceptions.length} integration=${result.integration_suites.length} feature_check_jobs=${result.feature_check_jobs.length} test_scope=${result.test_scope.length} closure_tests=${result.closure_test_rows.length} hook_binaries=${result.hook_coverage.hook_binaries} hook_retained=${result.hook_coverage.hook_retained} (${result.reason})\n`,
   );
 }
 

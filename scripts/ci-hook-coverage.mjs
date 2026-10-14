@@ -32,10 +32,18 @@
 // compiles its dependencies with fewer features and is not the hook's
 // build). HeadCanonical is credited for its own, package-scoped command.
 //
+// A plan may leave hook lanes to the hook (hook_retained_lanes, by the
+// lane's label in the hook script): the lib binaries such a lane runs need
+// no row, because the hook runs them before the push. Only lib binaries:
+// whatever else a retained lane runs still needs a row, as does
+// HeadCanonical. The planner leaves the hook's kind(lib) lane there when no
+// runner can build the `--workspace --lib` row in time (--lib-row-runner).
+// A row that names a runner must run exactly where its bound job runs.
+//
 // usage: ci-hook-coverage.mjs [--plan <file>|-] [--map]
 //   Reads a plan (ci-cargo-lanes.mjs --format json) and prints the coverage
 //   summary; exits 1 on a gap. --map prints every hook binary with the CI row
-//   that runs it.
+//   that runs it, or the hook lane the plan leaves it to.
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -57,6 +65,7 @@ export const CI_ROW_STEPS = [
   {
     field: "closure_test_rows",
     job: "closure-tests",
+    runsOn: "ubuntu-24.04",
     step: "Closure tests (the row's targets, workspace feature set)",
     matrix: "closure_test_matrix",
     env: {
@@ -139,6 +148,7 @@ export function bindRowSteps(workflowText) {
     if (!job.text.includes(`      matrix: \${{ fromJSON(needs.changes.outputs.${spec.matrix}) }}\n`)) {
       errors.push(`${where}: its matrix is not needs.changes.outputs.${spec.matrix}`);
     }
+    if (!job.text.includes(`\n    runs-on: ${spec.runsOn}\n`)) errors.push(`${where}: it does not run on ${spec.runsOn}`);
     if (/^\s+NEXTEST_[A-Z0-9_]*:/m.test(job.text)) errors.push(`${where}: sets a NEXTEST_ variable`);
     const step = block(job.text, `      - name: ${spec.step}`, 6);
     if (step.error) {
@@ -496,14 +506,21 @@ export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText
   }
 
   // The hook's workspace binaries for the scope, keyed package::kind::binary:
-  // built by the workspace inventory, run by at least one of its lanes.
+  // built by the workspace inventory, run by at least one of its lanes. A lib
+  // binary that a lane the plan leaves to the hook runs is the hook's; every
+  // other one needs a row.
   const builtFilter = parseFilter(hook.buildFilter);
   const lanes = hook.lanes.map((lane) => ({
     label: lane.label,
     filter: parseFilter(lane.filter),
     profileFilter: parseFilter(profileFilter(nextest, lane.profile)),
   }));
+  const retainedLabels = [...new Set(plan.hook_retained_lanes ?? [])].sort();
+  for (const label of retainedLabels) {
+    if (!lanes.some((lane) => lane.label === label)) errors.push(`the plan leaves "${label}" to the hook, which has no such workspace lane`);
+  }
   const expected = new Map();
+  const retained = new Map();
   for (const name of scope.filter((candidate) => byName.has(candidate))) {
     const pkg = byName.get(name);
     for (const target of pkg.targets) {
@@ -513,8 +530,15 @@ export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText
       if (!(target["required-features"] ?? []).every((feature) => unified.get(name).has(feature))) continue;
       const binary = { kind: nextestKind(target), binary: target.name, package: name };
       if (!builtFilter(binary)) continue;
-      const lane = lanes.find((candidate) => candidate.filter(binary) && candidate.profileFilter(binary));
-      if (lane) expected.set(`${name}::${binary.kind}::${target.name}`, { lane: lane.label, package: name });
+      const runs = (candidate) => candidate.filter(binary) && candidate.profileFilter(binary);
+      const lane = lanes.find(runs);
+      if (!lane) continue;
+      const key = `${name}::${binary.kind}::${target.name}`;
+      const keeper = binary.kind === "lib"
+        ? lanes.find((candidate) => retainedLabels.includes(candidate.label) && runs(candidate))
+        : undefined;
+      if (keeper) retained.set(key, { lane: keeper.label, package: name });
+      else expected.set(key, { lane: lane.label, package: name });
     }
   }
   const hc = hook.headCanonical;
@@ -528,6 +552,10 @@ export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText
   let headCanonical = null;
   for (const spec of CI_ROW_STEPS) {
     for (const row of plan[spec.field] ?? []) {
+      // The job runs every row where it runs (no row routes elsewhere yet).
+      if (row.runner != null && row.runner !== spec.runsOn) {
+        errors.push(`row ${row.name} names runner ${row.runner}, but job ${spec.job} runs on ${spec.runsOn}`);
+      }
       let read;
       try {
         read = rowBinaries(row, spec, byName, nextest, unified);
@@ -567,16 +595,20 @@ export function checkHookCoverage(plan, { metadata = readMetadata(), nextestText
   const missing = [...expected.keys()].filter((key) => !covered.has(key)).sort();
   if (headCanonicalExpected && !headCanonical) missing.push(headKey);
   const byLane = {};
-  for (const { lane } of expected.values()) byLane[lane] = (byLane[lane] ?? 0) + 1;
+  for (const { lane } of [...expected.values(), ...retained.values()]) byLane[lane] = (byLane[lane] ?? 0) + 1;
   if (headCanonicalExpected) byLane.HeadCanonical = 1;
   return {
     scope_packages: scope.length,
-    hook_binaries: expected.size + (headCanonicalExpected ? 1 : 0),
+    hook_binaries: expected.size + retained.size + (headCanonicalExpected ? 1 : 0),
+    hook_retained: retained.size,
     by_lane: byLane,
     missing,
     errors,
     map: Object.fromEntries([
-      ...[...expected.keys()].sort().map((key) => [key, covered.get(key) ?? null]),
+      ...[...expected.keys(), ...retained.keys()].sort().map((key) => [
+        key,
+        covered.get(key) ?? (retained.has(key) ? `hook: ${retained.get(key).lane}` : null),
+      ]),
       ...(headCanonicalExpected ? [[headKey, headCanonical]] : []),
     ]),
   };
@@ -596,6 +628,7 @@ function main() {
   const summary = {
     scope_packages: report.scope_packages,
     hook_binaries: report.hook_binaries,
+    hook_retained: report.hook_retained,
     by_lane: report.by_lane,
     missing: report.missing,
     errors: report.errors,

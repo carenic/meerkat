@@ -411,15 +411,19 @@ GitHub-hosted runners and sized to a 25-minute lane execution budget:
   by `scripts/ci-non-rust-readers-guard.mjs` in `make ci-lanes-selftest`).
   Rows (`closure_test_rows` in `scripts/ci-cargo-lanes.mjs`) select the whole
   workspace and name only their targets, so they compile the hook's own
-  units: one `--workspace --lib` row (filtered to the scope's packages),
-  every `tests/*.rs` target the hook builds (by name, `ci-integration`
+  units: every `tests/*.rs` target the hook builds (by name, `ci-integration`
   profile, the fast selection), `e2e-fast`, and HeadCanonical with the
   hook's own package-scoped command, all on the hook's 32 MiB test-thread
-  stack. Each row lists and runs one shared selection and first checks that
-  nextest selects exactly its planned binaries
-  (`scripts/ci-verify-row-binaries.mjs`). The plan fails when
-  `scripts/ci-hook-coverage.mjs` finds a hook binary in scope without a row:
-  it reads the hook's lanes from `scripts/pre-push-unit.sh`, binds every line
+  stack. The lib tests stay in the hook's `kind(lib)` lane: one
+  `--workspace --lib` row (filtered to the scope's packages) is planned only
+  with `--lib-row-runner LABEL`, for a runner that builds it in time (a
+  hosted 4-vCPU runner needs about 64 min), and the plan otherwise records
+  the lane it leaves to the hook (`hook_retained_lanes`). Each row lists and
+  runs one shared selection and first checks that nextest selects exactly
+  its planned binaries (`scripts/ci-verify-row-binaries.mjs`). The plan
+  fails when `scripts/ci-hook-coverage.mjs` finds a hook binary in scope
+  without a row (other than a lib binary the plan leaves to the hook): it
+  reads the hook's lanes from `scripts/pre-push-unit.sh`, binds every line
   of the executing step that names a row input, the exported test-thread
   stack, the selection, nextest or the binary check (so none can reassign
   an input or the stack), and credits only whole-workspace rows.

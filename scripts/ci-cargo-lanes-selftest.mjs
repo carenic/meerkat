@@ -109,7 +109,9 @@ const OTHER_E2E_LANES = ["e2e_auth_lane", "e2e_build_lane", "e2e_system_lane", "
 
 // The closure-tests rows: the pre-push hook's cargo-test coverage for the
 // test scope (the reverse-dependency closure plus the readers of changed
-// non-Rust inputs), each row naming exactly the binaries it runs.
+// non-Rust inputs), each row naming exactly the binaries it runs. The lib row
+// exists only on a named runner; without one the plan leaves the hook's
+// kind(lib) lane to the hook.
 function assertHookParity(plan, label) {
   assert.deepEqual(
     plan.test_scope,
@@ -118,6 +120,18 @@ function assertHookParity(plan, label) {
   );
   assert.deepEqual(plan.hook_coverage.missing, [], `${label}: every hook binary in scope has a row`);
   assert.deepEqual(plan.hook_coverage.errors, [], `${label}: every row builds`);
+  const libRows = plan.closure_test_rows.filter((row) => row.lane === "lib");
+  if (plan.lib_row_runner === null) {
+    assert.deepEqual(libRows, [], `${label}: no lib row without a runner for it`);
+    assert.deepEqual(plan.hook_retained_lanes, ["workspace unit lane"], `${label}: the hook keeps its kind(lib) lane`);
+  } else {
+    assert.deepEqual(plan.hook_retained_lanes, [], `${label}: a plan with a lib row leaves no lane to the hook`);
+    assert.equal(plan.hook_coverage.hook_retained, 0, `${label}: and no binary`);
+    for (const row of libRows) assert.equal(row.runner, plan.lib_row_runner, `${label}: the lib row runs on its runner`);
+  }
+  for (const row of plan.closure_test_rows.filter((candidate) => candidate.lane !== "lib")) {
+    assert.equal(row.runner, undefined, `${label}: ${row.name} runs on its job's runner`);
+  }
   const names = plan.closure_test_rows.map((row) => row.name);
   assert.equal(new Set(names).size, names.length, `${label}: closure test row names are unique`);
   const runs = [];
@@ -1056,7 +1070,9 @@ for (const path of [
 // Hook parity: workspace-unified features. meerkat-mcp's form_elicitation
 // and lifecycle_contract require test-support, which only the workspace's
 // feature unification enables (a package-scoped build has none), so their
-// row must carry it; the mob chain's lib tests run in the pull request.
+// row must carry it. The mob chain's lib tests run before the merge, never
+// only on main: in the hook's kind(lib) lane without a lib-row runner, in the
+// pull request's lib row with one.
 {
   const plan = planFor(["crates/meerkat-mcp/src/lib.rs"]);
   assertLanes(plan, "mcp touch");
@@ -1064,9 +1080,16 @@ for (const path of [
   assert.ok(row, "a row runs meerkat-mcp's form_elicitation");
   assert.ok(row.binaries.includes("meerkat-mcp::lifecycle_contract"), "and lifecycle_contract");
   assert.equal(row.package_flags, "--workspace", "under the workspace's resolution, which enables test-support");
+  assert.equal(
+    checkHookCoverage(plan).map["meerkat-mob::lib::meerkat_mob"],
+    "hook: workspace unit lane",
+    "without a lib-row runner, the hook runs meerkat-mob's lib tests",
+  );
+  const withRunner = planFor(["crates/meerkat-mcp/src/lib.rs"], ["--lib-row-runner", "ubuntu-24.04"]);
+  assertLanes(withRunner, "mcp touch, lib-row runner");
   assert.ok(
-    plan.closure_test_rows.some((candidate) => candidate.lane === "lib" && candidate.packages.includes("meerkat-mob")),
-    "meerkat-mob's lib tests run in the pull request, not only on main",
+    withRunner.closure_test_rows.some((candidate) => candidate.lane === "lib" && candidate.packages.includes("meerkat-mob")),
+    "with one, meerkat-mob's lib tests run in the pull request",
   );
 }
 
@@ -1112,12 +1135,15 @@ for (const path of [
   const lines = Object.fromEntries(github.stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
   assert.equal(lines.closure_test_count, String(plan.closure_test_rows.length));
   assert.equal(JSON.parse(lines.closure_test_matrix).include.length, plan.closure_test_rows.length);
+  assert.equal(lines.hook_retained_lanes, "workspace unit lane", "the plan log names the lane it leaves to the hook");
+  assert.equal(lines.hook_retained_count, String(plan.hook_coverage.hook_retained));
 }
 
 // The coverage checker on mutated plans: each mutation is a way a row change
-// could narrow what CI runs, and each must be reported.
+// could narrow what CI runs, and each must be reported. The plan has the lib
+// row (a runner named for it), so the lib mutations have a row to change.
 {
-  const plan = planFor(["crates/meerkat-mcp/src/lib.rs"]);
+  const plan = planFor(["crates/meerkat-mcp/src/lib.rs"], ["--lib-row-runner", "ubuntu-24.04"]);
   const baseline = checkHookCoverage(plan);
   assert.deepEqual([baseline.missing, baseline.errors], [[], []], "the planned rows cover the hook");
   const mutate = (change) => {
@@ -1176,6 +1202,55 @@ for (const path of [
   assert.equal(unbound.errors.length, CI_ROW_STEPS.length, "every row-executing step is bound");
 }
 
+// What a plan may leave to the hook: the lib binaries of a lane the hook
+// runs, nothing else; and a row runs where its bound job runs.
+{
+  const plan = planFor(["crates/meerkat-mcp/src/lib.rs"]);
+  const baseline = checkHookCoverage(plan);
+  assert.deepEqual([baseline.missing, baseline.errors], [[], []], "the rows and the hook's kind(lib) lane cover the hook");
+  assert.ok(baseline.hook_retained > 0, "the plan leaves lib binaries to the hook");
+  const mutate = (change) => {
+    const copy = JSON.parse(JSON.stringify(plan));
+    change(copy);
+    return checkHookCoverage(copy);
+  };
+  const unretained = mutate((copy) => {
+    copy.hook_retained_lanes = [];
+  });
+  assert.ok(unretained.missing.includes("meerkat-mcp::lib::meerkat_mcp"), "a lib binary that neither runs is a gap");
+  // A retained lane exempts lib binaries only: leaving the integration lane to
+  // the hook exempts none of its tests, and the lib binaries lose their lane.
+  const integrationKept = mutate((copy) => {
+    copy.hook_retained_lanes = ["workspace integration lane"];
+    copy.closure_test_rows = copy.closure_test_rows.filter((row) => !row.binaries.includes("meerkat-mcp::form_elicitation"));
+  });
+  assert.ok(integrationKept.missing.includes("meerkat-mcp::test::form_elicitation"), "the integration lane's tests still need rows");
+  assert.ok(integrationKept.missing.includes("meerkat-mcp::lib::meerkat_mcp"), "and the lib binaries their own lane");
+  const unknownLane = mutate((copy) => {
+    copy.hook_retained_lanes = ["workspace lib lane"];
+  });
+  assert.ok(
+    unknownLane.errors.some((error) => error.includes("leaves \"workspace lib lane\" to the hook, which has no such workspace lane")),
+    "a lane the hook does not have is refused",
+  );
+  assert.ok(unknownLane.missing.includes("meerkat-mcp::lib::meerkat_mcp"), "and exempts nothing");
+  const elsewhere = mutate((copy) => {
+    copy.closure_test_rows[0].runner = "r1-c3d-30";
+  });
+  assert.ok(
+    elsewhere.errors.some((error) => error.includes("names runner r1-c3d-30, but job closure-tests runs on ubuntu-24.04")),
+    "a row cannot name a runner its job does not run on",
+  );
+  // The planner fails the same way for a lib-row runner no bound job runs on,
+  // and refuses an empty label.
+  const r1 = run(["--format", "json", "--lib-row-runner", "r1-c3d-30", "--", "crates/meerkat-mcp/src/lib.rs"]);
+  assert.equal(r1.status, 1, "a lib row on an unbound runner fails the plan");
+  assert.match(r1.stderr, /row lib names runner r1-c3d-30, but job closure-tests runs on ubuntu-24\.04/);
+  const empty = run(["--format", "json", "--lib-row-runner", "", "--", "crates/meerkat-mcp/src/lib.rs"]);
+  assert.equal(empty.status, 1, "an empty lib-row runner is an error");
+  assert.match(empty.stderr, /--lib-row-runner requires a runner label/);
+}
+
 // The bound steps: what a closure-tests row lists is what it runs, and no
 // other nextest command, selection or missing binary check can hide in the
 // steps the coverage model reads. Each mutation edits the real ci.yml text.
@@ -1227,6 +1302,11 @@ for (const path of [
     "      matrix: ${{ fromJSON(needs.changes.outputs.integration_matrix) }}\n",
   );
   assert.ok(wrongMatrix.some((error) => error.includes("its matrix is not")), "the closure-tests job runs the closure matrix");
+  const otherRunner = mutated(
+    "    if: ${{ needs.changes.result == 'success' && needs.changes.outputs.closure_test_count != '0' }}\n    runs-on: ubuntu-24.04\n",
+    "    if: ${{ needs.changes.result == 'success' && needs.changes.outputs.closure_test_count != '0' }}\n    runs-on: ubuntu-22.04\n",
+  );
+  assert.ok(otherRunner.some((error) => error.includes("job closure-tests: it does not run on ubuntu-24.04")), "the job's runner is bound");
   const rewired = mutated(
     "          TESTS: ${{ matrix.tests }}\n          PROFILE: ${{ matrix.profile }}\n",
     "          TESTS: ${{ matrix.packages }}\n          PROFILE: ${{ matrix.profile }}\n",
@@ -1331,10 +1411,9 @@ for (const path of [
   assert.throws(() => profileFilter(nextest, "no-such-profile"));
 }
 
-// The planner skips a hook-parity lib row when an existing unit row already
-// builds the package with the workspace set: when the package's default
-// features imply that whole set (featureClosure). That inference must never
-// claim a feature Cargo does not enable in a package-scoped build.
+// featureClosure infers the features of a package-scoped build (HeadCanonical's
+// own command, any package-scoped row the checker reads). That inference must
+// never claim a feature Cargo does not enable in a package-scoped build.
 {
   const metadata = readMetadata();
   const packages = workspacePackages(metadata);
