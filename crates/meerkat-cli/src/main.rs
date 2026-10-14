@@ -10583,6 +10583,19 @@ impl meerkat_mcp::McpAuthResolver for CliMcpHostAuthResolver {
         self.authority.require_stored_bearer_token(target).await
     }
 
+    /// The native authority's realm, as the RPC and REST resolvers report
+    /// it: the connection scopes its target to it, so the identity it
+    /// reports (sign-out, awaiting-authorization) is the realm's own.
+    fn credential_realm(&self) -> Option<meerkat_core::connection::RealmId> {
+        meerkat_mcp::McpAuthResolver::credential_realm(&self.authority)
+    }
+
+    /// The native authority's bound egress profile: under a required
+    /// profile a connection uses only a resolver bound to that same one.
+    fn http_egress(&self) -> Option<meerkat_mcp::HttpEgressProfile> {
+        meerkat_mcp::McpAuthResolver::http_egress(&self.authority)
+    }
+
     fn selected_account(
         &self,
         target: &meerkat::McpServerIdentity,
@@ -33847,6 +33860,61 @@ mod comms_override_tests {
         assert_eq!(
             config.comms.advertise_address.as_deref(),
             Some("tcp://explicit.example.com:4300")
+        );
+    }
+}
+
+#[cfg(all(test, feature = "mcp"))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod cli_mcp_host_auth_resolver_tests {
+    use super::*;
+
+    /// The CLI host resolver reports its native authority's credential realm
+    /// and bound egress profile, as the RPC and REST resolvers (the
+    /// authority itself) do.
+    #[tokio::test]
+    async fn cli_resolver_forwards_credential_realm_and_http_egress() {
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let realm = meerkat_core::connection::RealmId::parse("team-alpha").unwrap();
+        let service = meerkat::HostAuthService::new(
+            meerkat_providers::auth_store::ProviderAuthPersistence::new(
+                Arc::new(meerkat_providers::auth_store::EphemeralTokenStore::new()),
+                Arc::new(meerkat_providers::auth_store::InMemoryCoordinator::new()),
+            ),
+            runtime.provider_auth_runtime_authority(),
+        )
+        .with_mcp_realm(realm.clone());
+        let profile =
+            meerkat_mcp::HttpEgressProfile::required(meerkat_mcp::HttpEgressPolicy::new());
+        let authority = service
+            .mcp_oauth_authority()
+            .unwrap()
+            .stored_only()
+            .with_http_egress(&profile);
+
+        // Positive control: the authority, as RPC and REST install it.
+        assert_eq!(
+            meerkat_mcp::McpAuthResolver::credential_realm(&authority),
+            Some(realm.clone())
+        );
+        assert!(
+            meerkat_mcp::McpAuthResolver::http_egress(&authority)
+                .is_some_and(|bound| bound.same_profile(&profile))
+        );
+
+        let resolver = CliMcpHostAuthResolver {
+            service,
+            authority,
+            mode: CliMcpAuthMode::Stored,
+        };
+        assert_eq!(
+            meerkat_mcp::McpAuthResolver::credential_realm(&resolver),
+            Some(realm)
+        );
+        assert!(
+            meerkat_mcp::McpAuthResolver::http_egress(&resolver)
+                .is_some_and(|bound| bound.same_profile(&profile)),
+            "the CLI resolver must report the authority's bound egress profile"
         );
     }
 }
