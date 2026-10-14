@@ -57,6 +57,13 @@ them.
   surfaces. Before, the help corpus did not mention it, so `rkat help` answered
   that Meerkat has no OS-level sandboxing. The 0.9 migration notes are now
   embedded with the skill as well.
+- `rkat help` injects its whole embedded corpus. Preloaded skills are cut at
+  `skills.max_injection_bytes` (32 KiB by default), and the embedded
+  meerkat-platform skill is about three times that size, so a help session saw
+  only its first third. A session that preloads the embedded help skills
+  (`rkat help`, or `rkat run --skill meerkat-platform`) now raises its own limit
+  to fit them; other skills keep the configured limit. JSON-RPC, REST and MCP
+  help still inject at the configured limit.
 - `--as-agent` works before the command name, like the other root options.
   `rkat --as-agent <AGENT> realm list` was rewritten into a prompt-first run
   whose prompt was the command name.

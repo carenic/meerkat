@@ -5057,6 +5057,18 @@ async fn resolve_runtime_skills(
             preload.push(skill);
         }
     }
+    // The embedded help skills (which `rkat help` preloads) are larger than
+    // the default per-skill injection limit; a truncated preload would hide
+    // most of the help corpus.
+    if preload
+        .iter()
+        .any(|name| meerkat::help::is_help_skill_name(name))
+    {
+        config.skills.max_injection_bytes = config
+            .skills
+            .max_injection_bytes
+            .max(meerkat::help::help_skill_injection_bytes());
+    }
     Ok((config, preload))
 }
 
@@ -18141,7 +18153,7 @@ fn mob_wire_detail(e: &anyhow::Error) -> Option<meerkat_contracts::wire::WireMob
 }
 
 /// §17.4 typed exit path (DEC-P7B-11, ADJ-P7-7): exit codes 45-48 and 56
-/// for the mob verb family ONLY — scoping is by construction, since only mob
+/// for the mob verb family ONLY - scoping is by construction, since only mob
 /// handler arms put mob-family errors into the chain via [`mob_anyhow`].
 /// Unmapped mob errors keep `EXIT_ERROR`. The pre-existing
 /// `EXIT_BUDGET_EXHAUSTED=2` vs `cli_exit_code(BudgetExhausted)=21`
@@ -27107,6 +27119,36 @@ default_model = "gemma"
                 .map(std::ffi::OsString::from)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn test_help_skill_preloads_raise_the_skill_injection_limit() {
+        let default_limit = Config::default().skills.max_injection_bytes;
+        let (config, preload) = resolve_runtime_skills(
+            Config::default(),
+            meerkat::help::platform_preload_skill_names(),
+        )
+        .await
+        .expect("builtin help skills resolve");
+        assert_eq!(preload, meerkat::help::platform_preload_skill_names());
+        assert_eq!(
+            config.skills.max_injection_bytes,
+            meerkat::help::help_skill_injection_bytes()
+        );
+        assert!(config.skills.max_injection_bytes > default_limit);
+
+        let (config, _) = resolve_runtime_skills(Config::default(), vec!["reviewer".to_string()])
+            .await
+            .expect("an ordinary builtin skill name resolves");
+        assert_eq!(config.skills.max_injection_bytes, default_limit);
+
+        let mut raised = Config::default();
+        raised.skills.max_injection_bytes = 1024 * 1024;
+        let (config, _) =
+            resolve_runtime_skills(raised, meerkat::help::platform_preload_skill_names())
+                .await
+                .expect("builtin help skills resolve");
+        assert_eq!(config.skills.max_injection_bytes, 1024 * 1024);
     }
 
     #[test]

@@ -98,6 +98,28 @@ pub fn platform_preload_skill_names() -> Vec<String> {
     ]
 }
 
+/// Whether `name` is one of the embedded help skills.
+#[must_use]
+pub fn is_help_skill_name(name: &str) -> bool {
+    name == MEERKAT_PLATFORM_SKILL_NAME || name == MEERKAT_CLI_REFERENCE_SKILL_NAME
+}
+
+/// Per-skill injection limit that carries each embedded help skill whole.
+///
+/// The platform skill is larger than the default `skills.max_injection_bytes`
+/// meant for ordinary skills, and a preload above the limit is truncated, so a
+/// help session at the default limit would see only the start of its corpus.
+/// Sessions that preload the help skills raise their limit to at least this.
+#[must_use]
+pub fn help_skill_injection_bytes() -> usize {
+    // Room for the rendered `<skill ...>` wrapper and escaped closing tags.
+    const WRAPPER_ALLOWANCE: usize = 4 * 1024;
+    MEERKAT_PLATFORM_SKILL_BODY
+        .len()
+        .max(MEERKAT_CLI_REFERENCE_SKILL_BODY.len())
+        + WRAPPER_ALLOWANCE
+}
+
 pub fn validate_help_request(request: &HelpRequest) -> Result<(), HelpRequestError> {
     if request.question.trim().is_empty() {
         return Err(HelpRequestError::EmptyQuestion);
@@ -462,6 +484,59 @@ mod tests {
                 MEERKAT_CLI_REFERENCE_SKILL_NAME.to_string(),
             ]
         );
+        assert!(
+            platform_preload_skill_names()
+                .iter()
+                .all(|name| is_help_skill_name(name))
+        );
+        assert!(!is_help_skill_name("workgraph-workflow"));
+    }
+
+    #[test]
+    fn help_skill_injection_limit_carries_each_embedded_skill_whole() {
+        let limit = help_skill_injection_bytes();
+        // The default limit is the reason this one exists: the platform
+        // skill does not fit it.
+        assert!(
+            MEERKAT_PLATFORM_SKILL_BODY.len()
+                > meerkat_core::skills_config::SkillsConfig::default().max_injection_bytes
+        );
+        for body in [
+            MEERKAT_PLATFORM_SKILL_BODY,
+            MEERKAT_CLI_REFERENCE_SKILL_BODY,
+        ] {
+            assert!(
+                limit >= body.len() + 1024,
+                "the help injection limit {limit} must carry a {}-byte skill whole",
+                body.len()
+            );
+        }
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn help_skills_render_untruncated_at_the_help_injection_limit() {
+        for (key, body) in [
+            (platform_skill_key(), MEERKAT_PLATFORM_SKILL_BODY),
+            (cli_reference_skill_key(), MEERKAT_CLI_REFERENCE_SKILL_BODY),
+        ] {
+            let rendered = meerkat_skills::renderer::render_injection_with_limit(
+                &key,
+                body,
+                help_skill_injection_bytes(),
+            );
+            assert!(
+                !rendered.ends_with("[truncated]"),
+                "{} must render whole at the help injection limit",
+                key.skill_name.as_str()
+            );
+            let tail = body
+                .trim_end()
+                .lines()
+                .last()
+                .expect("skill body has lines");
+            assert!(rendered.contains(tail));
+        }
     }
 
     #[test]
