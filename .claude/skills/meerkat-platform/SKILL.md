@@ -80,21 +80,25 @@ rkat-mcp --state-root /srv/meerkat/realms --realm team-alpha
 ## OS sandboxing (execution confinement)
 
 Realms isolate state, not processes. OS confinement is a separate, preview
-boundary that an embedding Rust host installs. The host builds an
-`ExecutionConfinement` requirement (file read and write grants, network,
-Unix sockets) and passes it to `AgentFactory` with `with_shell_confinement`
-(shell tool commands, background jobs and their monitors),
-`with_command_hook_confinement` (command hooks) and
-`with_mcp_stdio_launch_profile` (stdio MCP servers). Backends: macOS Seatbelt
-(`MacOsSeatbeltV1`) and Linux namespaces plus seccomp
+boundary that the host installs. Stock `rkat`, `rkat-rpc`, `rkat-rest` and
+`rkat-mcp` read the `[confinement]` config section (`all`, or `shell`,
+`command_hooks`, `mcp_stdio`: `trusted_host`, `workspace` or `custom`) and the
+`--confinement <trusted-host|workspace>` flags; a less trusted realm document
+can add a requirement but never weaken one, and an ordinary config write
+cannot change the section. A Rust host builds an `ExecutionConfinement`
+requirement (file read and write grants, network, Unix sockets) and passes it
+to `AgentFactory` with `with_shell_confinement` (shell tool commands,
+background jobs and their monitors), `with_command_hook_confinement` (command
+hooks) and `with_mcp_stdio_launch_profile` (stdio MCP servers), or installs a
+resolved `HostConfinement` with `with_host_confinement`. Backends: macOS
+Seatbelt (`MacOsSeatbeltV1`) and Linux namespaces plus seccomp
 (`LinuxNamespaceSeccompV1`, x86_64 and aarch64); Windows has no backend. A
 `Required` profile is enforced completely or the launch is refused before it
 runs (a shell call gets `confinement_refused`); Meerkat never falls back to
-running it unconfined. The default is `TrustedHost`, which is no OS sandbox:
-stock `rkat`, `rkat-rpc`, `rkat-rest` and `rkat-mcp` install no requirement,
-and no config key or CLI flag selects one. `--tools none`, the shell's
-`restrict_to_project` check, realm isolation and governed-realm grants are not
-OS sandboxes, and confinement grants no permission of its own.
+running it unconfined. The default is `TrustedHost`, which is no OS sandbox.
+`--tools none`, the shell's `restrict_to_project` check, realm isolation and
+governed-realm grants are not OS sandboxes, and confinement grants no
+permission of its own.
 
 Details (requirement fields, what each backend refuses, environment rules,
 refusal causes and events, what is not a sandbox): `references/security.md`.
@@ -336,13 +340,14 @@ surface, not the old live-adapter/docs-refresh snapshot:
   - Mobs: admission closes once the last exported `MobHandle` clone drops and
     the mob is idle; destroy can answer the retryable `mob_destroy_incomplete`;
     host-persisted deliveries are scope-bound (`STALE_DELIVERY_SCOPE`).
-  - OS process confinement (preview, Rust hosts only): `AgentFactory`
+  - OS process confinement (preview): `AgentFactory`
     `with_shell_confinement`, `with_command_hook_confinement` and
     `with_mcp_stdio_launch_profile` enforce an `ExecutionConfinement` through
     macOS Seatbelt or, usable from 0.9.0, a Linux namespace and seccomp
-    backend, or refuse the launch (`confinement_refused`); no config key or
-    CLI flag, stock binaries run as the trusted host, Windows has no backend.
-    See `references/security.md`.
+    backend, or refuse the launch (`confinement_refused`); Windows has no
+    backend. In 0.9.0 only a Rust host could turn it on; from 0.9.1 the stock
+    binaries also read the `[confinement]` config section and the
+    `--confinement` flags. See `references/security.md`.
   - Credentials stay in the file store `<config dir>/meerkat/credentials`;
     keychain access is typed (`credential_access_*` reasons) and never read
     as absence. See `references/security.md`.
