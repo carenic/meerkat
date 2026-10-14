@@ -4545,11 +4545,9 @@ export class MeerkatClient {
 
   // -- Auth + realm (Phase 4d) --------------------------------------------
   //
-  // These wrappers cover the RPC catalog's auth/* and realm/* methods.
-  // Write-side methods (auth/profile/create, delete, login/start,
-  // login/complete, login/device_start, logout) are currently server-stubbed
-  // with typed INVALID_REQUEST pointing to the CLI; the wrappers surface
-  // whatever the server returns so they stay honest about the state.
+  // These wrappers cover the RPC catalog's auth/* and realm/* methods. They
+  // surface whatever the server returns, so they stay honest about its
+  // state.
 
   async realmList(): Promise<unknown> {
     return this.request("realm/list", {});
@@ -4695,8 +4693,12 @@ export class MeerkatClient {
   }
 
   /**
-   * Remove an MCP server target's stored credential via `auth/logout`.
-   * Nothing is revoked at the provider; a pending attempt is unaffected.
+   * Disconnect an MCP server target via `auth/logout`. The target must name
+   * a server configured for this host. Logout retires the login attempt
+   * pending for the server, removes its stored credential, and stops
+   * offering the server to this runtime's sessions until a later login.
+   * Nothing is revoked at the provider; `cleared` is true even when no
+   * credential was stored.
    */
   async authMcpLogout(
     mcp: RpcWireMcpAuthTarget,
