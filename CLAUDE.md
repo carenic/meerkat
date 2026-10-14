@@ -443,10 +443,11 @@ default to Cargo.
 PR CI does not. A dispatch with `graph_only=true` runs only `gcp-buildbuddy`:
 the release final gate runs it on the release branch tip before the tag
 (`gh workflow run nightly.yml --ref release/X -f graph_only=true`), which
-also warms the remote cache for the tag run. `gcp-buildbuddy` runs only
-while the repository variable `MEERKAT_GCP_BUILDBUDDY_ENABLED` is `true`
-(default off: the job is skipped, nothing in GCP starts, and the other
-nightly jobs still run). The full nightly set is:
+also warms the remote cache for the tag run. The self-hosted graph is
+default off behind the repository variable `MEERKAT_GCP_BUILDBUDDY_ENABLED`:
+unless it is `true`, scheduled runs skip `gcp-buildbuddy` (nothing in GCP
+starts; the other nightly jobs still run) and a `graph_only` dispatch fails
+in `buildbuddy.yml`'s gate instead of finishing green. The full nightly set is:
 `workspace-unit` (`make test-unit`), `workspace-int` (`make test-int`),
 `e2e-fast`, `dense-topology` (`mob-dense-topology.yml`),
 `machine-verify` (bounded TLC, including every non-skipped composition

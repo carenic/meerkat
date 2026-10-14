@@ -431,11 +431,27 @@ def touches_gcp(text):
 
 # --- buildbuddy.yml -------------------------------------------------------
 
+DISABLED_STEP = "Require the self-hosted graph to be enabled"
+
+
+def buildbuddy_plan(scenario):
+    """Plan the called workflow: the caller's event and variables, no inputs."""
+    inner = Scenario(scenario.event, bool(scenario.vars), actor=scenario.actor)
+    order, jobs, results = plan("buildbuddy.yml", inner)
+    gcp = [job for job in order if ran(results, job) and touches_gcp(job_text(jobs, job))]
+    fails_closed = False
+    if ran(results, "gate"):
+        expression = step_if(jobs["gate"], DISABLED_STEP)
+        if expression is not None and truthy(evaluate(Parser(expression).parse(), inner, [], results)):
+            script = step_run_script(jobs["gate"], DISABLED_STEP)
+            fails_closed = subprocess.run(["bash", "-c", script], capture_output=True).returncode != 0
+    return order, jobs, results, gcp, fails_closed
+
+
 for gate in (False, True):
     scenario = Scenario("schedule", gate)
-    order, jobs, results = plan("buildbuddy.yml", scenario)
+    order, jobs, results, gcp_running, fails_closed = buildbuddy_plan(scenario)
     running = [job for job in order if ran(results, job)]
-    gcp_running = [job for job in running if touches_gcp(job_text(jobs, job))]
     if not gate:
         if gcp_running:
             fail(f"buildbuddy.yml with {GATE_VAR} unset plans GCP jobs: {gcp_running}")
@@ -444,30 +460,18 @@ for gate in (False, True):
         for job in GCP_JOBS:
             if job in jobs and ran(results, job):
                 fail(f"buildbuddy.yml with {GATE_VAR} unset plans {job}")
-        if "gate" not in running:
-            fail("buildbuddy.yml gate job must still run (and fail) when the graph is disabled")
+        if not fails_closed:
+            fail("buildbuddy.yml called with the graph disabled must fail its gate (a step that runs and exits non-zero)")
         else:
-            expression = step_if(jobs["gate"], "Require the self-hosted graph to be enabled")
-            script = None
-            if expression is not None:
-                script = step_run_script(jobs["gate"], "Require the self-hosted graph to be enabled")
-            if expression is None or script is None:
-                fail("buildbuddy.yml gate job has no step that fails while the graph is disabled")
-            elif not truthy(evaluate(Parser(expression).parse(), scenario, [], results)):
-                fail("buildbuddy.yml disabled-graph step does not run while the graph is disabled")
-            elif subprocess.run(["bash", "-c", script], capture_output=True).returncode == 0:
-                fail("buildbuddy.yml disabled-graph step does not fail")
-            else:
-                ok("buildbuddy.yml called with the graph disabled fails its gate instead of passing")
+            ok("buildbuddy.yml called with the graph disabled fails its gate instead of passing")
     else:
         for job in ("control-plane-up", "executors-up", "prebuild-submit", "native-submit",
                     "native-cargo-submit", "executors-down", "gate"):
             if not ran(results, job):
                 fail(f"buildbuddy.yml with {GATE_VAR}=true no longer plans {job}")
-        expression = step_if(jobs["gate"], "Require the self-hosted graph to be enabled")
-        if expression is not None and truthy(evaluate(Parser(expression).parse(), scenario, [], results)):
-            fail("buildbuddy.yml disabled-graph step runs while the graph is enabled")
-        ok(f"buildbuddy.yml with {GATE_VAR}=true keeps the GCP route: {[j for j in order if ran(results, j)]}")
+        if fails_closed:
+            fail("buildbuddy.yml disabled-graph step fails while the graph is enabled")
+        ok(f"buildbuddy.yml with {GATE_VAR}=true keeps the GCP route: {running}")
 
 _, bb_jobs = read_jobs("buildbuddy.yml")
 for job in bb_jobs:
@@ -477,26 +481,44 @@ for job in bb_jobs:
             fail(f"buildbuddy.yml job {job} touches GCP without a conjunctive {GATE_VAR} gate: if={expression!r}")
 
 # --- nightly.yml ----------------------------------------------------------
+# Scheduled and ordinary dispatches skip the graph while it is disabled and
+# keep their other jobs; a graph_only dispatch always calls buildbuddy.yml,
+# which then starts nothing in GCP and fails, so a disabled graph never
+# finishes as an empty green pre-tag check.
 
 for gate in (False, True):
-    for event, inputs in (("schedule", {}), ("workflow_dispatch", {"graph_only": True})):
+    for event, inputs in (
+        ("schedule", {}),
+        ("workflow_dispatch", {"graph_only": False}),
+        ("workflow_dispatch", {"graph_only": True}),
+    ):
         scenario = Scenario(event, gate, inputs=inputs)
+        graph_only = bool(inputs.get("graph_only"))
         before = len(FAILURES)
         order, jobs, results = plan("nightly.yml", scenario)
         running = [job for job in order if ran(results, job)]
         callers = [job for job in order if "uses: ./.github/workflows/buildbuddy.yml" in job_text(jobs, job)]
         if not callers:
             fail("nightly.yml no longer calls buildbuddy.yml")
+        expect_call = gate or graph_only
         for caller in callers:
-            if ran(results, caller) != gate:
-                fail(f"nightly {scenario.describe()}: {caller} planned={results[caller]}")
+            if ran(results, caller) != expect_call:
+                fail(f"nightly {scenario.describe()}: {caller} planned={results[caller]}, expected {'run' if expect_call else 'skipped'}")
         chains = [job for job in running if job not in callers]
-        if event == "schedule" and not chains:
+        if not graph_only and not chains:
             fail(f"nightly {scenario.describe()}: no other nightly job runs ({results})")
-        if event == "workflow_dispatch" and chains:
+        if graph_only and chains:
             fail(f"nightly graph-only dispatch runs non-graph jobs: {chains}")
+        outcome = "skipped"
+        if any(ran(results, caller) for caller in callers):
+            _, _, _, gcp, fails_closed = buildbuddy_plan(scenario)
+            if gate and (not gcp or fails_closed):
+                fail(f"nightly {scenario.describe()}: the enabled graph must start its GCP jobs and not fail closed")
+            if not gate and (gcp or not fails_closed):
+                fail(f"nightly {scenario.describe()}: the disabled graph must start nothing in GCP and fail (gcp={gcp}, fails_closed={fails_closed})")
+            outcome = "run" if gate else "called, starts nothing in GCP, fails (red)"
         if len(FAILURES) == before:
-            ok(f"nightly {scenario.describe()}: graph={'run' if gate else 'skipped'}, other jobs running={len(chains)}")
+            ok(f"nightly {scenario.describe()}: graph {outcome}; other jobs running={len(chains)}")
 
 # --- release.yml ----------------------------------------------------------
 

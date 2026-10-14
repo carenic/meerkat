@@ -511,11 +511,13 @@ fn nightly_holds_a_bounded_number_of_hosted_slots() {
             assert!(job.get("needs").is_none(), "{ROOT} runs first");
             // A graph-only dispatch (the pre-tag check) runs exactly this job.
             // Only the self-hosted graph's default-off repository gate skips
-            // it, and the chains below still run when it is skipped.
+            // it on other runs (the chains below still run); a graph-only
+            // dispatch always calls it, so a disabled graph fails there
+            // instead of finishing green with nothing run.
             assert_eq!(
                 job.get("if").and_then(serde_yaml::Value::as_str),
-                Some("${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' }}"),
-                "{ROOT} runs on every nightly run while the self-hosted graph is enabled, graph-only dispatches included"
+                Some("${{ vars.MEERKAT_GCP_BUILDBUDDY_ENABLED == 'true' || inputs.graph_only }}"),
+                "{ROOT} runs on every nightly run while the self-hosted graph is enabled and on every graph-only dispatch"
             );
             continue;
         }
