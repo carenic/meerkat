@@ -4,13 +4,13 @@ description: "Unified agent and module envelopes, structural mob events, lossy W
 icon: "timeline"
 ---
 
-*Mirrored from MobKit main at [29f6b2218762](https://github.com/lukacf/meerkat-mobkit/commit/29f6b2218762002247be3985014014bc60468330) on 2026-10-08; MobKit workspace version 0.8.49 at that commit.*
+*Mirrored from MobKit main at [552af87699c2](https://github.com/lukacf/meerkat-meta/commit/552af87699c24ffbc917d283d9da1c51574a3969) on 2026-10-14; MobKit workspace version 0.9.0 at that commit.*
 
-MobKit exposes three related event surfaces:
+Meta exposes three related event surfaces:
 
-- `EventEnvelope<UnifiedEvent>` merges projected Meerkat agent events with MobKit module events.
+- `EventEnvelope<UnifiedEvent>` merges projected Meerkat agent events with Meta module events.
 - `MobStructuralEventEnvelope` projects structural events from the Meerkat mob-event ledger.
-- The WorkGraph wake stream emits bare `UnifiedEvent::Module` values at `GET /mobkit/workgraph/facts/stream` as lossy notifications.
+- The WorkGraph wake stream emits bare `UnifiedEvent::Module` values at `GET /meta/workgraph/facts/stream` as lossy notifications.
 
 They have different transport shapes and durability properties.
 
@@ -57,11 +57,11 @@ Agent event names come from Meerkat's exhaustive event mapper. Current examples 
   the interaction is paused at an external callback boundary waiting for tool
   results, and it resumes and closes under the same `interaction_id`
 
-These strings are projections of Meerkat `AgentEvent` variants. MobKit does not synthesize them as module events.
+These strings are projections of Meerkat `AgentEvent` variants. Meta does not synthesize them as module events.
 
 ### Run failure payload
 
-`run_failed` carries Meerkat's typed failure fact as `error_report`; since Meerkat 0.7 there is no separately carried `error` string on the wire. MobKit's projection (`console_agent_event_payload`, the single site every SSE stream, event-log row and console frame goes through) keeps the report and derives two flat keys from it, so consumers read one shape:
+`run_failed` carries Meerkat's typed failure fact as `error_report`; since Meerkat 0.7 there is no separately carried `error` string on the wire. Meta's projection (`console_agent_event_payload`, the single site every SSE stream, event-log row and console frame goes through) keeps the report and derives two flat keys from it, so consumers read one shape:
 
 ```json
 {
@@ -85,13 +85,13 @@ These strings are projections of Meerkat `AgentEvent` variants. MobKit does not 
 | `error` | Derived: `error_report.message`. |
 | `reason` | Derived: `error_report.reason.reason_type`. Absent when there is no typed reason. |
 
-The console `interaction_failed` frame MobKit projects from `run_failed` carries the same payload, so wire consumers read `frame.payload.error` and `frame.payload.reason` on REST/RPC/SSE timeline frames. Frames MobKit mints itself (`reason: "superseded_by_later_run"`, or `error` set from a delivery failure) carry only the flat keys. Meerkat's own `interaction_failed` agent event carries a typed `reason` object (`kind` discriminator) whose `Display` is mirrored into `error`. The Python SDK exposes the report as `RunFailed.error_report` (with `error_class` and `reason_type` accessors) and derives `RunFailed.error` from it; the TypeScript SDK exposes `RunFailedEvent.errorReport`; `UnifiedAgentEvent.payload` carries it for `query_events` consumers.
+The console `interaction_failed` frame Meta projects from `run_failed` carries the same payload, so wire consumers read `frame.payload.error` and `frame.payload.reason` on REST/RPC/SSE timeline frames. Frames Meta mints itself (`reason: "superseded_by_later_run"`, or `error` set from a delivery failure) carry only the flat keys. Meerkat's own `interaction_failed` agent event carries a typed `reason` object (`kind` discriminator) whose `Display` is mirrored into `error`. The Python SDK exposes the report as `RunFailed.error_report` (with `error_class` and `reason_type` accessors) and derives `RunFailed.error` from it; the TypeScript SDK exposes `RunFailedEvent.errorReport`; `UnifiedAgentEvent.payload` carries it for `query_events` consumers.
 
 A retried LLM call (a 429, a network timeout) surfaces as `retrying` events before either terminal; a non-retryable failure (a 401 on a bad key) reaches `run_failed` in one round trip. The `user_input` frame of a console send terminates at `delivered` by design (the send was admitted); the turn's outcome is the sibling `interaction_complete` or `interaction_failed` frame, not a status change on the input frame.
 
 ### Merged module event names
 
-MobKit itself generates these module event types in the merged envelope log:
+Meta itself generates these module event types in the merged envelope log:
 
 | `module` | `event_type` | Payload |
 |----------|--------------|---------|
@@ -100,16 +100,16 @@ MobKit itself generates these module event types in the merged envelope log:
 | `router` | `resolved` | Full `RoutingResolution` |
 | `delivery` | `send` | `delivery_id`, `route_id`, `recipient`, `sink`, `status`, and `attempts` |
 
-Generic modules may supply additional event names through their own valid envelopes. Gating audit entries, memory operations, and supervisor health transitions are not currently generated as unified module events by MobKit.
+Generic modules may supply additional event names through their own valid envelopes. Gating audit entries, memory operations, and supervisor health transitions are not currently generated as unified module events by Meta.
 
 ### WorkGraph wake events
 
-The separate WorkGraph wake stream uses the `UnifiedEvent::Module` shape but serializes that value directly as SSE data. It does not wrap the value in `EventEnvelope`, write it to `merged_events`, or include it in `mobkit/events/subscribe`.
+The separate WorkGraph wake stream uses the `UnifiedEvent::Module` shape but serializes that value directly as SSE data. It does not wrap the value in `EventEnvelope`, write it to `merged_events`, or include it in `meta/events/subscribe`.
 
 | `module` | `event_type` | Payload |
 |----------|--------------|---------|
-| `mobkit.workgraph` | `workgraph.fact` | Lossy WorkGraph fact wake payload |
-| `mobkit.workgraph` | `workgraph.resync_required` | Resynchronization reason and optional skipped count |
+| `meta.workgraph` | `workgraph.fact` | Lossy WorkGraph fact wake payload |
+| `meta.workgraph` | `workgraph.resync_required` | Resynchronization reason and optional skipped count |
 
 Every connection begins with `workgraph.resync_required` and `reason = "initial_sync"`. The stream then sends `workgraph.fact` wakes and can send `workgraph.resync_required` with `reason = "lagged"` after broadcast lag. It has no SSE ID, `Last-Event-ID`, catch-up, or replay contract. Consumers obtain authoritative graph state through the WorkGraph `get`, `list`, `ready`, and `snapshot` pull methods.
 
@@ -149,16 +149,33 @@ pub struct MobStructuralEventEnvelope {
 
 The projection uses `event_id: "mob-evt-{cursor}"`, preserves the upstream cursor and timestamp, maps the event kind to its snake-case name, and places the full serialized kind payload in `data`. Current kinds include `mob_created`, `member_spawned`, `flow_started`, `step_dispatched`, `members_wired`, and `supervisor_escalation`. The enum can grow, so clients should not depend on a fixed variant count.
 
+### Member creation facts
+
+The `member_spawned` structural payload includes `creation`, a
+`MemberCreationRecord` from the canonical Meerkat journal. Its `creation_id`
+is a runtime-issued token; its `provenance.kind` is `root`, `spawn`, `fork`,
+`successor`, `unproven` or `legacy_unknown`. Spawn provenance records the exact
+source session and member binding. Fork provenance refers to the event's
+existing `fork_source` endpoint instead of introducing a second endpoint.
+
+Older journals that omit `creation` deserialize with `creation_id: null` and
+`provenance.kind: "legacy_unknown"`. Projection never fabricates a token or
+turns missing ancestry into a proven root. New creations whose ancestry cannot
+be proved use `unproven` with a new token; ordinary execution can still proceed.
+These facts establish runtime ancestry and contain no tool policy. Resource
+ACLs and current native policy remain separate checks. See Meerkat's
+[member creation contract](https://docs.rkat.ai/reference/session-contracts#member-creation-provenance-and-host-activation).
+
 ### Cursor persistence and replay
 
 The structural subscriber reads from `MobEventsView`. With a saved cursor it uses `subscribe_after(cursor)`; without one it starts from the latest cursor. It writes the last projected cursor to `PersistentMetadataStore` after projection.
 
 Cursor persistence is not event persistence:
 
-- If a persistent-state path is configured and no explicit metadata store is supplied, MobKit creates `<path>/mobkit_metadata.sqlite3` for projection metadata.
+- If a persistent-state path is configured and no explicit metadata store is supplied, Meta creates `<path>/meta_metadata.sqlite3` for projection metadata.
 - That metadata stores the resume cursor, not the mob-event ledger.
 - `.persistent_state(path)` by itself keeps Mob storage in memory.
-- Replaying events written while MobKit was down requires an upstream Meerkat mob-event store that retained those events.
+- Replaying events written while Meta was down requires an upstream Meerkat mob-event store that retained those events.
 
 If a saved cursor is stale for the available ledger, the subscriber falls back to the latest cursor.
 
@@ -166,9 +183,9 @@ If a saved cursor is stale for the available ledger, the subscriber falls back t
 
 | Surface | Purpose |
 |---------|---------|
-| `mobkit/mob_events/query` JSON-RPC | Query a structural snapshot or batch |
-| `mobkit/mob_events/subscribe` JSON-RPC | Create a subscription and receive its SSE URL |
-| `GET /mobkit/mob_events/stream` SSE | Tail structural events with cursor and filter resume |
+| `meta/mob_events/query` JSON-RPC | Query a structural snapshot or batch |
+| `meta/mob_events/subscribe` JSON-RPC | Create a subscription and receive its SSE URL |
+| `GET /meta/mob_events/stream` SSE | Tail structural events with cursor and filter resume |
 
 See [SSE API](/mobkit/api/sse) for stream parameters and [JSON-RPC API](/mobkit/api/rpc) for request and response shapes.
 
@@ -184,7 +201,7 @@ See [SSE API](/mobkit/api/sse) for stream parameters and [JSON-RPC API](/mobkit/
 | `ShutdownRequested` | Runtime shutdown began |
 | `ShutdownComplete` | Runtime shutdown completed |
 
-Each `LifecycleEvent` contains a monotonic `seq` and one `stage`. Read the retained entries through `MobkitRuntimeHandle::lifecycle_events()`. `ModulesStarted` is not proof that every module is healthy; inspect `SupervisorReport` for module transitions.
+Each `LifecycleEvent` contains a monotonic `seq` and one `stage`. Read the retained entries through `MetaRuntimeHandle::lifecycle_events()`. `ModulesStarted` is not proof that every module is healthy; inspect `SupervisorReport` for module transitions.
 
 ## See also
 
