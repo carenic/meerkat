@@ -39,8 +39,9 @@ OpenAI account, explicitly select `gpt-5.5` or set a compatible binding
 the free tier, select `gemini-3.8-flash` explicitly (`--model
 gemini-3.8-flash`) or keep it as the Gemini default with
 `[models] gemini = "gemini-3.8-flash"` in config.
-Catalog-default changes alone do not migrate arbitrary configured models or
-binding defaults. The CLI has a separate, narrow built-in OAuth repair.
+Catalog-default changes alone do not rewrite configured models, binding
+defaults, or the model an existing session recorded (a resumed session keeps
+its recorded model). The CLI has a separate, narrow built-in OAuth repair.
 </Warning>
 
 During interactive login, or read preparation when a matching stored token
