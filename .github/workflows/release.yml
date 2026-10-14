@@ -1496,6 +1496,11 @@ jobs:
         env:
           VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
           CARGO_INCREMENTAL: "0"
+          # Serialize memory-heavy wasm32 compilations. Local capped
+          # comparisons OOM-killed at jobs 4 and 2; with jobs 1, the Cargo
+          # phase completed under a 13 GiB limit. This controls Cargo
+          # concurrency, not a total memory cap or wasm-opt's parallelism.
+          CARGO_BUILD_JOBS: "1"
         run: scripts/release-build-web-sdk-package.sh "${GITHUB_WORKSPACE}/web-sdk-package"
 
       - name: Upload Web SDK package
