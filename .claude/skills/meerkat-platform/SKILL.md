@@ -59,6 +59,73 @@ rkat-rest --state-root /srv/meerkat/realms --realm team-alpha
 rkat-mcp --state-root /srv/meerkat/realms --realm team-alpha
 ```
 
+## OS sandboxing (execution confinement)
+
+Realms isolate state, not processes. OS-level sandboxing is a separate,
+host-installed boundary: since 0.9, Meerkat can run the local processes it
+launches under OS confinement. It covers shell tool commands (foreground,
+background jobs and their recovered monitors), command hooks, and stdio MCP
+servers. It is opt-in by the embedding host; the default `TrustedHost`
+profile is no OS sandbox.
+
+- **Requirement.** `meerkat_core::confinement::ExecutionConfinement`, validated
+  from a `ConfinementSpec`: `baseline` (`command_runtime_v1`: executable
+  loaders, system libraries, CPU/OS queries, null and random devices; no home,
+  scratch, network or credential grant), `read` and `write` (`unrestricted`,
+  or `paths` of absolute `literal`/`subtree` entries), `deny_read` and
+  `deny_write` (exclusions beat every grant, the baseline included), `network`
+  (`denied`, `unrestricted`, or exact `connect` endpoints), `unix_connect`
+  (socket paths) and `require_descendant_termination`. Relative paths, `.` or
+  `..` components, NUL bytes, and `connect` endpoints with port 0 or an
+  unspecified address are invalid.
+- **Enable it (Rust host, on `AgentFactory`):**
+  - shell tools: `.with_shell_confinement(ShellConfinement::Required { requirement })`
+    (`meerkat_tools::builtin::shell::ShellConfinement`; default `TrustedHost`);
+  - command hooks: `.with_command_hook_confinement(requirement, absolute_working_directory)`.
+    Hook commands then need an absolute program path, and an opaque
+    `hook_engine_override` is rejected;
+  - stdio MCP servers: `.with_mcp_stdio_launch_profile(McpStdioLaunchProfile::required(requirement, absolute_working_directory))`;
+    confined servers get a null stderr. Remote (HTTP/SSE) MCP servers are not
+    OS-confined; `.with_mcp_http_egress_profile(HttpEgressProfile::required(policy))`
+    is their separate destination boundary.
+  A worked requirement is in `docs/rust/native-authorization.mdx`.
+- **Backends (`meerkat-sandbox`).** macOS: `MacOsSeatbeltV1`,
+  `/usr/bin/sandbox-exec` with a generated Seatbelt profile. Linux:
+  `LinuxNamespaceSeccompV1`, unprivileged user, mount and IPC namespaces with a
+  private mount view (chroot; no host `/proc`, `/sys`, home or scratch),
+  no_new_privs, all capabilities dropped, and a seccomp filter (x86_64 and
+  aarch64). Windows and other platforms have no backend: every required
+  launch is refused.
+- **Refuse, never fall back.** A `Required` requirement is enforced completely
+  or the launch is refused before the command runs. `ConfinementRefusal`
+  causes: `invalid_requirement`, `invalid_launch`, `unsupported_requirement`,
+  `backend_unavailable`, `preparation_failed`. A refused shell call returns
+  `confinement_refused` tool feedback and the run continues; a refused
+  `pre_tool_execution` hook blocks only its tool; a refused mandatory
+  model-request hook withholds only that model operation.
+- **Environment.** Confined launches get only their explicit environment;
+  nothing is inherited from the host. Loader and startup injection variables
+  (`LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `GLIBC_TUNABLES`, and so on) are
+  refused.
+- **Backend limits.** Both backends refuse `require_descendant_termination`
+  and exact `connect` endpoints, so `network` is effectively `denied` or
+  `unrestricted`. Linux also refuses `deny_read`/`deny_write`, `unix_connect`,
+  `unrestricted` filesystem access, grants at `/`, `/proc`, `/sys` or `/dev`,
+  overlapping or missing read roots, and write grants that are not also read
+  subtrees. It probes the kernel when compiling the requirement, so a host
+  without unprivileged user namespaces gets `backend_unavailable`. Linux
+  positive acceptance on an eligible host was still open at the 0.9.0 release.
+- **Stock surfaces.** `rkat`, `rkat-rpc`, `rkat-rest` and `rkat-mcp` install no
+  `Required` profile, and no config key or CLI flag selects one: their shell
+  tool, command hooks and stdio MCP servers run as trusted host processes. The
+  shell's working-directory check (`restrict_to_project`), tool presets
+  (`--tools none` included), realm isolation and governed-realm grants are not
+  an OS sandbox.
+- **Not authorization.** Confinement limits what an already-authorized process
+  can touch. It grants no permission and replaces neither grants nor review,
+  and it does not make model output confidential. Run untrusted native code
+  outside the trusted host process.
+
 ## Storage architecture (0.8.4+)
 
 One `StorageLayout` path authority is resolved at bootstrap and carried through
@@ -1255,7 +1322,7 @@ Prompts and tool results support multimodal content (text, images, and video). T
 
 **Video support:** Inline video is Gemini-only. Supported media types: `video/mp4`, `video/webm`, `video/quicktime`. Non-Gemini providers degrade replayed video to `[video: media_type]` text placeholders. Video in tool results is rejected at all providers. Ingress validation rejects video input for non-Gemini models at RPC, REST, and session boundaries.
 
-**view_image builtin tool:** Reads images from disk (PNG/JPEG/GIF/WebP/SVG), returns base64 `ContentBlock::Image`. Path sandboxed to project root. 5 MB limit. Hidden on non-vision-capable models via `ToolScope` based on `ModelProfile.vision` and `ModelProfile.image_tool_results`.
+**view_image builtin tool:** Reads images from disk (PNG/JPEG/GIF/WebP/SVG), returns base64 `ContentBlock::Image`. Paths are restricted to the project root (a path check, not an OS sandbox). 5 MB limit. Hidden on non-vision-capable models via `ToolScope` based on `ModelProfile.vision` and `ModelProfile.image_tool_results`.
 
 **generate_image builtin tool:** Session-owned assistant image generation. The model calls one stable tool with universal fields (`prompt`, `provider`, `model`, `size`, `quality`, `format`, `count`, reference/source images) plus provider-owned `provider_params`. These are Meerkat tool fields, not raw provider request JSON; for OpenAI, `format` lowers to provider-side `output_format`. Provider crates own image model profiles, advanced provider parameters, and backend selection. For normal OpenAI generate/edit requests, prefer top-level `intent` and omit hosted-tool-only `provider_params.action`. Generated images are stored in the blob store; user-facing surfaces fetch blob payload/bytes by blob id via `rkat blob get <BLOB-ID>`, JSON-RPC `blob/get`, or SDK `get_blob` / `getBlob`.
 

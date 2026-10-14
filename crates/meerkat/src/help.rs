@@ -21,6 +21,8 @@ pub const MEERKAT_PLATFORM_MOBS_REFERENCE: &str =
     include_str!("../embedded_skills/meerkat-platform/references/mobs.md");
 pub const MEERKAT_PLATFORM_MIGRATION_REFERENCE: &str =
     include_str!("../embedded_skills/meerkat-platform/references/migration_0_5.md");
+pub const MEERKAT_PLATFORM_MIGRATION_0_9_REFERENCE: &str =
+    include_str!("../embedded_skills/meerkat-platform/references/migration_0_9.md");
 
 pub const MEERKAT_PLATFORM_SKILL_EXTENSIONS: &[(&str, &str)] = &[
     (
@@ -28,6 +30,10 @@ pub const MEERKAT_PLATFORM_SKILL_EXTENSIONS: &[(&str, &str)] = &[
         MEERKAT_PLATFORM_API_REFERENCE,
     ),
     ("references/mobs.md", MEERKAT_PLATFORM_MOBS_REFERENCE),
+    (
+        "references/migration_0_9.md",
+        MEERKAT_PLATFORM_MIGRATION_0_9_REFERENCE,
+    ),
     (
         "references/migration_0_5.md",
         MEERKAT_PLATFORM_MIGRATION_REFERENCE,
@@ -166,10 +172,65 @@ mod tests {
         assert!(MEERKAT_PLATFORM_SKILL_BODY.contains("Meerkat Platform Guide"));
         assert!(MEERKAT_CLI_REFERENCE_SKILL_BODY.contains("Meerkat CLI Reference"));
         assert!(MEERKAT_PLATFORM_API_REFERENCE.contains("JSON-RPC"));
+        assert!(MEERKAT_PLATFORM_MIGRATION_0_9_REFERENCE.contains("0.8 -> 0.9 Migration"));
+        for reference in [
+            "references/api_reference.md",
+            "references/mobs.md",
+            "references/migration_0_9.md",
+            "references/migration_0_5.md",
+        ] {
+            assert!(
+                MEERKAT_PLATFORM_SKILL_EXTENSIONS
+                    .iter()
+                    .any(|(path, _)| *path == reference),
+                "the platform skill must embed {reference}"
+            );
+            assert!(
+                MEERKAT_PLATFORM_SKILL_BODY.contains(&format!("`{reference}`")),
+                "the platform skill must point at its embedded {reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn platform_skill_answers_os_sandboxing_within_the_default_injection_window() {
+        let heading = "## OS sandboxing (execution confinement)";
+        let start = MEERKAT_PLATFORM_SKILL_BODY
+            .find(heading)
+            .expect("the platform skill must document OS sandboxing");
+        let section = &MEERKAT_PLATFORM_SKILL_BODY[start..];
+        let end = start
+            + section[heading.len()..]
+                .find("\n## ")
+                .map_or(section.len(), |offset| heading.len() + offset);
+        // Surfaces that preload the skill at the default per-skill injection
+        // limit see only its head; the sandboxing answer must sit inside it.
+        // 256 bytes leave room for the rendered <skill> wrapper.
+        let window = meerkat_core::skills_config::SkillsConfig::default().max_injection_bytes - 256;
         assert!(
-            MEERKAT_PLATFORM_SKILL_EXTENSIONS
-                .iter()
-                .any(|(path, _)| *path == "references/api_reference.md")
+            end <= window,
+            "the OS sandboxing section ends at byte {end}, past the default injection window {window}"
+        );
+        let section = &MEERKAT_PLATFORM_SKILL_BODY[start..end];
+        for fact in [
+            "ExecutionConfinement",
+            "with_shell_confinement",
+            "with_command_hook_confinement",
+            "with_mcp_stdio_launch_profile",
+            "MacOsSeatbeltV1",
+            "LinuxNamespaceSeccompV1",
+            "TrustedHost",
+            "confinement_refused",
+            "Windows",
+        ] {
+            assert!(
+                section.contains(fact),
+                "the OS sandboxing section must state {fact}"
+            );
+        }
+        assert!(
+            MEERKAT_CLI_REFERENCE_SKILL_BODY.contains("There is no sandbox or confinement flag"),
+            "the CLI reference must state that no rkat flag selects OS sandboxing"
         );
     }
 

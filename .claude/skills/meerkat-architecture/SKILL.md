@@ -471,8 +471,11 @@ Since 0.8.52 (the 0.9.0 release):
   mechanical launch requirements; `meerkat-sandbox` lowers them to the OS
   (Linux, macOS Seatbelt) for an exact native spawn (`ProcessLaunchSpec`) or
   refuses (`ConfinementRefusal`). Shell tools, MCP stdio servers, and command
-  hooks spawn through it; authorization and process-group containment stay
-  with their existing owners.
+  hooks spawn through it when the host selects a `Required` profile
+  (`AgentFactory::with_shell_confinement`, `with_mcp_stdio_launch_profile`,
+  `with_command_hook_confinement`); the default `TrustedHost` profile is
+  unconfined, and no stock surface selects `Required`. Authorization and
+  process-group containment stay with their existing owners.
 - **MCP host controls.** Per-server access ceilings (`McpServerAccess`),
   checked MCP routes (`ToolOperationTarget::CheckedMcpServerOperation`,
   `GrantTarget::CheckedMcpRoute`), realm service secrets for stdio servers

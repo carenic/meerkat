@@ -27,6 +27,12 @@ spelling, singular/plural forms, flags, and enum values matter.
   `schedule/*`.
 - There is no `rkat mcp reload` CLI command.
 - There is no `--tools all`; valid values are `safe`, `workspace`, `full`, `none`.
+- There is no sandbox or confinement flag, and no config key turns on OS
+  sandboxing. Stock `rkat` runs shell commands, command hooks and stdio MCP
+  servers as trusted host processes; `--tools none`, the shell's
+  `restrict_to_project` check and `--isolated` are not OS sandboxes. OS
+  confinement (macOS Seatbelt, Linux namespaces plus seccomp) is installed by a
+  Rust embedding host; see the meerkat-platform skill.
 - `rkat blob get` has no `-o` or `--out`; use `--output <FILE>`.
 - `rkat session show` has no `--json` flag.
 - `rkat models` and `rkat capabilities` take no arguments (no `--json`/`--format`, no `rkat models catalog`) and already print pretty JSON.
