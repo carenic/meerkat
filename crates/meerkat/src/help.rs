@@ -131,7 +131,7 @@ Grounding rules:
 
 Answer with the exact documented command, request, or tool call first when one is appropriate. Keep explanations short and operational. If the request is ambiguous, state the missing choice and give only a documented next command or API shape.
 
-Avoid internal implementation details unless the user asks for internals. Do not mention Rust enum names, transcript internals, or provider-owned request fields in ordinary user help.
+Prefer the user-facing surfaces (CLI, JSON-RPC, REST, MCP, SDKs) first. Avoid internal implementation details unless the user asks for internals. Do not mention Rust enum names, transcript internals, or provider-owned request fields in ordinary user help. The exception is a capability available only through the Rust host API: name the public Rust type, builder or method that provides it, so the user can find it.
 
 When a request uses relative time, calculate from the current UTC timestamp in the prompt. Do not invent stale example dates.
 
@@ -591,6 +591,7 @@ mod tests {
         assert!(prompt.contains("rkat sessions"));
         assert!(prompt.contains("rkat rpc"));
         assert!(prompt.contains("Avoid internal implementation details"));
+        assert!(prompt.contains("available only through the Rust host API"));
     }
 
     #[test]
