@@ -992,6 +992,28 @@ if [[ "${meerkat_bazel_backend}" != "gcp-local" && -n "${buildbuddy_remote_url}"
     --remote_cache="${buildbuddy_remote_url}"
     --remote_executor="${buildbuddy_remote_url}"
   )
+  # A plaintext endpoint is refused below, before the client starts.
+  if [[ "${meerkat_bazel_backend}" == "gcp-buildbuddy" && "${buildbuddy_remote_url}" == grpcs://* ]]; then
+    # The self-hosted control plane serves TLS with a certificate from its
+    # own per-boot CA; trust exactly that CA (the tunnel step writes it).
+    if [[ -z "${BUILDBUDDY_TLS_CERTIFICATE:-}" || ! -f "${BUILDBUDDY_TLS_CERTIFICATE}" ]]; then
+      echo "error: BUILDBUDDY_TLS_CERTIFICATE must name the control plane's CA certificate file for gcp-buildbuddy (got '${BUILDBUDDY_TLS_CERTIFICATE:-}')" >&2
+      exit 1
+    fi
+    # Actions run in the action image pinned by digest, on executors of the
+    # caller's own org (user-owned executors on the control plane).
+    gcp_action_image="${MEERKAT_BUILDBUDDY_CI_IMAGE:-}"
+    gcp_action_image="${gcp_action_image#docker://}"
+    if ! [[ "${gcp_action_image}" =~ ^[A-Za-z0-9._/:-]+@sha256:[0-9a-f]{64}$ ]]; then
+      echo "error: MEERKAT_BUILDBUDDY_CI_IMAGE must pin the action image by digest (<repository>[:tag]@sha256:<64 hex>) for gcp-buildbuddy; got '${MEERKAT_BUILDBUDDY_CI_IMAGE:-}'" >&2
+      exit 1
+    fi
+    bb_args+=(
+      --tls_certificate="${BUILDBUDDY_TLS_CERTIFICATE}"
+      "--remote_exec_header=x-buildbuddy-platform.container-image=docker://${gcp_action_image}"
+      --remote_exec_header=x-buildbuddy-platform.use-self-hosted-executors=true
+    )
+  fi
 fi
 if [[ "${#apple_platform_args[@]}" -gt 0 ]]; then
   bb_args+=("${apple_platform_args[@]}")

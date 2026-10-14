@@ -4,12 +4,27 @@
 # `bb` are fakes on PATH that record their arguments; nothing here reaches
 # GCP, BuildBuddy or any other endpoint.
 #
-#   - scripts/buildbuddy-bazel-poc never sends the BuildBuddy API key to a
-#     non-TLS endpoint, however the endpoint is configured, and keeps the key
-#     out of argv.
-#   - scripts/gcp-buildbuddy-executor-pool sync-secrets writes only the
-#     endpoint secret: the executor key secret is never written from CI, so
-#     the BuildBuddy Cloud key cannot reach the executors.
+#   control plane (scripts/gcp-buildbuddy-control-plane)
+#     - the rendered config: no anonymous use, an auth provider, a secret
+#       JWT key, TLS, executor authorization, user-owned executors; the
+#       startup script installs exactly that config and its hash;
+#     - ensure creates only the deny rule, the IAP rule and the executor rule
+#       (no 0.0.0.0/0 allow, no static address, no network tag), and refuses,
+#       changing nothing, on the legacy rule (open or disabled), a disabled
+#       or drifted managed rule, a foreign rule opening the VM, a VM or data
+#       disk not made from this rendering, or an image without a digest;
+#       it never re-enables or edits a firewall rule;
+#     - verify, endpoint, tunnel and stop.
+#   executor pool (scripts/gcp-buildbuddy-executor-pool)
+#     - sync-secrets accepts only grpcs:// to a private IPv4 plus the CA and
+#       never writes the executor key; per-secret IAM; digest-pinned images;
+#       derived template names, refusing a drifted template or stale
+#       instances.
+#   Bazel wrapper (scripts/buildbuddy-bazel-poc)
+#     - never sends the API key to a non-TLS endpoint, keeps it out of argv,
+#       and for gcp-buildbuddy trusts the control plane CA and pins the
+#       action image by digest.
+#   workflow wiring (buildbuddy.yml and the lane batch action)
 
 set -euo pipefail
 
@@ -20,6 +35,7 @@ trap 'rm -rf "$TEST_ROOT"' EXIT
 FAKE_BIN="${TEST_ROOT}/bin"
 mkdir -p "${FAKE_BIN}"
 FAKE_API_KEY="fake-buildbuddy-api-key-0123456789"
+FAKE_CI_IMAGE="europe-west1-docker.pkg.dev/proj-test/meerkat-ci/meerkat-ci-rust:1.94.0@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 failures=0
 
 fail() {
@@ -33,12 +49,14 @@ pass() {
 
 # --- fake gcloud: answers from <state>/state.json, records every call (argv,
 # stdin for --data-file=-, the contents of --metadata-from-file files) to
-# <state>/calls.jsonl. Mutating verbs only record.
+# <state>/calls.jsonl. Mutating verbs only record. start-iap-tunnel accepts
+# one connection on its --local-host-port and exits.
 cat >"${FAKE_BIN}/gcloud" <<'PY'
 #!/usr/bin/env python3
 import json
 import os
 import re
+import socket
 import sys
 
 STATE_DIR = os.environ["FAKE_GCLOUD_STATE"]
@@ -65,7 +83,7 @@ while index < len(ARGV):
         positionals.append(token)
     index += 1
 
-record = {"argv": ARGV}
+record = {"argv": ARGV, "words": positionals}
 for spec in flags.get("metadata-from-file", []):
     for item in str(spec).split(","):
         key, _, path = item.partition("=")
@@ -133,13 +151,22 @@ elif words[:2] == ["compute", "instances"]:
         if instance is None:
             missing(f"instance {name}")
         prefix = (flag("query-path") or "").rstrip("/")
-        attributes = [
-            item for item in STATE.get("guest_attributes", {}).get(name, [])
-            if not prefix or item.get("namespace") == prefix.split("/")[0]
-        ]
-        emit(attributes)
+        emit([item for item in STATE.get("guest_attributes", {}).get(name, [])
+              if not prefix or item.get("namespace") == prefix.split("/")[0]])
     elif words[2] == "get-serial-port-output":
         print("fake serial port output")
+elif words[:2] == ["compute", "start-iap-tunnel"]:
+    host, _, port = (flag("local-host-port") or "").rpartition(":")
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((host, int(port)))
+    server.listen(1)
+    server.settimeout(30)
+    try:
+        server.accept()[0].close()
+    except OSError:
+        pass
+    server.close()
 elif words[:2] == ["compute", "disks"] and words[2] == "describe":
     disk = STATE.get("disks", {}).get(name)
     emit(disk) if disk is not None else missing(f"disk {name}")
@@ -189,31 +216,6 @@ echo "INFO: Elapsed time: 0.1s" >&2
 SH
 chmod +x "${FAKE_BIN}/bb"
 
-new_state() {
-  local dir="${TEST_ROOT}/gcloud-$1"
-  mkdir -p "${dir}"
-  printf '%s\n' "$2" >"${dir}/state.json"
-  : >"${dir}/calls.jsonl"
-  printf '%s\n' "${dir}"
-}
-
-# Prints one line per recorded gcloud call: the argv joined by spaces.
-calls() {
-  python3 -c 'import json,sys
-for line in open(sys.argv[1]):
-    print(" ".join(json.loads(line)["argv"]))' "$1/calls.jsonl"
-}
-
-# stdin bodies the fake received, one per line, as "secret-name<TAB>value".
-secret_writes() {
-  python3 -c 'import json,sys
-for line in open(sys.argv[1]):
-    call = json.loads(line)
-    if "stdin" in call:
-        words = [a for a in call["argv"] if not a.startswith("--")]
-        print(words[3] + "\t" + call["stdin"])' "$1/calls.jsonl"
-}
-
 # --- scripts/buildbuddy-bazel-poc -------------------------------------------
 
 # run_wrapper NAME [VAR=value ...] -- [wrapper args ...]
@@ -247,15 +249,15 @@ run_wrapper() {
 }
 
 expect_refused() {
-  local label="$1"
+  local label="$1" message="$2"
   if [[ "${wrapper_status}" -eq 0 ]]; then
-    fail "wrapper sent the API key to a non-TLS endpoint (${label})"
-  elif ! grep -q 'refusing to send the BuildBuddy API key to non-TLS endpoint' "${wrapper_work}/out"; then
+    fail "wrapper ran with ${label}"
+  elif ! grep -qF -- "${message}" "${wrapper_work}/out"; then
     fail "wrapper failed for another reason (${label}): $(tail -n 3 "${wrapper_work}/out")"
   elif [[ -e "${wrapper_work}/tmp/fake-bb.argv" ]]; then
     fail "wrapper started the client before refusing (${label})"
   else
-    pass "wrapper refuses the API key for ${label}"
+    pass "wrapper refuses ${label}"
   fi
 }
 
@@ -282,58 +284,621 @@ expect_ran() {
   fi
 }
 
-run_wrapper gcp-plaintext MEERKAT_BAZEL_BACKEND=gcp-buildbuddy BUILDBUDDY_BAZEL_CONFIG=buildbuddy-linux-gcp-ci-rbe \
-  BUILDBUDDY_GRPC_URL=grpc://10.20.30.40:1985 --
-expect_refused "a plaintext grpc:// self-hosted endpoint"
+NON_TLS="refusing to send the BuildBuddy API key to non-TLS endpoint"
+GCP=(MEERKAT_BAZEL_BACKEND=gcp-buildbuddy BUILDBUDDY_BAZEL_CONFIG=buildbuddy-linux-gcp-ci-rbe)
+printf '%s\n' "-----BEGIN CERTIFICATE-----" "fake" "-----END CERTIFICATE-----" >"${TEST_ROOT}/control-ca.pem"
 
-run_wrapper gcp-http MEERKAT_BAZEL_BACKEND=gcp-buildbuddy BUILDBUDDY_BAZEL_CONFIG=buildbuddy-linux-gcp-ci-rbe \
-  BUILDBUDDY_ENDPOINT=http://10.20.30.40:8080 --
-expect_refused "an http:// endpoint (normalized to grpc://)"
+run_wrapper gcp-plaintext "${GCP[@]}" BUILDBUDDY_GRPC_URL=grpc://10.20.30.40:1985 --
+expect_refused "the API key for a plaintext grpc:// self-hosted endpoint" "${NON_TLS}"
+
+run_wrapper gcp-http "${GCP[@]}" BUILDBUDDY_ENDPOINT=http://10.20.30.40:8080 --
+expect_refused "the API key for an http:// endpoint (normalized to grpc://)" "${NON_TLS}"
 
 run_wrapper flag-plaintext -- --remote_cache=grpc://cache.example.invalid:9092
-expect_refused "an explicit --remote_cache=grpc:// flag"
+expect_refused "the API key for an explicit --remote_cache=grpc:// flag" "${NON_TLS}"
 
 run_wrapper flag-split -- --bes_backend grpc://bes.example.invalid:1985
-expect_refused "an explicit two-token --bes_backend grpc:// flag"
+expect_refused "the API key for an explicit two-token --bes_backend grpc:// flag" "${NON_TLS}"
 
 run_wrapper hosted --
 expect_ran "the hosted default (grpcs:// from .bazelrc)" "--config=buildbuddy"
 
-run_wrapper gcp-tls MEERKAT_BAZEL_BACKEND=gcp-buildbuddy BUILDBUDDY_BAZEL_CONFIG=buildbuddy-linux-gcp-ci-rbe \
-  BUILDBUDDY_GRPC_URL=grpcs://127.0.0.1:1986 BUILDBUDDY_HTTP_URL=https://localhost:8081 --
-expect_ran "a grpcs:// self-hosted endpoint" "--remote_cache=grpcs://127.0.0.1:1986" \
-  "--remote_executor=grpcs://127.0.0.1:1986" "--bes_backend=grpcs://127.0.0.1:1986"
+run_wrapper gcp-no-ca "${GCP[@]}" BUILDBUDDY_GRPC_URL=grpcs://127.0.0.1:1986 \
+  MEERKAT_BUILDBUDDY_CI_IMAGE="${FAKE_CI_IMAGE}" --
+expect_refused "gcp-buildbuddy without the control plane CA" "BUILDBUDDY_TLS_CERTIFICATE must name the control plane's CA"
 
-# --- scripts/gcp-buildbuddy-executor-pool sync-secrets ------------------------
+run_wrapper gcp-tag-image "${GCP[@]}" BUILDBUDDY_GRPC_URL=grpcs://127.0.0.1:1986 \
+  BUILDBUDDY_TLS_CERTIFICATE="${TEST_ROOT}/control-ca.pem" \
+  MEERKAT_BUILDBUDDY_CI_IMAGE=europe-west1-docker.pkg.dev/proj-test/meerkat-ci/meerkat-ci-rust:1.94.0 --
+expect_refused "gcp-buildbuddy with an action image tag without a digest" "MEERKAT_BUILDBUDDY_CI_IMAGE must pin the action image by digest"
 
-state="$(new_state sync-secrets '{"secrets": {"buildbuddy-endpoint": ["grpc://203.0.113.9:1985"], "buildbuddy-api-key": ["cloud-key-value"]}}')"
+run_wrapper gcp-tls "${GCP[@]}" BUILDBUDDY_GRPC_URL=grpcs://127.0.0.1:1986 BUILDBUDDY_HTTP_URL=https://localhost:8081 \
+  BUILDBUDDY_TLS_CERTIFICATE="${TEST_ROOT}/control-ca.pem" MEERKAT_BUILDBUDDY_CI_IMAGE="docker://${FAKE_CI_IMAGE}" --
+expect_ran "gcp-buildbuddy over its IAP tunnel" "--remote_cache=grpcs://127.0.0.1:1986" \
+  "--remote_executor=grpcs://127.0.0.1:1986" "--bes_backend=grpcs://127.0.0.1:1986" \
+  "--tls_certificate=${TEST_ROOT}/control-ca.pem" \
+  "--remote_exec_header=x-buildbuddy-platform.container-image=docker://${FAKE_CI_IMAGE}" \
+  "--remote_exec_header=x-buildbuddy-platform.use-self-hosted-executors=true"
+
+# --- control plane and executor pool scenarios --------------------------------
+
+cat >"${TEST_ROOT}/scenarios.py" <<'PY'
+import base64
+import datetime
+import hashlib
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+
+REPO, FAKE_BIN, ROOT = sys.argv[1:4]
+CONTROL = os.path.join(REPO, "scripts", "gcp-buildbuddy-control-plane")
+POOL = os.path.join(REPO, "scripts", "gcp-buildbuddy-executor-pool")
+PROJECT = "proj-test"
+CONTROL_SA = f"meerkat-bb-control@{PROJECT}.iam.gserviceaccount.com"
+EXECUTOR_SA = f"meerkat-bb-executor@{PROJECT}.iam.gserviceaccount.com"
+CONTROL_IMAGE = "buildbuddy.bbcr.io/public/buildbuddy-app-enterprise:enterprise-v2.265.0@sha256:" + "a" * 64
+EXECUTOR_IMAGE = "buildbuddy.bbcr.io/public/buildbuddy-executor-enterprise:enterprise-v2.265.0@sha256:" + "b" * 64
+CI_IMAGE = "europe-west1-docker.pkg.dev/proj-test/meerkat-ci/meerkat-ci-rust:1.94.0@sha256:" + "c" * 64
+CA_PEM = "-----BEGIN CERTIFICATE-----\nZmFrZSBjb250cm9sLXBsYW5lIENB\n-----END CERTIFICATE-----\n"
+CA_B64 = base64.b64encode(CA_PEM.encode()).decode()
+FAILURES = []
+ALL_CALLS = []
+COUNTER = [0]
+
+
+def fail(message):
+    FAILURES.append(message)
+    print(f"FAIL: {message}", file=sys.stderr)
+
+
+def ok(message):
+    print(f"ok: {message}")
+
+
+def run(script, args, state, **extra):
+    COUNTER[0] += 1
+    directory = os.path.join(ROOT, f"scenario-{COUNTER[0]}")
+    os.makedirs(directory)
+    with open(os.path.join(directory, "state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+    open(os.path.join(directory, "calls.jsonl"), "w").close()
+    env = {key: os.environ[key] for key in ("PATH", "HOME", "LANG") if key in os.environ}
+    env["PATH"] = FAKE_BIN + os.pathsep + env["PATH"]
+    env.update(FAKE_GCLOUD_STATE=directory, MEERKAT_GCP_PROJECT_ID=PROJECT,
+               MEERKAT_GCP_ZONE="europe-west1-b", TMPDIR=directory)
+    env.update({key: str(value) for key, value in extra.items()})
+    proc = subprocess.run([script] + args, env=env, capture_output=True, text=True, timeout=120)
+    with open(os.path.join(directory, "calls.jsonl"), encoding="utf-8") as handle:
+        calls = [json.loads(line) for line in handle]
+    ALL_CALLS.extend(calls)
+    return proc, calls
+
+
+def flag_values(call, name):
+    argv = call["argv"]
+    values = []
+    for index, token in enumerate(argv):
+        if token == f"--{name}" and index + 1 < len(argv):
+            values.append(argv[index + 1])
+        elif token.startswith(f"--{name}="):
+            values.append(token.split("=", 1)[1])
+    return values
+
+
+def flag(call, name):
+    values = flag_values(call, name)
+    return values[-1] if values else None
+
+
+def find(calls, *words):
+    return [call for call in calls if call["words"][:len(words)] == list(words)]
+
+
+MUTATING_VERBS = {"create", "update", "delete", "start", "stop", "resume", "resize",
+                  "add-iam-policy-binding", "remove-iam-policy-binding", "set-instance-template"}
+
+
+def mutating(calls):
+    return [" ".join(call["argv"]) for call in calls
+            if MUTATING_VERBS & set(call["words"][:4]) or call["words"][:3] == ["secrets", "versions", "add"]]
+
+
+def rule(name, action="ALLOW", perms=(("tcp", ["22"]),), sources=None, source_sas=None,
+         target_sas=None, target_tags=None, priority=1000, disabled=False):
+    body = {
+        "name": name,
+        "network": f"https://www.googleapis.com/compute/v1/projects/{PROJECT}/global/networks/default",
+        "direction": "INGRESS",
+        "priority": priority,
+        "disabled": disabled,
+        ("allowed" if action == "ALLOW" else "denied"): [
+            dict({"IPProtocol": proto}, **({"ports": ports} if ports else {})) for proto, ports in perms
+        ],
+    }
+    for key, value in (("sourceRanges", sources), ("sourceServiceAccounts", source_sas),
+                       ("targetServiceAccounts", target_sas), ("targetTags", target_tags)):
+        if value:
+            body[key] = value
+    return body
+
+
+DENY = rule("meerkat-bb-control-deny-ingress", action="DENY", perms=(("all", None),),
+            sources=["0.0.0.0/0"], target_sas=[CONTROL_SA], priority=1000)
+IAP = rule("meerkat-bb-control-allow-iap", perms=(("tcp", ["22", "1986", "8081"]),),
+           sources=["35.235.240.0/20"], target_sas=[CONTROL_SA], priority=900)
+EXECUTORS = rule("meerkat-bb-control-allow-executors", perms=(("tcp", ["1986"]),),
+                 source_sas=[EXECUTOR_SA], target_sas=[CONTROL_SA], priority=900)
+MANAGED = [DENY, IAP, EXECUTORS]
+DEFAULTS = [
+    rule("default-allow-ssh", perms=(("tcp", ["22"]),), sources=["0.0.0.0/0"], priority=65534),
+    rule("default-allow-internal", perms=(("tcp", ["0-65535"]), ("udp", ["0-65535"]), ("icmp", None)),
+         sources=["10.128.0.0/9"], priority=65534),
+]
+LEGACY = rule("meerkat-bb-control-grpc-http", perms=(("tcp", ["8080", "1985"]),),
+              sources=["0.0.0.0/0"], target_tags=["meerkat-bb-control"])
+DISK_OK = {"name": "meerkat-bb-control-data",
+           "labels": {"purpose": "buildbuddy-control", "repo": "meerkat", "bb-baseline": "hardened-v1"}}
+LAST_START = "2026-10-14T10:00:00.000-07:00"
+LAST_START_EPOCH = int(datetime.datetime.fromisoformat(LAST_START).timestamp())
+
+
+def instance(script, status="TERMINATED", account=CONTROL_SA, ip="10.132.0.7", guest="TRUE"):
+    return {
+        "name": "meerkat-bb-control", "status": status, "lastStartTimestamp": LAST_START,
+        "serviceAccounts": [{"email": account}],
+        "networkInterfaces": [{"networkIP": ip, "accessConfigs": [{"natIP": "34.1.2.3"}]}],
+        "metadata": {"items": [{"key": "startup-script", "value": script},
+                               {"key": "enable-guest-attributes", "value": guest}]},
+    }
+
+
+def attributes(ready="ok", config=None, booted=LAST_START_EPOCH + 5, ca=CA_B64):
+    values = {"ready": ready, "config-sha256": config, "boot-started": str(booted), "tls-ca": ca}
+    return [{"namespace": "meerkat", "key": key, "value": value} for key, value in values.items() if value is not None]
+
+
+CONTROL_ENV = {"MEERKAT_GCP_BUILDBUDDY_CONTROL_IMAGE": CONTROL_IMAGE}
+
+# --- rendering ---------------------------------------------------------------
+
+proc, _ = run(CONTROL, ["render-config"], {})
+config = proc.stdout
+want_lines = [
+    '  build_buddy_url: "https://localhost:8081"',
+    "  enable_anonymous_usage: false",
+    "  enable_self_auth: true",
+    '  jwt_key: "${BB_AUTH_JWT_KEY}"',
+    "  enable_ssl: true",
+    "  enable_remote_exec: true",
+    "  enable_user_owned_executors: true",
+    "  require_executor_authorization: true",
+]
+missing_lines = [line for line in want_lines if line not in config.splitlines()]
+plaintext = [line for line in config.splitlines() if re.search(r"\b(grpc|http)://", line)]
+if proc.returncode != 0 or missing_lines or plaintext or "enable_anonymous_usage: true" in config:
+    fail(f"rendered config: missing {missing_lines}, plaintext {plaintext}")
+else:
+    ok("rendered config: no anonymous use, self auth, per-boot JWT key, TLS, executor authorization")
+proc, _ = run(CONTROL, ["config-sha256"], {})
+config_sha = proc.stdout.strip()
+if config_sha != hashlib.sha256(config.encode()).hexdigest():
+    fail("config-sha256 is not the sha256 of render-config")
+proc_a, _ = run(CONTROL, ["render-config"], {})
+if proc_a.stdout != config:
+    fail("render-config is not deterministic")
+
+for image in ("", "buildbuddy.bbcr.io/public/buildbuddy-app-enterprise:latest",
+              "buildbuddy.bbcr.io/public/buildbuddy-app-enterprise:enterprise-v2.265.0"):
+    proc, calls = run(CONTROL, ["render-startup-script"], {}, MEERKAT_GCP_BUILDBUDDY_CONTROL_IMAGE=image)
+    if proc.returncode == 0 or "pin the BuildBuddy app image by digest" not in proc.stderr:
+        fail(f"render-startup-script accepted the unpinned image {image!r}")
+proc, calls = run(CONTROL, ["ensure"], {"firewall_rules": DEFAULTS})
+if proc.returncode == 0 or calls:
+    fail(f"ensure without a pinned image ran gcloud: {[' '.join(c['argv']) for c in calls]}")
+else:
+    ok("an app image without a digest is refused before any gcloud call")
+
+proc, _ = run(CONTROL, ["render-startup-script"], {}, **CONTROL_ENV)
+STARTUP = proc.stdout
+lines = STARTUP.splitlines()
+try:
+    begin = lines.index("cat >/etc/buildbuddy/config.yaml <<'BUILDBUDDY_CONFIG'")
+    end = lines.index("BUILDBUDDY_CONFIG", begin + 1)
+    installed = "\n".join(lines[begin + 1:end]) + "\n"
+except ValueError:
+    installed = None
+checks = {
+    "pins the image by digest": f'IMAGE="{CONTROL_IMAGE}"' in lines,
+    "embeds the config hash": f'CONFIG_SHA256="{config_sha}"' in lines,
+    "installs exactly the rendered config": installed == config,
+    "refuses a differing installed config": "config-mismatch" in STARTUP,
+    "signs a per-boot certificate for the tunnel and internal IP": "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:${internal_ip}" in STARTUP,
+    "destroys the CA key": 'rm -f "${tls}/ca.key"' in STARTUP,
+    "checks readiness over TLS with the CA": '--cacert "${tls}/ca.crt" "https://127.0.0.1:${HTTPS_PORT}/readyz"' in STARTUP,
+    "reports the config hash and CA": "report config-sha256" in STARTUP and "report tls-ca" in STARTUP,
+    "generates a per-boot JWT key": "BB_AUTH_JWT_KEY=" in STARTUP and "/dev/urandom" in STARTUP,
+}
+broken = [name for name, good in checks.items() if not good]
+if broken:
+    fail(f"startup script: {broken}")
+else:
+    ok("startup script installs the rendered config byte for byte and serves per-boot TLS")
+
+# Run the startup script's TLS block itself when openssl is present.
+first = next((i for i, l in enumerate(lines) if l.startswith('internal_ip="$(metadata')), None)
+last = next((i for i, l in enumerate(lines) if l.startswith("cat /etc/ssl/certs/ca-certificates.crt")), None)
+if first is None or last is None:
+    fail("startup script has no per-boot TLS block")
+elif subprocess.run(["sh", "-c", "command -v openssl"], capture_output=True).returncode == 0:
+    state = os.path.join(ROOT, "tls-run")
+    block = "\n".join(lines[first:last]).replace("state=/run/meerkat-bb-control", f"state={state}")
+    script = "set -euo pipefail\nmetadata() { echo 10.132.0.7; }\n" + block + "\n"
+    proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    tls = os.path.join(state, "tls")
+    verified = proc.returncode == 0 and all(
+        subprocess.run(["openssl", "verify", "-CAfile", os.path.join(tls, "ca.crt"), *opt,
+                        os.path.join(tls, "server.crt")], capture_output=True).returncode == 0
+        for opt in (["-verify_ip", "127.0.0.1"], ["-verify_ip", "10.132.0.7"], ["-verify_hostname", "localhost"]))
+    wrong = subprocess.run(["openssl", "verify", "-CAfile", os.path.join(tls, "ca.crt"), "-verify_ip",
+                            "34.1.2.3", os.path.join(tls, "server.crt")], capture_output=True).returncode
+    if not verified or wrong == 0 or os.path.exists(os.path.join(tls, "ca.key")):
+        fail(f"per-boot TLS block: verified={verified}, foreign IP rejected={wrong != 0}, "
+             f"CA key destroyed={not os.path.exists(os.path.join(tls, 'ca.key'))}: {proc.stderr[-300:]}")
+    else:
+        ok("per-boot certificate verifies for 127.0.0.1, localhost and the internal IP only; CA key destroyed")
+
+# --- ensure: fresh project ------------------------------------------------------
+
+proc, calls = run(CONTROL, ["ensure"], {"firewall_rules": DEFAULTS}, **CONTROL_ENV)
+creates = find(calls, "compute", "firewall-rules", "create")
+names = [call["words"][3] for call in creates]
+expected_rules = {
+    "meerkat-bb-control-deny-ingress": {"action": "DENY", "rules": "all", "source-ranges": "0.0.0.0/0",
+                                        "priority": "1000", "direction": "INGRESS", "network": "default",
+                                        "target-service-accounts": CONTROL_SA},
+    "meerkat-bb-control-allow-iap": {"action": "ALLOW", "rules": "tcp:22,tcp:1986,tcp:8081",
+                                     "source-ranges": "35.235.240.0/20", "priority": "900",
+                                     "direction": "INGRESS", "network": "default",
+                                     "target-service-accounts": CONTROL_SA},
+    "meerkat-bb-control-allow-executors": {"action": "ALLOW", "rules": "tcp:1986",
+                                           "source-service-accounts": EXECUTOR_SA, "priority": "900",
+                                           "direction": "INGRESS", "network": "default",
+                                           "target-service-accounts": CONTROL_SA},
+}
+problems = []
+if proc.returncode != 0:
+    problems.append(f"exit {proc.returncode}: {proc.stderr[-400:]}")
+if names != list(expected_rules):
+    problems.append(f"firewall creates {names}, expected the deny rule first then {list(expected_rules)[1:]}")
+for call in creates:
+    want = expected_rules.get(call["words"][3], {})
+    for key, value in want.items():
+        if flag(call, key) != value:
+            problems.append(f"{call['words'][3]} --{key}={flag(call, key)!r}, expected {value!r}")
+    if flag_values(call, "allow") or flag_values(call, "target-tags"):
+        problems.append(f"{call['words'][3]} uses --allow or --target-tags")
+    if flag(call, "action") == "ALLOW" and "0.0.0.0/0" in " ".join(call["argv"]):
+        problems.append(f"{call['words'][3]} allows 0.0.0.0/0")
+    if call["words"][3] == "meerkat-bb-control-allow-executors" and flag_values(call, "source-ranges"):
+        problems.append("the executor rule also takes source ranges")
+disks = find(calls, "compute", "disks", "create")
+if len(disks) != 1 or "bb-baseline=hardened-v1" not in (flag(disks[0], "labels") or ""):
+    problems.append("the data disk is not created with the baseline label")
+created = find(calls, "compute", "instances", "create")
+if len(created) != 1:
+    problems.append("no instance create")
+else:
+    vm = created[0]
+    if flag_values(vm, "address") or flag_values(vm, "tags"):
+        problems.append("the VM gets a static address or network tags")
+    if flag(vm, "metadata") != "enable-guest-attributes=TRUE":
+        problems.append("the VM does not enable guest attributes")
+    if flag(vm, "service-account") != CONTROL_SA or flag(vm, "network") != "default":
+        problems.append("the VM service account or network differs")
+    if (vm.get("files") or {}).get("startup-script") != STARTUP:
+        problems.append("the VM startup script is not the rendered one")
+if find(calls, "compute", "addresses") or find(calls, "compute", "firewall-rules", "update"):
+    problems.append("ensure reserved an address or updated a firewall rule")
+if problems:
+    fail("ensure on a fresh project: " + "; ".join(problems))
+else:
+    ok("ensure creates the deny rule, then the IAP and executor rules, the baseline disk and a tagless VM with the rendered startup script")
+
+# --- ensure: refusals change nothing ----------------------------------------------
+
+drifted_iap = dict(IAP, sourceRanges=["0.0.0.0/0"])
+disabled_iap = dict(IAP, disabled=True)
+old_vm = instance("#!/usr/bin/env bash\necho pre-hardening control plane\n")
+unbaselined_disk = {"name": "meerkat-bb-control-data", "labels": {"purpose": "buildbuddy-control"}}
+refusals = [
+    ("the legacy rule open to 0.0.0.0/0", {"firewall_rules": DEFAULTS + MANAGED + [LEGACY]},
+     "legacy firewall rule meerkat-bb-control-grpc-http exists"),
+    ("the legacy rule disabled", {"firewall_rules": DEFAULTS + MANAGED + [dict(LEGACY, disabled=True)]},
+     "it is never reused or re-enabled"),
+    ("a disabled managed rule", {"firewall_rules": DEFAULTS + [DENY, disabled_iap, EXECUTORS]},
+     "a disabled rule is never re-enabled"),
+    ("a managed rule opened to 0.0.0.0/0", {"firewall_rules": DEFAULTS + [DENY, drifted_iap, EXECUTORS]},
+     "managed firewall rule meerkat-bb-control-allow-iap sourceRanges"),
+    ("a foreign rule opening the VM's service account",
+     {"firewall_rules": DEFAULTS + MANAGED + [rule("debug-open", perms=(("tcp", ["8081"]),), sources=["0.0.0.0/0"],
+                                                   target_sas=[CONTROL_SA])]},
+     "firewall rule debug-open admits 0.0.0.0/0 to the control plane"),
+    ("a foreign rule opening the legacy tag",
+     {"firewall_rules": DEFAULTS + MANAGED + [rule("old-tag-open", sources=["::/0"], target_tags=["meerkat-bb-control"],
+                                                   disabled=True)]},
+     "firewall rule old-tag-open admits ::/0 to the control plane"),
+    ("an open all-instance rule ahead of the deny rule",
+     {"firewall_rules": DEFAULTS + MANAGED + [rule("all-open", perms=(("tcp", None),), sources=["0.0.0.0/0"], priority=500)]},
+     "ahead of meerkat-bb-control-deny-ingress"),
+    ("a VM made from another startup script",
+     {"firewall_rules": DEFAULTS + MANAGED, "instances": {"meerkat-bb-control": old_vm}, "disks": {"meerkat-bb-control-data": DISK_OK}},
+     "runs a startup script"),
+    ("a data disk without the baseline label",
+     {"firewall_rules": DEFAULTS + MANAGED, "disks": {"meerkat-bb-control-data": unbaselined_disk}},
+     "lacks label bb-baseline=hardened-v1"),
+]
+for label, state, message in refusals:
+    proc, calls = run(CONTROL, ["ensure"], state, **CONTROL_ENV)
+    if proc.returncode == 0:
+        fail(f"ensure accepted {label}")
+    elif message not in proc.stderr or "nothing was changed" not in proc.stderr:
+        fail(f"ensure refused {label} without saying so: {proc.stderr[-400:]}")
+    elif mutating(calls):
+        fail(f"ensure changed something before refusing {label}: {mutating(calls)}")
+    else:
+        ok(f"ensure refuses {label} and changes nothing")
+
+# --- ensure: existing hardened resources -------------------------------------------
+
+benign = DEFAULTS + MANAGED + [rule("all-open-shadowed", perms=(("tcp", None),), sources=["0.0.0.0/0"], priority=1000)]
+proc, calls = run(CONTROL, ["ensure"], {"firewall_rules": benign,
+                                        "instances": {"meerkat-bb-control": instance(STARTUP)},
+                                        "disks": {"meerkat-bb-control-data": DISK_OK}}, **CONTROL_ENV)
+changes = mutating(calls)
+if proc.returncode != 0 or len(changes) != 1 or not changes[0].startswith("compute instances start meerkat-bb-control"):
+    fail(f"ensure on the hardened plane: exit {proc.returncode}, changes {changes}: {proc.stderr[-300:]}")
+else:
+    ok("ensure only starts a stopped VM made from the rendering (default rules and shadowed rules are fine)")
+proc, calls = run(CONTROL, ["ensure"], {"firewall_rules": MANAGED,
+                                        "instances": {"meerkat-bb-control": instance(STARTUP, status="RUNNING")},
+                                        "disks": {"meerkat-bb-control-data": DISK_OK}}, **CONTROL_ENV)
+if proc.returncode != 0 or mutating(calls):
+    fail(f"ensure on a running hardened plane changed {mutating(calls)}")
+
+# --- verify ---------------------------------------------------------------------------
+
+running = {"firewall_rules": MANAGED, "instances": {"meerkat-bb-control": instance(STARTUP, status="RUNNING")}}
+for label, attrs, args, good, message in (
+    ("the rendered config hash", attributes(config=config_sha), ["verify"], True, "verified meerkat-bb-control"),
+    ("another config hash", attributes(config="0" * 64), ["verify"], False, "reports config sha256 '" + "0" * 64),
+    ("a report from an earlier boot", attributes(config=config_sha, booted=LAST_START_EPOCH - 3600),
+     ["verify", "--wait", "0"], False, "did not report ready"),
+    ("a config mismatch", attributes(ready="config-mismatch", config=config_sha), ["verify"], False,
+     "reports ready=config-mismatch"),
+):
+    proc, _ = run(CONTROL, args, dict(running, guest_attributes={"meerkat-bb-control": attrs}), **CONTROL_ENV)
+    if (proc.returncode == 0) != good or message not in proc.stdout + proc.stderr:
+        fail(f"verify with {label}: exit {proc.returncode}: {(proc.stdout + proc.stderr)[-300:]}")
+    else:
+        ok(f"verify {'accepts' if good else 'rejects'} {label}")
+proc, _ = run(CONTROL, ["verify"], {"instances": {"meerkat-bb-control": old_vm},
+                                    "guest_attributes": {"meerkat-bb-control": attributes(config=config_sha)}}, **CONTROL_ENV)
+if proc.returncode == 0:
+    fail("verify accepted a VM made from another startup script")
+
+# --- endpoint, tunnel, stop --------------------------------------------------------------
+
+output = os.path.join(ROOT, "github-output")
+open(output, "w").close()
+proc, _ = run(CONTROL, ["endpoint", "github-output"],
+              dict(running, guest_attributes={"meerkat-bb-control": attributes(config=config_sha)}), GITHUB_OUTPUT=output)
+with open(output, encoding="utf-8") as handle:
+    published = handle.read()
+want = ("executor_grpc_url=grpcs://10.132.0.7:1986\ngrpc_url=grpcs://127.0.0.1:1986\n"
+        f"http_url=https://localhost:8081\ntls_ca_b64={CA_B64}\n")
+if proc.returncode != 0 or published != want or "34.1.2.3" in published + proc.stdout:
+    fail(f"endpoint github-output wrote {published!r}: {proc.stderr[-300:]}")
+else:
+    ok("endpoint publishes gRPCS to the internal IP and the tunnel, plus the CA, never the external IP")
+proc, _ = run(CONTROL, ["endpoint"], {"instances": {"meerkat-bb-control": instance(STARTUP, ip="34.5.6.7")}})
+if proc.returncode == 0:
+    fail("endpoint accepted a public address")
+
+probe = socket.socket()
+probe.bind(("127.0.0.1", 0))
+port = probe.getsockname()[1]
+probe.close()
+env_file = os.path.join(ROOT, "github-env")
+open(env_file, "w").close()
+proc, calls = run(CONTROL, ["tunnel"], {}, BUILDBUDDY_TLS_CA_B64=CA_B64, MEERKAT_GCP_BUILDBUDDY_TUNNEL_PORT=port,
+                  GITHUB_ENV=env_file, RUNNER_TEMP=ROOT)
+tunnels = find(calls, "compute", "start-iap-tunnel")
+ca_file = os.path.join(ROOT, "meerkat-bb-control-ca.pem")
+with open(env_file, encoding="utf-8") as handle:
+    exported = handle.read()
+if (proc.returncode != 0 or len(tunnels) != 1 or tunnels[0]["words"][2:4] != ["meerkat-bb-control", "1986"]
+        or flag(tunnels[0], "local-host-port") != f"127.0.0.1:{port}"
+        or exported != f"BUILDBUDDY_TLS_CERTIFICATE={ca_file}\n" or open(ca_file).read() != CA_PEM):
+    fail(f"tunnel: exit {proc.returncode}, calls {[c['argv'] for c in tunnels]}, exported {exported!r}: {proc.stderr[-300:]}")
+else:
+    ok("tunnel forwards 127.0.0.1 to the gRPCS port over IAP and exports the CA for Bazel")
+proc, _ = run(CONTROL, ["tunnel"], {})
+if proc.returncode == 0:
+    fail("tunnel ran without the control-plane CA")
+
+proc, calls = run(CONTROL, ["stop"], running, MEERKAT_GCP_BUILDBUDDY_WAIT_ON_DOWN="0")
+stops = find(calls, "compute", "instances", "stop")
+if proc.returncode != 0 or len(stops) != 1 or "--async" not in stops[0]["argv"]:
+    fail(f"stop: {[c['argv'] for c in stops]}")
+else:
+    ok("stop stops the VM (asynchronously in CI)")
+
+# --- never re-enable ----------------------------------------------------------------------
+
+source = open(CONTROL, encoding="utf-8").read()
+forbidden = [token for token in ("firewall-rules update", "--no-disabled", "disabled=false", "firewall-rules delete")
+             if token in source]
+updates = [" ".join(c["argv"]) for c in ALL_CALLS if c["words"][:3] == ["compute", "firewall-rules", "update"]
+           or c["words"][:3] == ["compute", "firewall-rules", "delete"]]
+if forbidden or updates:
+    fail(f"the control plane script can edit or re-enable firewall rules: {forbidden} {updates}")
+else:
+    ok("no scenario ever updates, re-enables or deletes a firewall rule")
+
+# --- executor pool ----------------------------------------------------------------------------
+
+POOL_ENV = {"MEERKAT_BUILDBUDDY_EXECUTOR_IMAGE": EXECUTOR_IMAGE, "MEERKAT_BUILDBUDDY_CI_IMAGE": CI_IMAGE}
+SECRETS_OK = {"meerkat-bb-executor-api-key": ["executor-key"], "meerkat-bb-control-endpoint": ["grpcs://10.132.0.7:1986"],
+              "meerkat-bb-control-ca": [CA_PEM]}
+
+
+def secret_writes(calls):
+    return [(call["words"][3], call.get("stdin")) for call in calls if "stdin" in call]
+
+
+proc, calls = run(POOL, ["sync-secrets"], {"secrets": {"buildbuddy-api-key": ["cloud-key-value"]}},
+                  BUILDBUDDY_GRPC_URL="grpcs://10.20.30.40:1986", BUILDBUDDY_TLS_CA_B64=CA_B64,
+                  BUILDBUDDY_API_KEY="cloud-key-value")
+writes = secret_writes(calls)
+if (proc.returncode != 0 or writes != [("meerkat-bb-control-endpoint", "grpcs://10.20.30.40:1986"),
+                                        ("meerkat-bb-control-ca", CA_PEM.rstrip("\n"))]
+        or any("api-key" in " ".join(c["argv"]) for c in calls)):
+    fail(f"sync-secrets wrote {writes}: {proc.stderr[-300:]}")
+else:
+    ok("sync-secrets writes the gRPCS endpoint and the CA, never an API key")
+for label, url, ca, message in (
+    ("a plaintext endpoint", "grpc://10.20.30.40:1985", CA_B64, "must be grpcs://<private IPv4>"),
+    ("a public endpoint", "grpcs://203.0.113.9:1986", CA_B64, "is not a private IPv4 address"),
+    ("a hostname endpoint", "grpcs://bb.example.invalid:1986", CA_B64, "must be grpcs://<private IPv4>"),
+    ("a missing CA", "grpcs://10.20.30.40:1986", "", "BUILDBUDDY_TLS_CA_B64"),
+):
+    proc, calls = run(POOL, ["sync-secrets"], {"secrets": {}}, BUILDBUDDY_GRPC_URL=url, BUILDBUDDY_TLS_CA_B64=ca)
+    if proc.returncode == 0 or secret_writes(calls) or message not in proc.stderr:
+        fail(f"sync-secrets did not refuse {label} as such: {proc.stderr[-200:]}")
+    else:
+        ok(f"sync-secrets refuses {label}")
+
+for label, env, message in (
+    ("an executor image without a digest",
+     dict(POOL_ENV, MEERKAT_BUILDBUDDY_EXECUTOR_IMAGE="buildbuddy.bbcr.io/public/buildbuddy-executor-enterprise:enterprise-v2.265.0"),
+     "MEERKAT_BUILDBUDDY_EXECUTOR_IMAGE must pin the executor image by digest"),
+    ("an action image without a digest",
+     dict(POOL_ENV, MEERKAT_BUILDBUDDY_CI_IMAGE="europe-west1-docker.pkg.dev/proj-test/meerkat-ci/meerkat-ci-rust:1.94.0"),
+     "MEERKAT_BUILDBUDDY_CI_IMAGE must pin the action image by digest"),
+):
+    proc, calls = run(POOL, ["ensure"], {"secrets": SECRETS_OK}, **env)
+    if proc.returncode == 0 or mutating(calls) or message not in proc.stderr:
+        fail(f"executor pool ensure did not refuse {label} as such: {proc.stderr[-200:]}")
+    else:
+        ok(f"executor pool ensure refuses {label}")
+
+policy = {"bindings": [{"role": "roles/secretmanager.secretAccessor", "members": [f"serviceAccount:{EXECUTOR_SA}"]}]}
+proc, calls = run(POOL, ["ensure"], {"secrets": SECRETS_OK, "project_iam_policy": policy}, MEERKAT_GCP_BUILDBUDDY_MANAGE_IAM="1", **POOL_ENV)
+problems = []
+granted = sorted(c["words"][2] for c in find(calls, "secrets", "add-iam-policy-binding")
+                 if flag(c, "role") == "roles/secretmanager.secretAccessor" and flag(c, "member") == f"serviceAccount:{EXECUTOR_SA}")
+if granted != sorted(SECRETS_OK):
+    problems.append(f"per-secret accessor on {granted}")
+if any(flag(c, "role") == "roles/secretmanager.secretAccessor" for c in find(calls, "projects", "add-iam-policy-binding")):
+    problems.append("a project-wide secretAccessor binding is added")
+removed = [c for c in find(calls, "projects", "remove-iam-policy-binding") if flag(c, "role") == "roles/secretmanager.secretAccessor"]
+if len(removed) != 1 or "--all" not in removed[0]["argv"]:
+    problems.append("the project-wide secretAccessor binding is not removed")
+templates = find(calls, "compute", "instance-templates", "create")
+template_name = templates[0]["words"][3] if templates else ""
+script = (templates[0].get("files") or {}).get("startup-script") or "" if templates else ""
+if not re.fullmatch(r"meerkat-bb-exec-template-[0-9a-f]{12}", template_name):
+    problems.append(f"template name {template_name!r} is not derived from its rendering")
+for needle in ('API_KEY_SECRET="meerkat-bb-executor-api-key"', 'ENDPOINT_SECRET="meerkat-bb-control-endpoint"',
+               'CA_SECRET="meerkat-bb-control-ca"', f'EXECUTOR_IMAGE="{EXECUTOR_IMAGE}"', f'CI_IMAGE="{CI_IMAGE}"',
+               'case "${app_target}" in\n  grpcs://*) ;;\n  *)\n    echo "Refusing a non-TLS BuildBuddy app target',
+               "SSL_CERT_FILE=/etc/buildbuddy/ca-bundle.pem", "umask 077"):
+    if needle not in script:
+        problems.append(f"executor startup script lacks {needle!r}")
+migs = find(calls, "compute", "instance-groups", "managed", "create")
+if len(migs) != 1 or flag(migs[0], "template") != template_name:
+    problems.append("the MIG is not created from the derived template")
+if proc.returncode != 0 or problems:
+    fail(f"executor pool ensure: exit {proc.returncode}: {problems}: {proc.stderr[-300:]}")
+else:
+    ok("executor pool ensure grants Secret Manager access per secret, drops the project-wide grant, and derives the template")
+
+drifted_template = {"properties": {"metadata": {"items": [{"key": "startup-script", "value": "#!/bin/bash\necho other\n"}]}}}
+proc, calls = run(POOL, ["ensure"], {"secrets": SECRETS_OK, "instance_templates": {template_name: drifted_template}}, **POOL_ENV)
+if proc.returncode == 0 or "exists with a different startup script" not in proc.stderr or mutating(calls):
+    fail(f"executor pool ensure reused a drifted template: {proc.stderr[-300:]}")
+else:
+    ok("executor pool ensure refuses a template of the derived name that differs")
+
+mig = {"name": "meerkat-bb-exec", "instanceTemplate": f"https://compute/projects/{PROJECT}/global/instanceTemplates/{template_name}"}
+stale = [{"instance": "https://compute/zones/z/instances/meerkat-bb-exec-abcd", "instanceStatus": "TERMINATED",
+          "version": {"instanceTemplate": "https://compute/global/instanceTemplates/meerkat-bb-exec-template-v4"}}]
+template_ok = {"properties": {"metadata": {"items": [{"key": "startup-script", "value": script}]}},
+               "selfLink": mig["instanceTemplate"]}
+proc, calls = run(POOL, ["up"], {"secrets": SECRETS_OK, "instance_templates": {template_name: template_ok},
+                                 "migs": {"meerkat-bb-exec": mig}, "mig_instances": {"meerkat-bb-exec": stale}}, **POOL_ENV)
+resized = [c for c in find(calls, "compute", "instance-groups", "managed", "update") if flag_values(c, "size")]
+if proc.returncode == 0 or "meerkat-bb-exec-template-v4" not in proc.stderr or resized:
+    fail(f"up started executors made from another template: {proc.stderr[-300:]}")
+else:
+    ok("up refuses while pool instances come from another template")
+
+proc, calls = run(POOL, ["ensure"], {"secrets": dict(SECRETS_OK, **{"meerkat-bb-executor-api-key": []})}, **POOL_ENV)
+if (proc.returncode == 0 or find(calls, "compute", "instance-templates", "create")
+        or "meerkat-bb-executor-api-key has no version" not in proc.stderr):
+    fail("executor pool ensure ran without an executor key")
+else:
+    ok("executor pool ensure refuses an executor key secret without a version")
+
+sys.exit(1 if FAILURES else 0)
+PY
+
 set +e
-FAKE_GCLOUD_STATE="${state}" PATH="${FAKE_BIN}:${PATH}" \
-  BUILDBUDDY_GRPC_URL=grpcs://10.20.30.40:1986 BUILDBUDDY_API_KEY=cloud-key-value \
-  "${REPO_ROOT}/scripts/gcp-buildbuddy-executor-pool" sync-secrets >"${state}/out" 2>&1
-sync_status=$?
+python3 "${TEST_ROOT}/scenarios.py" "${REPO_ROOT}" "${FAKE_BIN}" "${TEST_ROOT}"
+scenario_status=$?
 set -e
-if [[ "${sync_status}" -ne 0 ]]; then
-  fail "sync-secrets failed: $(tail -n 3 "${state}/out")"
-elif calls "${state}" | grep -q 'buildbuddy-api-key'; then
-  fail "sync-secrets touched the executor key secret: $(calls "${state}" | grep 'buildbuddy-api-key' | head -n 1)"
-elif secret_writes "${state}" | grep -qF 'cloud-key-value'; then
-  fail "sync-secrets wrote the API key value into Secret Manager"
-elif [[ "$(secret_writes "${state}")" != "$(printf 'buildbuddy-endpoint\tgrpcs://10.20.30.40:1986')" ]]; then
-  fail "sync-secrets wrote unexpected secrets: $(secret_writes "${state}")"
-else
-  pass "sync-secrets writes only the endpoint secret and never the executor key"
+if [[ "${scenario_status}" -ne 0 ]]; then
+  fail "control plane / executor pool scenarios (see FAIL lines above)"
 fi
 
-# --- .github/workflows/buildbuddy.yml uses its own key ------------------------
+# --- workflow wiring ------------------------------------------------------------------
 
 workflow="${REPO_ROOT}/.github/workflows/buildbuddy.yml"
+batch_action="${REPO_ROOT}/.github/actions/run-buildbuddy-ci-lane-batch/action.yml"
 if grep -q 'secrets\.BUILDBUDDY_API_KEY' "${workflow}"; then
   fail "buildbuddy.yml reads the BuildBuddy Cloud key (secrets.BUILDBUDDY_API_KEY)"
 elif ! grep -qF 'BUILDBUDDY_API_KEY: ${{ secrets.MEERKAT_GCP_BUILDBUDDY_API_KEY }}' "${workflow}"; then
   fail "buildbuddy.yml does not take its API key from secrets.MEERKAT_GCP_BUILDBUDDY_API_KEY"
 else
   pass "buildbuddy.yml uses the self-hosted key, never the BuildBuddy Cloud key"
+fi
+missing_wiring=()
+for needle in \
+  'run: scripts/test-gcp-buildbuddy-hardening.sh' \
+  'run: scripts/gcp-buildbuddy-control-plane ensure' \
+  'run: scripts/gcp-buildbuddy-control-plane verify --wait' \
+  'executor_grpc_url: ${{ steps.endpoint.outputs.executor_grpc_url }}' \
+  'tls_ca_b64: ${{ steps.endpoint.outputs.tls_ca_b64 }}' \
+  'BUILDBUDDY_GRPC_URL: ${{ needs.control-plane-up.outputs.executor_grpc_url }}' \
+  '  control-plane-down:' \
+  'run: scripts/gcp-buildbuddy-control-plane stop' \
+  '      - control-plane-down'; do
+  grep -qF -- "${needle}" "${workflow}" || missing_wiring+=("${needle}")
+done
+grep -qF 'run: scripts/gcp-buildbuddy-control-plane tunnel' "${batch_action}" || missing_wiring+=("the batch action opens the IAP tunnel")
+if [[ "$(grep -c 'BUILDBUDDY_TLS_CA_B64: ${{ needs.control-plane-up.outputs.tls_ca_b64 }}' "${workflow}")" -ne 11 ]]; then
+  missing_wiring+=("the CA reaches executors-up and all ten submitters")
+fi
+if grep -q '0\.0\.0\.0/0' "${workflow}" "${batch_action}"; then
+  missing_wiring+=("no 0.0.0.0/0 in the workflow")
+fi
+if [[ "${#missing_wiring[@]}" -gt 0 ]]; then
+  fail "buildbuddy.yml wiring lacks: ${missing_wiring[*]}"
+else
+  pass "buildbuddy.yml verifies the installed config, tunnels submitters, passes the CA and stops the control plane after use"
 fi
 
 if [[ "${failures}" -gt 0 ]]; then

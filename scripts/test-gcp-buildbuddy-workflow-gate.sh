@@ -426,7 +426,12 @@ def job_text(jobs, job):
 
 
 def touches_gcp(text):
-    return "google-github-actions/auth" in text or "scripts/gcp-buildbuddy-" in text
+    # Submitters authenticate and open their IAP tunnel inside the batch action.
+    return any(marker in text for marker in (
+        "google-github-actions/auth",
+        "scripts/gcp-buildbuddy-",
+        "uses: ./.github/actions/run-buildbuddy-ci-lane-batch",
+    ))
 
 
 # --- buildbuddy.yml -------------------------------------------------------
@@ -466,7 +471,7 @@ for gate in (False, True):
             ok("buildbuddy.yml called with the graph disabled fails its gate instead of passing")
     else:
         for job in ("control-plane-up", "executors-up", "prebuild-submit", "native-submit",
-                    "native-cargo-submit", "executors-down", "gate"):
+                    "native-cargo-submit", "executors-down", "control-plane-down", "gate"):
             if not ran(results, job):
                 fail(f"buildbuddy.yml with {GATE_VAR}=true no longer plans {job}")
         if fails_closed:
