@@ -352,6 +352,9 @@ impl Config {
         if other.agent.extraction_prompt.is_some() {
             self.agent.extraction_prompt = other.agent.extraction_prompt;
         }
+        if other.agent.budget_warning_threshold != AgentConfig::default().budget_warning_threshold {
+            self.agent.budget_warning_threshold = other.agent.budget_warning_threshold;
+        }
 
         // Storage config
         if other.storage.hosting.is_some() {
@@ -1016,6 +1019,13 @@ impl Config {
                 "agent.max_tokens_per_turn must be greater than 0 when set".to_string(),
             ));
         }
+        let threshold = self.agent.budget_warning_threshold;
+        if threshold.is_nan() || threshold <= 0.0 || threshold > 1.0 {
+            return Err(ConfigError::Validation(format!(
+                "agent.budget_warning_threshold must be greater than 0 and at most 1, got \
+                 {threshold}"
+            )));
+        }
         if self.budget.max_tokens == Some(0) {
             return Err(ConfigError::Validation(
                 "budget.max_tokens must be greater than 0 when set".to_string(),
@@ -1141,7 +1151,9 @@ pub struct AgentConfig {
     pub max_tokens_per_turn: Option<u32>,
     /// Temperature for sampling
     pub temperature: Option<f32>,
-    /// Warning threshold for budget (0.0-1.0)
+    /// Fraction of each budget limit (tokens, tool calls, time) at which the
+    /// agent emits one early `BudgetWarning`, before the limit is reached.
+    /// Must be in `(0, 1]`; `1.0` keeps only the warning at the limit.
     pub budget_warning_threshold: f32,
     /// Maximum turns before forced stop
     pub max_turns: Option<u32>,
@@ -1176,6 +1188,11 @@ pub struct AgentConfig {
     pub provider_native_tools: crate::ProviderNativeToolPolicy,
     /// Output schema for structured output extraction.
     ///
+    /// A per-build setting: the factory takes it from the build's
+    /// `output_schema`, never from a realm config, so `[agent] output_schema`
+    /// in a realm document applies to no session and loads with
+    /// [`ConfigWarning::UnappliedAgentOutputSchema`].
+    ///
     /// When set, every request shows the model the schema, and a final reply
     /// that already validates becomes the structured output. Otherwise the
     /// agent performs an extraction turn after completing the agentic work,
@@ -1191,7 +1208,8 @@ pub struct AgentConfig {
     ///
     /// When `output_schema` is set, this prompt is sent as a user message
     /// after the agentic loop to elicit schema-valid JSON. Defaults to a
-    /// built-in prompt if `None`.
+    /// built-in prompt if `None`. A realm's `[agent] extraction_prompt` sets
+    /// it for every agent the factory builds from that config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extraction_prompt: Option<String>,
 }
@@ -3023,6 +3041,10 @@ pub enum ConfigWarning {
     /// settings the table is no fallback policy and inherits the parent
     /// realm's explicit policy, off if there is none.
     LegacyModelFallbackCatalogChain,
+    /// `[agent] output_schema` in a realm document. A schema is a per-build
+    /// setting, so the realm value applies to no session; the document still
+    /// loads.
+    UnappliedAgentOutputSchema,
 }
 
 impl std::fmt::Display for ConfigWarning {
@@ -3044,6 +3066,12 @@ impl std::fmt::Display for ConfigWarning {
                  if there is none). To silence this warning, delete the key (or the whole \
                  [model_fallback] table), or add a reviewed [[model_fallback.chain]] target \
                  to enable fallback here",
+            ),
+            Self::UnappliedAgentOutputSchema => f.write_str(
+                "[agent] output_schema in a realm config applies to no session: structured \
+                 output is requested per run (rkat run --schema, output_schema on session \
+                 create or turn start, or AgentBuildConfig.output_schema). To silence this \
+                 warning, delete the key",
             ),
         }
     }
@@ -3177,6 +3205,9 @@ impl PersistedConfigDocument {
             mut removed_key_warnings,
         } = self;
         removed_key_warnings.extend(config.normalize_persisted());
+        if config.agent.output_schema.is_some() {
+            removed_key_warnings.push(ConfigWarning::UnappliedAgentOutputSchema);
+        }
         (config, removed_key_warnings)
     }
 
@@ -3744,6 +3775,55 @@ model = "custom-model"
             "extraction_prompt must survive merge when absent in later layer"
         );
         assert_eq!(base.agent.model, "custom-model");
+    }
+
+    #[test]
+    fn test_merge_budget_warning_threshold_survives_layering() {
+        let mut base = Config::default();
+        base.merge_toml_str("[agent]\nbudget_warning_threshold = 0.5\n")
+            .expect("merge toml");
+        assert_eq!(base.agent.budget_warning_threshold, 0.5);
+
+        base.merge_toml_str("[agent]\nmodel = \"custom-model\"\n")
+            .expect("merge toml2");
+        assert_eq!(
+            base.agent.budget_warning_threshold, 0.5,
+            "budget_warning_threshold must survive merge when absent in later layer"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_budget_warning_threshold_outside_unit_interval() {
+        for threshold in [0.0, -0.5, 1.5, f32::NAN] {
+            let mut config = Config::default();
+            config.agent.budget_warning_threshold = threshold;
+            let err = config
+                .validate(*crate::model_profile::test_catalog::TEST_CATALOG)
+                .expect_err("an out-of-range warning threshold should be invalid");
+            assert!(
+                err.to_string().contains("agent.budget_warning_threshold"),
+                "{threshold}: {err}"
+            );
+        }
+        let mut config = Config::default();
+        config.agent.budget_warning_threshold = 1.0;
+        config
+            .validate(*crate::model_profile::test_catalog::TEST_CATALOG)
+            .expect("1.0 keeps only the warning at the limit");
+    }
+
+    #[test]
+    fn test_realm_agent_output_schema_loads_with_an_unapplied_warning() {
+        let (config, warnings) =
+            Config::from_persisted_toml("[agent.output_schema]\ntype = \"object\"\n")
+                .expect("a realm output_schema still loads");
+        assert!(config.agent.output_schema.is_some());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.to_string().contains("[agent] output_schema")),
+            "a realm output_schema must warn that it applies to no session: {warnings:?}"
+        );
     }
 
     #[test]

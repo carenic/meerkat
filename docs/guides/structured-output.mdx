@@ -261,7 +261,7 @@ The extraction turn logic:
 ### Attempt flow
 
 1. **Max attempts** = `structured_output_retries + 1` (default: 2 + 1 = 3 attempts).
-2. **First attempt prompt**: `"Provide the final output as valid JSON matching the required schema. Output ONLY the JSON, no additional text or markdown formatting."`
+2. **First attempt prompt**: `"Provide the final output as valid JSON matching the required schema. Output ONLY the JSON, no additional text or markdown formatting."` (a realm's `[agent] extraction_prompt` replaces it)
 3. **Retry prompt** (on validation failure): `"The previous output was invalid: {error}. Please provide valid JSON matching the schema. Output ONLY the JSON, no additional text."`
 4. LLM is called with **no tools**. Core requests **temperature 0.0**; provider
    lowering may omit it when unsupported by the model. Output is not
@@ -322,6 +322,12 @@ Schema warnings are collected during compilation and included in `RunResult.sche
 |-------|------|---------|-------------|
 | `output_schema` | `Option<OutputSchema>` | `None` | JSON schema for extraction |
 | `structured_output_retries` | `u32` | `2` | Max validation retries |
+| `extraction_prompt` | `Option<String>` | `None` | Prompt of the extraction turn; `None` uses the built-in one |
+
+The schema is set per run (the surfaces below, or `AgentBuildConfig`). A
+realm config's `[agent] output_schema` applies to no session and loads with a
+warning. A realm config's `[agent] extraction_prompt` does apply: it replaces
+the extraction prompt for every agent built from that config.
 
 ## Usage
 
